@@ -64352,51 +64352,61 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const accessScopeRef = import_react49.default.useRef(accessScope);
   accessScopeRef.current = accessScope;
   const accessRefreshVersion = import_react49.default.useRef(0);
+  const accessSettledScope = import_react49.default.useRef(null);
   const visibleAccessData = accessData.scope === accessScope ? accessData : null;
   import_react49.default.useEffect(() => {
     accessRefreshVersion.current += 1;
+    accessSettledScope.current = null;
     setAccessData({ scope: accessScope, loading: false, status: null, config: null, error: null });
   }, [accessScope, experience?.access?.can_administer]);
-  const refreshAccessData = import_react49.default.useCallback(() => panelRefreshFlight("access", async () => {
-    if (accessScope !== accessScopeRef.current) return;
-    const version2 = ++accessRefreshVersion.current;
-    const isCurrent = () => version2 === accessRefreshVersion.current && accessScope === accessScopeRef.current;
-    const accessTarget = controlWorkbenchTarget("access");
-    setAccessData((current) => ({
-      scope: accessScope,
-      loading: true,
-      error: null,
-      status: current.scope === accessScope ? current.status : null,
-      config: current.scope === accessScope ? current.config : null
-    }));
-    let status = null;
-    try {
-      status = await executeHeadlessCommand(CONSOLE_COMMAND_NAMES2.accessStatus, accessTarget) || null;
-      if (!isCurrent()) return;
-      let config2 = null;
-      if (status?.available && status?.can_administer) {
-        const result = await executeHeadlessCommand(CONSOLE_COMMAND_NAMES2.getAccessConfig, accessTarget);
-        config2 = result?.config || null;
-        status = {
-          ...status,
-          revision: result?.revision,
-          owner_instance: result?.owner_instance,
-          conditional_mutations: status.conditional_mutations === "checked_v1" ? result?.conditional_mutations : void 0
-        };
-      }
-      if (isCurrent()) setAccessData({ scope: accessScope, loading: false, status, config: config2, error: null });
-    } catch (err) {
-      if (!isCurrent()) return;
-      const failure = classifyConsoleSendFailure(err);
-      const forbidden = failure.kind === "access_denied" || failure.kind === "unauthenticated";
+  const refreshAccessData = import_react49.default.useCallback((mode = "explicit") => {
+    if (accessScope === accessScopeRef.current && (mode === "explicit" || accessSettledScope.current !== accessScope)) {
+      if (mode === "explicit") accessRefreshVersion.current += 1;
       setAccessData((current) => ({
-        ...current,
-        loading: false,
-        error: errorMessage(err),
-        ...forbidden ? { status: null, config: null } : {}
+        scope: accessScope,
+        loading: true,
+        error: null,
+        status: current.scope === accessScope ? current.status : null,
+        config: current.scope === accessScope ? current.config : null
       }));
     }
-  }), [panelRefreshFlight, baseUrl, accessScope]);
+    return panelRefreshFlight("access", async () => {
+      if (accessScope !== accessScopeRef.current) return;
+      const version2 = ++accessRefreshVersion.current;
+      const isCurrent = () => version2 === accessRefreshVersion.current && accessScope === accessScopeRef.current;
+      const accessTarget = controlWorkbenchTarget("access");
+      let status = null;
+      try {
+        status = await executeHeadlessCommand(CONSOLE_COMMAND_NAMES2.accessStatus, accessTarget) || null;
+        if (!isCurrent()) return;
+        let config2 = null;
+        if (status?.available && status?.can_administer) {
+          const result = await executeHeadlessCommand(CONSOLE_COMMAND_NAMES2.getAccessConfig, accessTarget);
+          config2 = result?.config || null;
+          status = {
+            ...status,
+            revision: result?.revision,
+            owner_instance: result?.owner_instance,
+            conditional_mutations: status.conditional_mutations === "checked_v1" ? result?.conditional_mutations : void 0
+          };
+        }
+        if (!isCurrent()) return;
+        accessSettledScope.current = accessScope;
+        setAccessData({ scope: accessScope, loading: false, status, config: config2, error: null });
+      } catch (err) {
+        if (!isCurrent()) return;
+        accessSettledScope.current = accessScope;
+        const failure = classifyConsoleSendFailure(err);
+        const forbidden = failure.kind === "access_denied" || failure.kind === "unauthenticated";
+        setAccessData((current) => ({
+          ...current,
+          loading: false,
+          error: errorMessage(err),
+          ...forbidden ? { status: null, config: null } : {}
+        }));
+      }
+    });
+  }, [panelRefreshFlight, baseUrl, accessScope]);
   const refreshMemoryData = import_react49.default.useCallback(() => panelRefreshFlight("memory", async () => {
     const memoryTarget = controlWorkbenchTarget("memory");
     try {
@@ -64757,7 +64767,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         );
       }));
     }
-    if (openPanels.some((t) => t.kind === "access")) refreshes.push(refreshAccessData());
+    if (openPanels.some((t) => t.kind === "access")) refreshes.push(refreshAccessData("background"));
     if (openPanels.some((t) => t.kind === "memory")) refreshes.push(refreshMemoryData());
     if (openPanels.some((t) => t.kind === "workgraph")) refreshes.push(refreshWorkGraphData());
     if (openPanels.some((t) => t.kind === "topology")) refreshes.push(refreshTopologyData());
