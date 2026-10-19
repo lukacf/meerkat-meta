@@ -34,10 +34,13 @@ import {
   STORAGE_RESOLUTION_CODE,
   INIT_IN_PROGRESS_CODE,
   COMPOSITION_PROVENANCE_CODE,
+  MEMBER_RELOAD_REQUIRED_CODE,
+  MEMBER_RELOAD_REQUIRED_KIND,
   WORKGRAPH_UNAVAILABLE_CODE,
   WORKGRAPH_CONFLICT_CODE,
   CapabilityUnavailableError,
   CompositionProvenanceError,
+  MemberReloadRequiredError,
   ConsoleTimelineReplayUnavailableError,
   LeaseLostError,
   RegisteredSpecChangedError,
@@ -735,6 +738,14 @@ function rpcErrorFromPayload(
   }
   if (code === COMPOSITION_PROVENANCE_CODE) {
     return new CompositionProvenanceError(message, rid, method, err.data);
+  }
+  if (
+    code === MEMBER_RELOAD_REQUIRED_CODE &&
+    typeof err.data === "object" &&
+    err.data !== null &&
+    (err.data as Record<string, unknown>).kind === MEMBER_RELOAD_REQUIRED_KIND
+  ) {
+    return new MemberReloadRequiredError(message, rid, method, err.data);
   }
   if (code === WORKGRAPH_UNAVAILABLE_CODE) {
     return new WorkGraphUnavailableError(message, rid, method, err.data);
@@ -2932,6 +2943,11 @@ export class MobHandle {
     );
   }
 
+  /**
+   * Force-cancel a running member immediately. A mob refusal rejects with
+   * meerkat's typed code and data; a member whose runtime registration must be
+   * reloaded first rejects with {@link MemberReloadRequiredError}.
+   */
   async forceCancelMember(memberId: string): Promise<void> {
     await this._runtime._rpc("meta/force_cancel_member", {
       member_id: memberId,

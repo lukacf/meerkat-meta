@@ -9,6 +9,16 @@
   timeout (60 seconds by default) or, for the shutdown handshake, the
   gateway's whole shutdown horizon. The transport then lets go of that
   stdout, so it no longer keeps the host process running.
+- `MemberReloadRequiredError` (extends `RpcError`), with
+  `MEMBER_RELOAD_REQUIRED_CODE` (`-32029`) and `MEMBER_RELOAD_REQUIRED_KIND`
+  (`"mob_member_reload_required"`): `MobHandle.forceCancelMember` rejects
+  with it for a member whose runtime registration must be reloaded, when the
+  refusal carries both the code and the kind. It has `memberId`, `reason` and
+  `requiredAction` (`"reload_member_registration"`), each `null` when the
+  gateway sent no such field. Any other `-32029` stays a plain `RpcError`.
+- `MobHandle.forceCancelMember` rejects with meerkat's typed mob refusal: an
+  unknown member now arrives as an `RpcError` with code `-32602` (`mob member
+  not found: <id>`) instead of `-32000`.
 
 ## 0.9.3
 

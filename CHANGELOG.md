@@ -87,6 +87,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ChildMobStandDownOutcome::EnumerationFailed { detail }`, instead of a
   `Retained` entry; the gateway's shutdown diagnostics still report it as
   `retained` with one unsettled entry.
+- Behaviour-only: `meta/force_cancel_member` answers a mob refusal with
+  meerkat's typed code and structured data on stdio and on `/console/rpc`,
+  as `meta/stop_member_run` does, instead of `-32000` with the refusal in
+  its message (`force_cancel_member failed: ...`). A member whose runtime
+  registration must be reloaded before it accepts work answers meerkat's
+  `-32029` with `error.data.kind` `mob_member_reload_required`, the
+  `member_id`, the `reason` and `required_action`
+  `reload_member_registration`, the same refusal rkat-rpc sends. An unknown
+  member answers `-32602` `mob member not found: <id>`. A generated alias
+  without identity authority and an identity-runtime failure keep `-32000`.
 
 ### Security
 
@@ -140,6 +150,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   has no completion until `activate_without_identity_context` returns `Ok`.
   Installing an identity context withdraws a completion not yet taken;
   attaching one leaves it as it is.
+- Python SDK `MemberReloadRequiredError` and TypeScript SDK
+  `MemberReloadRequiredError` (with `MEMBER_RELOAD_REQUIRED_CODE`, `-32029`,
+  and `MEMBER_RELOAD_REQUIRED_KIND`, `mob_member_reload_required`):
+  `force_cancel_member` / `forceCancelMember` raise it for a member whose
+  runtime registration must be reloaded, when the refusal carries both the
+  code and the kind, with `member_id`/`memberId`, `reason` and
+  `required_action`/`requiredAction`. Any other `-32029` stays a plain
+  `RpcError`.
 
 ### Changed
 

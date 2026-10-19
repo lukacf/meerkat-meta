@@ -128,6 +128,29 @@ async fn stop_member_run_is_not_current_for_a_stale_run_and_validates_its_params
     assert!(response["error"].is_object(), "{response:#?}");
 }
 
+/// `meta/force_cancel_member` answers a mob refusal with meerkat's typed code
+/// and message, the rendering `meta/stop_member_run` uses, instead of a
+/// `-32000` with the refusal flattened into text: an unknown member is
+/// meerkat's `MemberNotFound`. The reload-required rendering (-32029 with its
+/// data) is pinned by the unit test
+/// `a_member_that_needs_a_reload_keeps_its_code_and_named_repair`.
+#[tokio::test(flavor = "multi_thread")]
+async fn force_cancel_member_answers_a_mob_refusal_typed() {
+    let (_temp, runtime) = runtime().await;
+    let response = rpc(
+        &runtime,
+        "meta/force_cancel_member",
+        json!({ "member_id": "missing" }),
+    )
+    .await;
+    assert_eq!(response["error"]["code"], json!(-32602), "{response:#?}");
+    assert_eq!(
+        response["error"]["message"],
+        json!("mob member not found: missing"),
+        "{response:#?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_member_run_is_advertised_by_the_gateway() {
     let (_temp, runtime) = runtime().await;
