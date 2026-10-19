@@ -1907,9 +1907,17 @@ The older `console.route` style is not the stock console contract. Use `GET /con
 
 ## Mob announcements (optional)
 
-Available on gateways launched persistent and identity-first with
-`runtime_options.mob_announcements = {"enabled": true}`; otherwise these
-methods answer `-32044`. The host announces a development to a mob hosted on
+Available on hosts launched persistent and identity-first with mob
+announcements enabled: `runtime_options.mob_announcements = {"enabled": true}`
+on `rpc_gateway`, the `mob_announcements` init param on `meta_gateway`, or
+`UnifiedRuntimeBuilder::mob_announcements` in a Rust host; otherwise these
+methods answer `-32044`. The console serves the same methods on
+`POST /console/rpc` through the same handler, so a runtime without mob
+announcements answers them there exactly as `rpc_gateway` does:
+`-32044` `mob_announcements_unavailable`. On the console every method, the
+reads included, requires the `runtime.admin` grant, and a read-only console
+refuses the ones that change state (`announce`,
+`subscriptions/{put,pause,resume,cancel}` and `deliveries/reconcile`). The host announces a development to a mob hosted on
 this gateway, once per mob and source key. Every member subscription that
 names the mob and one of the announcement's topics captures it in the same
 transaction, and each subscriber receives what it is owed in bounded batches,

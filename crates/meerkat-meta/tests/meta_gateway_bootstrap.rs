@@ -1318,3 +1318,306 @@ fn both_gateways_default_to_a_loopback_bind_with_no_advertised_base() {
         "{console}"
     );
 }
+
+/// A meta_gateway on its own workspace whose `config/mob.toml` names the mob
+/// `mob_id` and the roster's member `personal:alice`, launched with the
+/// persistent identity-first init plus `overrides` and the flags `args`.
+#[cfg(unix)]
+struct ComposedGateway {
+    child: std::process::Child,
+    _stdin: std::process::ChildStdin,
+    http_base_url: String,
+    init: Value,
+}
+
+#[cfg(unix)]
+impl ComposedGateway {
+    /// `Err` carries the init answer of a gateway that refused to start.
+    fn launch(
+        workspace: &Path,
+        mob_id: &str,
+        overrides: Value,
+        args: &[&str],
+    ) -> Result<Self, Value> {
+        let config = workspace.join("config");
+        std::fs::create_dir_all(&config).expect("config dir");
+        std::fs::write(
+            config.join("mob.toml"),
+            format!(
+                "[mob]\nid = \"{mob_id}\"\norchestrator = \"alpha\"\n\n[profiles.alpha]\nmodel = \
+                 \"gpt-5.5\"\nexternal_addressable = true\n\n[profiles.alpha.tools]\ncomms = true\n"
+            ),
+        )
+        .expect("mob.toml");
+        let mut params = json!({
+            "workspace_root": workspace,
+            "store_path": workspace.join("store"),
+            "persistent_sessions": true,
+            "identity_roster": [{ "identity": "personal:alice", "profile": "alpha" }],
+        });
+        for (key, value) in overrides.as_object().expect("init overrides") {
+            params[key.as_str()] = value.clone();
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_meta_gateway"))
+            .args(args)
+            .current_dir(workspace)
+            .env("ANTHROPIC_API_KEY", "sk-ant-regression-test")
+            .env("OPENAI_API_KEY", "sk-regression-test")
+            .env("XDG_STATE_HOME", workspace.join("xdg-state"))
+            .env("RUST_LOG", "error")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn meta_gateway");
+        let mut stdin = child.stdin.take().expect("gateway stdin");
+        let stdout = child.stdout.take().expect("gateway stdout");
+        writeln!(
+            stdin,
+            "{}",
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "meta/init", "params": params })
+        )
+        .expect("write init");
+        stdin.flush().expect("flush init");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = BufReader::new(stdout).read_line(&mut line);
+            let _ = tx.send(line);
+        });
+        let line = rx
+            .recv_timeout(Duration::from_mins(1))
+            .expect("init answer");
+        let mut gateway = Self {
+            child,
+            _stdin: stdin,
+            http_base_url: String::new(),
+            init: Value::Null,
+        };
+        let response: Value = serde_json::from_str(&line).expect("init JSON");
+        if response.get("error").is_some() {
+            return Err(response);
+        }
+        gateway.http_base_url = response["result"]["http_base_url"]
+            .as_str()
+            .expect("HTTP base URL")
+            .to_owned();
+        gateway.init = response["result"].clone();
+        Ok(gateway)
+    }
+
+    /// The console's whole answer to one JSON-RPC call: result or error.
+    fn call(&self, method: &str, params: Value) -> Value {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("HTTP client")
+            .post(format!("{}/console/rpc", self.http_base_url))
+            .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": method, "params": params }))
+            .send()
+            .expect("HTTP RPC")
+            .json()
+            .expect("HTTP RPC JSON")
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ComposedGateway {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// meta_gateway composes mob announcements from its init's
+/// `mob_announcements` and serves them on `/console/rpc`: a subscription put
+/// there is listed there.
+#[cfg(unix)]
+#[test]
+fn meta_gateway_serves_mob_announcements_on_its_console() {
+    let workspace = TempDir::new().expect("workspace");
+    let gateway = ComposedGateway::launch(
+        workspace.path(),
+        "meta-announcing",
+        json!({ "mob_announcements": { "enabled": true } }),
+        &[],
+    )
+    .expect("init with mob announcements");
+    let member = json!({ "mob_id": "meta-announcing", "identity": "personal:alice" });
+    let put = gateway.call(
+        "meta/mob_announcements/subscriptions/put",
+        json!({
+            "operation_id": "op-1",
+            "subscription_id": "sub-1",
+            "member": member,
+            "topics": ["t"]
+        }),
+    );
+    assert_eq!(put["result"]["subscription"]["state"], "active", "{put}");
+    assert_eq!(
+        put["result"]["subscription"]["selector"]["mobs"],
+        json!(["meta-announcing"]),
+        "a subscription that names no mob takes the gateway's own: {put}"
+    );
+    let listed = gateway.call(
+        "meta/mob_announcements/subscriptions/list",
+        json!({ "member": member }),
+    );
+    assert_eq!(
+        listed["result"]["subscriptions"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
+}
+
+/// A read-only console refuses the announcement methods that change state
+/// and still answers the reads.
+#[cfg(unix)]
+#[test]
+fn a_read_only_meta_gateway_console_refuses_announcement_changes() {
+    let workspace = TempDir::new().expect("workspace");
+    let gateway = ComposedGateway::launch(
+        workspace.path(),
+        "meta-read-only",
+        json!({ "mob_announcements": { "enabled": true }, "console_read_only": true }),
+        &[],
+    )
+    .expect("init with mob announcements");
+    let put = gateway.call(
+        "meta/mob_announcements/subscriptions/put",
+        json!({
+            "operation_id": "op-1",
+            "subscription_id": "sub-1",
+            "member": { "mob_id": "meta-read-only", "identity": "personal:alice" },
+            "topics": ["t"]
+        }),
+    );
+    assert_eq!(put["error"]["data"]["kind"], "read_only", "{put}");
+    let listed = gateway.call("meta/mob_announcements/subscriptions/list", json!({}));
+    assert_eq!(listed["result"]["subscriptions"], json!([]), "{listed}");
+}
+
+/// Without `mob_announcements`, meta_gateway answers the family exactly as
+/// rpc_gateway does when they are off: the one handler both dispatch to.
+#[cfg(unix)]
+#[test]
+fn meta_gateway_without_mob_announcements_answers_as_rpc_gateway_does() {
+    let workspace = TempDir::new().expect("workspace");
+    let gateway = ComposedGateway::launch(workspace.path(), "meta-plain", json!({}), &[])
+        .expect("init without mob announcements");
+    let unavailable = serde_json::to_value(
+        meerkat_meta::mob_announcements::rpc::announcements_unavailable_error(),
+    )
+    .expect("error JSON");
+    for method in [
+        "meta/mob_announcements/subscriptions/list",
+        "meta/mob_announcements/subscriptions/put",
+    ] {
+        let answer = gateway.call(method, json!({}));
+        assert_eq!(answer["error"], unavailable, "{method}: {answer}");
+    }
+}
+
+/// meta_gateway refuses at init the mob announcements it cannot compose,
+/// through the parser and refusals rpc_gateway uses.
+#[cfg(unix)]
+#[test]
+fn meta_gateway_refuses_mob_announcements_it_cannot_compose() {
+    for (overrides, refusal) in [
+        (
+            json!({ "mob_announcements": { "enabled": true }, "identity_first": false }),
+            "identity_first: false",
+        ),
+        (
+            json!({ "mob_announcements": { "enabled": true }, "persistent_sessions": false }),
+            "persistent_sessions: true",
+        ),
+        (
+            json!({ "mob_announcements": { "enabled": false, "member_tools_in_child_mobs": true } }),
+            "member_tools_in_child_mobs is refused",
+        ),
+        (
+            json!({ "mob_announcements": { "enabled": true, "retention_ms": 0 } }),
+            "mob_announcements.retention_ms must be at least",
+        ),
+    ] {
+        let workspace = TempDir::new().expect("workspace");
+        let Err(answer) =
+            ComposedGateway::launch(workspace.path(), "meta-refused", overrides.clone(), &[])
+        else {
+            panic!("{overrides} must be refused at init");
+        };
+        assert!(
+            answer.to_string().contains(refusal),
+            "{overrides}: {answer}"
+        );
+    }
+}
+
+/// meta_gateway's control listener serves keyed inject status reads with the
+/// default window: there is no switch that turns it off. A peer granted
+/// `inject_status` on a roster member gets a signed answer.
+#[cfg(unix)]
+#[test]
+fn meta_gateway_serves_keyed_inject_status_on_its_control_listener() {
+    use meerkat_meta::contact_directory::{ContactEntry, MobTransport};
+    use meerkat_meta::runtime::cross_mob_remote::RemoteMobProxy;
+    use meerkat_meta::runtime::keyed_inject::KeyedInjectCallOutcome;
+
+    let workspace = TempDir::new().expect("workspace");
+    let gateway_home = workspace.path().join("xdg-state").join("meerkat-meta");
+    std::fs::create_dir_all(&gateway_home).expect("gateway home");
+    let server_keys =
+        meerkat_meta::GatewayPeerKeys::load_or_create(&gateway_home).expect("gateway keys");
+    let caller = std::sync::Arc::new(meerkat_meta::GatewayPeerKeys::ephemeral());
+    std::fs::create_dir_all(workspace.path().join("config")).expect("config dir");
+    std::fs::write(
+        workspace.path().join("config").join("contacts.toml"),
+        format!(
+            "[control_grants.peer-gateway]\npubkey = \"{}\"\nverbs = [\"inject_status\"]\nmembers \
+             = [\"personal:alice\"]\n",
+            caller.pubkey_b64()
+        ),
+    )
+    .expect("contacts.toml");
+    let gateway = ComposedGateway::launch(
+        workspace.path(),
+        "meta-keyed",
+        json!({}),
+        &["--control-listen", "tcp://127.0.0.1:0"],
+    )
+    .expect("init with a control listener");
+    let address = gateway.init["control_listen_address"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a bound control listener: {}", gateway.init))
+        .to_owned();
+    let entry = ContactEntry {
+        mob_id: "meta-keyed".to_string(),
+        transport: MobTransport::Tcp(
+            address
+                .strip_prefix("tcp://")
+                .expect("tcp listener address")
+                .to_string(),
+        ),
+        pubkey: Some(server_keys.pubkey_bytes()),
+        require_signed_control: Some(true),
+    };
+    let proxy = RemoteMobProxy::from_entry_with_caller(&entry, Some(caller))
+        .expect("valid contact")
+        .expect("tcp proxy");
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_millis(),
+    )
+    .expect("milliseconds fit");
+    let outcome = tokio::runtime::Runtime::new()
+        .expect("tokio runtime")
+        .block_on(proxy.inject_status("personal:alice", "batch-1", false, now_ms))
+        .expect("a signed answer");
+    assert!(
+        matches!(outcome, KeyedInjectCallOutcome::Answered(_)),
+        "{outcome:?}"
+    );
+}

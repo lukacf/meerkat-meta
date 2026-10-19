@@ -375,7 +375,9 @@ request's issue time may be from the serving gateway's clock.
 ## Configuration
 
 `rpc_gateway` takes it through `runtime_options.mob_announcements` on a
-persistent, identity-first launch:
+persistent, identity-first launch; `meta_gateway` takes the same object as its
+`mob_announcements` init param, and a Rust host as
+`UnifiedRuntimeBuilder::mob_announcements` (see Composition below):
 
 ```json
 {
@@ -434,6 +436,39 @@ spelling to reconcile), and storage maintenance fences it in every build. A
 gateway refuses an announcement database with a newer schema and fails
 `meta/init` closed, so after a later schema change, going back to an older
 binary means disabling mob announcements or keeping the newer binary.
+
+### Composition
+
+Every surface lowers into one `AnnouncementComposition`, in two steps and in
+this order:
+
+- `AnnouncementComposition::new` refuses a configuration
+  `AnnouncementConfig::validate` refuses: the gateway-wide grant of the
+  member tools to child mob profiles, and a batch policy, retention window,
+  settle check bound or limit out of range. It is the one check: the options
+  parser and `AnnouncementService::new` run it too, so no surface composes
+  what another refuses. `member_tools_in_child_mobs` is refused even with
+  `enabled: false`.
+- `register_member_tools` puts the member tool bundle on the mob spec before
+  the runtime is built, for the host's own profiles only.
+- `compose` opens the announcement database, attaches the owner to the
+  runtime, binds the member tools, starts the dispatcher and follows the mob
+  set. It runs once the runtime's identity runtime is installed and before
+  the control listener's keyed inject plane is sealed.
+
+`rpc_gateway` composes from `runtime_options.mob_announcements`, with its
+`control_request_window_ms` as the window peers apply to its requests.
+`meta_gateway` composes from its init's `mob_announcements`, with the default
+window its control listener serves with (`DEFAULT_KEYED_INJECT_WINDOW_MS`,
+five minutes; it has no switch that turns keyed injects off). The builder
+composes from `UnifiedRuntimeBuilder::mob_announcements`, refuses it without
+`persistent_state()` or an identity-first runtime, and uses the window its
+keyed inject plane serves with. The runtime's shutdown stops the dispatcher,
+whichever surface composed it; a stop is idempotent, so a gateway that stops
+it first changes nothing. The console's `/console/rpc` serves the
+`meta/mob_announcements/*` methods through the stdin surface's handler,
+reading the runtime's owner at each request, and requires `runtime.admin` for
+every one of them.
 
 ## RPC methods
 

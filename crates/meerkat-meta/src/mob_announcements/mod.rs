@@ -135,9 +135,11 @@ struct BatchOptions {
     min_wake_interval_ms: Option<u64>,
 }
 
-/// Why `runtime_options.mob_announcements` is refused at startup.
+/// Why a mob announcement configuration is refused before anything is
+/// composed, on every surface that takes one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AnnouncementOptionsError {
+#[non_exhaustive]
+pub enum AnnouncementOptionsError {
     /// An option is malformed or out of range; the message names it.
     Invalid(String),
     /// `member_tools_in_child_mobs` would hand the member tools to every
@@ -157,9 +159,8 @@ impl std::fmt::Display for AnnouncementOptionsError {
         match self {
             Self::Invalid(message) => f.write_str(message),
             Self::ChildMemberToolsNeedProfileOptIn => f.write_str(
-                "runtime_options.mob_announcements.member_tools_in_child_mobs is refused: each \
-                 child mob profile must opt in to the member tools itself, and this build cannot \
-                 offer that per-profile opt-in yet",
+                "member_tools_in_child_mobs is refused: each child mob profile must opt in to the \
+                 member tools itself, and this build cannot offer that per-profile opt-in yet",
             ),
         }
     }
@@ -170,8 +171,25 @@ impl std::fmt::Display for AnnouncementOptionsError {
 pub(crate) fn parse_runtime_options(
     value: &serde_json::Value,
 ) -> Result<Option<AnnouncementConfig>, AnnouncementOptionsError> {
-    let options: AnnouncementOptions = serde_json::from_value(value.clone())
-        .map_err(|error| format!("runtime_options.mob_announcements: {error}"))?;
+    parse_options(value, "runtime_options.mob_announcements")
+}
+
+/// Parse a mob announcement options object (`{enabled, batch?,
+/// retention_ms?, member_limits?, member_tools_in_child_mobs?,
+/// child_member_limits?}`), as every gateway takes it; `path` is where the
+/// surface takes it, for the messages. `Ok(None)` when it is disabled. The
+/// result has passed [`AnnouncementConfig::validate`].
+pub fn parse_options(
+    value: &serde_json::Value,
+    path: &str,
+) -> Result<Option<AnnouncementConfig>, AnnouncementOptionsError> {
+    let options: AnnouncementOptions =
+        serde_json::from_value(value.clone()).map_err(|error| format!("{path}: {error}"))?;
+    // Refused whether or not announcements are enabled: an operator who sets
+    // it would believe it does something.
+    if options.member_tools_in_child_mobs {
+        return Err(AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn);
+    }
     if !options.enabled {
         return Ok(None);
     }
@@ -186,13 +204,6 @@ pub(crate) fn parse_runtime_options(
             .unwrap_or(policy.min_wake_interval_ms);
     }
     if let Some(retention_ms) = options.retention_ms {
-        if retention_ms < owner::MIN_RETENTION_MS {
-            return Err(format!(
-                "runtime_options.mob_announcements.retention_ms must be at least {}",
-                owner::MIN_RETENTION_MS
-            )
-            .into());
-        }
         config.retention_ms = retention_ms;
     }
     if let Some(limits) = options.member_limits {
@@ -207,69 +218,130 @@ pub(crate) fn parse_runtime_options(
         current.topics_per_subscription = limits
             .topics_per_subscription
             .unwrap_or(current.topics_per_subscription);
-        current
-            .validate()
-            .map_err(|error| format!("runtime_options.mob_announcements.member_limits: {error}"))?;
-    }
-    // Child mob profiles get the member tools only by opting in, profile by
-    // profile, and this build cannot offer that yet: the gateway-wide grant
-    // is refused rather than handed to every child profile.
-    if options.member_tools_in_child_mobs {
-        return Err(AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn);
     }
     if let Some(limits) = options.child_member_limits {
         let current = &mut config.child_limits;
         current.subscriptions = limits.subscriptions.unwrap_or(current.subscriptions);
         current.per_mob = limits.per_mob.unwrap_or(current.per_mob);
-        current.validate().map_err(|error| {
-            format!("runtime_options.mob_announcements.child_member_limits: {error}")
-        })?;
     }
-    config
-        .policy
-        .validate()
-        .map_err(|error| format!("runtime_options.mob_announcements.batch: {error}"))?;
+    config.validate().map_err(|error| match error {
+        AnnouncementOptionsError::Invalid(message) => {
+            AnnouncementOptionsError::Invalid(format!("{path}.{message}"))
+        }
+        other => other,
+    })?;
     Ok(Some(config))
 }
 
-/// Compose mob announcements for a persistent identity-first gateway: open
-/// its database, attach the owner to the runtime, start the dispatcher and
-/// follow the mob set, so destroyed mobs leave the subscriptions that name
-/// them.
-pub(crate) fn compose_for_runtime(
-    runtime: &crate::unified_runtime::UnifiedRuntime,
-    layout: &crate::storage_layout::MetaStorageLayout,
+/// Where a runtime keeps its mob announcement owner once one attaches. A
+/// surface built before the owner attaches (the console) reads it at each
+/// request.
+pub type AnnouncementSlot = Arc<std::sync::OnceLock<AnnouncementService>>;
+
+/// Mob announcements as a host enables them, composed the same way on every
+/// surface: `rpc_gateway` from `runtime_options.mob_announcements`,
+/// `meta_gateway` from its init's `mob_announcements`, and a runtime the
+/// builder composes from
+/// [`UnifiedRuntimeBuilder::mob_announcements`](crate::UnifiedRuntimeBuilder::mob_announcements).
+///
+/// Two steps, in this order: [`Self::register_member_tools`] puts the member
+/// tool bundle on the mob spec before the runtime is built, and
+/// [`Self::compose`] attaches the owner once the runtime's identity runtime
+/// is installed, before the keyed inject plane of its control listener is
+/// sealed.
+pub struct AnnouncementComposition {
     config: AnnouncementConfig,
-    member_tools: Option<&tools::ToolSlot>,
-) -> Result<AnnouncementService, String> {
-    let local = Arc::new(local_delivery(runtime)?);
-    let identities = runtime
-        .identity_runtime_ref()
-        .cloned()
-        .ok_or("mob announcements require an identity-first gateway")?;
-    let own_mob = MobId::new(runtime.mob_handle().mob_id().to_string())
-        .map_err(|error| format!("this gateway's mob id: {error}"))?;
-    let path = layout
-        .mob_announcements_db()
-        .map_err(|error| format!("mob announcement database: {error}"))?;
-    let store = storage::open_disk_store(path)
-        .map_err(|error| format!("mob announcement database: {error}"))?;
-    let window_ms = config.peer_request_window_ms;
-    let remote = runtime
-        .peer_delivery_access()
-        .map(|(contacts, keys)| Arc::new(RemoteMemberDelivery::new(contacts, keys, window_ms)));
-    // Callers in mobs members created are attributed through this
-    // gateway's runtime only when they can be offered the tools.
-    let children = config
-        .member_tools_in_child_mobs
-        .then(|| Arc::clone(&local));
-    let native = AnnouncementNativeDelivery::new(local, remote);
-    let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config)
-        .map_err(|error| error.to_string())?;
-    if !runtime.attach_mob_announcements(service.clone()) {
-        return Err("mob announcements are already attached to this runtime".to_string());
+    member_tools: tools::ToolSlot,
+}
+
+impl AnnouncementComposition {
+    /// Refuses a configuration [`AnnouncementConfig::validate`] refuses.
+    pub fn new(config: AnnouncementConfig) -> Result<Self, AnnouncementOptionsError> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            member_tools: Arc::new(std::sync::OnceLock::new()),
+        })
     }
-    if let Some(slot) = member_tools {
+
+    /// The window a peer applies to this gateway's keyed inject requests: a
+    /// batch for a member on a peer expires only once it has passed. Each
+    /// surface sets the window its own control listener serves with.
+    #[must_use]
+    pub fn with_peer_request_window(mut self, window_ms: u64) -> Self {
+        self.config.peer_request_window_ms = window_ms;
+        self
+    }
+
+    /// Put the member tool bundle ([`tools::TOOL_BUNDLE`]) on `spec`. The
+    /// host's own profiles that name it in `tools.rust_bundles` get the
+    /// member tools; no child mob profile does, since that takes a
+    /// per-profile opt-in this build cannot offer yet.
+    pub fn register_member_tools(
+        &self,
+        spec: crate::mob_handle_runtime::MobBootstrapSpec,
+    ) -> crate::mob_handle_runtime::MobBootstrapSpec {
+        let (name, dispatcher) = self.member_tool_bundle();
+        spec.register_tool_bundle_with_availability(
+            name,
+            dispatcher,
+            meerkat_mob_mcp::ChildToolBundleAvailability::HostOnly,
+        )
+    }
+
+    /// The member tool bundle's name and dispatcher, for a composer that
+    /// collects its bundles before it resolves a spec. Host only.
+    pub(crate) fn member_tool_bundle(
+        &self,
+    ) -> (&'static str, Arc<dyn meerkat_core::AgentToolDispatcher>) {
+        (
+            tools::TOOL_BUNDLE,
+            Arc::new(tools::MobAnnouncementTools::new(Arc::clone(
+                &self.member_tools,
+            ))),
+        )
+    }
+
+    /// Attach the owner to `runtime`: open its database under `layout`,
+    /// bind the member tools, start the dispatcher and follow the mob set,
+    /// so destroyed mobs leave the subscriptions that name them. The runtime
+    /// must be identity-first; its shutdown stops the dispatcher.
+    pub fn compose(
+        self,
+        runtime: &crate::unified_runtime::UnifiedRuntime,
+        layout: &crate::storage_layout::MetaStorageLayout,
+    ) -> Result<AnnouncementService, String> {
+        let Self {
+            config,
+            member_tools,
+        } = self;
+        let local = Arc::new(local_delivery(runtime)?);
+        let identities = runtime
+            .identity_runtime_ref()
+            .cloned()
+            .ok_or("mob announcements require an identity-first gateway")?;
+        let own_mob = MobId::new(runtime.mob_handle().mob_id().to_string())
+            .map_err(|error| format!("this gateway's mob id: {error}"))?;
+        let path = layout
+            .mob_announcements_db()
+            .map_err(|error| format!("mob announcement database: {error}"))?;
+        let store = storage::open_disk_store(path)
+            .map_err(|error| format!("mob announcement database: {error}"))?;
+        let window_ms = config.peer_request_window_ms;
+        let remote = runtime
+            .peer_delivery_access()
+            .map(|(contacts, keys)| Arc::new(RemoteMemberDelivery::new(contacts, keys, window_ms)));
+        // Callers in mobs members created are attributed through this
+        // gateway's runtime only when they can be offered the tools.
+        let children = config
+            .member_tools_in_child_mobs
+            .then(|| Arc::clone(&local));
+        let native = AnnouncementNativeDelivery::new(local, remote);
+        let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config)
+            .map_err(|error| error.to_string())?;
+        if !runtime.attach_mob_announcements(service.clone()) {
+            return Err("mob announcements are already attached to this runtime".to_string());
+        }
         // A non-owning handle: the member tools never keep the mob open.
         let callers = tools::RosterCallerResolver::new(
             own_mob,
@@ -277,7 +349,7 @@ pub(crate) fn compose_for_runtime(
             identities,
             children,
         );
-        let bound = slot
+        let bound = member_tools
             .set(tools::ToolBackend {
                 service: service.clone(),
                 callers: Arc::new(callers),
@@ -287,10 +359,10 @@ pub(crate) fn compose_for_runtime(
         if !bound {
             return Err("the member tools are already bound".to_string());
         }
+        drop(service.start());
+        drop(service.watch_mobs());
+        Ok(service)
     }
-    drop(service.start());
-    drop(service.watch_mobs());
-    Ok(service)
 }
 
 /// The seam to this gateway's own runtime: its identity runtime, its agent

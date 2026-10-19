@@ -35,7 +35,7 @@ There are no roles. Every check evaluates the caller's attributes (subject, grou
 | `workgraph.view` | Read WorkGraph snapshots, items, attention, events, and facts; observe the wake stream |
 | `workgraph.manage` | Mutate WorkGraph items, goals, links, and attention bindings |
 | `mob.observe` | Subscribe to whole-mob raw event streams |
-| `runtime.admin` | Routing tables, labels, wiring, reconcile |
+| `runtime.admin` | Routing tables, labels, wiring, reconcile, mob announcements |
 | `topology.view` | Inspect topology state for an agent; also requires `agent.view` |
 | `topology.connect` / `topology.disconnect` / `topology.reconnect` | Plan or apply the corresponding edge action; required independently on both endpoints |
 | `topology.bulk` | Submit more than one explicit topology operation in a bounded transaction |
@@ -327,6 +327,7 @@ the composed Console bundle; discovery alone is not an E2E result.
 - `meta/memory/panel/*` (the console Memory panel's reads) filters every returned record by its scope: identity-scoped records need `agent.memory.read` + `agent.view` on that identity, mob-scoped records need `mob.memory.read`, operator-scoped records need `operator.memory.read`, realm-scoped records and `meta/memory/panel/dreams` need an unscoped `agent.memory.read` grant, and quarantined records (still quarantined, or tombstoned after ever being quarantined) plus `meta/memory/panel/quarantine` need `memory.quarantine.review`. The review grant only opens the quarantine surface; each queue record and pending promotion is still filtered by the per-scope read grants above on its (target) scope. Memory content is more sensitive than roster visibility, so plain `agent.view` alone no longer reads any of it.
 - `meta/memory/quarantine/decide` (the operator quarantine decision) requires `memory.quarantine.review`, `agent.view` and `agent.memory.read` on the identity, and `agent.memory.write` to release or `agent.memory.delete` to tombstone (any other verdict needs both, then fails validation). Every effect is one the same caller could already cause through `remember`, `update` or `forget` (a released update supersedes its prior, as `update` does); the decision adds the lineage, the trust ceiling, the content binding and the audit trail. An anonymous caller is held to the same grants whenever access control is on. The capabilities list advertises it only to callers holding `memory.quarantine.review`.
 - Lifecycle and runtime RPCs — mapped to `agent.retire` / `agent.respawn` / `agent.reset` / `agent.spawn` / `runtime.admin` per method.
+- `meta/mob_announcements/*` on `/console/rpc` - every method, the reads included, requires `runtime.admin` with no resource: they list announcements, subscriptions and deliveries across members and mobs with no per-agent filter. A read-only console refuses the ones that change state (`announce`, `subscriptions/put`, `pause`, `resume`, `cancel` and `deliveries/reconcile`) with the `read_only` error. The capabilities list names the family only while the runtime has mob announcements.
 - Topology control — query visibility requires `agent.view` and
   `topology.view` per endpoint. Connect, disconnect, and reconnect require the
   matching `topology.*` grant on both endpoint identities for planning as well
@@ -485,7 +486,11 @@ own keys only. Both need:
   A gateway that is not identity-first, or whose configuration turns serving
   off (`runtime_options.serve_keyed_inject: false` on `rpc_gateway`),
   answers `not_served` with its typed cause, `not_identity_first` or
-  `runtime_disabled`, in a field of the signed refusal.
+  `runtime_disabled`, in a field of the signed refusal. `meta_gateway` has
+  no such switch: its listener serves keyed injects whenever its runtime is
+  identity-first (its default), with the default window,
+  `DEFAULT_KEYED_INJECT_WINDOW_MS` (five minutes), so the grants that name
+  the verbs are what decide who may call them.
 
 Every answer is signed with the serving gateway's key, and the caller treats
 only an answer its pinned key verifies as evidence. A signed refusal says

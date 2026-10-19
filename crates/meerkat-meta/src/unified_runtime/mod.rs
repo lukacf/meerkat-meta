@@ -463,7 +463,7 @@ pub struct UnifiedRuntimeCore {
         std::sync::RwLock<Option<Arc<crate::identity_first::MutableRosterProvider>>>,
     /// Mob announcements: attached once by the host after boot, absent
     /// until then and in every host that did not enable them.
-    mob_announcements: std::sync::OnceLock<crate::mob_announcements::AnnouncementService>,
+    mob_announcements: crate::mob_announcements::AnnouncementSlot,
     /// The serving side of the keyed inject plane on the cross-mob control
     /// channel. The control listener starts before the receiver is composed,
     /// so it re-reads this per request.
@@ -913,7 +913,7 @@ impl UnifiedRuntime {
                     workgraph_fact_tail_task,
                 )),
                 console_identity_roster: std::sync::RwLock::new(None),
-                mob_announcements: std::sync::OnceLock::new(),
+                mob_announcements: Default::default(),
                 keyed_inject_slot: crate::runtime::keyed_inject::pending_keyed_inject_slot(),
                 console_operator_resolver: std::sync::RwLock::new(None),
                 console_governed_ingress: Default::default(),
@@ -2009,6 +2009,12 @@ impl UnifiedRuntime {
     /// The attached mob announcement owner, when the host enabled them.
     pub fn mob_announcements(&self) -> Option<crate::mob_announcements::AnnouncementService> {
         self.mob_announcements.get().cloned()
+    }
+
+    /// The slot the mob announcement owner attaches to, for a surface built
+    /// before it attaches: the console reads it at each request.
+    pub(crate) fn mob_announcements_slot(&self) -> crate::mob_announcements::AnnouncementSlot {
+        std::sync::Arc::clone(&self.mob_announcements)
     }
 
     /// Seal what the keyed inject plane of the cross-mob control channel

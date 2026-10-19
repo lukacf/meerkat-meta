@@ -101,6 +101,40 @@ pub struct AnnouncementConfig {
     pub member_tools_in_child_mobs: bool,
 }
 
+impl AnnouncementConfig {
+    /// Refuse a configuration no host composes, whichever surface built
+    /// it: the gateway-wide grant of the member tools to child mobs (each
+    /// child mob profile must opt in itself, and this build cannot offer
+    /// that yet) and a policy, window or limit out of range. Every
+    /// constructor runs this one check: the options parser,
+    /// [`super::AnnouncementComposition::new`] and
+    /// [`AnnouncementService::new`].
+    pub fn validate(&self) -> Result<(), super::AnnouncementOptionsError> {
+        use super::AnnouncementOptionsError::{ChildMemberToolsNeedProfileOptIn, Invalid};
+        if self.member_tools_in_child_mobs {
+            return Err(ChildMemberToolsNeedProfileOptIn);
+        }
+        self.policy
+            .validate()
+            .map_err(|error| Invalid(format!("batch: {error}")))?;
+        if self.retention_ms < MIN_RETENTION_MS {
+            return Err(Invalid(format!(
+                "retention_ms must be at least {MIN_RETENTION_MS}"
+            )));
+        }
+        if self.settle_check_min_ms == 0 || self.settle_check_min_ms > self.settle_check_max_ms {
+            return Err(Invalid("settle checks need 0 < min <= max".to_string()));
+        }
+        self.member_limits
+            .validate()
+            .map_err(|error| Invalid(format!("member_limits: {error}")))?;
+        self.child_limits
+            .validate()
+            .map_err(|error| Invalid(format!("child_member_limits: {error}")))?;
+        Ok(())
+    }
+}
+
 impl Default for AnnouncementConfig {
     fn default() -> Self {
         Self {
@@ -121,6 +155,9 @@ impl Default for AnnouncementConfig {
 #[non_exhaustive]
 pub enum AnnouncementError {
     Store(AnnouncementStoreError),
+    /// The configuration the owner was built with is refused; see
+    /// [`AnnouncementConfig::validate`].
+    Configuration(super::AnnouncementOptionsError),
     /// This host's runtime admits work only through a native work
     /// authorization host, which refuses host continuations.
     GovernedRuntime,
@@ -153,6 +190,7 @@ impl std::fmt::Display for AnnouncementError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Store(error) => error.fmt(f),
+            Self::Configuration(error) => error.fmt(f),
             Self::GovernedRuntime => f.write_str(
                 "this host's runtime admits work only through a native work authorization \
                  host, which refuses host continuations",
@@ -492,21 +530,9 @@ impl AnnouncementService {
         config: AnnouncementConfig,
         clock: Clock,
     ) -> Result<Self, AnnouncementError> {
-        config.policy.validate()?;
-        if config.retention_ms < MIN_RETENTION_MS {
-            return Err(AnnouncementStoreError::Invalid(format!(
-                "retention must be at least {MIN_RETENTION_MS} ms"
-            ))
-            .into());
-        }
-        if config.settle_check_min_ms == 0
-            || config.settle_check_min_ms > config.settle_check_max_ms
-        {
-            return Err(AnnouncementStoreError::Invalid(
-                "settle checks need 0 < min <= max".into(),
-            )
-            .into());
-        }
+        config
+            .validate()
+            .map_err(AnnouncementError::Configuration)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 store,
@@ -582,6 +608,12 @@ impl AnnouncementService {
     pub fn stop(&self) {
         self.inner.stopped.store(true, Ordering::SeqCst);
         self.inner.wake.notify_one();
+    }
+
+    /// Whether a stop was requested and not undone by a later start.
+    #[cfg(test)]
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.inner.stopped.load(Ordering::SeqCst)
     }
 
     fn ensure_deliverable(&self) -> Result<(), AnnouncementError> {

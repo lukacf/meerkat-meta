@@ -42,11 +42,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   announcer. New methods `meta/mob_announcements/{announce, get,
   subscriptions/{put,pause,resume,cancel,get,list},
   deliveries/{list,observe,reconcile}}`, with typed errors `-32044` to
-  `-32048`. A persistent, identity-first `rpc_gateway` enables them with
-  `runtime_options.mob_announcements`; without it nothing opens the
-  announcement database (`mob_announcements.sqlite3`, fenced by storage
-  maintenance in every build) and the methods answer
-  `mob_announcements_unavailable`. Nothing holds retention much past the
+  `-32048`. A persistent, identity-first host enables them, composed the
+  same way on every surface: `rpc_gateway` with
+  `runtime_options.mob_announcements`, `meta_gateway` with its
+  `mob_announcements` init param, and a Rust host with
+  `UnifiedRuntimeBuilder::mob_announcements`; each refuses what it cannot
+  compose before it builds anything. The console serves the methods on
+  `/console/rpc`, every one of them, the reads included, behind the
+  `runtime.admin` grant, and a read-only console refuses the ones that
+  change state. Without mob announcements nothing opens the announcement
+  database (`mob_announcements.sqlite3`, fenced by storage maintenance in
+  every build) and the methods answer `mob_announcements_unavailable` on
+  every surface. Nothing holds retention much past the
   window: what waited longer for a delivery that never started expires, and
   the member's next batch reports it as a gap. A submission whose outcome is
   not learned in time settles `expired_unverified`, and a committed batch
@@ -84,8 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`runtime_options.mob_announcements.child_member_limits`); a put past a
   bound is refused with `child_member_limit`.
 
-- `runtime_options.mob_announcements.member_tools_in_child_mobs` is refused
-  when set: each child mob profile has to opt in to the member tools itself,
+- `member_tools_in_child_mobs` in the mob announcement options is refused
+  when set, on every surface and even with `enabled: false`: each child mob
+  profile has to opt in to the member tools itself,
   which this release cannot offer yet, and the gateway-wide grant to every
   child profile is not handed out. The host RPC subscribes members of child
   mobs instead.

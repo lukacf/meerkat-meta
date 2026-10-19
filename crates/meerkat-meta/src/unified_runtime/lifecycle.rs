@@ -250,6 +250,12 @@ impl UnifiedRuntime {
 
     pub async fn shutdown(&self) -> UnifiedRuntimeShutdownReport {
         self.shutting_down.store(true, Ordering::SeqCst);
+        // Nothing is delivered once teardown starts: stop the mob
+        // announcement dispatcher first, whichever surface composed it.
+        // Stopping is idempotent; a gateway may already have stopped it.
+        if let Some(announcements) = self.mob_announcements() {
+            announcements.stop();
+        }
         // The liveness probe is observation only. Abort it before anything
         // can quiesce the mob actor so an intentional shutdown stall cannot
         // page a false ActorLoopStalled.

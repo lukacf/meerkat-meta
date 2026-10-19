@@ -132,6 +132,10 @@ pub struct ConsoleJsonState {
     /// The trusted host's governance of Console sends, when installed
     /// ([`crate::console_governed_ingress`]); read at each send.
     pub(crate) governed_ingress: crate::console_governed_ingress::ConsoleGovernedIngressSlot,
+    /// The runtime's mob announcement owner slot. `meta/mob_announcements/*`
+    /// read it at each request: the owner attaches after the console router
+    /// may be built. Empty when announcements are off.
+    pub(crate) mob_announcements: crate::mob_announcements::AnnouncementSlot,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +290,7 @@ pub fn console_json_router(decisions: RuntimeDecisionState) -> Router {
         topology: None,
         job_health_projection: None,
         governed_ingress: Default::default(),
+        mob_announcements: Default::default(),
     })
 }
 
@@ -323,6 +328,7 @@ pub fn console_json_router_with_aggregator_and_access(
         topology: None,
         job_health_projection: None,
         governed_ingress: Default::default(),
+        mob_announcements: Default::default(),
     })
 }
 
@@ -383,6 +389,7 @@ pub(crate) fn console_json_router_with_runtime_and_events(
         None,
         None,
         Default::default(),
+        Default::default(),
     )
 }
 
@@ -409,6 +416,7 @@ pub(crate) fn console_json_router_with_runtime_events_and_policy(
     job_health_projection: Option<Arc<std::sync::RwLock<Option<serde_json::Value>>>>,
     shared_aggregator: Option<MetaConsoleAggregator>,
     governed_ingress: crate::console_governed_ingress::ConsoleGovernedIngressSlot,
+    mob_announcements: crate::mob_announcements::AnnouncementSlot,
 ) -> Router {
     let console_aggregator = shared_aggregator.or_else(|| {
         console_events.clone().map(|events| {
@@ -464,6 +472,7 @@ pub(crate) fn console_json_router_with_runtime_events_and_policy(
         topology,
         job_health_projection,
         governed_ingress,
+        mob_announcements,
     })
 }
 
@@ -931,6 +940,7 @@ pub async fn console_rpc_handler(
         state.identity_roster.clone(),
         state.workgraph.as_ref(),
         state.topology.as_ref(),
+        state.mob_announcements.get(),
         &ConsoleSendGovernance::for_request(&state, &auth_context),
     ))
     .await;
@@ -2625,6 +2635,9 @@ fn is_console_mutating_rpc_method(method: &str) -> bool {
     if crate::rpc::workgraph_methods::is_workgraph_mutating_method(method) {
         return true;
     }
+    if crate::mob_announcements::rpc::is_announcement_mutating_method(method) {
+        return true;
+    }
     matches!(
         method,
         "meta/retire"
@@ -3126,6 +3139,12 @@ fn console_rpc_access_requirements(
         | "meta/status_identity"
         | "meta/registered_spec"
         | "meta/console/inspect_identity" => one(ACTION_AGENT_VIEW, target),
+        // Mob announcements: every method needs the admin grant, the reads
+        // too. They list subscriptions and deliveries across members with no
+        // per-agent filtering, like the plumbing reads above.
+        method if crate::mob_announcements::rpc::is_announcement_method(method) => {
+            one(ACTION_RUNTIME_ADMIN, None)
+        }
         // WorkGraph spans the whole mob, so both actions are resource-less:
         // reads need the view grant, every mutation the manage grant.
         method if crate::rpc::workgraph_methods::is_workgraph_mutating_method(method) => {
@@ -4888,6 +4907,7 @@ pub async fn console_rpc_multipart_handler(
             state.identity_roster.clone(),
             state.workgraph.as_ref(),
             state.topology.as_ref(),
+            state.mob_announcements.get(),
             &ConsoleSendGovernance::for_request(&state, &auth_context),
         ))
         .await
@@ -6941,6 +6961,7 @@ async fn handle_console_runtime_rpc(
         None,
         None,
         None,
+        None,
         &crate::http_console::ConsoleSendGovernance::default(),
     )
     .await
@@ -6968,6 +6989,7 @@ async fn handle_console_runtime_rpc_with_visibility(
     identity_roster: Option<Arc<crate::identity_first::MutableRosterProvider>>,
     workgraph: Option<&meerkat::WorkGraphService>,
     topology: Option<&crate::topology_control::TopologyRuntimeHandle>,
+    mob_announcements: Option<&crate::mob_announcements::AnnouncementService>,
     governance: &ConsoleSendGovernance,
 ) -> Value {
     let response_id = request.id.clone().unwrap_or(Value::Null);
@@ -7159,6 +7181,21 @@ async fn handle_console_runtime_rpc_with_visibility(
                     // strips it for callers without the reviewer grant.
                     methods.push("meta/memory/quarantine/decide");
                 }
+            }
+            // Announcement methods are advertised only while the runtime has
+            // the owner attached, as on the stdin surface.
+            if mob_announcements.is_some() {
+                methods.extend(
+                    crate::mob_announcements::rpc::ANNOUNCEMENT_METHODS
+                        .iter()
+                        .copied()
+                        .filter(|method| {
+                            can_mutate
+                                || !crate::mob_announcements::rpc::is_announcement_mutating_method(
+                                    method,
+                                )
+                        }),
+                );
             }
             if workgraph.is_some() {
                 methods.extend_from_slice(crate::rpc::workgraph_methods::WORKGRAPH_READ_METHODS);
@@ -10762,6 +10799,29 @@ async fn handle_console_runtime_rpc_with_visibility(
             }
         })
         .await,
+        // After the read-only gate and the runtime.admin check above, through
+        // the stdin surface's own handler: a runtime without the owner answers
+        // here exactly as it does there.
+        method if crate::mob_announcements::rpc::is_announcement_method(method) => {
+            let outcome = match crate::mob_announcements::MobId::new(
+                runtime.handle().mob_id().to_string(),
+            ) {
+                Ok(own_mob) => {
+                    crate::mob_announcements::rpc::handle_announcement_method(
+                        mob_announcements,
+                        &own_mob,
+                        method,
+                        &request.params,
+                    )
+                    .await
+                }
+                Err(error) => Err(JsonRpcError::new(-32000, error.to_string())),
+            };
+            match outcome {
+                Ok(result) => response_value(response_id, Some(result), None),
+                Err(error) => response_value(response_id, None, Some(error)),
+            }
+        }
         _ => response_value(
             response_id,
             None,
@@ -13906,6 +13966,7 @@ comms = true
                 None,
                 None,
                 None,
+                None,
                 &crate::http_console::ConsoleSendGovernance::default(),
             ))
             .await
@@ -13988,6 +14049,7 @@ comms = true
             topology: None,
             job_health_projection: None,
             governed_ingress: Default::default(),
+            mob_announcements: Default::default(),
         };
         let authenticate = |subject: &str| {
             let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
@@ -15410,6 +15472,7 @@ comms = true
                 None,
                 None,
                 None,
+                None,
                 &crate::http_console::ConsoleSendGovernance::default(),
             ))
             .await;
@@ -15524,6 +15587,7 @@ comms = true
                     None,
                     None,
                     None,
+                    None,
                     &crate::http_console::ConsoleSendGovernance::default(),
                 ))
                 .await;
@@ -15595,6 +15659,7 @@ comms = true
                 rpc_request_with_params(method, json!({ "identity": "review:singleton" })),
                 true,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -15929,6 +15994,7 @@ comms = true
             None,
             None,
             None,
+            None,
             &governance,
         );
         // 52,248 bytes with the arms inline (MobKit 0.8.46, debug), 6,256
@@ -15983,6 +16049,7 @@ comms = true
             rpc_request("meta/reset_all"),
             true,
             false,
+            None,
             None,
             None,
             None,
@@ -16087,6 +16154,7 @@ comms = true
             rpc_request("meta/reset_all"),
             true,
             false,
+            None,
             None,
             None,
             None,
@@ -16650,6 +16718,7 @@ comms = true
             None,
             None,
             None,
+            None,
             &crate::http_console::ConsoleSendGovernance::default(),
         ))
         .await;
@@ -17012,6 +17081,7 @@ comms = true
             None,
             None,
             None,
+            None,
             &crate::http_console::ConsoleSendGovernance::default(),
         ))
         .await;
@@ -17069,6 +17139,7 @@ comms = true
             None,
             None,
             None,
+            None,
             &crate::http_console::ConsoleSendGovernance::default(),
         ))
         .await;
@@ -17106,6 +17177,7 @@ comms = true
             None,
             Some(&send_only_controller),
             Some(&send_only_view),
+            None,
             None,
             None,
             None,
@@ -17186,6 +17258,7 @@ comms = true
             None,
             None,
             None,
+            None,
             &crate::http_console::ConsoleSendGovernance::default(),
         ))
         .await;
@@ -17223,6 +17296,7 @@ comms = true
             None,
             Some(&wildcard_allow_exact_deny_controller),
             Some(&wildcard_allow_exact_deny_view),
+            None,
             None,
             None,
             None,
@@ -17266,6 +17340,7 @@ comms = true
             None,
             Some(&wildcard_allow_exact_deny_controller),
             Some(&wildcard_allow_exact_deny_view),
+            None,
             None,
             None,
             None,
@@ -21102,6 +21177,7 @@ mod console_viewer_resolver_tests {
             topology: None,
             job_health_projection: None,
             governed_ingress: Default::default(),
+            mob_announcements: Default::default(),
         }
     }
 
@@ -21411,6 +21487,7 @@ mod console_human_admission_tests {
             topology: None,
             job_health_projection: None,
             governed_ingress: Default::default(),
+            mob_announcements: Default::default(),
         }
     }
 
@@ -21827,5 +21904,57 @@ mod console_human_admission_tests {
             .enter(),
             Err(GovernedEntryRefusal::NotAuthorized(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod mob_announcement_console_access_tests {
+    use super::*;
+
+    /// Every `meta/mob_announcements/*` method as the console serves it:
+    /// `true` for the ones that change state. A method added to the family
+    /// fails here until it is classified.
+    const CLASSIFIED: &[(&str, bool)] = &[
+        ("meta/mob_announcements/announce", true),
+        ("meta/mob_announcements/get", false),
+        ("meta/mob_announcements/subscriptions/put", true),
+        ("meta/mob_announcements/subscriptions/pause", true),
+        ("meta/mob_announcements/subscriptions/resume", true),
+        ("meta/mob_announcements/subscriptions/cancel", true),
+        ("meta/mob_announcements/subscriptions/get", false),
+        ("meta/mob_announcements/subscriptions/list", false),
+        ("meta/mob_announcements/deliveries/list", false),
+        ("meta/mob_announcements/deliveries/observe", false),
+        ("meta/mob_announcements/deliveries/reconcile", true),
+    ];
+
+    /// The console takes the family's methods and its read/mutate split from
+    /// the family's own module, and every method, reads included, needs the
+    /// runtime admin grant with no resource.
+    #[test]
+    fn every_mob_announcement_method_needs_runtime_admin_on_the_console() {
+        let classified: Vec<&str> = CLASSIFIED.iter().map(|(method, _)| *method).collect();
+        assert_eq!(
+            crate::mob_announcements::rpc::ANNOUNCEMENT_METHODS,
+            classified.as_slice(),
+            "classify every announcement method here"
+        );
+        for (method, mutating) in CLASSIFIED {
+            assert_eq!(
+                console_rpc_access_requirements(method, &json!({})),
+                Some(vec![(ACTION_RUNTIME_ADMIN, None)]),
+                "{method}"
+            );
+            assert_eq!(
+                is_console_mutating_rpc_method(method),
+                *mutating,
+                "{method}"
+            );
+            assert_eq!(
+                crate::mob_announcements::rpc::is_announcement_mutating_method(method),
+                *mutating,
+                "{method}"
+            );
+        }
     }
 }

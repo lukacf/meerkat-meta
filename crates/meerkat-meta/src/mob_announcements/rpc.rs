@@ -51,6 +51,21 @@ pub fn is_announcement_method(method: &str) -> bool {
     ANNOUNCEMENT_METHODS.contains(&method)
 }
 
+/// The announcement methods that change state; every other one only reads.
+/// A read-only console refuses these.
+pub const ANNOUNCEMENT_MUTATE_METHODS: &[&str] = &[
+    "meta/mob_announcements/announce",
+    "meta/mob_announcements/subscriptions/put",
+    "meta/mob_announcements/subscriptions/pause",
+    "meta/mob_announcements/subscriptions/resume",
+    "meta/mob_announcements/subscriptions/cancel",
+    "meta/mob_announcements/deliveries/reconcile",
+];
+
+pub fn is_announcement_mutating_method(method: &str) -> bool {
+    ANNOUNCEMENT_MUTATE_METHODS.contains(&method)
+}
+
 fn invalid_params(message: impl std::fmt::Display) -> JsonRpcError {
     JsonRpcError::new(-32602, format!("Invalid params: {message}"))
 }
@@ -88,6 +103,7 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
             json!({ "member": member }),
         ),
         AnnouncementError::InvalidMember(_) => invalid_params(message),
+        AnnouncementError::Configuration(_) => invalid_params(message),
         AnnouncementError::UnusableMember(_) => typed(
             ANNOUNCEMENTS_REFUSED_CODE,
             "unusable_member",

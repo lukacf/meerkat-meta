@@ -8718,11 +8718,22 @@ async fn identity_first_test_runtime(
     state: &std::path::Path,
     mob_id: &str,
 ) -> crate::UnifiedRuntime {
-    Box::pin(
-        crate::UnifiedRuntimeBuilder::default()
-            .definition(
-                meerkat_mob::MobDefinition::from_toml(&format!(
-                    r#"
+    Box::pin(identity_first_test_builder(state, mob_id, "").await.build())
+        .await
+        .expect("build the identity-first runtime")
+}
+
+/// The builder of [`identity_first_test_runtime`], before `build()`.
+/// `tools` adds lines to the member profile's tools table.
+async fn identity_first_test_builder(
+    state: &std::path::Path,
+    mob_id: &str,
+    tools: &str,
+) -> crate::UnifiedRuntimeBuilder {
+    crate::UnifiedRuntimeBuilder::default()
+        .definition(
+            meerkat_mob::MobDefinition::from_toml(&format!(
+                r#"
 [mob]
 id = "{mob_id}"
 
@@ -8733,23 +8744,20 @@ runtime_mode = "turn_driven"
 
 [profiles.personal.tools]
 comms = true
+{tools}
 "#
-                ))
-                .expect("definition"),
-            )
-            .persistent_state(state)
-            .continuity_from_state_dir(state)
-            .await
-            .expect("open the state-dir identity substrate")
-            .roster_provider(Arc::new(StatusRoster))
-            .identity_bootstrap_mode(crate::identity_first::IdentityBootstrapMode::LazyMaterialize)
-            .identity_runtime_instance_id(mob_id)
-            .comms(true)
-            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
-            .build(),
-    )
-    .await
-    .expect("build the identity-first runtime")
+            ))
+            .expect("definition"),
+        )
+        .persistent_state(state)
+        .continuity_from_state_dir(state)
+        .await
+        .expect("open the state-dir identity substrate")
+        .roster_provider(Arc::new(StatusRoster))
+        .identity_bootstrap_mode(crate::identity_first::IdentityBootstrapMode::LazyMaterialize)
+        .identity_runtime_instance_id(mob_id)
+        .comms(true)
+        .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
 }
 
 /// No drive path reads a batch whose route contradicts its member: the
@@ -8919,4 +8927,223 @@ async fn a_delivery_reaching_its_commit_after_its_deadline_commits_nothing() {
         status.status
     );
     runtime.shutdown().await;
+}
+
+/// One `meta/mob_announcements/*` call through the handler every surface
+/// dispatches to, as this host.
+async fn host_call(
+    service: &AnnouncementService,
+    own_mob: &MobId,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    super::rpc::handle_announcement_method(Some(service), own_mob, method, &params)
+        .await
+        .unwrap_or_else(|error| panic!("{method}: {error:?}"))
+}
+
+/// A runtime the builder composes mob announcements on gets the owner the
+/// gateways get: attached, its dispatcher delivering to a member whose
+/// profile names the member tool bundle the builder registered, and stopped
+/// by the runtime's shutdown. The builder's control listener serves keyed
+/// injects with [`crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS`]
+/// unless told otherwise, so that is the window the owner assumes its peers
+/// apply, whatever the configuration said.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_builder_composes_mob_announcements_like_every_gateway() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config = AnnouncementConfig {
+        policy: SealingPolicy {
+            max_count: 1,
+            max_bytes: 1_048_576,
+            max_delay_ms: 50,
+            min_wake_interval_ms: 0,
+        },
+        peer_request_window_ms: 1,
+        ..AnnouncementConfig::default()
+    };
+    let tools = format!("rust_bundles = [\"{}\"]", super::tools::TOOL_BUNDLE);
+    let runtime = Box::pin(
+        identity_first_test_builder(state.path(), "mob-k-builder", &tools)
+            .await
+            .mob_announcements(config)
+            .build(),
+    )
+    .await
+    .expect("the builder composes mob announcements");
+    let service = runtime
+        .mob_announcements()
+        .expect("the builder attached the owner to its runtime");
+    assert_eq!(
+        service.config().peer_request_window_ms,
+        crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS,
+        "the owner assumes the window the runtime's own keyed inject plane serves with"
+    );
+    let own_mob = mob("mob-k-builder");
+    let member = serde_json::json!({ "mob_id": "mob-k-builder", "identity": "agent:a" });
+    let subscribed = host_call(
+        &service,
+        &own_mob,
+        "meta/mob_announcements/subscriptions/put",
+        serde_json::json!({
+            "operation_id": "op-1",
+            "subscription_id": "sub-1",
+            "member": member,
+            "topics": ["t"]
+        }),
+    )
+    .await;
+    assert_eq!(
+        subscribed["subscription"]["state"], "active",
+        "{subscribed}"
+    );
+    let announced = host_call(
+        &service,
+        &own_mob,
+        "meta/mob_announcements/announce",
+        serde_json::json!({ "source_key": "k-1", "topics": ["t"], "body": "composed by the builder" }),
+    )
+    .await;
+    assert_eq!(announced["captured"], 1, "{announced}");
+    // The dispatcher the composition started delivers the member's batch
+    // through the runtime's own native seam.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    loop {
+        let listed = host_call(
+            &service,
+            &own_mob,
+            "meta/mob_announcements/deliveries/list",
+            serde_json::json!({ "member": member }),
+        )
+        .await;
+        let state = &listed["deliveries"][0]["state"]["state"];
+        if state == "committed" || state == "delivered" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the member's batch was never committed natively: {listed}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    runtime.shutdown().await;
+    assert!(
+        service.is_stopped(),
+        "the runtime's shutdown stops the dispatcher"
+    );
+    // A gateway may stop it as well: a second stop changes nothing.
+    service.stop();
+    assert!(service.is_stopped());
+}
+
+/// The builder refuses mob announcements it cannot compose before it builds
+/// anything: without the persistent state that holds their database,
+/// without an identity-first runtime, with the gateway-wide child mob grant
+/// of the member tools, or with the member tool bundle's name taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_builder_refuses_mob_announcements_it_cannot_compose() {
+    fn refusal(
+        result: std::result::Result<crate::UnifiedRuntime, crate::UnifiedRuntimeBuilderError>,
+    ) -> String {
+        match result {
+            Err(crate::UnifiedRuntimeBuilderError::ConflictingConfiguration(message)) => message,
+            Err(other) => panic!("expected a configuration refusal, got {other:?}"),
+            Ok(_) => panic!("expected a configuration refusal, got a runtime"),
+        }
+    }
+    let definition = || {
+        meerkat_mob::MobDefinition::from_toml("[mob]\nid = \"mob-k-refused\"\n")
+            .expect("definition")
+    };
+    let message = refusal(
+        crate::UnifiedRuntimeBuilder::default()
+            .definition(definition())
+            .mob_announcements(AnnouncementConfig::default())
+            .build()
+            .await,
+    );
+    assert!(message.contains("requires persistent_state()"), "{message}");
+    let state = tempfile::tempdir().expect("state dir");
+    let message = refusal(
+        crate::UnifiedRuntimeBuilder::default()
+            .definition(definition())
+            .persistent_state(state.path())
+            .mob_announcements(AnnouncementConfig::default())
+            .build()
+            .await,
+    );
+    assert!(message.contains("an identity-first runtime"), "{message}");
+    let state = tempfile::tempdir().expect("state dir");
+    let message = refusal(
+        identity_first_test_builder(state.path(), "mob-k-refused", "")
+            .await
+            .mob_announcements(AnnouncementConfig {
+                member_tools_in_child_mobs: true,
+                ..AnnouncementConfig::default()
+            })
+            .build()
+            .await,
+    );
+    assert!(
+        message.contains("member_tools_in_child_mobs is refused"),
+        "{message}"
+    );
+    let state = tempfile::tempdir().expect("state dir");
+    let message = refusal(
+        identity_first_test_builder(state.path(), "mob-k-refused", "")
+            .await
+            .register_tool_bundle(
+                super::tools::TOOL_BUNDLE,
+                Arc::new(super::tools::MobAnnouncementTools::new(Arc::new(
+                    std::sync::OnceLock::new(),
+                ))),
+            )
+            .mob_announcements(AnnouncementConfig::default())
+            .build()
+            .await,
+    );
+    assert!(
+        message.contains("is the mob announcement member tools"),
+        "{message}"
+    );
+}
+
+/// Every constructor refuses the gateway-wide child mob grant of the member
+/// tools through the one check: the options parser (enabled or not), the
+/// composition and the owner itself.
+#[test]
+fn every_constructor_refuses_the_child_mob_member_tools_grant() {
+    // Refused even disabled: an operator who sets it would believe it does
+    // something.
+    assert!(matches!(
+        super::parse_options(
+            &serde_json::json!({ "enabled": false, "member_tools_in_child_mobs": true }),
+            "mob_announcements",
+        ),
+        Err(super::AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn)
+    ));
+    let granted = AnnouncementConfig {
+        member_tools_in_child_mobs: true,
+        ..AnnouncementConfig::default()
+    };
+    assert!(matches!(
+        super::AnnouncementComposition::new(granted),
+        Err(super::AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn)
+    ));
+    let (_dir, store) = temp_store();
+    let refused = AnnouncementService::new(
+        Arc::new(store) as Arc<dyn AnnouncementStore>,
+        Arc::new(ScriptedNative::new()) as Arc<dyn NativeDelivery>,
+        granted,
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(AnnouncementError::Configuration(
+                super::AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn
+            ))
+        ),
+        "{:?}",
+        refused.err()
+    );
 }
