@@ -68,9 +68,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and processing approvals through a short-lived bootstrap token that is never
   saved, gives the service's extractor a dedicated read-only token and grant,
   and waits for `semantic_ingest_ready`. A later `up` only reads the space and
-  grant back. A project that still records the old default pin builds the new
-  default; an explicitly chosen pin is kept. The exported knowledge README
-  states the licences of the embedded storage engine.
+  grant back, and in a knowledge folder prepared before the extractor token
+  existed it adds only that token. The image lets its service user read the
+  bundled migrations and extraction skills even when the source was checked
+  out under a private umask, and the service's budget checks use the project
+  space instead of a space named `default`. A project that still records the
+  old default pin builds the new default; an explicitly chosen pin is kept. The
+  exported knowledge README states the licences of the embedded storage engine
+  and names the source's notes on its patches to it.
 - The `complete_held_identity_members` documentation no longer says that
   resumed members are skipped. A held identity bootstrap holds fresh members
   only: a roster member that already has continuity refuses the whole pass

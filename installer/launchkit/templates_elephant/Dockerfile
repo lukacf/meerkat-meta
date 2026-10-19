@@ -22,6 +22,8 @@ COPY --from=build /app/target/release/meerkat-recall /usr/local/bin/meerkat-reca
 RUN ln -s meerkat-recall /usr/local/bin/elephant
 COPY --from=build /app/crates/migrations/sql/ /app/migrations/
 COPY --from=build /app/skills/ /app/skills/
+# Copied files keep the checkout's modes, which a private umask leaves unreadable to the service user.
+RUN chmod -R a+rX /app/migrations /app/skills
 USER elephant
 ENV PIPELINE_SKILLS_DIR=/app/skills
 ENV PIPELINE_MULTIMODAL_ASSET_ROOT=/app/assets

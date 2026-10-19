@@ -16,7 +16,7 @@ From the deployment root:
 .venv/bin/python knowledge/manage.py verify
 ```
 
-`setup` generates distinct random database/JWT secrets and project-scoped read-only, operator and extractor tokens, saved with mode 0600. It uses saved project provider keys for OpenAI embeddings and the configured extraction provider, asking locally when a key is missing. No credentials belong in the downloaded blueprint. Tokens expire after 90 days; `renew` rotates the tokens without changing the database or signing secret, and the next `up` gives the service its new extractor token. The embedded store does not use the database secret; `setup` keeps it so that knowledge folders from earlier versions keep the same recovery checks.
+`setup` generates distinct random database/JWT secrets and project-scoped read-only, operator and extractor tokens, saved with mode 0600. It uses saved project provider keys for OpenAI embeddings and the configured extraction provider, asking locally when a key is missing. No credentials belong in the downloaded blueprint. Tokens expire after 90 days; `renew` rotates the tokens without changing the database or signing secret, and the next `up` gives the service its new extractor token. In a folder prepared before the extractor token existed, `up` adds only that token and leaves the other tokens and secrets unchanged. The embedded store does not use the database secret; `setup` keeps it so that knowledge folders from earlier versions keep the same recovery checks.
 
 After an earlier local setup attempt, restore the original private `knowledge/.env` from backup if it is missing or its signing or database secrets are lost, before running `setup`, `renew` or `up`. Keep the existing knowledge volume. Changing provider keys or generating new credentials cannot recover its stored knowledge.
 
@@ -53,7 +53,7 @@ Set the token and expected space variables named in `settings.json` in the deplo
 
 ## Licences
 
-The knowledge service source is licensed MIT OR Apache-2.0. Its storage engine is SurrealDB 2.6.5: the `surrealdb` and `surrealdb-core` crates, which the source vendors with its own patches and which the image always includes. They are under the Business Source License 1.1 (BUSL-1.1) from SurrealDB Ltd. Its Additional Use Grant does not cover offering a Database Service, and it changes to Apache-2.0 on 2029-09-17. RocksDB comes from `surrealdb-rocksdb` (Apache-2.0) and `surrealdb-librocksdb-sys` (MIT, Apache-2.0 or BSD-3-Clause). The full licence texts are in the checked-out source: `LICENSE`, `vendor/surrealdb-2.6.5/LICENSE` and `vendor/surrealdb-core-2.6.5/LICENSE`. The project licence does not replace the licences of these components.
+The knowledge service source is licensed MIT OR Apache-2.0. Its storage engine is SurrealDB 2.6.5: the `surrealdb` and `surrealdb-core` crates, which the source vendors with its own patches and which the image always includes. They are under the Business Source License 1.1 (BUSL-1.1) from SurrealDB Ltd. Its Additional Use Grant does not cover offering a Database Service, and it changes to Apache-2.0 on 2029-09-17. RocksDB comes from `surrealdb-rocksdb` (Apache-2.0) and `surrealdb-librocksdb-sys` (MIT, Apache-2.0 or BSD-3-Clause). The full licence texts are in the checked-out source: `LICENSE`, `vendor/surrealdb-2.6.5/LICENSE` and `vendor/surrealdb-core-2.6.5/LICENSE`; `vendor/RECALL_SURREALDB_PATCH.md` describes the source's patches to those crates. The project licence does not replace the licences of these components.
 
 ## Provenance
 

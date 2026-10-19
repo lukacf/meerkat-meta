@@ -91,6 +91,8 @@ def generate_elephant_files(knowledge: dict, project_slug: str, provider: str = 
         "SURREALDB_NAMESPACE": "elephant", "SURREALDB_DATABASE": project_slug.replace("-", "_"),
         "ELEPHANT_DURABILITY_PATH": "/data/recovery", "ELEPHANT_SNAPSHOT_DIR": "/data/backups",
         "ELEPHANT_HOST": "0.0.0.0", "ELEPHANT_PORT": "3000", "RUST_LOG": "warn",
+        # The runtime status reports this space's budget; without it, a space named "default".
+        "MCP_SPACE_ID": project_slug,
         "SKIP_AUTH": "false", "JWT_SECRET": "${JWT_SECRET:?Run knowledge/manage.py setup}",
         "JWT_ALGORITHM": "HS256", "JWT_ISSUER": "mobkit-launch", "JWT_AUDIENCE": project_slug,
         # The extractor reads this project space through the service's own

@@ -52,7 +52,7 @@ def test_local_compose_is_one_embedded_service_with_a_private_volume():
     assert environment["SKIP_AUTH"] == "false"
     # The extractor reaches this space through the service's own listener.
     assert environment["PIPELINE_AGENTIC_MCP_URL"] == "http://127.0.0.1:3000/mcp/agent"
-    assert environment["PIPELINE_AGENTIC_MCP_SPACE_ID"] == "test-project"
+    assert environment["PIPELINE_AGENTIC_MCP_SPACE_ID"] == environment["MCP_SPACE_ID"] == "test-project"
     assert environment["MCP_BEARER_TOKEN"] == "${MCP_BEARER_TOKEN:?Run knowledge/manage.py setup}"
     assert not any("SURREALDB_PASS" in value or "SURREALDB_USER" in key for key, value in environment.items())
     settings = json.loads(files["knowledge/settings.json"])
@@ -79,6 +79,18 @@ def test_local_image_provides_every_command_the_stack_runs():
         assert command[:2] == ["sh", "-c"]
         programs |= {step.split()[1] if step.split()[0] == "exec" else step.split()[0] for step in command[2].split("&&")}
     assert programs == {"elephant"} and programs <= provided
+
+
+def test_local_image_lets_its_service_user_read_the_copied_source_files():
+    dockerfile = generate_elephant_files(config(), "test-project")["knowledge/Dockerfile"]
+    runtime = dockerfile.rsplit("\nFROM ", 1)[1].splitlines()
+    user = next(index for index, line in enumerate(runtime) if line.startswith("USER "))
+    # Copied files keep the checkout's modes, so a private umask would hide them from the service user.
+    copies = {index: line.split()[-1].rstrip("/") for index, line in enumerate(runtime[:user])
+              if line.startswith("COPY --from=build ") and line.endswith("/")}
+    assert sorted(copies.values()) == ["/app/migrations", "/app/skills"]
+    for index, target in copies.items():
+        assert any(line.startswith("RUN chmod -R a+rX ") and target in line.split()[4:] for line in runtime[index + 1:user])
 
 
 @pytest.mark.parametrize("repository", ["https://github.com/lukacf/elephant", "https://github.com/lukacf/elephant.git", ELEPHANT_REPOSITORY])
@@ -176,6 +188,44 @@ def test_setup_keeps_operator_credentials_out_of_project_env(manager, monkeypatc
     old_secret = local["JWT_SECRET"]
     manager.setup(settings, renew=True)
     assert manager.read_env(manager.ROOT / ".env")["JWT_SECRET"] == old_secret
+
+
+def test_up_gives_an_older_folder_only_its_missing_extractor_token(manager, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-value")
+    settings = {**config(), "provider": "openai", "project": "test-project"}
+    manager.setup(settings)
+    path = manager.ROOT / ".env"
+    older = {key: value for key, value in manager.read_env(path).items() if key != "MCP_BEARER_TOKEN"}
+    manager.write_env(path, older)
+    project = (manager.ROOT.parent / ".env").read_bytes()
+    monkeypatch.setattr(manager, "load_settings", lambda: settings)
+    monkeypatch.setattr(manager, "local_preflight", lambda: None)
+    monkeypatch.setattr(manager, "setup", lambda *_, **__: pytest.fail("up re-ran setup for a folder that keeps its secrets"))
+    monkeypatch.setattr(manager.getpass, "getpass", lambda _: pytest.fail("up asked for a provider key"))
+    minted = []
+    for name in ("jwt_token", "worker_token"):
+        monkeypatch.setattr(manager, name, lambda *args, _name=name, _mint=getattr(manager, name), **kwargs:
+                            minted.append(_name) or _mint(*args, **kwargs))
+    calls = []
+    monkeypatch.setattr(manager, "source_checkout", lambda _: calls.append("source"))
+    monkeypatch.setattr(manager, "compose", lambda *args: calls.append(args[0]))
+    monkeypatch.setattr(manager, "provision", lambda _, values: calls.append(("provision", "MCP_BEARER_TOKEN" in values)) or {})
+    monkeypatch.setattr(manager, "space_status", lambda *_, **__: {})
+    async def verify(*_args, **_kwargs):
+        return {"connected": True}
+    monkeypatch.setattr(manager, "mcp_operation", verify)
+    monkeypatch.setattr(sys, "argv", ["manage.py", "up"])
+    manager.main()
+    current = manager.read_env(path)
+    assert claims_of(current.pop("MCP_BEARER_TOKEN"))["sub"] == "recall-extractor"
+    assert current == older
+    assert (manager.ROOT.parent / ".env").read_bytes() == project
+    assert calls == ["source", "up", ("provision", True)]
+    assert minted == ["worker_token"]
+    # A folder that has the token keeps it.
+    before = path.read_bytes()
+    manager.main()
+    assert path.read_bytes() == before and minted == ["worker_token"]
 
 
 def test_bad_env_value_does_not_truncate_existing_configuration(manager):

@@ -121,6 +121,14 @@ def bootstrap_token(secret, space, *, now=None):
                          "bootstrap_space": space, "scopes": BOOTSTRAP_SCOPES, "clearances": CLEARANCES})
 
 
+def add_missing_worker_token(settings):
+    """Give a folder prepared before the extractor token existed that token alone."""
+    values = read_env(ROOT / ".env")
+    if not values.get("MCP_BEARER_TOKEN"):
+        values["MCP_BEARER_TOKEN"] = worker_token(values["JWT_SECRET"], settings["project"])
+        write_env(ROOT / ".env", values)
+
+
 def require_retained_secrets(settings, values, project_values, *, renew=False):
     missing = any(not values.get(key) for key in ("JWT_SECRET", "SURREALDB_PASS"))
     names = (settings["token_env"], settings["space_env"])
@@ -542,8 +550,10 @@ def main():
         else:
             missing_secrets = require_retained_secrets(settings, read_env(ROOT / ".env"), read_env(ROOT.parent / ".env"))
             local_preflight()
-            if missing_secrets or not read_env(ROOT / ".env").get("MCP_BEARER_TOKEN"):
+            if missing_secrets:
                 setup(settings)
+            else:
+                add_missing_worker_token(settings)
             source_checkout(settings)
             compose("up", "--build", "--detach", "--wait", "--wait-timeout", "180")
             values = read_env(ROOT / ".env")
