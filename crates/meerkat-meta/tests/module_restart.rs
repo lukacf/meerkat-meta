@@ -97,6 +97,18 @@ fn running_or_unreaped(pid: i64) -> bool {
         .success()
 }
 
+/// True only while `pid` has not exited: `ps` reports it in a state other
+/// than `Z`, so an exited child that is still unreaped does not count.
+fn running_not_exited(pid: i64) -> bool {
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("run ps");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let state = stdout.trim();
+    output.status.success() && !state.is_empty() && !state.starts_with('Z')
+}
+
 fn respawn_probe_config(script: &str) -> MetaConfig {
     MetaConfig {
         modules: vec![shell_module("respawn-probe", script, RestartPolicy::Never)],
@@ -515,7 +527,7 @@ fn phase_d_respawn_terminate_failure_keeps_existing_child_tracked_and_aborts_swa
     let replacement_pid = respawn_probe_pid(&state_file, 2);
     assert_ne!(replacement_pid, initial_pid);
     assert!(
-        running_or_unreaped(initial_pid),
+        running_not_exited(initial_pid),
         "the original child {initial_pid} keeps running after the refused swap"
     );
     assert!(
