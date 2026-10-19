@@ -42,6 +42,8 @@ def load(name, path):
 
 
 forge = load("forge_release", ROOT / "scripts/forge-release.py")
+# The Guide's one exact selected release; the module has no package imports.
+guide_sdk = load("forge_guide_sdk", ROOT / "installer/launchkit/guide_sdk.py")
 release_tests = load("release_workflow_tests", ROOT / "scripts/test_release_workflow.py")
 REPO = "lukacf/meerkat-meta"
 SHA = "a" * 40
@@ -460,6 +462,50 @@ class InputsTests(unittest.TestCase):
         value = forge.validate_inputs(json.loads((ROOT / forge.INPUTS).read_text()))
         self.assertEqual(value["guide"]["meta_source"], "b275e0ed4fe61cf4ff43d16691c54efb17812919")
         self.assertEqual(value["guide"]["core_source"], "a00bafaf1d862fb41112ff1f30312b350ad05246")
+
+    def test_the_guide_skeleton_is_refused_until_every_pending_value_is_filled(self):
+        selected = guide_sdk.SELECTED_VERSION
+        skeleton = json.loads((ROOT / forge.INPUTS_DIR / "forge-release-inputs.skeleton.json").read_text())
+        guide = skeleton["guide"]
+        # The gateway and the Guide's client come from the same Meta release commit.
+        self.assertEqual((guide["version"], guide["core_version"], guide["meta_source"]),
+                         (selected, selected, guide_sdk.SOURCE))
+        self.assertTrue(re.fullmatch("[0-9a-f]{40}", guide["core_source"]))
+        self.assertEqual(list(skeleton["targets"]), ["linux-x86_64"])
+        entry = skeleton["targets"]["linux-x86_64"]
+        self.assertEqual((list(entry["files"]), entry["selection"], entry["paths"]), ([entry["gateway"]], None, None))
+        self.assertEqual(entry["files"][entry["gateway"]]["url"],
+                         f"https://github.com/lukacf/meerkat-meta/releases/download/v{selected}/"
+                         f"meta-rpc-gateway-{selected}-x86_64-unknown-linux-gnu.tar.gz")
+        # Only the product owner's selection, its paths and their files are pending.
+        with self.assertRaisesRegex(forge.ProtocolError, "owner's product selection"):
+            forge.validate_inputs(skeleton)
+        # With a fixture owner selection, every value the skeleton already holds is valid.
+        product = target_inputs()
+        filled = copy.deepcopy(skeleton)
+        target = filled["targets"]["linux-x86_64"]
+        target["files"].update({name: pin for name, pin in product["files"].items() if name != product["gateway"]})
+        target.update(selection=product["selection"], paths=product["paths"])
+        forge.validate_inputs(filled)
+
+        def gateway_value(key):
+            return lambda value: value["targets"]["linux-x86_64"]["files"]["guide/rpc_gateway"].__setitem__(key, None)
+
+        pending = {
+            "meta source": lambda value: value["guide"].__setitem__("meta_source", None),
+            "core source": lambda value: value["guide"].__setitem__("core_source", None),
+            "selection": lambda value: value["targets"]["linux-x86_64"].__setitem__("selection", None),
+            "paths": lambda value: value["targets"]["linux-x86_64"].__setitem__("paths", None),
+            "product files": lambda value: value["targets"]["linux-x86_64"].__setitem__(
+                "files", {"guide/rpc_gateway": value["targets"]["linux-x86_64"]["files"]["guide/rpc_gateway"]}),
+            **{f"gateway {key}": gateway_value(key) for key in ("archive_size", "archive_sha256", "size", "sha256")},
+        }
+        for label, reset in pending.items():
+            with self.subTest(label):
+                value = copy.deepcopy(filled)
+                reset(value)
+                with self.assertRaises(forge.ProtocolError):
+                    forge.validate_inputs(value)
 
     def test_a_complete_target_is_valid(self):
         forge.validate_inputs(inputs(("linux-x86_64", "macos-arm64")))

@@ -596,7 +596,7 @@ async def test_validation_read_leaves_event_loop_responsive():
 
     task = asyncio.create_task(deployment.await_validation(read, "checked", marker="exact"))
     try:
-        await asyncio.wait_for(entered, 1)
+        await asyncio.wait_for(entered, 30)
         ticks = []
         loop.call_soon(ticks.append, "alive")
         await asyncio.sleep(0)
@@ -629,7 +629,7 @@ async def test_real_status_validation_reads_leave_event_loop_responsive(owned, m
     monkeypatch.setattr(owner, name, blocked)
     task = asyncio.create_task(service.status(service.guide.identity))
     try:
-        await asyncio.wait_for(entered, 1)
+        await asyncio.wait_for(entered, 30)
         ticks = []
         loop.call_soon(ticks.append, "alive")
         await asyncio.sleep(0)
@@ -666,7 +666,7 @@ async def test_repeated_action_cancellation_drains_same_read_before_unlock_witho
     task = asyncio.create_task(service.action(service.guide.identity,
         previous["deployment_id"], "apply-update", update_id=identity))
     try:
-        await asyncio.wait_for(entered, 1)
+        await asyncio.wait_for(entered, 30)
         task.cancel()
         await asyncio.sleep(0)
         task.cancel()

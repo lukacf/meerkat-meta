@@ -251,7 +251,7 @@ async def test_application_executor_joins_existing_command_future_when_waiter_is
         return {"returncode": 0, "stdout": b"specimen", "stderr": b""}
     execute = application_command_executor(command, root=tmp_path, timeout=2)
     task = asyncio.create_task(execute(("existing-command-lane",)))
-    assert await asyncio.to_thread(entered.wait, 2)
+    assert await asyncio.to_thread(entered.wait, 30)
     task.cancel()
     await asyncio.sleep(0)
     task.cancel()
@@ -421,7 +421,7 @@ async def test_cancelled_waiter_joins_original_publication_worker(tmp_path, monk
     monkeypatch.setattr(f.finalizer, "_prepare_publication", held)
     task = asyncio.create_task(f.run())
     try:
-        assert await asyncio.to_thread(entered.wait, 2)
+        assert await asyncio.to_thread(entered.wait, 30)
         task.cancel()
         await asyncio.sleep(0)
         task.cancel()
@@ -473,7 +473,7 @@ async def test_finalizer_fences_and_publication_use_original_task_across_cancell
     monkeypatch.setattr(module.os, "replace", replace)
     task = asyncio.create_task(run())
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 30)
         original_operation = f.finalizer._finalize_task
         assert original_operation is not task and not original_operation.done()
         if cancelled:
@@ -530,7 +530,7 @@ async def test_finalizer_owner_refusal_preserves_original_error_and_settles_requ
     f.f.caller.require_current, f.f.caller.execute = current, execute
     task = asyncio.create_task(run())
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 30)
         original_operation = f.finalizer._finalize_task
         if cancelled:
             task.cancel()

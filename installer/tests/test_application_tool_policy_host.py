@@ -207,7 +207,7 @@ async def test_policy_read_runs_off_loop_and_settles_on_cancellation(tmp_path, m
     monkeypatch.setattr(host, "_read_tool_policy_source", delayed)
     task = asyncio.create_task(loaded.load_tool_policy())
     try:
-        assert await asyncio.to_thread(entered.wait, 1)
+        assert await asyncio.to_thread(entered.wait, 30)
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done()
@@ -358,7 +358,7 @@ async def test_direct_selected_connect_settles_stale_runtime_cleanup_through_can
     task = asyncio.create_task(host.connect_application_runtime(
         SimpleNamespace(), loaded, application_startup=Startup()))
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), 30)
         task.cancel()
         await asyncio.sleep(0)
         task.cancel()

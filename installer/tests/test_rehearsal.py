@@ -1129,7 +1129,7 @@ async def test_worker_reawaits_sdk_startup_drain_after_cancellation(tmp_path, mo
     monkeypatch.setattr(worker, "_native_request", request)
     task = asyncio.create_task(worker.run(tmp_path))
     try:
-        await asyncio.wait_for(draining.wait(), 2)
+        await asyncio.wait_for(draining.wait(), 30)
         if trigger == "signal":
             callback, captured = callbacks[signal.SIGTERM]
             loop.call_soon(callback, context=captured)

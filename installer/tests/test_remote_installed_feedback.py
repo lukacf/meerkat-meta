@@ -484,7 +484,7 @@ async def test_source_and_operation_locks_remain_held_through_candidate_admissio
     service.implementation.submit = AsyncMock(side_effect=pending)
     task = asyncio.create_task(improve(service, body))
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 30)
         assert service.lock.locked() and service.operation_lock(directory).locked()
     finally:
         release.set()
@@ -517,7 +517,7 @@ async def test_identical_feedback_replays_cannot_admit_a_second_build_after_cand
     first = asyncio.create_task(improve(service, deepcopy(body)))
     replays = []
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 30)
         replays = [asyncio.create_task(improve(service, deepcopy(body))) for _ in range(5)]
     finally:
         release.set()

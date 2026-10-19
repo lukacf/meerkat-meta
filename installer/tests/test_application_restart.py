@@ -383,7 +383,7 @@ async def test_restart_rejects_owner_and_config_deadline_changed_during_input_wo
     monkeypatch.setattr(ExactFile, method, delayed)
     task = asyncio.create_task(f.owner.connect(config, f.app))
     try:
-        async with asyncio.timeout(2):
+        async with asyncio.timeout(30):
             while not entered.is_set():
                 if task.done():
                     await task

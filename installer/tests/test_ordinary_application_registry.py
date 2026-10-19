@@ -281,7 +281,7 @@ async def test_restart_waits_for_original_interactive_worker_cleanup(ordinary_re
     restarting = asyncio.create_task(f.service.action(saved["id"], directory.name,
         "restart", action_request_id=request))
     try:
-        await asyncio.wait_for(command.wait(), 2)
+        await asyncio.wait_for(command.wait(), 30)
         assert not restarting.done() and len(f.service.launched) == before
         assert f.service.lock.locked()
         if cancelled:

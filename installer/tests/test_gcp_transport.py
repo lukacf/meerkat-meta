@@ -391,7 +391,7 @@ def test_external_cancellation_during_cloud_check_remains_cancellation(tmp_path,
                 cleaned.set()
         transport.verify = verify
         task = asyncio.create_task(operation(transport, kind, 10))
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), 30)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 1)

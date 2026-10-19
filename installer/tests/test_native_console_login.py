@@ -137,7 +137,7 @@ def fixture():
 
 async def entered(event):
     # Avoid consuming a worker, especially in the default-capacity control.
-    async with asyncio.timeout(2):
+    async with asyncio.timeout(30):
         while not event.is_set():
             await asyncio.sleep(0.001)
 

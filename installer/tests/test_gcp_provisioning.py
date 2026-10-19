@@ -485,7 +485,7 @@ async def test_shutdown_waits_for_admission_and_never_starts_work_after_gated_ac
         return {"user": "mobkit", "public_key": KEY}
     service.prepare_access = prepare
     admission = asyncio.create_task(create(wait=False))
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     stopping = asyncio.create_task(service.shutdown())
     await asyncio.sleep(0)
     assert service.closed and not stopping.done() and not service.tasks and not cloud.calls

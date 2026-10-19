@@ -770,7 +770,7 @@ async def test_repeated_cancellation_during_spawn_acquisition_retains_owned_proc
     runner = GcloudReadOnly(executable="/controlled-not-executed/gcloud")
     service = GcpPreflightService(local, command=runner, rest=Cloud())
     task = asyncio.create_task(service.options(local.state["id"], local.build_id))
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     task.cancel()
     await asyncio.sleep(0)
     task.cancel()

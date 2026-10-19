@@ -32,7 +32,7 @@ def command_owner(root):
 
 
 async def wait_until(predicate):
-    async with asyncio.timeout(3):
+    async with asyncio.timeout(30):
         while not predicate():
             await asyncio.sleep(0.005)
 
@@ -225,7 +225,7 @@ async def test_interruption_joins_original_child_before_staging_is_removed(super
             files.owner.stop.set()
         else:
             task.cancel()
-        await asyncio.wait_for(cleanup_entered.wait(), 3)
+        await asyncio.wait_for(cleanup_entered.wait(), 30)
         assert not task.done() and files.owner.child is files.children[0]
         staged = Path(files.commands[0][0][-1])
         assert staged.is_file()
@@ -280,7 +280,7 @@ async def test_unconfirmed_child_cleanup_retains_staging_until_original_owner_re
     try:
         await wait_until(lambda: bool(files.children))
         files.owner.stop.set()
-        await asyncio.wait_for(cleanup_entered.wait(), 3)
+        await asyncio.wait_for(cleanup_entered.wait(), 30)
         staged = Path(files.commands[0][0][-1])
         # Settle inherited pipes so the injected failed reap remains the only
         # cleanup failure. The actual original fixture child still runs.

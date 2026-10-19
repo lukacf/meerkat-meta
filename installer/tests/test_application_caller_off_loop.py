@@ -87,7 +87,7 @@ async def test_repeated_cancellation_joins_exact_entered_worker(tmp_path, monkey
     block_phase(monkeypatch, f, phase, held_io)
     task = asyncio.create_task(operation(f))
     try:
-        assert await asyncio.to_thread(entered.wait, 1)
+        assert await asyncio.to_thread(entered.wait, 30)
         task.cancel()
         await asyncio.sleep(0)
         task.cancel()

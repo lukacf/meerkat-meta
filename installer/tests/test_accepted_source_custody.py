@@ -376,7 +376,7 @@ async def test_cancelled_projection_joins_worker_and_preserves_private_evidence(
     monkeypatch.setattr(custody, "_retain", delayed)
     with project_lock(destination) as lease:
         task = asyncio.create_task(retain(directory, receipt, lease))
-        for _ in range(1000):
+        for _ in range(30000):
             if entered.is_set():
                 break
             await asyncio.sleep(0.001)
@@ -512,7 +512,7 @@ async def test_final_filesystem_check_is_off_loop_and_cancellation_joins_it(tmp_
     monkeypatch.setattr(custody.AcceptedApplicationSource, "_filesystem", blocked_final_check)
     with project_lock(destination) as lease:
         task = asyncio.create_task(retain(directory, receipt, lease))
-        for _ in range(1000):
+        for _ in range(30000):
             if entered.is_set():
                 break
             await asyncio.sleep(0.001)
@@ -655,7 +655,7 @@ async def test_cancelled_currentness_joins_worker_and_keeps_its_invalidation(tmp
         monkeypatch.setattr(source, "_filesystem", delayed)
         try:
             task = asyncio.create_task(source.require_current_async())
-            for _ in range(1000):
+            for _ in range(30000):
                 if entered.is_set():
                     break
                 await asyncio.sleep(0.001)

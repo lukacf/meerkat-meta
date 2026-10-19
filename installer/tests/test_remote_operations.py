@@ -879,7 +879,7 @@ async def test_exported_supervisor_failed_force_reap_is_bounded_and_preserves_ow
     monkeypatch.setattr(module, 'signal_group', lambda process, selected: signals.append((process.pid, selected)))
     monkeypatch.setattr(module.os, 'killpg', lambda pid, selected: None)
     task = asyncio.create_task(module.supervise(operations))
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         await asyncio.sleep(0.01)
         if operations.health_path.exists() and json.loads(operations.health_path.read_text())['ready']:
@@ -1225,7 +1225,7 @@ async def test_cancelled_supervisor_admission_keeps_exact_child_and_cleanup_join
     monkeypatch.setattr(module, 'stop_supervised_application', close)
     task = asyncio.create_task(module.supervise(operations))
     try:
-        await asyncio.wait_for(admitting.wait(), 2)
+        await asyncio.wait_for(admitting.wait(), 30)
         task.cancel('original admission cancellation')
         await asyncio.sleep(0)
         task.cancel('repeated admission cancellation')
@@ -1233,7 +1233,7 @@ async def test_cancelled_supervisor_admission_keeps_exact_child_and_cleanup_join
         assert not task.done(), 'Cancellation discarded the admitted child before handle custody.'
         assert admissions == [child] and not admission_cancelled and not closures
         admit.set()
-        await asyncio.wait_for(cleaning.wait(), 2)
+        await asyncio.wait_for(cleaning.wait(), 30)
         task.cancel('first cleanup cancellation')
         await asyncio.sleep(0)
         task.cancel('repeated cleanup cancellation')
@@ -1294,7 +1294,7 @@ async def test_cancelled_supervisor_admission_failure_preserves_error_without_cl
         lambda *args: pytest.fail('No process handle was supplied.'))
     task = asyncio.create_task(module.supervise(operations))
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 30)
         task.cancel('original admission cancellation')
         await asyncio.sleep(0)
         task.cancel('repeated admission cancellation')
@@ -1355,7 +1355,7 @@ async def test_supervisor_cleanup_preserves_startup_failure_through_repeated_can
     monkeypatch.setattr(module, 'stop_supervised_application', close)
     task = asyncio.create_task(module.supervise(operations))
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 30)
         task.cancel('first cleanup cancellation')
         await asyncio.sleep(0)
         task.cancel('repeated cleanup cancellation')

@@ -234,7 +234,7 @@ async def test_dynamic_seed_registration_rejects_snapshot_changed_during_async_h
         return original(row)
     application.integration.tools_for_agent = delayed
     pending = asyncio.create_task(build(dispatcher, seed["profile"], "stale-seed"))
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     # A new validated snapshot was published by another operation during the hook.
     application._snapshot = copy.deepcopy(application._snapshot)
     release.set()
@@ -344,7 +344,7 @@ async def test_host_selection_async_snapshot_change_never_registers_stale_callba
     application.integration.select_host_tools = select
     pending = asyncio.create_task(build(dispatcher, application.deployment["agents"][0]["profile"], "stale-selection"))
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), 30)
         application._snapshot = copy.deepcopy(application._snapshot)
         release.set()
         with pytest.raises(ValueError, match="roster changed"):

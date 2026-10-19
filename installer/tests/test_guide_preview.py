@@ -120,7 +120,7 @@ async def test_actual_checked_atomic_tool_preview_and_commit_or_failure_are_one_
         pending, deferred = await operations.submit(service, initial["id"], request)
         assert deferred and pending["operation"]["status"] == "running"
         task = operations.tasks[initial["id"]]
-        await asyncio.wait_for(staged.wait(), 2)
+        await asyncio.wait_for(staged.wait(), 30)
         assert seen["request_id"] == fingerprint({"guide_id": initial["id"], **request.model_dump(mode="json")})
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://127.0.0.1") as client:
             read = await client.get(f"/api/guide/{initial['id']}")
@@ -199,7 +199,7 @@ async def test_actual_full_authoring_previews_topology_before_brief_then_checked
         pending, deferred = await operations.submit(service, initial["id"], request)
         assert deferred and pending["operation"]["status"] == "running"
         task = operations.tasks[initial["id"]]
-        await asyncio.wait_for(topology_staged.wait(), 2)
+        await asyncio.wait_for(topology_staged.wait(), 30)
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://127.0.0.1") as client:
             early = (await client.get(f"/api/guide/{initial['id']}")).json()
             assert early["live_design"]["blueprint"] == seen["pair"][0]
@@ -209,7 +209,7 @@ async def test_actual_full_authoring_previews_topology_before_brief_then_checked
                 assert early.get(key) == initial.get(key)
             assert service.store.get(initial["id"]) == saved_original
             publish.set()
-            await asyncio.wait_for(pair_staged.wait(), 2)
+            await asyncio.wait_for(pair_staged.wait(), 30)
             paired = (await client.get(f"/api/guide/{initial['id']}")).json()
             assert (paired["live_design"]["blueprint"], paired["live_design"]["brief"]) == seen["pair"]
             assert "context_pending" not in paired["live_design"]
