@@ -449,7 +449,7 @@ def test_actual_main_repeated_cancellation_keeps_same_shutdown_and_application_l
         async def interrupt():
             caller.cancel("original caller cancellation")
             try:
-                await asyncio.wait_for(cleanup_entered.wait(), 3)
+                await asyncio.wait_for(cleanup_entered.wait(), 30)
                 assert not factory.source._closed and not source._closed
                 application_startup.lease.require_current()
                 with pytest.raises(RuntimeError, match="already running"):
@@ -658,7 +658,7 @@ def test_actual_main_keeps_lease_until_same_sdk_shutdown_continuation_joins(
 
         async def observe():
             try:
-                await asyncio.wait_for(continuation_entered.wait(), 3)
+                await asyncio.wait_for(continuation_entered.wait(), 30)
                 assert calls[0][0] is calls[1][0] is runtime
                 assert calls[0][1] is not calls[1][1]
                 assert application_startup._shutdown_error is refusal

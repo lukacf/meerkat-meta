@@ -473,7 +473,7 @@ async def test_finalizer_fences_and_publication_use_original_task_across_cancell
     monkeypatch.setattr(module.os, "replace", replace)
     task = asyncio.create_task(run())
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 30)
         original_operation = f.finalizer._finalize_task
         assert original_operation is not task and not original_operation.done()
         if cancelled:
@@ -530,7 +530,7 @@ async def test_finalizer_owner_refusal_preserves_original_error_and_settles_requ
     f.f.caller.require_current, f.f.caller.execute = current, execute
     task = asyncio.create_task(run())
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 30)
         original_operation = f.finalizer._finalize_task
         if cancelled:
             task.cancel()

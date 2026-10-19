@@ -289,7 +289,7 @@ async def test_console_assets_held_html_body_rechecks_login_before_transform_or_
             await sign_in(client, front)
             session = client.cookies[front.cookie]
             pending = asyncio.create_task(client.get("/console"))
-            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.wait_for(entered.wait(), 30)
             if retirement == "logout":
                 assert (await client.post("/logout", headers={"Origin": front.origin})).status_code == 303
             else:

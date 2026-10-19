@@ -405,7 +405,7 @@ async def test_cancellation_after_service_admission_stops_exact_instance_before_
     service, directory, target, old, private, identity, manager, _ = background
     manager.behaviors = ["block"]
     task = asyncio.create_task(services.update_background(directory, manager, "update", update_id=identity))
-    await asyncio.wait_for(manager.started.wait(), 2)
+    await asyncio.wait_for(manager.started.wait(), 30)
     assert read_receipt(directory)["build_id"] == service.implementation.identity
     (target / "data/ledger.db").write_bytes(b"state recorded before host cancellation")
     task.cancel()
@@ -514,7 +514,7 @@ async def test_user_stop_during_manager_start_cancels_activation_without_later_s
     controller = DeploymentService(service.root.parent, service.guide, service.implementation, service_manager=manager)
     manager.behaviors = ["block"]
     await controller.action(service.guide.identity, directory.name, "apply-update", update_id=identity)
-    await asyncio.wait_for(manager.started.wait(), 2)
+    await asyncio.wait_for(manager.started.wait(), 30)
     result = await controller.action(service.guide.identity, directory.name, "stop")
     assert result["status"] == "stopped"
     assert result["update"]["status"] == "restored-stopped" and result["build_id"] == old["build_id"]

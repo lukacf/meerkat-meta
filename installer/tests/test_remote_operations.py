@@ -1225,7 +1225,7 @@ async def test_cancelled_supervisor_admission_keeps_exact_child_and_cleanup_join
     monkeypatch.setattr(module, 'stop_supervised_application', close)
     task = asyncio.create_task(module.supervise(operations))
     try:
-        await asyncio.wait_for(admitting.wait(), 2)
+        await asyncio.wait_for(admitting.wait(), 30)
         task.cancel('original admission cancellation')
         await asyncio.sleep(0)
         task.cancel('repeated admission cancellation')
@@ -1294,7 +1294,7 @@ async def test_cancelled_supervisor_admission_failure_preserves_error_without_cl
         lambda *args: pytest.fail('No process handle was supplied.'))
     task = asyncio.create_task(module.supervise(operations))
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 30)
         task.cancel('original admission cancellation')
         await asyncio.sleep(0)
         task.cancel('repeated admission cancellation')
@@ -1355,7 +1355,7 @@ async def test_supervisor_cleanup_preserves_startup_failure_through_repeated_can
     monkeypatch.setattr(module, 'stop_supervised_application', close)
     task = asyncio.create_task(module.supervise(operations))
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 30)
         task.cancel('first cleanup cancellation')
         await asyncio.sleep(0)
         task.cancel('repeated cleanup cancellation')

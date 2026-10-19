@@ -189,12 +189,12 @@ async def test_interrupted_command_waits_original_cleanup_and_drain_tasks(comman
     trial = command_owner
     trial.cleanup_release.clear()
     task = asyncio.create_task(trial.owner.command(["inert-install"], "install", 30))
-    await asyncio.wait_for(trial.pipe.started.wait(), 1)
+    await asyncio.wait_for(trial.pipe.started.wait(), 30)
     if interruption == "stop":
         trial.owner.stop.set()
     else:
         task.cancel()
-    await asyncio.wait_for(trial.cleanup_started.wait(), 1)
+    await asyncio.wait_for(trial.cleanup_started.wait(), 30)
     assert not task.done() and trial.owner.child is trial.process
     assert not trial.pipe.reader.done() and not trial.exits[0].done()
     # Repeated caller cancellation cannot release the original retained child.

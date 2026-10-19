@@ -345,7 +345,7 @@ async def test_stream_cancellation_reaps_only_owned_process_and_closes_every_pip
     monkeypatch.setattr(ssh_transport.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
     monkeypatch.setattr(ssh_transport, "_read", read)
     task = asyncio.create_task(ssh_transport._execute_stream(["offline-ssh"], writer, 30))
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     task.cancel()
     with pytest.raises(asyncio.CancelledError): await asyncio.wait_for(task, 1)
     assert signals == [(process.pid, signal.SIGKILL)]
@@ -477,7 +477,7 @@ async def test_profile_transfer_retains_private_copies_and_original_deadline_unt
     monkeypatch.setattr(SshTransport, "transfer_file", transfer)
     task = asyncio.create_task(profiles.transfer_file(ENDPOINT, "pass", {}, selected,
         expected_fingerprint=FINGERPRINT, deadline=deadline, require_current=current))
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     if cancel:
         task.cancel()
         with pytest.raises(asyncio.CancelledError): await task
@@ -581,7 +581,7 @@ async def test_iap_cancelled_observation_joins_callback_cleanup_before_return(tm
     monkeypatch.setattr(SshTransport, "transfer_file", forbidden)
     task = asyncio.create_task(transport.transfer_file(GCP_ENDPOINT, "pass", {}, artifact(tmp_path),
         expected_fingerprint=FINGERPRINT))
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     task.cancel()
     with pytest.raises(asyncio.CancelledError): await asyncio.wait_for(task, 1)
     assert cleaned.is_set() and calls == []

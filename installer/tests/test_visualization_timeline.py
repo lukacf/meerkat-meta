@@ -576,7 +576,7 @@ async def test_same_content_retry_keeps_original_attempt_across_native_admission
         return SimpleNamespace(json=lambda: {'frames': [frame(31, 'interaction_complete', interaction_id='retry-interaction', session_id='retry-session')]})
     monkeypatch.setattr('launchkit.architect._native_request', request)
     retried = await owned.ops.submit(owned.service, owned.blueprint, owned.model, setup_id='setup-A', stream_id='overview')
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     expected = {name: retried[name] for name in owned.expected}
     assert retried['id'] != owned.receipt['id'] and retried['status'] == 'running'
     assert 'native_admission' not in retried

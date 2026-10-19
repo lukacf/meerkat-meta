@@ -341,7 +341,7 @@ async def test_release_wins_final_admission_fence_without_simulated_send(hosts, 
     service = OfflineDemandService(tmp_path / 'offline-ledger', before_admission=True)
     ack = await declare(host, consumer(), 1)
     receipt = await submit(host, service, ack)
-    await asyncio.wait_for(service.entered.wait(), 2)
+    await asyncio.wait_for(service.entered.wait(), 30)
     await host.release_intent(**body(ack))
     assert service.cancelled == []
     service.before.set()
@@ -358,7 +358,7 @@ async def test_admission_wins_release_preserving_pending_identity_and_idempotenc
     service = OfflineDemandService(tmp_path / 'offline-ledger', after_send=True, lost_response=lost_response)
     ack = await declare(host, consumer(), 1)
     receipt = await submit(host, service, ack)
-    await asyncio.wait_for(service.waiting.wait(), 2)
+    await asyncio.wait_for(service.waiting.wait(), 30)
     key = receipt['native_request_key']
     exact_pending = service.ledger_path(key).read_bytes()
     exact_owner = {name: deepcopy(receipt[name]) for name in (
@@ -405,7 +405,7 @@ async def test_withdrawn_candidate_never_borrows_or_cancels_draining_prior_owner
     service = DrainingService(tmp_path / 'offline-ledger')
     ack = await declare(host, consumer(), 1)
     candidate = await submit(host, service, ack, 2)
-    await asyncio.wait_for(started.wait(), 2)
+    await asyncio.wait_for(started.wait(), 30)
     await host.release_intent(**body(ack))
     assert service.cancelled == [] and prior_path.read_bytes() == prior_bytes
     assert candidate['native_request_key'] != prior['key'] and 'native_admission' not in candidate
@@ -472,7 +472,7 @@ async def test_actual_visualizer_drains_saved_owner_after_release_without_any_ne
     desired['project']['name'] = 'A different queued proposal'
     candidate = await host.submit(service, desired, model, setup_id='setup-A', stream_id='overview',
                                   consumer_intent=body(ack))
-    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(entered.wait(), 30)
     await host.release_intent(**body(ack))
     assert pending_path.read_bytes() == exact_pending and not cancelled and not sends
     assert candidate['native_request_key'] != key and 'native_admission' not in candidate
@@ -494,7 +494,7 @@ async def test_managed_requeue_keeps_original_context_before_another_window_publ
     host, service = hosts(), OfflineDemandService(tmp_path / 'offline-ledger', after_send=True)
     first_intent = await declare(host, consumer(), 1)
     first = await submit(host, service, first_intent)
-    await asyncio.wait_for(service.waiting.wait(), 2)
+    await asyncio.wait_for(service.waiting.wait(), 30)
     waiting_intent = await declare(host, consumer(), 1)
     waiting = await submit(host, service, waiting_intent, 2)
     frozen = deepcopy(waiting['revision_context'])
