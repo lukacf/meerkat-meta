@@ -14298,19 +14298,27 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         None
     }
     /// Complete the application from the held members' finished surfaces.
-    /// Called once, after every roster identity is held (resumed members are
-    /// not held), with the pass's
-    /// [`crate::identity_first::HeldCompletion`]. An `Ok` recorded before the
-    /// setup deadline is the pass's choice `Activate`; Core then accepts or
-    /// expires each held member's activation on its own, so a member can end
-    /// `Broken` while the others are published. Any other outcome, or the
-    /// deadline or the caller's loss first, is the pass's terminal `Abort`:
-    /// the gateway then calls [`Self::begin_close`] before it waits for this
-    /// callback's settlement, the members' aborts or the runtime's shutdown,
-    /// and init fails. [`crate::identity_first::HeldCompletion::aborted`]
-    /// wakes the callback at that `Abort`; the callback is still joined,
-    /// whatever it does. Only called when [`Self::identity_bootstrap_hold`]
-    /// returns a hold.
+    /// Called once, after every roster identity is held, with the pass's
+    /// [`crate::identity_first::HeldCompletion`]. A held pass holds fresh
+    /// members only: a roster member that already has continuity (it would
+    /// resume), is placed or externally bound, or has an initial message
+    /// refuses the whole pass with
+    /// [`crate::identity_first::HeldBootstrapRefusal`] before any member is
+    /// held. A member embodied outside the pass after that freshness read
+    /// refuses it with
+    /// [`crate::identity_first::HeldBootstrapRefusal::NotHeld`] once its
+    /// embodiment settles unheld. Either way this callback never sees such a
+    /// roster. An `Ok` recorded
+    /// before the setup deadline is the pass's choice `Activate`; Core then
+    /// accepts or expires each held member's activation on its own, so a
+    /// member can end `Broken` while the others are published. Any other
+    /// outcome, or the deadline or the caller's loss first, is the pass's
+    /// terminal `Abort`: the gateway then calls [`Self::begin_close`] before
+    /// it waits for this callback's settlement, the members' aborts or the
+    /// runtime's shutdown, and init fails.
+    /// [`crate::identity_first::HeldCompletion::aborted`] wakes the callback
+    /// at that `Abort`; the callback is still joined, whatever it does. Only
+    /// called when [`Self::identity_bootstrap_hold`] returns a hold.
     async fn complete_held_identity_members(
         &self,
         members: Vec<crate::identity_first::HeldIdentityMember>,
