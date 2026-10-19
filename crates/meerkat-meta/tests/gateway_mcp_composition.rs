@@ -199,7 +199,7 @@ fn every_gateway_member_factory_is_offered_to_the_host_before_bootstrap() {
                 assert_eq!(lines.last(), Some(&"bootstrap"), "{mode}: {lines:?}");
                 let offers = &lines[..lines.len() - 1];
                 assert!(
-                    offers.len() % 2 == 0
+                    offers.len().is_multiple_of(2)
                         && offers.chunks(2).all(|offer| {
                             let kind = offer[0]
                                 .strip_prefix("factory ")
