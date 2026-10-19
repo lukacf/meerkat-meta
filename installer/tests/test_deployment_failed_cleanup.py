@@ -63,8 +63,8 @@ class ChildImplementation(Implementation):
         result = io.BytesIO()
         with zipfile.ZipFile(io.BytesIO(payload)) as old, zipfile.ZipFile(result, "w") as archive:
             for name in old.namelist():
-                archive.writestr(name, APP if name == "app.py" else old.read(name))
-            archive.writestr("storage_setup.py", source.read_bytes())
+                archive.writestr(zipfile.ZipInfo(name), APP if name == "app.py" else old.read(name))
+            archive.writestr(zipfile.ZipInfo("storage_setup.py"), source.read_bytes())
         return result.getvalue(), slug
 
 
