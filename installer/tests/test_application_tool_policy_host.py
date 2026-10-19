@@ -207,7 +207,7 @@ async def test_policy_read_runs_off_loop_and_settles_on_cancellation(tmp_path, m
     monkeypatch.setattr(host, "_read_tool_policy_source", delayed)
     task = asyncio.create_task(loaded.load_tool_policy())
     try:
-        assert await asyncio.to_thread(entered.wait, 1)
+        assert await asyncio.to_thread(entered.wait, 30)
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done()

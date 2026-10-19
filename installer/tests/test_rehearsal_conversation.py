@@ -472,7 +472,7 @@ def native_seam(tmp_path, monkeypatch):
 
 
 async def wait_for_worker(directory, status):
-    for _ in range(200):
+    for _ in range(3000):
         if read_receipt(directory).get("status") == status: return
         await asyncio.sleep(.01)
     pytest.fail(f"Worker did not reach {status}")

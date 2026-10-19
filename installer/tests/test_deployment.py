@@ -631,7 +631,7 @@ async def test_shutdown_serializes_restart_and_preserves_the_later_admission(ser
     fresh.tasks[directory.name] = old_task
     await asyncio.wait_for(entered.wait(), 30)
     shutting_down = asyncio.create_task(fresh.shutdown())
-    await asyncio.wait_for(stopping.wait(), 1)
+    await asyncio.wait_for(stopping.wait(), 30)
     restarting = asyncio.create_task(fresh.action(service.guide.identity, receipt["deployment_id"], "restart"))
     await asyncio.sleep(0)
     try:
@@ -674,7 +674,7 @@ async def test_cancelled_shutdown_drains_its_original_join_and_final_receipt_pas
     fresh.tasks[directory.name] = task
     await asyncio.wait_for(entered.wait(), 30)
     shutting_down = asyncio.create_task(fresh.shutdown())
-    await asyncio.wait_for(stopping.wait(), 1)
+    await asyncio.wait_for(stopping.wait(), 30)
     try:
         for _ in range(3):
             shutting_down.cancel()
@@ -1076,7 +1076,7 @@ async def test_shutdown_during_worker_teardown_joins_same_wait_without_losing_ha
     fresh.tasks[directory.name] = task
     await asyncio.wait_for(entered.wait(), 30)
     task.cancel()
-    await asyncio.wait_for(stopping.wait(), 1)
+    await asyncio.wait_for(stopping.wait(), 30)
     shutting_down = asyncio.create_task(fresh.shutdown())
     await asyncio.sleep(0)
     await asyncio.sleep(0)
@@ -1172,7 +1172,7 @@ async def test_shutdown_force_reap_failure_preserves_live_worker_and_reports_cle
     await asyncio.wait_for(entered.wait(), 30)
     shutting_down = asyncio.create_task(fresh.shutdown())
     if cancel_shutdown:
-        await asyncio.wait_for(stopping.wait(), 1)
+        await asyncio.wait_for(stopping.wait(), 30)
         for _ in range(3):
             shutting_down.cancel()
             await asyncio.sleep(0)

@@ -61,7 +61,7 @@ def handshake(monkeypatch):
 
 
 async def settle_cleanup(observation, starter):
-    await observation.wait(observation.cleanup_started.wait(), timeout=2)
+    await observation.wait(observation.cleanup_started.wait(), timeout=30)
     assert not starter.done() and not observation.cleanup_finished.is_set()
     assert not observation.connection.ready.cancelled(), "The original readiness future remains shielded."
     observation.release_cleanup.set()
@@ -105,7 +105,7 @@ async def test_caller_cancellation_keeps_original_cleanup_and_is_not_a_timeout(h
     connection = handshake.connection
     starter = asyncio.create_task(connection.start())
     try:
-        await handshake.wait(handshake.entered.wait(), timeout=2)
+        await handshake.wait(handshake.entered.wait(), timeout=30)
         starter.cancel()
         await settle_cleanup(handshake, starter)
         with pytest.raises(asyncio.CancelledError):

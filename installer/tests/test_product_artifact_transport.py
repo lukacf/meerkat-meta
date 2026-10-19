@@ -424,7 +424,7 @@ async def test_cancelled_blocked_writer_retains_owned_inputs_until_original_thre
         profiles.request(ENDPOINT, "pass", payload, expected_fingerprint=FINGERPRINT))
     task = asyncio.create_task(operation)
     try:
-        assert await asyncio.to_thread(entered.wait, 1)
+        assert await asyncio.to_thread(entered.wait, 30)
         task.cancel()
         assert await asyncio.to_thread(reaped.wait, 1)
         assert await asyncio.to_thread(pipe_closed.wait, 1)

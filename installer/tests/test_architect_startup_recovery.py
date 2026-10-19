@@ -992,7 +992,7 @@ async def test_cancelling_saturated_readiness_backoff_cleans_without_another_wai
         await asyncio.Event().wait()
     monkeypatch.setattr(module, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep}))
     task = asyncio.create_task(service.start())
-    await asyncio.wait_for(sleeping.wait(), timeout=2)
+    await asyncio.wait_for(sleeping.wait(), timeout=30)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

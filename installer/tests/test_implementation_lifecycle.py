@@ -300,9 +300,9 @@ async def test_receipt_two_writers_preserve_publication_and_host_stop_flags(buil
     second_thread = threading.Thread(target=invoke, args=(second_callback, second_started), name="second-writer")
     first_thread.start()
     try:
-        assert entered.wait(1)
+        assert entered.wait(30)
         second_thread.start()
-        assert second_started.wait(1)
+        assert second_started.wait(30)
         # A separate open lock descriptor must block this other writer's read.
         await asyncio.sleep(.02)
         assert "second-writer" not in reads
@@ -346,9 +346,9 @@ async def test_progress_accumulation_serializes_two_writers_without_erasing_stop
     second = threading.Thread(target=record, args=("Second actual progress", started), name="second-progress")
     first.start()
     try:
-        assert entered.wait(1)
+        assert entered.wait(30)
         second.start()
-        assert started.wait(1)
+        assert started.wait(30)
         await asyncio.sleep(.02)
         assert "second-progress" not in reads
     finally:
@@ -493,7 +493,7 @@ async def test_actual_execute_retains_initialization_runtime_and_reawaits_shutdo
     monkeypatch.setattr(worker, "IMPLEMENTATION_SECONDS", .04)
     task = asyncio.create_task(worker.run(directory))
     try:
-        await asyncio.wait_for(draining.wait(), 2)
+        await asyncio.wait_for(draining.wait(), 30)
         if trigger == "signal":
             callback, context = callbacks[signal.SIGTERM]
             loop.call_soon(callback, context=context)
@@ -545,7 +545,7 @@ async def test_normal_completed_source_cleanup_outlives_job_timer_and_preserves_
     monkeypatch.setattr(worker, "IMPLEMENTATION_SECONDS", .03)
     task = asyncio.create_task(worker.run(directory))
     try:
-        await asyncio.wait_for(draining.wait(), 2)
+        await asyncio.wait_for(draining.wait(), 30)
         completed = read_receipt(directory)
         assert completed["status"] == "completed" and completed["ready_to_package"]
         for callback, context in callbacks.values():

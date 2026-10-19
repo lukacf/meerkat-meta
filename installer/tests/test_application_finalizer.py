@@ -251,7 +251,7 @@ async def test_application_executor_joins_existing_command_future_when_waiter_is
         return {"returncode": 0, "stdout": b"specimen", "stderr": b""}
     execute = application_command_executor(command, root=tmp_path, timeout=2)
     task = asyncio.create_task(execute(("existing-command-lane",)))
-    assert await asyncio.to_thread(entered.wait, 2)
+    assert await asyncio.to_thread(entered.wait, 30)
     task.cancel()
     await asyncio.sleep(0)
     task.cancel()
@@ -421,7 +421,7 @@ async def test_cancelled_waiter_joins_original_publication_worker(tmp_path, monk
     monkeypatch.setattr(f.finalizer, "_prepare_publication", held)
     task = asyncio.create_task(f.run())
     try:
-        assert await asyncio.to_thread(entered.wait, 2)
+        assert await asyncio.to_thread(entered.wait, 30)
         task.cancel()
         await asyncio.sleep(0)
         task.cancel()

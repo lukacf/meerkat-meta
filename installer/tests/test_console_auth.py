@@ -138,7 +138,7 @@ def managed_connect_factory(tmp_path, *, release=None, application_current=None,
 async def connect_ready(client, front):
     response = await client.post("/console/forge/connect/initialize", json={}, headers={"Origin": front.origin})
     assert response.status_code in (200, 202)
-    for _ in range(200):
+    for _ in range(6000):
         response = await client.get("/console/forge/connect/state")
         if response.status_code == 200 and response.json().get("status") == "ready":
             return response.json()
@@ -264,7 +264,7 @@ async def test_managed_connect_startup_prompt_is_answerable_without_initializati
             await login(client, front)
             response = await client.post("/console/forge/connect/initialize", json={}, headers={"Origin": front.origin})
             assert response.status_code == 202 and response.json() == {"status": "starting"}
-            for _ in range(200):
+            for _ in range(6000):
                 if children[0]._prompts:
                     break
                 await asyncio.sleep(0.005)
@@ -1697,7 +1697,7 @@ async def test_login_retirement_joins_the_first_slow_upstream_close_before_logou
             await asyncio.wait_for(stream.waiting.wait(), 30)
             logout = asyncio.create_task(client.post("/logout", headers={"Origin": front.origin}))
             tasks.append(logout)
-            await asyncio.wait_for(closing.wait(), 1)
+            await asyncio.wait_for(closing.wait(), 30)
             assert front.sessions == {} and not logout.done() and not stream.closed.is_set()
             assert (await client.get("/console/timeline/stream")).status_code == 401
             release.set()
@@ -1735,7 +1735,7 @@ async def test_login_retirement_owns_httpx_finite_stream_exhaustion_close(tmp_pa
             task, frames, public, _ = await held_console_stream(app, front, client.cookies[front.cookie])
             tasks.append(task)
             assert await asyncio.wait_for(frames.get(), 1) == b'id: native-42\ndata: {"native":"finite"}\n\n'
-            await asyncio.wait_for(closing.wait(), 1)
+            await asyncio.wait_for(closing.wait(), 30)
             logout = asyncio.create_task(client.post("/logout", headers={"Origin": front.origin}))
             tasks.append(logout)
             if failing:

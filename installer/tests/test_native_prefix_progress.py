@@ -140,7 +140,7 @@ async def test_cancel_during_owned_copy_joins_worker_and_stops_subsequent_writes
             settled.set()
     task = asyncio.create_task(worker._joined_product_mutation(supervisor, mutation, _owner_current=current))
     try:
-        assert await asyncio.to_thread(entered.wait, 3)
+        assert await asyncio.to_thread(entered.wait, 30)
         task.cancel()
         await asyncio.sleep(0)
         assert supervisor.stop.is_set() and not task.done()

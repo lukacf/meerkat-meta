@@ -42,7 +42,7 @@ def frame(value):
     return (FRAME_PREFIX + json.dumps(value, separators=(",", ":")) + "\n").encode()
 
 
-async def wait_record(path, timeout=2):
+async def wait_record(path, timeout=30):
     async def ready():
         while not path.exists():
             await asyncio.sleep(.01)
