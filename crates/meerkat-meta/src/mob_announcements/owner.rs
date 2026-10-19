@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, Notify};
 pub use super::native::AdmittedInput;
 use super::native::{
     MemberMobScan, MemberProblem, MemberRoute, MobOrigin, MobPresence, NativeDelivery,
-    NativeStatus, NativeSubmitError, PrepareError,
+    NativeStatus, NativeSubmitError, OwnerRefusal, PrepareError, route_contradiction,
 };
 use super::store::AnnouncementStore;
 use super::types::{
@@ -1041,6 +1041,17 @@ impl AnnouncementService {
                 input: None,
             });
         }
+        // Nothing is read for a batch whose route contradicts its member,
+        // here as on every drive path: the one guard answers instead.
+        if let Some(refusal) = self.route_refusal(&batch) {
+            return Ok(DeliveryObservation {
+                batch,
+                native: NativeObservation::Unavailable {
+                    detail: refusal.to_string(),
+                },
+                input: None,
+            });
+        }
         let native = match self.inner.native.status(&batch).await {
             Err(error) => NativeObservation::Unavailable { detail: error.0 },
             Ok(status) => Self::native_observation(status),
@@ -1223,8 +1234,8 @@ impl AnnouncementService {
             .member_route(member)
             .await?
             .map(|kept| kept.route)
-            .ok_or_else(|| {
-                AnnouncementStoreError::Storage(format!("no route is kept for member {member}"))
+            .ok_or_else(|| AnnouncementStoreError::RouteNotKept {
+                member: member.clone(),
             })?;
         if route == MemberRoute::Child {
             self.member_mob_ended(member, now).await?;
@@ -1282,6 +1293,17 @@ impl AnnouncementService {
     pub(crate) async fn walk_entries(&self) -> (usize, usize) {
         let walk = self.inner.round.lock().await;
         (walk.due.len(), walk.reported.len())
+    }
+
+    /// Seal one member's due backlog now, as a round does.
+    #[cfg(test)]
+    pub(crate) async fn seal_member(
+        &self,
+        member: &Member,
+    ) -> Result<Option<Batch>, AnnouncementError> {
+        let id = new_batch_id()?;
+        let policy = self.inner.config.policy;
+        self.seal_backlog(member, &id, &policy, self.now()).await
     }
 
     /// When each batch the walk reports as failing was last reported.
@@ -1625,6 +1647,22 @@ impl AnnouncementService {
     /// Advance one batch as far as native evidence allows now. Returns when
     /// it should be looked at again, or `None` once it is settled.
     async fn drive(&self, mut batch: Batch, now: u64) -> Result<Option<u64>, AnnouncementError> {
+        // A route that contradicts its member blocks the batch before
+        // anything is prepared, ended, submitted or read for it: no member
+        // of this gateway's mob is touched in that member's place.
+        if BatchStateTag::UNSETTLED.contains(&batch.state.tag())
+            && let Some(refusal) = self.route_refusal(&batch)
+        {
+            self.apply(
+                &batch,
+                BatchEvent::Block {
+                    cause: refusal.to_string(),
+                },
+                now,
+            )
+            .await?;
+            return Ok(None);
+        }
         let mut submitted_this_round = false;
         for _ in 0..8 {
             let retry_at = Some(now.saturating_add(self.settle_pause_ms(&batch, now)));
@@ -1839,6 +1877,13 @@ impl AnnouncementService {
         Ok(Some(
             now.saturating_add(self.inner.config.settle_check_min_ms),
         ))
+    }
+
+    /// Whether the batch's kept route contradicts its member, by the one
+    /// guard the native seam runs too.
+    fn route_refusal(&self, batch: &Batch) -> Option<OwnerRefusal> {
+        let own = self.inner.native.own_mob()?;
+        route_contradiction(&own, &batch.member, batch.route)
     }
 
     /// The batch as the store holds it now.

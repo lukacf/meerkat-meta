@@ -492,6 +492,35 @@ impl std::fmt::Display for OwnerRefusal {
     }
 }
 
+/// The one guard on a member's kept route: a local route names a member of
+/// this gateway's own mob. Run before anything is prepared, ended, submitted
+/// or read for the member, so no member of this gateway's mob is touched in
+/// another mob's member's place.
+pub(crate) fn route_contradiction(
+    own: &MobId,
+    member: &Member,
+    route: MemberRoute,
+) -> Option<OwnerRefusal> {
+    (route == MemberRoute::Local && member.mob_id != *own).then(|| {
+        OwnerRefusal::LocalRouteNamesAnotherMob {
+            member: member.clone(),
+            own: own.clone(),
+        }
+    })
+}
+
+impl OwnerRefusal {
+    /// What a submission meets for this refusal: a member on a peer is not
+    /// this seam's to reach now, and a self-contradicting route is never
+    /// deliverable.
+    pub(crate) fn submit_error(&self) -> NativeSubmitError {
+        match self {
+            Self::NoPeerPath => NativeSubmitError::Unavailable(self.to_string()),
+            Self::LocalRouteNamesAnotherMob { .. } => NativeSubmitError::Invalid(self.to_string()),
+        }
+    }
+}
+
 /// The continuation owner of `member` by its kept route, on the gateway
 /// whose own mob is `own`. A member of `own` is named by its roster id, a
 /// member of a mob a member created by its plain roster id, and a local
@@ -501,13 +530,10 @@ pub(crate) fn continuation_owner(
     member: &Member,
     route: MemberRoute,
 ) -> Result<meerkat::ContinuationOwner, OwnerRefusal> {
+    if let Some(refusal) = route_contradiction(own, member, route) {
+        return Err(refusal);
+    }
     match route {
-        MemberRoute::Local if member.mob_id != *own => {
-            Err(OwnerRefusal::LocalRouteNamesAnotherMob {
-                member: member.clone(),
-                own: own.clone(),
-            })
-        }
         MemberRoute::Local => Ok(meerkat::ContinuationOwner::Member {
             mob_id: member.mob_id.to_string(),
             identity: crate::member_comms_id::roster_member_id_for_identity(
@@ -1362,6 +1388,9 @@ impl NativeDelivery for MobNativeDelivery {
     }
 
     async fn check_member(&self, member: &Member, route: MemberRoute) -> Result<(), MemberProblem> {
+        if let Some(refusal) = route_contradiction(&self.mob_id, member, route) {
+            return Err(MemberProblem::Ambiguous(refusal.to_string()));
+        }
         match route {
             MemberRoute::Local => match self.identity_service(&member.identity).await {
                 Ok(IdentityService::Local) => Ok(()),
@@ -1396,14 +1425,9 @@ impl NativeDelivery for MobNativeDelivery {
         batch: &Batch,
         committed_at_ms: u64,
     ) -> Result<NativeReceipt, NativeSubmitError> {
-        let owner =
-            self.owner_for(&batch.member, batch.route)
-                .map_err(|refusal| match refusal {
-                    OwnerRefusal::NoPeerPath => NativeSubmitError::Unavailable(refusal.to_string()),
-                    OwnerRefusal::LocalRouteNamesAnotherMob { .. } => {
-                        NativeSubmitError::Invalid(refusal.to_string())
-                    }
-                })?;
+        let owner = self
+            .owner_for(&batch.member, batch.route)
+            .map_err(|refusal| refusal.submit_error())?;
         let delivery = continuation_for(batch).map_err(NativeSubmitError::Invalid)?;
         let receipt = self
             .submit_delivery_to(&owner, delivery, committed_at_ms)
@@ -1412,6 +1436,11 @@ impl NativeDelivery for MobNativeDelivery {
         Ok(receipt)
     }
 
+    /// No owner path reads a batch whose route contradicts its member: the
+    /// owner's one route guard blocks it before any drive step and observes
+    /// it without a read. A direct call is refused by the same guard before
+    /// anything is read; until a status read has a terminal error class, it
+    /// answers that refusal as `NativeUnavailable`.
     async fn status(&self, batch: &Batch) -> Result<NativeStatus, NativeUnavailable> {
         let owner = self
             .owner_for(&batch.member, batch.route)

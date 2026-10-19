@@ -107,6 +107,16 @@ pub enum AnnouncementStoreError {
     TooLarge(String),
     Invalid(String),
     Storage(String),
+    /// A subscription reached the store without the route its owner resolves
+    /// for the member: the store never assumes one.
+    RouteRequired {
+        member: Member,
+    },
+    /// No route is kept for the member, so nothing of its backlog is sealed:
+    /// none is assumed.
+    RouteNotKept {
+        member: Member,
+    },
 }
 
 impl fmt::Display for AnnouncementStoreError {
@@ -167,6 +177,12 @@ impl fmt::Display for AnnouncementStoreError {
             Self::TooLarge(detail) => write!(f, "request too large: {detail}"),
             Self::Invalid(detail) => write!(f, "invalid request: {detail}"),
             Self::Storage(detail) => write!(f, "announcement storage failed: {detail}"),
+            Self::RouteRequired { member } => write!(
+                f,
+                "a subscription for {member} reached the store without its route; the owner \
+                 resolves it"
+            ),
+            Self::RouteNotKept { member } => write!(f, "no route is kept for member {member}"),
         }
     }
 }

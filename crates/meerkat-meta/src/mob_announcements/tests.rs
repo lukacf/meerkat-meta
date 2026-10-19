@@ -2150,6 +2150,8 @@ struct Ledger {
     strand: BTreeSet<String>,
     /// Native status reads, for pacing checks.
     status_reads: u64,
+    /// Native input reads.
+    input_reads: u64,
 }
 
 struct ScriptedNative {
@@ -2164,6 +2166,8 @@ struct ScriptedNative {
     destroyed: Mutex<BTreeSet<String>>,
     /// Members whose owner reports them gone for good, and why.
     gone: Mutex<BTreeMap<String, SubscriptionEnd>>,
+    /// Identities a member preparation was asked for, in order.
+    prepared: Mutex<Vec<String>>,
     /// The next submission's final answer that its member is gone.
     submit_gone: Mutex<Option<SubscriptionEnd>>,
     apply_on_commit: bool,
@@ -2198,6 +2202,7 @@ impl ScriptedNative {
             peers: ["mob-b".to_string()].into(),
             destroyed: Mutex::new(BTreeSet::new()),
             gone: Mutex::new(BTreeMap::new()),
+            prepared: Mutex::new(Vec::new()),
             submit_gone: Mutex::new(None),
             apply_on_commit: true,
             origins: Mutex::new(BTreeMap::new()),
@@ -2419,6 +2424,10 @@ impl NativeDelivery for ScriptedNative {
         member: &Member,
         route: MemberRoute,
     ) -> std::result::Result<(), PrepareError> {
+        self.prepared
+            .lock()
+            .unwrap()
+            .push(member.identity.to_string());
         if route == MemberRoute::Child {
             if self.held(&member.mob_id) {
                 return Err(PrepareError::Unavailable(format!(
@@ -2572,6 +2581,7 @@ impl NativeDelivery for ScriptedNative {
         _: &str,
         _: &str,
     ) -> std::result::Result<Option<serde_json::Value>, NativeUnavailable> {
+        self.ledger.lock().unwrap().input_reads += 1;
         Ok(Some(serde_json::json!({ "phase": "consumed" })))
     }
 }
@@ -6993,9 +7003,11 @@ async fn a_subscription_without_its_route_is_refused_by_the_store() {
             1,
         )
         .await;
-    assert!(
-        matches!(&refused, Err(AnnouncementStoreError::Storage(detail)) if detail.contains("without its route")),
-        "{refused:?}"
+    assert_eq!(
+        refused.map(|_| ()),
+        Err(AnnouncementStoreError::RouteRequired {
+            member: member("agent:a")
+        })
     );
     assert_eq!(store.member_route(&member("agent:a")).await.unwrap(), None);
     assert_eq!(store.subscription(&sid("s1")).await.unwrap(), None);
@@ -7034,5 +7046,297 @@ fn a_local_route_names_the_members_own_mob_and_refuses_another() {
     assert_eq!(
         continuation_owner(&own, &elsewhere, MemberRoute::Peer),
         Err(OwnerRefusal::NoPeerPath)
+    );
+}
+
+/// A kept local route for a member of another mob contradicts itself. The
+/// batch is blocked, typed, before anything is prepared or ended: this
+/// gateway's member of the same name is neither prepared nor ended, and the
+/// subscription stays.
+#[tokio::test]
+async fn a_local_route_for_another_mobs_member_is_blocked_before_anything_is_touched() {
+    let harness = harness_with(ScriptedNative::new());
+    // This gateway's member of that name is gone: preparing it would end
+    // subscriptions, falsely.
+    harness
+        .native
+        .gone
+        .lock()
+        .unwrap()
+        .insert("agent:a".into(), SubscriptionEnd::MemberLeft);
+    let other = Member::new(mob("checkout"), MemberIdentity::new("agent:a").unwrap());
+    let mut request = put_for("s1", other.clone(), &["ios"]);
+    request.route = Some(local_route());
+    harness
+        .store
+        .put_subscription(&op("o1"), request, 1)
+        .await
+        .unwrap();
+    harness
+        .service
+        .announce(announce_request("payments", "k1", &["ios"], "one"))
+        .await
+        .unwrap();
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let batches = harness
+        .service
+        .deliveries(&BatchQuery {
+            member: Some(other.clone()),
+            limit: 10,
+            ..BatchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(
+        batches[0].state,
+        BatchState::Blocked {
+            cause: super::native::OwnerRefusal::LocalRouteNamesAnotherMob {
+                member: other,
+                own: mob(OWN_MOB),
+            }
+            .to_string()
+        }
+    );
+    assert!(
+        harness.native.prepared.lock().unwrap().is_empty(),
+        "nothing is prepared for the same-named member"
+    );
+    assert_eq!(harness.native.submits(), 0);
+    let subscription = harness
+        .service
+        .subscription(&sid("s1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        subscription.state,
+        SubscriptionState::Active,
+        "nothing is ended"
+    );
+}
+
+/// A batch for another mob's member with a kept local route, left by
+/// earlier code in `state`, submitting or committed, as a store holds it.
+/// Returns the batch id and the typed state the guard must leave it in.
+async fn contradicting_batch_left_in(state: BatchStateTag) -> (Harness, BatchId, BatchState) {
+    let harness = harness_with(ScriptedNative::new());
+    let other = Member::new(mob("checkout"), MemberIdentity::new("agent:a").unwrap());
+    let mut request = put_for("s1", other.clone(), &["ios"]);
+    request.route = Some(local_route());
+    harness
+        .store
+        .put_subscription(&op("o1"), request, 1)
+        .await
+        .unwrap();
+    harness
+        .service
+        .announce(announce_request("payments", "k1", &["ios"], "one"))
+        .await
+        .unwrap();
+    let id = batch_id("b-earlier");
+    harness
+        .store
+        .seal_batch(
+            &other,
+            &id,
+            &harness.service.config().policy,
+            None,
+            10_000_000,
+        )
+        .await
+        .unwrap()
+        .expect("a backlog to seal");
+    harness
+        .store
+        .transition_batch(
+            &id,
+            BatchStateTag::Sealed,
+            BatchEvent::BeginSubmit,
+            10_000_001,
+        )
+        .await
+        .unwrap();
+    if state == BatchStateTag::Committed {
+        harness
+            .store
+            .transition_batch(
+                &id,
+                BatchStateTag::Submitting,
+                BatchEvent::NativeCommitted {
+                    receipt: receipt("b-earlier"),
+                },
+                10_000_002,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        harness.store.batch(&id).await.unwrap().unwrap().state.tag(),
+        state
+    );
+    harness.clock.store(10_000_003, Ordering::SeqCst);
+    let blocked = BatchState::Blocked {
+        cause: super::native::OwnerRefusal::LocalRouteNamesAnotherMob {
+            member: other,
+            own: mob(OWN_MOB),
+        }
+        .to_string(),
+    };
+    (harness, id, blocked)
+}
+
+/// What the native seam was asked for: status reads, submissions and input
+/// reads.
+fn native_calls(harness: &Harness) -> (u64, u64, u64) {
+    let ledger = harness.native.ledger.lock().unwrap();
+    (ledger.status_reads, ledger.submits, ledger.input_reads)
+}
+
+/// A batch earlier code left submitting or committed, with a route that
+/// contradicts its member, is never polled: its next round and a reconcile
+/// each block it, typed, with no status read, submission, input read or
+/// preparation.
+async fn a_contradicting_batch_left_in_is_blocked_unread(state: BatchStateTag) {
+    let (harness, id, blocked) = contradicting_batch_left_in(state).await;
+    harness.service.run_round().await.unwrap();
+    assert_eq!(
+        harness.store.batch(&id).await.unwrap().unwrap().state,
+        blocked,
+        "at the next round"
+    );
+    assert_eq!(
+        native_calls(&harness),
+        (0, 0, 0),
+        "nothing is read or submitted"
+    );
+    assert!(harness.native.prepared.lock().unwrap().is_empty());
+
+    let (harness, id, blocked) = contradicting_batch_left_in(state).await;
+    let observed = harness.service.reconcile_delivery(&id).await.unwrap();
+    assert_eq!(observed.batch.state, blocked, "at reconcile");
+    assert!(
+        matches!(observed.native, NativeObservation::Unavailable { .. }),
+        "{:?}",
+        observed.native
+    );
+    assert_eq!(
+        native_calls(&harness),
+        (0, 0, 0),
+        "nothing is read or submitted"
+    );
+    assert!(harness.native.prepared.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_submitting_batch_with_a_contradicting_route_is_blocked_unread() {
+    a_contradicting_batch_left_in_is_blocked_unread(BatchStateTag::Submitting).await;
+}
+
+#[tokio::test]
+async fn a_committed_batch_with_a_contradicting_route_is_blocked_unread() {
+    a_contradicting_batch_left_in_is_blocked_unread(BatchStateTag::Committed).await;
+}
+
+/// A member whose kept route is gone under an active subscription is not
+/// sealed, typed, and no route is assumed for it; another member's backlog
+/// still seals.
+#[tokio::test]
+async fn a_member_without_its_kept_route_is_not_sealed_and_others_still_are() {
+    let mut native = ScriptedNative::new();
+    native.known = ["agent:a".to_string(), "agent:b".to_string()].into();
+    let harness = harness_with(native);
+    harness.subscribe("s1").await;
+    harness
+        .service
+        .put_subscription(
+            &op("s2"),
+            put("s2", "agent:b", &["ios"], StartFrontier::Now),
+        )
+        .await
+        .unwrap();
+    harness.announce_burst(2).await;
+    let db =
+        rusqlite::Connection::open(harness._dir.path().join("mob_announcements.sqlite3")).unwrap();
+    db.execute(
+        "DELETE FROM member_routes WHERE member = ?1",
+        [member("agent:a").key()],
+    )
+    .unwrap();
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    assert_eq!(
+        harness
+            .store
+            .seal_batch(
+                &member("agent:a"),
+                &batch_id("b9"),
+                &policy(),
+                None,
+                10_000_000
+            )
+            .await
+            .map(|_| ()),
+        Err(AnnouncementStoreError::RouteNotKept {
+            member: member("agent:a")
+        }),
+        "the store assumes no route either"
+    );
+    assert_eq!(
+        harness
+            .service
+            .seal_member(&member("agent:a"))
+            .await
+            .map(|_| ()),
+        Err(AnnouncementError::Store(
+            AnnouncementStoreError::RouteNotKept {
+                member: member("agent:a")
+            }
+        ))
+    );
+    harness.service.run_round().await.unwrap();
+    let batches_of = |who: &'static str| {
+        let service = harness.service.clone();
+        async move {
+            service
+                .deliveries(&BatchQuery {
+                    member: Some(member(who)),
+                    limit: 10,
+                    ..BatchQuery::default()
+                })
+                .await
+                .unwrap()
+                .len()
+        }
+    };
+    assert_eq!(
+        batches_of("agent:a").await,
+        0,
+        "nothing is sealed without a route"
+    );
+    assert_eq!(batches_of("agent:b").await, 1, "another member still seals");
+}
+
+/// A self-contradicting route is never deliverable: a submission meets it
+/// as invalid, and a member on a peer as unavailable now.
+#[test]
+fn a_self_contradicting_route_is_invalid_to_a_submission() {
+    let refusal = super::native::route_contradiction(
+        &mob(OWN_MOB),
+        &Member::new(mob("checkout"), MemberIdentity::new("agent:a").unwrap()),
+        MemberRoute::Local,
+    )
+    .expect("a local route for another mob's member contradicts itself");
+    assert!(matches!(
+        refusal.submit_error(),
+        NativeSubmitError::Invalid(_)
+    ));
+    assert!(matches!(
+        super::native::OwnerRefusal::NoPeerPath.submit_error(),
+        NativeSubmitError::Unavailable(_)
+    ));
+    assert_eq!(
+        super::native::route_contradiction(&mob(OWN_MOB), &member("agent:a"), MemberRoute::Local),
+        None
     );
 }

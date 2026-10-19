@@ -210,7 +210,9 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
             AnnouncementStoreError::TooLarge(_) | AnnouncementStoreError::Invalid(_) => {
                 invalid_params(message)
             }
-            AnnouncementStoreError::Storage(_) => JsonRpcError::new(-32000, message),
+            AnnouncementStoreError::Storage(_)
+            | AnnouncementStoreError::RouteRequired { .. }
+            | AnnouncementStoreError::RouteNotKept { .. } => JsonRpcError::new(-32000, message),
         },
     }
 }

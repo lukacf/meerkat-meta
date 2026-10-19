@@ -878,12 +878,12 @@ fn put_subscription_in(
         return decode(&result);
     }
     request.selector.validate()?;
-    let route = request.route.as_ref().ok_or_else(|| {
-        storage(format!(
-            "a subscription for {} reached the store without its route; the owner resolves it",
-            request.member
-        ))
-    })?;
+    let route = request
+        .route
+        .as_ref()
+        .ok_or_else(|| AnnouncementStoreError::RouteRequired {
+            member: request.member.clone(),
+        })?;
     keep_member_route_in(db, &request.member, route)?;
     if route.route == MemberRoute::Child {
         within_child_limits(db, request)?;
@@ -1592,9 +1592,11 @@ fn seal_batch_in(
         });
     }
     // Every subscription keeps its member's route, so a member with owed
-    // captures has one.
+    // captures has one; none is assumed when it is gone.
     let route = member_route_in(db, member)?
-        .ok_or_else(|| storage(format!("no route is kept for member {member}")))?
+        .ok_or_else(|| AnnouncementStoreError::RouteNotKept {
+            member: member.clone(),
+        })?
         .route;
     let batch = Batch {
         id: batch_id.clone(),
