@@ -250,6 +250,10 @@ fn classify_scoped_submit_mob_error(error: meerkat_mob::MobError) -> ScopedDeliv
             mismatch: ScopeMismatch::MemberBinding,
             detail: error.to_string(),
         },
+        // A closed admission admits nothing, whatever closed it (an idle
+        // close, the last owner's release, a stand-down, a shutdown, a
+        // destroy or an actor exit), and neither does a member closed for
+        // identity convergence: both are definite refusals.
         error @ (MobError::UnsupportedForMode { .. }
         | MobError::MemberReloadRequired { .. }
         | MobError::MemberAdmissionBacklogFull { .. }
@@ -258,7 +262,9 @@ fn classify_scoped_submit_mob_error(error: meerkat_mob::MobError) -> ScopedDeliv
         | MobError::InvalidTransition { .. }
         | MobError::ActorCommandChannelClosed
         | MobError::MemberRetirementInProgress { .. }
-        | MobError::RetirementInProgress { .. }) => ScopedDeliveryError::Rejected {
+        | MobError::RetirementInProgress { .. }
+        | MobError::AdmissionClosed { .. }
+        | MobError::IdentityConvergenceAdmissionClosed { .. }) => ScopedDeliveryError::Rejected {
             detail: error.to_string(),
         },
         error => ScopedDeliveryError::Uncertain {
@@ -11856,6 +11862,43 @@ mod scoped_classification_tests {
             "{moved:?}"
         );
         for refusal in [&unbound, &unavailable, &moved] {
+            assert!(!refusal.admission_possible(), "{refusal:?}");
+        }
+    }
+
+    /// A closed mob admits nothing, whatever closed it, and neither does a
+    /// member closed for identity convergence: the refusal is definite, never
+    /// an uncertain delivery a caller would have to recover.
+    #[test]
+    fn a_closed_admission_rejects_a_scoped_delivery() {
+        use meerkat_mob::MobAdmissionCloseReason as Reason;
+        let mob_id = meerkat_mob::MobId::from("closed-mob");
+        let closed = [
+            Reason::IdleClose,
+            Reason::LastOwnerReleased,
+            Reason::StandDown,
+            Reason::Shutdown,
+            Reason::Destroyed,
+            Reason::DurabilityFailStop,
+            Reason::ActorLost,
+            Reason::DispatchFailed,
+        ]
+        .into_iter()
+        .map(|reason| meerkat_mob::MobError::AdmissionClosed {
+            mob_id: mob_id.clone(),
+            reason,
+        });
+        let converging = meerkat_mob::MobError::IdentityConvergenceAdmissionClosed {
+            member_id: meerkat_mob::ids::AgentIdentity::from("converging"),
+        };
+        for error in closed.chain(std::iter::once(converging)) {
+            let detail = error.to_string();
+            let refusal = classify_scoped_submit_mob_error(error);
+            assert!(
+                matches!(&refusal, ScopedDeliveryError::Rejected { detail: rejected }
+                    if rejected == &detail),
+                "{refusal:?}"
+            );
             assert!(!refusal.admission_possible(), "{refusal:?}");
         }
     }

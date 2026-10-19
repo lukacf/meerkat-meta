@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A scope-bound delivery that meerkat refuses because the mob's admission
+  is closed (`MobError::AdmissionClosed`, whatever closed it: an idle close,
+  the last owner's release, a stand-down, a shutdown, a destroy or an actor
+  exit) or because the member is closed for identity convergence
+  (`MobError::IdentityConvergenceAdmissionClosed`) is reported as
+  `ScopedDeliveryError::Rejected` (wire kind `scoped_delivery_rejected`,
+  `admission_possible: false`). Before, it was reported as `Uncertain`
+  (`scoped_delivery_uncertain`), so a caller recovered a delivery that was
+  never admitted.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking
