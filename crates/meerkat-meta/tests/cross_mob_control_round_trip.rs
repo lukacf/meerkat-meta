@@ -66,6 +66,7 @@ use meerkat_meta::runtime::cross_mob_control::{
     ControlGrant, ControlGrantTable, ControlMemberScope, ControlVerb,
 };
 use meerkat_meta::runtime::cross_mob_remote::{RemoteMobError, RemoteMobProxy};
+use meerkat_meta::runtime::keyed_inject::{KeyedInjectCallOutcome, NativeStatus};
 use meerkat_meta::{GatewayPeerKeys, UnifiedRuntime, UnifiedRuntimeBuilder};
 use meerkat_mob::{MobDefinition, SpawnMemberSpec};
 
@@ -262,7 +263,7 @@ async fn configured_listener_without_grants_refuses_every_caller() {
     assert!(
         matches!(
             error,
-            RemoteMobError::ControlRequestUnauthorized { ref code, .. }
+            RemoteMobError::Rejected { ref code, .. }
                 if code == "caller_not_granted"
         ),
         "unexpected deny-all result: {error:?}"
@@ -463,4 +464,219 @@ async fn uds_control_round_trip_wires_both_sides() {
 
     rt_a.shutdown().await;
     rt_b.shutdown().await;
+}
+
+const KEYED_MEMBER: &str = "personal:alice";
+
+const MOB_TOML_IDENTITY: &str = r#"
+[mob]
+id = "mob-k"
+
+[profiles.personal]
+model = "gpt-5.5"
+external_addressable = true
+runtime_mode = "turn_driven"
+
+[profiles.personal.tools]
+comms = true
+"#;
+
+struct KeyedMemberRoster;
+
+#[async_trait::async_trait]
+impl meerkat_meta::identity_first::contracts::RosterProvider for KeyedMemberRoster {
+    async fn roster(
+        &self,
+        _context: &meerkat_meta::identity_first::RosterContext,
+    ) -> Result<
+        Vec<meerkat_meta::identity_first::DurableAgentSpec>,
+        meerkat_meta::identity_first::RosterError,
+    > {
+        Ok(vec![meerkat_meta::identity_first::DurableAgentSpec {
+            identity: meerkat_meta::identity_first::AgentIdentity::parse(KEYED_MEMBER)
+                .expect("parse identity"),
+            profile: meerkat_mob::ProfileName::from("personal"),
+            addressability: meerkat_meta::identity_first::AgentAddressability::Addressable,
+            display_name: None,
+            labels: std::collections::BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: None,
+            backend: None,
+            binding: None,
+            placement: None,
+        }])
+    }
+}
+
+/// The caller's grant for the keyed inject verbs on one member.
+fn keyed_grants_for(caller: &GatewayPeerKeys, member: &str) -> ControlGrantTable {
+    let mut grants = ControlGrantTable::new();
+    grants.insert(
+        caller.pubkey_bytes(),
+        ControlGrant::new(
+            "peer-gateway",
+            [ControlVerb::InjectKeyed, ControlVerb::InjectStatus],
+            ControlMemberScope::members([member]),
+        ),
+    );
+    grants
+}
+
+/// A proxy to `runtime`'s control listener, pinning `server_keys` and
+/// authenticating as `caller`.
+fn keyed_proxy(
+    runtime: &UnifiedRuntime,
+    mob_id: &str,
+    server_keys: &GatewayPeerKeys,
+    caller: Arc<GatewayPeerKeys>,
+) -> RemoteMobProxy {
+    let address = runtime
+        .control_listener_advertised_address()
+        .expect("listener bound");
+    let entry = ContactEntry {
+        mob_id: mob_id.to_string(),
+        transport: MobTransport::Tcp(
+            address
+                .strip_prefix("tcp://")
+                .expect("tcp listener address")
+                .to_string(),
+        ),
+        pubkey: Some(server_keys.pubkey_bytes()),
+        require_signed_control: Some(true),
+    };
+    RemoteMobProxy::from_entry_with_caller(&entry, Some(caller))
+        .expect("valid contact")
+        .expect("tcp proxy")
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_millis(),
+    )
+    .expect("milliseconds fit")
+}
+
+/// The builder composes the keyed inject plane of the control listener it
+/// binds, through the composition every gateway shares: a runtime that is not
+/// identity-first answers `not_served` with its typed cause, rather than
+/// `keyed_inject_unavailable` forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_builder_runtime_that_is_not_identity_first_answers_keyed_inject_not_served() {
+    let _serial = CONTROL_TEST_LOCK.lock().await;
+    let server_keys = GatewayPeerKeys::ephemeral();
+    let caller = Arc::new(GatewayPeerKeys::ephemeral());
+    let runtime = build_runtime(
+        MOB_TOML_B,
+        "tcp://127.0.0.1:0",
+        server_keys.clone(),
+        keyed_grants_for(&caller, KEYED_MEMBER),
+    )
+    .await;
+    let proxy = keyed_proxy(&runtime, "mob-b", &server_keys, caller);
+    match proxy
+        .inject_status(KEYED_MEMBER, "batch-1", false, now_ms())
+        .await
+        .expect("a signed answer")
+    {
+        KeyedInjectCallOutcome::Refused { code, cause, .. } => {
+            assert_eq!(code, "not_served");
+            assert_eq!(cause.as_deref(), Some("not_identity_first"));
+        }
+        other => panic!("expected not_served, got {other:?}"),
+    }
+    runtime.shutdown().await;
+}
+
+/// A runtime whose configuration turns keyed inject serving off answers
+/// `not_served` with the cause `runtime_disabled`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_builder_runtime_with_keyed_inject_off_answers_runtime_disabled() {
+    let _serial = CONTROL_TEST_LOCK.lock().await;
+    let server_keys = GatewayPeerKeys::ephemeral();
+    let caller = Arc::new(GatewayPeerKeys::ephemeral());
+    let definition = MobDefinition::from_toml(MOB_TOML_B).expect("parse mob definition");
+    let mut runtime = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .default_llm_client(Arc::new(TestClient::default()))
+            .meerkat_config(tcp_member_comms_config())
+            .control_listen("tcp://127.0.0.1:0")
+            .control_grants(keyed_grants_for(&caller, KEYED_MEMBER))
+            .keyed_inject_plane(meerkat_meta::mob_announcements::KeyedInjectPlane::Disabled)
+            .build(),
+    )
+    .await
+    .expect("build runtime");
+    runtime.set_gateway_peer_keys(server_keys.clone());
+    let proxy = keyed_proxy(&runtime, "mob-b", &server_keys, caller);
+    match proxy
+        .inject_keyed(
+            meerkat_meta::runtime::keyed_inject::KeyedInject {
+                member: KEYED_MEMBER,
+                delivery_key: "batch-1",
+                content_digest: "digest",
+                summary: "1 announcement",
+                body: "a body",
+            },
+            now_ms(),
+        )
+        .await
+        .expect("a signed answer")
+    {
+        KeyedInjectCallOutcome::Refused { code, cause, .. } => {
+            assert_eq!(code, "not_served");
+            assert_eq!(cause.as_deref(), Some("runtime_disabled"));
+        }
+        other => panic!("expected not_served, got {other:?}"),
+    }
+    runtime.shutdown().await;
+}
+
+/// An identity-first runtime the builder composes with a control listener
+/// serves peers' keyed injects: a granted status read answers from
+/// the runtime's own continuation owner.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_builder_composed_identity_first_runtime_serves_keyed_inject() {
+    let _serial = CONTROL_TEST_LOCK.lock().await;
+    let state = tempfile::tempdir().expect("state dir");
+    let server_keys = GatewayPeerKeys::ephemeral();
+    let caller = Arc::new(GatewayPeerKeys::ephemeral());
+    let mut runtime = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(MobDefinition::from_toml(MOB_TOML_IDENTITY).expect("definition"))
+            .persistent_state(state.path())
+            .continuity_from_state_dir(state.path())
+            .await
+            .expect("open the state-dir identity substrate")
+            .roster_provider(Arc::new(KeyedMemberRoster))
+            .identity_bootstrap_mode(
+                meerkat_meta::identity_first::IdentityBootstrapMode::LazyMaterialize,
+            )
+            .identity_runtime_instance_id("mob-k")
+            .comms(true)
+            .default_llm_client(Arc::new(TestClient::default()))
+            .control_listen("tcp://127.0.0.1:0")
+            .control_grants(keyed_grants_for(&caller, KEYED_MEMBER))
+            .build(),
+    )
+    .await
+    .expect("build the identity-first runtime");
+    runtime.set_gateway_peer_keys(server_keys.clone());
+    let proxy = keyed_proxy(&runtime, "mob-k", &server_keys, caller);
+    match proxy
+        .inject_status(KEYED_MEMBER, "batch-1", false, now_ms())
+        .await
+        .expect("a signed answer")
+    {
+        KeyedInjectCallOutcome::Answered(answer) => {
+            assert_eq!(answer.status, NativeStatus::NotCommitted);
+        }
+        other => panic!("expected a served status read, got {other:?}"),
+    }
+    runtime.shutdown().await;
 }

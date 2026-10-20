@@ -173,6 +173,8 @@ pub struct UnifiedRuntimeBuilder {
     contact_directory: Option<ContactDirectory>,
     control_listen: Option<String>,
     control_grants: Option<crate::runtime::cross_mob_control::ControlGrantTable>,
+    keyed_inject: Option<crate::mob_announcements::KeyedInjectPlane>,
+    mob_announcements: Option<crate::mob_announcements::AnnouncementConfig>,
     persistent_metadata: Option<Arc<dyn PersistentMetadataStore>>,
     access_controller: Option<crate::access::AccessController>,
     flow_editor_host_deploy: bool,
@@ -1057,6 +1059,42 @@ impl UnifiedRuntimeBuilder {
         self
     }
 
+    /// How the configured cross-mob control listener serves peers' keyed
+    /// injects. Without it, an identity-first runtime serves them with the
+    /// default freshness window, and any other runtime answers `not_served`.
+    pub fn keyed_inject_plane(mut self, plane: crate::mob_announcements::KeyedInjectPlane) -> Self {
+        self.keyed_inject = Some(plane);
+        self
+    }
+
+    /// Enable mob announcements on this runtime, composed the way
+    /// `rpc_gateway` composes `runtime_options.mob_announcements`
+    /// ([`crate::mob_announcements::AnnouncementComposition`]): members
+    /// announce to their mob and receive what they subscribe to in batches,
+    /// and the host's own profiles that name
+    /// [`crate::mob_announcements::tools::TOOL_BUNDLE`] in
+    /// `tools.rust_bundles` get the member tools. With
+    /// `member_tools_in_child_mobs` the bundle is offered to child mobs, and
+    /// a child mob profile mounts it by naming it in its `tools.bundles`.
+    ///
+    /// Needs [`Self::persistent_state`], which holds the announcement
+    /// database, and an identity-first runtime ([`Self::roster_provider`]);
+    /// `build()` refuses it otherwise, and refuses a configuration
+    /// [`crate::mob_announcements::AnnouncementConfig::validate`] refuses.
+    /// While [`Self::keyed_inject_plane`] serves (by default with
+    /// [`crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS`]),
+    /// its window is also the one this runtime assumes its peers apply to its
+    /// own requests, in place of the configuration's
+    /// `peer_request_window_ms`. The runtime's shutdown stops the dispatcher.
+    #[must_use]
+    pub fn mob_announcements(
+        mut self,
+        config: crate::mob_announcements::AnnouncementConfig,
+    ) -> Self {
+        self.mob_announcements = Some(config);
+        self
+    }
+
     /// Install a persistent metadata store. Used for the structural-events
     /// subscription cursor — see `runtime::metadata::PersistentMetadataStore`.
     /// When unset, the builder defaults to an `InMemoryMetadataStore`, which
@@ -1256,6 +1294,56 @@ impl UnifiedRuntimeBuilder {
                 ),
             ));
         }
+
+        // Mob announcements compose through the same two steps as on every
+        // gateway: refuse what cannot compose before anything is built, and
+        // put the member tool bundle on the spec with the builder's own.
+        let announcements = match self.mob_announcements.take() {
+            Some(config) => {
+                // An identity-first runtime on an external substrate has no
+                // state directory to hold the announcement database.
+                if !has_persistent_state {
+                    return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                        "mob_announcements() requires persistent_state(), which holds the \
+                         announcement database"
+                            .to_string(),
+                    ));
+                }
+                if !wants_identity_first {
+                    return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                        "mob_announcements() requires an identity-first runtime \
+                         (roster_provider())"
+                            .to_string(),
+                    ));
+                }
+                let mut composition = crate::mob_announcements::AnnouncementComposition::new(
+                    config,
+                )
+                .map_err(|error| {
+                    UnifiedRuntimeBuilderError::ConflictingConfiguration(format!(
+                        "mob_announcements(): {error}"
+                    ))
+                })?;
+                if let crate::mob_announcements::KeyedInjectPlane::Serve { window_ms } =
+                    self.keyed_inject.unwrap_or_default()
+                {
+                    composition = composition.with_peer_request_window(window_ms);
+                }
+                let (name, dispatcher, availability) = composition.member_tool_bundle();
+                if self.tool_bundles.contains_key(name) {
+                    return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                        format!(
+                            "tool bundle '{name}' is the mob announcement member tools, which \
+                         mob_announcements() registers"
+                        ),
+                    ));
+                }
+                self.tool_bundles
+                    .insert(name.to_string(), (dispatcher, availability));
+                Some(composition)
+            }
+            None => None,
+        };
 
         #[cfg(feature = "extension-state")]
         if (!self.tool_bundle_factories.is_empty() || !self.mcp_document_bindings.is_empty())
@@ -2028,6 +2116,23 @@ impl UnifiedRuntimeBuilder {
                 })?;
         }
 
+        // Mob announcements attach once the identity runtime is installed,
+        // before discovery and before the control listener seals its keyed
+        // inject plane: the order every gateway composes them in. A failure
+        // follows the cooperative shutdown path of the other late errors.
+        if let Some(composition) = announcements {
+            let composed = match storage_layout.as_ref() {
+                Some(layout) => composition.compose(&runtime, layout).map(drop),
+                None => Err("mob announcements need persistent_state()".to_string()),
+            };
+            if let Err(error) = composed {
+                let build_error =
+                    UnifiedRuntimeBuilderError::Io(format!("mob_announcements(): {error}"));
+                runtime.shutdown().await;
+                return Err(build_error);
+            }
+        }
+
         if runtime.identity_first_context.is_none()
             && let Some(ref discovery) = runtime.discovery
         {
@@ -2069,6 +2174,17 @@ impl UnifiedRuntimeBuilder {
                 .start_control_listener_with_authorizer(addr, authorizer)
                 .await
             {
+                let build_error =
+                    UnifiedRuntimeBuilderError::Io(format!("control_listen(): {error}"));
+                runtime.shutdown().await;
+                return Err(build_error);
+            }
+            // The runtime is composed: seal what the listener's keyed inject
+            // plane serves, through the composition every surface shares.
+            if let Err(error) = crate::mob_announcements::compose_keyed_inject_plane(
+                &runtime,
+                self.keyed_inject.unwrap_or_default(),
+            ) {
                 let build_error =
                     UnifiedRuntimeBuilderError::Io(format!("control_listen(): {error}"));
                 runtime.shutdown().await;

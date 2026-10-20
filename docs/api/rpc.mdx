@@ -252,6 +252,11 @@ errors. SDKs surface it on `RpcError.data`.
 | `-32018` | stdio gateway: an ordinary request arrived before `meta/init` settled. It was refused at once, not queued. Startup provider callbacks must not issue ordinary RPCs on the runtime that is starting. `meta/shutdown` is still admitted. | `{kind: "init_in_progress", method}` |
 | `-32019` | `meta/init` mob composition provenance refusal: the persistent mob storage's recorded composition cannot be proven to match the launch. Raised before the mob actuates, for a supplied definition that differs from the recorded one, a candidate launch whose definition differs from the stored one it would boot, a store created by a rehearsal launch, a composition manifest that is unreadable, malformed, of an unsupported version or could not be written, or undeclared non-empty storage. (`missing` is part of the kind vocabulary but the gateway does not raise it today: an authoritative launch adopts and records the definition when the manifest is absent.) The message keeps the `Runtime bootstrap failed: ` prefix and names the remedy. The gateway writes the error response (or, for an accepted init, the `failed` settlement) and exits. | `{kind, fields, manifest?, storage?, found_version?, supported_version?}`; `kind` is `divergent`, `candidate_divergent`, `created_by_rehearsal`, `missing`, `unreadable`, `malformed`, `unsupported_version`, `not_recorded` or `unproven_storage`; `fields` is always present and lists the diverged definition fields as dotted paths (empty for other kinds) |
 | `-32030` | HTTP console ABAC gate refused the operation | `{kind: "access_denied", ...}` |
+| `-32044` | A mob announcement method on a gateway that did not enable mob announcements (see [Mob announcements](#mob-announcements-optional)) | `{kind: "mob_announcements_unavailable"}` |
+| `-32045` | Mob announcement conflict: a source key already bound to other content, a stale subscription revision, a reused operation id, a batch that moved | `{kind: "announcement_conflict", existing}`, `{kind: "stale_revision", current_revision}`, `{kind: "operation_reused"}` or `{kind: "batch_moved", current}` |
+| `-32046` | `meta/mob_announcements/subscriptions/put` start frontier outside a mob's announcements: older than what is retained, or beyond its head (a mob that has announced nothing yet is at head 0) | `{kind: "gap", mob_id, earliest_retained}` or `{kind: "frontier_beyond_head", mob_id, head}` |
+| `-32047` | Mob announcement typed refusal | `{kind}`: `governed_runtime`, `unknown_member` (with `member`), `unusable_member`, `unusable_peer`, `subscription_cancelled`, `subscription_ended` (with `end`), `member_mismatch`, `unrelated_mob` (with `mob_id`; member tools only), `ambiguous_mob` (with `mob_id`, or `kept_route`), `child_member_limit` (with `limit`, and `mob_id` for the bound per mob) or `native_unavailable` |
+| `-32048` | A mob announcement method names a subscription, delivery or mob that does not exist here | `{kind: "unknown_subscription"}`, `{kind: "unknown_delivery"}` or `{kind: "unknown_mob", mobs}` |
 
 The `-32010` constant is exported from both SDKs as
 `MOB_EVENTS_STALE_CURSOR_CODE`. The Python and TypeScript SDKs auto-
@@ -1991,6 +1996,152 @@ the first replayed event by `event_id`.
 ## Console ingress
 
 The older `console.route` style is not the stock console contract. Use `GET /console/experience`, `GET /console/timeline`, and `POST /console/rpc` instead.
+
+## Mob announcements (optional)
+
+Available on hosts launched persistent and identity-first with mob
+announcements enabled: `runtime_options.mob_announcements = {"enabled": true}`
+on `rpc_gateway`, the `mob_announcements` init param on `meta_gateway`, or
+`UnifiedRuntimeBuilder::mob_announcements` in a Rust host; otherwise these
+methods answer `-32044`. The console serves the same methods on
+`POST /console/rpc` through the same handler, so a runtime without mob
+announcements answers them there exactly as `rpc_gateway` does:
+`-32044` `mob_announcements_unavailable`. On the console every method, the
+reads included, requires the `runtime.admin` grant, and a read-only console
+refuses the ones that change state (`announce`,
+`subscriptions/{put,pause,resume,cancel}` and `deliveries/reconcile`). The host announces a development to a mob hosted on
+this gateway, once per mob and source key. Every member subscription that
+names the mob and one of the announcement's topics captures it in the same
+transaction, and each subscriber receives what it is owed in bounded batches,
+each as one Meerkat host continuation. The design, defaults and limits are in
+`docs/design/mob-announcements.md` in the repository.
+
+| Method | Params | Result |
+|--------|--------|--------|
+| `meta/mob_announcements/announce` | `{mob_id?, source_key, topics, body, correlation_id?, causes?}` | `{announcement, replayed, captured}` |
+| `meta/mob_announcements/get` | `{mob_id, source_key}` | `{announcement}` (`null` when absent) |
+| `meta/mob_announcements/subscriptions/put` | `{operation_id, subscription_id, member, topics, mobs?, start?, expected_revision?}` | `{subscription}` |
+| `meta/mob_announcements/subscriptions/pause`, `resume`, `cancel` | `{operation_id, subscription_id, expected_revision}` | `{subscription, unresolved_batches}` |
+| `meta/mob_announcements/subscriptions/get` | `{subscription_id}` | `{subscription, marker}` |
+| `meta/mob_announcements/subscriptions/list` | `{member?, after?, limit?}` | `{subscriptions}` |
+| `meta/mob_announcements/deliveries/list` | `{member?, subscription_id?, after?, limit?}` | `{deliveries}` |
+| `meta/mob_announcements/deliveries/observe` | `{batch_id}` | `{batch, native, input?, marker?}` |
+| `meta/mob_announcements/deliveries/reconcile` | `{batch_id}` | `{batch, native, input?, marker?}` |
+
+`mob_id` and `mobs` default to this gateway's mob, and every mob named must
+be hosted here (`-32048` `unknown_mob` otherwise). A host call announces as
+`{"kind": "host"}`; `captured` counts the subscriptions that captured the
+announcement and never names them. `start` is `{"kind": "now"}` (default) or
+`{"kind": "after", "frontier": {"<mob id>": <sequence>}}`; capture starts
+after each named sequence, and the frontier may name only the subscription's
+mobs. A sequence beyond a mob's head is refused with `-32046`
+`frontier_beyond_head`, never clamped. `native.status` is the native
+continuation owner's own status (`not_submitted`, `not_committed`, `pending`,
+`applied`, `stranded`, `refused`, or `unavailable` when it could not be
+read), and `input` is the admitted input's runtime state. Admission is not
+processing: read `input` for what the runtime did with it. A batch in state
+`expired` waited longer than the retention window with nothing native
+holding it, and, once submitted and owed again after a refusal, past the
+quiet window after its last request. One in state `expired_unverified` was submitted, and whether it
+was committed was never learned: past the retention window, and past the
+quiet window since its last submission (the request window plus the slowest
+settle pause), no status read brought a status. One in state
+`committed_unconfirmed` was committed to the member's inbox, with its
+`receipt` kept, and its admission was never confirmed: past the retention
+window since the commit it was still pending, or no status could be read for
+the quiet window after that. Neither is ever submitted again. The member's
+next batch lists what it did not get in `gaps` (`[{mob_id, count, reason}]`,
+reason `expired`, `not_retained`, `delivery_not_confirmed` or
+`admission_not_confirmed`) and in a gap line of its body. A delivery that was
+not confirmed can still arrive later, after later announcements: neither its
+arrival nor its absence was confirmed. A batch that settles so hands its own
+gap lines to the member's next batch too: a member reads them at least once,
+and may read them twice.
+
+What a status read finds after such a batch settled is kept on it as `late`:
+the native status in its own shape (`status` is `not_committed`, `pending`,
+`applied`, `stranded` or `refused`, with its `receipt`), and `at_ms`, when it
+was read. It never reopens the batch, and the member's next batch goes on as
+it was. Such a batch is read again once per quiet window until what it keeps
+is final (anything but `pending`) or retention removes it.
+
+`member` is `{"mob_id": "<mob id>", "identity": "<identity>"}`: an identity
+is unique only within its mob. A member of this gateway's mob must be a
+registered identity served by this gateway's runtime: one placed on a host or
+bound to an external runtime is refused with `-32047` `unusable_member`. A
+member of another mob hosted here (a mob a member created) must be on that
+mob's roster now, and the mob running and not completed; it is reached
+through this gateway's runtime by its plain roster id. A mob held until its
+owner resolves is `native_unavailable`. A mob id that names a mob hosted
+here and a peer alike, or a member whose kept route would change, is
+refused with `ambiguous_mob`. A
+member of a mob on a peer gateway is reached through keyed inject (see
+[Keyed inject](/concepts/access-control#keyed-inject)) when this gateway's
+contact directory files that mob with a pinned key and this gateway holds a
+signing key; otherwise it is refused with `unusable_peer`.
+
+A subscription's `state` is `active`, `paused`, `cancelled` or `ended`. It
+ends, with `ended` saying why, only on a final fact: every mob it named was
+destroyed (`mobs_ended`); for a member of another mob hosted here, that mob
+was destroyed, created again, completed or reset after the subscription was
+made (`member_mob_ended`, with `why`); or its member departed
+(`member_departed`, with the `departure` evidence: for a member on a peer
+gateway, that gateway's signed `member_departed` answer, `{"kind":
+"signed_peer_departure", "peer": "<mob id>"}`). No gateway of this release
+records a final fact that a member left, so none answers `member_departed`
+yet, and a member's departure ends nothing. What an ended subscription
+captured and no batch holds settles. A destroyed mob leaves the
+subscriptions that name it at a new revision and is listed in their
+`ended_mobs`.
+
+A member that is not registered, or not served, where its deliveries go
+ends nothing: it may be registered or served again. Nor does a member that
+left this gateway, a placement, a governed runtime or a member with no live
+incarnation. Its owed batches expire after the retention window meanwhile,
+and `subscriptions/cancel` ends a subscription whose member is not coming
+back. Its deliveries wait, and `marker` says why: the latest classified
+outcome of an attempt for the member, `{cause, evidence, since_ms}`, held in
+memory and rebuilt from the next attempt after a restart (`null`, or absent,
+while nothing waits). It is the latest attempt's, so it can outlive the wait
+it names (after a cancel, or once the batch settles) until the member's next
+attempt or a restart.
+`evidence` is `verified` (a signed answer whose signature verified),
+`unverified` (an unsigned answer, one that failed verification, or none) or
+`local` (this gateway's own fact). A signed answer that nothing was
+committed returns the batch to `sealed`, and it is submitted again at the
+slowest settle pace; an unknown outcome keeps it `submitting` until a status
+read settles it, and nothing is submitted again before one does.
+
+| `cause.kind` | Evidence | Meaning |
+|---|---|---|
+| `peer_composing` | verified | The peer's keyed inject plane is still starting. |
+| `peer_not_serving` | verified | The peer does not serve keyed inject; `cause` is `not_identity_first`, `runtime_disabled` or `unknown` (none given, or one this build does not know). |
+| `clock_skew` | verified | The peer refused the request as issued outside its window (`outside_window`); `issued_at_ms` and `window_ms` are this gateway's own. |
+| `stale_request` | verified | The peer refused the request for its timing and committed nothing; `cause` is `issued_before_start` (issued before the peer's serving process started), `deadline_passed` (the peer could not commit it by its deadline, the request's issue time plus the window) or `unknown`. |
+| `member_unknown` | verified, local | The member is not registered where it is served. |
+| `member_not_served_here` | verified, local | The member is placed on a host (`placed_on_host`) or bound to an external runtime (`external_binding`); `cause` is `null` from a peer, which does not say which. |
+| `governed` | verified, local | The member's runtime refuses host continuations. |
+| `member_not_live` | verified, local | The member has no live incarnation now. |
+| `peer_native_unavailable` | verified | The peer could not read or write its native state; the status is read next. |
+| `peer_refused_unknown` | verified | A signed refusal this build cannot read for the request (`code`); the outcome stays unknown. |
+| `peer_refused` | verified | A signed refusal of a status read with a code this build knows (`code`, such as `conflict`) that settles nothing for a read; the outcome stays unknown. |
+| `local_not_authenticatable` | local | This gateway cannot call the peer authenticated; the peer was never asked. |
+| `answer_failed_verification` | unverified | An answer failed verification; the outcome is unknown. |
+| `peer_unanswered` | unverified | No signed answer; `code` is the peer's unsigned code as text, or `null`. |
+| `native_unavailable` | local | This gateway's own native owner could not be read or written now. |
+
+A `not_served` or `stale_request` cause this build does not know reads
+`unknown`; a peer's refusal code it does not know is kept as
+`peer_refused_unknown` with the code; and a departure's evidence has one
+kind in this release, `signed_peer_departure`. On the peer route, a peer
+answers its own blocked status (`native_key_invalid`,
+`native_inconsistent`) as `native_unavailable`, so the batch waits instead
+of blocking and the bounds on an unknown outcome settle it: a status read
+that rules a batch out blocks it on the local route only. A blocked batch's
+`cause` starts
+with its typed reason: `conflict`, `peer_invalid_request`,
+`request_oversize`, `native_invalid`, `native_inconsistent` or
+`native_key_invalid`.
 
 ## See also
 

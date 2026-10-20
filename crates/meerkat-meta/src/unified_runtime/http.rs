@@ -369,6 +369,7 @@ impl UnifiedRuntime {
             Some(Arc::clone(&self.job_health_projection)),
             Some(view),
             self.console_governed_ingress.clone(),
+            self.mob_announcements_slot(),
         )
     }
 
