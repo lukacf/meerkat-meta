@@ -119,7 +119,7 @@ async fn scoped_grant_admits_only_its_verb_and_member() {
     assert!(
         matches!(
             wrong_member,
-            RemoteMobError::ControlRequestUnauthorized { ref code, .. } if code == "member_not_granted"
+            RemoteMobError::Rejected { ref code, .. } if code == "member_not_granted"
         ),
         "got {:?}",
         wrong_member
@@ -133,7 +133,7 @@ async fn scoped_grant_admits_only_its_verb_and_member() {
     assert!(
         matches!(
             wrong_verb,
-            RemoteMobError::ControlRequestUnauthorized { ref code, .. } if code == "verb_not_granted"
+            RemoteMobError::Rejected { ref code, .. } if code == "verb_not_granted"
         ),
         "got {:?}",
         wrong_verb
@@ -160,7 +160,11 @@ async fn unauthenticated_and_unknown_callers_are_refused() {
     let mut table = ControlGrantTable::new();
     table.insert(
         granted_keys.pubkey_bytes(),
-        ControlGrant::new("ops-mob", ControlVerb::all(), ControlMemberScope::All),
+        ControlGrant::new(
+            "ops-mob",
+            ControlVerb::all().iter().copied(),
+            ControlMemberScope::All,
+        ),
     );
     let authorizer = Arc::new(ControlAuthorizer::with_grants(table));
 
@@ -191,7 +195,7 @@ async fn unauthenticated_and_unknown_callers_are_refused() {
     assert!(
         matches!(
             anonymous_error,
-            RemoteMobError::ControlRequestUnauthorized { ref code, .. } if code == "unauthenticated_caller"
+            RemoteMobError::Rejected { ref code, .. } if code == "unauthenticated_caller"
         ),
         "got {:?}",
         anonymous_error
@@ -207,7 +211,7 @@ async fn unauthenticated_and_unknown_callers_are_refused() {
     assert!(
         matches!(
             stranger_error,
-            RemoteMobError::ControlRequestUnauthorized { ref code, .. } if code == "caller_not_granted"
+            RemoteMobError::Rejected { ref code, .. } if code == "caller_not_granted"
         ),
         "got {:?}",
         stranger_error

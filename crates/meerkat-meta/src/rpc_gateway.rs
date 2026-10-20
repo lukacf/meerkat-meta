@@ -215,6 +215,18 @@ struct GatewayRuntimeOptions {
     /// `http_listen` exposes the listener beyond this host. Same word and
     /// rule as `--allow-remote` on `rkat-rpc --tcp`.
     allow_remote: bool,
+    /// `runtime_options.mob_announcements`: members announce to their mob
+    /// and receive what they subscribe to in batches. Persistent
+    /// identity-first launches only; `None` keeps them off.
+    mob_announcements: Option<crate::mob_announcements::AnnouncementConfig>,
+    /// `runtime_options.control_request_window_ms`: how far a signed keyed
+    /// inject request's issue time may be from this gateway's clock, in
+    /// either direction, before the control listener refuses it as stale.
+    control_request_window_ms: u64,
+    /// `runtime_options.serve_keyed_inject`: whether the control listener
+    /// serves peers' keyed injects (default true). Off, both keyed inject
+    /// verbs answer `not_served` with the cause `runtime_disabled`.
+    serve_keyed_inject: bool,
 }
 
 /// `runtime_options.live` wire forms: `true` mounts the live WebSocket
@@ -404,6 +416,19 @@ impl GatewayRuntimeOptions {
         }
         false
     }
+
+    /// How the control listener serves peers' keyed injects:
+    /// `serve_keyed_inject` off disables it, and otherwise it serves within
+    /// `control_request_window_ms`.
+    fn keyed_inject_plane(&self) -> crate::mob_announcements::KeyedInjectPlane {
+        if self.serve_keyed_inject {
+            crate::mob_announcements::KeyedInjectPlane::Serve {
+                window_ms: self.control_request_window_ms,
+            }
+        } else {
+            crate::mob_announcements::KeyedInjectPlane::Disabled
+        }
+    }
 }
 
 impl Default for GatewayRuntimeOptions {
@@ -447,6 +472,9 @@ impl Default for GatewayRuntimeOptions {
             http_listen: crate::gateway_composition::DEFAULT_GATEWAY_HTTP_LISTEN,
             http_public_base_url: None,
             allow_remote: false,
+            mob_announcements: None,
+            control_request_window_ms: crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS,
+            serve_keyed_inject: true,
         }
     }
 }
@@ -4186,6 +4214,78 @@ actions = ["agent.view"]
         );
         assert!(declared.allow_remote);
         Ok(())
+    }
+
+    /// `runtime_options.serve_keyed_inject` turns keyed inject serving off;
+    /// it defaults on, and only a boolean is accepted.
+    #[test]
+    fn gateway_runtime_options_parse_serve_keyed_inject() -> Result<(), String> {
+        let defaulted = parse_gateway_runtime_options(&json!({ "runtime_options": {} }), None)?;
+        assert_eq!(
+            defaulted.keyed_inject_plane(),
+            crate::mob_announcements::KeyedInjectPlane::Serve {
+                window_ms: crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS
+            }
+        );
+        let windowed = parse_gateway_runtime_options(
+            &json!({ "runtime_options": { "control_request_window_ms": 60_000 } }),
+            None,
+        )?;
+        assert_eq!(
+            windowed.keyed_inject_plane(),
+            crate::mob_announcements::KeyedInjectPlane::Serve { window_ms: 60_000 }
+        );
+        let off = parse_gateway_runtime_options(
+            &json!({ "runtime_options": {
+                "serve_keyed_inject": false,
+                "control_request_window_ms": 60_000
+            } }),
+            None,
+        )?;
+        assert_eq!(
+            off.keyed_inject_plane(),
+            crate::mob_announcements::KeyedInjectPlane::Disabled
+        );
+        let malformed = parse_gateway_runtime_options(
+            &json!({ "runtime_options": { "serve_keyed_inject": "no" } }),
+            None,
+        )
+        .map(|_| ());
+        assert!(
+            matches!(&malformed, Err(error) if error.contains("runtime_options.serve_keyed_inject")),
+            "{malformed:?}"
+        );
+        Ok(())
+    }
+
+    /// `runtime_options.mob_announcements.member_tools_in_child_mobs` is the
+    /// ceiling of the per-profile opt-in: gateway init takes it, and the
+    /// composed configuration carries it. Without it the ceiling is off.
+    #[test]
+    fn gateway_runtime_options_take_the_member_tools_ceiling_for_child_mobs() {
+        let state = std::path::Path::new("/nonexistent-state");
+        for (ceiling, expected) in [
+            (json!(true), true),
+            (json!(false), false),
+            (Value::Null, false),
+        ] {
+            let mut options = json!({ "enabled": true });
+            if !ceiling.is_null() {
+                options["member_tools_in_child_mobs"] = ceiling;
+            }
+            let parsed = parse_gateway_runtime_options(
+                &json!({ "runtime_options": { "mob_announcements": options } }),
+                Some(state),
+            )
+            .expect("the ceiling is an option, not a refusal");
+            assert_eq!(
+                parsed
+                    .mob_announcements
+                    .expect("enabled")
+                    .member_tools_in_child_mobs,
+                expected
+            );
+        }
     }
 
     #[test]
@@ -8439,6 +8539,9 @@ fn parse_gateway_runtime_options(
         "http_listen",
         "http_public_base_url",
         "allow_remote",
+        "mob_announcements",
+        "control_request_window_ms",
+        "serve_keyed_inject",
     ];
     let unsupported = runtime_options
         .keys()
@@ -8507,6 +8610,28 @@ fn parse_gateway_runtime_options(
         parsed.allow_remote = value
             .as_bool()
             .ok_or_else(|| "runtime_options.allow_remote must be a boolean".to_string())?;
+    }
+    if let Some(value) = runtime_options.get("control_request_window_ms") {
+        let window = value
+            .as_u64()
+            .filter(|window| (1_000..=3_600_000).contains(window))
+            .ok_or_else(|| {
+                "runtime_options.control_request_window_ms must be an integer in 1000..=3600000"
+                    .to_string()
+            })?;
+        parsed.control_request_window_ms = window;
+    }
+    if let Some(value) = runtime_options.get("serve_keyed_inject") {
+        parsed.serve_keyed_inject = value
+            .as_bool()
+            .ok_or_else(|| "runtime_options.serve_keyed_inject must be a boolean".to_string())?;
+    }
+    if let Some(value) = runtime_options.get("mob_announcements") {
+        parsed.mob_announcements = crate::mob_announcements::parse_runtime_options(value)
+            .map_err(|error| error.to_string())?;
+        if parsed.mob_announcements.is_some() && persistent_state.is_none() {
+            return Err("runtime_options.mob_announcements needs a persistent launch".to_string());
+        }
     }
     if let Some(memory_config) = runtime_options.get("memory_config") {
         parsed.runtime_options.memory_backend = Some(parse_gateway_memory_config(
@@ -16244,6 +16369,27 @@ external_addressable = true
             .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?,
         None => None,
     };
+    // Mob announcements compose through the one composition every surface
+    // shares: the member tool bundle a profile opts into with
+    // `tools.rust_bundles` goes on the mob spec below, and the owner attaches
+    // once the runtime is built. A peer refuses a keyed inject issued further
+    // from its clock than this gateway's window, which bounds when a peer
+    // member's batch may expire.
+    let announcements = gateway_options
+        .mob_announcements
+        .map(|config| {
+            crate::mob_announcements::AnnouncementComposition::new(config).map(|composition| {
+                composition.with_peer_request_window(gateway_options.control_request_window_ms)
+            })
+        })
+        .transpose()
+        .map_err(|error| {
+            fail_init(
+                &request_id,
+                -32602,
+                format!("runtime_options.mob_announcements: {error}"),
+            )
+        })?;
     let (
         mob_spec,
         _temp_dir,
@@ -16855,6 +17001,11 @@ external_addressable = true
             });
         }
         slots.extend(crate::storage_health::scratch_ring_buffer_slots());
+        if let Some(announcements) = announcements.as_ref() {
+            // The host's own profiles name the bundle; under the ceiling a
+            // child mob profile mounts it by naming it in its tools.bundles.
+            spec = announcements.register_member_tools(spec);
+        }
         // The M4 census had no mob slot at all, which is why an in-memory mob
         // storage on this persistent launch was invisible to healthz and the
         // storage doctor while sessions correctly reported persistent. It now
@@ -18651,6 +18802,23 @@ external_addressable = true
         };
     let app = app.layer(axum::Extension(console_voice_controller.clone()));
 
+    // Mob announcements attach once the identity runtime and the agent mob
+    // tool state exist, before the first request is served.
+    if let Some(announcements) = announcements {
+        announcements
+            .compose(&runtime, &storage_layout)
+            .map_err(|message| fail_init(&request_id, -32602, message))?;
+    }
+    // The runtime is composed: seal what the control listener's keyed inject
+    // plane serves, through the one composition every surface shares.
+    if control_listen_address.is_some() {
+        crate::mob_announcements::compose_keyed_inject_plane(
+            &runtime,
+            gateway_options.keyed_inject_plane(),
+        )
+        .map_err(|message| fail_init(&request_id, -32602, message))?;
+    }
+
     // 8. Send init response via stdout channel
     let loaded_modules = runtime.loaded_modules().await;
     let runtime_origin = if prepared.is_some() {
@@ -18836,6 +19004,9 @@ external_addressable = true
             signal = dispatch_end.signal().map(tracing::field::display),
             "rpc_gateway dispatch loop ended; running graceful shutdown"
         );
+        if let Some(announcements) = runtime.mob_announcements() {
+            announcements.stop();
+        }
         if let Some(closed) = observed_stdio_close(&resources.stdio) {
             gateway_shutdown = gateway_shutdown.or(closed.shutdown_request);
         }

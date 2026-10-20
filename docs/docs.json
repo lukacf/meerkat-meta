@@ -45,6 +45,7 @@
               "concepts/gating",
               "concepts/access-control",
               "concepts/delivery",
+              "concepts/mob-announcements",
               "concepts/scheduling",
               "concepts/memory",
               "concepts/sessions"

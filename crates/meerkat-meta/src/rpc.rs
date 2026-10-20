@@ -2143,6 +2143,11 @@ async fn handle_unified_rpc_json_inner(
                 methods.extend_from_slice(workgraph_methods::WORKGRAPH_READ_METHODS);
                 methods.extend_from_slice(workgraph_methods::WORKGRAPH_MUTATE_METHODS);
             }
+            // Mob announcement methods are advertised only when the host
+            // enabled them.
+            if runtime.mob_announcements().is_some() {
+                methods.extend_from_slice(crate::mob_announcements::rpc::ANNOUNCEMENT_METHODS);
+            }
             // Live methods are advertised only when the gateway attached a
             // live transport (`runtime_options.live`, persistent mode).
             if live.is_some() {
@@ -5756,6 +5761,37 @@ async fn handle_unified_rpc_json_inner(
                         }
                     }
                 }
+            }
+        }
+        method if crate::mob_announcements::rpc::is_announcement_method(method) => {
+            let service = runtime.mob_announcements();
+            let outcome = match crate::mob_announcements::MobId::new(
+                runtime.mob_handle().mob_id().to_string(),
+            ) {
+                Ok(own_mob) => {
+                    crate::mob_announcements::rpc::handle_announcement_method(
+                        service.as_ref(),
+                        &own_mob,
+                        method,
+                        &request.params,
+                    )
+                    .await
+                }
+                Err(error) => Err(JsonRpcError::new(-32000, error.to_string())),
+            };
+            match outcome {
+                Ok(result) => JsonRpcResponse {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id: response_id,
+                    result: Some(result),
+                    error: None,
+                },
+                Err(error) => JsonRpcResponse {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id: response_id,
+                    result: None,
+                    error: Some(error),
+                },
             }
         }
         method if workgraph_methods::is_workgraph_method(method) => {
@@ -9816,9 +9852,14 @@ shell = true
             catalogs["result"]["runtime_flows"][0]["id"],
             json!("runtime_rpc_main")
         );
+        // The list also reads the draft store. An explicit store path keeps it
+        // off the host's gateway home, which another Meta install on the same
+        // machine may own (its drafts would add rows, and an unadopted
+        // predecessor home refuses the call).
+        let drafts = tempfile::tempdir()?;
         let listed = super::handle_mobpack_authoring_rpc_with_runtime(
             "meta/mobpacks/list",
-            &json!({}),
+            &json!({ "store_path": drafts.path().join("drafts.json") }),
             json!(2),
             Some(&runtime),
         )
@@ -9826,6 +9867,11 @@ shell = true
         let listed: Value = serde_json::to_value(listed)?;
         assert_eq!(listed["result"]["runtime_backed"], json!(true));
         assert_eq!(listed["result"]["rows"][0]["id"], json!("runtime_rpc_main"));
+        assert_eq!(
+            listed["result"]["rows"].as_array().map(Vec::len),
+            Some(1),
+            "an empty draft store adds no rows"
+        );
 
         let fetched = super::handle_mobpack_authoring_rpc_with_runtime(
             "meta/mobpacks/get",
@@ -12995,7 +13041,7 @@ comms = true
         assert!(target.live.is_some(), "the race requires a live projection");
 
         identity_rt
-            .remove(&identity)
+            .remove_unrecorded_for_test(&identity)
             .await
             .expect("simulate a concurrent durable delete after resolution");
         assert!(matches!(

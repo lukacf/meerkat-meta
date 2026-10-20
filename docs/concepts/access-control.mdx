@@ -35,7 +35,7 @@ There are no roles. Every check evaluates the caller's attributes (subject, grou
 | `workgraph.view` | Read WorkGraph snapshots, items, attention, events, and facts; observe the wake stream |
 | `workgraph.manage` | Mutate WorkGraph items, goals, links, and attention bindings |
 | `mob.observe` | Subscribe to whole-mob raw event streams |
-| `runtime.admin` | Routing tables, labels, wiring, reconcile |
+| `runtime.admin` | Routing tables, labels, wiring, reconcile, mob announcements |
 | `topology.view` | Inspect topology state for an agent; also requires `agent.view` |
 | `topology.connect` / `topology.disconnect` / `topology.reconnect` | Plan or apply the corresponding edge action; required independently on both endpoints |
 | `topology.bulk` | Submit more than one explicit topology operation in a bounded transaction |
@@ -332,6 +332,7 @@ the composed Console bundle; discovery alone is not an E2E result.
 - `meta/memory/panel/*` (the console Memory panel's reads) filters every returned record by its scope: identity-scoped records need `agent.memory.read` + `agent.view` on that identity, mob-scoped records need `mob.memory.read`, operator-scoped records need `operator.memory.read`, realm-scoped records and `meta/memory/panel/dreams` need an unscoped `agent.memory.read` grant, and quarantined records (still quarantined, or tombstoned after ever being quarantined) plus `meta/memory/panel/quarantine` need `memory.quarantine.review`. The review grant only opens the quarantine surface; each queue record and pending promotion is still filtered by the per-scope read grants above on its (target) scope. Memory content is more sensitive than roster visibility, so plain `agent.view` alone no longer reads any of it.
 - `meta/memory/quarantine/decide` (the operator quarantine decision) requires `memory.quarantine.review`, `agent.view` and `agent.memory.read` on the identity, and `agent.memory.write` to release or `agent.memory.delete` to tombstone (any other verdict needs both, then fails validation). Every effect is one the same caller could already cause through `remember`, `update` or `forget` (a released update supersedes its prior, as `update` does); the decision adds the lineage, the trust ceiling, the content binding and the audit trail. An anonymous caller is held to the same grants whenever access control is on. The capabilities list advertises it only to callers holding `memory.quarantine.review`.
 - Lifecycle and runtime RPCs — mapped to `agent.retire` / `agent.respawn` / `agent.reset` / `agent.spawn` / `runtime.admin` per method.
+- `meta/mob_announcements/*` on `/console/rpc` - every method, the reads included, requires `runtime.admin` with no resource: they list announcements, subscriptions and deliveries across members and mobs with no per-agent filter. A read-only console refuses the ones that change state (`announce`, `subscriptions/put`, `pause`, `resume`, `cancel` and `deliveries/reconcile`) with the `read_only` error. The capabilities list names the family only while the runtime has mob announcements.
 - Topology control — query visibility requires `agent.view` and
   `topology.view` per endpoint. Connect, disconnect, and reconnect require the
   matching `topology.*` grant on both endpoint identities for planning as well
@@ -383,6 +384,16 @@ Two separately granted host-plane verbs address the runtime host, not a member:
 Host verbs must be explicitly named in the grant and require an installed
 host-facts provider to return data; member selectors do not scope them.
 
+Two more member-plane verbs carry keyed, reconcilable delivery, which mob
+announcements use to reach members of a mob on a peer gateway:
+
+| Verb | Reaches |
+|------|---------|
+| `inject_keyed` | Commit a keyed delivery into one of your members' runtime inbox, once per key |
+| `inject_status` | Read the status of a keyed delivery the same caller made |
+
+They too must be named explicitly in a grant (see [Keyed inject](#keyed-inject)).
+
 A **control grant** binds one calling gateway - identified by its Ed25519 pubkey, the same one `meta/peer_pubkey` reports - to the verbs it may use and, for member-plane operations, the members it may reach. Anything outside the grant is refused before the request reaches your mob, so an ungranted caller never learns whether the member it named exists.
 
 ### How a caller is identified
@@ -407,7 +418,8 @@ verbs = ["inject"]
 ```
 
 `verbs = ["*"]` grants only the four member-plane verbs, never
-`host_describe` or `host_health`; include those names explicitly when intended.
+`host_describe`, `host_health`, `inject_keyed` or `inject_status`; include those
+names explicitly when intended.
 An unknown verb, a missing or empty `verbs` list, an undecodable pubkey, or two
 labels sharing one pubkey are all config errors - the table refuses to load
 rather than granting something the operator did not write.
@@ -445,6 +457,58 @@ Use `ControlAuthorizer::with_grants_for_audience(table, "my-mob-id")` when one c
 <Note>
 The SDK-driven `rpc_gateway` accepts the same TOML under `runtime_options.control_grants_toml`; the conventional `meta_gateway` reads `[control_grants]` beside `[mobs]` in `config/contacts.toml`. The Rust builder accepts a `ControlGrantTable` through `control_grants`. Every configured-listener path binds the table to the runtime's mob id as the signed audience. `ControlAuthorizer::from_toml` still distinguishes an absent section from an empty section for embedders that explicitly choose compatibility behavior.
 </Note>
+
+### Keyed inject
+
+`inject_keyed` delivers one keyed continuation to a member: the serving
+gateway commits it into the member's durable runtime inbox under the key,
+scoped to the caller (the label of the grant that admitted it), and admits it
+as one input when the member is served. An identical request under the same
+key answers the original receipt; other content under it is refused
+(`conflict`). `inject_status` reads such a delivery back, for the caller's
+own keys only. Both need:
+
+- a grant that names the verb explicitly, on a listener with grants (an open
+  authorizer refuses them);
+- a request issued within the serving gateway's freshness window of its own
+  clock (`runtime_options.control_request_window_ms`, five minutes by
+  default) and not before the serving process started. A delivery the
+  gateway admitted has a deadline, its issue time plus the window: the
+  gateway prepares the member within it, checks it again just before the
+  commit, and refuses a delivery it cannot commit in time; a member
+  preparation it stopped waiting for still finishes, so the next attempt
+  finds the member ready. The deadline uses the serving gateway's own
+  window, so gateways that deliver to each other should configure the same
+  `control_request_window_ms`. Each stale refusal carries its typed cause in
+  a field of the signed refusal: `outside_window`, `issued_before_start`
+  (a request issued before the serving process started, as when it
+  restarted while the request was on its way) or `deadline_passed`;
+- an identity-first serving gateway that serves keyed injects. Every gateway
+  that binds a control listener (`rpc_gateway`, `meta_gateway`, and a
+  runtime the builder composes) seals what the plane serves once its runtime
+  is composed, whether or not it enables mob announcements itself. Until
+  then the verbs answer `keyed_inject_unavailable`: the gateway is starting.
+  A gateway that is not identity-first, or whose configuration turns serving
+  off (`runtime_options.serve_keyed_inject: false` on `rpc_gateway`),
+  answers `not_served` with its typed cause, `not_identity_first` or
+  `runtime_disabled`, in a field of the signed refusal. `meta_gateway` has
+  no such switch: its listener serves keyed injects whenever its runtime is
+  identity-first (its default), with the default window,
+  `DEFAULT_KEYED_INJECT_WINDOW_MS` (five minutes), so the grants that name
+  the verbs are what decide who may call them.
+
+Every answer is signed with the serving gateway's key, and the caller treats
+only an answer its pinned key verifies as evidence. A signed refusal says
+that nothing was committed for that attempt, and the caller's delivery waits
+with a typed reason: a member that is unknown or not served there (placed
+on a host, or bound to an external runtime), a governed runtime, a member
+with no live incarnation, a stale request or a gateway that does not serve
+keyed injects are states that can change, so none of them ends a
+subscription. Only a signed `member_departed` ends the caller's
+subscriptions for that member. An unsigned answer, such as a `decode` error
+from a gateway that predates these verbs, is never evidence: the outcome
+stays unknown, and the caller reads the delivery's status before it submits
+again.
 
 Three limits worth stating plainly:
 

@@ -589,6 +589,7 @@ mod tests {
             topology: None,
             job_health_projection: None,
             governed_ingress: Default::default(),
+            mob_announcements: Default::default(),
         }
     }
 

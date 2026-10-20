@@ -195,6 +195,13 @@ pub fn enumerate_state_dir_databases(state_dir: &Path) -> Vec<PathBuf> {
             files.push(path);
         }
     }
+    // The mob announcement database is not a slot (it has no legacy
+    // spelling), and only a gateway that enables mob announcements opens it:
+    // every build fences it.
+    let announcements = state_dir.join(crate::storage_layout::MOB_ANNOUNCEMENTS_DB_FILE_NAME);
+    if announcements.is_file() {
+        files.push(announcements);
+    }
     for spelling in MEMORY_ROOT_SPELLINGS {
         let root = state_dir.join(spelling);
         let Ok(entries) = fs::read_dir(&root) else {

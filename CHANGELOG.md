@@ -98,6 +98,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   member answers `-32602` `mob member not found: <id>`. A generated alias
   without identity authority and an identity-runtime failure keep `-32000`.
 
+- `runtime::cross_mob_remote::RemoteMobError::ControlRequestUnauthorized`,
+  `runtime::remote_host::RemoteHostError::Unauthorized` and
+  `RemoteHostError::HostPlaneUnavailable` are removed. Every unsigned control
+  or host refusal, authorization denials and `host_plane_unavailable`
+  included, is now `RemoteMobError::Rejected` or `RemoteHostError::Rejected`
+  with the peer's code as text: an unsigned answer is never evidence. Both
+  enums are now `#[non_exhaustive]`, so a match on them outside this crate
+  needs a wildcard arm, and a later variant no longer breaks it.
+
+- The keyed inject verbs extend the cross-mob control types in
+  `runtime::cross_mob_control`: `ControlRequest` and `ControlVerb` gain
+  `InjectKeyed` and `InjectStatus`, and `ControlResponse` gains
+  `InjectReceipt`, `InjectStatus` and `InjectRefused`. The three enums are
+  now `#[non_exhaustive]`, so a match on them outside this crate needs a
+  wildcard arm, and a later variant no longer breaks it.
+  `ControlVerb::all()` returns `&'static [ControlVerb]` instead of a
+  fixed-size array, so a later verb no longer changes its type.
+  `ControlVerb::member_plane()`, what `verbs = ["*"]` expands to, is
+  unchanged.
+
 ### Security
 
 - No crate in Meta's dependency graph uses serde_yaml 0.9 (deprecated) or its
@@ -182,6 +202,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   code and the kind, with `member_id`/`memberId`, `reason` and
   `required_action`/`requiredAction`. Any other `-32029` stays a plain
   `RpcError`.
+
+- Mob announcements. The host announces a development to a mob hosted on
+  this gateway; member subscriptions, keyed by `{mob_id, identity}`, take the
+  topics they name from the mobs they name (this gateway's mob by default);
+  and each subscriber receives what it is owed in bounded batches, each one
+  Meerkat host continuation keyed by batch id (`meta.mob_announcements`
+  namespace). An announcement is captured for every matching subscription in
+  its own transaction. A lost acknowledgment is reconciled from native status
+  without a second submission, and a delivery stranded on a retired
+  incarnation moves to a successor batch that names its predecessor. A
+  subscription ends, typed, only on a final fact: every mob it named was
+  destroyed, or a peer gateway answered, signed, that its member departed
+  (no gateway of this release answers that yet, since none records a final
+  fact that a member left); a destroyed mob leaves the subscriptions that
+  name it, and retention removes ended subscriptions and the logs of
+  destroyed mobs. A member that is not registered or not served where its
+  deliveries go ends nothing, nor does one that left this gateway, a
+  placement, a governed runtime or a member with no live incarnation: its
+  owed batches expire after the retention window, `subscriptions/cancel`
+  ends its subscriptions, its deliveries wait, and
+  `deliveries/observe` and `subscriptions/get` show why as a typed `marker`
+  with the class of its evidence (`verified`, `unverified` or `local`).
+  Batch bodies quote each announcement and name its mob and
+  announcer. New methods `meta/mob_announcements/{announce, get,
+  subscriptions/{put,pause,resume,cancel,get,list},
+  deliveries/{list,observe,reconcile}}`, with typed errors `-32044` to
+  `-32048`. A persistent, identity-first host enables them, composed the
+  same way on every surface: `rpc_gateway` with
+  `runtime_options.mob_announcements`, `meta_gateway` with its
+  `mob_announcements` init param, and a Rust host with
+  `UnifiedRuntimeBuilder::mob_announcements`; each refuses what it cannot
+  compose before it builds anything. The console serves the methods on
+  `/console/rpc`, every one of them, the reads included, behind the
+  `runtime.admin` grant, and a read-only console refuses the ones that
+  change state. Without mob announcements nothing opens the announcement
+  database (`mob_announcements.sqlite3`, fenced by storage maintenance in
+  every build) and the methods answer `mob_announcements_unavailable` on
+  every surface. Nothing holds retention much past the
+  window: what waited longer for a delivery that never started expires, and
+  the member's next batch reports it as a gap. A submission whose outcome is
+  not learned in time settles `expired_unverified`, and a committed batch
+  whose admission is not confirmed in time settles `committed_unconfirmed`
+  with its receipt kept: neither is submitted again, the member's next batch
+  reports their announcements as `delivery_not_confirmed` or
+  `admission_not_confirmed` and goes on, and what a status read finds later
+  is kept on the batch as its `late` outcome. Every public enum of the
+  Rust surface is `#[non_exhaustive]`. See
+  `docs/design/mob-announcements.md`.
+
+- Mob announcement member tools. A profile that lists the
+  `mob_announcements` bundle in `tools.rust_bundles` gives its members
+  `mob_announce` and `mob_subscription`: a member announces into its own mob
+  as itself and manages its own subscriptions. A subscription a member makes
+  can name its own mob and the mobs above and below it among the mobs
+  members created, never a sibling's; any other mob is refused with
+  `unrelated_mob`. Which mob a member created is derived once from
+  Meerkat's durable records and kept, so a repoint of the creator does not
+  lose it. Every call is attributed to exactly one member through the mob
+  roster and the identity runtime, or refused; per-member limits come from
+  `runtime_options.mob_announcements.member_limits`.
+
+- Members of mobs hosted here as mob announcement subscribers. The host can
+  subscribe a member of any mob this gateway hosts, such as a mob a member
+  created, by its plain roster id; it is delivered to through this
+  gateway's runtime. Its subscriptions end with `member_mob_ended` when that
+  mob is destroyed, created again, completed or reset after the
+  subscription was made, read from the mob's own durable records; a member
+  being respawned, or a mob held after a restart, ends nothing. How a member
+  is reached is kept from its first subscription and never changes: a mob
+  id that names a mob hosted here and a peer alike is refused with
+  `ambiguous_mob`. Live subscriptions for such members are bounded on the
+  gateway and per named mob
+  (`runtime_options.mob_announcements.child_member_limits`); a put past a
+  bound is refused with `child_member_limit`.
+
+- Members of mobs members create can use the mob announcement member tools.
+  `member_tools_in_child_mobs` in the mob announcement options, on every
+  surface, is the ceiling: with it the `mob_announcements` bundle is offered
+  to child mobs, never supplied to every child profile, and a child mob
+  profile gets the tools only by naming `mob_announcements` in its own
+  `tools.bundles`. Without it a child create whose profile names the bundle
+  is refused, and a member that opted in under a ceiling since lowered is
+  built without the tools. A child member's own subscriptions count against
+  `member_limits` and `child_member_limits`.
+
+- Keyed cross-mob inject. Two new control verbs, `inject_keyed` and
+  `inject_status`, deliver one keyed continuation to a member of the serving
+  gateway's mob, once per key and scoped to the calling grant, and read it
+  back. Requests and answers are signed, requests must be issued within
+  `runtime_options.control_request_window_ms` (five minutes by default) of
+  the serving gateway's clock, a delivery is committed by its deadline (its
+  issue time plus the window) or refused, and every stale refusal carries its
+  typed cause (`outside_window`, `issued_before_start`, `deadline_passed`) in
+  a signed field. A grant must name the verbs (`*` does not cover them).
+  Every gateway that binds a control listener (`rpc_gateway`,
+  `meta_gateway`, and a runtime the builder composes) seals what the keyed
+  inject plane serves once its runtime is composed: an identity-first
+  gateway serves them, and until then both verbs answer
+  `keyed_inject_unavailable`. A gateway that is not identity-first, or that
+  turns serving off (`runtime_options.serve_keyed_inject: false`, or
+  `UnifiedRuntimeBuilder::keyed_inject_plane(KeyedInjectPlane::Disabled)`),
+  answers `not_served` with its typed cause (`not_identity_first`,
+  `runtime_disabled`) in a signed field of the refusal. Mob announcements
+  use them to deliver to members of mobs on peer gateways. A signed refusal
+  says that nothing was committed, and the delivery waits with a typed
+  reason; only a signed `member_departed` ends a subscription, and no
+  gateway of this release answers it yet. An unsigned
+  answer, such as one from a gateway that predates these verbs, is never
+  evidence: the delivery's outcome stays unknown until a status read settles
+  it. Every public enum of `runtime::keyed_inject` is `#[non_exhaustive]`.
 
 ### Changed
 
@@ -413,6 +543,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   whose transcript history had retired its oldest compaction (it keeps 4 by
   default), so every later turn failed and asked for a runtime reload that
   failed the same way. Meerkat Core 0.9.4 derives that head.
+
+### Known limitations
+
+- A member that leaves a mob ends nothing for mob announcements. No 0.9.4
+  gateway answers `member_departed`, and none records a final fact that a
+  member retired or was deleted, so the member's subscriptions wait, typed,
+  as for a member that is not registered. Its owed batches expire after the
+  retention window, and `subscriptions/cancel` ends its subscriptions.
 
 ## [0.9.3] - 2026-10-18
 

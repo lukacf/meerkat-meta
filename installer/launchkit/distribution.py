@@ -105,17 +105,20 @@ def _frontend_inputs(root):
             if not isinstance(name, str) or not isinstance(content, str):
                 raise DistributionError("The prebuilt frontend source map is invalid.")
             path = source_map.parent / name
-            if not path.resolve().is_relative_to(repo):
+            resolved = path.resolve()
+            if not resolved.is_relative_to(repo):
                 raise DistributionError("The prebuilt frontend is stale. Build it from the current checkout first.")
+            located = resolved.relative_to(repo)
             # Installed packages are not public source inputs: package-lock.json
             # pins them, and their own source maps can name files the packages
             # do not ship (inline-style-parser's index.js, the MCP SDK's
             # TypeScript sources), which the bundler carries into app.js.map.
-            if "node_modules" in PurePosixPath(name).parts:
+            # Where a name resolves in the checkout decides, not its spelling.
+            if "node_modules" in located.parts:
                 continue
             if not path.is_file() or _read(path) != content.encode():
                 raise DistributionError("The prebuilt frontend is stale. Build it from the current checkout first.")
-            inputs[path.resolve().relative_to(repo).as_posix()] = _digest(content.encode())
+            inputs[located.as_posix()] = _digest(content.encode())
     if _read(root / "web/index.html") != _read(root / "web/dist/index.html"):
         raise DistributionError("The prebuilt frontend index is stale.")
     if _read(root / "assets/meerkat-transparent.png") != _read(root / "web/dist/assets/meerkat-transparent.png"):

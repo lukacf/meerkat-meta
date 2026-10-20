@@ -3134,6 +3134,15 @@ impl IdentityEdgeOwnership {
 pub(crate) type HeldFreshnessHook =
     Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
 
+/// Why this gateway's runtime does not serve a member it has registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotServedHere {
+    /// The member is placed on a host.
+    PlacedOnHost,
+    /// The member is bound to an external runtime.
+    ExternalBinding,
+}
+
 pub struct IdentityRuntime {
     entries: IdentityEntries,
     event_channels: RwLock<BTreeMap<AgentIdentity, broadcast::Sender<IdentityEvent>>>,
@@ -9631,9 +9640,15 @@ impl IdentityRuntime {
         Ok(())
     }
 
-    /// Remove an identity from the runtime.
-    #[allow(dead_code)]
-    pub(crate) async fn remove(&self, identity: &AgentIdentity) -> Option<IdentityEntry> {
+    /// Test only: drops an identity's entry and event channel without
+    /// recording anything, the way a concurrent durable delete leaves the
+    /// table. Outside tests an identity leaves only through its recorded
+    /// retire and delete paths.
+    #[cfg(test)]
+    pub(crate) async fn remove_unrecorded_for_test(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Option<IdentityEntry> {
         self.event_channels.write().await.remove(identity);
         self.entries.write().await.remove(identity)
     }
@@ -11439,6 +11454,27 @@ impl IdentityRuntime {
     /// console reservation. HTTP replays return that original frame/status or
     /// typed unknown fate after failure; they never re-prepare changed memory.
     /// No replay cache (or eviction which could make an old key executable).
+    /// Why this gateway's runtime does not serve `identity`'s member, read
+    /// from its registered spec: `None` for a local session-backed member,
+    /// otherwise its remote placement or its external binding. A runtime
+    /// inbox row for such a member is never applied here.
+    pub(crate) async fn not_served_here(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<NotServedHere>, IdentityRuntimeError> {
+        let entries = self.entries.read().await;
+        let entry = entries
+            .get(identity)
+            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
+        Ok(if entry.spec.placement.is_some() {
+            Some(NotServedHere::PlacedOnHost)
+        } else if durable_spec_uses_external_binding(&entry.spec) {
+            Some(NotServedHere::ExternalBinding)
+        } else {
+            None
+        })
+    }
+
     /// Whether a console send to `identity` can carry a native skill
     /// selection: only a local session-backed member (no external binding,
     /// no remote placement) has meerkat's host-human skill carrier. Read

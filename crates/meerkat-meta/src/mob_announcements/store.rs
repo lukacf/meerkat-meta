@@ -1,0 +1,244 @@
+//! The mob announcement store contract.
+
+use std::collections::BTreeSet;
+
+use async_trait::async_trait;
+
+use super::types::{
+    AnnounceOutcome, AnnounceRequest, Announcement, Batch, BatchEvent, BatchId, BatchPosition,
+    BatchQuery, BatchStateTag, ExpiryReport, Member, MemberBacklog, MemberRouteRecord, MobId,
+    MobLineage, OperationId, PruneReport, PutSubscription, Result, SealingPolicy, SourceKey,
+    Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
+};
+
+/// Durable mob announcements, member subscriptions and delivery batches.
+///
+/// Every method is one atomic transaction. In particular:
+///
+/// - `announce` commits the announcement and its capture for every matching
+///   subscription together, so a committed announcement is never missing an
+///   owed announcement it should have produced, and nothing is captured for
+///   an announcement that did not commit.
+/// - `seal_batch` re-checks the sealing policy and binds the batch's exact
+///   items and immutable body in the same transaction.
+/// - `announce` refuses an announcement whose rendering, JSON-encoded,
+///   exceeds [`super::types::MAX_ITEM_WIRE_BYTES`], so any one announcement
+///   fits a batch for a member on a peer gateway.
+/// - `transition_batch` applies [`super::types::BatchState::apply`] against
+///   the state the caller observed, and settles or moves the batch's owed
+///   announcements in the same transaction.
+///
+/// Mutations of subscriptions carry an operation id: a replay with the same
+/// request returns the original result, and the same id with another request
+/// is refused. Implementations must keep those receipts at least as long as
+/// the retention window.
+#[async_trait]
+pub trait AnnouncementStore: Send + Sync {
+    async fn announce(&self, request: AnnounceRequest, now_ms: u64) -> Result<AnnounceOutcome>;
+
+    async fn announcement(
+        &self,
+        mob_id: &MobId,
+        source_key: &SourceKey,
+    ) -> Result<Option<Announcement>>;
+
+    async fn put_subscription(
+        &self,
+        operation: &OperationId,
+        request: PutSubscription,
+        now_ms: u64,
+    ) -> Result<Subscription>;
+
+    async fn change_subscription(
+        &self,
+        operation: &OperationId,
+        id: &SubscriptionId,
+        expected_revision: u64,
+        change: SubscriptionChange,
+        now_ms: u64,
+    ) -> Result<SubscriptionChangeOutcome>;
+
+    async fn subscription(&self, id: &SubscriptionId) -> Result<Option<Subscription>>;
+
+    /// End every live subscription of `member` for `end`, a final fact the
+    /// caller read from the member's owner: each is marked ended at a new
+    /// revision, what it captured and no batch holds settles, and its
+    /// sealed batches nothing else wants are cancelled. Returns the ended
+    /// subscriptions.
+    async fn end_member(
+        &self,
+        member: &Member,
+        end: SubscriptionEnd,
+        now_ms: u64,
+    ) -> Result<Vec<SubscriptionId>>;
+
+    /// The mobs live subscriptions name, and the mobs whose announcement
+    /// log is not marked ended: every mob whose destruction matters here.
+    async fn known_mobs(&self) -> Result<BTreeSet<MobId>>;
+
+    /// Drop destroyed mobs from every live subscription that names them, at
+    /// a new revision. What was captured from them stays owed. A
+    /// subscription left with no mob ends ([`SubscriptionEnd::MobsEnded`]).
+    /// Their announcement logs are marked ended, so retention can remove
+    /// them once nothing refers to them. Returns the changed subscriptions.
+    async fn drop_ended_mobs(
+        &self,
+        ended: &BTreeSet<MobId>,
+        now_ms: u64,
+    ) -> Result<Vec<SubscriptionId>>;
+
+    async fn subscriptions(
+        &self,
+        member: Option<&Member>,
+        after: Option<&SubscriptionId>,
+        limit: usize,
+    ) -> Result<Vec<Subscription>>;
+
+    /// The live lineage records: at most one per mob, for the incarnation
+    /// hosted when it was derived.
+    async fn lineage(&self) -> Result<Vec<MobLineage>>;
+
+    /// The member's kept route: the route of its first subscription, kept
+    /// while it has subscriptions or batches. A put whose route differs is
+    /// refused with
+    /// [`RouteKept`](super::types::AnnouncementStoreError::RouteKept).
+    async fn member_route(&self, member: &Member) -> Result<Option<MemberRouteRecord>>;
+
+    /// End every live subscription of the member, as [`Self::end_member`]
+    /// does, and drop its kept route in the same transaction: the mob it
+    /// was kept for is gone or was created again. Batches keep the route
+    /// they were sealed with.
+    async fn unbind_member_route(
+        &self,
+        member: &Member,
+        end: SubscriptionEnd,
+        now_ms: u64,
+    ) -> Result<Vec<SubscriptionId>>;
+
+    /// Members kept on the route to mobs members created, with their kept
+    /// routes.
+    async fn child_member_routes(&self) -> Result<Vec<(Member, MemberRouteRecord)>>;
+
+    /// End the member's live subscriptions made before `cursor` of its own
+    /// mob's event log, as [`Self::end_member`] ends them.
+    async fn end_member_before(
+        &self,
+        member: &Member,
+        cursor: u64,
+        end: SubscriptionEnd,
+        now_ms: u64,
+    ) -> Result<Vec<SubscriptionId>>;
+
+    /// Where the next check of the member's own mob log starts: after the
+    /// earliest cursor a live subscription of the member was made at, or
+    /// after the cursor a check already read through, whichever is later.
+    /// `None` when no live subscription of the member records a cursor.
+    async fn member_mob_check_from(&self, member: &Member) -> Result<Option<u64>>;
+
+    /// Record that the member's own mob neither completed nor reset after
+    /// [`Self::member_mob_check_from`] through `through`. Only ever
+    /// advances.
+    async fn record_member_mob_check(&self, member: &Member, through: u64) -> Result<()>;
+
+    /// Record a derived lineage. A live record of the same mob and
+    /// incarnation stays as it is: a relation is derived once. A live
+    /// record of another incarnation ends first. Returns whether a record
+    /// was written.
+    async fn record_lineage(&self, lineage: &MobLineage, now_ms: u64) -> Result<bool>;
+
+    /// End the live lineage records of `mobs`: they are no longer hosted.
+    async fn end_lineage(&self, mobs: &BTreeSet<MobId>, now_ms: u64) -> Result<()>;
+
+    /// Members with deliverable announcements and no unsettled batch,
+    /// oldest first. A member whose batch is outstanding cannot be sealed
+    /// again until that batch settles, so it takes no place in the page.
+    async fn backlogs(&self, limit: usize) -> Result<Vec<MemberBacklog>>;
+
+    /// Seal the member's deliverable backlog into one batch if the policy
+    /// says it is due at `now_ms`; `None` when it is not. The batch carries
+    /// the member's kept route, read in the same transaction; a member
+    /// without one is refused with [`AnnouncementStoreError::RouteNotKept`]
+    /// and nothing is sealed, since no route is assumed. A batch on a peer
+    /// route also stops where its JSON-encoded body, counted with
+    /// [`super::types::header_wire_bound`], would exceed one peer request
+    /// ([`super::types::MAX_REMOTE_BODY_WIRE_BYTES`]).
+    async fn seal_batch(
+        &self,
+        member: &Member,
+        batch_id: &BatchId,
+        policy: &SealingPolicy,
+        now_ms: u64,
+    ) -> Result<Option<Batch>>;
+
+    async fn batch(&self, id: &BatchId) -> Result<Option<Batch>>;
+
+    async fn batches(&self, query: &BatchQuery) -> Result<Vec<Batch>>;
+
+    /// Batches that are sealed, submitting or committed, in (sealed time,
+    /// id) order, starting after `after` when it is given.
+    async fn unsettled_batches(
+        &self,
+        after: Option<&BatchPosition>,
+        limit: usize,
+    ) -> Result<Vec<Batch>>;
+
+    /// The position of the last unsettled batch in that order, if any.
+    async fn newest_unsettled_batch(&self) -> Result<Option<BatchPosition>>;
+
+    async fn transition_batch(
+        &self,
+        id: &BatchId,
+        expected: BatchStateTag,
+        event: BatchEvent,
+        now_ms: u64,
+    ) -> Result<Batch>;
+
+    /// Batches that settled without their delivery being confirmed and
+    /// whose next late read is due at `now_ms`, the longest due first. A
+    /// batch enters this set when it settles so, and leaves it when
+    /// [`Self::record_late_read`] names no next read or retention removes
+    /// it.
+    async fn late_reads_due(&self, now_ms: u64, limit: usize) -> Result<Vec<Batch>>;
+
+    /// Record a late read of a batch that settled without its delivery being
+    /// confirmed: the outcome it found, if any, is kept on the batch, which
+    /// is otherwise left as it is (its state, and when it settled), and the
+    /// next read is due at `next_read_at_ms`, or never when `None`. Any
+    /// other batch is refused.
+    async fn record_late_read(
+        &self,
+        id: &BatchId,
+        late: Option<super::types::LateOutcome>,
+        next_read_at_ms: Option<u64>,
+    ) -> Result<Batch>;
+
+    /// Settle as expired what waited longer than the retention window with
+    /// nothing native holding it, at most `limit` of each kind: owed
+    /// announcements no batch holds (each once per member), and sealed
+    /// batches sealed before the window whose last change is older than
+    /// `quiet_ms`. A sealed batch may be owed again after a refused
+    /// submission while an earlier request for it can still commit, so it
+    /// waits out the quiet window after its last request first. The
+    /// member's next batch reports them as gaps. A batch the native owner
+    /// may hold is never expired here.
+    async fn expire(
+        &self,
+        now_ms: u64,
+        retention_ms: u64,
+        quiet_ms: u64,
+        limit: usize,
+    ) -> Result<ExpiryReport>;
+
+    /// Remove what retention allows, oldest first and at most `limit` of
+    /// each kind: announcements that no subscription is still owed and that
+    /// are older than the window, across mobs, each mob stopping at its
+    /// first announcement that is not (so its retained history never has
+    /// holes); settled batches no owed announcement still names; old
+    /// operation receipts; and cancelled or ended subscriptions that
+    /// changed before the window and hold no unsettled batch, with the
+    /// member rows nothing refers to and the logs of ended mobs that retain
+    /// nothing and that no subscription names; and lineage records that
+    /// ended before the window and that no live record names as parent.
+    /// [`PruneReport::more`] says whether another pass has work.
+    async fn prune(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<PruneReport>;
+}

@@ -22,6 +22,10 @@
 //!   the local side can build a signed descriptor without caller-supplied
 //!   bookkeeping.
 //!
+//! It also carries the keyed inject plane ([`super::keyed_inject`]):
+//! [`RemoteMobProxy::inject_keyed`] and [`RemoteMobProxy::inject_status`].
+//! Those never run unauthenticated, in either direction.
+//!
 //! The server side is [`super::cross_mob_control::MobHandleControlHandler`],
 //! bound by `UnifiedRuntime::start_control_listener` (builder
 //! `control_listen()` or the gateway `--control-listen` flag). Each request
@@ -33,6 +37,7 @@ use crate::contact_directory::{ContactEntry, MobTransport};
 
 /// Errors raised by the remote-mob proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RemoteMobError {
     /// The contact directory entry uses an unsupported transport.
     UnsupportedTransport { mob_id: String, transport: String },
@@ -44,9 +49,11 @@ pub enum RemoteMobError {
         endpoint: String,
         operation: &'static str,
     },
-    /// The peer rejected our request with an error response. Carries the
-    /// peer's stable `code` (e.g. `unknown_member`, `mob_error`) and a
-    /// human-readable message.
+    /// The peer answered with an error response. Error responses are never
+    /// signed, so this is never evidence of anything: `code` (for example
+    /// `unknown_member`, `member_not_granted` or `mob_error`) and `message`
+    /// are the peer's words, kept as text for operators, and no caller
+    /// branches on them.
     Rejected {
         mob_id: String,
         endpoint: String,
@@ -68,18 +75,6 @@ pub enum RemoteMobError {
         mob_id: String,
         endpoint: String,
         reason: String,
-    },
-    /// The peer's control listener enforces scoped caller grants and this
-    /// gateway's identity is not granted the requested verb / member.
-    /// Split out of [`Self::Rejected`] because the remedy is entirely
-    /// different: nothing about the request is malformed and retrying will
-    /// not help - the peer operator has to widen the grant (or this
-    /// gateway has to install the keypair the grant names).
-    ControlRequestUnauthorized {
-        mob_id: String,
-        endpoint: String,
-        code: String,
-        message: String,
     },
 }
 
@@ -158,20 +153,6 @@ impl std::fmt::Display for RemoteMobError {
                      keys installed), fix the pinned pubkey, or set \
                      require_signed_control = false on this contact to accept unsigned \
                      responses"
-                )
-            }
-            Self::ControlRequestUnauthorized {
-                mob_id,
-                endpoint,
-                code,
-                message,
-            } => {
-                write!(
-                    f,
-                    "remote mob '{mob_id}' control channel ({endpoint}) refused this gateway \
-                     [{code}]: {message}. The peer enforces scoped control grants: ask its \
-                     operator to file this gateway's pubkey (meta/peer_pubkey) under \
-                     [control_grants] with the verb and member scope you need"
                 )
             }
         }
@@ -316,17 +297,9 @@ impl RemoteMobProxy {
         Some(uuid::Uuid::new_v4().simple().to_string())
     }
 
-    /// Classify a peer `Err` response. Authorization refusals get their
-    /// own typed variant so callers do not have to string-match codes.
+    /// A peer `Err` response. It is unsigned, so its code is kept as text
+    /// and never classified: one unverified class for every code.
     fn rejected(&self, code: String, message: String) -> RemoteMobError {
-        if super::cross_mob_control::ControlAuthzDenial::is_denial_code(&code) {
-            return RemoteMobError::ControlRequestUnauthorized {
-                mob_id: self.mob_id.clone(),
-                endpoint: self.endpoint.comms_address(),
-                code,
-                message,
-            };
-        }
         RemoteMobError::Rejected {
             mob_id: self.mob_id.clone(),
             endpoint: self.endpoint.comms_address(),
@@ -508,6 +481,172 @@ impl RemoteMobProxy {
                 message: format!("expected Member response, got {other:?}"),
             }),
         }
+    }
+
+    /// Whether this proxy can make authenticated keyed inject calls: the contact
+    /// pins the peer's gateway key and does not opt out of signed control
+    /// responses, and this gateway holds its own signing key.
+    pub fn keyed_inject_ready(&self) -> Result<(), super::keyed_inject::KeyedInjectCallError> {
+        use super::keyed_inject::KeyedInjectCallError;
+        if self.pinned_pubkey.is_none() {
+            return Err(KeyedInjectCallError::NotAuthenticatable(format!(
+                "the contact for '{}' pins no gateway key",
+                self.mob_id
+            )));
+        }
+        if !self.require_signed_responses {
+            return Err(KeyedInjectCallError::NotAuthenticatable(format!(
+                "the contact for '{}' opts out of signed control responses",
+                self.mob_id
+            )));
+        }
+        if self.caller_keys.is_none() {
+            return Err(KeyedInjectCallError::NotAuthenticatable(
+                "this gateway holds no signing key".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Deliver one keyed host continuation to `delivery.member` on the peer.
+    ///
+    /// Unlike the member-plane calls, this never runs unauthenticated: see
+    /// [`Self::keyed_inject_ready`]. The answer must verify against the pinned
+    /// key whatever the contact's `require_signed_control` says. An
+    /// unsigned, unverifiable or `Err` answer is a
+    /// [`super::keyed_inject::KeyedInjectCallError`], which is never evidence
+    /// about the delivery.
+    pub async fn inject_keyed(
+        &self,
+        delivery: super::keyed_inject::KeyedInject<'_>,
+        issued_at_ms: u64,
+    ) -> Result<
+        super::keyed_inject::KeyedInjectCallOutcome<super::keyed_inject::NativeReceipt>,
+        super::keyed_inject::KeyedInjectCallError,
+    > {
+        use super::cross_mob_control::ControlResponse;
+        use super::keyed_inject::{KeyedInjectCallError, KeyedInjectCallOutcome};
+        let request = super::cross_mob_control::ControlRequest::InjectKeyed {
+            remote_member: delivery.member.to_string(),
+            delivery_key: delivery.delivery_key.to_string(),
+            content_digest: delivery.content_digest.to_string(),
+            summary: delivery.summary.to_string(),
+            body: delivery.body.to_string(),
+            issued_at_ms,
+            nonce: uuid::Uuid::new_v4().simple().to_string(),
+            caller: None,
+        };
+        match self.dispatch_keyed_inject(request).await? {
+            ControlResponse::InjectReceipt { receipt, .. } => {
+                Ok(KeyedInjectCallOutcome::Answered(receipt))
+            }
+            ControlResponse::InjectRefused {
+                code,
+                message,
+                cause,
+                ..
+            } => Ok(KeyedInjectCallOutcome::Refused {
+                code,
+                message,
+                cause,
+            }),
+            ControlResponse::Err { code, message } => {
+                Err(KeyedInjectCallError::Rejected { code, message })
+            }
+            other => Err(KeyedInjectCallError::Unexpected(format!(
+                "expected a keyed inject receipt, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Read a keyed delivery's native status for `member` on the peer.
+    /// Authenticated exactly like [`Self::inject_keyed`].
+    pub async fn inject_status(
+        &self,
+        member: &str,
+        delivery_key: &str,
+        with_input: bool,
+        issued_at_ms: u64,
+    ) -> Result<
+        super::keyed_inject::KeyedInjectCallOutcome<super::keyed_inject::KeyedInjectStatusAnswer>,
+        super::keyed_inject::KeyedInjectCallError,
+    > {
+        use super::cross_mob_control::ControlResponse;
+        use super::keyed_inject::{
+            KeyedInjectCallError, KeyedInjectCallOutcome, KeyedInjectStatusAnswer,
+        };
+        let request = super::cross_mob_control::ControlRequest::InjectStatus {
+            remote_member: member.to_string(),
+            delivery_key: delivery_key.to_string(),
+            with_input,
+            issued_at_ms,
+            nonce: uuid::Uuid::new_v4().simple().to_string(),
+            caller: None,
+        };
+        match self.dispatch_keyed_inject(request).await? {
+            ControlResponse::InjectStatus { status, input, .. } => {
+                Ok(KeyedInjectCallOutcome::Answered(KeyedInjectStatusAnswer {
+                    status,
+                    input,
+                }))
+            }
+            ControlResponse::InjectRefused {
+                code,
+                message,
+                cause,
+                ..
+            } => Ok(KeyedInjectCallOutcome::Refused {
+                code,
+                message,
+                cause,
+            }),
+            ControlResponse::Err { code, message } => {
+                Err(KeyedInjectCallError::Rejected { code, message })
+            }
+            other => Err(KeyedInjectCallError::Unexpected(format!(
+                "expected a keyed inject status, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Sign, send and authenticate one keyed inject exchange. The response must
+    /// verify against the pinned key; `Err` answers, which are never signed,
+    /// pass through for the caller to report as rejections.
+    async fn dispatch_keyed_inject(
+        &self,
+        mut request: super::cross_mob_control::ControlRequest,
+    ) -> Result<super::cross_mob_control::ControlResponse, super::keyed_inject::KeyedInjectCallError>
+    {
+        use super::keyed_inject::KeyedInjectCallError;
+        self.keyed_inject_ready()?;
+        let (Some(pinned), Some(keys)) = (self.pinned_pubkey.as_ref(), self.caller_keys.as_ref())
+        else {
+            return Err(KeyedInjectCallError::NotAuthenticatable(
+                "no pinned key or no signing key".to_string(),
+            ));
+        };
+        super::cross_mob_control::sign_control_request_as_caller(
+            keys,
+            Some(self.mob_id.as_str()),
+            &mut request,
+        );
+        let payload = serde_json::to_vec(&request)
+            .map_err(|error| KeyedInjectCallError::Unexpected(error.to_string()))?;
+        if payload.len() > super::cross_mob_control::MAX_CONTROL_PAYLOAD as usize {
+            return Err(KeyedInjectCallError::Oversize {
+                bytes: payload.len(),
+            });
+        }
+        let response = super::cross_mob_control::RemoteControlClient::send_payload(
+            &self.endpoint,
+            &payload,
+            super::cross_mob_control::DEFAULT_CONTROL_TIMEOUT,
+        )
+        .await
+        .map_err(|error| KeyedInjectCallError::Transport(self.attach_mob_id(error).to_string()))?;
+        super::cross_mob_control::verify_control_response(pinned, &payload, &response)
+            .map_err(KeyedInjectCallError::Unauthenticated)?;
+        Ok(response)
     }
 
     fn attach_mob_id(&self, err: RemoteMobError) -> RemoteMobError {

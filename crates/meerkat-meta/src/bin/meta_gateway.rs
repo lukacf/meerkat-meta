@@ -108,6 +108,13 @@ struct InitParams {
     /// and reconciled thereafter. `meta/ensure_member` adds to it at
     /// runtime.
     identity_roster: Option<Vec<meerkat_meta::identity_first::DurableAgentSpec>>,
+    /// Mob announcements: the object `rpc_gateway` takes as
+    /// `runtime_options.mob_announcements` (`{enabled, batch?,
+    /// retention_ms?, member_limits?, child_member_limits?}`), through the
+    /// same parser and the same refusals. Needs the identity-first runtime
+    /// (the default) and `persistent_sessions: true`.
+    #[serde(default)]
+    mob_announcements: Option<Value>,
     /// Member role migrations this activation is authorized to perform, e.g.
     /// `[{"identity": "domain:automation", "from_role": "domain"}]`.
     ///
@@ -940,6 +947,27 @@ fn parse_init_request(line: &str) -> anyhow::Result<(Value, InitParams)> {
              definition or resume an existing runtime while the host believes the prepared \
              application is in force"
         ));
+    }
+    if let Some(value) = parsed.mob_announcements.as_ref() {
+        // The same parser and refusals as rpc_gateway's
+        // runtime_options.mob_announcements. Enabled, it needs the durable
+        // identity substrate and the persistent stores its database sits
+        // beside.
+        let enabled = meerkat_meta::mob_announcements::parse_options(value, "mob_announcements")
+            .map_err(|error| anyhow!("{error}"))?
+            .is_some();
+        if enabled && parsed.identity_first == Some(false) {
+            return Err(anyhow!(
+                "mob_announcements needs the identity-first runtime and is refused with \
+                 identity_first: false"
+            ));
+        }
+        if enabled && parsed.persistent_sessions != Some(true) {
+            return Err(anyhow!(
+                "mob_announcements needs persistent_sessions: true: its database sits beside \
+                 the persistent stores"
+            ));
+        }
     }
     if parsed.application_tool_policies.is_some() {
         return Err(anyhow!(
@@ -1927,6 +1955,19 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
     // remains as a one-release opt-out for deployments that need the pure
     // mob-plane console back (changelog-flagged).
     let identity_first = params.identity_first.unwrap_or(true);
+    // Mob announcements compose through the one composition every surface
+    // shares: the member tool bundle goes on the persistent mob spec, and the
+    // owner attaches after the identity-first attachment. The options keep
+    // the default peer request window: this gateway's control listener
+    // serves keyed injects with it.
+    let announcements = match params.mob_announcements.as_ref() {
+        Some(value) => meerkat_meta::mob_announcements::parse_options(value, "mob_announcements")
+            .map_err(|error| anyhow!("{error}"))?
+            .map(meerkat_meta::mob_announcements::AnnouncementComposition::new)
+            .transpose()
+            .map_err(|error| anyhow!("mob_announcements: {error}"))?,
+        None => None,
+    };
     let identity_roster_seed = params.identity_roster.clone().unwrap_or_default();
     let role_migration_declarations = params.role_migrations.clone().unwrap_or_default();
     let realm = params.realm.as_deref();
@@ -2225,6 +2266,12 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             ),
         );
         spec.resolved_storage = Some(resolved_storage);
+        if let Some(announcements) = announcements.as_ref() {
+            // The host's own profiles name the member tool bundle; under the
+            // ceiling a child mob profile mounts it by naming it in its
+            // tools.bundles.
+            spec = announcements.register_member_tools(spec);
+        }
         (
             spec,
             schedule_host_inputs,
@@ -2608,6 +2655,15 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             .map_err(|error| anyhow!("failed to spawn fallback alpha meerkat: {error}"))?;
     }
 
+    // Mob announcements attach once the identity runtime is installed and
+    // before the control listener seals its keyed inject plane: the order
+    // every surface composes them in.
+    if let Some(announcements) = announcements {
+        announcements
+            .compose(runtime, &layout)
+            .map_err(|error| anyhow!("mob_announcements: {error}"))?;
+    }
+
     // Bind the cross-mob control listener after identity-first attachment so
     // its startup log reflects the final authority posture (the handler
     // re-reads the identity slot per request either way).
@@ -2621,6 +2677,13 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             .await
             .map_err(|error| anyhow!("--control-listen {addr}: {error}"))?;
         tracing::info!(%advertised, "cross-mob control listener bound");
+        // The runtime is composed: seal what the listener's keyed inject
+        // plane serves, through the composition every surface shares.
+        meerkat_meta::mob_announcements::compose_keyed_inject_plane(
+            runtime,
+            meerkat_meta::mob_announcements::KeyedInjectPlane::default(),
+        )
+        .map_err(|error| anyhow!("--control-listen {addr}: {error}"))?;
     }
 
     // Start schedule delivery only after identity-first attachment. The host
