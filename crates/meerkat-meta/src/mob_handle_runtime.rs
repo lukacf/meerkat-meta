@@ -5771,6 +5771,12 @@ pub struct MobBootstrapSpec {
     /// in a degraded `mob_composition` slot.
     pub candidate_definition: crate::mob_composition_manifest::CandidateDefinition,
     pub session_service: Arc<dyn MobSessionService>,
+    /// The host config the member builder resolves models with: the image
+    /// checks judge a member's model the way Core's model registry does,
+    /// self-hosted and config-declared models included. `None` until a stock
+    /// constructor or [`Self::with_member_model_config`] records it; the
+    /// static model catalog alone answers then.
+    pub(crate) member_model_config: Option<Arc<meerkat::Config>>,
     pub binary_blob_store: Option<Arc<dyn BinaryBlobStore>>,
     pub(crate) agent_mob_mcp_state: Option<Arc<meerkat_mob_mcp::MobMcpState>>,
     runtime_delivery: Option<MobRuntimeDelivery>,
@@ -6012,6 +6018,7 @@ impl MobBootstrapSpec {
             mob_storage_provenance: crate::mob_composition_manifest::MobStorageProvenance::default(
             ),
             session_service,
+            member_model_config: None,
             binary_blob_store: None,
             agent_mob_mcp_state: None,
             runtime_delivery: None,
@@ -6118,6 +6125,17 @@ impl MobBootstrapSpec {
         custody: Arc<crate::member_mcp_custody::MemberMcpCustody>,
     ) -> Self {
         self.member_mcp_custody = Some(custody);
+        self
+    }
+
+    /// Record the host config `session_service`'s member builder was given,
+    /// so the image checks judge a self-hosted or config-declared model by its
+    /// `vision` flag, as Core's model registry does. Without it they judge
+    /// with the static model catalog alone, which knows neither kind. The
+    /// stock constructors record it themselves.
+    #[must_use]
+    pub fn with_member_model_config(mut self, config: Arc<meerkat::Config>) -> Self {
+        self.member_model_config = Some(config);
         self
     }
 
@@ -6962,6 +6980,7 @@ impl MobBootstrapSpec {
             factory = factory.with_image_generation_machine(weak_image_generation_machine(machine));
         }
         let config = agent_config.unwrap_or_default();
+        let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
         builder.default_blob_store = Some(blob_store.clone());
@@ -7026,6 +7045,7 @@ impl MobBootstrapSpec {
         // `with_agent_mob_tools` order).
         let mut spec =
             Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook());
+        spec.member_model_config = Some(member_model_config);
         // The builder's own default decorator cell, so member taint composes
         // over the default this factory would apply.
         spec.dispatch_taint_slot
@@ -7428,6 +7448,7 @@ impl MobBootstrapSpec {
                 .with_image_generation_machine(weak_image_generation_machine(&runtime_adapter));
         }
         let config = agent_config.unwrap_or_default();
+        let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
         // Mount document MCP tools before native inherited visibility is resolved.
@@ -7588,6 +7609,7 @@ impl MobBootstrapSpec {
         let mut spec =
             Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook())
                 .with_mob_storage_provenance(provenance);
+        spec.member_model_config = Some(member_model_config);
         // The builder's own default decorator cell, so member taint composes
         // over the default this factory would apply.
         spec.dispatch_taint_slot
@@ -7825,6 +7847,7 @@ impl MobBootstrapSpec {
             factory = factory
                 .with_image_generation_machine(weak_image_generation_machine(&runtime_adapter));
         }
+        let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
         // Mount document MCP tools before native inherited visibility is resolved.
@@ -7944,6 +7967,7 @@ impl MobBootstrapSpec {
         // `with_agent_mob_tools` order).
         let mut spec =
             Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook());
+        spec.member_model_config = Some(member_model_config);
         // The builder's own default decorator cell, so member taint composes
         // over the default this factory would apply.
         spec.dispatch_taint_slot
@@ -8350,6 +8374,8 @@ pub struct MobRuntime {
     runtime_delivery: Option<Arc<RunningMobRuntimeDelivery>>,
 
     session_service: Option<Arc<dyn MobSessionService>>,
+    /// See [`MobBootstrapSpec`]'s field of the same name.
+    member_model_config: Option<Arc<meerkat::Config>>,
     agent_mob_mcp_state: Option<Arc<meerkat_mob_mcp::MobMcpState>>,
     implicit_delegate_retirement_overrides: Option<ImplicitDelegateRetirementOverrides>,
     binary_blob_store: Option<Arc<dyn BinaryBlobStore>>,
@@ -8704,6 +8730,7 @@ impl MobRuntime {
         let state_dir_claims = std::mem::take(&mut spec.state_dir_claims);
         let child_mob_root_claim = spec.child_mob_root_claim.clone();
         let session_service = spec.session_service.clone();
+        let member_model_config = spec.member_model_config.clone();
         let binary_blob_store = spec.binary_blob_store.clone();
         let mob_id = spec.definition.id.clone();
         let agent_mob_mcp_state = spec.agent_mob_mcp_state.clone();
@@ -9166,6 +9193,7 @@ impl MobRuntime {
                 handle,
                 runtime_delivery,
                 session_service: Some(session_service),
+                member_model_config,
                 agent_mob_mcp_state,
                 implicit_delegate_retirement_overrides,
                 binary_blob_store,
@@ -9224,6 +9252,7 @@ impl MobRuntime {
             handle,
             runtime_delivery: None,
             session_service: None,
+            member_model_config: None,
             agent_mob_mcp_state: None,
             implicit_delegate_retirement_overrides: None,
             binary_blob_store: None,
@@ -10062,6 +10091,14 @@ impl MobRuntime {
         self.session_service.as_ref()
     }
 
+    /// The host config this runtime's member builder resolves models with,
+    /// when the bootstrap spec recorded it
+    /// ([`MobBootstrapSpec::with_member_model_config`]): the image checks'
+    /// source for self-hosted and config-declared models.
+    pub fn member_model_config(&self) -> Option<Arc<meerkat::Config>> {
+        self.member_model_config.clone()
+    }
+
     /// Access the committed-boundary heal authority recorded at bootstrap,
     /// if any (2026-07-29 incident: injected into the identity-first session
     /// bridge so the continuity repair supervisor heals for real).
@@ -10560,11 +10597,45 @@ pub fn content_input_has_images(content: &meerkat_core::ContentInput) -> bool {
     }
 }
 
+/// The model registry Core builds a member of `definition` against: the
+/// static catalog, the `[models.<id>]` and self-hosted models of
+/// `model_config` (the host config the member builder holds), and the mob
+/// definition's own `[models.<id>]` entries. `None` without a host config, or
+/// when that registry does not assemble, in which case Core refuses to build
+/// the member at all.
+pub(crate) fn member_model_registry(
+    model_config: Option<&meerkat::Config>,
+    definition: &MobDefinition,
+) -> Option<meerkat_core::ModelRegistry> {
+    meerkat_core::ModelRegistry::from_config_with_models(
+        model_config?,
+        &definition.models,
+        meerkat_models::canonical(),
+    )
+    .ok()
+}
+
+/// The image capability of `model` as the static model catalog knows it.
+/// Self-hosted and config-declared models are not in the catalog; Meta's own
+/// surfaces judge them with the host config's model registry instead.
 pub fn model_capabilities_for_model(
     provider: Provider,
     model: &str,
 ) -> crate::runtime::ConsoleModelCapabilities {
+    model_capabilities_for_model_with_registry(None, provider, model)
+}
+
+/// [`model_capabilities_for_model`], with a model the static catalog does not
+/// know (a self-hosted or config-declared one) answered by `registry`, whose
+/// `vision` flag for it is the one Core admits images by. A catalog model
+/// keeps its catalog answer.
+pub(crate) fn model_capabilities_for_model_with_registry(
+    registry: Option<&meerkat_core::ModelRegistry>,
+    provider: Provider,
+    model: &str,
+) -> crate::runtime::ConsoleModelCapabilities {
     let image_input = meerkat_models::profile_for(provider, model)
+        .or_else(|| registry?.profile_for_provider(provider, model))
         .map(|profile| profile.vision)
         .unwrap_or(false);
     crate::runtime::ConsoleModelCapabilities { image_input }
@@ -10573,8 +10644,26 @@ pub fn model_capabilities_for_model(
 pub fn model_capabilities_for_profile(
     profile: &Profile,
 ) -> crate::runtime::ConsoleModelCapabilities {
+    model_capabilities_for_profile_with_registry(None, profile)
+}
+
+/// [`model_capabilities_for_profile`], with a model the static catalog does
+/// not know answered by `registry` for the provider Core's member build
+/// resolves: the profile's declared provider, else the one the registry
+/// registers the model for.
+pub(crate) fn model_capabilities_for_profile_with_registry(
+    registry: Option<&meerkat_core::ModelRegistry>,
+    profile: &Profile,
+) -> crate::runtime::ConsoleModelCapabilities {
     let image_input = meerkat_models::infer_provider(&profile.model)
         .and_then(|provider| meerkat_models::profile_for(provider, &profile.model))
+        .or_else(|| {
+            let registry = registry?;
+            let provider = profile
+                .provider
+                .or_else(|| registry.entry(&profile.model).map(|entry| entry.provider))?;
+            registry.profile_for_provider(provider, &profile.model)
+        })
         .map(|profile| profile.vision)
         .unwrap_or(false);
     crate::runtime::ConsoleModelCapabilities { image_input }
@@ -10584,10 +10673,18 @@ pub fn model_capabilities_for_role(
     definition: &MobDefinition,
     role: &str,
 ) -> crate::runtime::ConsoleModelCapabilities {
+    model_capabilities_for_role_with_registry(None, definition, role)
+}
+
+pub(crate) fn model_capabilities_for_role_with_registry(
+    registry: Option<&meerkat_core::ModelRegistry>,
+    definition: &MobDefinition,
+    role: &str,
+) -> crate::runtime::ConsoleModelCapabilities {
     let profile_name = ProfileName::from(role);
     definition
         .resolve_inline_profile(&profile_name)
-        .map(model_capabilities_for_profile)
+        .map(|profile| model_capabilities_for_profile_with_registry(registry, profile))
         .unwrap_or(crate::runtime::ConsoleModelCapabilities { image_input: false })
 }
 
@@ -10603,11 +10700,30 @@ pub async fn model_capabilities_for_member(
     session_service: Option<&Arc<dyn MobSessionService>>,
     member_id: &meerkat_mob::ids::AgentIdentity,
 ) -> crate::runtime::ConsoleModelCapabilities {
+    model_capabilities_for_member_with_config(handle, session_service, None, member_id).await
+}
+
+/// [`model_capabilities_for_member`], judged with `model_config`, the host
+/// config the mob's members are built with
+/// ([`MobRuntime::member_model_config`]): a self-hosted or config-declared
+/// model accepts images when its `vision` flag says so, as it does in Core.
+/// `None` judges with the static model catalog alone.
+pub(crate) async fn model_capabilities_for_member_with_config(
+    handle: &MobHandle,
+    session_service: Option<&Arc<dyn MobSessionService>>,
+    model_config: Option<&meerkat::Config>,
+    member_id: &meerkat_mob::ids::AgentIdentity,
+) -> crate::runtime::ConsoleModelCapabilities {
+    let registry = member_model_registry(model_config, handle.definition());
     if let Some(service) = session_service
         && let Some(session_id) = handle.resolve_bridge_session_id(member_id).await
         && let Ok(view) = service.read(&session_id).await
     {
-        return model_capabilities_for_model(view.state.provider, &view.state.model);
+        return model_capabilities_for_model_with_registry(
+            registry.as_ref(),
+            view.state.provider,
+            &view.state.model,
+        );
     }
 
     // Capability projection is a read-only display hint: a faulted or absent
@@ -10617,13 +10733,33 @@ pub async fn model_capabilities_for_member(
         .await
         .ok()
         .flatten()
-        .map(|member| model_capabilities_for_role(handle.definition(), member.role.as_str()))
+        .map(|member| {
+            model_capabilities_for_role_with_registry(
+                registry.as_ref(),
+                handle.definition(),
+                member.role.as_str(),
+            )
+        })
         .unwrap_or(crate::runtime::ConsoleModelCapabilities { image_input: false })
 }
 
 pub async fn assert_member_accepts_images(
     handle: &MobHandle,
     session_service: Option<&Arc<dyn MobSessionService>>,
+    member_id: &str,
+    content: &meerkat_core::ContentInput,
+) -> Result<(), MobRuntimeError> {
+    assert_member_accepts_images_with_config(handle, session_service, None, member_id, content)
+        .await
+}
+
+/// [`assert_member_accepts_images`], judged with `model_config`, the host
+/// config the mob's members are built with (see
+/// [`model_capabilities_for_member_with_config`]).
+pub(crate) async fn assert_member_accepts_images_with_config(
+    handle: &MobHandle,
+    session_service: Option<&Arc<dyn MobSessionService>>,
+    model_config: Option<&meerkat::Config>,
     member_id: &str,
     content: &meerkat_core::ContentInput,
 ) -> Result<(), MobRuntimeError> {
@@ -10641,7 +10777,13 @@ pub async fn assert_member_accepts_images(
     else {
         return Err(MobRuntimeError::InvalidInput("member not found"));
     };
-    let caps = model_capabilities_for_member(handle, session_service, &member.agent_identity).await;
+    let caps = model_capabilities_for_member_with_config(
+        handle,
+        session_service,
+        model_config,
+        &member.agent_identity,
+    )
+    .await;
     if caps.image_input {
         Ok(())
     } else {
@@ -12267,6 +12409,98 @@ mod tests {
             );
         }
         let _ = handle.shutdown().await;
+    }
+
+    /// The image checks' source: a catalog model keeps its catalog answer;
+    /// a self-hosted or mob-declared model answers by its `vision` flag, and
+    /// only through the host config's registry; a model no source registers,
+    /// or a registered one under another provider, stays refused.
+    #[test]
+    fn member_model_registry_answers_self_hosted_and_declared_models() {
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "image-capability-source"
+
+[models.declared-vision]
+provider = "openai"
+vision = true
+
+[profiles.catalog]
+model = "gpt-5.5"
+
+[profiles.seeing]
+model = "seeing-model"
+provider = "self_hosted"
+
+[profiles.blind]
+model = "blind-model"
+provider = "self_hosted"
+
+[profiles.declared]
+model = "declared-vision"
+
+[profiles.unknown]
+model = "unknown-model"
+provider = "self_hosted"
+"#,
+        )
+        .expect("mob definition");
+        let config: meerkat::Config = toml::from_str(
+            r#"
+[self_hosted]
+default_model = "seeing-model"
+
+[self_hosted.servers.loop]
+base_url = "http://127.0.0.1:9"
+
+[self_hosted.models.seeing-model]
+server = "loop"
+remote_model = "seeing-model"
+display_name = "Seeing"
+family = "seeing-model"
+vision = true
+
+[self_hosted.models.blind-model]
+server = "loop"
+remote_model = "blind-model"
+display_name = "Blind"
+family = "blind-model"
+"#,
+        )
+        .expect("host config");
+        let registry =
+            member_model_registry(Some(&config), &definition).expect("the registry assembles");
+        let judged = |role: &str| {
+            model_capabilities_for_role_with_registry(Some(&registry), &definition, role)
+                .image_input
+        };
+        let by_model = |provider: Provider, model: &str| {
+            model_capabilities_for_model_with_registry(Some(&registry), provider, model).image_input
+        };
+
+        assert_eq!(
+            judged("catalog"),
+            model_capabilities_for_role(&definition, "catalog").image_input
+        );
+        assert_eq!(
+            by_model(Provider::OpenAI, "gpt-5.5"),
+            model_capabilities_for_model(Provider::OpenAI, "gpt-5.5").image_input
+        );
+        assert!(judged("seeing"));
+        assert!(by_model(Provider::SelfHosted, "seeing-model"));
+        assert!(!judged("blind"));
+        assert!(!by_model(Provider::SelfHosted, "blind-model"));
+        assert!(judged("declared"));
+        assert!(by_model(Provider::OpenAI, "declared-vision"));
+        assert!(!judged("unknown"));
+        assert!(!by_model(Provider::SelfHosted, "unknown-model"));
+        assert!(!by_model(Provider::OpenAI, "seeing-model"));
+
+        // Without a host config the static catalog alone answers.
+        assert!(member_model_registry(None, &definition).is_none());
+        assert!(!model_capabilities_for_role(&definition, "seeing").image_input);
+        assert!(!model_capabilities_for_role(&definition, "declared").image_input);
     }
 
     /// A direct send is an action with no identity authority to consult. It

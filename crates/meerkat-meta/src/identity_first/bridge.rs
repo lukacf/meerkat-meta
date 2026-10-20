@@ -20,7 +20,7 @@ use meerkat_mob::{
 
 use crate::mob_handle_runtime::{
     content_input_has_images, is_previous_member_cleanup_ambiguous_error,
-    is_recoverable_lifecycle_cleanup_error, model_capabilities_for_member,
+    is_recoverable_lifecycle_cleanup_error, model_capabilities_for_member_with_config,
     topology_restore_failed_peer_ids,
 };
 
@@ -4809,6 +4809,10 @@ pub struct MobSessionBridge {
     session_store: Option<Arc<dyn meerkat::SessionStore>>,
     /// Session service used to project the live effective model for capability checks.
     session_service: Option<Arc<dyn MobSessionService>>,
+    /// The host config the mob's members are built with, so the image check
+    /// judges a self-hosted or config-declared model by its `vision` flag as
+    /// Core does. `None` judges with the static model catalog alone.
+    member_model_config: Option<Arc<meerkat::Config>>,
     runtime_members: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     runtime_sessions: Arc<tokio::sync::RwLock<HashMap<String, meerkat_core::types::SessionId>>>,
     /// Lazily-minted ops-owner bridge session for external (peer-only)
@@ -5020,6 +5024,7 @@ impl MobSessionBridge {
             handle,
             session_store: None,
             session_service: None,
+            member_model_config: None,
             runtime_members: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             generated_external_owner_session: std::sync::OnceLock::new(),
@@ -5044,6 +5049,7 @@ impl MobSessionBridge {
             handle,
             session_store: None,
             session_service: Some(session_service),
+            member_model_config: None,
             runtime_members: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             generated_external_owner_session: std::sync::OnceLock::new(),
@@ -5068,6 +5074,7 @@ impl MobSessionBridge {
             handle,
             session_store: Some(session_store),
             session_service: None,
+            member_model_config: None,
             runtime_members: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             generated_external_owner_session: std::sync::OnceLock::new(),
@@ -5093,6 +5100,7 @@ impl MobSessionBridge {
             handle,
             session_store: Some(session_store),
             session_service: Some(session_service),
+            member_model_config: None,
             runtime_members: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             generated_external_owner_session: std::sync::OnceLock::new(),
@@ -5209,6 +5217,16 @@ impl MobSessionBridge {
         authority: Arc<dyn meerkat_runtime::SessionServiceRuntimeExt>,
     ) -> Self {
         self.runtime_ingress_authority = Some(authority);
+        self
+    }
+
+    /// Judge image deliveries with the host config the mob's members are built
+    /// with ([`crate::mob_handle_runtime::MobRuntime::member_model_config`]),
+    /// so a self-hosted or config-declared model's `vision` flag counts as it
+    /// does in Core. Without it the static model catalog alone answers.
+    #[must_use]
+    pub fn with_member_model_config(mut self, config: Arc<meerkat::Config>) -> Self {
+        self.member_model_config = Some(config);
         self
     }
 
@@ -8662,9 +8680,10 @@ impl MobSessionBridge {
                 .bound(
                     "deliver.model_capabilities",
                     &mid,
-                    model_capabilities_for_member(
+                    model_capabilities_for_member_with_config(
                         &self.handle,
                         self.session_service.as_ref(),
+                        self.member_model_config.as_deref(),
                         &member_entry.agent_identity,
                     ),
                 )

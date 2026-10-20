@@ -16706,9 +16706,10 @@ external_addressable = true
         #[cfg(not(feature = "experimental-gpt-live"))]
         let live_agent_factory = factory.clone();
         let live_machine = Arc::clone(&adapter);
+        let member_agent_config = gateway_agent_config(&gateway_options);
         let mut inner_builder = crate::gateway_mcp_composition::gateway_member_builder(
             factory,
-            gateway_agent_config(&gateway_options),
+            member_agent_config.clone(),
             &adapter,
             &composition_storage,
         );
@@ -16917,6 +16918,7 @@ external_addressable = true
         gateway_transcript_edit_service = Some(Arc::clone(&concrete_service) as _);
         let session_service: Arc<dyn meerkat_mob::MobSessionService> = concrete_service;
         let mut spec = MobBootstrapSpec::new(definition, mob_storage, session_service)
+            .with_member_model_config(Arc::new(member_agent_config))
             .with_member_mcp_custody(Arc::clone(&member_mcp_custody))
             .with_host_default_agent_llm_client_decorator(host_default_decorator)
             .with_mob_storage_provenance(mob_storage_provenance)
@@ -17110,9 +17112,10 @@ external_addressable = true
             &member_mcp_custody,
         )
         .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?;
+        let member_agent_config = gateway_agent_config(&gateway_options);
         let mut inner_builder = crate::gateway_mcp_composition::gateway_member_builder(
             factory,
-            gateway_agent_config(&gateway_options),
+            member_agent_config.clone(),
             &adapter,
             &composition_storage,
         );
@@ -17216,6 +17219,7 @@ external_addressable = true
         let session_service: Arc<dyn meerkat_mob::MobSessionService> = concrete;
 
         let mut spec = MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
+            .with_member_model_config(Arc::new(member_agent_config))
             .with_member_mcp_custody(Arc::clone(&member_mcp_custody))
             .with_host_default_agent_llm_client_decorator(process_local_host_default_decorator)
             .with_optional_tool_consequence_policy_registry(
@@ -17601,6 +17605,11 @@ external_addressable = true
         // the next materialization re-Breaks.
         if let Some(recoverer) = runtime.mob_runtime().committed_boundary_recoverer() {
             identity_bridge = identity_bridge.with_committed_boundary_recoverer(recoverer);
+        }
+        // Image deliveries are judged with the member builder's host config,
+        // so a self-hosted model's `vision` flag counts.
+        if let Some(config) = runtime.mob_runtime().member_model_config() {
+            identity_bridge = identity_bridge.with_member_model_config(config);
         }
         // Governed binding pins the member session actor's actual controller
         // through the concrete session owner.

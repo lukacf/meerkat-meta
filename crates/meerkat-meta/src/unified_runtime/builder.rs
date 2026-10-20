@@ -1902,6 +1902,11 @@ impl UnifiedRuntimeBuilder {
             if let Some(recoverer) = runtime.mob_runtime.committed_boundary_recoverer() {
                 bridge = bridge.with_committed_boundary_recoverer(recoverer);
             }
+            // Image deliveries are judged with the member builder's host
+            // config, so a self-hosted model's `vision` flag counts.
+            if let Some(config) = runtime.mob_runtime.member_model_config() {
+                bridge = bridge.with_member_model_config(config);
+            }
             Some(Arc::new(bridge) as Arc<dyn crate::identity_first::bridge::SessionBridge>)
         };
 

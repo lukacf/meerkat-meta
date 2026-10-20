@@ -2939,6 +2939,12 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         let (mob_storage, mob_storage_provenance) =
             meerkat_meta::mob_composition_manifest::persistent_mob_storage(layout.event_log_db())?;
         let mut spec = MobBootstrapSpec::new(definition, mob_storage, service)
+            // The config `build_persistent_session_service` gave the member
+            // builder: the same producer over the same inputs.
+            .with_member_model_config(Arc::new(gateway_agent_config(
+                host_config.as_ref(),
+                compaction_policy.as_ref(),
+            )?))
             .with_member_mcp_custody(Arc::clone(&member_mcp_custody))
             .with_host_default_agent_llm_client_decorator(host_default_decorator)
             .with_mob_storage_provenance(mob_storage_provenance)
@@ -3032,6 +3038,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         // Same producer as the persistent arm: host config first, the
         // compaction declaration on top.
         let config = gateway_agent_config(host_config.as_ref(), compaction_policy.as_ref())?;
+        let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
         builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
@@ -3070,6 +3077,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             .acquire_canonical_runtime_adapter(Some(Arc::clone(&adapter)))
             .context("failed to acquire the process-local gateway session runtime owner")?;
         let mut spec = MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
+            .with_member_model_config(member_model_config)
             .with_member_mcp_custody(Arc::clone(&member_mcp_custody))
             .with_host_default_agent_llm_client_decorator(host_default_decorator)
             // The SAME store handed to MeerkatMachine::persistent above.
@@ -3276,6 +3284,11 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         // the next materialization re-Breaks.
         if let Some(recoverer) = runtime.mob_runtime().committed_boundary_recoverer() {
             bridge = bridge.with_committed_boundary_recoverer(recoverer);
+        }
+        // Image deliveries are judged with the member builder's host config,
+        // so a self-hosted model's `vision` flag counts.
+        if let Some(config) = runtime.mob_runtime().member_model_config() {
+            bridge = bridge.with_member_model_config(config);
         }
         // Governed binding pins the member session actor's actual controller
         // through the concrete session owner.

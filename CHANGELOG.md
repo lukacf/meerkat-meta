@@ -1437,6 +1437,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   backoff pass (250 ms, doubling to at most 60 s apart), so the identity
   converges, and sends to it are accepted again, once the error clears. A
   stopped mob retries it when it is resumed.
+- A member on a self-hosted model that the host config declares with
+  `vision = true` (`[self_hosted.models.<id>]`) now takes images. Meta's image
+  check asked only the static model catalog, which lists no self-hosted model,
+  so it refused every image for such a member ("target member model cannot
+  accept image input") on identity sends, console sends and
+  `meta/send_message`, although Meerkat accepts it, and the console showed
+  the member as not taking images. The check and the console's member rows
+  now read the model registry Meerkat builds the member with: the host
+  config's self-hosted and `[models.<id>]` entries and the mob definition's
+  own `[models.<id>]` entries, each judged by its `vision` flag. Catalog models
+  answer as before, and a model without the flag is still refused. The
+  gateways and `UnifiedRuntimeBuilder` pass their host config on; a host that
+  composes its own session service passes it with
+  `MobBootstrapSpec::with_member_model_config` (and to a hand-built identity
+  bridge with `MobSessionBridge::with_member_model_config`). Without it, the
+  check answers from the catalog alone, as before.
 
 ### Known limitations
 

@@ -23,8 +23,8 @@ use meerkat_mob::{
 };
 
 use crate::mob_handle_runtime::{
-    is_recoverable_lifecycle_cleanup_error, member_entry_to_json,
-    model_capabilities_for_member_entry, model_capabilities_for_role,
+    is_recoverable_lifecycle_cleanup_error, member_entry_to_json, member_model_registry,
+    model_capabilities_for_member_entry, model_capabilities_for_role_with_registry,
     model_routing_status_for_member, model_routing_status_for_session, resolved_tools_for_member,
     resolved_tools_for_session, topology_restore_failed_peer_ids, topology_restore_warning_json,
 };
@@ -6466,17 +6466,28 @@ fn parse_optional_runtime_binding(
     }
 }
 
+/// The model registry `runtime`'s members are built against
+/// ([`member_model_registry`]), built once per member listing.
+fn console_member_model_registry(runtime: &MobRuntime) -> Option<meerkat_core::ModelRegistry> {
+    member_model_registry(
+        runtime.member_model_config().as_deref(),
+        runtime.handle().definition(),
+    )
+}
+
 async fn member_entry_to_console_json(
     runtime: &MobRuntime,
+    model_registry: Option<&meerkat_core::ModelRegistry>,
     entry: &meerkat_mob::runtime::MobMemberListEntry,
 ) -> Value {
     let mut value = member_entry_to_json(entry);
     if let Some(object) = value.as_object_mut() {
         object.insert(
             "model_capabilities".to_string(),
-            serde_json::to_value(model_capabilities_for_member_entry(
+            serde_json::to_value(model_capabilities_for_role_with_registry(
+                model_registry,
                 runtime.handle().definition(),
-                entry,
+                entry.role.as_str(),
             ))
             .unwrap_or(Value::Null),
         );
@@ -9078,6 +9089,7 @@ async fn handle_console_runtime_rpc_with_visibility(
         "meta/list_members" => meerkat_runtime::stack_relief::box_in_own_frame(move || async move {
             let handle = runtime.handle();
             let entries = handle.list_members_including_retiring().await;
+            let model_registry = console_member_model_registry(runtime);
             let mut members = Vec::with_capacity(entries.len());
             for entry in &entries {
                 let alias =
@@ -9092,7 +9104,9 @@ async fn handle_console_runtime_rpc_with_visibility(
                 {
                     continue;
                 }
-                members.push(member_entry_to_console_json(runtime, entry).await);
+                members.push(
+                    member_entry_to_console_json(runtime, model_registry.as_ref(), entry).await,
+                );
             }
             retain_visible_member_rows(&mut members, access_view);
             response_value(response_id, Some(Value::Array(members)), None)
@@ -9119,7 +9133,14 @@ async fn handle_console_runtime_rpc_with_visibility(
             match entries.into_iter().find(|e| e.agent_identity == identity) {
                 Some(entry) => response_value(
                     response_id,
-                    Some(member_entry_to_console_json(runtime, &entry).await),
+                    Some(
+                        member_entry_to_console_json(
+                            runtime,
+                            console_member_model_registry(runtime).as_ref(),
+                            &entry,
+                        )
+                        .await,
+                    ),
                     None,
                 ),
                 None => invalid_params(response_id, format!("member not found: {member_id}")),
@@ -9149,6 +9170,7 @@ async fn handle_console_runtime_rpc_with_visibility(
                     return invalid_params(response_id, format!("member lookup failed: {err}"));
                 }
             };
+            let model_registry = console_member_model_registry(runtime);
             let mut matches = Vec::with_capacity(entries.len());
             for entry in &entries {
                 let alias =
@@ -9163,7 +9185,9 @@ async fn handle_console_runtime_rpc_with_visibility(
                 {
                     continue;
                 }
-                matches.push(member_entry_to_console_json(runtime, entry).await);
+                matches.push(
+                    member_entry_to_console_json(runtime, model_registry.as_ref(), entry).await,
+                );
             }
             retain_visible_member_rows(&mut matches, access_view);
             response_value(response_id, Some(Value::Array(matches)), None)
@@ -12701,8 +12725,10 @@ async fn walk_console_snapshot_read_model(
     let runtime_machine = runtime
         .session_service()
         .and_then(|service| crate::mob_handle_runtime::observed_runtime_adapter(service.as_ref()));
+    let member_model_config = runtime.member_model_config();
     let (primary_members, _primary_owner_index) = project_console_members_from_handle(
         &handle,
+        member_model_config.as_deref(),
         runtime_machine.as_deref(),
         None,
         None,
@@ -12745,6 +12771,7 @@ async fn walk_console_snapshot_read_model(
             collect_console_session_index_for_handle(&delegate_handle, &mut state).await;
             let (delegate_members, _delegate_owner_index) = project_console_members_from_handle(
                 &delegate_handle,
+                member_model_config.as_deref(),
                 runtime_machine.as_deref(),
                 Some(&host_identity),
                 Some(mob_id.as_str()),
@@ -13794,6 +13821,7 @@ async fn prime_access_cache_from_handle_with_registry_namespace(
 
 async fn project_console_members_from_handle(
     handle: &MobHandle,
+    member_model_config: Option<&meerkat::Config>,
     runtime_machine: Option<&meerkat_runtime::MeerkatMachine>,
     host_identity: Option<&str>,
     source_mob_id: Option<&str>,
@@ -13804,6 +13832,9 @@ async fn project_console_members_from_handle(
     // `MobMemberListEntry`; the structural `list_all_members` roster no longer
     // carries it, so the console projection reads the operational list.
     let entries = handle.list_members_including_retiring().await;
+    // A delegate mob's members are built by the same member builder, against
+    // its own definition's `[models.<id>]` entries.
+    let model_registry = member_model_registry(member_model_config, handle.definition());
     let mut members = Vec::with_capacity(entries.len());
     let mut session_owner_by_id = BTreeMap::new();
     for entry in &entries {
@@ -13815,8 +13846,11 @@ async fn project_console_members_from_handle(
         if let Some(session_id) = session_id.as_ref() {
             session_owner_by_id.insert(session_id.clone(), identity.clone());
         }
-        let model_capabilities =
-            model_capabilities_for_role(handle.definition(), entry.role.as_str());
+        let model_capabilities = model_capabilities_for_role_with_registry(
+            model_registry.as_ref(),
+            handle.definition(),
+            entry.role.as_str(),
+        );
         let mut labels = entry.labels.clone();
         // Spawn-time console metadata (group/display labels, spawned_by
         // lineage) fills gaps the roster does not carry; roster labels win —
@@ -22839,6 +22873,7 @@ comms = true
             None,
             None,
             None,
+            None,
             &empty_read_model,
             &BTreeMap::new(),
         )
@@ -22854,6 +22889,7 @@ comms = true
                 .await;
         let (members, session_owner_by_id) = project_console_members_from_handle(
             &runtime.handle(),
+            None,
             None,
             None,
             None,
@@ -24029,6 +24065,7 @@ comms = true
         let handle = runtime.handle();
         let (mut members, _) = project_console_members_from_handle(
             &handle,
+            None,
             runtime_machine.as_deref(),
             None,
             None,
@@ -24107,6 +24144,7 @@ comms = true
         let handle = runtime.handle();
         let (mut members, _) = project_console_members_from_handle(
             &handle,
+            None,
             runtime_machine.as_deref(),
             None,
             None,
@@ -24188,6 +24226,7 @@ comms = true
             .expect("meerkat reports progress for a local member");
         let (members, _) = project_console_members_from_handle(
             &handle,
+            None,
             runtime_machine.as_deref(),
             None,
             None,

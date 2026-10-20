@@ -10,9 +10,9 @@ use serde_json::Value;
 
 use crate::blob_store::is_valid_blob_id_value;
 use crate::mob_handle_runtime::{
-    assert_member_accepts_images, is_recoverable_lifecycle_cleanup_error, member_entry_to_json,
-    model_routing_status_for_member, model_routing_status_for_session, resolved_tools_for_member,
-    resolved_tools_for_session, send_message_on_mob_with_interaction,
+    assert_member_accepts_images_with_config, is_recoverable_lifecycle_cleanup_error,
+    member_entry_to_json, model_routing_status_for_member, model_routing_status_for_session,
+    resolved_tools_for_member, resolved_tools_for_session, send_message_on_mob_with_interaction,
     topology_restore_failed_peer_ids, topology_restore_warning_json,
 };
 use crate::unified_runtime::UnifiedRuntime;
@@ -429,9 +429,10 @@ pub(super) async fn handle_send_message(
                 SendMessageTarget::Identity { .. } => None,
             };
             if let Some(guard_member_id) = image_guard_member_id
-                && let Err(err) = assert_member_accepts_images(
+                && let Err(err) = assert_member_accepts_images_with_config(
                     &runtime.mob_handle(),
                     runtime.mob_runtime().session_service(),
+                    runtime.mob_runtime().member_model_config().as_deref(),
                     guard_member_id,
                     &content,
                 )

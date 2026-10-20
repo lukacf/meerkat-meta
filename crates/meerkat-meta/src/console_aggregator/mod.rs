@@ -44,7 +44,7 @@ use crate::console_contracts::SYSTEM_EVENT_IDENTITY;
 #[cfg(test)]
 use crate::mob_handle_runtime::send_message_on_mob_with_mode;
 use crate::mob_handle_runtime::{
-    MobRuntime, assert_member_accepts_images, is_recoverable_lifecycle_cleanup_error,
+    MobRuntime, assert_member_accepts_images_with_config, is_recoverable_lifecycle_cleanup_error,
 };
 use crate::runtime::ConsoleMember;
 use crate::unified_runtime::{ConsoleEventStore, UnifiedRuntime};
@@ -2605,9 +2605,10 @@ impl MetaConsoleAggregator {
                 ));
             }
         }
-        assert_member_accepts_images(
+        assert_member_accepts_images_with_config(
             &resolved.handle,
             resolved.entry.runtime.session_service(),
+            resolved.entry.runtime.member_model_config().as_deref(),
             &resolved.runtime_identity,
             &content,
         )
