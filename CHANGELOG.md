@@ -1404,6 +1404,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   store that cannot be read is refused (`RuntimeStoreUnreadable`). The
   check runs before any identity wakes, on `persistent_state()` and
   `scratch_dir()` realms alike.
+- An identity whose member retirement failed after it had durably started
+  (a storage write or a host failure during its adoption, retire, reset or
+  respawn) no longer stays in `Backoff` until the gateway restarts. A
+  running gateway now retries the retirement itself on the identity's next
+  backoff pass (250 ms, doubling to at most 60 s apart), so the identity
+  converges, and sends to it are accepted again, once the error clears. A
+  stopped mob retries it when it is resumed.
 
 ### Known limitations
 
@@ -1457,13 +1464,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rewrites. If that file becomes unreadable, the copy
   `storage-migrate-native --apply` kept lacks the reset rows: run
   identity-reset again for each reset made since.
-- If a storage write or the host fails after an identity's member
-  retirement has durably started (in its adoption, retire, reset or
-  respawn), the identity stays in `Backoff` in its convergence status, and
-  sends to it are refused, until the gateway restarts: the restart drives
-  the retirement again and recovers it. An embedder can also stop and
-  resume the mob (`MobHandle::stop`, then `resume`). A Core fix is planned
-  for a later release.
 - An identity runtime a host makes with `IdentityRuntime::new` and never
   installs in its `UnifiedRuntime` gets no cross-mob alias authority and no
   turn completions from the mob. `UnifiedRuntime::wire_cross_mob`, and so
