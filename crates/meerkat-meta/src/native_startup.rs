@@ -881,14 +881,32 @@ mod tests {
     }
 
     /// An unmigrated directory refuses typed before any store opens, naming
-    /// the migration verb, and the refusal leaves every file byte-identical.
+    /// the migration verb, and the refusal leaves every file byte-identical:
+    /// its 0.9.3 WholeBlob runtime store takes no head-canonical pin, and
+    /// still opens as a 0.9.3 store afterwards, so `storage-migrate-native`
+    /// can still convert it.
     #[tokio::test]
     async fn an_unmigrated_directory_refuses_and_is_left_byte_identical() {
+        use meerkat_runtime::RuntimeStore as _;
         let dir = tempfile::tempdir().expect("tempdir");
         drop(
             meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
                 .expect("a 0.9.3 sessions database"),
         );
+        let runtime = dir.path().join(RUNTIME_DB_FILE_NAME);
+        let session = meerkat_core::Session::new();
+        let whole_blob = meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(&runtime)
+            .expect("a 0.9.3 runtime store");
+        whole_blob
+            .commit_session_snapshot(
+                &meerkat_runtime::LogicalRuntimeId::for_session(session.id()),
+                meerkat_runtime::store::SerializedSessionSnapshot {
+                    session_snapshot: serde_json::to_vec(&session).expect("encode").into(),
+                },
+            )
+            .await
+            .expect("a committed WholeBlob body");
+        drop(whole_blob);
         let snapshot = |dir: &Path| {
             std::fs::read_dir(dir)
                 .expect("read the state directory")
@@ -919,11 +937,19 @@ mod tests {
         // The claim's lock file, and the read-only probe's shared-memory
         // index and empty write-ahead log, are the only additions allowed.
         after.remove(STATE_DIR_LOCK_FILE_NAME);
-        after.remove("sessions.sqlite3-shm");
-        if after.get("sessions.sqlite3-wal").is_some_and(Vec::is_empty) {
-            after.remove("sessions.sqlite3-wal");
+        for database in ["sessions.sqlite3", RUNTIME_DB_FILE_NAME] {
+            after.remove(&format!("{database}-shm"));
+            let wal = format!("{database}-wal");
+            if after.get(&wal).is_some_and(Vec::is_empty) {
+                after.remove(&wal);
+            }
         }
+        assert!(before.contains_key(RUNTIME_DB_FILE_NAME));
         assert_eq!(after, before, "the refusal changed the state directory");
+        drop(
+            meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(&runtime)
+                .expect("the refused runtime store still opens as a 0.9.3 store"),
+        );
     }
 
     /// A layout naming a separate session database refuses typed

@@ -1171,8 +1171,9 @@ mod tests {
     /// A runtime whose committed WholeBlob body compacted over a tool
     /// result's inline image converts: `--apply` moves the image to the
     /// realm blob store before the conversion's first write, the converted
-    /// session names it by its content address, and it hydrates from
-    /// `blobs/` in the state directory.
+    /// session names it by its content address, it hydrates from `blobs/`
+    /// in the state directory, and no table of `runtime.sqlite` but the
+    /// kept 0.9.3 bodies holds it inline.
     #[tokio::test]
     async fn an_applied_runtime_hydrates_its_inline_images_from_the_realm_blob_store() {
         use crate::storage_migrate::MigrateMode;
@@ -1206,7 +1207,7 @@ mod tests {
         assert!(report.applied.is_some(), "{report:#?}");
         assert_eq!(native_layout_status(dir.path()), NativeLayoutStatus::Native);
 
-        let converted = meerkat_store::SqliteSessionStore::open(path)
+        let converted = meerkat_store::SqliteSessionStore::open(path.clone())
             .unwrap()
             .load(session.id())
             .await
@@ -1226,5 +1227,40 @@ mod tests {
             .await
             .expect("the image hydrates from blobs/");
         assert_eq!(image.data, SCREENSHOT);
+
+        // No table of runtime.sqlite holds the image inline any more, except
+        // the 0.9.3 WholeBlob bodies Core keeps beside the converted rows.
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND name <> 'runtime_whole_blob_bodies'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!tables.is_empty());
+        for table in &tables {
+            let mut statement = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                for column in 0..columns {
+                    let bytes = match row.get_ref(column).unwrap() {
+                        rusqlite::types::ValueRef::Text(bytes)
+                        | rusqlite::types::ValueRef::Blob(bytes) => bytes,
+                        _ => continue,
+                    };
+                    assert!(
+                        !bytes
+                            .windows(SCREENSHOT.len())
+                            .any(|window| window == SCREENSHOT.as_bytes()),
+                        "{table} holds the image inline"
+                    );
+                }
+            }
+        }
     }
 }
