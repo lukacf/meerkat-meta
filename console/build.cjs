@@ -31,6 +31,11 @@ const bundleSyntaxOptions = {
   supported: { "template-literal": false },
 };
 
+// console-host.css pulls in the console's own fonts (src/fonts). Inlined as
+// data: URLs they travel inside the stylesheet, so every host that serves the
+// stylesheet serves the fonts too and no page requests a font elsewhere.
+const fontLoaders = { ".woff2": "dataurl" };
+
 function assetVersion(bytes) {
   return crypto.createHash("sha256").update(bytes).digest("hex").slice(0, 12);
 }
@@ -71,6 +76,7 @@ async function main() {
     external: ["react", "react-dom", "react-dom/client", "react/jsx-runtime", "react/jsx-dev-runtime"],
     alias,
     nodePaths,
+    loader: fontLoaders,
     ...bundleSyntaxOptions,
     minify: false,
   });
@@ -90,6 +96,7 @@ async function main() {
     },
     alias,
     nodePaths,
+    loader: fontLoaders,
     ...bundleSyntaxOptions,
     keepNames: true,
     minify: true,
@@ -123,7 +130,7 @@ async function main() {
   );
 }
 
-module.exports = { bundleSyntaxOptions };
+module.exports = { bundleSyntaxOptions, fontLoaders };
 
 if (require.main === module) {
   main().catch((error) => {

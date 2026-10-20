@@ -19,6 +19,11 @@ export function forgeBuildOptions() {
       "@console-core": fileURLToPath(new URL("../../packages/console-core/src", import.meta.url)),
     },
     define: { "process.env.NODE_ENV": '"production"' },
+    // fonts/fonts.css names Forge's own woff2 fonts. Each lands in
+    // dist/fonts beside app.css, which the Forge server serves, so the page
+    // fetches only the subsets it shows and nothing from another origin.
+    loader: { ".woff2": "file" },
+    assetNames: "fonts/[name]-[hash]",
     logLevel: "info",
   };
 }

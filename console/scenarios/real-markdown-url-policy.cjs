@@ -71,17 +71,14 @@ async function urlPolicy(host) {
     for (const mode of ["default", "custom"]) {
       const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
       const page = currentPage = await context.newPage();
-      const errors = [], expectedCancellations = [], imageRequests = [], externalRequests = [], hostFontRequests = [];
+      const errors = [], expectedCancellations = [], imageRequests = [], externalRequests = [];
       let initializing = true;
       page.on("pageerror", error => errors.push(error.message));
       page.on("request", request => {
         if (request.resourceType() === "image") imageRequests.push(request.url());
-        const url = new URL(request.url());
-        if (url.origin !== fixture.baseUrl) {
-          const hostFont = (url.origin === "https://fonts.googleapis.com" && url.pathname === "/css2" && request.resourceType() === "stylesheet")
-            || (url.origin === "https://fonts.gstatic.com" && request.resourceType() === "font");
-          (hostFont ? hostFontRequests : externalRequests).push(request.url());
-        }
+        // The console carries its own fonts, so nothing, not even a font,
+        // is fetched from another origin.
+        if (new URL(request.url()).origin !== fixture.baseUrl) externalRequests.push(request.url());
       });
       page.on("requestfailed", request => {
         const detail = { url: request.url(), error: request.failure()?.errorText };
@@ -124,13 +121,13 @@ async function urlPolicy(host) {
           assert.equal(await document.getByRole("link", { name: "Denied link", exact: true }).getAttribute("href"), "https://denied.invalid/link", "default HTTPS links remain links until a host restricts them");
           assert.deepEqual(imageRequests, [], "default renderer issues no image request");
         }
-        assert.deepEqual(externalRequests, [], "rendering never fetches external tracking URLs");
+        assert.deepEqual(externalRequests, [], "rendering fetches nothing from another origin: no tracking URL and no hosted font");
         assert.deepEqual(errors, []);
         await fs.mkdir(evidence, { recursive: true });
         await page.screenshot({ path: path.join(evidence, `${host}-markdown-policy-${mode}.png`), fullPage: true });
-        result.cases.push({ mode, imageRequests, externalRequests, hostFontRequests, errors, expectedCancellations });
+        result.cases.push({ mode, imageRequests, externalRequests, errors, expectedCancellations });
       } catch (error) {
-        result.cases.push({ mode, imageRequests, externalRequests, hostFontRequests, errors, expectedCancellations, failure: error.stack || String(error) });
+        result.cases.push({ mode, imageRequests, externalRequests, errors, expectedCancellations, failure: error.stack || String(error) });
         await fs.mkdir(evidence, { recursive: true });
         await page.screenshot({ path: path.join(evidence, `${host}-markdown-policy-${mode}-failure.png`), fullPage: true }).catch(() => {});
         throw error;
