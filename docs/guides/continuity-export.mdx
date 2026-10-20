@@ -201,20 +201,28 @@ standard base64, with padding and without line breaks:
 ```
 
 Queries of this shape fill them from a host's tables, one row per line. The
-names in angle brackets stand for your tables and functions:
+names in angle brackets stand for your tables, columns and functions. Each
+query must give one row per identity or per session: a table that keeps a
+history of records or snapshots needs the newest-row pick shown, and a
+repeated identity or session stops the export.
 
 ```sql
--- records.jsonl: the current record of each identity
-SELECT identity, agent_runtime_id, session_id, generation, checkpoint_version
-FROM <continuity records>;
+-- records.jsonl: the current record of each identity, one row per identity
+SELECT r.identity, r.agent_runtime_id, r.session_id, r.generation, r.checkpoint_version
+FROM <continuity records> AS r
+WHERE r.<written at> = (SELECT MAX(<written at>) FROM <continuity records>
+                        WHERE identity = r.identity);
 
--- sessions.jsonl: the latest snapshot of each session a record names
+-- sessions.jsonl: the latest snapshot of each session a record names,
+-- one row per session
 SELECT s.session_id, <base64 of the snapshot bytes> AS data
 FROM <session snapshots> AS s
-JOIN <continuity records> AS r ON r.session_id = s.session_id;
+JOIN <the records query above> AS r ON r.session_id = s.session_id
+WHERE s.<saved at> = (SELECT MAX(<saved at>) FROM <session snapshots>
+                      WHERE session_id = s.session_id);
 
 -- identities.txt: one identity per line
-SELECT identity FROM <continuity records>;
+SELECT DISTINCT identity FROM <continuity records>;
 ```
 
 Some tools write 64-bit integers into JSON as strings: the provider reads
