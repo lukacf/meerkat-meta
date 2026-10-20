@@ -44211,10 +44211,18 @@ function exitDetailOf(exit3) {
   const target = asString(exit3.target_identity);
   const order2 = asNumber(exit3.participant_order);
   const round = asNumber(exit3.round);
+  const refusal = asRecord(exit3.refusal);
+  const refusalCause = asString(asRecord(refusal?.cause)?.kind);
+  const refusalKeys = refusal && Array.isArray(refusal.keys) ? refusal.keys.length : 0;
   const parts = [];
   if (order2 !== void 0) parts.push("slot ".concat(order2));
   if (round !== void 0) parts.push("round ".concat(round + 1));
   if (target) parts.push(target);
+  if (refusalCause) {
+    parts.push(
+      "fork instruction refusal: ".concat(refusalCause.replace(/_/g, " ")) + (refusalKeys > 0 ? " (".concat(refusalKeys, " key").concat(refusalKeys === 1 ? "" : "s", ")") : "")
+    );
+  }
   if (detail) parts.push(detail);
   return parts.length > 0 ? parts.join(" \xB7 ") : void 0;
 }

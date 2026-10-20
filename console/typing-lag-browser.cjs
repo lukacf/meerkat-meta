@@ -39,6 +39,7 @@ const http = require("node:http");
 const path = require("node:path");
 const { build } = require("esbuild");
 const { chromium } = require("playwright");
+const { fontLoaders } = require("./build.cjs");
 
 function arg(name, fallback) {
   const index = process.argv.indexOf(`--${name}`);
@@ -149,6 +150,7 @@ async function buildHarness() {
       "@console-components/styles": path.resolve(SRC, "../packages/console-components/src/styles/index.ts"),
     },
     nodePaths: [path.resolve(SRC, "node_modules")],
+    loader: fontLoaders,
     jsx: "automatic",
     keepNames: true,
     minify: MINIFY,

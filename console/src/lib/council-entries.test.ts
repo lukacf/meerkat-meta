@@ -140,6 +140,23 @@ test("a failed exit carries its typed detail into the card", () => {
   assert.ok(entry?.exitDetail?.includes("round 2"), "round is rendered 1-based for humans");
 });
 
+test("a fork instruction refusal renders its typed cause as the exit detail", () => {
+  const entry = councilEntryFromFrame(
+    resultFrame(sealedResult({
+      exit_reason: {
+        reason: "participant_fork_instruction_refused",
+        participant_order: 1,
+        refusal: { cause: { kind: "policy_refuses" }, keys: [["host", "persona"]] },
+      },
+    })),
+    IDENTITY,
+  );
+  assert.equal(entry?.status, "failed");
+  assert.equal(entry?.exitReason, "participant_fork_instruction_refused");
+  assert.ok(entry?.exitDetail?.includes("slot 1"));
+  assert.ok(entry?.exitDetail?.includes("fork instruction refusal: policy refuses (1 key)"));
+});
+
 test("an exchange with no observed terminal stays pending, never assumed complete", () => {
   // A receipt left pending is what a coordinator crash looks like; silently
   // upgrading it to completed would hide exactly that.

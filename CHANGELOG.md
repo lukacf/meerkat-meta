@@ -105,6 +105,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   own YAML parsing already used serde-saphyr, and the Meerkat Core 0.9.4
   crates parse SKILL.md frontmatter with serde-saphyr as well, so `deny.toml`
   no longer ignores that advisory.
+- The console and the flow editor no longer fetch their fonts from Google
+  Fonts. Their stylesheets imported Inter Tight and IBM Plex Mono from
+  `fonts.googleapis.com`, so every console or flow editor load sent a
+  request to a third party, and a host without internet access drew them in
+  fallback fonts. Meta now carries the same woff2 files Google Fonts served
+  (Inter Tight 3.004 and IBM Plex Mono 2.3, under the SIL Open Font License
+  1.1, with their license texts in `console/src/fonts/`), inlined as `data:`
+  URLs into `/console/assets/console-app.css`, which grows from about 260 KB
+  to about 1.7 MB, and `/flow-editor/assets/flow-editor.css`, which grows
+  from about 94 KB to about 1.5 MB. A Content-Security-Policy in front of
+  either that restricts fonts must allow `font-src data:`.
+- Meta Forge's page no longer fetches DM Sans, Manrope and Newsreader from
+  Google Fonts on every session. The same woff2 files Google Fonts served
+  (DM Sans 4.004, Manrope 4.504 and Newsreader 1.003, under the SIL Open
+  Font License 1.1) ship in `installer/web/fonts/`, with their license texts
+  beside them and in `installer/THIRD_PARTY_NOTICES.md`. The build emits
+  them to `web/dist/fonts/`, which Forge serves itself, and the page fetches
+  a font only when it shows that font's characters.
 
 ### Added
 
@@ -234,6 +252,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Meta Forge's packager accepts the frontend it has just built. esbuild
+  carries the file names that installed packages' own source maps give
+  (inline-style-parser's `index.js`, the MCP SDK's TypeScript sources) into
+  `web/dist/app.js.map`, and the stale-frontend check read every named file,
+  so packaging a fresh build stopped with `FileNotFoundError`. The check now
+  compares and records only the checkout's own sources, skips sources under
+  `node_modules` (which `package-lock.json` pins), and refuses a missing
+  checkout source as a stale frontend.
 - Meta Forge's local knowledge service starts and becomes ready for semantic
   ingestion. `knowledge/manage.py up` used to stop before the service started:
   the pinned source commit could not be fetched, and every available revision

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink } from "node:fs/promises";
+import { copyFile, cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +36,8 @@ test("actual frontend build handles a relocated checkout with spaces and Unicode
         await copyFile(join(sourceWeb, entry.name), join(web, entry.name));
       }
     }
+    // Forge's own fonts and their licenses are public inputs in one directory.
+    await cp(join(sourceWeb, "fonts"), join(web, "fonts"), { recursive: true });
     await copyFile(sourceAsset, join(assets, "meerkat-transparent.png"));
     // state.mjs imports this known public planning input outside the flat web tree.
     await copyFile(sourceLimits, join(launchkit, "blueprint-limits.json"));
@@ -68,6 +70,13 @@ test("actual frontend build handles a relocated checkout with spaces and Unicode
     const css = await readFile(join(output, "app.css"), "utf8");
     assert.ok(javascript.length > 1000, "the real App bundle was emitted");
     assert.ok(css.length > 1000, "the real stylesheet bundle was emitted");
+    // The page names only fonts the build emitted beside it, none elsewhere.
+    const fonts = [...new Set([...css.matchAll(/url\("\.\/(fonts\/[^"]+\.woff2)"\)/g)].map((match) => match[1]))];
+    assert.ok(fonts.length > 0, "the stylesheet names Forge's own fonts");
+    for (const font of fonts) assert.equal((await stat(join(output, font))).isFile(), true, `${font} was emitted`);
+    for (const page of [css, await readFile(join(output, "index.html"), "utf8")]) {
+      assert.doesNotMatch(page, /fonts\.(googleapis|gstatic)\.com/, "the page loads no font from another origin");
+    }
     for (const name of ["app.js.map", "app.css.map"]) {
       const map = JSON.parse(await readFile(join(output, name), "utf8"));
       assert.ok(map.sources.length > 0);

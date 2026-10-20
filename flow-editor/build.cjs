@@ -14,6 +14,36 @@ const tmpDir = path.join(root, ".tmp");
 const corePackageEntry = path.join(root, "../packages/flow-editor-core/src/index.ts");
 const componentsPackageEntry = path.join(root, "../packages/flow-editor-components/src/index.ts");
 const appEntry = path.join(srcDir, "app.tsx");
+const consoleFontsDir = path.join(root, "../console/src/fonts");
+
+// The designer handoff pins src/tokens.css byte for byte
+// (test/handoff-visual-contract.test.cjs), and that file imports Inter Tight
+// and IBM Plex Mono from Google Fonts. The shipped stylesheet carries the
+// console's own copies of those fonts in that import's place, inlined as
+// data: URLs, so the flow editor requests no font from another origin.
+const remoteFontsImport =
+  '@import url("https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap");';
+
+async function inlinedConsoleFontsCss() {
+  const css = await fs.readFile(path.join(consoleFontsDir, "fonts.css"), "utf8");
+  const fontUrl = /url\("\.\/([^"]+\.woff2)"\)/g;
+  const files = [...new Set([...css.matchAll(fontUrl)].map((match) => match[1]))];
+  if (files.length === 0) throw new Error("console/src/fonts/fonts.css names no woff2 font");
+  const dataUrls = new Map(await Promise.all(files.map(async (file) => {
+    const bytes = await fs.readFile(path.join(consoleFontsDir, file));
+    return [file, `data:font/woff2;base64,${bytes.toString("base64")}`];
+  })));
+  return css.replace(fontUrl, (_, file) => `url("${dataUrls.get(file)}")`).trim();
+}
+
+function withLocalFonts(tokensCss, fontsCss) {
+  if (!tokensCss.includes(remoteFontsImport)) {
+    throw new Error(
+      "flow-editor/src/tokens.css no longer has the Google Fonts import the build replaces with the console's fonts; update build.cjs",
+    );
+  }
+  return tokensCss.replace(remoteFontsImport, () => fontsCss);
+}
 
 // S23 end-state: flow-editor.js is a single esbuild bundle of the app.tsx
 // shell entry, which imports the views from @flow-editor-components and
@@ -125,11 +155,12 @@ async function buildAssets({ outDir, rustOutDir }) {
     );
   }
 
-  const [tokensCss, stylesCss] = await Promise.all([
+  const [tokensCss, stylesCss, fontsCss] = await Promise.all([
     fs.readFile(path.join(srcDir, "tokens.css"), "utf8"),
     fs.readFile(path.join(srcDir, "styles.css"), "utf8"),
+    inlinedConsoleFontsCss(),
   ]);
-  const css = `${tokensCss}\n${stylesCss}`;
+  const css = `${withLocalFonts(tokensCss, fontsCss)}\n${stylesCss}`;
   await fs.writeFile(path.join(outDir, "flow-editor.css"), css, "utf8");
 
   const [vendorBytes, appBytes, cssBytes] = await Promise.all([
