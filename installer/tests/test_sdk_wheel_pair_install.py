@@ -136,7 +136,7 @@ def forbid_private_copy(monkeypatch):
     monkeypatch.setattr(installed.tempfile, "TemporaryDirectory", forbidden)
 
 
-@pytest.mark.parametrize("pair_files", ["0.9.0", "0.9.1"], indirect=True)
+@pytest.mark.parametrize("pair_files", ["0.9.0", "0.9.1", "0.9.4"], indirect=True)
 def test_exact_pair_private_copies_hashes_isolation_readback_and_original_facts(pair_files, monkeypatch):
     monkeypatch.setenv("PIP_CONFIG_FILE", "/not-selected/pip.conf")
     monkeypatch.setenv("PIP_TARGET", "/not-selected/target")

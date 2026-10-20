@@ -78,6 +78,19 @@ impl GatewayProcess {
         }))
     }
 
+    /// `meta/init` without `persistent_state`: a process-local launch.
+    fn init_process_local(&mut self, runtime_options: Value) -> Value {
+        self.rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "meta/init",
+            "params": {
+                "mob_config": MOB_CONFIG,
+                "runtime_options": runtime_options
+            }
+        }))
+    }
+
     fn status(&mut self) -> Value {
         self.rpc(json!({
             "jsonrpc": "2.0",
@@ -126,16 +139,37 @@ fn status_census_reports_persistent_runtime_store_by_default() {
     );
 }
 
-/// The explicit `runtime_store = {"storage": "memory"}` declaration is
-/// accepted on the wire and shows up as a declared-ephemeral slot.
+/// The explicit `runtime_store = {"storage": "memory"}` declaration
+/// refuses a persistent launch with the typed storage-resolution code:
+/// sessions live in the runtime store under the state directory, so a
+/// persistent launch keeps it there, and the message names both settings.
 #[test]
-fn runtime_store_memory_declaration_is_census_visible() {
+fn runtime_store_memory_declaration_refuses_a_persistent_launch() {
     let state_dir = tempfile::tempdir().expect("state dir");
     let mut gateway = GatewayProcess::start();
     let init = gateway.init(
         &state_dir,
         json!({ "runtime_store": { "storage": "memory" } }),
     );
+    assert_eq!(
+        init["error"]["code"],
+        json!(meerkat_meta::STORAGE_RESOLUTION_CODE),
+        "{init}"
+    );
+    let message = init["error"]["message"].as_str().expect("error message");
+    assert!(
+        message.contains("runtime_options.runtime_store") && message.contains("persistent_state"),
+        "{message}"
+    );
+}
+
+/// On a process-local launch (no `persistent_state`) the same declaration
+/// is accepted, and the census shows the runtime store as a declared
+/// in-memory slot.
+#[test]
+fn runtime_store_memory_declaration_is_census_visible_on_a_process_local_launch() {
+    let mut gateway = GatewayProcess::start();
+    let init = gateway.init_process_local(json!({ "runtime_store": { "storage": "memory" } }));
     assert!(init["result"]["contract_version"].is_string(), "{init}");
 
     let status = gateway.status();
@@ -166,9 +200,10 @@ fn event_log_null_declaration_boots_and_is_census_visible() {
     assert_eq!(queried["result"], json!([]));
 }
 
-/// File-name twins refuse at init with the typed storage-resolution code
-/// (-32014) and a message that points at the storage doctor — the error the
-/// SDKs reify as `StorageResolutionError` instead of a transport failure.
+/// Session file-name twins refuse init with the typed storage-resolution
+/// code (-32014), the error the SDKs reify as `StorageResolutionError`
+/// instead of a transport failure. Both spellings are the 0.9.3 session
+/// projection, so the message names the native migration that moves them.
 #[test]
 fn session_store_twins_refuse_init_with_storage_resolution_code() {
     let state_dir = tempfile::tempdir().expect("state dir");
@@ -183,17 +218,21 @@ fn session_store_twins_refuse_init_with_storage_resolution_code() {
         "{init}"
     );
     let message = init["error"]["message"].as_str().expect("error message");
-    assert!(message.contains("meta/storage/doctor"), "{message}");
+    assert!(
+        message.contains(meerkat_meta::storage_layout::NATIVE_STORAGE_MIGRATION_VERB),
+        "{message}"
+    );
 }
 
-/// A runtime store that cannot open is a typed startup refusal (M4's
-/// fail-closed posture), and the message names the explicit ephemeral
-/// declaration as the remediation.
+/// A runtime database that cannot be read is a typed startup refusal (the
+/// fail-closed posture): the native layout check names the file and why it
+/// could not be read, before any store opens.
 #[test]
 fn runtime_store_open_failure_refuses_init_with_storage_resolution_code() {
     let state_dir = tempfile::tempdir().expect("state dir");
-    // A directory where the runtime database file must live forces the
-    // SQLite open to fail without touching permissions (CI-safe).
+    // A directory where the runtime database file must live cannot be read
+    // as a database (no permission change, so CI-safe); the native layout
+    // check refuses it before any store opens.
     std::fs::create_dir(state_dir.path().join("runtime.sqlite")).expect("block runtime db");
 
     let mut gateway = GatewayProcess::start();
@@ -205,7 +244,7 @@ fn runtime_store_open_failure_refuses_init_with_storage_resolution_code() {
     );
     let message = init["error"]["message"].as_str().expect("error message");
     assert!(
-        message.contains("runtime_options.runtime_store"),
+        message.contains("runtime.sqlite could not be read"),
         "{message}"
     );
 }

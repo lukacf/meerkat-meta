@@ -582,34 +582,26 @@ class TestDS05DurableRespawn:
 
 
 # ===========================================================================
-# DS-06: Lease Loss Stops New Work
+# DS-06: Dispatch To An Active Identity
 # ===========================================================================
-
-# DS-06: Lease loss requires an external LeaseProvider that can force Lost.
-# The gateway currently creates a LocalLeaseProvider internally — there is no
-# SDK callback path for lease operations yet. When external LeaseProvider
-# support is wired, this test must be upgraded to:
-#   1. Force lease loss via the test provider
-#   2. Assert dispatch is rejected after loss
-#   3. Assert status reflects unhealthy lease
-# For now, this test only verifies the happy path (dispatch succeeds with lease).
 
 
 @_skip_no_key
 @_skip_no_binary
-class TestDS06LeaseSemantics:
+class TestDS06Dispatch:
     @pytest.mark.asyncio
     @pytest.mark.timeout(60)
-    async def test_dispatch_succeeds_with_lease_happy_path(self, mob_toml, state_dir):
-        """Happy path only: dispatch works when lease is held.
+    async def test_dispatch_succeeds_on_an_active_identity(self, mob_toml, state_dir):
+        """Dispatch to a booted identity succeeds and leaves it active.
 
-        NOTE: Does NOT test lease loss — requires external LeaseProvider (not yet wired).
+        Meta holds no identity leases since 0.9.4: Core's realm lock and
+        hosting claim give host exclusivity, so there is no lease to lose.
         """
         roster = DownstreamRoster(_DEFAULT_ROSTER)
 
         rt = await _boot_identity_runtime(state_dir, mob_toml, roster)
         try:
-            di = DispatchInput(content="before lease check", origin="connector")
+            di = DispatchInput(content="dispatch check", origin="connector")
             result = await rt.dispatch("triage:main", di)
             assert result is not None
 
@@ -645,17 +637,6 @@ class TestDS07ResetVsDelete:
             after = await rt.status("identity:luka")
             assert after.generation == old_gen + 1
             assert after.session_id != old_session
-            # The replacement's empty initial document is born through one
-            # head-canonical create-CAS write. There are no messages to append,
-            # so this creation flush advances its fresh allocator exactly once
-            # before reset returns. Retire cleanup targets the superseded old
-            # session and cannot advance the replacement's checkpoint.
-            # Rust pins first boot, reset return, status and the durable record:
-            #   crates/meerkat-meta/tests/identity_first_builder.rs
-            #     reset_checkpoint_version_is_the_initial_document_flush_not_cleanup
-            # Keep this exact: None/0 would lose the durable creation flush;
-            # 2 would be the older nonempty append-plus-head write shape.
-            assert after.checkpoint_version == 1
         finally:
             await rt.shutdown()
 

@@ -1,9 +1,11 @@
-//! A held identity bootstrap: a fresh roster member is constructed under its
-//! identity's custody and held before its publication while the host reads
-//! its finished surface; the host then publishes it (its custody stays) or
-//! aborts it (its custody is cleaned up, so the identity can be created
-//! again). Turn-driven members on a machine whose grant owner refuses all
-//! work: no first prompt is admitted.
+//! A held identity bootstrap: a fresh roster member is constructed and held
+//! before its publication while the host reads its finished surface; the
+//! host then publishes it or aborts it. Core's mob is the member's only
+//! custody: an aborted member is never published, so Core's member history
+//! gains no binding for the identity and a later held pass holds it again.
+//! Every custody assertion reads Core (its roster and its member history),
+//! never a Meta store. Turn-driven members on a machine whose grant owner
+//! refuses all work: no first prompt is admitted.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::BTreeMap;
@@ -24,10 +26,10 @@ use meerkat_core::auth::{PrincipalKind, PrincipalRef};
 use meerkat_core::{OperationAuthorizationError, PreparedAuthorizationBinding};
 use meerkat_meta::UnifiedRuntime;
 use meerkat_meta::identity_first::{
-    AgentAddressability, AgentIdentity, ContinuityResolveState, ContinuityStore, DurabilityPolicy,
-    DurableAgentSpec, IdentityFirstRuntimeContext, IdentityRuntime, IdentityRuntimeConfig,
-    LocalContinuityStore, LocalLeaseProvider, MobSessionBridge, RosterContext, RosterError,
-    RosterProvider,
+    AgentAddressability, AgentIdentity, ContinuityStore, DurabilityPolicy, DurableAgentSpec,
+    IdentityFirstRuntimeContext, IdentityRuntime, IdentityRuntimeConfig, LocalContinuityStore,
+    LocalLeaseProvider, MobSessionBridge, RosterContext, RosterError, RosterProvider,
+    SessionBridge,
 };
 use meerkat_runtime::input_authority::NativeAdmissionError;
 use meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration;
@@ -397,39 +399,33 @@ fn member(identity: &AgentIdentity) -> DurableAgentSpec {
     }
 }
 
-/// The host's custody owners, shared across runtimes.
-struct Custody {
-    continuity: Arc<LocalContinuityStore>,
-    leases: Arc<LocalLeaseProvider>,
+/// `identity`'s latest binding in Core's member history since the latest
+/// mob reset; `None` when Core never spawned it since then.
+async fn core_last_binding(
+    runtime: &UnifiedRuntime,
+    identity: &AgentIdentity,
+) -> Option<meerkat_mob::MemberBinding> {
+    MobSessionBridge::new(runtime.mob_handle())
+        .last_member_binding(identity)
+        .await
+        .expect("Core's member history reads")
 }
 
-impl Custody {
-    fn new() -> Self {
-        Self {
-            continuity: Arc::new(LocalContinuityStore::in_memory().expect("continuity store")),
-            leases: Arc::new(LocalLeaseProvider::new()),
-        }
-    }
-
-    async fn state(&self, identity: &AgentIdentity) -> ContinuityResolveState {
-        self.continuity
-            .resolve_many(std::slice::from_ref(identity))
-            .await
-            .expect("resolve continuity")
-            .remove(identity)
-            .expect("one state per identity")
-    }
+/// Whether Core's member history binds `identity` to a live member.
+async fn core_binds_live(runtime: &UnifiedRuntime, identity: &AgentIdentity) -> bool {
+    core_last_binding(runtime, identity)
+        .await
+        .is_some_and(|binding| binding.state() == meerkat_mob::MemberBindingState::Live)
 }
 
 /// A governed runtime with the identity context installed, not bootstrapped.
 async fn installed_runtime(
     dir: &tempfile::TempDir,
     mob_id: &str,
-    custody: &Custody,
     roster: &[DurableAgentSpec],
     hook: Arc<SelectingHook>,
 ) -> UnifiedRuntime {
-    installed_runtime_with(dir, mob_id, custody, roster, hook, None, None).await
+    installed_runtime_with(dir, mob_id, roster, hook, None, None).await
 }
 
 /// The fake OpenAI key members built on the provider default resolve their
@@ -455,7 +451,6 @@ fn fixture_provider_config() -> meerkat::Config {
 async fn installed_runtime_with(
     dir: &tempfile::TempDir,
     mob_id: &str,
-    custody: &Custody,
     roster: &[DurableAgentSpec],
     hook: Arc<SelectingHook>,
     client: Option<Arc<dyn meerkat_llm_core::LlmClient>>,
@@ -479,15 +474,21 @@ async fn installed_runtime_with(
         builder = builder.session_hook(session_hook);
     }
     let mut runtime = builder.build().await.expect("build");
+    // The identity runtime ignores the continuity store and the lease
+    // provider (Core's mob is the authority); the config still names them.
     let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-        continuity_store: Arc::clone(&custody.continuity) as Arc<dyn ContinuityStore>,
-        lease_provider: Arc::clone(&custody.leases) as _,
+        continuity_store: Arc::new(LocalContinuityStore::in_memory().expect("continuity store"))
+            as Arc<dyn ContinuityStore>,
+        lease_provider: Arc::new(LocalLeaseProvider::new()) as _,
         runtime_instance_id: format!("{mob_id}-instance"),
         has_runtime_store: true,
         durability_policy: DurabilityPolicy::SyncWriteThrough,
         bridge: Some(Arc::new(MobSessionBridge::new(runtime.mob_handle()))),
         default_timeout: None,
     }));
+    // The held-completion marks live in the state directory, where the
+    // builder and the gateway put them.
+    identity_runtime.set_held_completion_state_dir(Some(dir.path().join("state")));
     runtime.install_identity_first_context(Arc::new(IdentityFirstRuntimeContext::new(
         identity_runtime,
         Arc::new(Roster(roster.to_vec())),
@@ -505,18 +506,11 @@ fn mob_id(prefix: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_held_roster_member_is_published_after_its_host_completes() {
     let dir = tempfile::tempdir().unwrap();
-    let custody = Custody::new();
     let identity = AgentIdentity::parse("held-activate").unwrap();
     let roster = vec![member(&identity)];
     let hook = Arc::new(SelectingHook::default());
-    let mut runtime = installed_runtime(
-        &dir,
-        &mob_id("held-activate"),
-        &custody,
-        &roster,
-        hook.clone(),
-    )
-    .await;
+    let mut runtime =
+        installed_runtime(&dir, &mob_id("held-activate"), &roster, hook.clone()).await;
     let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = Arc::clone(&observed);
     let result = runtime
@@ -543,11 +537,8 @@ async fn a_held_roster_member_is_published_after_its_host_completes() {
         "the activated member is published"
     );
     assert!(
-        matches!(
-            custody.state(&identity).await,
-            ContinuityResolveState::Ready { .. }
-        ),
-        "its identity custody is committed"
+        core_binds_live(&runtime, &identity).await,
+        "Core's member history binds the published member"
     );
     let _ = runtime.shutdown().await;
 }
@@ -558,7 +549,6 @@ async fn a_held_roster_member_is_published_after_its_host_completes() {
 async fn held_and_activated(
     dir: &tempfile::TempDir,
     prefix: &str,
-    custody: &Custody,
     client: Arc<dyn meerkat_llm_core::LlmClient>,
     session_hook: Option<Arc<dyn meerkat_meta::SessionHook>>,
 ) -> (
@@ -570,7 +560,6 @@ async fn held_and_activated(
     let mut runtime = installed_runtime_with(
         dir,
         &mob_id(prefix),
-        custody,
         &roster,
         Arc::new(SelectingHook::default()),
         Some(client),
@@ -648,11 +637,9 @@ async fn session_owner_route(runtime: &UnifiedRuntime) -> meerkat_mob::Controlle
 #[tokio::test(flavor = "multi_thread")]
 async fn a_held_member_carries_the_route_its_actor_pins() {
     let dir = tempfile::tempdir().unwrap();
-    let custody = Custody::new();
     let (runtime, members) = held_and_activated(
         &dir,
         "held-route",
-        &custody,
         test_client(),
         Some(Arc::new(RoutedControllerHook)),
     )
@@ -690,15 +677,8 @@ async fn a_held_member_carries_the_route_its_actor_pins() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_held_member_on_a_raw_default_client_carries_its_route() {
     let dir = tempfile::tempdir().unwrap();
-    let custody = Custody::new();
-    let (runtime, members) = held_and_activated(
-        &dir,
-        "held-raw-route",
-        &custody,
-        Arc::new(RoutedRawClient),
-        None,
-    )
-    .await;
+    let (runtime, members) =
+        held_and_activated(&dir, "held-raw-route", Arc::new(RoutedRawClient), None).await;
     let report = members[0]
         .controller_route
         .report()
@@ -738,9 +718,7 @@ async fn a_held_member_on_a_raw_default_client_carries_its_route() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_held_member_without_route_facts_carries_unavailable() {
     let dir = tempfile::tempdir().unwrap();
-    let custody = Custody::new();
-    let (runtime, members) =
-        held_and_activated(&dir, "held-no-route", &custody, test_client(), None).await;
+    let (runtime, members) = held_and_activated(&dir, "held-no-route", test_client(), None).await;
     assert_eq!(
         members[0].controller_route,
         meerkat_mob::ControllerRouteObservation::Unavailable
@@ -748,21 +726,20 @@ async fn a_held_member_without_route_facts_carries_unavailable() {
     let _ = runtime.shutdown().await;
 }
 
+/// A host that refuses its application aborts the held member: Core never
+/// publishes it, so Core's member history gains no binding for the identity.
+/// The failed bootstrap shuts its runtime down; the next runtime over the
+/// same state directory and mob finds the identity fresh (a binding would
+/// refuse the pass as `ExistingContinuity`) and holds it again.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_aborted_held_roster_member_releases_its_identity_custody() {
-    let custody = Custody::new();
+async fn an_aborted_held_roster_member_leaves_no_binding_and_is_held_again() {
     let identity = AgentIdentity::parse("held-abort").unwrap();
     let roster = vec![member(&identity)];
-
     let dir = tempfile::tempdir().unwrap();
-    let mut runtime = installed_runtime(
-        &dir,
-        &mob_id("held-abort"),
-        &custody,
-        &roster,
-        Arc::new(SelectingHook::default()),
-    )
-    .await;
+    let mob = mob_id("held-abort");
+
+    let mut runtime =
+        installed_runtime(&dir, &mob, &roster, Arc::new(SelectingHook::default())).await;
     let held = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&held);
     let error = runtime
@@ -787,30 +764,247 @@ async fn an_aborted_held_roster_member_releases_its_identity_custody() {
         runtime.mob_handle().list_members().await.is_empty(),
         "the aborted member is not published"
     );
+    // The failed bootstrap already shut this runtime down. Dropping it also
+    // releases the state directory's claim before the next runtime opens the
+    // same directory, even if that shutdown did not run to its end.
+    let _ = runtime.shutdown().await;
+    drop(runtime);
+
+    // The same state directory and mob: Core's member history kept no
+    // binding, so the next held pass holds the identity again.
+    let mut runtime =
+        installed_runtime(&dir, &mob, &roster, Arc::new(SelectingHook::default())).await;
+    let held = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&held);
+    runtime
+        .bootstrap_installed_identity_first_context_held(
+            &roster,
+            tokio::time::Instant::now() + Duration::from_mins(1),
+            Box::new(move |members, _completion| {
+                Box::pin(async move {
+                    counted.store(members.len(), Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
+        )
+        .await
+        .expect("the identity is held again and published");
+    assert_eq!(
+        held.load(Ordering::SeqCst),
+        1,
+        "the identity was held again"
+    );
+    assert_eq!(runtime.mob_handle().list_members().await.len(), 1);
     assert!(
-        !matches!(
-            custody.state(&identity).await,
-            ContinuityResolveState::Ready { .. }
-        ),
-        "no continuity is committed for the aborted member"
+        core_binds_live(&runtime, &identity).await,
+        "Core's member history binds the published member"
     );
     let _ = runtime.shutdown().await;
+}
 
-    // The identity's custody was released: an ordinary bootstrap creates it.
+/// The held-completion mark outlives its runtime. Core holds nothing for an
+/// aborted held member (no binding), so only the durable mark keeps it owed:
+/// an ordinary bootstrap of the next runtime over the same state directory
+/// refuses it typed and publishes nothing, a reset refuses it too and a
+/// delete finds nothing to delete, so no binding is minted, and a held pass
+/// then publishes it and removes the mark.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aborted_held_member_stays_owed_across_a_restart() {
+    let identity = AgentIdentity::parse("held-owed-restart").unwrap();
+    let roster = vec![member(&identity)];
     let dir = tempfile::tempdir().unwrap();
-    let mut runtime = installed_runtime(
-        &dir,
-        &mob_id("held-abort-again"),
-        &custody,
-        &roster,
-        Arc::new(SelectingHook::default()),
-    )
-    .await;
+    let mob = mob_id("held-owed-restart");
+    let marks = dir
+        .path()
+        .join("state")
+        .join(meerkat_meta::identity_first::HELD_COMPLETION_OWED_DIR);
+    let marked = || std::fs::read_dir(&marks).map(Iterator::count).unwrap_or(0);
+
+    let mut runtime =
+        installed_runtime(&dir, &mob, &roster, Arc::new(SelectingHook::default())).await;
     runtime
+        .bootstrap_installed_identity_first_context_held(
+            &roster,
+            tokio::time::Instant::now() + Duration::from_mins(1),
+            Box::new(|_members, _completion| {
+                Box::pin(async { Err("the application bundle failed".to_string()) })
+            }),
+        )
+        .await
+        .expect_err("an aborted held bootstrap fails");
+    assert_eq!(marked(), 1, "the aborted member's mark is on disk");
+    let _ = runtime.shutdown().await;
+    drop(runtime);
+
+    // An ordinary bootstrap over the same directory: the member is fresh in
+    // Core, and the mark still refuses it.
+    let mut runtime =
+        installed_runtime(&dir, &mob, &roster, Arc::new(SelectingHook::default())).await;
+    let mut restored = runtime
         .bootstrap_installed_identity_first_context(&roster)
         .await
-        .expect("the identity is created again");
-    assert_eq!(runtime.mob_handle().list_members().await.len(), 1);
+        .expect("the ordinary bootstrap runs");
+    let outcome = restored.outcomes.remove(&identity);
+    assert!(
+        matches!(
+            &outcome,
+            Some(meerkat_meta::identity_first::RestoreOutcome::Refused(error))
+                if matches!(
+                    **error,
+                    meerkat_meta::identity_first::IdentityRuntimeError::HeldCompletionOwed { .. }
+                )
+        ),
+        "{outcome:?}"
+    );
+    assert!(
+        runtime.mob_handle().list_members().await.is_empty(),
+        "the ordinary bootstrap published nothing"
+    );
+    assert!(
+        core_last_binding(&runtime, &identity).await.is_none(),
+        "Core never spawned the owed member"
+    );
+    assert_eq!(marked(), 1, "the mark stays until a held pass publishes it");
+
+    // Neither reset nor delete starts a fresh life for the owed member: Core
+    // would bind a member its host's completion never saw, and the next
+    // restart would read that binding as the pass's publication.
+    let identities = runtime.identity_runtime().expect("the identity runtime");
+    let reset = identities.reset(&identity).await;
+    assert!(
+        matches!(
+            reset,
+            Err(meerkat_meta::identity_first::IdentityRuntimeError::HeldCompletionOwed { .. })
+        ),
+        "{reset:?}"
+    );
+    let deleted = identities.delete_identity(&identity).await;
+    assert!(
+        matches!(deleted, Ok(None)),
+        "delete finds nothing Core spawned: {deleted:?}"
+    );
+    drop(identities);
+    assert!(
+        core_last_binding(&runtime, &identity).await.is_none(),
+        "neither reset nor delete minted a binding"
+    );
+    assert_eq!(marked(), 1, "the mark stays");
+
+    // A held pass covers the owed member: it is held, published, and its
+    // mark is removed.
+    let held = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&held);
+    runtime
+        .bootstrap_installed_identity_first_context_held(
+            &roster,
+            tokio::time::Instant::now() + Duration::from_mins(1),
+            Box::new(move |members, _completion| {
+                Box::pin(async move {
+                    counted.store(members.len(), Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
+        )
+        .await
+        .expect("a held pass publishes the owed member");
+    assert_eq!(held.load(Ordering::SeqCst), 1);
+    assert!(
+        core_binds_live(&runtime, &identity).await,
+        "Core's member history binds the published member"
+    );
+    assert_eq!(marked(), 0, "publishing the member removed its mark");
+    let _ = runtime.shutdown().await;
+}
+
+/// A held add owes its host the same completion a held roster pass does:
+/// the aborted added member's mark outlives the runtime, so the next
+/// runtime's ordinary bootstrap over the same state directory refuses the
+/// listed member typed, publishes nothing for it and keeps the mark.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aborted_held_add_stays_owed_across_a_restart() {
+    let running = AgentIdentity::parse("held-add-owed-running").unwrap();
+    let added = AgentIdentity::parse("held-add-owed-added").unwrap();
+    let roster = vec![member(&running)];
+    let dir = tempfile::tempdir().unwrap();
+    let mob = mob_id("held-add-owed-restart");
+    let marks = dir
+        .path()
+        .join("state")
+        .join(meerkat_meta::identity_first::HELD_COMPLETION_OWED_DIR);
+    let marked = || std::fs::read_dir(&marks).map(Iterator::count).unwrap_or(0);
+
+    let mut runtime =
+        installed_runtime(&dir, &mob, &roster, Arc::new(SelectingHook::default())).await;
+    runtime
+        .bootstrap_installed_identity_first_context_held(
+            &roster,
+            tokio::time::Instant::now() + Duration::from_mins(1),
+            Box::new(|_members, _completion| Box::pin(async { Ok(()) })),
+        )
+        .await
+        .expect("the running member is published");
+    assert_eq!(
+        marked(),
+        0,
+        "publishing the running member removed its mark"
+    );
+    let context = runtime
+        .identity_first_context()
+        .expect("the identity context");
+    let start = context
+        .add_member_held(
+            member(&added),
+            tokio::time::Instant::now() + Duration::from_mins(1),
+            |_members, _completion| async { Err("the application bundle failed".to_string()) },
+        )
+        .await
+        .expect("the held add starts");
+    match start {
+        meerkat_meta::identity_first::HeldBootstrapStart::Unsettled(settlement) => {
+            settlement
+                .settled()
+                .await
+                .expect_err("the host's refusal aborts the add");
+        }
+        meerkat_meta::identity_first::HeldBootstrapStart::Activated(result) => {
+            panic!("the refused add activated: {:?}", result.outcomes)
+        }
+    }
+    drop(context);
+    assert_eq!(marked(), 1, "the aborted added member's mark is on disk");
+    let _ = runtime.shutdown().await;
+    drop(runtime);
+
+    // The host had listed the added member: an ordinary bootstrap of the
+    // next runtime over the same directory refuses it typed.
+    let listed = vec![member(&running), member(&added)];
+    let mut runtime =
+        installed_runtime(&dir, &mob, &listed, Arc::new(SelectingHook::default())).await;
+    let mut restored = runtime
+        .bootstrap_installed_identity_first_context(&listed)
+        .await
+        .expect("the ordinary bootstrap runs");
+    let outcome = restored.outcomes.remove(&added);
+    assert!(
+        matches!(
+            &outcome,
+            Some(meerkat_meta::identity_first::RestoreOutcome::Refused(error))
+                if matches!(
+                    **error,
+                    meerkat_meta::identity_first::IdentityRuntimeError::HeldCompletionOwed { .. }
+                )
+        ),
+        "{outcome:?}"
+    );
+    assert!(
+        core_last_binding(&runtime, &added).await.is_none(),
+        "Core never spawned the owed added member"
+    );
+    assert!(
+        core_binds_live(&runtime, &running).await,
+        "the running member resumes"
+    );
+    assert_eq!(marked(), 1, "the mark stays until a held pass publishes it");
     let _ = runtime.shutdown().await;
 }
 
@@ -820,14 +1014,12 @@ async fn an_aborted_held_roster_member_releases_its_identity_custody() {
 #[tokio::test(flavor = "multi_thread")]
 async fn held_members_never_occupy_a_construction_slot() {
     let dir = tempfile::tempdir().unwrap();
-    let custody = Custody::new();
     let roster: Vec<_> = (0..6)
         .map(|index| member(&AgentIdentity::parse(&format!("held-slot-{index}")).unwrap()))
         .collect();
     let mut runtime = installed_runtime(
         &dir,
         &mob_id("held-slots"),
-        &custody,
         &roster,
         Arc::new(SelectingHook::default()),
     )
@@ -852,34 +1044,30 @@ async fn held_members_never_occupy_a_construction_slot() {
     let _ = runtime.shutdown().await;
 }
 
-/// A roster with a member that already has continuity (it would resume, not
-/// be created) is refused before anything is held or created.
+/// A roster with a member Core already spawned (it would resume, not be
+/// created) is refused before anything is held or created.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_roster_with_an_existing_member_is_refused_before_anything_is_held() {
-    let custody = Custody::new();
     let existing = AgentIdentity::parse("held-existing").unwrap();
     let fresh = AgentIdentity::parse("held-fresh").unwrap();
-
+    let roster = vec![member(&existing), member(&fresh)];
     let dir = tempfile::tempdir().unwrap();
-    let mut runtime = installed_runtime(
-        &dir,
-        &mob_id("held-existing"),
-        &custody,
-        &[member(&existing)],
-        Arc::new(SelectingHook::default()),
-    )
-    .await;
+    let hook = Arc::new(SelectingHook::default());
+    let mut runtime = installed_runtime(&dir, &mob_id("held-mixed"), &roster, hook.clone()).await;
     runtime
         .bootstrap_installed_identity_first_context(&[member(&existing)])
         .await
         .expect("the existing member is created");
-    let _ = runtime.shutdown().await;
+    assert!(
+        core_binds_live(&runtime, &existing).await,
+        "Core's member history binds the existing member"
+    );
+    assert!(
+        core_last_binding(&runtime, &fresh).await.is_none(),
+        "Core never spawned the fresh member"
+    );
+    let constructed = hook.prepared.load(Ordering::SeqCst);
 
-    let roster = vec![member(&existing), member(&fresh)];
-    let dir = tempfile::tempdir().unwrap();
-    let hook = Arc::new(SelectingHook::default());
-    let mut runtime =
-        installed_runtime(&dir, &mob_id("held-mixed"), &custody, &roster, hook.clone()).await;
     let error = runtime
         .bootstrap_installed_identity_first_context_held(
             &roster,
@@ -899,31 +1087,24 @@ async fn a_roster_with_an_existing_member_is_refused_before_anything_is_held() {
     );
     assert_eq!(
         hook.prepared.load(Ordering::SeqCst),
-        0,
-        "nothing was constructed"
+        constructed,
+        "the refused pass constructed nothing"
     );
-    assert!(matches!(
-        custody.state(&fresh).await,
-        ContinuityResolveState::Uninitialized
-    ));
 }
 
-/// A caller that goes away while a member is genuinely held (its
-/// continuity, lease and runtime state already registered) abandons the
-/// pass: the runtime's owned task aborts the member, runs its identity
-/// transaction's own cleanup, joins the host's callback (which stops once
-/// the pass aborts) and retires the pass, so a retry on the same runtime
-/// holds and publishes the member with no stale held state.
+/// A caller that goes away while a member is genuinely held (Core holds it
+/// at its hold point) abandons the pass: the runtime's owned task aborts the
+/// member and waits until Core has settled it, joins the host's callback
+/// (which stops once the pass aborts) and retires the pass, so a retry on
+/// the same runtime holds and publishes the member with no stale held state.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_held_bootstrap_cleans_up_in_its_owner() {
     let dir = tempfile::tempdir().unwrap();
-    let custody = Custody::new();
     let identity = AgentIdentity::parse("held-dropped").unwrap();
     let roster = vec![member(&identity)];
     let mut runtime = installed_runtime(
         &dir,
         &mob_id("held-dropped"),
-        &custody,
         &roster,
         Arc::new(SelectingHook::default()),
     )
@@ -949,25 +1130,19 @@ async fn a_dropped_held_bootstrap_cleans_up_in_its_owner() {
         }
         // The bootstrap future is dropped here, while the member is held.
     }
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while !matches!(
-            custody.state(&identity).await,
-            ContinuityResolveState::Uninitialized
-        ) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the owned task ran the held member's cleanup");
     assert!(
         runtime.mob_handle().list_members().await.is_empty(),
         "the abandoned member was never published"
     );
 
+    // The retry waits for the abandoned pass under the runtime's bootstrap
+    // controller, then finds the identity fresh in Core: the aborted member
+    // left no binding.
     let held = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&held);
-    runtime
-        .bootstrap_installed_identity_first_context_held(
+    tokio::time::timeout(
+        Duration::from_mins(2),
+        runtime.bootstrap_installed_identity_first_context_held(
             &roster,
             tokio::time::Instant::now() + Duration::from_mins(1),
             Box::new(move |members, _completion| {
@@ -976,26 +1151,27 @@ async fn a_dropped_held_bootstrap_cleans_up_in_its_owner() {
                     Ok(())
                 })
             }),
-        )
-        .await
-        .expect("a retry holds and publishes the member");
+        ),
+    )
+    .await
+    .expect("the abandoned pass settles in its owner")
+    .expect("a retry holds and publishes the member");
     assert_eq!(held.load(Ordering::SeqCst), 1);
     assert_eq!(runtime.mob_handle().list_members().await.len(), 1);
-    assert!(matches!(
-        custody.state(&identity).await,
-        ContinuityResolveState::Ready { .. }
-    ));
+    assert!(
+        core_binds_live(&runtime, &identity).await,
+        "Core's member history binds the published member"
+    );
     let _ = runtime.shutdown().await;
 }
 
 /// The bounded start returns the pass's pending settlement at the setup
 /// deadline while the member's construction is still blocked: the
-/// identity's custody stays owned until Core has settled the member, and
-/// the settlement then cleans it up.
+/// settlement stays pending for as long as Core owns the member, and
+/// resolves once Core has settled it, with nothing published.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_held_bootstrap_returns_at_its_deadline_while_construction_is_blocked() {
     let dir = tempfile::tempdir().unwrap();
-    let custody = Custody::new();
     let identity = AgentIdentity::parse("held-blocked-construction").unwrap();
     let roster = vec![member(&identity)];
     let (release, parked) = tokio::sync::watch::channel(false);
@@ -1003,7 +1179,6 @@ async fn a_held_bootstrap_returns_at_its_deadline_while_construction_is_blocked(
     let mut runtime = installed_runtime(
         &dir,
         &mob_id("held-blocked-construction"),
-        &custody,
         &roster,
         hook.clone(),
     )
@@ -1037,23 +1212,22 @@ async fn a_held_bootstrap_returns_at_its_deadline_while_construction_is_blocked(
         "the construction is parked"
     );
     assert_eq!(asked.load(Ordering::SeqCst), 0, "the host was never asked");
-    // Core still owns the parked member, so the identity stays owned for as
-    // long as that lasts, not only at the instant the start returned.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        !matches!(
-            custody.state(&identity).await,
-            ContinuityResolveState::Uninitialized
-        ),
-        "the identity stays owned while Core still owns its member"
-    );
-    release.send_replace(true);
-    let error = tokio::time::timeout(
-        Duration::from_mins(1),
-        runtime.finish_held_identity_bootstrap(settlement),
-    )
-    .await
-    .expect("the settlement completes once the construction returns");
+    // Core still owns the parked member, so the settlement stays pending for
+    // as long as that lasts, not only at the instant the start returned.
+    let error = {
+        let finish = runtime.finish_held_identity_bootstrap(settlement);
+        tokio::pin!(finish);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut finish)
+                .await
+                .is_err(),
+            "the settlement waits while Core still owns the member"
+        );
+        release.send_replace(true);
+        tokio::time::timeout(Duration::from_mins(1), finish)
+            .await
+            .expect("the settlement completes once the construction returns")
+    };
     assert!(
         matches!(
             error,
@@ -1063,10 +1237,6 @@ async fn a_held_bootstrap_returns_at_its_deadline_while_construction_is_blocked(
         ),
         "{error}"
     );
-    assert!(matches!(
-        custody.state(&identity).await,
-        ContinuityResolveState::Uninitialized
-    ));
     assert!(runtime.mob_handle().list_members().await.is_empty());
 }
 
@@ -1076,13 +1246,11 @@ async fn a_held_bootstrap_returns_at_its_deadline_while_construction_is_blocked(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_held_bootstrap_returns_at_its_deadline_while_its_callback_runs() {
     let dir = tempfile::tempdir().unwrap();
-    let custody = Custody::new();
     let identity = AgentIdentity::parse("held-blocked-callback").unwrap();
     let roster = vec![member(&identity)];
     let mut runtime = installed_runtime(
         &dir,
         &mob_id("held-blocked-callback"),
-        &custody,
         &roster,
         Arc::new(SelectingHook::default()),
     )
@@ -1135,25 +1303,19 @@ async fn a_held_bootstrap_returns_at_its_deadline_while_its_callback_runs() {
     );
     assert_eq!(returned.load(Ordering::SeqCst), 1);
     assert!(runtime.mob_handle().list_members().await.is_empty());
-    assert!(matches!(
-        custody.state(&identity).await,
-        ContinuityResolveState::Uninitialized
-    ));
 }
 
 /// A caller lost while the host's callback runs is the pass's terminal
-/// `Abort`: the callback's later `Ok` activates nothing, and the member's
-/// identity custody is cleaned up.
+/// `Abort`: the callback's later `Ok` activates nothing, and Core keeps no
+/// binding for the member, so a retry on the same runtime holds it again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_caller_lost_during_the_callback_never_activates_its_members() {
     let dir = tempfile::tempdir().unwrap();
-    let custody = Custody::new();
     let identity = AgentIdentity::parse("held-caller-lost").unwrap();
     let roster = vec![member(&identity)];
     let mut runtime = installed_runtime(
         &dir,
         &mob_id("held-caller-lost"),
-        &custody,
         &roster,
         Arc::new(SelectingHook::default()),
     )
@@ -1182,16 +1344,6 @@ async fn a_caller_lost_during_the_callback_never_activates_its_members() {
         // The caller goes away here, while the host's callback runs.
     }
     release.send_replace(true);
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while !matches!(
-            custody.state(&identity).await,
-            ContinuityResolveState::Uninitialized
-        ) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the abandoned pass cleaned up its member's custody");
     tokio::time::timeout(Duration::from_secs(10), async {
         while acknowledged.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1199,9 +1351,41 @@ async fn a_caller_lost_during_the_callback_never_activates_its_members() {
     })
     .await
     .expect("the callback acknowledged Ok after the caller was gone");
+    // The retry waits for the abandoned pass under the runtime's bootstrap
+    // controller. The late `Ok` published nothing: Core holds no binding for
+    // the identity (one would refuse the retry as `ExistingContinuity`), so
+    // the retry holds it again.
+    let held = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&held);
+    tokio::time::timeout(
+        Duration::from_mins(2),
+        runtime.bootstrap_installed_identity_first_context_held(
+            &roster,
+            tokio::time::Instant::now() + Duration::from_mins(1),
+            Box::new(move |members, _completion| {
+                Box::pin(async move {
+                    counted.store(members.len(), Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
+        ),
+    )
+    .await
+    .expect("the abandoned pass settles in its owner")
+    .expect("a retry holds and publishes the member");
+    assert_eq!(
+        held.load(Ordering::SeqCst),
+        1,
+        "the identity was held again"
+    );
+    assert_eq!(
+        runtime.mob_handle().list_members().await.len(),
+        1,
+        "only the retry published the member"
+    );
     assert!(
-        runtime.mob_handle().list_members().await.is_empty(),
-        "the callback's later Ok activated nothing"
+        core_binds_live(&runtime, &identity).await,
+        "Core's member history binds the published member"
     );
     let _ = runtime.shutdown().await;
 }
@@ -1214,13 +1398,11 @@ async fn a_caller_lost_during_the_callback_never_activates_its_members() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_external_publication_before_a_late_ok_is_kept_and_not_replayed() {
     let dir = tempfile::tempdir().unwrap();
-    let custody = Custody::new();
     let identity = AgentIdentity::parse("held-external").unwrap();
     let roster = vec![member(&identity)];
     let mut runtime = installed_runtime(
         &dir,
         &mob_id("held-external"),
-        &custody,
         &roster,
         Arc::new(SelectingHook::default()),
     )

@@ -141,23 +141,69 @@ impl ConsoleEventStore {
         event_type: impl Into<String>,
         data: Value,
     ) -> ConsoleIdentityEventEnvelope {
-        let identity = identity.into();
-        let envelope = ConsoleIdentityEventEnvelope {
+        let envelope = self.next_envelope(identity.into(), interaction_id, event_type.into(), data);
+        self.append_envelope(envelope.clone()).await;
+        envelope
+    }
+
+    /// Append one of the runtime's own events (an identity-less memory
+    /// event) under the system identity.
+    pub(crate) async fn append_runtime_plane_event(
+        &self,
+        event_type: impl Into<String>,
+        data: Value,
+    ) -> ConsoleIdentityEventEnvelope {
+        let envelope = self.next_envelope(
+            SYSTEM_EVENT_IDENTITY.to_string(),
+            None,
+            event_type.into(),
+            data,
+        );
+        self.store_envelope(envelope.clone()).await;
+        envelope
+    }
+
+    fn next_envelope(
+        &self,
+        identity: String,
+        interaction_id: Option<String>,
+        event_type: String,
+        data: Value,
+    ) -> ConsoleIdentityEventEnvelope {
+        ConsoleIdentityEventEnvelope {
             event_id: format!(
                 "console-evt-{}",
                 self.next_event_seq.fetch_add(1, Ordering::Relaxed)
             ),
             interaction_id,
             identity,
-            event_type: event_type.into(),
+            event_type,
             timestamp_ms: current_time_ms(),
             data,
-        };
-        self.append_envelope(envelope.clone()).await;
-        envelope
+        }
     }
 
+    /// Append an event attributed to `envelope.identity`. A runtime-plane
+    /// identity is refused: it names the runtime's own events, which only
+    /// [`Self::append_runtime_plane_event`] writes. Every member-attributed
+    /// writer of this store ends here (agent events and their images, spawn
+    /// kickoffs, lifecycle records, interaction failures and evictions,
+    /// member memory events), so no member event reaches the console under
+    /// one.
     pub(crate) async fn append_envelope(&self, envelope: ConsoleIdentityEventEnvelope) -> bool {
+        if crate::console_contracts::is_runtime_plane_identity(&envelope.identity) {
+            crate::console_contracts::warn_runtime_plane_member_drop(
+                &envelope.identity,
+                None,
+                &envelope.identity,
+                "console event store",
+            );
+            return false;
+        }
+        self.store_envelope(envelope).await
+    }
+
+    async fn store_envelope(&self, envelope: ConsoleIdentityEventEnvelope) -> bool {
         {
             let mut state = self.state.write().await;
             if state
@@ -476,6 +522,20 @@ impl ConsoleEventStore {
                 );
                 return;
             };
+            // No member's events take a runtime-plane identity. Every
+            // creation path refuses such a member; this drops the events of
+            // one created before they did.
+            if crate::console_contracts::is_runtime_plane_identity(&identity) {
+                crate::console_contracts::warn_runtime_plane_member_drop(
+                    agent_id
+                        .rsplit_once(':')
+                        .map_or(agent_id.as_str(), |(member_id, _)| member_id),
+                    Some(agent_id),
+                    &identity,
+                    "agent events",
+                );
+                return;
+            }
             // Cache only registration-backed resolutions. A heuristic
             // derive guess must stay repairable: caching it would make the
             // exact-match lookup permanently shadow a later
@@ -1254,6 +1314,17 @@ fn derive_identity_from_runtime_id(runtime_id: &str) -> Option<String> {
         return None;
     }
     Some(identity.to_string())
+}
+
+/// The identity this store attributes the agent events of `runtime_id` to
+/// when no spawn registration names it: the runtime id projected into the
+/// public alias space (as every agent event's source is), then
+/// [`derive_identity_from_runtime_id`]. The runtime-plane member checks
+/// evaluate a member with this same code.
+pub(crate) fn attributed_identity_for_runtime(
+    runtime_id: &meerkat_mob::ids::AgentRuntimeId,
+) -> Option<String> {
+    derive_identity_from_runtime_id(&crate::member_comms_id::runtime_event_alias(runtime_id))
 }
 
 #[cfg(test)]
@@ -2108,6 +2179,53 @@ mod tests {
                 payload: Some(payload),
             },
         }
+    }
+
+    /// No member event reaches the console under a runtime-plane identity:
+    /// every member-attributed writer of the store refuses one (agent events,
+    /// lifecycle records, interaction failures and plain appends).
+    #[tokio::test]
+    async fn member_attributed_writers_refuse_runtime_plane_identities() {
+        let store = ConsoleEventStore::new();
+        store
+            .project_unified_event(&agent_event_with_payload(
+                "evt-system-member",
+                "_system:1",
+                "text_delta",
+                json!({ "delta": "member text" }),
+            ))
+            .await;
+        store
+            .register_runtime_identity("console-override", "__console__")
+            .await;
+        store
+            .project_unified_event(&agent_event_with_payload(
+                "evt-console-member",
+                "console-override:1",
+                "text_delta",
+                json!({ "delta": "member text" }),
+            ))
+            .await;
+        store
+            .record_lifecycle("__console__", "member_retired", json!({}))
+            .await;
+        store
+            .record_interaction_failure("_system", "interaction-1", json!({ "reason": "test" }))
+            .await;
+        store
+            .append("__console__", None, "memory.harvest.completed", json!({}))
+            .await;
+        let replay = store.replay_all(None).await.expect("replay");
+        let runtime_plane = replay
+            .iter()
+            .filter(|event| event.identity == "_system" || event.identity == "__console__")
+            .map(|event| (event.identity.as_str(), event.event_type.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            runtime_plane,
+            vec![("_system", "runtime_bootstrapped")],
+            "only the runtime's own bootstrap event carries a runtime-plane identity"
+        );
     }
 
     /// Regression: an agent event that arrives before any registration must

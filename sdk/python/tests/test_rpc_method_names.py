@@ -1299,32 +1299,6 @@ def test_console_timeline_replay_unavailable_uses_distinct_typed_error():
     assert err.data["latest_cursor"] == "console:42"
 
 
-def test_lease_lost_reifies_as_lease_lost_error_not_capability_unavailable():
-    """Identity-plane lease loss (-32005) must NOT collide with -32004.
-
-    -32004 is CAPABILITY_UNAVAILABLE_CODE which reifies into the
-    permanent-capability-gap error type. A transient/recoverable lease loss
-    must surface as the distinct LeaseLostError so callers do not give up on
-    an identity that merely needs a lease re-acquire.
-    """
-    from meerkat_meta.errors import (
-        CapabilityUnavailableError,
-        LeaseLostError,
-    )
-    from meerkat_meta.runtime import _rpc_error_from_payload
-
-    err = _rpc_error_from_payload(
-        {"code": -32005, "message": "lease lost: review:singleton"},
-        request_id="rid",
-        method="meta/send",
-    )
-
-    assert isinstance(err, LeaseLostError)
-    assert not isinstance(err, CapabilityUnavailableError)
-    assert err.code == -32005
-    assert err.method == "meta/send"
-
-
 @pytest.mark.asyncio
 async def test_wait_ready_rpc_name():
     """wait_ready must call meta/wait_ready and forward timeout in ms."""

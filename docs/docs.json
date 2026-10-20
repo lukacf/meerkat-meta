@@ -60,7 +60,9 @@
               "guides/flow-editor",
               "guides/authentication",
               "guides/deployment",
-              "guides/upgrading-from-mobkit"
+              "guides/upgrading-to-0-9-4",
+              "guides/upgrading-from-mobkit",
+              "guides/continuity-export"
             ]
           }
         ]

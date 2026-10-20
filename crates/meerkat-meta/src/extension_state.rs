@@ -1,8 +1,6 @@
 //! Optional provider-owned documents and native tool bundle factories.
 //! No documents, dispatcher definitions or authority resolver exist unless
 //! this feature is compiled and a factory is explicitly registered.
-pub(crate) mod identity_publication;
-pub use identity_publication::IdentityPublication;
 pub(crate) mod mcp_binding;
 pub use mcp_binding::{ChildMcpAvailability, HostMcpDocumentBinding};
 
@@ -202,6 +200,92 @@ fn unverifiable(error: documents::Error) -> MobIdQuarantineReason {
     MobIdQuarantineReason::Unverifiable {
         error: error.to_string(),
     }
+}
+
+/// One resolution's read of the identity bridge mob's member binding
+/// history: a lineage walk decides the principal of each ancestor, and every
+/// answer comes from the same fold of Core's journal. Taken at the first
+/// principal decided, which follows the first creation snapshot read, so it
+/// sees every binding that snapshot and its ancestors name.
+#[derive(Default)]
+struct BridgeHistoryRead(Option<meerkat_mob::MemberBindingHistory>);
+
+impl BridgeHistoryRead {
+    async fn get(
+        &mut self,
+        handle: &MobReadHandle,
+    ) -> documents::Result<&meerkat_mob::MemberBindingHistory> {
+        if self.0.is_none() {
+            let history = handle
+                .member_binding_history()
+                .await
+                .map_err(|_| documents::Error::AuthorityUnavailable)?;
+            self.0 = Some(history);
+        }
+        self.0
+            .as_ref()
+            .ok_or(documents::Error::AuthorityUnavailable)
+    }
+}
+
+/// What a member binding's continuity intent says about an identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityMarker {
+    /// Core's durable-identity marker, keyed by the identity or by the
+    /// member id that encodes it (Core's reconciler keys by its member).
+    Matches,
+    /// A durable-identity marker for something else: no principal.
+    Foreign,
+    /// No durable-identity marker.
+    Absent,
+}
+
+/// Read `binding`'s marker against `identity`, the Meta identity its member
+/// id decodes to (`None` when it decodes to none).
+fn identity_marker(
+    binding: &meerkat_mob::MemberBinding,
+    identity: Option<&crate::identity_first::AgentIdentity>,
+) -> IdentityMarker {
+    match binding.continuity_intent() {
+        meerkat_mob::SpawnContinuityIntent::DurableIdentity { .. } => match identity {
+            Some(identity)
+                if crate::identity_first::runtime::binding_carries_identity_marker(
+                    binding, identity,
+                ) =>
+            {
+                IdentityMarker::Matches
+            }
+            _ => IdentityMarker::Foreign,
+        },
+        _ => IdentityMarker::Absent,
+    }
+}
+
+/// The Meta identity a member of the identity bridge mob encodes: its roster
+/// id decoded, when encoding the identity gives that id back (the encoding
+/// every identity-first spawn uses).
+fn bridge_member_identity(member: &str) -> Option<crate::identity_first::AgentIdentity> {
+    let decoded = crate::member_comms_id::runtime_alias_str(member);
+    let identity = crate::identity_first::AgentIdentity::parse(&decoded).ok()?;
+    (crate::member_comms_id::roster_member_id_for_identity(identity.as_str()).as_str() == member)
+        .then_some(identity)
+}
+
+/// Whether the identity-first runtime labelled a live member as an identity
+/// (`agent_identity`, which raw member surfaces refuse to set). The label
+/// only ever refuses a principal: Core's own mob tools take any label, so it
+/// never grants one.
+async fn labelled_identity_member(
+    handle: &MobReadHandle,
+    member: &meerkat_mob::AgentIdentity,
+) -> documents::Result<bool> {
+    Ok(handle
+        .get_member(member)
+        .await
+        .map_err(|_| documents::Error::AuthorityUnavailable)?
+        .is_some_and(|entry| {
+            crate::member_comms_id::durable_identity_label(&entry.labels).is_some()
+        }))
 }
 
 /// Orders the changes of which mob holds an id against document operations.
@@ -472,13 +556,19 @@ struct Admission {
 pub(crate) struct NativeAuthorityRegistry {
     realm: String,
     identity_bridge_mob: String,
+    /// Whether the composition runs the identity-first runtime: only then
+    /// is a member of [`Self::identity_bridge_mob`] ever an
+    /// [`Principal::Agent`] (see [`Self::principal`]).
+    identity_first: bool,
+    /// The composition's identity-first runtime, bound once it is built
+    /// (after this registry). [`Self::principal`] reads its registered
+    /// identities. Non-owning: the composition owns the runtime.
+    identity_runtime: std::sync::OnceLock<std::sync::Weak<crate::identity_first::IdentityRuntime>>,
     handles: std::sync::RwLock<BTreeMap<String, BoundMob>>,
     /// Creates [`Self::before_create`] admitted whose mob has not activated.
     admissions: std::sync::Mutex<BTreeMap<String, Admission>>,
     sessions: Arc<dyn MobSessionService>,
-    continuity: Option<Arc<dyn crate::identity_first::contracts::ContinuityStore>>,
     access: Option<crate::access::AccessController>,
-    pub(crate) publications: Arc<identity_publication::IdentityPublications>,
     /// The composition's document store, unwrapped: the registry's own reads
     /// of it run under the mob id gate.
     store: Arc<dyn documents::ExtensionDocumentStore>,
@@ -490,22 +580,48 @@ impl NativeAuthorityRegistry {
         realm: String,
         identity_bridge_mob: String,
         sessions: Arc<dyn MobSessionService>,
-        continuity: Option<Arc<dyn crate::identity_first::contracts::ContinuityStore>>,
+        identity_first: bool,
         access: Option<crate::access::AccessController>,
         store: Arc<dyn documents::ExtensionDocumentStore>,
     ) -> Arc<Self> {
         Arc::new(Self {
             realm,
             identity_bridge_mob,
+            identity_first,
+            identity_runtime: std::sync::OnceLock::new(),
             handles: std::sync::RwLock::new(BTreeMap::new()),
             admissions: std::sync::Mutex::new(BTreeMap::new()),
             sessions,
-            continuity,
             access,
-            publications: Arc::new(Default::default()),
             store,
             ordering: Arc::default(),
         })
+    }
+
+    /// Bind the composition's identity-first runtime, built after this
+    /// registry. The first binding stays.
+    pub(crate) fn bind_identity_runtime(
+        &self,
+        runtime: &Arc<crate::identity_first::IdentityRuntime>,
+    ) {
+        let _ = self.identity_runtime.set(Arc::downgrade(runtime));
+    }
+
+    /// Whether the identity-first runtime registered `identity` from its
+    /// roster. While no runtime is bound (the build has not reached it) or
+    /// after it is gone (shutdown), nothing can say: no principal.
+    async fn registered_identity(
+        &self,
+        identity: &crate::identity_first::AgentIdentity,
+    ) -> documents::Result<bool> {
+        match self
+            .identity_runtime
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            Some(runtime) => Ok(runtime.is_registered(identity).await),
+            None => Err(documents::Error::AuthorityUnavailable),
+        }
     }
 
     /// The document store every document service of the composition uses:
@@ -526,16 +642,6 @@ impl NativeAuthorityRegistry {
                 let registry = registry.upgrade().ok_or_else(|| {
                     meerkat_mob::MobError::Internal("extension authority owner unavailable".into())
                 })?;
-                if let Some(continuity) = &registry.continuity {
-                    let cursor = handle
-                        .member_creation_journal_cursor()
-                        .await
-                        .map_err(|e| meerkat_mob::MobError::Internal(e.to_string()))?;
-                    continuity
-                        .establish_identity_history_coverage(handle.mob_id().as_str(), cursor)
-                        .await
-                        .map_err(|e| meerkat_mob::MobError::Internal(e.to_string()))?;
-                }
                 let id = handle.mob_id().to_string();
                 let poisoned = || {
                     meerkat_mob::MobError::Internal("extension authority registry poisoned".into())
@@ -876,50 +982,39 @@ impl NativeAuthorityRegistry {
         Ok(result)
     }
 
-    async fn principal(&self, snapshot: &MemberCreationSnapshot) -> documents::Result<Principal> {
-        if let Some(continuity) = &self.continuity {
-            if let Some(identity) = continuity
-                .historical_identity_binding(&snapshot.session_id)
-                .await
-                .map_err(|_| documents::Error::AuthorityUnavailable)?
-            {
-                return Ok(Principal::Agent(identity.to_string()));
-            }
-            self.publications.wait(snapshot).await?;
-            if let Some(identity) = continuity
-                .historical_identity_binding(&snapshot.session_id)
-                .await
-                .map_err(|_| documents::Error::AuthorityUnavailable)?
-            {
-                return Ok(Principal::Agent(identity.to_string()));
-            }
-            if snapshot.member_binding.mob_id == self.identity_bridge_mob {
-                let decoded =
-                    crate::member_comms_id::runtime_alias_str(&snapshot.member_binding.member);
-                if let Ok(identity) = crate::identity_first::AgentIdentity::parse(&decoded)
-                    && crate::member_comms_id::mob_member_id(identity.as_str()).as_str()
-                        == snapshot.member_binding.member
-                    && continuity
-                        .has_historical_identity(&identity)
-                        .await
-                        .map_err(|_| documents::Error::AuthorityUnavailable)?
-                {
-                    // Durable intent reserves the host target even after
-                    // publication cancellation and process restart. Only
-                    // exact-session history above can establish Agent.
-                    return Err(documents::Error::AuthorityUnavailable);
-                }
-            }
-            if !continuity
-                .identity_history_covers_birth(
-                    &snapshot.member_binding.mob_id,
-                    snapshot.birth_cursor,
-                )
-                .await
-                .map_err(|_| documents::Error::AuthorityUnavailable)?
-            {
-                return Err(documents::Error::AuthorityUnavailable);
-            }
+    /// The principal a member session acts as.
+    ///
+    /// In an identity-first composition, a member of the identity bridge mob
+    /// is the Meta identity its roster id encodes ([`Principal::Agent`]) when
+    /// Core's member binding history proves it: the binding that last named
+    /// the session, or the member's current life, carries Core's
+    /// durable-identity marker for that identity. Only identity-first spawns,
+    /// Core's identity reconciler and a host's materialization set the
+    /// marker; no raw member surface can. The current-life clause covers the
+    /// member's earlier sessions, which a lineage walk reaches through
+    /// successor links: the first sessions of a member that Meta 0.9.3
+    /// spawned carry no marker.
+    ///
+    /// Every other member is a [`Principal::Worker`], except one that
+    /// presents as an identity the history cannot prove: an unreadable
+    /// identity intent row, an intent row without the marker, a member whose
+    /// id names an identity the identity-first runtime registered (live or
+    /// retired), or a live member that runtime labelled. Meta 0.9.3 spawned
+    /// such a member and nothing has respawned it since. Those resolve no
+    /// principal, so nothing they write lands under a worker owner that the
+    /// identity never sees.
+    ///
+    /// `reads` holds the one history read a resolution takes.
+    async fn principal(
+        &self,
+        snapshot: &MemberCreationSnapshot,
+        reads: &mut BridgeHistoryRead,
+    ) -> documents::Result<Principal> {
+        if self.identity_first
+            && snapshot.member_binding.mob_id == self.identity_bridge_mob
+            && let Some(identity) = self.bridge_identity(snapshot, reads).await?
+        {
+            return Ok(Principal::Agent(identity.to_string()));
         }
         Ok(Principal::Worker {
             mob_id: snapshot.member_binding.mob_id.clone(),
@@ -932,25 +1027,121 @@ impl NativeAuthorityRegistry {
         })
     }
 
+    /// The Meta identity a session of the identity bridge mob acts as, or
+    /// `None` for a worker (see [`Self::principal`]).
+    async fn bridge_identity(
+        &self,
+        snapshot: &MemberCreationSnapshot,
+        reads: &mut BridgeHistoryRead,
+    ) -> documents::Result<Option<crate::identity_first::AgentIdentity>> {
+        let handle = self.handle(&self.identity_bridge_mob)?;
+        let history = reads.get(&handle).await?;
+        let member = meerkat_mob::AgentIdentity::from(snapshot.member_binding.member.as_str());
+        // The creation snapshot came from the same journal, read earlier: a
+        // session the history does not bind to this member is a read that
+        // raced the mob's destroy, never a worker.
+        let binding = history
+            .binding_for_session(&snapshot.session_id)
+            .filter(|binding| binding.identity() == &member)
+            .ok_or(documents::Error::AuthorityUnavailable)?;
+        let management = history.identity_management(&member);
+        if management == meerkat_mob::MemberIdentityManagement::IntentUnreadable {
+            return Err(documents::Error::AuthorityUnavailable);
+        }
+        let identity = bridge_member_identity(&snapshot.member_binding.member);
+        let session = identity_marker(binding, identity.as_ref());
+        let life = history
+            .last_binding(&member)
+            .map(|current| identity_marker(current, identity.as_ref()));
+        match (session, life) {
+            (IdentityMarker::Matches, _)
+            | (IdentityMarker::Absent, Some(IdentityMarker::Matches)) => {
+                // A marker matches only a decoded identity.
+                identity
+                    .map(Some)
+                    .ok_or(documents::Error::AuthorityUnavailable)
+            }
+            (IdentityMarker::Foreign, _)
+            | (IdentityMarker::Absent, Some(IdentityMarker::Foreign)) => {
+                Err(documents::Error::AuthorityUnavailable)
+            }
+            (IdentityMarker::Absent, None | Some(IdentityMarker::Absent)) => {
+                // Raw member ids share the identity encoding, so only the
+                // roster's registration tells an unmarked identity member
+                // from a worker once it is no longer live.
+                let registered = match identity.as_ref() {
+                    Some(identity) => self.registered_identity(identity).await?,
+                    None => false,
+                };
+                if management != meerkat_mob::MemberIdentityManagement::CommandDriven
+                    || registered
+                    || labelled_identity_member(&handle, &member).await?
+                {
+                    Err(documents::Error::AuthorityUnavailable)
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Whether an [`Principal::Agent`] owner names an identity whose current
+    /// life Core's member binding history knows: its last binding since the
+    /// latest mob reset carries the identity's durable-identity marker, or,
+    /// for a member Meta 0.9.3 spawned and has not respawned since, the live
+    /// member carries the identity-first runtime's label. Naming an owner
+    /// grants nothing, so the label may stand in for the marker here; it
+    /// never does in [`Self::principal`].
+    async fn validate_agent_owner(
+        &self,
+        identity: &crate::identity_first::AgentIdentity,
+    ) -> documents::Result<()> {
+        let handle = self.handle(&self.identity_bridge_mob)?;
+        let history = handle
+            .member_binding_history()
+            .await
+            .map_err(|_| documents::Error::AuthorityUnavailable)?;
+        let member = crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
+        if history.identity_management(&member)
+            == meerkat_mob::MemberIdentityManagement::IntentUnreadable
+        {
+            return Err(documents::Error::AuthorityUnavailable);
+        }
+        let current = history
+            .last_binding(&member)
+            .ok_or(documents::Error::NotFound)?;
+        match identity_marker(current, Some(identity)) {
+            IdentityMarker::Matches => Ok(()),
+            IdentityMarker::Foreign => Err(documents::Error::NotFound),
+            IdentityMarker::Absent => {
+                let labelled = handle
+                    .get_member(&member)
+                    .await
+                    .map_err(|_| documents::Error::AuthorityUnavailable)?
+                    .is_some_and(|entry| {
+                        crate::member_comms_id::durable_identity_label(&entry.labels)
+                            == Some(identity.as_str())
+                    });
+                if labelled {
+                    Ok(())
+                } else {
+                    Err(documents::Error::NotFound)
+                }
+            }
+        }
+    }
+
     async fn validate_owner(&self, owner: &Owner) -> documents::Result<()> {
         match owner {
             Owner::Realm => Ok(()),
             Owner::Mob(id) => self.handle(id).map(|_| ()),
             Owner::Agent(Principal::Agent(identity)) => {
-                let continuity = self
-                    .continuity
-                    .as_ref()
-                    .ok_or(documents::Error::AuthorityUnavailable)?;
+                if !self.identity_first {
+                    return Err(documents::Error::AuthorityUnavailable);
+                }
                 let identity = crate::identity_first::AgentIdentity::parse(identity)
                     .map_err(|_| documents::Error::NotFound)?;
-                let states = continuity
-                    .resolve_many(std::slice::from_ref(&identity))
-                    .await
-                    .map_err(|_| documents::Error::AuthorityUnavailable)?;
-                match states.get(&identity) {
-                    Some(crate::identity_first::ContinuityResolveState::Ready { .. }) => Ok(()),
-                    _ => Err(documents::Error::NotFound),
-                }
+                self.validate_agent_owner(&identity).await
             }
             Owner::Agent(Principal::Worker {
                 mob_id,
@@ -975,7 +1166,9 @@ impl NativeAuthorityRegistry {
                     .creation
                     .creation_id
                     .is_some_and(|id| id.to_string() == *creation_id)
-                    && self.principal(&snapshot).await?
+                    && self
+                        .principal(&snapshot, &mut BridgeHistoryRead::default())
+                        .await?
                         == match owner {
                             Owner::Agent(principal) => principal.clone(),
                             _ => return Err(documents::Error::NotFound),
@@ -1116,7 +1309,10 @@ impl ToolCallerResolver for NativeCallerResolver {
             return Err(documents::Error::AuthorityUnavailable);
         }
         let mut snapshot = registry.snapshot(&binding, session_id).await?;
-        let principal = registry.principal(&snapshot).await?;
+        // One read of the identity bridge mob's history decides the session
+        // and every ancestor the walk below reaches.
+        let mut reads = BridgeHistoryRead::default();
+        let principal = registry.principal(&snapshot, &mut reads).await?;
         let mut child = principal.clone();
         let mut links = Vec::new();
         let mut visited = BTreeSet::new();
@@ -1164,7 +1360,7 @@ impl ToolCallerResolver for NativeCallerResolver {
             if parent_snapshot.creation.creation_id != Some(creation_id) {
                 return Err(documents::Error::AuthorityUnavailable);
             }
-            let parent = registry.principal(&parent_snapshot).await?;
+            let parent = registry.principal(&parent_snapshot, &mut reads).await?;
             if let Some(kind) = kind {
                 let ceiling = self.source_ceiling(&registry, &parent_snapshot).await?;
                 links.push(LineageLink {
@@ -1268,22 +1464,20 @@ comms = true
         let spec = crate::MobBootstrapSpec::persistent(
             definition,
             meerkat_mob::MobStorage::in_memory(),
+            crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
             dir.path().to_path_buf(),
             4,
-            Arc::new(
-                meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-                    .unwrap(),
-            ),
         )
+        .await
         .unwrap()
         .with_options(crate::MobBootstrapOptions {
             allow_ephemeral_sessions: false,
             notify_orchestrator_on_resume: false,
             default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
         });
-        // Keep the exact epoch-observing facade used by the session authority.
+        // Keep the exact runtime store the session authority commits to.
         // Mutating a SessionStore export would not change native policy.
-        let runtime_store = spec.runtime_authority_prewarm.clone().unwrap();
+        let runtime_store = spec.durable_runtime_store.clone().unwrap();
         let sessions = spec.session_service.clone();
         let runtime = crate::MobRuntime::bootstrap(spec).await.unwrap();
         let handle = runtime.handle();
@@ -1349,7 +1543,7 @@ comms = true
             "test".into(),
             handle.mob_id().to_string(),
             sessions.clone(),
-            None,
+            false,
             None,
             test_store(dir.path()),
         );
@@ -1366,12 +1560,7 @@ comms = true
             resolver.source_ceiling(&registry, &snapshot).await.unwrap(),
             Some(Role::Editor)
         );
-        let mut source = sessions
-            .load_persisted_session(&session_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let mut metadata = source.try_session_metadata().unwrap().unwrap();
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
         for (policy, expected) in [
             (
                 Some(meerkat_core::ops::ToolAccessPolicy::ReadOnly),
@@ -1391,14 +1580,40 @@ comms = true
             ),
             (None, Some(Role::Editor)),
         ] {
+            // The native pair keeps the session head-canonical: each commit
+            // extends the head the runtime store last issued, read back with
+            // the session it materializes.
+            let mut source = sessions
+                .load_persisted_session(&session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut metadata = source.try_session_metadata().unwrap().unwrap();
             metadata.tooling.tool_access_policy = policy;
             source.set_session_metadata(metadata.clone()).unwrap();
+            let observed = runtime_store
+                .load_session_boundary_authority(&runtime_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_canonical()
+                .unwrap()
+                .boundary_head()
+                .clone();
+            let mutation = meerkat_core::session_store::PreparedHeadCanonicalMutation::prepare(
+                &source,
+                Some(observed),
+            )
+            .unwrap();
             runtime_store
-                .commit_session_snapshot(
-                    &meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
-                    meerkat_runtime::SerializedSessionSnapshot {
-                        session_snapshot: source.to_persisted_bytes().unwrap().into(),
-                    },
+                .commit_prepared_session_boundary(
+                    &runtime_id,
+                    meerkat_runtime::PreparedRuntimeSessionCommit::snapshot_only(
+                        meerkat_core::lifecycle::core_executor::BoundSessionCommit::head_canonical_from_session(
+                            &source, mutation,
+                        )
+                        .unwrap(),
+                    ),
                 )
                 .await
                 .unwrap();
@@ -1503,13 +1718,11 @@ comms = true
         let spec = crate::MobBootstrapSpec::persistent(
             definition,
             meerkat_mob::MobStorage::in_memory(),
+            crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
             dir.path().to_path_buf(),
             4,
-            Arc::new(
-                meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-                    .unwrap(),
-            ),
         )
+        .await
         .unwrap()
         .with_options(crate::MobBootstrapOptions {
             allow_ephemeral_sessions: false,
@@ -1539,7 +1752,7 @@ comms = true
             "test".into(),
             handle.mob_id().to_string(),
             sessions.clone(),
-            None,
+            false,
             None,
             test_store(dir.path()),
         );
@@ -1608,13 +1821,11 @@ comms = true
         let spec = crate::MobBootstrapSpec::persistent(
             definition,
             meerkat_mob::MobStorage::in_memory(),
+            crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
             dir.path().to_path_buf(),
             4,
-            Arc::new(
-                meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-                    .unwrap(),
-            ),
         )
+        .await
         .unwrap()
         .with_options(crate::MobBootstrapOptions {
             allow_ephemeral_sessions: false,
@@ -1628,7 +1839,7 @@ comms = true
             "test".into(),
             handle.mob_id().to_string(),
             sessions.clone(),
-            None,
+            false,
             None,
             test_store(dir.path()),
         );
@@ -1696,13 +1907,11 @@ comms = true
         let spec = crate::MobBootstrapSpec::persistent(
             definition,
             meerkat_mob::MobStorage::in_memory(),
+            crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
             dir.path().to_path_buf(),
             4,
-            Arc::new(
-                meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-                    .unwrap(),
-            ),
         )
+        .await
         .unwrap()
         .with_options(crate::MobBootstrapOptions {
             allow_ephemeral_sessions: false,
@@ -1717,7 +1926,7 @@ comms = true
             "test".into(),
             handle.mob_id().to_string(),
             sessions.clone(),
-            None,
+            false,
             None,
             Arc::clone(&store),
         );
@@ -2052,13 +2261,11 @@ comms = true
         let spec = crate::MobBootstrapSpec::persistent(
             definition,
             meerkat_mob::MobStorage::in_memory(),
+            crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
             dir.path().to_path_buf(),
             4,
-            Arc::new(
-                meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-                    .unwrap(),
-            ),
         )
+        .await
         .unwrap()
         .with_options(crate::MobBootstrapOptions {
             allow_ephemeral_sessions: false,
@@ -2074,7 +2281,7 @@ comms = true
             "test".into(),
             handle.mob_id().to_string(),
             sessions.clone(),
-            None,
+            false,
             None,
             Arc::new(PausedWrites {
                 inner: test_store(dir.path()),
@@ -2158,12 +2365,11 @@ comms = true
         let spec = crate::MobBootstrapSpec::persistent(
             definition,
             meerkat_mob::MobStorage::in_memory(),
+            crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
             dir.to_path_buf(),
             4,
-            Arc::new(
-                meerkat_store::SqliteSessionStore::open(dir.join("sessions.sqlite3")).unwrap(),
-            ),
         )
+        .await
         .unwrap()
         .with_options(crate::MobBootstrapOptions {
             allow_ephemeral_sessions: false,
@@ -2194,7 +2400,7 @@ comms = true
             "test".into(),
             handle.mob_id().to_string(),
             sessions,
-            None,
+            false,
             None,
             Arc::clone(&store),
         );
@@ -2359,7 +2565,7 @@ comms = true
             "test".into(),
             runtime.handle().mob_id().to_string(),
             runtime.session_service().unwrap().clone(),
-            None,
+            false,
             None,
             Arc::clone(&store),
         );
@@ -2620,7 +2826,7 @@ comms = true
             "test".into(),
             runtime.handle().mob_id().to_string(),
             runtime.session_service().unwrap().clone(),
-            None,
+            false,
             None,
             Arc::clone(&store) as Arc<dyn documents::ExtensionDocumentStore>,
         );
@@ -2657,5 +2863,240 @@ comms = true
         assert!(registry.handle("racing-activation-child").is_ok());
         child.stop().await.unwrap();
         runtime.handle().stop().await.unwrap();
+    }
+
+    /// The registered-identity check behind an unmarked member's refusal
+    /// answers only while the identity-first runtime is bound: before the
+    /// build binds it and after it is gone, it refuses, so such a member
+    /// never falls back to a worker.
+    #[tokio::test]
+    async fn registered_identity_answers_only_through_a_bound_identity_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "registered-identity"
+[profiles.worker]
+model = "gpt-5.5"
+"#,
+        )
+        .unwrap();
+        let spec = crate::MobBootstrapSpec::persistent(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
+            dir.path().to_path_buf(),
+            4,
+        )
+        .await
+        .unwrap();
+        let registry = NativeAuthorityRegistry::new(
+            "test".into(),
+            "registered-identity".into(),
+            spec.session_service.clone(),
+            true,
+            None,
+            test_store(dir.path()),
+        );
+        let rostered = crate::identity_first::AgentIdentity::parse("durable:rostered").unwrap();
+        let unlisted = crate::identity_first::AgentIdentity::parse("durable:unlisted").unwrap();
+        assert!(matches!(
+            registry.registered_identity(&rostered).await,
+            Err(documents::Error::AuthorityUnavailable)
+        ));
+
+        let runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
+            crate::identity_first::IdentityRuntimeConfig {
+                continuity_store: Arc::new(
+                    crate::identity_first::LocalContinuityStore::in_memory().unwrap(),
+                ),
+                lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
+                runtime_instance_id: "registered-identity".to_string(),
+                has_runtime_store: true,
+                durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                bridge: None,
+                default_timeout: None,
+            },
+        ));
+        runtime
+            .register_locked(crate::identity_first::DurableAgentSpec {
+                identity: rostered.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            })
+            .await;
+        registry.bind_identity_runtime(&runtime);
+        assert!(matches!(
+            registry.registered_identity(&rostered).await,
+            Ok(true)
+        ));
+        assert!(matches!(
+            registry.registered_identity(&unlisted).await,
+            Ok(false)
+        ));
+
+        drop(runtime);
+        assert!(matches!(
+            registry.registered_identity(&rostered).await,
+            Err(documents::Error::AuthorityUnavailable)
+        ));
+    }
+
+    /// A retired member keeps its creation snapshot, so a lineage walk still
+    /// reaches its session as an ancestor; only a live member can be the
+    /// caller. Unmarked and retired, its identity label no longer refuses it,
+    /// and its id cannot tell it from a raw worker (raw member ids share the
+    /// identity encoding): the identity runtime's registration does. Once the
+    /// identity is registered, its member resolves no principal; a raw
+    /// worker's id that names no registered identity still resolves as a
+    /// worker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retired_unmarked_member_of_a_registered_identity_has_no_principal() {
+        let dir = tempfile::tempdir().unwrap();
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "retired-unmarked"
+[profiles.worker]
+model = "gpt-5.5"
+[profiles.worker.tools]
+comms = true
+"#,
+        )
+        .unwrap();
+        let spec = crate::MobBootstrapSpec::persistent(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
+            dir.path().to_path_buf(),
+            4,
+        )
+        .await
+        .unwrap()
+        .with_options(crate::MobBootstrapOptions {
+            allow_ephemeral_sessions: false,
+            notify_orchestrator_on_resume: false,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let sessions = spec.session_service.clone();
+        let runtime = crate::MobRuntime::bootstrap(spec).await.unwrap();
+        let handle = runtime.handle();
+        let identity = "durable:retired";
+        let member = crate::member_comms_id::mob_member_id(identity);
+        let raw = crate::member_comms_id::mob_member_id("durable:unlisted");
+        handle
+            .spawn_spec(
+                meerkat_mob::SpawnMemberSpec::host_root("worker", member.clone()).with_labels(
+                    BTreeMap::from([("agent_identity".to_string(), identity.to_string())]),
+                ),
+            )
+            .await
+            .unwrap();
+        handle
+            .spawn_spec(meerkat_mob::SpawnMemberSpec::host_root(
+                "worker",
+                raw.clone(),
+            ))
+            .await
+            .unwrap();
+        let mut retired = Vec::new();
+        for id in [&member, &raw] {
+            let session_id = handle
+                .get_member(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .bridge_session_id()
+                .unwrap()
+                .clone();
+            let binding = handle
+                .member_creation_for_session(&session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .member_binding;
+            handle.retire(id.clone()).await.unwrap();
+            assert!(handle.get_member(id).await.unwrap().is_none());
+            retired.push((binding, session_id));
+        }
+        let registry = NativeAuthorityRegistry::new(
+            "test".into(),
+            handle.mob_id().to_string(),
+            sessions,
+            true,
+            None,
+            test_store(dir.path()),
+        );
+        registry.before_activation()(handle.read_handle())
+            .await
+            .unwrap();
+        // The read a lineage walk makes for an ancestor: the retired
+        // members' creation snapshots stay readable.
+        let mut snapshots = Vec::new();
+        for (binding, session_id) in &retired {
+            snapshots.push(registry.snapshot(binding, session_id).await.unwrap());
+        }
+        let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
+            crate::identity_first::IdentityRuntimeConfig {
+                continuity_store: Arc::new(
+                    crate::identity_first::LocalContinuityStore::in_memory().unwrap(),
+                ),
+                lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
+                runtime_instance_id: "retired-unmarked".to_string(),
+                has_runtime_store: true,
+                durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                bridge: None,
+                default_timeout: None,
+            },
+        ));
+        registry.bind_identity_runtime(&identity_runtime);
+        let principal = |snapshot| {
+            let registry = &registry;
+            async move {
+                registry
+                    .principal(snapshot, &mut BridgeHistoryRead::default())
+                    .await
+            }
+        };
+        let worker = |principal: documents::Result<Principal>, id: &str| match principal {
+            Ok(Principal::Worker { member_id, .. }) => member_id == id,
+            _ => false,
+        };
+        // Unregistered, the retired labelled member is a worker like any
+        // other retired member.
+        assert!(worker(principal(&snapshots[0]).await, member.as_str()));
+        assert!(worker(principal(&snapshots[1]).await, raw.as_str()));
+
+        identity_runtime
+            .register_locked(crate::identity_first::DurableAgentSpec {
+                identity: crate::identity_first::AgentIdentity::parse(identity).unwrap(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            })
+            .await;
+        assert!(matches!(
+            principal(&snapshots[0]).await,
+            Err(documents::Error::AuthorityUnavailable)
+        ));
+        assert!(worker(principal(&snapshots[1]).await, raw.as_str()));
+        handle.stop().await.unwrap();
     }
 }

@@ -157,10 +157,6 @@ async fn boot_persistent(
     dir: &tempfile::TempDir,
     configure: impl FnOnce(MobBootstrapSpec) -> MobBootstrapSpec,
 ) -> MobRuntime {
-    let session_store = Arc::new(
-        meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-            .expect("open session store"),
-    );
     let (storage, provenance) = meerkat_meta::mob_composition_manifest::persistent_mob_storage(
         dir.path().join("mob.sqlite3"),
     )
@@ -168,12 +164,12 @@ async fn boot_persistent(
     let spec = MobBootstrapSpec::persistent(
         definition(),
         storage,
+        provenance,
         dir.path().to_path_buf(),
         4,
-        session_store,
     )
+    .await
     .expect("compose persistent stores")
-    .with_mob_storage_provenance(provenance)
     .with_options(options());
     MobRuntime::bootstrap(configure(spec))
         .await
@@ -493,7 +489,7 @@ async fn fork_off_and_councils_are_not_governed_by_the_child_policy() {
         &meerkat_runtime::mob_operator_authority::set_create_authority(&creator_authority(), false)
             .expect("no create scope"),
         &mob_id,
-        handle.incarnation(),
+        handle.live_incarnation(),
         "worker",
     )
     .expect("spawnable worker profile");
@@ -513,7 +509,7 @@ async fn fork_off_and_councils_are_not_governed_by_the_child_policy() {
     let convener_authority = meerkat_runtime::mob_operator_authority::grant_manage_mob(
         &creator_authority(),
         &mob_id,
-        handle.incarnation(),
+        handle.live_incarnation(),
     )
     .expect("manage scope");
     let convener = agent_surface(

@@ -1,0 +1,183 @@
+---
+title: "Exporting SDK-hosted continuity from 0.9.3"
+description: "Before a 0.9.3 deployment that kept continuity behind an SDK continuity provider upgrades to 0.9.4, export that continuity into a file that meta_gateway storage-migrate-native imports."
+icon: "file-export"
+---
+
+Meta 0.9.4 keeps session and identity truth in Core's local stores. The 0.9.3
+SDK continuity provider (`continuity_store` on the Python builder,
+`continuityStore` on the TypeScript builder) has no 0.9.4 runtime. If your
+0.9.3 deployment passed one to the builder, export its continuity once, before
+you upgrade. A deployment without a continuity provider skips this page.
+
+The upgrade runs in this order:
+
+1. Stop every 0.9.3 gateway that uses the store.
+2. Run the export with 0.9.3 still installed (this page).
+3. Upgrade to 0.9.4.
+4. Import the file with `meta_gateway storage-migrate-native`.
+5. Start 0.9.4.
+
+The export is a standalone script. `continuity_export.py` needs Python 3.10 or
+later and nothing beyond the standard library; `continuity-export.mjs` needs
+Node.js 18 or later and no packages. Neither imports the Meta SDK, so either
+one runs in your 0.9.3 environment beside your provider. Use the one in your
+provider's language: both write the same file.
+
+## 1. Download and check the scripts
+
+Both scripts ship in the `v0.9.4` tag. Download them and check their SHA-256
+digests before you run either:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/lukacf/meerkat-meta/v0.9.4/tools/continuity-export/continuity_export.py
+curl -fsSLO https://raw.githubusercontent.com/lukacf/meerkat-meta/v0.9.4/tools/continuity-export/continuity-export.mjs
+sha256sum --check --strict <<'EOF'
+36ffe2f8da8e0e68a85b31b7045197a37cec9ba19fe9f9223872cf266457ae80  continuity_export.py
+228771596cf78882d112bb574befc5a7c79913b755317dda00a7342235c7831e  continuity-export.mjs
+EOF
+```
+
+On macOS, use `shasum -a 256 --check` in place of `sha256sum --check --strict`.
+Each file must print `OK`. Anything else means the download is not the
+released script: do not run it.
+
+## 2. List the identities
+
+The 0.9.3 provider protocol cannot list the identities a store holds, so the
+export covers exactly the identities you name. Name every identity the store
+holds a record for, including retired identities and identities your roster no
+longer lists. Put one identity on each line of a UTF-8 file. A byte order
+mark at the start of the file, whitespace around an identity and blank lines
+are ignored:
+
+```text
+agent:alpha
+agent:beta
+```
+
+An identity the store holds no record for is exported as `uninitialized`, so
+a typo shows up in the summary. Only the current session of each identity is
+exported; its earlier sessions are not migrated.
+
+## 3. Run the export
+
+Point `--provider` at the provider object you passed to the 0.9.3 builder, or
+at a function that returns it (the function may be async).
+
+With Python, `--provider` takes `module.path:attribute`, and the current
+directory is importable:
+
+```bash
+python3 continuity_export.py --provider my_app.continuity:provider \
+  --identities-file identities.txt --output continuity-export.jsonl
+```
+
+With Node.js, `--provider` takes a module path relative to the current
+directory and an optional `#export` name, `default` when omitted. An ES module
+or a CommonJS file works; run the script under `tsx` to load a TypeScript
+module:
+
+```bash
+node continuity-export.mjs --provider ./continuity-provider.mjs#provider \
+  --identities-file identities.txt --output continuity-export.jsonl
+```
+
+A Node.js provider's `resolveMany` answers in the snake_case wire shape its
+0.9.3 gateway read, as every working 0.9.3 deployment does: a camelCase
+record is refused as `Unreadable`; the 0.9.3 gateway could not read one
+either.
+
+`--identity ID` names an identity on the command line. Repeat it, or combine
+it with `--identities-file`.
+
+`--missing-snapshot fresh` is for a store written by a host built with the
+Python or TypeScript SDK; see "Hosts built with the Python or TypeScript SDK"
+below.
+
+The export calls only the provider's 0.9.3 read methods: `resolve_many`,
+`load_session_snapshot` and, when the provider has it,
+`resolve_record_by_session` (`resolveMany`, `loadSessionSnapshot` and
+`resolveRecordBySession` in Node.js). It writes nothing to the provider and
+never replaces an existing file. It sees the store as it is while it runs,
+which is why every gateway is stopped first. On success it prints a summary:
+each identity with its state, and for a ready identity its session and the
+size and SHA-256 of its session document.
+
+| Exit status | Meaning |
+|---|---|
+| 0 | The file was written. |
+| 1 | Refused: nothing was written, and each identity that blocks the export is printed. |
+| 2 | A usage error, or the output file already exists or cannot be written. |
+| 3 | The provider failed: its module, its factory, a read or the value a read returned. Nothing was written; run the export again. |
+| 4 | With `--verify`: a file failed a check (see step 4). |
+
+The file holds the session documents of every exported identity, so keep it
+with the same care as the 0.9.3 store. The script creates it readable by its
+owner only. It writes each identity's entry as soon as it has read the
+session, so its memory use follows the largest session rather than the whole
+store: allow up to about 20 times the largest session. It needs free space
+beside the output for about twice the file while it runs. An export that is
+killed before it finishes can leave hidden `.<output>.*.partial` files beside
+the output; they hold session documents, so delete them.
+
+## When the export refuses
+
+If any listed identity cannot be exported as it stands, the export writes
+nothing and prints each blocking identity with its class, its session, what
+it found and the action that clears it:
+
+```text
+continuity export refused; nothing was written:
+  class=RuntimeMissing identity=agent:alpha session=019ecb20-4899-7292-a2b4-c81bc7a44258
+    detail: the provider holds no snapshot for session 019ecb20-4899-7292-a2b4-c81bc7a44258 (0.9.3 record: agent_runtime_id rt:agent:alpha:0, generation 0, checkpoint_version 0)
+    action: if a 0.9.3 host built with the Python or TypeScript SDK wrote the store, it never saved snapshots: rerun the export with --missing-snapshot fresh, which writes the identity as uninitialized, so it starts fresh with an empty transcript, as at every 0.9.3 restart; otherwise restore the session's snapshot, or delete the identity with the 0.9.3 binary, then rerun the export
+```
+
+| Class | What the export found | Action |
+|---|---|---|
+| `Broken` | The provider reports the identity's continuity as broken. | Settle or delete the identity with the 0.9.3 binary, then rerun the export. |
+| `RuntimeMissing` | The provider holds no snapshot for the identity's current session. | If a 0.9.3 host built with the Python or TypeScript SDK wrote the store, it never saved snapshots: rerun the export with --missing-snapshot fresh, which writes the identity as uninitialized, so it starts fresh with an empty transcript, as at every 0.9.3 restart; otherwise restore the session's snapshot, or delete the identity with the 0.9.3 binary, then rerun the export. |
+| `IdentityDisagrees` | The record names another identity, the session is bound to more than one identity, or `resolve_record_by_session` does not bind the session to this identity. | Settle the identity's record with the 0.9.3 binary (or delete the identity), then rerun the export. |
+| `Unreadable` | An answer is not in the 0.9.3 wire shape, for example a malformed record or an empty snapshot. | Make the provider answer in the 0.9.3 wire shape, then rerun the export. |
+| `Unlisted` | The provider answered for an identity you did not list. | Add the identity to the identity list, then rerun the export. |
+| `TooLarge` | The session's snapshot does not fit in one entry of the file: an entry holds at most 536,870,888 bytes, a snapshot of about 400 MB. | Reset or delete the identity with the 0.9.3 binary (either drops its session), then rerun the export. |
+
+## Hosts built with the Python or TypeScript SDK
+
+A 0.9.3 gateway that the Python or TypeScript SDK started with a continuity
+provider kept its sessions in memory. It saved each identity's continuity
+record to the provider but never a session snapshot, so every restart started
+every identity fresh. This is a known issue of 0.9.3.
+
+For such a store the export refuses every ready identity as `RuntimeMissing`:
+it cannot tell a snapshot that was never saved from one that was lost. Rerun
+it with `--missing-snapshot fresh`:
+
+```bash
+python3 continuity_export.py --provider my_app.continuity:provider \
+  --identities-file identities.txt --output continuity-export.jsonl \
+  --missing-snapshot fresh
+```
+
+Each ready identity without a snapshot is then written as `uninitialized`, so
+it starts fresh after the upgrade with an empty transcript, as it did at every
+0.9.3 restart: nothing of its conversation is carried. The summary counts
+them and lists each one with its session and its 0.9.3 record. Every other
+refusal still stops the export.
+
+A host that drives the gateway itself and passes `persistent_state` with the
+continuity provider did save snapshots. For it, `RuntimeMissing` means a
+snapshot is missing from the provider: restore it rather than use the flag.
+
+## 4. Check the file
+
+```bash
+python3 continuity_export.py --verify continuity-export.jsonl
+```
+
+`node continuity-export.mjs --verify continuity-export.jsonl` checks it the
+same way. Either script checks the header, the count, length and SHA-256 of
+the entries, and every entry, prints the summary again, and exits with status 4
+when the file fails a check. Keep the file unchanged until 0.9.4 has imported
+it.

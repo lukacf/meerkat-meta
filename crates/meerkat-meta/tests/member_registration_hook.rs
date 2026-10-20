@@ -107,11 +107,7 @@ fn options() -> MobBootstrapOptions {
 
 /// A spec whose session service is backed by the canonical runtime adapter,
 /// which a registration hook requires.
-fn persistent_spec(dir: &tempfile::TempDir) -> MobBootstrapSpec {
-    let session_store = Arc::new(
-        meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-            .expect("open session store"),
-    );
+async fn persistent_spec(dir: &tempfile::TempDir) -> MobBootstrapSpec {
     let (storage, provenance) = meerkat_meta::mob_composition_manifest::persistent_mob_storage(
         dir.path().join("mob.sqlite3"),
     )
@@ -119,12 +115,12 @@ fn persistent_spec(dir: &tempfile::TempDir) -> MobBootstrapSpec {
     MobBootstrapSpec::persistent(
         definition(),
         storage,
+        provenance,
         dir.path().to_path_buf(),
         4,
-        session_store,
     )
+    .await
     .expect("compose persistent stores")
-    .with_mob_storage_provenance(provenance)
     .with_options(options())
 }
 
@@ -139,7 +135,7 @@ async fn a_hooked_member_without_the_host_grant_owner_is_refused_not_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let hook = Arc::new(RecordingHook::default());
         let spec = if persistent {
-            persistent_spec(&dir)
+            persistent_spec(&dir).await
         } else {
             MobBootstrapSpec::ephemeral(
                 definition(),
@@ -178,6 +174,7 @@ async fn a_hook_on_both_the_builder_and_the_supplied_spec_is_refused() {
     let error = UnifiedRuntime::builder()
         .mob_spec(
             persistent_spec(&dir)
+                .await
                 .with_member_runtime_registration_hook(Arc::new(RecordingHook::default())),
         )
         .member_runtime_registration_hook(Arc::new(RecordingHook::default()))

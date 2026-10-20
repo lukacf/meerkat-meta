@@ -243,6 +243,11 @@ CROSS_AREA_READS = {
     # hooks' configuration, and the workspace manifest names its members.
     ("sdk/typescript/", "crates/"): set(),
     ("scripts/", "crates/"): set(),
+    # fmt-lint runs the continuity export scripts' tests on every run; they
+    # read their golden files below crates/meerkat-meta/tests/fixtures and
+    # check the pins and tables of the export guide under docs/.
+    ("tools/", "crates/"): set(),
+    ("tools/", "docs/"): set(),
     (".pre-commit-config.yaml", "crates/"): set(),
     ("Cargo.toml", "crates/"): set(),
 
@@ -505,10 +510,19 @@ class CiChangesTests(unittest.TestCase):
 
     def test_files_only_fmt_lint_and_audit_read_skip_every_lane(self):
         # fmt-lint and audit run on every pull request.
+        export_tools = sorted(f"tools/continuity-export/{path.name}"
+                              for path in (ROOT / "tools/continuity-export").iterdir() if path.is_file())
+        self.assertLessEqual({"tools/continuity-export/continuity_export.py",
+                              "tools/continuity-export/continuity-export.mjs",
+                              "tools/continuity-export/test_continuity_export.py",
+                              "tools/continuity-export/continuity-export.test.mjs"}, set(export_tools))
         for path in (".pre-commit-config.yaml", ".gitignore", "BUILD.bazel", "MODULE.bazel", ".bazelrc",
                      ".bazelversion", "tools/bazel/platforms/BUILD.bazel", "deny.toml",
                      # Generated per crate; only fmt-lint's freshness check reads them.
-                     "crates/meerkat-meta/BUILD.bazel"):
+                     "crates/meerkat-meta/BUILD.bazel",
+                     # The continuity export scripts and their tests, and every
+                     # other file beside them; fmt-lint runs the tests.
+                     *export_tools):
             with self.subTest(path=path):
                 self.assertEqual(self.lanes(path), set())
         # Every other top-level script reaches the console lane only: its

@@ -3,7 +3,7 @@
 use super::*;
 use crate::console_aggregator::{
     AppendOutcome, ConsoleFrameSource, ConsoleFrameStatus, ConsoleTimelinePage,
-    InMemoryConsoleLogStore, NewConsoleFrame,
+    ConsoleTimelineWindowPage, InMemoryConsoleLogStore, NewConsoleFrame,
 };
 use axum::body::Body;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -36,18 +36,21 @@ use meerkat_core::types::{HandlingMode, StopReason};
 use meerkat_meta::identity_first::contracts::{ContinuityStore, LeaseProvider};
 use meerkat_meta::identity_first::{
     AgentAddressability, AgentBuildDraft, AgentIdentity, AgentRuntimeId, BridgeAdmissionError,
-    BridgeDelivery, BridgeError, BridgeTurnReceipt, CheckpointVersion, CompletionProgress,
-    ContinuityGeneration, ContinuityRecord, CorrelationId, DeliveryErrorClass,
-    DispatchIdempotencyKey, DispatchInput, DispatchOrigin, DurabilityPolicy, DurableAgentSpec,
-    FencingToken, IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig, LeaseGrant,
+    BridgeDelivery, BridgeError, BridgeTurnReceipt, CompletionProgress, CorrelationId,
+    DeliveryErrorClass, DispatchIdempotencyKey, DispatchInput, DispatchOrigin, DurabilityPolicy,
+    DurableAgentSpec, IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig,
     LocalContinuityStore, LocalLeaseProvider, MemberInspection, MutableRosterProvider,
     ResumeSessionOutcome, SessionBridge, SessionSnapshot, TurnOutcome, TurnOutput, TurnTicket,
     TurnTracking, TurnUntrackable,
 };
 use serde_json::{Value, json};
 
+#[path = "support/core_members.rs"]
+mod core_members;
 #[path = "support/llm_usage.rs"]
 mod llm_usage;
+
+use core_members::CoreMembers;
 
 // ===========================================================================
 // Scripted bridge
@@ -118,6 +121,9 @@ struct TicketBridge {
     inspections: AtomicUsize,
     /// Every member build (`create_session`) or resume (`resume_session`).
     materializations: AtomicUsize,
+    /// The members Core holds, as this double's creates, resumes and retires
+    /// leave them (or as a test bound them).
+    core: CoreMembers,
 }
 
 impl TicketBridge {
@@ -144,6 +150,7 @@ impl TicketBridge {
             latest_output: std::sync::Mutex::new(None),
             inspections: AtomicUsize::new(0),
             materializations: AtomicUsize::new(0),
+            core: CoreMembers::default(),
         })
     }
 
@@ -225,29 +232,86 @@ impl TicketBridge {
 impl SessionBridge for TicketBridge {
     async fn create_session(
         &self,
-        _identity: &AgentIdentity,
-        _runtime_id: &AgentRuntimeId,
-        _spec: &DurableAgentSpec,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
-        session_id: &meerkat_core::types::SessionId,
-    ) -> Result<meerkat_core::types::SessionId, BridgeError> {
+    ) -> Result<meerkat_meta::identity_first::MemberRuntimeBinding, BridgeError> {
+        let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+            .map_err(|error| BridgeError::Mob(error.to_string()))?;
+        let session_id = &meerkat_core::types::SessionId::new();
         self.materializations.fetch_add(1, Ordering::SeqCst);
-        Ok(session_id.clone())
+        let binding = meerkat_meta::identity_first::MemberRuntimeBinding {
+            agent_runtime_id,
+            session_id: Some(session_id.clone()),
+        };
+        self.core.bind(identity, &binding, &spec.profile);
+        Ok(binding)
     }
 
     async fn resume_session(
         &self,
-        _identity: &AgentIdentity,
-        _runtime_id: &AgentRuntimeId,
-        _spec: &DurableAgentSpec,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
         session_id: &meerkat_core::types::SessionId,
-        _snapshot: &SessionSnapshot,
+        _resume_from_role: Option<&meerkat_mob::ProfileName>,
     ) -> Result<ResumeSessionOutcome, BridgeError> {
+        let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+            .map_err(|error| BridgeError::Mob(error.to_string()))?;
         self.materializations.fetch_add(1, Ordering::SeqCst);
+        self.core.bind(
+            identity,
+            &meerkat_meta::identity_first::MemberRuntimeBinding {
+                agent_runtime_id: agent_runtime_id.clone(),
+                session_id: Some(session_id.clone()),
+            },
+            &spec.profile,
+        );
         Ok(ResumeSessionOutcome::Resumed {
             session_id: session_id.clone(),
+            agent_runtime_id,
         })
+    }
+
+    async fn live_member(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_meta::identity_first::MemberRuntimeBinding>, BridgeError> {
+        self.core.live_member(identity)
+    }
+
+    async fn live_member_scope(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+        self.core.live_member_scope(identity)
+    }
+
+    async fn ensure_member_live(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_meta::identity_first::MemberRuntimeBinding>, BridgeError> {
+        self.core.live_member(identity)
+    }
+
+    async fn member_binding_history(
+        &self,
+    ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+        self.core.history()
+    }
+
+    async fn last_member_binding(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+        self.core.last_member_binding(identity)
+    }
+
+    async fn identity_management(
+        &self,
+        _identity: &AgentIdentity,
+    ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+        Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
     }
 
     async fn deliver_admitted(
@@ -312,7 +376,8 @@ impl SessionBridge for TicketBridge {
         Ok(SessionSnapshot { data: Vec::new() })
     }
 
-    async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+    async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+        self.core.retire(runtime_id);
         Ok(())
     }
 
@@ -345,40 +410,32 @@ fn make_runtime(bridge: Option<Arc<dyn SessionBridge>>) -> Arc<IdentityRuntime> 
 }
 
 /// Register an Active identity bound to `session`, the session the bridge
-/// resolves every turn onto (so no delivery looks like a rotation).
+/// resolves every turn onto (so no delivery looks like a rotation): Core
+/// holds its member live on that session, at fence 1. Without a bridge only
+/// the spec is registered.
 async fn register_spec(
     runtime: &IdentityRuntime,
+    bridge: Option<&TicketBridge>,
     spec: DurableAgentSpec,
     session: &meerkat_core::types::SessionId,
 ) -> AgentIdentity {
     let identity = spec.identity.clone();
-    runtime
-        .register(
-            spec,
-            IdentityLifecycleState::Active,
-            Some(ContinuityRecord {
-                identity: identity.clone(),
-                agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{identity}")).unwrap(),
-                session_id: session.clone(),
-                generation: ContinuityGeneration::new(0),
-                checkpoint_version: CheckpointVersion::new(0),
-            }),
-            Some(LeaseGrant {
-                identity: identity.clone(),
-                fencing_token: FencingToken::new(1),
-                ttl: Duration::from_mins(5),
-            }),
-        )
-        .await;
+    if let Some(bridge) = bridge {
+        bridge
+            .core
+            .bind_live_at_fence(&identity, &spec.profile, 0, Some(session.clone()), 1);
+    }
+    runtime.register(spec).await;
     identity
 }
 
 async fn register_bound(
     runtime: &IdentityRuntime,
+    bridge: Option<&TicketBridge>,
     name: &str,
     session: &meerkat_core::types::SessionId,
 ) -> AgentIdentity {
-    register_spec(runtime, make_spec(name), session).await
+    register_spec(runtime, bridge, make_spec(name), session).await
 }
 
 fn tracked(turn: &TurnTracking) -> TurnTicket {
@@ -441,7 +498,7 @@ async fn concurrent_deliveries_to_one_identity_each_get_their_own_output() {
     let session = meerkat_core::types::SessionId::new();
     let bridge = TicketBridge::new(true, session.clone());
     let runtime = make_runtime(Some(bridge.clone()));
-    let keeper = register_bound(&runtime, "keeper", &session).await;
+    let keeper = register_bound(&runtime, Some(&bridge), "keeper", &session).await;
 
     let a = runtime
         .send_with_turn_ticket(&keeper, None, &content("alpha"), HandlingMode::Queue, None)
@@ -512,8 +569,8 @@ async fn a_failed_turn_is_failed_and_an_unknown_ticket_is_unknown() {
     let session = meerkat_core::types::SessionId::new();
     let bridge = TicketBridge::new(true, session.clone());
     let runtime = make_runtime(Some(bridge.clone()));
-    let keeper = register_bound(&runtime, "keeper", &session).await;
-    let other = register_bound(&runtime, "other", &session).await;
+    let keeper = register_bound(&runtime, Some(&bridge), "keeper", &session).await;
+    let other = register_bound(&runtime, Some(&bridge), "other", &session).await;
 
     let a = runtime
         .send_with_turn_ticket(&keeper, None, &content("alpha"), HandlingMode::Queue, None)
@@ -548,7 +605,7 @@ async fn an_untrackable_turn_is_delivered_once_on_the_ingress_lane() {
     let session = meerkat_core::types::SessionId::new();
     let bridge = TicketBridge::new(false, session.clone());
     let runtime = make_runtime(Some(bridge.clone()));
-    let keeper = register_bound(&runtime, "keeper", &session).await;
+    let keeper = register_bound(&runtime, Some(&bridge), "keeper", &session).await;
 
     let sent = runtime
         .send_with_turn_ticket(&keeper, None, &content("alpha"), HandlingMode::Queue, None)
@@ -561,16 +618,21 @@ async fn an_untrackable_turn_is_delivered_once_on_the_ingress_lane() {
     assert_eq!(bridge.ingress_admissions().len(), 1);
     assert!(bridge.tracked_admissions().is_empty());
 
-    // No bridge at all: nothing to deliver or track.
+    // No bridge at all: Core's mob is out of reach, so the send is refused
+    // typed and nothing is admitted or tracked.
     let bare = make_runtime(None);
-    let lone = register_bound(&bare, "lone", &session).await;
-    let sent = bare
+    let lone = register_bound(&bare, None, "lone", &session).await;
+    let refused = bare
         .send_with_turn_ticket(&lone, None, &content("alpha"), HandlingMode::Queue, None)
         .await
-        .expect("send without a bridge");
-    assert_eq!(
-        sent.turn,
-        TurnTracking::Unavailable(TurnUntrackable::NotDelivered)
+        .expect_err("a send without a session bridge is refused");
+    assert!(
+        matches!(
+            &refused,
+            meerkat_meta::identity_first::IdentityRuntimeError::Internal(detail)
+                if detail.contains("no session bridge is installed")
+        ),
+        "{refused:?}"
     );
 }
 
@@ -582,7 +644,7 @@ async fn a_reused_interaction_id_never_shares_a_ticket() {
     let session = meerkat_core::types::SessionId::new();
     let bridge = TicketBridge::new(true, session.clone());
     let runtime = make_runtime(Some(bridge.clone()));
-    let keeper = register_bound(&runtime, "keeper", &session).await;
+    let keeper = register_bound(&runtime, Some(&bridge), "keeper", &session).await;
 
     let interaction = uuid::Uuid::new_v4().to_string();
     let mut tickets = Vec::new();
@@ -655,8 +717,8 @@ async fn a_fanned_out_correlation_gets_a_ticket_per_identity() {
     let session = meerkat_core::types::SessionId::new();
     let bridge = TicketBridge::new(true, session.clone());
     let runtime = make_runtime(Some(bridge.clone()));
-    let luka = register_bound(&runtime, "luka", &session).await;
-    let erin = register_bound(&runtime, "erin", &session).await;
+    let luka = register_bound(&runtime, Some(&bridge), "luka", &session).await;
+    let erin = register_bound(&runtime, Some(&bridge), "erin", &session).await;
 
     let correlation = "telegram:primary/i:769";
     let to_luka = runtime
@@ -707,7 +769,7 @@ async fn a_reused_correlation_on_one_identity_is_two_turns() {
     let session = meerkat_core::types::SessionId::new();
     let bridge = TicketBridge::new(true, session.clone());
     let runtime = make_runtime(Some(bridge.clone()));
-    let keeper = register_bound(&runtime, "keeper", &session).await;
+    let keeper = register_bound(&runtime, Some(&bridge), "keeper", &session).await;
 
     let first = runtime
         .dispatch_with_turn_ticket(&keeper, None, &correlated("one", "msg-1", "chat-42"))
@@ -753,7 +815,7 @@ async fn a_redispatch_names_the_original_ticket_and_never_overwrites_its_output(
     let session = meerkat_core::types::SessionId::new();
     let bridge = TicketBridge::new(true, session.clone());
     let runtime = make_runtime(Some(bridge.clone()));
-    let keeper = register_bound(&runtime, "keeper", &session).await;
+    let keeper = register_bound(&runtime, Some(&bridge), "keeper", &session).await;
 
     let original = runtime
         .dispatch_with_turn_ticket(&keeper, None, &correlated("work", "evt-9", "evt-9"))
@@ -821,7 +883,7 @@ async fn a_live_mode_refusal_falls_back_to_the_ingress_lane_once() {
         let bridge = TicketBridge::new(true, session.clone());
         *bridge.refuses_tracked_in.lock().unwrap() = Some(mode);
         let runtime = make_runtime(Some(bridge.clone()));
-        let keeper = register_bound(&runtime, "keeper", &session).await;
+        let keeper = register_bound(&runtime, Some(&bridge), "keeper", &session).await;
 
         let sent = runtime
             .send_with_turn_ticket(&keeper, None, &content("alpha"), HandlingMode::Queue, None)
@@ -869,7 +931,7 @@ async fn a_redispatch_after_a_session_rotation_runs_and_reports_its_own_turn() {
     let session = meerkat_core::types::SessionId::new();
     let bridge = TicketBridge::new(true, session.clone());
     let runtime = make_runtime(Some(bridge.clone()));
-    let keeper = register_bound(&runtime, "keeper", &session).await;
+    let keeper = register_bound(&runtime, Some(&bridge), "keeper", &session).await;
 
     let original = runtime
         .dispatch_with_turn_ticket(&keeper, None, &correlated("work", "evt-7", "evt-7"))
@@ -884,9 +946,10 @@ async fn a_redispatch_after_a_session_rotation_runs_and_reports_its_own_turn() {
         completed("first answer")
     );
 
-    // The member moves onto a fresh session; the next delivery reconciles the
-    // identity onto it.
+    // The member moves onto a fresh session and Core rebinds its live member
+    // there (same runtime id); the identity follows Core's binding.
     let rotated = bridge.rotate_session();
+    bridge.core.move_live_session(&keeper, rotated.clone());
     runtime
         .send_admission_tracked(&keeper, None, &content("ping"), HandlingMode::Queue, None)
         .await
@@ -933,7 +996,7 @@ async fn a_redispatch_rotated_onto_a_new_session_is_not_given_the_original_ticke
     let session = meerkat_core::types::SessionId::new();
     let bridge = TicketBridge::new(true, session.clone());
     let runtime = make_runtime(Some(bridge.clone()));
-    let keeper = register_bound(&runtime, "keeper", &session).await;
+    let keeper = register_bound(&runtime, Some(&bridge), "keeper", &session).await;
 
     let original = runtime
         .dispatch_with_turn_ticket(&keeper, None, &correlated("work", "evt-8", "evt-8"))
@@ -978,7 +1041,7 @@ async fn a_session_resolution_failure_keeps_the_turns_own_output() {
     let session = meerkat_core::types::SessionId::new();
     let bridge = TicketBridge::build(true, true, session.clone());
     let runtime = make_runtime(Some(bridge.clone()));
-    let keeper = register_bound(&runtime, "keeper", &session).await;
+    let keeper = register_bound(&runtime, Some(&bridge), "keeper", &session).await;
 
     let sent = runtime
         .send_with_turn_ticket(&keeper, None, &content("alpha"), HandlingMode::Queue, None)
@@ -1923,10 +1986,8 @@ async fn a_tracked_turn_advances_the_identity_wide_cursor() {
             )
             .await;
             panic!(
-                "{content} (tracked={track}): the cursor never passed {baseline:?}; lease {:?}",
-                status.map(
-                    |status| status.map(|status| status.lease.map(|lease| lease.fencing_token))
-                ),
+                "{content} (tracked={track}): the cursor never passed {baseline:?}; status {:?}",
+                status.map(|status| status.map(|status| (status.state, status.generation))),
             );
         }
         assert_eq!(
@@ -2279,9 +2340,9 @@ async fn a_send_naming_a_superseded_registered_row_is_refused_before_delivery() 
 
 /// A Dormant identity is not woken for an input authored from a superseded
 /// registered row: the row is checked in the lifecycle-owned embodiment
-/// decision, under the identity's lifecycle lock, so the refusal takes no
-/// lease, builds or resumes nothing and leaves the identity's readiness
-/// untouched. The current row wakes it and is delivered.
+/// decision, under the identity's lifecycle lock, so the refusal spawns,
+/// builds or resumes nothing and leaves the identity's readiness untouched.
+/// The current row wakes it and is delivered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_superseded_row_does_not_wake_a_dormant_identity() {
     let session = meerkat_core::types::SessionId::new();
@@ -2289,9 +2350,7 @@ async fn a_superseded_row_does_not_wake_a_dormant_identity() {
     let runtime = make_runtime(Some(bridge.clone()));
     let spec = make_spec("sleeper");
     let identity = spec.identity.clone();
-    runtime
-        .register(spec.clone(), IdentityLifecycleState::Dormant, None, None)
-        .await;
+    runtime.register(spec.clone()).await;
     let stale = runtime
         .registered_spec(&identity)
         .await
@@ -2327,7 +2386,10 @@ async fn a_superseded_row_does_not_wake_a_dormant_identity() {
         IdentityLifecycleState::Dormant,
         "the refusal did not wake the identity"
     );
-    assert!(status.lease.is_none(), "the refusal took no lease");
+    assert!(
+        status.agent_runtime_id.is_none(),
+        "the refusal spawned no member"
+    );
     assert!(
         status.session_id.is_none(),
         "the refusal created no session"

@@ -433,6 +433,57 @@ async fn route_requires_workgraph_view_abac_before_subscribing() {
 }
 
 #[tokio::test]
+async fn open_stream_ends_when_the_committed_policy_drops_workgraph_view() {
+    let access = workgraph_access(true);
+    let hub = WorkGraphFactHub::with_capacity(8);
+    let app = workgraph_facts_sse_router(hub.clone(), None, Some(access.clone()));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(WORKGRAPH_FACTS_STREAM_PATH)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let initial = next_sse_frame(&mut body).await;
+    assert_eq!(data_json(&initial)["payload"]["reason"], "initial_sync");
+    assert!(hub.publish_fact(&fact(1, "before-change")));
+    assert_eq!(
+        data_json(&next_sse_frame(&mut body).await)["payload"]["seq"],
+        1
+    );
+
+    access
+        .delete_rule("workgraph-view")
+        .expect("commit the change");
+    // The stream still holds its subscription, so this fact is queued on it.
+    assert!(hub.publish_fact(&fact(2, "after-change")));
+    let next = tokio::time::timeout(Duration::from_secs(20), body.next())
+        .await
+        .expect("the stream ends");
+    assert!(
+        next.is_none(),
+        "a frame sent after the committed change: {:?}",
+        next.map(|frame| frame.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+    );
+    // A reconnect is decided under the committed policy as well.
+    let reconnect = app
+        .oneshot(
+            Request::builder()
+                .uri(WORKGRAPH_FACTS_STREAM_PATH)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("reconnect response");
+    assert_eq!(reconnect.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn zero_subscribers_perform_zero_frontier_and_page_reads() {
     let store = Arc::new(CountingReadStore::default());
     let service = WorkGraphService::new(store.clone());

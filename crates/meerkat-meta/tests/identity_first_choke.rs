@@ -78,24 +78,6 @@ fn make_internal_spec(name: &str) -> DurableAgentSpec {
     }
 }
 
-fn make_record(name: &str, generation: u64, cpv: u64) -> ContinuityRecord {
-    ContinuityRecord {
-        identity: make_identity(name),
-        agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{name}:{generation}")).unwrap(),
-        session_id: meerkat_core::types::SessionId::new(),
-        generation: ContinuityGeneration::new(generation),
-        checkpoint_version: CheckpointVersion::new(cpv),
-    }
-}
-
-fn make_grant(name: &str, token: u64) -> LeaseGrant {
-    LeaseGrant {
-        identity: make_identity(name),
-        fencing_token: FencingToken::new(token),
-        ttl: Duration::from_mins(5),
-    }
-}
-
 fn make_runtime(store: Arc<dyn ContinuityStore>, lease: Arc<dyn LeaseProvider>) -> IdentityRuntime {
     IdentityRuntime::new(IdentityRuntimeConfig {
         continuity_store: store,
@@ -104,6 +86,28 @@ fn make_runtime(store: Arc<dyn ContinuityStore>, lease: Arc<dyn LeaseProvider>) 
         has_runtime_store: false,
         durability_policy: DurabilityPolicy::SyncWriteThrough,
         bridge: None,
+        default_timeout: None,
+    })
+}
+
+#[path = "support/core_bridge.rs"]
+mod core_bridge;
+#[path = "support/core_members.rs"]
+mod core_members;
+
+/// [`make_runtime`] with a session bridge whose Core is the members fixture,
+/// for scenarios that need Core to build members.
+fn make_runtime_with_core_bridge(
+    store: Arc<dyn ContinuityStore>,
+    lease: Arc<dyn LeaseProvider>,
+) -> IdentityRuntime {
+    IdentityRuntime::new(IdentityRuntimeConfig {
+        continuity_store: store,
+        lease_provider: lease,
+        runtime_instance_id: "choke-runtime".to_string(),
+        has_runtime_store: false,
+        durability_policy: DurabilityPolicy::SyncWriteThrough,
+        bridge: Some(Arc::new(core_bridge::CoreBridge::default())),
         default_timeout: None,
     })
 }
@@ -134,21 +138,6 @@ struct MockBridgeInner {
 struct MockBridge(Arc<MockBridgeInner>);
 
 impl MockBridge {
-    fn new() -> Self {
-        Self(Arc::new(MockBridgeInner {
-            calls: tokio::sync::Mutex::new(Vec::new()),
-            responses: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        }))
-    }
-
-    async fn set_response(&self, method: &str, response: Result<Value, String>) {
-        self.0
-            .responses
-            .lock()
-            .await
-            .insert(method.to_string(), response);
-    }
-
     #[allow(dead_code)]
     async fn last_call(&self) -> (String, Value) {
         self.0
@@ -178,165 +167,13 @@ impl CallbackBridge for MockBridge {
 // CHOKE-01: RosterProvider → DurableAgentSpec → ContinuityStore.resolve_many
 // ===========================================================================
 
-#[tokio::test]
-async fn identity_first_choke_01_roster_to_resolve_many_mapping() {
-    let store = Arc::new(LocalContinuityStore::in_memory().unwrap());
-    let lease_prov = Arc::new(LocalLeaseProvider::new());
-    let runtime = make_runtime(store.clone(), lease_prov.clone());
-
-    // Roster produces identities
-    let roster = vec![
-        make_spec("triage:main"),
-        make_spec("worker:alpha"),
-        make_spec("gate:main"),
-    ];
-
-    // restore_flow extracts identities and calls resolve_many
-    let result = restore_flow(&runtime, &roster, None, None).await.unwrap();
-
-    // The BTreeMap keys from resolve must map back to the correct DurableAgentSpec
-    assert_eq!(result.outcomes.len(), 3);
-    for spec in &roster {
-        assert!(
-            result.outcomes.contains_key(&spec.identity),
-            "resolve result must contain key for roster identity {}",
-            spec.identity
-        );
-    }
-
-    // Verify the store got records for all identities
-    let identities: Vec<AgentIdentity> = roster.iter().map(|s| s.identity.clone()).collect();
-    let resolved = store.resolve_many(&identities).await.unwrap();
-    assert_eq!(resolved.len(), 3);
-    for id in &identities {
-        assert!(
-            resolved.contains_key(id),
-            "store resolve_many must return entry for {id}"
-        );
-    }
-}
-
 // ===========================================================================
 // CHOKE-02: LeaseProvider.acquire → FencingToken → ContinuityStore.save
 // ===========================================================================
 
-#[tokio::test]
-async fn identity_first_choke_02_fencing_token_flows_unmodified() {
-    let store = Arc::new(LocalContinuityStore::in_memory().unwrap());
-    let lease_prov = Arc::new(LocalLeaseProvider::new());
-
-    let id = make_identity("triage:main");
-
-    // Acquire lease → get fencing token
-    let grants = lease_prov
-        .acquire_leases(&[id.clone()], "choke-runtime")
-        .await
-        .unwrap();
-    let grant = match grants.get(&id).unwrap() {
-        LeaseAcquireResult::Acquired(g) => g.clone(),
-        _ => panic!("expected Acquired"),
-    };
-    let token = grant.fencing_token;
-
-    // Upsert record with this token
-    let record = make_record("triage:main", 0, 0);
-    store
-        .upsert_continuity_record(&record, token)
-        .await
-        .unwrap();
-
-    // Save snapshot with same token → ok
-    store
-        .save_session_snapshot(
-            &id,
-            &record.session_id,
-            record.generation,
-            CheckpointVersion::new(1),
-            token,
-            &SessionSnapshot {
-                data: b"data".to_vec(),
-            },
-        )
-        .await
-        .unwrap();
-
-    // Save with a stale token (lower) → rejected
-    let stale = FencingToken::new(token.get().saturating_sub(1));
-    if stale.get() < token.get() {
-        let err = store
-            .save_session_snapshot(
-                &id,
-                &record.session_id,
-                record.generation,
-                CheckpointVersion::new(2),
-                stale,
-                &SessionSnapshot {
-                    data: b"stale".to_vec(),
-                },
-            )
-            .await;
-        assert!(err.is_err(), "stale fencing token must be rejected");
-    }
-}
-
 // ===========================================================================
 // CHOKE-03: ContinuityStore.load_session_snapshot → Meerkat session restore
 // ===========================================================================
-
-#[tokio::test]
-async fn identity_first_choke_03_session_snapshot_restore_path() {
-    let store = Arc::new(LocalContinuityStore::in_memory().unwrap());
-
-    let id = make_identity("triage:main");
-    let record = make_record("triage:main", 0, 0);
-
-    // Persist record and snapshot
-    store
-        .upsert_continuity_record(&record, FencingToken::new(1))
-        .await
-        .unwrap();
-
-    let original_data = b"session-history-data-v1";
-    store
-        .save_session_snapshot(
-            &id,
-            &record.session_id,
-            record.generation,
-            CheckpointVersion::new(1),
-            FencingToken::new(1),
-            &SessionSnapshot {
-                data: original_data.to_vec(),
-            },
-        )
-        .await
-        .unwrap();
-
-    // Load the snapshot back
-    let loaded = store
-        .load_session_snapshot(&record.session_id)
-        .await
-        .unwrap()
-        .expect("snapshot should exist");
-
-    // Verify data integrity
-    assert_eq!(
-        loaded.data, original_data,
-        "snapshot data must survive save/load round-trip"
-    );
-
-    // Verify this works through the restore_flow path
-    let lease_prov = Arc::new(LocalLeaseProvider::new());
-    let runtime = make_runtime(store.clone(), lease_prov.clone());
-    let roster = vec![make_spec("triage:main")];
-    let result = restore_flow(&runtime, &roster, None, None).await.unwrap();
-
-    match result.outcomes.get(&id).unwrap() {
-        RestoreOutcome::Resumed { record, .. } => {
-            assert_eq!(record.identity, id);
-        }
-        other => panic!("expected Resumed, got: {other:?}"),
-    }
-}
 
 // ===========================================================================
 // CHOKE-04: TopologyProvider edges → comms wiring
@@ -387,57 +224,6 @@ async fn identity_first_choke_04_topology_edges_to_wiring() {
 // CHOKE-05: Builder persistent_state → bundled LocalContinuityStore + LocalLeaseProvider
 // ===========================================================================
 
-#[tokio::test]
-async fn identity_first_choke_05_builder_bundled_providers() {
-    // Verify LocalContinuityStore and LocalLeaseProvider are functional and satisfy contracts
-    let store = LocalContinuityStore::in_memory().unwrap();
-    let lease_prov = LocalLeaseProvider::new();
-
-    let id = make_identity("triage:main");
-
-    // Lease: monotonic tokens
-    let grants1 = lease_prov
-        .acquire_leases(&[id.clone()], "inst-1")
-        .await
-        .unwrap();
-    let t1 = match grants1.get(&id).unwrap() {
-        LeaseAcquireResult::Acquired(g) => g.fencing_token,
-        _ => panic!("expected Acquired"),
-    };
-    lease_prov
-        .release_leases(&[LeaseGrant {
-            identity: id.clone(),
-            fencing_token: t1,
-            ttl: Duration::from_secs(30),
-        }])
-        .await
-        .unwrap();
-
-    let grants2 = lease_prov
-        .acquire_leases(&[id.clone()], "inst-1")
-        .await
-        .unwrap();
-    let t2 = match grants2.get(&id).unwrap() {
-        LeaseAcquireResult::Acquired(g) => g.fencing_token,
-        _ => panic!("expected Acquired"),
-    };
-    assert!(
-        t2.get() > t1.get(),
-        "fencing tokens must be monotonic: t1={}, t2={}",
-        t1.get(),
-        t2.get()
-    );
-
-    // Store: functional CRUD
-    let record = make_record("triage:main", 0, 0);
-    store.upsert_continuity_record(&record, t2).await.unwrap();
-    let resolved = store.resolve_many(&[id.clone()]).await.unwrap();
-    assert!(matches!(
-        resolved.get(&id).unwrap(),
-        ContinuityResolveState::Ready { .. }
-    ));
-}
-
 // ===========================================================================
 // CHOKE-06: DurableAgentSpec.addressability → send/dispatch enforcement
 // ===========================================================================
@@ -449,24 +235,10 @@ async fn identity_first_choke_06_addressability_to_delivery_enforcement() {
     let runtime = make_runtime(store, lease);
 
     // Register Addressable
-    runtime
-        .register(
-            make_spec("public:main"),
-            IdentityLifecycleState::Active,
-            Some(make_record("public:main", 0, 0)),
-            Some(make_grant("public:main", 1)),
-        )
-        .await;
+    runtime.register(make_spec("public:main")).await;
 
     // Register InternalOnly
-    runtime
-        .register(
-            make_internal_spec("internal:main"),
-            IdentityLifecycleState::Active,
-            Some(make_record("internal:main", 0, 0)),
-            Some(make_grant("internal:main", 2)),
-        )
-        .await;
+    runtime.register(make_internal_spec("internal:main")).await;
 
     // Trace: addressability from roster → runtime → delivery enforcement
     let status_public = runtime.status(&make_identity("public:main")).await.unwrap();
@@ -484,13 +256,15 @@ async fn identity_first_choke_06_addressability_to_delivery_enforcement() {
         AgentAddressability::InternalOnly
     );
 
-    // send() enforcement matches addressability
-    assert!(
+    // send() enforcement matches addressability. This runtime has no session
+    // bridge, so no member exists to deliver to (#306: Core holds members);
+    // addressability is judged before delivery either way.
+    assert!(!matches!(
         runtime
             .send(&make_identity("public:main"), &make_content())
-            .await
-            .is_ok()
-    );
+            .await,
+        Err(IdentityRuntimeError::NotAddressable(_))
+    ));
     assert!(matches!(
         runtime
             .send(&make_identity("internal:main"), &make_content())
@@ -498,67 +272,24 @@ async fn identity_first_choke_06_addressability_to_delivery_enforcement() {
         Err(IdentityRuntimeError::NotAddressable(_))
     ));
 
-    // dispatch() works for both
-    assert!(
+    // dispatch() is not refused as not addressable for either
+    assert!(!matches!(
         runtime
             .dispatch(&make_identity("public:main"), &make_dispatch_input())
-            .await
-            .is_ok()
-    );
-    assert!(
+            .await,
+        Err(IdentityRuntimeError::NotAddressable(_))
+    ));
+    assert!(!matches!(
         runtime
             .dispatch(&make_identity("internal:main"), &make_dispatch_input())
-            .await
-            .is_ok()
-    );
+            .await,
+        Err(IdentityRuntimeError::NotAddressable(_))
+    ));
 }
 
 // ===========================================================================
 // CHOKE-07: AgentIdentity → AgentRuntimeId → MeerkatId mapping
 // ===========================================================================
-
-#[tokio::test]
-async fn identity_first_choke_07_identity_to_runtime_id_mapping() {
-    let store = Arc::new(LocalContinuityStore::in_memory().unwrap());
-    let lease_prov = Arc::new(LocalLeaseProvider::new());
-    let runtime = make_runtime(store.clone(), lease_prov.clone());
-
-    let roster = vec![make_spec("triage:main"), make_spec("worker:main")];
-    let result = restore_flow(&runtime, &roster, None, None).await.unwrap();
-
-    // Collect mappings from first boot
-    let mut mappings: BTreeMap<AgentIdentity, AgentRuntimeId> = BTreeMap::new();
-    for (id, outcome) in &result.outcomes {
-        if let RestoreOutcome::Created { record, .. } = outcome {
-            mappings.insert(id.clone(), record.agent_runtime_id.clone());
-        }
-    }
-
-    // Verify mapping is stable: status() returns the same AgentRuntimeId
-    for (id, expected_rid) in &mappings {
-        let status = runtime.status(id).await.unwrap();
-        assert_eq!(
-            status.agent_runtime_id.as_ref().unwrap(),
-            expected_rid,
-            "AgentRuntimeId mapping must be stable in status for {id}"
-        );
-    }
-
-    // Verify mapping persists in ContinuityStore
-    let identities: Vec<AgentIdentity> = roster.iter().map(|s| s.identity.clone()).collect();
-    let resolved = store.resolve_many(&identities).await.unwrap();
-    for (id, expected_rid) in &mappings {
-        match resolved.get(id).unwrap() {
-            ContinuityResolveState::Ready { record } => {
-                assert_eq!(
-                    &record.agent_runtime_id, expected_rid,
-                    "AgentRuntimeId in store must match runtime for {id}"
-                );
-            }
-            other => panic!("expected Ready for {id}, got: {other:?}"),
-        }
-    }
-}
 
 // ===========================================================================
 // CHOKE-08: Gateway wire format — newtypes as primitives
@@ -675,240 +406,17 @@ async fn identity_first_choke_09_durable_agent_spec_gateway_round_trip() {
 // CHOKE-10: Provider → gateway callback → Rust trait impl
 // ===========================================================================
 
-#[tokio::test]
-async fn identity_first_choke_10_provider_callback_round_trip() {
-    let mock = MockBridge::new();
-
-    // Simulate a provider returning mixed resolve states
-    let id_uninit = "uninit:main";
-    let id_ready = "ready:main";
-    let id_broken = "broken:main";
-
-    let ready_record = ContinuityRecord {
-        identity: make_identity(id_ready),
-        agent_runtime_id: AgentRuntimeId::parse("rt:ready:0").unwrap(),
-        session_id: meerkat_core::types::SessionId::new(),
-        generation: ContinuityGeneration::new(0),
-        checkpoint_version: CheckpointVersion::new(3),
-    };
-
-    let response = json!({
-        id_uninit: { "state": "uninitialized" },
-        id_ready: { "state": "ready", "record": serde_json::to_value(&ready_record).unwrap() },
-        id_broken: { "state": "broken", "failure": {
-            "identity": id_broken,
-            "kind": "snapshot_corrupted",
-            "record": null,
-            "detail": "data corruption detected"
-        }}
-    });
-
-    mock.set_response("callback/continuity_store/resolve_many", Ok(response))
-        .await;
-
-    let store = GatewayContinuityStore::new(mock);
-    let ids = vec![
-        make_identity(id_uninit),
-        make_identity(id_ready),
-        make_identity(id_broken),
-    ];
-    let result = store.resolve_many(&ids).await.unwrap();
-
-    assert_eq!(result.len(), 3);
-    assert!(matches!(
-        result.get(&make_identity(id_uninit)).unwrap(),
-        ContinuityResolveState::Uninitialized
-    ));
-    match result.get(&make_identity(id_ready)).unwrap() {
-        ContinuityResolveState::Ready { record } => {
-            assert_eq!(record.identity, make_identity(id_ready));
-            assert_eq!(record.checkpoint_version, CheckpointVersion::new(3));
-        }
-        other => panic!("expected Ready, got: {other:?}"),
-    }
-    match result.get(&make_identity(id_broken)).unwrap() {
-        ContinuityResolveState::Broken { failure } => {
-            assert_eq!(failure.kind, ContinuityFailureKind::SnapshotCorrupted);
-            assert_eq!(failure.detail, "data corruption detected");
-        }
-        other => panic!("expected Broken, got: {other:?}"),
-    }
-}
-
 // ===========================================================================
 // CHOKE-11: dispatch → runtime substrate → ack semantics
 // ===========================================================================
-
-#[tokio::test]
-async fn identity_first_choke_11_dispatch_ack_semantics() {
-    let store = Arc::new(LocalContinuityStore::in_memory().unwrap());
-    let lease = Arc::new(LocalLeaseProvider::new());
-
-    // Without runtime_store: ack = in-memory only
-    let runtime_no_store = IdentityRuntime::new(IdentityRuntimeConfig {
-        continuity_store: store.clone(),
-        lease_provider: lease.clone(),
-        runtime_instance_id: "no-store".to_string(),
-        has_runtime_store: false,
-        durability_policy: DurabilityPolicy::SyncWriteThrough,
-        bridge: None,
-        default_timeout: None,
-    });
-    runtime_no_store
-        .register(
-            make_spec("triage:main"),
-            IdentityLifecycleState::Active,
-            Some(make_record("triage:main", 0, 0)),
-            Some(make_grant("triage:main", 1)),
-        )
-        .await;
-
-    let (_, is_durable) = runtime_no_store
-        .dispatch(&make_identity("triage:main"), &make_dispatch_input())
-        .await
-        .unwrap();
-    assert!(
-        !is_durable,
-        "without runtime_store, dispatch ack must be in-memory"
-    );
-
-    // With runtime_store: ack = durable
-    let runtime_with_store = IdentityRuntime::new(IdentityRuntimeConfig {
-        continuity_store: store.clone(),
-        lease_provider: lease.clone(),
-        runtime_instance_id: "with-store".to_string(),
-        has_runtime_store: true,
-        durability_policy: DurabilityPolicy::SyncWriteThrough,
-        bridge: None,
-        default_timeout: None,
-    });
-    runtime_with_store
-        .register(
-            make_spec("worker:main"),
-            IdentityLifecycleState::Active,
-            Some(make_record("worker:main", 0, 0)),
-            Some(make_grant("worker:main", 2)),
-        )
-        .await;
-
-    let (_, is_durable) = runtime_with_store
-        .dispatch(&make_identity("worker:main"), &make_dispatch_input())
-        .await
-        .unwrap();
-    assert!(
-        is_durable,
-        "with runtime_store, dispatch ack must be durable"
-    );
-}
 
 // ===========================================================================
 // CHOKE-12: Active owner → fence/retire → destructive continuity mutation
 // ===========================================================================
 
-#[tokio::test]
-async fn identity_first_choke_12_fence_then_destroy_sequencing() {
-    let store = Arc::new(LocalContinuityStore::in_memory().unwrap());
-    let lease_prov = Arc::new(LocalLeaseProvider::new());
-    let runtime = make_runtime(store.clone(), lease_prov.clone());
-
-    let id = make_identity("triage:main");
-
-    // Acquire real lease
-    let grants = lease_prov
-        .acquire_leases(&[id.clone()], "choke-runtime")
-        .await
-        .unwrap();
-    let initial_grant = match grants.get(&id).unwrap() {
-        LeaseAcquireResult::Acquired(g) => g.clone(),
-        _ => panic!("expected Acquired"),
-    };
-
-    let record = make_record("triage:main", 0, 0);
-    store
-        .upsert_continuity_record(&record, initial_grant.fencing_token)
-        .await
-        .unwrap();
-
-    runtime
-        .register(
-            make_spec("triage:main"),
-            IdentityLifecycleState::Active,
-            Some(record.clone()),
-            Some(initial_grant.clone()),
-        )
-        .await;
-
-    // Reset fences the old owner first, then advances generation
-    let new_record = runtime.reset(&id).await.unwrap();
-    assert_eq!(new_record.generation, ContinuityGeneration::new(1));
-
-    // Old owner's late write with original token is rejected
-    let late_write = store
-        .save_session_snapshot(
-            &id,
-            &record.session_id,
-            record.generation,
-            CheckpointVersion::new(1),
-            initial_grant.fencing_token, // old token
-            &SessionSnapshot {
-                data: b"late".to_vec(),
-            },
-        )
-        .await;
-    assert!(
-        late_write.is_err(),
-        "late write from fenced owner must be rejected"
-    );
-}
-
 // ===========================================================================
 // CHOKE-13: Lease renewal → behavioral transition on loss
 // ===========================================================================
-
-#[tokio::test]
-async fn identity_first_choke_13_lease_loss_behavioral_transition() {
-    let store = Arc::new(LocalContinuityStore::in_memory().unwrap());
-    let lease = Arc::new(LocalLeaseProvider::new());
-    let runtime = make_runtime(store, lease);
-
-    let id = make_identity("triage:main");
-    runtime
-        .register(
-            make_spec("triage:main"),
-            IdentityLifecycleState::Active,
-            Some(make_record("triage:main", 0, 0)),
-            Some(make_grant("triage:main", 1)),
-        )
-        .await;
-
-    // Before loss: operations work
-    assert!(runtime.send(&id, &make_content()).await.is_ok());
-    assert!(runtime.dispatch(&id, &make_dispatch_input()).await.is_ok());
-
-    // Mark lease lost (simulates renewal returning Lost)
-    runtime.mark_lease_lost(&id).await.unwrap();
-
-    // After loss: operations rejected immediately
-    assert!(matches!(
-        runtime.send(&id, &make_content()).await,
-        Err(IdentityRuntimeError::InvalidState {
-            state: IdentityLifecycleState::Broken,
-            ..
-        })
-    ));
-    assert!(matches!(
-        runtime.dispatch(&id, &make_dispatch_input()).await,
-        Err(IdentityRuntimeError::InvalidState {
-            state: IdentityLifecycleState::Broken,
-            ..
-        })
-    ));
-
-    // Status reflects lost lease
-    let status = runtime.status(&id).await.unwrap();
-    assert!(status.lease.is_none(), "status should reflect lost lease");
-    assert_eq!(status.state, IdentityLifecycleState::Broken);
-}
 
 // ===========================================================================
 // CHOKE-14: IdentityStatus wire format across languages
@@ -925,14 +433,7 @@ async fn identity_first_choke_14_identity_status_wire_format() {
         .insert("env".to_string(), "production".to_string());
     spec.labels.insert("tier".to_string(), "1".to_string());
 
-    runtime
-        .register(
-            spec,
-            IdentityLifecycleState::Active,
-            Some(make_record("triage:main", 2, 10)),
-            Some(make_grant("triage:main", 5)),
-        )
-        .await;
+    runtime.register(spec).await;
 
     let status = runtime.status(&make_identity("triage:main")).await.unwrap();
 
@@ -941,106 +442,34 @@ async fn identity_first_choke_14_identity_status_wire_format() {
 
     // Verify all fields survive serialization
     assert_eq!(json["identity"].as_str().unwrap(), "triage:main");
-    assert_eq!(json["state"].as_str().unwrap(), "active");
+    // No session bridge, so Core holds no member: dormant (#306).
+    assert_eq!(json["state"].as_str().unwrap(), "dormant");
 
     // Labels as string map
     let labels = json["labels"].as_object().unwrap();
     assert_eq!(labels["env"].as_str().unwrap(), "production");
     assert_eq!(labels["tier"].as_str().unwrap(), "1");
 
-    // Generation and checkpoint as integers
-    assert!(json["generation"].is_number());
-    assert_eq!(json["generation"].as_u64().unwrap(), 2);
+    // The generation is Core's member generation: none without a member.
+    assert!(json["generation"].is_null());
 
-    // ContinuityHealth with structured DurabilityPolicy
-    let health = &json["continuity_health"];
-    assert!(health["store_reachable"].as_bool().unwrap());
-    let policy = &health["durability_policy"];
-    // SyncWriteThrough should serialize as a recognizable value
-    assert!(!policy.is_null(), "durability_policy must be present");
-
-    // Lease info with fencing token
-    let lease_info = &json["lease"];
-    assert!(!lease_info.is_null(), "lease info must be present");
-    assert_eq!(lease_info["fencing_token"].as_u64().unwrap(), 5);
+    // Meta's continuity facts left the wire with the continuity store (#306).
+    for removed in [
+        "checkpoint_version",
+        "lease",
+        "continuity_health",
+        "continuity_unrecoverable",
+    ] {
+        assert!(
+            json.get(removed).is_none(),
+            "{removed} must be gone: {json}"
+        );
+    }
 }
 
 // ===========================================================================
 // CHOKE-15: Destructive lifecycle ops over gateway bridge
 // ===========================================================================
-
-#[tokio::test]
-async fn identity_first_choke_15_destructive_ops_bridge() {
-    let store = Arc::new(LocalContinuityStore::in_memory().unwrap());
-    let lease_prov = Arc::new(LocalLeaseProvider::new());
-    let runtime = make_runtime(store.clone(), lease_prov.clone());
-
-    let id = make_identity("triage:main");
-
-    // Acquire lease and seed record
-    let grants = lease_prov
-        .acquire_leases(&[id.clone()], "choke-runtime")
-        .await
-        .unwrap();
-    let grant = match grants.get(&id).unwrap() {
-        LeaseAcquireResult::Acquired(g) => g.clone(),
-        _ => panic!("expected Acquired"),
-    };
-    let record = make_record("triage:main", 0, 0);
-    store
-        .upsert_continuity_record(&record, grant.fencing_token)
-        .await
-        .unwrap();
-
-    runtime
-        .register(
-            make_spec("triage:main"),
-            IdentityLifecycleState::Active,
-            Some(record),
-            Some(grant),
-        )
-        .await;
-
-    // Reset: verify result has advanced generation
-    let new_record = runtime.reset(&id).await.unwrap();
-    let reset_json = serde_json::to_value(&new_record).unwrap();
-    assert_eq!(
-        reset_json["generation"].as_u64().unwrap(),
-        1,
-        "reset must advance generation"
-    );
-
-    // Re-register for delete test
-    let grants2 = lease_prov
-        .acquire_leases(&[id.clone()], "choke-runtime")
-        .await
-        .unwrap();
-    let grant2 = match grants2.get(&id).unwrap() {
-        LeaseAcquireResult::Acquired(g) => g.clone(),
-        _ => panic!("expected Acquired"),
-    };
-    store
-        .upsert_continuity_record(&new_record, grant2.fencing_token)
-        .await
-        .unwrap();
-    runtime
-        .register(
-            make_spec("triage:main"),
-            IdentityLifecycleState::Active,
-            Some(new_record),
-            Some(grant2),
-        )
-        .await;
-
-    // Delete: verify identity removed
-    runtime.delete_identity(&id).await.unwrap();
-    assert!(!runtime.contains(&id).await);
-    let resolved = store.resolve_many(&[id.clone()]).await.unwrap();
-    assert!(matches!(
-        resolved.get(&id).unwrap(),
-        ContinuityResolveState::Uninitialized
-    ));
-}
 
 // ===========================================================================
 // CHOKE-16: ContinuityStore → SessionStore adapter → Meerkat SessionService
@@ -1070,7 +499,8 @@ async fn identity_first_choke_16_continuity_session_store_adapter() {
 async fn identity_first_choke_17_topology_to_customizer_context() {
     let store = Arc::new(LocalContinuityStore::in_memory().unwrap());
     let lease_prov = Arc::new(LocalLeaseProvider::new());
-    let runtime = make_runtime(store.clone(), lease_prov.clone());
+    // The customizer runs when Core builds a member, so the restore needs a bridge.
+    let runtime = make_runtime_with_core_bridge(store.clone(), lease_prov.clone());
 
     let seen_contexts = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
@@ -1153,14 +583,7 @@ async fn identity_first_choke_18_hot_update_registry_behavioral_change() {
     let runtime = make_runtime(store, lease);
 
     // Register as InternalOnly
-    runtime
-        .register(
-            make_internal_spec("agent:main"),
-            IdentityLifecycleState::Active,
-            Some(make_record("agent:main", 0, 0)),
-            Some(make_grant("agent:main", 1)),
-        )
-        .await;
+    runtime.register(make_internal_spec("agent:main")).await;
 
     let id = make_identity("agent:main");
 
@@ -1174,8 +597,12 @@ async fn identity_first_choke_18_hot_update_registry_behavioral_change() {
     let new_spec = make_spec("agent:main"); // Addressable
     runtime.update_spec(new_spec).await.unwrap();
 
-    // send() now works immediately, no restart needed
-    assert!(runtime.send(&id, &make_content()).await.is_ok());
+    // send() is no longer refused as not addressable, no restart needed
+    // (this runtime has no session bridge, so no member exists to deliver to)
+    assert!(!matches!(
+        runtime.send(&id, &make_content()).await,
+        Err(IdentityRuntimeError::NotAddressable(_))
+    ));
 
     // Hot-update: labels change visible in status()
     let mut labeled_spec = make_spec("agent:main");

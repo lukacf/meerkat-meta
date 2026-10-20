@@ -6,6 +6,11 @@ shipped in MobKit 0.8.19 on meerkat 0.8.25. This is the design doc the
 authorities had been an accident of chronology, ratified only diffusely in
 code comments. This document is the recorded decision.
 
+**Since Meta 0.9.4** Core's mob machine holds an identity's session,
+generation and fence, and Meta keeps no continuity records or leases of its
+own. The split between the two planes below is unchanged; where this record
+names Meta's 0.9.3 identity substrate, read Core's member history instead.
+
 ## The two authorities
 
 Meta has two member-lifecycle authorities. "Identity-first vs
@@ -20,13 +25,13 @@ storage limits of the underlying mob/session substrate.
 |---|---|---|
 | Owner | mob-actor roster (`MobHandle`) | `IdentityRuntime` |
 | Key | member `AgentIdentity`/member identifier (a Meta-generated incarnation alias where applicable), not the per-runtime `AgentRuntimeId` | stable application `AgentIdentity` |
-| Durability | ephemeral-worker usage policy | continuity records, lease-fenced embodiment, resume-first restore |
-| Disposal | strict archive invariants (ask-20 class) | tolerant session-owned cleanup + Broken-identity repair task |
+| Durability | ephemeral-worker usage policy | Core-held session and generation per identity, resume-first restore |
+| Disposal | strict archive invariants (ask-20 class) | tolerant session-owned cleanup; a refused wake is answered typed |
 | Stand-up | `spawn`/`ensure_member` (`SpawnMemberSpec`) | roster reconcile (`restore_flow`) |
 
 Mob/session storage and member launch modes support persistence and resume;
 this does not mean every worker is automatically resumed. Identity-plane
-continuity, leases, and roster reconciliation remain the prescribed abstraction
+continuity and roster reconciliation remain the prescribed abstraction
 for durable populations under D1.
 
 History (verified): the mob plane predates identity-first (`ensure_member`
@@ -67,7 +72,7 @@ Consequences:
 Deployment census at decision time (audit-verified):
 
 - **The operator deployment** (production, 100+ users): dual-plane already — eternal fleet
-  identity-first via the builder (roster + BigQuery continuity store +
+  identity-first via the builder (roster + BigQuery-backed continuity and
   leases, LazyMaterialize); ALL worker churn on the mob plane (programmatic
   `spawn_worker_with_parent` + agent `mob_spawn_member`, idle-retire reaping).
   This doctrine formalizes the operator deployment's model; the operator deployment migrates nothing.
@@ -89,7 +94,7 @@ identity substrate, `meta_gateway` got none. The drift class is caused by
 divergent **construction**, not by binary count.
 
 **Decided:** extract one shared runtime-construction path — identity
-substrate always built (continuity store, lease provider, identity runtime;
+substrate always built (the identity runtime and the stores it reads;
 the roster may be empty) — and have both binaries call it. The actual binary
 merge is a later packaging step (target: 0.8), because the two binaries have
 deliberately different stdin contracts (`rpc_gateway`: stdin JSON-RPC loop;

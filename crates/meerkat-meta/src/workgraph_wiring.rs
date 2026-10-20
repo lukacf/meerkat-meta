@@ -2947,16 +2947,17 @@ comms = true
     /// must place the admission sidecar beside the store and register the
     /// tool-plane slot; ephemeral (memory-backed, single-process) specs must
     /// register the slot but NOT the sidecar.
-    #[test]
-    fn spec_constructors_configure_the_admission_sidecar_per_store_kind() {
+    #[tokio::test]
+    async fn spec_constructors_configure_the_admission_sidecar_per_store_kind() {
         let dir = tempfile::tempdir().expect("temp dir");
         let spec = crate::MobBootstrapSpec::persistent(
             admission_definition(&unique_admission_mob_id()),
             meerkat_mob::MobStorage::in_memory(),
+            crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
             dir.path().to_path_buf(),
             8,
-            Arc::new(meerkat_store::MemoryStore::new()),
         )
+        .await
         .expect("persistent spec");
         assert_eq!(
             spec.workgraph_admission_sidecar,

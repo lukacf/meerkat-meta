@@ -27,10 +27,9 @@
 //! stdin-JSONL host protocol (the same idiom as
 //! `gateway_concurrent_dispatch.rs` and `storage_layout_boot.rs`). The test
 //! process is the SDK host: it answers `callback/roster_provider/roster` and
-//! nothing else, so the gateway opens its OWN continuity substrate in the
-//! state dir and installs `ContinuitySessionStoreAdapter` as meerkat's
-//! session store — the shipped identity-first composition, not a builder arm
-//! assembled by the test.
+//! nothing else, so the gateway composes its own stores in the state dir:
+//! Core's session and runtime stores, both on `runtime.sqlite` - the shipped
+//! identity-first composition, not a builder arm assembled by the test.
 //!
 //! The LLM is `runtime_options.demo_llm` (meerkat's `TestClient`): no network,
 //! no API key, deterministic single-turn replies.
@@ -42,28 +41,19 @@
 //!
 //! # What is asserted
 //!
-//! Only DURABLE state, read back out of `continuity.sqlite3` with plain
-//! SQL after the child has exited — never an in-process handle:
+//! Only DURABLE state, read back out of Core's session store on
+//! `runtime.sqlite`, never an in-process handle:
 //!
-//! - exactly ONE `continuity_session_heads` row survives each reboot, and its
-//!   session id never changes (session rotation is a failure, not a recovery),
-//! - the head's strand rows form a complete, gap-free `0..message_count`
-//!   prefix (the store's own read contract, `strand_messages_in_txn(.., 0..
-//!   head.message_count)`),
+//! - the identity's session never changes across reboots (session rotation is
+//!   a failure, not a recovery),
 //! - the transcript a reboot inherits is EXACTLY the transcript the previous
-//!   process left (element-wise JSON equality, same order, same length —
+//!   process left (element-wise JSON equality, same order, same length -
 //!   restore may not mutate the durable transcript),
 //! - each turn EXTENDS that transcript: the previous messages stay an exact
 //!   prefix and every earlier boot's marker token is still present,
-//! - the identity is `active` with a reachable continuity store, and the
+//! - the identity is `active` with no recorded wake refusal, and the
 //!   gateway's shutdown handshake attests completed runtime cleanup (a wedged
 //!   runtime reports `shutdown: false`).
-//!
-//! The second test additionally reproduces the field shape the same-process
-//! sibling documents as its own blind spot — a runtime snapshot pinned behind
-//! the durable head — but ACROSS a process boundary and with the decode memo
-//! off, which is where the committed-head read path must carry recovery
-//! entirely on its own.
 
 #![allow(
     clippy::expect_used,
@@ -268,6 +258,19 @@ impl Gateway {
     /// Send one request and return its response, answering host callbacks
     /// while waiting. Panics with the child's stderr tail on timeout.
     fn call(&mut self, id: &str, method: &str, params: Value, deadline: Duration) -> Value {
+        let response = self.request(id, method, params, deadline);
+        assert!(
+            response.get("error").is_none(),
+            "[{}] {method} failed: {response}\n{}",
+            self.label,
+            self.stderr_tail()
+        );
+        response
+    }
+
+    /// [`Self::call`] for a request that may be refused: the response is
+    /// returned as it came, error or result.
+    fn request(&mut self, id: &str, method: &str, params: Value, deadline: Duration) -> Value {
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -277,23 +280,14 @@ impl Gateway {
         let matched = self.wait_for(deadline, answer_host_callback, |message| {
             is_response_with_id(message, id)
         });
-        match matched {
-            Some(response) => {
-                assert!(
-                    response.get("error").is_none(),
-                    "[{}] {method} failed: {response}\n{}",
-                    self.label,
-                    self.stderr_tail()
-                );
-                response
-            }
-            None => panic!(
+        matched.unwrap_or_else(|| {
+            panic!(
                 "[{}] no response to {method} within {:?}\n{}",
                 self.label,
                 deadline,
                 self.stderr_tail()
-            ),
-        }
+            )
+        })
     }
 
     /// The SDK shutdown handshake, then EOF, then reaping. The result is the
@@ -441,6 +435,25 @@ fn send_turn(gateway: &mut Gateway, prompt: &str) {
     );
 }
 
+/// The session `meta/status_identity` names for the identity.
+fn bound_session(gateway: &mut Gateway) -> String {
+    let response = gateway.call(
+        "status",
+        "meta/status_identity",
+        json!({ "identity": IDENTITY }),
+        RPC_TIMEOUT,
+    );
+    response["result"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "[{}] the identity has no session: {response}",
+                gateway.label
+            )
+        })
+        .to_string()
+}
+
 /// Assert the restored identity is healthy and bound to `session_id`.
 fn assert_identity_bound(gateway: &mut Gateway, session_id: &str) {
     let response = gateway.call(
@@ -462,10 +475,9 @@ fn assert_identity_bound(gateway: &mut Gateway, session_id: &str) {
         "[{}] restore rebound the identity to a different session: {response}",
         gateway.label
     );
-    assert_eq!(
-        result["continuity_health"]["store_reachable"],
-        json!(true),
-        "[{}] continuity store unreachable after restore: {response}",
+    assert!(
+        result["wake_refusal"].is_null(),
+        "[{}] restore recorded a wake refusal: {response}",
         gateway.label
     );
 }
@@ -474,59 +486,11 @@ fn assert_identity_bound(gateway: &mut Gateway, session_id: &str) {
 // Durable state (read from disk, never from a handle)
 // ---------------------------------------------------------------------------
 
-fn continuity_db(state: &Path) -> PathBuf {
-    MetaStorageLayout::with_injected_roots(state.to_path_buf(), None)
-        .continuity_db()
-        .expect("resolve the continuity db path")
-        .path
-}
-
 /// The layout-authoritative runtime store path, derived rather than
 /// hardcoded so a layout rename cannot turn the snapshot harness into a
 /// silent no-op.
 fn runtime_db(state: &Path) -> PathBuf {
     MetaStorageLayout::with_injected_roots(state.to_path_buf(), None).runtime_db()
-}
-
-/// Open the durable file the way a reader must: an ordinary read/write path.
-/// `?immutable=1` ignores the `-wal` sidecar and manufactures a 0-byte file at
-/// a missing path, which is exactly how a probe lies about durability.
-fn open_durable(db: &Path) -> rusqlite::Connection {
-    let conn = rusqlite::Connection::open(db).expect("open durable sqlite file");
-    conn.busy_timeout(Duration::from_secs(10))
-        .expect("set busy timeout");
-    conn
-}
-
-fn table_exists(conn: &rusqlite::Connection, table: &str) -> bool {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-        rusqlite::params![table],
-        |row| row.get::<_, i64>(0),
-    )
-    .unwrap_or(0)
-        == 1
-}
-
-/// `(session_id, message_count)` for every durable head. Cheap enough to poll
-/// while the child process is still writing.
-fn head_summaries(db: &Path) -> Vec<(String, i64)> {
-    if !db.exists() {
-        return Vec::new();
-    }
-    let conn = open_durable(db);
-    if !table_exists(&conn, "continuity_session_heads") {
-        return Vec::new();
-    }
-    let mut stmt = conn
-        .prepare("SELECT session_id, message_count FROM continuity_session_heads ORDER BY 1")
-        .expect("prepare head summary");
-    stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })
-    .expect("query head summaries")
-    .collect::<Result<Vec<_>, _>>()
-    .expect("collect head summaries")
 }
 
 /// The durable transcript, reconstructed exactly the way the store's own
@@ -551,148 +515,58 @@ impl DurableTranscript {
     }
 }
 
-/// Read the durable transcript, failing loudly on every shape that would make
-/// a downstream assertion vacuous.
-fn read_durable_transcript(state: &Path, phase: &str) -> DurableTranscript {
-    let db = continuity_db(state);
-    assert!(
-        db.exists(),
-        "PRECONDITION FAILED ({phase}): {} does not exist — no gateway process ever opened the \
-         continuity substrate. State dir: {:?}",
-        db.display(),
-        state_dir_listing(state)
-    );
-    let conn = open_durable(&db);
-    assert!(
-        table_exists(&conn, "continuity_session_heads"),
-        "PRECONDITION FAILED ({phase}): {} has no continuity_session_heads table — session I/O \
-         is MIS-WIRED (it never rode the continuity adapter), so nothing asserted after this \
-         point is meaningful. State dir: {:?}",
-        db.display(),
-        state_dir_listing(state)
-    );
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT session_id, message_count, head_json FROM continuity_session_heads ORDER BY 1",
-        )
-        .expect("prepare head read");
-    let heads = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        })
-        .expect("query heads")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect heads");
-
-    assert!(
-        !heads.is_empty(),
-        "PRECONDITION FAILED ({phase}): {} holds NO durable session head. Session I/O is \
-         MIS-WIRED. State dir: {:?}",
-        db.display(),
-        state_dir_listing(state)
-    );
-    assert_eq!(
-        heads.len(),
-        1,
-        "({phase}) exactly one head-canonical document must exist; found {}: {:?}",
-        heads.len(),
-        heads
-            .iter()
-            .map(|(id, count, _)| (id.clone(), *count))
-            .collect::<Vec<_>>()
-    );
-
-    let (session_id, message_count, head_json) = heads.into_iter().next().expect("one head");
-    let head: Value = serde_json::from_slice(&head_json).expect("decode head_json");
-    let strand = head["strand"]
-        .as_str()
-        .unwrap_or_else(|| panic!("({phase}) head document names no strand: {head}"))
-        .to_string();
-    let head_count = head["message_count"]
-        .as_i64()
-        .unwrap_or_else(|| panic!("({phase}) head document has no message_count: {head}"));
-    assert_eq!(
-        head_count, message_count,
-        "({phase}) the head row's indexed message_count disagrees with the head document"
-    );
-
-    let mut strand_stmt = conn
-        .prepare(
-            "SELECT seq, message_json FROM continuity_strand_messages \
-             WHERE session_id = ?1 AND strand = ?2 AND seq >= 0 AND seq < ?3 ORDER BY seq ASC",
-        )
-        .expect("prepare strand read");
-    let strand_rows = strand_stmt
-        .query_map(
-            rusqlite::params![session_id.as_str(), strand.as_str(), message_count],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .expect("query strand rows")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect strand rows");
-
-    let observed_seqs = strand_rows.iter().map(|(seq, _)| *seq).collect::<Vec<_>>();
-    let expected_seqs = (0..message_count).collect::<Vec<_>>();
-    assert_eq!(
-        observed_seqs, expected_seqs,
-        "({phase}) session {session_id} strand {strand} does not cover a gap-free 0..\
-         {message_count} prefix — the head claims messages its strand rows cannot serve"
-    );
-
-    let messages = strand_rows
-        .into_iter()
-        .map(|(seq, bytes)| {
-            serde_json::from_slice::<Value>(&bytes)
-                .unwrap_or_else(|e| panic!("({phase}) strand row seq {seq} is not valid JSON: {e}"))
-        })
+/// Read `session_id`'s durable transcript from Core's session store (it shares
+/// `runtime.sqlite` with the runtime store), failing loudly when Core holds no
+/// such session.
+fn read_durable_transcript(state: &Path, session_id: &str, phase: &str) -> DurableTranscript {
+    use meerkat::SessionStore as _;
+    use meerkat_core::session_store::IncrementalSessionStore as _;
+    let store = meerkat_store::SqliteSessionStore::open(runtime_db(state))
+        .unwrap_or_else(|error| panic!("({phase}) open Core's session store: {error}"));
+    let id = meerkat_core::types::SessionId::parse(session_id).expect("a session id");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the store read");
+    let (session, head) = runtime.block_on(async {
+        let session = store
+            .load(&id)
+            .await
+            .unwrap_or_else(|error| panic!("({phase}) read session {session_id}: {error}"));
+        let head = store
+            .load_canonical_head(&id)
+            .await
+            .unwrap_or_else(|error| panic!("({phase}) read the head of {session_id}: {error}"));
+        (session, head)
+    });
+    let session = session
+        .unwrap_or_else(|| panic!("({phase}) Core's session store holds no session {session_id}"));
+    let messages = session
+        .messages()
+        .iter()
+        .map(|message| serde_json::to_value(message).expect("a durable message encodes"))
         .collect::<Vec<_>>();
-
     DurableTranscript {
-        session_id,
-        strand,
-        message_count,
+        session_id: session_id.to_string(),
+        strand: head.map(|head| head.strand.to_string()).unwrap_or_default(),
+        message_count: i64::try_from(messages.len()).expect("a message count"),
         messages,
     }
 }
 
-fn state_dir_listing(state: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(state)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .map(|entry| {
-                    let len = entry.metadata().map(|m| m.len()).unwrap_or_default();
-                    format!("{}({len}B)", entry.file_name().to_string_lossy())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    names
-}
-
-/// Turn-boundary barrier: block until the durable head reaches `floor`
-/// messages. The head row is written by the same boundary save that persists
-/// the strand rows, so once the count moves, that turn is durable.
-fn wait_for_durable_messages(state: &Path, floor: i64, what: &str) {
-    let db = continuity_db(state);
+/// Turn-boundary barrier: block until Core's durable session reaches `floor`
+/// messages, so that turn is durable.
+fn wait_for_durable_messages(state: &Path, session_id: &str, floor: i64, what: &str) {
     let start = Instant::now();
     loop {
-        let heads = head_summaries(&db);
-        if let [(_, count)] = heads.as_slice()
-            && *count >= floor
-        {
+        let count = read_durable_transcript(state, session_id, what).message_count;
+        if count >= floor {
             return;
         }
         assert!(
             start.elapsed() < TURN_TIMEOUT,
-            "timed out waiting for {what}: want one durable head with >= {floor} messages, \
-             observed {heads:?}"
+            "timed out waiting for {what}: want >= {floor} durable messages in {session_id}, \
+             observed {count}"
         );
         thread::sleep(Duration::from_millis(150));
     }
@@ -733,7 +607,7 @@ fn assert_exact_prefix(previous: &DurableTranscript, current: &DurableTranscript
 /// and the identity binding must survive on the strength of the bytes on disk
 /// alone.
 #[test]
-fn head_canonical_document_survives_real_process_restarts() {
+fn core_session_survives_real_process_restarts() {
     // `(label, disable the decode memo in this child)`. Boot 2 — the first
     // resume, and the one that must decode a transcript it did not write —
     // runs with the memo off. Boot 3 runs with it on, so the shipped
@@ -768,7 +642,8 @@ fn head_canonical_document_survives_real_process_restarts() {
         // Pre-turn: what this cold process INHERITED must be exactly what the
         // previous process left behind.
         if let Some(before) = previous.as_ref() {
-            let inherited = read_durable_transcript(&state, &format!("{label} pre-turn"));
+            let inherited =
+                read_durable_transcript(&state, &before.session_id, &format!("{label} pre-turn"));
             assert_eq!(
                 inherited.message_count, before.message_count,
                 "({label}) restore mutated the durable transcript length before any turn: \
@@ -791,11 +666,15 @@ fn head_canonical_document_survives_real_process_restarts() {
             &mut gateway,
             &format!("Please note this token: {}", tokens[index]),
         );
-        wait_for_durable_messages(&state, floor, &format!("{label}'s turn"));
+        let session_id = match previous.as_ref() {
+            Some(before) => before.session_id.clone(),
+            None => bound_session(&mut gateway),
+        };
+        wait_for_durable_messages(&state, &session_id, floor, &format!("{label}'s turn"));
         gateway.shutdown_and_reap();
 
         // Post-exit: read the durable file with the writer gone.
-        let after = read_durable_transcript(&state, &format!("{label} post-turn"));
+        let after = read_durable_transcript(&state, &session_id, &format!("{label} post-turn"));
         eprintln!(
             "PROBE {label}: session={} strand={} messages={}",
             after.session_id, after.strand, after.message_count
@@ -828,251 +707,11 @@ fn head_canonical_document_survives_real_process_restarts() {
         BOOTS.len(),
         final_transcript.message_count
     );
-
-    // One identity, one continuity record, naming the surviving session.
-    let conn = open_durable(&continuity_db(&state));
-    let records = {
-        let mut stmt = conn
-            .prepare("SELECT identity, session_id FROM continuity_records ORDER BY 1")
-            .expect("prepare continuity records");
-        stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .expect("query continuity records")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect continuity records")
-    };
-    assert_eq!(
-        records,
-        vec![(IDENTITY.to_string(), final_transcript.session_id)],
-        "the identity binding must survive every restart pointing at the same session"
-    );
-}
-
-/// The same-process sibling documents its own blind spot: after a clean
-/// shutdown the persistent runtime snapshot is as fresh as the durable head,
-/// so resume never has to consult `continuity_session_heads`.
-///
-/// This test manufactures the advisory's field shape — a runtime snapshot
-/// pinned behind the committed head — and then reboots into it AS A NEW
-/// PROCESS with the decode memo disabled. Recovery must be carried entirely
-/// by the committed continuity head, read from bytes, with no in-process
-/// residue of the producer that wrote them.
-#[test]
-fn cold_process_with_a_stale_runtime_snapshot_resumes_from_the_committed_head() {
-    const TOKEN_A: &str = "MARKER-STALE-COLD-1-DELTA";
-    const TOKEN_B: &str = "MARKER-STALE-COLD-2-ECHO";
-    const TOKEN_C: &str = "MARKER-STALE-COLD-3-FOXTROT";
-
-    let temp = tempfile::TempDir::new().expect("temp dir");
-    let state = temp.path().join("state");
-    let stash = temp.path().join("runtime-snapshot-after-boot-1");
-    std::fs::create_dir_all(&state).expect("create state dir");
-
-    // --- Boot 1: seed the transcript, then stash the runtime snapshot ------
-    let mut gateway = boot("stale/boot-1", &state, false);
-    send_turn(&mut gateway, &format!("Please note this token: {TOKEN_A}"));
-    wait_for_durable_messages(&state, MESSAGES_PER_TURN, "stale/boot-1's turn");
-    gateway.shutdown_and_reap();
-    let after_boot_1 = read_durable_transcript(&state, "stale/boot-1");
-    save_runtime_store(&state, &stash);
-
-    // --- Boot 2: advance the durable head past the stashed snapshot --------
-    let mut gateway = boot("stale/boot-2", &state, false);
-    assert_identity_bound(&mut gateway, &after_boot_1.session_id);
-    send_turn(&mut gateway, &format!("Second token: {TOKEN_B}"));
-    wait_for_durable_messages(
-        &state,
-        after_boot_1.message_count + MESSAGES_PER_TURN,
-        "stale/boot-2's turn",
-    );
-    gateway.shutdown_and_reap();
-    let after_boot_2 = read_durable_transcript(&state, "stale/boot-2");
-    assert_exact_prefix(&after_boot_1, &after_boot_2, "stale/boot-2");
-    assert!(
-        after_boot_2.message_count > after_boot_1.message_count,
-        "boot 2 must advance the durable head past the stashed runtime snapshot ({} -> {})",
-        after_boot_1.message_count,
-        after_boot_2.message_count
-    );
-
-    // --- Arm the divergence: runtime snapshot back at the boot-1 state -----
-    //
-    // POSITIVE proof the divergence is armed, not assumed: a renamed or
-    // relocated runtime store would make save/restore silent no-ops, and boot
-    // 3 would then resume from a perfectly fresh snapshot while every
-    // assertion below passed vacuously.
-    let fresh_runtime_messages = runtime_snapshot_message_count(&state, &after_boot_2.session_id)
-        .expect("boot 2's clean shutdown must leave a runtime snapshot for the session");
-    restore_runtime_store(&state, &stash);
-    let stale_runtime_messages = runtime_snapshot_message_count(&state, &after_boot_2.session_id)
-        .expect("the restored runtime store must hold the boot-1 snapshot for the session");
-    assert!(
-        stale_runtime_messages < fresh_runtime_messages,
-        "divergence NOT armed: the rollback left the runtime snapshot at \
-         {stale_runtime_messages} messages, not behind the boot-2 snapshot it replaced \
-         ({fresh_runtime_messages}); the restore replaced nothing"
-    );
-    assert!(
-        stale_runtime_messages < after_boot_2.message_count,
-        "divergence NOT armed: the restored runtime snapshot ({stale_runtime_messages} messages) \
-         is not behind the committed continuity head ({})",
-        after_boot_2.message_count
-    );
-    eprintln!(
-        "PROBE divergence armed: runtime snapshot rolled back to {stale_runtime_messages} \
-         messages (boot-2 snapshot held {fresh_runtime_messages}), committed head at {} messages",
-        after_boot_2.message_count
-    );
-    // The durable head is untouched by the runtime-store swap.
-    let before_boot_3 = read_durable_transcript(&state, "stale/pre-boot-3");
-    assert_exact_prefix(&after_boot_2, &before_boot_3, "stale/pre-boot-3");
-    assert_eq!(
-        before_boot_3.message_count, after_boot_2.message_count,
-        "swapping the runtime store must not change the committed continuity head"
-    );
-
-    // --- Boot 3: cold process, memo off, stale runtime snapshot ------------
-    let mut gateway = boot("stale/boot-3/memo-off", &state, true);
-    assert_identity_bound(&mut gateway, &after_boot_2.session_id);
-    let inherited = read_durable_transcript(&state, "stale/boot-3 pre-turn");
-    assert_exact_prefix(&after_boot_2, &inherited, "stale/boot-3 pre-turn");
-    assert_eq!(
-        inherited.message_count, after_boot_2.message_count,
-        "restore from a stale runtime snapshot must not rewind or mutate the committed head"
-    );
-
-    send_turn(&mut gateway, &format!("Third token: {TOKEN_C}"));
-    wait_for_durable_messages(
-        &state,
-        after_boot_2.message_count + MESSAGES_PER_TURN,
-        "stale/boot-3's turn (a reader that preferred the stale runtime snapshot would have its \
-         save refused here)",
-    );
-    gateway.shutdown_and_reap();
-
-    let after_boot_3 = read_durable_transcript(&state, "stale/boot-3");
-    assert_exact_prefix(&after_boot_2, &after_boot_3, "stale/boot-3");
-    assert!(
-        after_boot_3.message_count >= after_boot_2.message_count + MESSAGES_PER_TURN,
-        "the turn served from the committed head must extend it ({} -> {})",
-        after_boot_2.message_count,
-        after_boot_3.message_count
-    );
-    let joined = after_boot_3.joined_json();
-    for token in [TOKEN_A, TOKEN_B, TOKEN_C] {
-        assert!(
-            joined.contains(token),
-            "the recovered transcript lost marker {token}; durable messages: {}",
-            after_boot_3.message_count
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Runtime-store snapshot harness (second test)
 // ---------------------------------------------------------------------------
-
-/// Every file the persistent runtime store owns right now.
-fn runtime_store_files(state: &Path) -> Vec<PathBuf> {
-    let db = runtime_db(state);
-    ["", "-wal", "-shm", "-journal"]
-        .iter()
-        .map(|suffix| PathBuf::from(format!("{}{suffix}", db.display())))
-        .filter(|path| path.exists())
-        .collect()
-}
-
-/// Copy the runtime store aside. Fails loudly when there is nothing to copy:
-/// a silent no-op would leave the divergence assertions vacuously green.
-fn save_runtime_store(state: &Path, into: &Path) {
-    let files = runtime_store_files(state);
-    assert!(
-        !files.is_empty(),
-        "no runtime store files exist at {} — the snapshot harness is watching the wrong \
-         location and the manufactured divergence would never arm. State dir: {:?}",
-        runtime_db(state).display(),
-        state_dir_listing(state)
-    );
-    std::fs::create_dir_all(into).expect("create snapshot dir");
-    for path in files {
-        let name = path.file_name().expect("runtime store file name");
-        std::fs::copy(&path, into.join(name)).expect("copy runtime store file");
-    }
-}
-
-/// Put the stashed runtime store back, replacing whatever is there now.
-fn restore_runtime_store(state: &Path, from: &Path) {
-    for path in runtime_store_files(state) {
-        std::fs::remove_file(&path).expect("clear current runtime store file");
-    }
-    let store_dir = runtime_db(state)
-        .parent()
-        .expect("runtime db has a parent directory")
-        .to_path_buf();
-    let mut restored = 0_usize;
-    for entry in std::fs::read_dir(from).expect("read snapshot dir") {
-        let entry = entry.expect("snapshot entry");
-        std::fs::copy(entry.path(), store_dir.join(entry.file_name()))
-            .expect("restore runtime store file");
-        restored += 1;
-    }
-    assert!(
-        restored > 0,
-        "runtime store stash at {} was empty — nothing was restored, the divergence was never \
-         armed",
-        from.display()
-    );
-}
-
-/// Message count of the runtime store's persisted snapshot for `session_id`,
-/// parsed from the persisted envelope (`{id, messages, ...}` — plain UTF-8
-/// JSON per the store's `JsonColumnBytes` contract).
-fn runtime_snapshot_message_count(state: &Path, session_id: &str) -> Option<i64> {
-    let db = runtime_db(state);
-    assert!(
-        db.exists(),
-        "runtime store {} does not exist — cannot verify the manufactured divergence",
-        db.display()
-    );
-    let conn = open_durable(&db);
-    // meerkat 0.8.11: whole-blob boundary commits land in the
-    // runtime_whole_blob_authority + runtime_whole_blob_bodies pair; the
-    // runtime_session_snapshots table is the pre-0.8.11 legacy
-    // representation and current commits never write it.
-    assert!(
-        table_exists(&conn, "runtime_whole_blob_authority"),
-        "runtime store {} has no runtime_whole_blob_authority table — the divergence probe \
-         is reading the wrong store",
-        db.display()
-    );
-    let mut stmt = conn
-        .prepare(
-            "SELECT bodies.session_snapshot \
-             FROM runtime_whole_blob_authority AS authority \
-             JOIN runtime_whole_blob_bodies AS bodies \
-               ON bodies.blob_sha256 = authority.blob_sha256",
-        )
-        .expect("prepare runtime snapshots");
-    let blobs = stmt
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))
-        .expect("query runtime snapshots")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect runtime snapshots");
-    for blob in blobs {
-        let value: serde_json::Value =
-            serde_json::from_slice(&blob).expect("parse persisted session envelope");
-        if value.get("id").and_then(serde_json::Value::as_str) == Some(session_id) {
-            let count = value
-                .get("messages")
-                .and_then(serde_json::Value::as_array)
-                .map(Vec::len)
-                .expect("persisted session envelope has a messages array");
-            return Some(i64::try_from(count).expect("message count fits"));
-        }
-    }
-    None
-}
 
 /// Wait for a stderr line: the reader thread pumps asynchronously, so a bare
 /// read races the boot that produced the line.
@@ -1296,4 +935,342 @@ fn the_roster_callback_receives_the_mob_definition_and_previous_identities() {
     );
 
     gateway.shutdown_and_reap();
+}
+
+// ---------------------------------------------------------------------------
+// First boot of a migrated state directory
+// ---------------------------------------------------------------------------
+
+/// Remove Core's mob store from `state`, with its sidecars: the shape of a
+/// directory `storage-migrate-native` converted, whose mob journal 0.9.3
+/// kept in memory. Core's session store keeps every session; no member
+/// binding names one.
+fn remove_mob_store(state: &Path) {
+    let mob_store = MetaStorageLayout::with_injected_roots(state.to_path_buf(), None)
+        .event_log_db()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the mob store has a file name")
+        .to_string();
+    let mut removed = 0;
+    for entry in std::fs::read_dir(state).expect("read the state directory") {
+        let entry = entry.expect("a state entry");
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&mob_store))
+        {
+            std::fs::remove_file(entry.path()).expect("remove the mob store");
+            removed += 1;
+        }
+    }
+    assert!(
+        removed > 0,
+        "the persistent launch kept no mob store in {}",
+        state.display()
+    );
+}
+
+/// A gateway-shaped state directory `storage-migrate-native` converted: the
+/// identity's session is in Core's session store, Core's mob holds no
+/// binding of it, and the first-boot manifest's `Resume` row names that
+/// session. The stdin gateway's first roster compile carries the row out:
+/// the identity resumes the session, keeps its transcript, and the manifest
+/// is removed. A gateway that never reads the manifest wakes the identity
+/// fresh on a new session, and the migrated transcript stays unbound.
+#[test]
+fn the_stdin_gateway_carries_out_a_migrated_state_dirs_first_boot_resume_row() {
+    const TOKEN: &str = "MARKER-FIRST-BOOT-RESUME-DELTA";
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&state).expect("create state dir");
+
+    let mut gateway = boot("first-boot/written", &state, false);
+    send_turn(&mut gateway, &format!("Please note this token: {TOKEN}"));
+    let session_id = bound_session(&mut gateway);
+    wait_for_durable_messages(&state, &session_id, MESSAGES_PER_TURN, "the migrated turn");
+    gateway.shutdown_and_reap();
+
+    remove_mob_store(&state);
+    meerkat_meta::identity_first::FirstBootManifest::write_new(
+        &state,
+        vec![meerkat_meta::identity_first::FirstBootRow::Resume {
+            identity: meerkat_meta::identity_first::AgentIdentity::parse(IDENTITY)
+                .expect("the identity parses"),
+            session: meerkat_core::types::SessionId::parse(&session_id)
+                .expect("the session id parses"),
+        }],
+    )
+    .expect("storage-migrate-native writes the first-boot manifest");
+
+    let mut gateway = boot("first-boot/carried-out", &state, false);
+    assert_identity_bound(&mut gateway, &session_id);
+    assert!(
+        !meerkat_meta::identity_first::FirstBootManifest::path(&state).exists(),
+        "the manifest is removed once its last row is carried out"
+    );
+    let migrated = read_durable_transcript(&state, &session_id, "first-boot resume");
+    assert!(
+        migrated.joined_json().contains(TOKEN),
+        "the resumed session keeps its migrated transcript"
+    );
+    send_turn(&mut gateway, "Which token did I give you?");
+    wait_for_durable_messages(
+        &state,
+        &session_id,
+        migrated.message_count + MESSAGES_PER_TURN,
+        "the first turn after the carry-out",
+    );
+    gateway.shutdown_and_reap();
+}
+
+/// A first-boot manifest the gateway cannot read may hold a row for any
+/// identity, so every identity is refused typed until it reads. That holds
+/// for an identity whose Core member survived the restart too: its delivery
+/// would otherwise land on the session the unread row may retire. The
+/// gateway stays up and its bootstrap status names the file.
+#[test]
+fn the_stdin_gateway_refuses_every_identity_while_its_first_boot_manifest_is_unreadable() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&state).expect("create state dir");
+
+    let mut gateway = boot("unreadable/written", &state, false);
+    bound_session(&mut gateway);
+    gateway.shutdown_and_reap();
+
+    let manifest = meerkat_meta::identity_first::FirstBootManifest::path(&state);
+    std::fs::write(
+        &manifest,
+        br#"{"format":"meerkat-meta.first-boot-manifest","version":2,"rows_sha256":"00","rows":[]}"#,
+    )
+    .expect("write a manifest from a later format version");
+
+    let mut gateway = boot("unreadable/refused", &state, false);
+    let status = gateway.call(
+        "bootstrap",
+        "meta/status_identity_bootstrap",
+        json!({}),
+        RPC_TIMEOUT,
+    );
+    let error = status["result"]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(&manifest.display().to_string()),
+        "the bootstrap status names the unreadable manifest: {status}"
+    );
+    let refused = gateway.request(
+        "send",
+        "meta/send",
+        json!({ "identity": IDENTITY, "content": "Are you there?" }),
+        RPC_TIMEOUT,
+    );
+    assert_eq!(
+        refused["error"]["code"],
+        json!(-32014),
+        "a send is refused with the storage-resolution code: {refused}"
+    );
+    assert_eq!(
+        refused["error"]["data"]["kind"],
+        json!("first_boot_manifest_unreadable"),
+        "the refusal names the unreadable manifest: {refused}"
+    );
+    gateway.shutdown_and_reap();
+}
+
+// ---------------------------------------------------------------------------
+// Offline identity reset
+// ---------------------------------------------------------------------------
+
+/// Run `meta_gateway identity-reset --json` for the identity over `state`
+/// and return its report, asserting the exit code (0 done, 1 refused).
+fn identity_reset(state: &Path, apply: bool, exit_code: i32) -> Value {
+    identity_reset_of(state, IDENTITY, apply, exit_code)
+}
+
+/// [`identity_reset`] for `identity`.
+fn identity_reset_of(state: &Path, identity: &str, apply: bool, exit_code: i32) -> Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_meta_gateway"));
+    command
+        .arg("identity-reset")
+        .arg("--state-dir")
+        .arg(state)
+        .args(["--identity", identity, "--json"]);
+    if apply {
+        command.arg("--apply");
+    }
+    let output = command.output().expect("run meta_gateway identity-reset");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!("identity-reset printed no JSON report ({error}); stderr: {stderr}")
+    });
+    assert_eq!(
+        output.status.code(),
+        Some(exit_code),
+        "identity-reset exit code; report: {report}; stderr: {stderr}"
+    );
+    report
+}
+
+/// `meta_gateway identity-reset` gives an identity of a stopped directory a
+/// fresh life at its next start. It is refused while a gateway runs on the
+/// directory, and for an identity Core binds to nothing that owes its host a
+/// held completion; a dry run writes nothing and reports a held-completion
+/// mark of the bound identity as stale; `--apply` leaves one `Fresh` row
+/// naming the session of the identity's live binding, and applying it again
+/// finds the row pending. The next boot drops the stale mark and carries the
+/// row out: the identity answers on a new session that does not inherit the
+/// old transcript, the manifest is removed, and Core keeps the old session,
+/// its binding retired.
+#[test]
+fn the_identity_reset_verb_gives_a_stopped_directorys_identity_a_fresh_session() {
+    use sha2::Digest as _;
+    const TOKEN: &str = "MARKER-IDENTITY-RESET-OLD-LIFE";
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&state).expect("create state dir");
+    let manifest = meerkat_meta::identity_first::FirstBootManifest::path(&state);
+
+    let mut gateway = boot("identity-reset/old-life", &state, false);
+    send_turn(&mut gateway, &format!("Please note this token: {TOKEN}"));
+    let old_session = bound_session(&mut gateway);
+    wait_for_durable_messages(
+        &state,
+        &old_session,
+        MESSAGES_PER_TURN,
+        "the old life's turn",
+    );
+    let running = identity_reset(&state, true, 1);
+    assert_eq!(
+        (
+            &running["refusal"]["kind"],
+            &running["refusal"]["refusal"]["kind"]
+        ),
+        (&json!("directory"), &json!("runtime_in_use")),
+        "the reset is refused while a gateway runs on the directory: {running}"
+    );
+    gateway.shutdown_and_reap();
+    assert!(!manifest.exists(), "a refused reset writes no manifest");
+
+    // A marked identity Core binds to nothing owes its host a held
+    // completion: there is no life to reset.
+    const OWED: &str = "agent:held-owed";
+    let marks = state.join(meerkat_meta::identity_first::HELD_COMPLETION_OWED_DIR);
+    std::fs::create_dir_all(&marks).expect("create the held-completion marks");
+    let owed_mark = marks.join(format!("{:x}", sha2::Sha256::digest(OWED.as_bytes())));
+    std::fs::write(&owed_mark, OWED).expect("mark an unbound identity owed");
+    let owed = identity_reset_of(&state, OWED, true, 1);
+    assert_eq!(
+        owed["refusal"]["kind"],
+        json!("held_completion_owed"),
+        "an unbound identity owing a held completion is refused: {owed}"
+    );
+    assert!(!manifest.exists(), "a refused reset writes no manifest");
+    std::fs::remove_file(&owed_mark).expect("clear the owed mark");
+
+    // A mark left by a held activation that stopped before clearing it: Core
+    // binds the identity, so the mark is stale.
+    let mark = marks.join(format!("{:x}", sha2::Sha256::digest(IDENTITY.as_bytes())));
+    std::fs::write(&mark, IDENTITY).expect("leave a stale held-completion mark");
+
+    let dry_run = identity_reset(&state, false, 0);
+    assert_eq!(
+        (
+            &dry_run["retired_session"],
+            &dry_run["binding_state"],
+            &dry_run["written"],
+            &dry_run["stale_held_completion_mark"]
+        ),
+        (
+            &json!(old_session),
+            &json!("live"),
+            &json!(false),
+            &json!(true)
+        ),
+        "the dry run names the session it would retire and the stale mark: {dry_run}"
+    );
+    assert!(!manifest.exists(), "a dry run writes no manifest");
+
+    let applied = identity_reset(&state, true, 0);
+    assert_eq!(
+        (&applied["retired_session"], &applied["written"]),
+        (&json!(old_session), &json!(true)),
+        "the applied reset writes the row: {applied}"
+    );
+    let again = identity_reset(&state, true, 0);
+    assert_eq!(
+        (&again["written"], &again["already_pending"]),
+        (&json!(false), &json!(true)),
+        "a second reset finds the same row pending: {again}"
+    );
+    let written = meerkat_meta::identity_first::FirstBootManifest::read(&state)
+        .expect("the manifest reads")
+        .expect("the reset wrote the manifest");
+    assert_eq!(
+        written.rows(),
+        [meerkat_meta::identity_first::FirstBootRow::Fresh {
+            identity: meerkat_meta::identity_first::AgentIdentity::parse(IDENTITY)
+                .expect("the identity parses"),
+            retired_session: meerkat_core::types::SessionId::parse(&old_session)
+                .expect("the session id parses"),
+        }],
+        "the manifest holds one Fresh row naming the old session"
+    );
+
+    let mut gateway = boot("identity-reset/fresh-life", &state, false);
+    let fresh_session = bound_session(&mut gateway);
+    assert_ne!(
+        fresh_session, old_session,
+        "the reset identity starts on a new session"
+    );
+    assert!(
+        !manifest.exists(),
+        "the manifest is removed once its last row is carried out"
+    );
+    assert!(!mark.exists(), "the next start drops the stale mark");
+    send_turn(&mut gateway, "Which token did I give you?");
+    wait_for_durable_messages(
+        &state,
+        &fresh_session,
+        MESSAGES_PER_TURN,
+        "the fresh life's first turn",
+    );
+    let fresh = read_durable_transcript(&state, &fresh_session, "fresh life");
+    assert!(
+        !fresh.joined_json().contains(TOKEN),
+        "the fresh life does not inherit the old transcript"
+    );
+    gateway.shutdown_and_reap();
+
+    let old = read_durable_transcript(&state, &old_session, "old life");
+    assert!(
+        old.joined_json().contains(TOKEN),
+        "Core keeps the old session"
+    );
+    let history = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the history read")
+        .block_on(meerkat_mob::MobStorage::read_member_binding_history(
+            MetaStorageLayout::with_injected_roots(state, None).event_log_db(),
+        ))
+        .expect("read Core's member history");
+    let core_identity = meerkat_meta::member_comms_id::roster_member_id_for_identity(IDENTITY);
+    assert_eq!(
+        history
+            .last_binding(&core_identity)
+            .and_then(|binding| binding.session_id())
+            .map(ToString::to_string),
+        Some(fresh_session),
+        "Core's last binding of the identity is the fresh session"
+    );
+    assert_eq!(
+        history
+            .binding_for_session(
+                &meerkat_core::types::SessionId::parse(&old_session)
+                    .expect("the session id parses")
+            )
+            .map(meerkat_mob::MemberBinding::state),
+        Some(meerkat_mob::MemberBindingState::Retired),
+        "the old session is bound to nothing"
+    );
 }

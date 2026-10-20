@@ -1040,7 +1040,11 @@ async fn console_human_reset_refuses_old_prepared_session_and_old_worker_fence()
         .find(|member| member.agent_identity.as_str() == h.identity.as_str())
         .unwrap();
     let successor = h.identity_runtime.reset(&h.identity).await.unwrap();
-    assert_ne!(successor.session_id, h.session_id);
+    let successor_session = successor
+        .session_id()
+        .cloned()
+        .expect("the successor is bound to a session");
+    assert_ne!(successor_session, h.session_id);
     let replay = h.send(request).await.unwrap();
     assert_eq!(
         replay.session_id.as_deref(),
@@ -1073,7 +1077,7 @@ async fn console_human_reset_refuses_old_prepared_session_and_old_worker_fence()
     let replacement_history = h
         .unified
         .mob_runtime()
-        .read_session_history(&successor.session_id.to_string(), 0, None)
+        .read_session_history(&successor_session.to_string(), 0, None)
         .await
         .unwrap();
     assert!(
@@ -1115,7 +1119,11 @@ async fn console_human_redispatch_into_a_moved_session_fails_and_delivers_nothin
         Some(h.session_id.to_string().as_str())
     );
     let successor = h.identity_runtime.reset(&h.identity).await.unwrap();
-    assert_ne!(successor.session_id, h.session_id);
+    let successor_session = successor
+        .session_id()
+        .cloned()
+        .expect("the successor is bound to a session");
+    assert_ne!(successor_session, h.session_id);
 
     let replay = h.send(request).await.unwrap();
     assert_eq!(replay.input_frame_id, accepted.input_frame_id);
@@ -1164,7 +1172,7 @@ async fn console_human_redispatch_into_a_moved_session_fails_and_delivers_nothin
     let successor_history = h
         .unified
         .mob_runtime()
-        .read_session_history(&successor.session_id.to_string(), 0, None)
+        .read_session_history(&successor_session.to_string(), 0, None)
         .await
         .expect("the successor session's history reads");
     assert!(
@@ -1505,9 +1513,7 @@ async fn console_send_selected_skills_refused_before_reservation_for_external_or
     placed.placement = Some(meerkat_contracts::WireHostRef("remote-host".to_string()));
     for spec in [external, placed] {
         let identity = spec.identity.to_string();
-        h.identity_runtime
-            .register(spec, IdentityLifecycleState::Dormant, None, None)
-            .await;
+        h.identity_runtime.register(spec).await;
         let request = ConsoleSendRequest {
             identity: identity.clone(),
             skill_refs: vec![selected_skill()],

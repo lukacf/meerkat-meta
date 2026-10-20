@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use meerkat_core::DurabilityResolution;
 use meerkat_meta::blob_store::BinaryBlobStore;
 use meerkat_meta::console_aggregator::ConsoleLogStore;
-use meerkat_meta::identity_first::{AgentMemoryProvider, ContinuityStore};
+use meerkat_meta::identity_first::AgentMemoryProvider;
 use meerkat_meta::storage_provider::{
     MetaLeaseAuthority, MetaRealmOpenContext, MetaRealmStoreSet, MetaStorageProvider,
     enforce_fail_closed_store_set,
@@ -24,7 +24,7 @@ use meerkat_meta::storage_provider::{
 use meerkat_meta::unified_runtime::EventLogStore;
 use meta_store_conformance::{
     AgentMemoryProviderFactory, BinaryBlobStoreFactory, ConformanceFailure, ConsoleLogStoreFactory,
-    ContinuityStoreFactory, EventLogStoreFactory, ReferenceMemoryBundleProvider, chapters,
+    EventLogStoreFactory, ReferenceMemoryBundleProvider, chapters,
 };
 
 /// The provider under test, held as the trait object a downstream would
@@ -51,15 +51,6 @@ async fn open_fresh_realm(dir: &Path) -> MetaRealmStoreSet {
 // In-memory stores share state per handle: a clone of the Arc is the correct
 // restart model for deliberately non-persistent backends (see the factory
 // contract).
-
-struct SlotContinuityFactory(Arc<dyn ContinuityStore>);
-
-#[async_trait]
-impl ContinuityStoreFactory for SlotContinuityFactory {
-    async fn open(&self) -> Result<Arc<dyn ContinuityStore>, ConformanceFailure> {
-        Ok(Arc::clone(&self.0))
-    }
-}
 
 struct SlotConsoleFactory(Arc<dyn ConsoleLogStore>);
 
@@ -141,36 +132,6 @@ async fn bundle_realm_opens_complete_and_fail_closed_valid() {
         provider.migrator().is_none(),
         "the reference bundle honestly reports no migration story"
     );
-}
-
-#[tokio::test]
-async fn bundle_continuity_slot_passes_the_continuity_profile() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let set = open_fresh_realm(dir.path()).await;
-    chapters::continuity_store(&SlotContinuityFactory(set.continuity_store))
-        .await
-        .expect("the bundle's continuity slot must satisfy the continuity profile");
-}
-
-#[tokio::test]
-async fn bundle_continuity_slot_passes_the_compatibility_rollback_profile() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let set = open_fresh_realm(dir.path()).await;
-    chapters::continuity_rollback(
-        &SlotContinuityFactory(set.continuity_store),
-        chapters::RollbackPath::CompatibilityDefault,
-    )
-    .await
-    .expect("the bundle's continuity slot must satisfy the compatibility rollback profile");
-}
-
-#[tokio::test]
-async fn bundle_continuity_slot_hosts_the_session_adapter_chapter() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let set = open_fresh_realm(dir.path()).await;
-    chapters::continuity_session_adapter(&SlotContinuityFactory(set.continuity_store), false)
-        .await
-        .expect("the bundle's continuity slot must host the session adapter chapter");
 }
 
 #[tokio::test]

@@ -3478,10 +3478,13 @@ mod tests {
     use meerkat_core::types::SessionId;
     use tokio::sync::Mutex as AsyncMutex;
 
+    /// A bridge whose Core reads answer from [`Self::core`], the members its
+    /// creates, resumes and retires committed.
     struct RecoveryBridge {
         wires: AsyncMutex<BTreeSet<(AgentRuntimeId, AgentRuntimeId)>>,
         wire_calls: AtomicUsize,
         unwire_calls: AtomicUsize,
+        core: crate::identity_first::core_test_members::CoreTestMembers,
     }
 
     struct RecoveryRoster(Vec<DurableAgentSpec>);
@@ -3507,6 +3510,7 @@ mod tests {
                 ),
                 wire_calls: AtomicUsize::new(0),
                 unwire_calls: AtomicUsize::new(0),
+                core: crate::identity_first::core_test_members::CoreTestMembers::default(),
             }
         }
 
@@ -3526,30 +3530,42 @@ mod tests {
     impl SessionBridge for RecoveryBridge {
         async fn create_session(
             &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
+            identity: &AgentIdentity,
+            spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
-            session_id: &SessionId,
-        ) -> Result<SessionId, BridgeError> {
-            Ok(session_id.clone())
-        }
-
-        fn requires_resume_snapshot(&self) -> bool {
-            false
+        ) -> Result<crate::identity_first::MemberRuntimeBinding, BridgeError> {
+            let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
+            let session_id = &meerkat_core::types::SessionId::new();
+            let binding = crate::identity_first::MemberRuntimeBinding {
+                agent_runtime_id,
+                session_id: Some(session_id.clone()),
+            };
+            self.core.bind(identity, &binding, &spec.profile);
+            Ok(binding)
         }
 
         async fn resume_session(
             &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
+            identity: &AgentIdentity,
+            spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
             session_id: &SessionId,
-            _snapshot: &SessionSnapshot,
+            _resume_from_role: Option<&meerkat_mob::ProfileName>,
         ) -> Result<ResumeSessionOutcome, BridgeError> {
+            let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
+            self.core.bind(
+                identity,
+                &crate::identity_first::MemberRuntimeBinding {
+                    agent_runtime_id: agent_runtime_id.clone(),
+                    session_id: Some(session_id.clone()),
+                },
+                &spec.profile,
+            );
             Ok(ResumeSessionOutcome::Resumed {
                 session_id: session_id.clone(),
+                agent_runtime_id,
             })
         }
 
@@ -3573,8 +3589,56 @@ mod tests {
             ))
         }
 
-        async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+        async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+            self.core.retire(runtime_id);
             Ok(())
+        }
+
+        async fn live_member(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn live_member_scope(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+            self.core.live_member_scope(identity)
+        }
+
+        async fn ensure_member_live(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn last_member_binding(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+            self.core.last_member_binding(identity)
+        }
+
+        async fn member_binding_history(
+            &self,
+        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+            self.core.history()
+        }
+
+        async fn identity_management(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+            Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
+        }
+
+        async fn durable_identity_members(
+            &self,
+        ) -> Result<Vec<meerkat_mob::MemberBinding>, BridgeError> {
+            self.core.durable_identity_members()
         }
 
         async fn wire_peer(
@@ -3812,8 +3876,11 @@ mod tests {
 
         assert!(controller.has_pending().await);
         assert!(!handle_report.is_complete());
-        let expected_managed_while_pending =
-            usize::from(initially_connected || action == TopologyAction::Disconnect);
+        // Core attributes a physical wire to identities only through their live
+        // members, so while both endpoints are dormant an interrupted connect's
+        // wire is not a managed edge. The pending recovery still holds the
+        // edge, and the end state below is the same.
+        let expected_managed_while_pending = usize::from(action == TopologyAction::Disconnect);
         assert_eq!(
             runtime.managed_peer_edges_snapshot().await.len(),
             expected_managed_while_pending

@@ -13,9 +13,9 @@ use crate::contact_directory::ContactDirectory;
 pub use crate::identity_first::IdentityBootstrapMode;
 use crate::identity_first::{
     AgentCustomizer, AgentMemoryConfig, AgentMemoryCustomizer, AgentMemoryProvider,
-    AgentMemoryRuntimeInjector, AgentRuntimeServices, ContinuitySessionStoreAdapter,
-    DurabilityPolicy, IdentityFirstRuntimeContext, IdentityRuntime, IdentityRuntimeConfig,
-    LocalContinuityStore, LocalLeaseProvider, RosterContext, RosterProvider, TopologyProvider,
+    AgentMemoryRuntimeInjector, AgentRuntimeServices, DurabilityPolicy,
+    IdentityFirstRuntimeContext, IdentityRuntime, IdentityRuntimeConfig, LocalContinuityStore,
+    LocalLeaseProvider, RosterContext, RosterProvider, TopologyProvider,
 };
 use crate::mob_composition_manifest::MobStorageProvenance;
 use crate::mob_handle_runtime::{
@@ -68,13 +68,19 @@ pub struct UnifiedRuntimeBuilder {
     /// re-resolved under a later working directory, or a symlink retargeted
     /// between open and build, must not slip past as a lexical match.
     continuity_state_dir: Option<PathBuf>,
+    /// The state directory's claim for this runtime, taken before anything
+    /// opens a store in it (see [`crate::state_dir_claim`]) and handed to the
+    /// runtime through its bootstrap spec.
+    state_dir_claim: Option<Arc<crate::state_dir_claim::StateDirClaim>>,
     session_hook: Option<Arc<dyn SessionHook>>,
-    custom_session_store: Option<Arc<dyn meerkat::SessionStore>>,
     meerkat_config: Option<meerkat::Config>,
     mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
     /// The host's operation refusal observer, installed on every
     /// builder-owned agent factory.
     operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
+    /// The host's fork instruction policy, applied to every builder-owned
+    /// mob spec. `None` keeps Meerkat's default.
+    fork_instruction_policy: Option<meerkat_core::ForkInstructionPolicy>,
     /// Host-level compaction policy composed over `meerkat_config`'s
     /// compaction slot at spec-resolve time. Separate from `meerkat_config`
     /// so tuning compaction does not require an embedder to author a whole
@@ -209,11 +215,15 @@ impl UnifiedRuntimeBuilder {
     }
 
     /// Enable persistent state at the given path. When set, the builder
-    /// creates a `SqliteSessionStore`, runtime store, metadata store, console
-    /// log store, and binary blob store under this directory. Mob storage stays
-    /// in-memory unless supplied through [`mob_storage`](Self::mob_storage).
-    /// When not set, the builder uses an ephemeral session service with an
-    /// auto-created temp directory.
+    /// composes Core's session and runtime stores on `runtime.sqlite`, and
+    /// the metadata store, console log store, binary blob store and mob
+    /// storage (`event_log.sqlite3`, unless supplied through
+    /// [`mob_storage`](Self::mob_storage)) under this directory. Before any
+    /// store opens, `build()` refuses a directory that another process still
+    /// hosts runtimes on, one that needs `meta_gateway
+    /// storage-migrate-native`, and one whose identity bindings lost their
+    /// runtime store. When not set, the builder uses an ephemeral session
+    /// service with an auto-created temp directory.
     pub fn persistent_state(mut self, path: impl Into<PathBuf>) -> Self {
         self.persistent_state_path = Some(path.into());
         self
@@ -226,9 +236,14 @@ impl UnifiedRuntimeBuilder {
     ///
     /// This slot is separate from the realm stores selected by
     /// [`storage_provider`](Self::storage_provider) and does not change session
-    /// persistence. Without an override, mob storage remains in-memory. A
-    /// pre-built [`mob_spec`](Self::mob_spec) already owns this slot and cannot
-    /// be combined with this override.
+    /// persistence. Without an override, a
+    /// [`persistent_state`](Self::persistent_state) build keeps mob storage
+    /// durable in `event_log.sqlite3` under the state directory, and any other
+    /// build keeps it in memory. A persistent build with a
+    /// [`roster_provider`](Self::roster_provider) refuses storage without a
+    /// persistent path: the roster's identity bindings live in it. A pre-built
+    /// [`mob_spec`](Self::mob_spec) already owns this slot and cannot be
+    /// combined with this override.
     pub fn mob_storage(mut self, storage: MobStorage, provenance: MobStorageProvenance) -> Self {
         self.mob_storage = Some((storage, provenance));
         self
@@ -253,15 +268,6 @@ impl UnifiedRuntimeBuilder {
     /// Set a session lifecycle hook.
     pub fn session_hook(mut self, hook: Arc<dyn SessionHook>) -> Self {
         self.session_hook = Some(hook);
-        self
-    }
-
-    /// Set a custom session store. When set, the builder uses this store
-    /// instead of creating a default one. Works with both `.persistent_state()`
-    /// (overrides the auto-created SQLite store) and ephemeral builds
-    /// (provides durable sessions without local mob storage).
-    pub fn session_store(mut self, store: Arc<dyn meerkat::SessionStore>) -> Self {
-        self.custom_session_store = Some(store);
         self
     }
 
@@ -334,9 +340,9 @@ impl UnifiedRuntimeBuilder {
     /// instead of starting on the whole-blob fallback (one warning, then the
     /// whole session document written at every turn boundary).
     ///
-    /// For an identity-first launch this means the continuity store must
-    /// serve [`ContinuityStore::as_incremental_sessions`](crate::identity_first::contracts::ContinuityStore::as_incremental_sessions).
-    /// Off by default.
+    /// The SQLite session store `persistent_state()` composes is
+    /// incremental; a [`storage_provider`](Self::storage_provider)'s realm
+    /// session store may not be. Off by default.
     pub fn require_incremental_session_persistence(mut self, required: bool) -> Self {
         self.require_incremental_session_persistence = required;
         self
@@ -354,46 +360,25 @@ impl UnifiedRuntimeBuilder {
         self
     }
 
-    /// Open the state directory's identity substrate and install BOTH halves,
-    /// composing the SHIPPED GATEWAY's session topology on the builder.
+    /// Open the state directory's identity substrate (the continuity store
+    /// and its lease provider) and install both halves, through the same
+    /// [`crate::gateway_wiring`] seam the gateways use, including the fencing
+    /// floor, which must resume above the persisted high-water or restore
+    /// aborts every restart with a stale token.
     ///
-    /// # Why this exists (doctrine D2, and a real coverage hole)
-    ///
-    /// `persistent_state()` + `roster_provider()` alone does NOT reproduce the
-    /// gateway. The gateway opens the local identity substrate FIRST and makes
-    /// its [`ContinuitySessionStoreAdapter`] meerkat's `SessionStore`, so ALL
-    /// session I/O — heads, strand rows, resume reads — rides
-    /// `continuity.sqlite3` (see `bin/rpc_gateway.rs`, the
-    /// `identity_session_store_adapter` binding). The builder, by contrast,
-    /// only installs that adapter when an EXTERNAL continuity store is
-    /// supplied; on the plain `persistent_state()` arm it opens a
-    /// `SqliteSessionStore` for sessions and opens the local continuity store
-    /// later, for identity metadata only. A test written against that arm
-    /// exercises neither the continuity adapter nor the head-canonical resume
-    /// path, and will pass while proving nothing.
-    ///
-    /// This method closes that hole for embedders and tests that WANT the
-    /// gateway shape, through the same [`crate::gateway_wiring`] seam the
-    /// binaries use — including the fencing floor, which must resume above the
-    /// persisted high-water or restore aborts every restart with a stale
-    /// token.
-    ///
-    /// # Not a default
-    ///
-    /// It is deliberately opt-in. Flipping the plain `persistent_state()` arm
-    /// over would move an existing deployment's session authority from
-    /// `sessions.sqlite3` to an empty `continuity.sqlite3` — every durable
-    /// member would resume onto nothing. That is a data migration, not a
-    /// wiring default.
-    ///
-    /// Pair with [`persistent_state`](Self::persistent_state) pointing at the
-    /// SAME directory and with [`roster_provider`](Self::roster_provider).
+    /// The continuity store holds identity records only: sessions live in
+    /// Core's session and runtime stores on `runtime.sqlite`, which
+    /// [`persistent_state`](Self::persistent_state) composes. Pair it with
+    /// `persistent_state` pointing at the SAME directory and with
+    /// [`roster_provider`](Self::roster_provider).
     ///
     /// # Errors
     ///
-    /// Fails when the state directory cannot be created, when the continuity
-    /// slot cannot be resolved (file-name twins), or when the substrate cannot
-    /// be opened — never degrades to a zero fencing floor.
+    /// Fails when the state directory cannot be created or claimed, when it
+    /// is refused before any store opens (see
+    /// [`persistent_state`](Self::persistent_state)), when the continuity slot
+    /// cannot be resolved (file-name twins), or when the substrate cannot be
+    /// opened; it never degrades to a zero fencing floor.
     pub async fn continuity_from_state_dir(
         mut self,
         state_dir: impl AsRef<std::path::Path>,
@@ -417,6 +402,11 @@ impl UnifiedRuntimeBuilder {
                 state_dir.display()
             ))
         })?;
+        self.claim_state_dir(
+            &state_dir,
+            crate::native_startup::RuntimeStoreLocation::StateDir,
+        )
+        .await?;
         let continuity_db = MetaStorageLayout::with_injected_roots(state_dir.clone(), None)
             .continuity_db()?
             .path;
@@ -427,6 +417,63 @@ impl UnifiedRuntimeBuilder {
         self.lease_provider = Some(substrate.lease_provider);
         self.continuity_state_dir = Some(state_dir);
         Ok(self)
+    }
+
+    /// Claim `state_dir` for this runtime, once (see
+    /// [`crate::state_dir_claim`]), and run the startup checks before any
+    /// store opens in it (see [`crate::native_startup`]). The claim this
+    /// builder or its supplied `mob_spec` already holds on the same
+    /// directory is reused: the OS lock belongs to its open file
+    /// description, so a second acquisition would refuse this very runtime,
+    /// and its holder ran the checks when it took it. `runtime_store` is
+    /// where this composition's runtime store lives: a storage provider's
+    /// backend leaves no `runtime.sqlite` here for the bindings check.
+    async fn claim_state_dir(
+        &mut self,
+        state_dir: &std::path::Path,
+        runtime_store: crate::native_startup::RuntimeStoreLocation,
+    ) -> Result<(), UnifiedRuntimeBuilderError> {
+        let held = self
+            .state_dir_claim
+            .iter()
+            .chain(
+                self.mob_spec
+                    .iter()
+                    .flat_map(|spec| spec.state_dir_claims.iter()),
+            )
+            .find(|claim| same_directory(claim.state_dir(), state_dir))
+            .cloned();
+        let claim = match held {
+            Some(claim) => claim,
+            None => {
+                let claim = Arc::new(crate::state_dir_claim::StateDirClaim::acquire(state_dir)?);
+                let mob_store = self.durable_mob_store();
+                crate::native_startup::refuse_unready_state_dir_for(
+                    state_dir,
+                    mob_store.as_deref(),
+                    runtime_store,
+                )
+                .await?;
+                claim
+            }
+        };
+        self.state_dir_claim = Some(claim);
+        Ok(())
+    }
+
+    /// The durable mob store this build composes: the supplied storage's
+    /// persistent path, or, under `persistent_state`, the default
+    /// `event_log.sqlite3` beside the sessions.
+    fn durable_mob_store(&self) -> Option<std::path::PathBuf> {
+        match (&self.mob_storage, &self.persistent_state_path) {
+            (Some((_, provenance)), _) => provenance
+                .persistent_path()
+                .map(std::path::Path::to_path_buf),
+            (None, Some(state_path)) => Some(
+                MetaStorageLayout::with_injected_roots(state_path.clone(), None).event_log_db(),
+            ),
+            (None, None) => None,
+        }
     }
 
     /// Set the desired identity roster provider for identity-first bootstrap.
@@ -564,6 +611,18 @@ impl UnifiedRuntimeBuilder {
         observer: Arc<dyn meerkat_core::OperationRefusalObserver>,
     ) -> Self {
         self.operation_refusal_observer = Some(observer);
+        self
+    }
+
+    /// Set the host's fork instruction policy for member forks of the mob
+    /// this builder composes (persistent, scratch and temp-dir launches, on
+    /// create and on resume): what a fork of a member with activated host
+    /// instructions does with them (see
+    /// `MobBootstrapSpec::with_fork_instruction_policy`). Unset, Meerkat's
+    /// default applies. A supplied, already-built mob_spec carries its own
+    /// policy, so the builder refuses this override; set it on that spec.
+    pub fn fork_instruction_policy(mut self, policy: meerkat_core::ForkInstructionPolicy) -> Self {
+        self.fork_instruction_policy = Some(policy);
         self
     }
 
@@ -720,15 +779,13 @@ impl UnifiedRuntimeBuilder {
     }
 
     /// Declare that the runtime store is intentionally ephemeral
-    /// (in-memory) on a persistent-state build.
+    /// (in-memory), for a [`storage_provider`](Self::storage_provider) realm
+    /// opened on a [`scratch_dir`](Self::scratch_dir).
     ///
-    /// Persistent-state builds fail closed when `runtime.sqlite` cannot be
-    /// opened — the former silent `InMemoryRuntimeStore` fallback (in which
-    /// resume across restart and archive operations fail) is gone. This
-    /// declaration makes the in-memory runtime store a configuration
-    /// instead of an error (tests, demos), reported as `declared_ephemeral`
-    /// in the per-slot storage census. Ephemeral launch modes declare it
-    /// implicitly; without `persistent_state()` this is a no-op.
+    /// A [`persistent_state`](Self::persistent_state) build refuses it:
+    /// sessions live in the runtime store under the state directory, so a
+    /// persistent build keeps that store there. Ephemeral launch modes
+    /// declare it implicitly.
     pub fn ephemeral_runtime_store(mut self, enabled: bool) -> Self {
         self.ephemeral_runtime_store = enabled;
         self
@@ -830,8 +887,8 @@ impl UnifiedRuntimeBuilder {
     /// WebSocket router), the builder-path equivalent of the gateway's
     /// `runtime_options.live`.
     ///
-    /// Requires a persistent session store ([`Self::session_store`] or
-    /// [`Self::continuity_from_state_dir`]); `build()` fails closed with
+    /// Requires persistent sessions ([`Self::persistent_state`], or a
+    /// [`Self::storage_provider`] realm); `build()` fails closed with
     /// [`UnifiedRuntimeBuilderError::LiveCompose`] otherwise. The doors are
     /// composed by [`UnifiedRuntime::compose_live`] after the runtime is
     /// shared; [`UnifiedRuntime::build_reference_app_router`] does that and
@@ -1173,6 +1230,12 @@ impl UnifiedRuntimeBuilder {
             ));
         }
 
+        if self.mob_spec.is_some() && self.fork_instruction_policy.is_some() {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "fork_instruction_policy() and mob_spec() are mutually exclusive: the supplied spec carries its own policy (MobBootstrapSpec::with_fork_instruction_policy)".into(),
+            ));
+        }
+
         self.identity_bootstrap_mode
             .validate()
             .map_err(UnifiedRuntimeBuilderError::ConflictingConfiguration)?;
@@ -1215,6 +1278,35 @@ impl UnifiedRuntimeBuilder {
             return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
                 "blob_store() and binary_blob_store() are mutually exclusive — inject the one \
                  typed form you have"
+                    .to_string(),
+            ));
+        }
+        // Sessions live in the runtime store under the state directory: a
+        // persistent build cannot declare that store in memory.
+        if has_persistent_state && self.ephemeral_runtime_store {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "ephemeral_runtime_store(true) declares an in-memory runtime store, but \
+                 persistent_state() is set: sessions live in the runtime store under the \
+                 state directory, so a persistent build keeps it there. Remove the \
+                 declaration, or build without persistent_state()"
+                    .to_string(),
+            ));
+        }
+        // The roster's identity bindings live in the mob storage: a persistent
+        // identity-first build keeps it durable.
+        if has_persistent_state
+            && self.roster_provider.is_some()
+            && self
+                .mob_storage
+                .as_ref()
+                .is_some_and(|(_, provenance)| provenance.persistent_path().is_none())
+        {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "mob_storage() supplies storage without a persistent path while \
+                 persistent_state() and roster_provider() are set: the roster's identity \
+                 bindings live in the mob storage, so they would not survive a restart while \
+                 the sessions do. Omit mob_storage() to keep mob storage durable under the \
+                 state directory, or supply persistent_mob_storage(path)"
                     .to_string(),
             ));
         }
@@ -1344,6 +1436,18 @@ impl UnifiedRuntimeBuilder {
             }
             None => None,
         };
+        // One Meta runtime per state directory: claim it once the
+        // configuration is known to be coherent (a refused one leaves the
+        // directory untouched) and before the identity substrate or any local
+        // store opens in it. A storage provider claimed it already.
+        if let Some(state_path) = self.persistent_state_path.clone() {
+            let runtime_store = if self.provider_meerkat_stores.is_some() {
+                crate::native_startup::RuntimeStoreLocation::StorageProvider
+            } else {
+                crate::native_startup::RuntimeStoreLocation::StateDir
+            };
+            self.claim_state_dir(&state_path, runtime_store).await?;
+        }
 
         #[cfg(feature = "extension-state")]
         if (!self.tool_bundle_factories.is_empty() || !self.mcp_document_bindings.is_empty())
@@ -1358,21 +1462,15 @@ impl UnifiedRuntimeBuilder {
             self = self.continuity_from_state_dir(path).await?;
         }
 
-        let continuity_session_store = self
-            .continuity_store
-            .as_ref()
-            .map(|store| Arc::new(ContinuitySessionStoreAdapter::new(store.clone())));
-        if let Some(store) = continuity_session_store.as_ref() {
-            self.custom_session_store = Some(store.clone());
-        }
-        // Strict mode: the default SQLite session store is incremental, so
-        // only a custom or continuity-backed store can fail this.
+        // Strict mode: the SQLite session store `persistent_state()` composes
+        // is incremental, so only a storage provider's realm session store
+        // can fail this.
         if self.require_incremental_session_persistence
-            && let Some(store) = self.custom_session_store.as_ref()
-            && Arc::clone(store).as_incremental().is_none()
+            && let Some(stores) = self.provider_meerkat_stores.as_ref()
+            && Arc::clone(&stores.session_store).as_incremental().is_none()
         {
             return Err(UnifiedRuntimeBuilderError::SessionStoreNotIncremental {
-                store_kind: self.custom_session_store_kind(),
+                store_kind: format!("{} session store", stores.provider_name),
             });
         }
 
@@ -1421,6 +1519,20 @@ impl UnifiedRuntimeBuilder {
             }
             None => self.resolve_mob_spec().await?,
         };
+        // The runtime keeps the state directory's claim until its shutdown
+        // has run to its end; a resolved spec already carries it, a supplied
+        // one may not.
+        if let Some(claim) = self.state_dir_claim.take()
+            && !mob_spec
+                .state_dir_claims
+                .iter()
+                .any(|held| Arc::ptr_eq(held, &claim))
+        {
+            mob_spec.state_dir_claims.push(claim);
+        }
+        // The session store the stock constructors composed, for the agent
+        // memory engines below.
+        let composed_session_store = mob_spec.durable_session_store.clone();
         // Never skip a supplied grant owner: every spec path that builds a
         // runtime machine consumes it, and an unconsumed one is refused.
         if self.take_grant_configuration().is_some() {
@@ -1579,11 +1691,17 @@ impl UnifiedRuntimeBuilder {
             agent_memory_provider.clone()
         };
         if let Some(provider) = classic_agent_memory.as_ref() {
+            // Composed after a spawn customizer the spec already carries,
+            // never replacing it: the host's runs first, and memory keys on
+            // the identity it leaves.
             mob_spec.spawn_member_customizer =
-                Some(Arc::new(crate::memory::MemorySpawnCustomizer::new(
-                    provider.clone(),
-                    self.agent_memory_config.clone().unwrap_or_default(),
-                )));
+                Some(crate::identity_first::ComposedSpawnMemberCustomizer::over(
+                    mob_spec.spawn_member_customizer.take(),
+                    Arc::new(crate::memory::MemorySpawnCustomizer::new(
+                        provider.clone(),
+                        self.agent_memory_config.clone().unwrap_or_default(),
+                    )),
+                ));
         }
         // Identity-first `customize_build` tools follow each member across
         // meerkat-side rebuilds through one stable dispatcher per identity
@@ -1721,34 +1839,14 @@ impl UnifiedRuntimeBuilder {
             // `PublicSessionBridge`).
             let handle = runtime.mob_runtime.handle();
             let session_service = runtime.mob_runtime.session_service().cloned();
-            let session_store = self.custom_session_store.clone();
-            let mut bridge: crate::identity_first::bridge::MobSessionBridge = if let Some(store) =
-                continuity_session_store.clone()
-            {
-                crate::identity_first::bridge::MobSessionBridge::with_continuity_session_store(
-                    handle,
-                    store,
-                    session_service,
-                )
-            } else if let (Some(store), Some(service)) =
-                (session_store.clone(), session_service.clone())
-            {
-                crate::identity_first::bridge::MobSessionBridge::with_session_store_and_service(
-                    handle, store, service,
-                )
-            } else if let Some(store) = session_store {
-                crate::identity_first::bridge::MobSessionBridge::with_session_store(handle, store)
-            } else if let Some(service) = session_service {
-                crate::identity_first::bridge::MobSessionBridge::with_session_service(
-                    handle, service,
-                )
-            } else {
-                crate::identity_first::bridge::MobSessionBridge::new(handle)
-            };
-            #[cfg(feature = "extension-state")]
-            if let Some(authority) = &runtime.extension_authority {
-                bridge = bridge.with_extension_identity_publication(authority.publications.clone());
-            }
+            let mut bridge: crate::identity_first::bridge::MobSessionBridge =
+                if let Some(service) = session_service {
+                    crate::identity_first::bridge::MobSessionBridge::with_session_service(
+                        handle, service,
+                    )
+                } else {
+                    crate::identity_first::bridge::MobSessionBridge::new(handle)
+                };
             // Heal seam (2026-07-29 incident): without the recoverer, the
             // continuity repair supervisor can only reset entries — a
             // cosmetic heal that materialization re-Breaks when the durable
@@ -1873,6 +1971,19 @@ impl UnifiedRuntimeBuilder {
                 },
             ));
             identity_runtime.set_topology_controller(topology_controller.clone());
+            // `storage-migrate-native` leaves the first-boot manifest of a
+            // migrated state directory there; the first roster
+            // compile carries it out.
+            identity_runtime.set_first_boot_state_dir(self.persistent_state_path.clone());
+            // A held bootstrap's held-completion marks live in the same
+            // directory, so a restart keeps them.
+            identity_runtime.set_held_completion_state_dir(self.persistent_state_path.clone());
+            // Extension documents refuse a principal to an unmarked member
+            // of an identity this runtime registers.
+            #[cfg(feature = "extension-state")]
+            if let Some(registry) = runtime.extension_authority.as_ref() {
+                registry.bind_identity_runtime(&identity_runtime);
+            }
 
             let roster_specs = roster_provider
                 .roster(&RosterContext {
@@ -1921,9 +2032,6 @@ impl UnifiedRuntimeBuilder {
                 contact_directory: self.contact_directory,
                 session_bridge,
                 identity_first_context,
-                identity_lease_renewal_task: tokio::sync::Mutex::new(None),
-                identity_continuity_repair_task: tokio::sync::Mutex::new(None),
-                retired_supervisor_cleanups: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
                 console_log_store,
                 ..core
             },
@@ -2016,29 +2124,16 @@ impl UnifiedRuntimeBuilder {
                 .or_else(|| self.scratch_dir.clone());
             let transcript_store: Option<Arc<dyn meerkat::SessionStore>> =
                 if engines.distiller.enabled || engines.steward.enabled {
-                    if let Some(store) = self.custom_session_store.clone() {
-                        // The ACTIVE session authority — the provider/
-                        // continuity adapter or a caller-injected store. The
-                        // engines must read the transcripts the runtime
-                        // actually persists; opening the local session
-                        // database here would hand them an empty or stale
-                        // parallel history.
-                        Some(store)
-                    } else {
-                        let layout = storage_layout.as_ref().ok_or_else(|| {
-                            UnifiedRuntimeBuilderError::ConflictingConfiguration(
-                                "agent memory engines require persistent_state()".to_string(),
-                            )
-                        })?;
-                        Some(Arc::new(
-                            meerkat_store::SqliteSessionStore::open(layout.session_db()?.path)
-                                .map_err(|e| {
-                                    UnifiedRuntimeBuilderError::Io(format!(
-                                        "agent memory session store: {e}"
-                                    ))
-                                })?,
-                        ))
-                    }
+                    // The session store the runtime persists through: the
+                    // engines must read the transcripts the runtime actually
+                    // keeps, never a parallel copy.
+                    Some(composed_session_store.clone().ok_or_else(|| {
+                        UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                            "agent memory engines require a durable session store: \
+                             persistent_state() or a storage_provider() realm"
+                                .to_string(),
+                        )
+                    })?)
                 } else {
                     None
                 };
@@ -2201,20 +2296,6 @@ impl UnifiedRuntimeBuilder {
         Ok(runtime)
     }
 
-    /// Health-surface label for the store behind `custom_session_store`; the
-    /// H2 probe warning names the concrete store the builder composed
-    /// (`build()` installs a `ContinuitySessionStoreAdapter` there when a
-    /// continuity store is configured).
-    fn custom_session_store_kind(&self) -> String {
-        match self.continuity_store.as_ref() {
-            Some(store) => format!(
-                "ContinuitySessionStoreAdapter over {}",
-                store.store_type_name()
-            ),
-            None => "custom session store".to_string(),
-        }
-    }
-
     /// The `meerkat::Config` builder-created session services are built with:
     /// the caller's [`meerkat_config`](Self::meerkat_config) with the
     /// host-level [`compaction`](Self::compaction) declaration composed over
@@ -2275,12 +2356,6 @@ impl UnifiedRuntimeBuilder {
         if self.tool_bundle_factories.is_empty() && self.mcp_document_bindings.is_empty() {
             return Ok(None);
         }
-        if let Some(continuity) = &self.continuity_store {
-            continuity
-                .enable_identity_binding_history()
-                .await
-                .map_err(UnifiedRuntimeBuilderError::ExtensionAuthorityUnavailable)?;
-        }
         let state_dir = self.persistent_state_path.clone().ok_or_else(|| {
             UnifiedRuntimeBuilderError::ConflictingConfiguration(
                 "durable extension documents require persistent_state()".into(),
@@ -2318,7 +2393,9 @@ impl UnifiedRuntimeBuilder {
             realm.as_str().to_string(),
             spec.definition.id.to_string(),
             Arc::clone(&spec.session_service),
-            self.continuity_store.clone(),
+            // Identity-first compositions are exactly the ones with a
+            // roster (build() refuses one without it).
+            self.roster_provider.is_some(),
             self.access_controller.clone(),
             Arc::clone(&opened.store),
         );
@@ -2505,6 +2582,18 @@ impl UnifiedRuntimeBuilder {
         if self.ephemeral_runtime_store {
             declared_ephemeral_domains.push("runtime".to_string());
         }
+        // The provider opens its realm in the state directory: claim it first
+        // (see `build`). A non-disk provider's meerkat-level bundle holds the
+        // runtime store (see below), so no `runtime.sqlite` sits here for
+        // the bindings check.
+        if let Some(state_path) = self.persistent_state_path.clone() {
+            let runtime_store = if provider.meerkat_provider().name() == "disk" {
+                crate::native_startup::RuntimeStoreLocation::StateDir
+            } else {
+                crate::native_startup::RuntimeStoreLocation::StorageProvider
+            };
+            self.claim_state_dir(&state_path, runtime_store).await?;
+        }
         let ctx = crate::storage_provider::MetaRealmOpenContext {
             layout,
             state_dir,
@@ -2517,10 +2606,6 @@ impl UnifiedRuntimeBuilder {
         crate::storage_provider::enforce_fail_closed_store_set(&set, &ctx)?;
         #[cfg(feature = "extension-state")]
         if !self.tool_bundle_factories.is_empty() || !self.mcp_document_bindings.is_empty() {
-            set.continuity_store
-                .enable_identity_binding_history()
-                .await
-                .map_err(UnifiedRuntimeBuilderError::ExtensionAuthorityUnavailable)?;
             self.extension_store = Some(provider.open_extension_state(&ctx).await?);
         }
 
@@ -2733,10 +2818,24 @@ impl UnifiedRuntimeBuilder {
         #[cfg(not(feature = "extension-state"))]
         let wait_for_document_mcp = false;
 
-        let (mob_storage, mob_storage_provenance) = self
-            .mob_storage
-            .clone()
-            .unwrap_or_else(|| (MobStorage::in_memory(), MobStorageProvenance::default()));
+        let (mob_storage, mob_storage_provenance) = match (
+            self.mob_storage.clone(),
+            self.persistent_state_path.as_ref(),
+        ) {
+            (Some(supplied), _) => supplied,
+            // A persistent build keeps its mob storage durable beside the
+            // sessions by default.
+            (None, Some(state_path)) => crate::mob_composition_manifest::persistent_mob_storage(
+                MetaStorageLayout::with_injected_roots(state_path.clone(), None).event_log_db(),
+            )
+            .map_err(|error| {
+                UnifiedRuntimeBuilderError::Io(format!(
+                    "failed to open the persistent mob storage under {}: {error}",
+                    state_path.display()
+                ))
+            })?,
+            (None, None) => (MobStorage::in_memory(), MobStorageProvenance::default()),
+        };
 
         // Note: blocking I/O (fs, SQLite) — acceptable at startup.
         let mut spec = if let Some(ref state_path) = self.persistent_state_path {
@@ -2747,36 +2846,16 @@ impl UnifiedRuntimeBuilder {
                 ))
             })?;
 
-            let session_store_kind = if self.custom_session_store.is_some() {
-                self.custom_session_store_kind()
-            } else {
-                "SqliteSessionStore".to_string()
-            };
             let state_layout = MetaStorageLayout::with_injected_roots(state_path.clone(), None);
             let meerkat_realm = state_layout.meerkat_level_realm()?.clone();
-            let session_store: Arc<dyn meerkat::SessionStore> =
-                if let Some(ref store) = self.custom_session_store {
-                    store.clone()
-                } else {
-                    let sqlite_path = state_layout.session_db()?.path;
-                    Arc::new(
-                        meerkat_store::SqliteSessionStore::open(sqlite_path).map_err(|e| {
-                            UnifiedRuntimeBuilderError::Io(format!(
-                                "failed to open SQLite session store: {e}"
-                            ))
-                        })?,
-                    )
-                };
             MobBootstrapSpec::persistent_inner_with_provider_stores(
                 definition,
                 mob_storage,
+                mob_storage_provenance.clone(),
                 state_path.clone(),
                 max_sessions,
-                session_store,
-                &session_store_kind,
                 self.blob_injection()?,
                 self.ephemeral_blobs,
-                self.ephemeral_runtime_store,
                 self.schedule_store.clone(),
                 self.workgraph_store.clone(),
                 hook,
@@ -2789,7 +2868,9 @@ impl UnifiedRuntimeBuilder {
                 self.effective_mcp_call_context_provider(),
                 self.operation_refusal_observer.clone(),
                 wait_for_document_mcp,
+                self.state_dir_claim.clone(),
             )
+            .await
             .map_err(storage_resolution_builder_error)?
         } else if let Some(ref scratch_dir) = self.scratch_dir {
             std::fs::create_dir_all(scratch_dir).map_err(|e| {
@@ -2804,8 +2885,6 @@ impl UnifiedRuntimeBuilder {
                 mob_storage,
                 scratch_dir.clone(),
                 max_sessions,
-                self.custom_session_store.clone(),
-                &self.custom_session_store_kind(),
                 self.blob_injection()?,
                 self.schedule_store.clone(),
                 self.workgraph_store.clone(),
@@ -2832,8 +2911,6 @@ impl UnifiedRuntimeBuilder {
                 mob_storage,
                 store_path,
                 max_sessions,
-                self.custom_session_store.clone(),
-                &self.custom_session_store_kind(),
                 self.blob_injection()?,
                 self.schedule_store.clone(),
                 self.workgraph_store.clone(),
@@ -2853,6 +2930,10 @@ impl UnifiedRuntimeBuilder {
         };
 
         spec = spec.with_mob_storage_provenance(mob_storage_provenance);
+        // One place for all three compositions above.
+        if let Some(policy) = self.fork_instruction_policy {
+            spec = spec.with_fork_instruction_policy(policy);
+        }
         spec.options = MobBootstrapOptions {
             allow_ephemeral_sessions: true,
             notify_orchestrator_on_resume: true,
@@ -2908,6 +2989,19 @@ fn verify_shared_state_root(
         ));
     }
     Ok(())
+}
+
+/// Whether two state-directory spellings name one physical directory, by
+/// canonical identity. A spelling that cannot be canonicalized (the
+/// directory does not exist yet) names no claimed directory.
+fn same_directory(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (
+        crate::storage_layout::canonicalize_storage_root(left),
+        crate::storage_layout::canonicalize_storage_root(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// The realm extension authority and documents are keyed by: the installation
@@ -3023,39 +3117,31 @@ mod tests {
         }
     }
 
+    /// A persistent build without `mob_storage()` keeps its mob storage
+    /// durable beside the sessions: every resolution names the same
+    /// `event_log.sqlite3` under the state directory.
     #[tokio::test]
-    async fn persistent_state_without_mob_storage_keeps_the_ephemeral_mob_default() {
+    async fn persistent_state_without_mob_storage_keeps_mob_storage_durable() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let definition = MobDefinition::from_toml("[mob]\nid = \"builder-mob-default\"\n")
             .expect("fixture definition");
         let builder = UnifiedRuntimeBuilder::default()
             .definition(definition)
             .persistent_state(dir.path());
+        let journal =
+            MetaStorageLayout::with_injected_roots(dir.path().to_path_buf(), None).event_log_db();
         let first = builder.resolve_mob_spec().await.expect("first spec");
-        let first_store = first
-            .storage
-            .forked_participant_store()
-            .expect("default fork store")
-            .clone();
         assert_eq!(
-            first.mob_storage_provenance,
-            MobStorageProvenance::default()
+            first.mob_storage_provenance.persistent_path(),
+            Some(journal.as_path())
         );
         drop(first);
+        assert!(journal.is_file(), "the mob journal is durable");
         let second = builder.resolve_mob_spec().await.expect("second spec");
         assert_eq!(
-            second.mob_storage_provenance,
-            MobStorageProvenance::default()
-        );
-        assert!(
-            !Arc::ptr_eq(
-                &first_store,
-                second
-                    .storage
-                    .forked_participant_store()
-                    .expect("default fork store"),
-            ),
-            "persistent_state alone must not reuse a mob storage owner",
+            second.mob_storage_provenance.persistent_path(),
+            Some(journal.as_path()),
+            "a restart reopens the same durable mob storage"
         );
     }
 
@@ -3145,73 +3231,65 @@ mod tests {
                     && detail.contains("mob_spec() is already erased")));
     }
 
-    #[cfg(feature = "extension-state")]
+    /// The builder's fork instruction policy reaches the spec of each
+    /// composition it owns; unset, the spec keeps Meerkat's default.
     #[tokio::test]
-    async fn extension_gateway_authority_refuses_before_storage_or_factory_activation() {
-        struct NoCallbacks;
-        #[async_trait::async_trait]
-        impl crate::identity_first::gateway_bridges::CallbackBridge for NoCallbacks {
-            async fn call(
-                &self,
-                _: &str,
-                _: serde_json::Value,
-            ) -> Result<serde_json::Value, String> {
-                panic!("extension activation must not invent SDK history callbacks")
+    async fn the_fork_instruction_policy_reaches_every_builder_owned_spec() {
+        use meerkat_core::ForkInstructionPolicy;
+        let dir = tempfile::tempdir().expect("temporary directory");
+        for arm in ["persistent", "scratch", "temporary"] {
+            for (index, policy) in [
+                None,
+                Some(ForkInstructionPolicy::ReactivateInherited),
+                Some(ForkInstructionPolicy::Refuse),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let definition = MobDefinition::from_toml("[mob]\nid = \"builder-fork-policy\"\n")
+                    .expect("fixture definition");
+                let builder = UnifiedRuntimeBuilder::default().definition(definition);
+                let builder = match arm {
+                    "persistent" => {
+                        builder.persistent_state(dir.path().join(format!("state-{index}")))
+                    }
+                    "scratch" => builder.scratch_dir(dir.path().join(format!("scratch-{index}"))),
+                    _ => builder,
+                };
+                let builder = match policy {
+                    Some(policy) => builder.fork_instruction_policy(policy),
+                    None => builder,
+                };
+                let spec = builder.resolve_mob_spec().await.expect("spec resolves");
+                assert_eq!(
+                    spec.fork_instruction_policy,
+                    policy.unwrap_or(ForkInstructionPolicy::RequireExplicitActivation),
+                    "{arm} {policy:?}",
+                );
             }
         }
+    }
 
-        let definition = MobDefinition::from_toml("[mob]\nid = \"extension-activation\"\n")
-            .expect("definition parses");
-        let mut spec = UnifiedRuntimeBuilder::default()
+    /// A supplied spec carries its own fork instruction policy: the builder
+    /// refuses a second one instead of overriding it.
+    #[tokio::test]
+    async fn supplied_spec_refuses_a_builder_fork_instruction_policy() {
+        let definition = MobDefinition::from_toml("[mob]\nid = \"fork-policy-override\"\n")
+            .expect("fixture definition");
+        let spec = UnifiedRuntimeBuilder::default()
             .definition(definition)
             .resolve_mob_spec()
             .await
-            .expect("ephemeral spec resolves without execution");
-        let continuity = Arc::new(
-            crate::identity_first::gateway_bridges::GatewayContinuityStore::new(NoCallbacks),
-        );
-        let mut builder = UnifiedRuntimeBuilder::default().continuity_store(continuity);
-        assert!(
-            builder
-                .materialize_extension_factories(&mut spec)
-                .await
-                .expect("no registered extension leaves the host unchanged")
-                .is_none()
-        );
-
-        let dir = tempfile::tempdir().expect("temporary directory");
-        let state = dir.path().join("unopened-extension-state");
-        builder = builder.persistent_state(&state).register_tool_bundle_factory(
-            "durable-documents-test",
-            crate::extension_state::ToolBundleRequirements::durable_documents(
-                "durable-documents-test",
-                "documents_read",
-                "documents_apply",
-            ),
-            Arc::new(
-                |_: crate::extension_state::ToolBundleContext| -> Result<
-                    Arc<dyn meerkat_core::AgentToolDispatcher>,
-                    String,
-                > {
-                    panic!("unsupported authority must refuse before factory activation")
-                },
-            ),
-        );
-        assert!(matches!(
-            builder.materialize_extension_factories(&mut spec).await,
-            Err(UnifiedRuntimeBuilderError::ExtensionAuthorityUnavailable(
-                crate::identity_first::ContinuityStoreError::UnsupportedAuthority {
-                    capability: "SDK-hosted identity binding history"
-                }
-            ))
-        ));
-        assert!(
-            !state.exists(),
-            "refusal must precede opening document storage"
-        );
-        assert!(spec.before_activation.is_none());
-        assert!(spec.after_destroy.is_none());
-        assert!(spec.before_create.is_none());
+            .expect("empty fixture spec");
+        let result = UnifiedRuntimeBuilder::default()
+            .mob_spec(spec)
+            .fork_instruction_policy(meerkat_core::ForkInstructionPolicy::Refuse)
+            .build()
+            .await;
+        assert!(matches!(result,
+            Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(detail))
+                if detail.contains("fork_instruction_policy()")
+                    && detail.contains("mob_spec()")));
     }
 
     /// A document bundle's declared read/edit tools; composition never
@@ -3555,17 +3633,15 @@ mod tests {
         use crate::extension_state::{ToolBundleContext, ToolBundleRequirements};
         let dir = tempfile::tempdir().expect("temporary directory");
         let adopted = disk_adopted_state(dir.path()).await;
-        let supplied = || {
+        let supplied = || async {
             MobBootstrapSpec::persistent(
                 realm_definition("supplied"),
                 MobStorage::in_memory(),
+                MobStorageProvenance::declared_ephemeral(),
                 adopted.clone(),
                 4,
-                Arc::new(
-                    meerkat_store::SqliteSessionStore::open(adopted.join("sessions.sqlite3"))
-                        .expect("session store"),
-                ),
             )
+            .await
             .expect("supplied persistent spec")
         };
         let documents_realm = Arc::new(std::sync::Mutex::new(None::<String>));
@@ -3593,7 +3669,7 @@ mod tests {
         let elsewhere = dir.path().join("elsewhere");
         let mut builder =
             with_bundle(UnifiedRuntimeBuilder::default().persistent_state(&elsewhere));
-        let mut spec = supplied();
+        let mut spec = supplied().await;
         let error = match builder.materialize_extension_factories(&mut spec).await {
             Err(error) => error,
             Ok(_) => panic!("a spec composed over another state directory must refuse"),
@@ -3615,7 +3691,7 @@ mod tests {
         drop(builder);
 
         let mut builder = with_bundle(UnifiedRuntimeBuilder::default().persistent_state(&adopted));
-        let mut spec = supplied();
+        let mut spec = supplied().await;
         let registry = builder
             .materialize_extension_factories(&mut spec)
             .await

@@ -279,8 +279,8 @@ async fn boot_one_member(
     .await
     .expect("restore_flow");
     let runtime_id = match result.outcomes.get(&alice).expect("alice outcome") {
-        RestoreOutcome::Created { record, .. } | RestoreOutcome::Resumed { record, .. } => {
-            record.agent_runtime_id.clone()
+        RestoreOutcome::Created { binding, .. } | RestoreOutcome::Resumed { binding, .. } => {
+            binding.agent_runtime_id.clone()
         }
         other => panic!("expected the member to be created, got {other:?}"),
     };
@@ -566,6 +566,388 @@ async fn session_commit_pending_fails_closed_without_a_live_runtime_session() {
         "a retired member's session is gone, not quiet"
     );
     unified.shutdown().await;
+}
+
+/// A reset's superseded member retires through Core alone when no continuity
+/// session copy is composed, as in this file's bridge: there is no Meta
+/// projection to abandon, so the retire neither refuses nor leaves the
+/// member's roster row behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_superseded_member_retires_through_core_without_a_session_copy() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let (unified, bridge, runtime_id) = boot_one_member(
+        &temp.path().join("state"),
+        ScriptedClient::immediate(true),
+        Duration::from_secs(30),
+    )
+    .await;
+    let member = unified
+        .mob_handle()
+        .list_all_members()
+        .await
+        .into_iter()
+        .next()
+        .expect("the booted member")
+        .agent_identity;
+    let session_id = unified
+        .mob_handle()
+        .get_member(&member)
+        .await
+        .expect("read the member")
+        .and_then(|entry| entry.bridge_session_id().cloned())
+        .expect("the member has a session");
+
+    bridge
+        .retire_reset_superseded_member(&runtime_id, &session_id)
+        .await
+        .expect("with no session copy composed, the retire runs through Core alone");
+
+    assert!(
+        unified
+            .mob_handle()
+            .list_all_members()
+            .await
+            .iter()
+            .all(|entry| entry.agent_identity != member),
+        "the superseded member must leave no roster row"
+    );
+    unified.shutdown().await;
+}
+
+/// Core's typed Absent is the bridge's typed refusal, never a fresh spawn of
+/// its own: resuming a session Core holds no durable copy of refuses with
+/// `Unavailable { reason: Absent }` naming the session, and no member is
+/// spawned for the identity. The caller decides what happens next.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_absent_session_is_refused_typed_and_never_fresh_spawned() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let (unified, bridge, _runtime_id) = boot_one_member(
+        &temp.path().join("state"),
+        ScriptedClient::immediate(true),
+        Duration::from_secs(30),
+    )
+    .await;
+    let ghost = spec("ghost");
+    let draft = AgentBuildDraft {
+        compaction_curator: Default::default(),
+        model: None,
+        system_prompt: None,
+        additional_instructions: ghost.additional_instructions.clone(),
+        labels: ghost.labels.clone(),
+        app_context: ghost.context.clone(),
+        external_tools: Vec::new(),
+        local_external_tools: Default::default(),
+        provider_params: None,
+    };
+    let absent = meerkat_core::types::SessionId::new();
+
+    let refusal = bridge
+        .resume_session(&ghost.identity, &ghost, &draft, &absent, None)
+        .await
+        .expect_err("a session Core holds no copy of must be refused, not fresh-spawned");
+    let BridgeError::ResumeRejected { kind, .. } = &refusal else {
+        panic!("expected a typed resume refusal, got {refusal:?}");
+    };
+    assert_eq!(format!("{kind:?}"), "Unavailable { reason: Absent }");
+    assert!(
+        refusal.to_string().contains(&absent.to_string()),
+        "the refusal must name the session: {refusal}"
+    );
+    assert!(
+        unified
+            .mob_handle()
+            .list_all_members()
+            .await
+            .iter()
+            .all(|entry| !entry.agent_identity.as_str().contains("ghost")),
+        "no member may be spawned for the refused identity"
+    );
+    unified.shutdown().await;
+}
+
+/// The identity-keyed reads answer from Core. `live_member` and
+/// `live_member_scope` report the booted member's committed incarnation and
+/// session, `ensure_member_live` reports the same binding, the convergence
+/// status of an identity no intent manages reads as missing, and an identity
+/// Core holds no member for reads as `None` everywhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn identity_keyed_reads_answer_from_core() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let (unified, bridge, runtime_id) = boot_one_member(
+        &temp.path().join("state"),
+        ScriptedClient::immediate(true),
+        Duration::from_secs(30),
+    )
+    .await;
+    let alice = id("alice");
+
+    let live = bridge
+        .live_member(&alice)
+        .await
+        .expect("read the live member")
+        .expect("Core holds the booted member");
+    assert_eq!(
+        live.agent_runtime_id, runtime_id,
+        "the live member is the incarnation the runtime recorded"
+    );
+    let session_id = live
+        .session_id
+        .clone()
+        .expect("the booted member is session-backed");
+
+    let scope = bridge
+        .live_member_scope(&alice)
+        .await
+        .expect("capture the delivery scope")
+        .expect("Core holds the booted member");
+    assert_eq!(scope.session_id(), &session_id);
+
+    let ensured = bridge
+        .ensure_member_live(&alice)
+        .await
+        .expect("ensure the member is live")
+        .expect("Core holds the booted member");
+    assert_eq!(ensured, live);
+
+    assert!(matches!(
+        bridge
+            .identity_convergence_status(&alice)
+            .await
+            .expect("read the convergence status"),
+        meerkat_mob::identity::IdentityStoredObservation::Missing
+    ));
+
+    let ghost = id("ghost");
+    assert!(bridge.live_member(&ghost).await.expect("read").is_none());
+    assert!(
+        bridge
+            .live_member_scope(&ghost)
+            .await
+            .expect("read")
+            .is_none()
+    );
+    assert!(
+        bridge
+            .ensure_member_live(&ghost)
+            .await
+            .expect("read")
+            .is_none()
+    );
+    unified.shutdown().await;
+}
+
+/// A host-adopted identity is refused typed, and nothing moves. Meta writes
+/// no Core identity intent row, so a row Core holds for an identity is the
+/// host's: here Core's own `adopt_member_identity_declaration` writes
+/// revision 1 naming the member's live session. `ensure_member_live` and the
+/// resume collision arm read that row before any other step and refuse
+/// `HostAdopted`. The roster entry (generation, fence, runtime id, role,
+/// mode, labels, status), the member's session binding and Core's member
+/// lifecycle events stay exactly as they were.
+///
+/// The refusal is matched by its Debug name so this test also compiles, and
+/// fails for the right reason, against a bridge that has no such variant.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_adopted_identity_is_refused_typed_and_nothing_moves() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let (unified, bridge, runtime_id) = boot_one_member(
+        &temp.path().join("state"),
+        ScriptedClient::immediate(true),
+        Duration::from_secs(30),
+    )
+    .await;
+    // One committed turn, so the adopted session has a durable transcript.
+    bridge
+        .deliver_awaiting_commit_with_mode_context_and_system_prompt(
+            &runtime_id,
+            &meerkat_core::ContentInput::Text("before the host adopts".to_string()),
+            None,
+            &[],
+            HandlingMode::Queue,
+            None,
+        )
+        .await
+        .expect("a committed turn before adoption");
+
+    let handle = unified.mob_handle();
+    let alice = spec("alice");
+    let member = meerkat_meta::member_comms_id::mob_member_id(alice.identity.as_str());
+    let session_id = handle
+        .resolve_bridge_session_id(&member)
+        .await
+        .expect("the booted member is session-backed");
+    let entry = handle
+        .get_member(&member)
+        .await
+        .expect("roster read")
+        .expect("Core holds the booted member");
+
+    // The host adopts the identity: revision 1 naming the live session.
+    let params: meerkat_contracts::wire::MobAdoptMemberIdentityDeclarationParams =
+        serde_json::from_value(serde_json::json!({
+            "mob_id": handle.mob_id().to_string(),
+            "agent_identity": member.to_string(),
+            "request_id": "host-adopts-alice",
+            "precondition": "expected_absent",
+            "declaration_scope": "host-adoption-test",
+            "declaration_revision": 1,
+            "session": {
+                "session_id": session_id.to_string(),
+                "lineage_id": format!("session:{session_id}"),
+                "lineage_generation": 0,
+                "authority_policy": "require_existing"
+            },
+            "member": {
+                "profile_name": entry.role.to_string(),
+                "runtime_mode": entry.runtime_mode,
+                "labels": entry.labels,
+                "execution": { "execution": "controlling_session" }
+            },
+            "owned_wiring": [],
+            "convergence": { "kind": "drain", "max_wait_ms": 5000 }
+        }))
+        .expect("adoption params");
+    let request: meerkat_mob::AdoptMemberIdentityDeclaration =
+        params.try_into().expect("adoption request");
+    let adoption = handle
+        .adopt_member_identity_declaration(request)
+        .await
+        .expect("the host adopts alice");
+    assert!(
+        matches!(
+            adoption.adoption,
+            meerkat_mob::IdentityAdoptionOutcome::Adopted {
+                desired_revision: 1
+            }
+        ),
+        "{adoption:?}"
+    );
+    // Core converges the adopted row on its own. Let it settle, so the
+    // snapshot below sees only what the bridge does.
+    let converged = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(meerkat_mob::identity::IdentityStoredObservation::Valid(status)) =
+                handle.identity_convergence_status(&member).await
+                && status.condition() == meerkat_mob::IdentityConvergenceCondition::Converged
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(converged.is_ok(), "Core converges the adopted identity");
+
+    let before = member_snapshot(&handle, &member).await;
+    let cursor = last_event_cursor(&handle).await;
+
+    let draft = AgentBuildDraft {
+        compaction_curator: Default::default(),
+        model: None,
+        system_prompt: None,
+        additional_instructions: alice.additional_instructions.clone(),
+        labels: alice.labels.clone(),
+        app_context: alice.context.clone(),
+        external_tools: Vec::new(),
+        local_external_tools: Default::default(),
+        provider_params: None,
+    };
+    let ensured = bridge.ensure_member_live(&alice.identity).await;
+    let resumed = bridge
+        .resume_session(&alice.identity, &alice, &draft, &session_id, None)
+        .await;
+    let host_adopted = |error: Option<&BridgeError>| {
+        error.is_some_and(|e| format!("{e:?}").starts_with("HostAdopted"))
+    };
+    assert!(
+        host_adopted(ensured.as_ref().err()) && host_adopted(resumed.as_ref().err()),
+        "a host-adopted identity is refused HostAdopted by both verbs: ensure_member_live -> \
+         {ensured:?}, resume_session -> {resumed:?}"
+    );
+
+    assert_eq!(
+        member_snapshot(&handle, &member).await,
+        before,
+        "nothing moved: the roster entry and the session binding are unchanged"
+    );
+    let lifecycle: Vec<_> = events_after(&handle, cursor)
+        .await
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                meerkat_mob::MobEventKind::MemberSpawned(_)
+                    | meerkat_mob::MobEventKind::MemberRetirementStarted { .. }
+                    | meerkat_mob::MobEventKind::MemberRetired { .. }
+                    | meerkat_mob::MobEventKind::MemberReset { .. }
+                    | meerkat_mob::MobEventKind::MemberSessionBindingRecovered(_)
+            )
+        })
+        .collect();
+    assert!(
+        lifecycle.is_empty(),
+        "no member was spawned, retired or reset: {lifecycle:?}"
+    );
+    unified.shutdown().await;
+}
+
+/// Everything about `member` a retire, respawn or ensure would change.
+async fn member_snapshot(
+    handle: &meerkat_mob::MobHandle,
+    member: &meerkat_mob::AgentIdentity,
+) -> String {
+    let entry = handle
+        .get_member(member)
+        .await
+        .expect("roster read")
+        .expect("the member stays on the roster");
+    let status = handle
+        .list_members_including_retiring()
+        .await
+        .into_iter()
+        .find(|listed| listed.agent_identity == *member)
+        .map(|listed| listed.status);
+    let session = handle.resolve_bridge_session_id(member).await;
+    format!(
+        "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+        entry.agent_identity,
+        entry.generation,
+        entry.fence_token,
+        entry.agent_runtime_id,
+        entry.role,
+        entry.runtime_mode,
+        entry.labels,
+        status,
+        session
+    )
+}
+
+/// The cursor of the newest event in the mob's event store.
+async fn last_event_cursor(handle: &meerkat_mob::MobHandle) -> u64 {
+    let mut cursor = 0;
+    loop {
+        let batch = handle.poll_events(cursor, 512).await.expect("poll events");
+        match batch.last() {
+            Some(event) => cursor = event.cursor,
+            None => return cursor,
+        }
+    }
+}
+
+/// Every event appended after `cursor`.
+async fn events_after(
+    handle: &meerkat_mob::MobHandle,
+    mut cursor: u64,
+) -> Vec<meerkat_mob::MobEvent> {
+    let mut events = Vec::new();
+    loop {
+        let batch = handle.poll_events(cursor, 512).await.expect("poll events");
+        match batch.last() {
+            Some(event) => cursor = event.cursor,
+            None => return events,
+        }
+        events.extend(batch);
+    }
 }
 
 /// meerkat 0.8.45 reads member status through `observe_member_status_view`,

@@ -100,7 +100,9 @@ SKIPPABLE_FILES = frozenset(
         "deny.toml",
     }
 )
-SKIPPABLE_PREFIXES = ("docs/", "tools/bazel/")
+# tools/continuity-export holds standalone scripts whose tests fmt-lint runs;
+# no lane job reads them.
+SKIPPABLE_PREFIXES = ("docs/", "tools/bazel/", "tools/continuity-export/")
 
 # Prefix -> the lanes a change below it can reach. The first match decides,
 # so a narrower prefix comes before the area that contains it.
@@ -172,8 +174,13 @@ FEATURE_GATES = {
     "extension_state": re.compile(r'feature\s*=\s*"extension-state"'),
 }
 FEATURE_PATHS = {
-    # The transcript fixture the voice modules include_str!.
-    "voice": ("crates/meerkat-meta/src/console_voice/", "crates/meerkat-meta/tests/fixtures/console_voice_v1.json"),
+    # The transcript fixture the voice modules include_str!, and the runtime
+    # store forwarding probe, a test module only openai-live builds compile.
+    "voice": (
+        "crates/meerkat-meta/src/console_voice/",
+        "crates/meerkat-meta/tests/fixtures/console_voice_v1.json",
+        "crates/meerkat-meta/src/runtime_store_forwarding_probe",
+    ),
     "extension_state": ("crates/meta-extension-state/", "crates/meerkat-meta/src/extension_state"),
 }
 

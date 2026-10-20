@@ -11,6 +11,9 @@
 //! cursor next to the output, and SDK completion waits take the output as
 //! soon as the cursor moves.
 
+#[path = "support/core_members.rs"]
+mod core_members;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -20,9 +23,8 @@ use async_trait::async_trait;
 use meerkat_meta::identity_first::contracts::{ContinuityStore, LeaseProvider};
 use meerkat_meta::identity_first::{
     AgentAddressability, AgentBuildDraft, AgentIdentity, AgentRuntimeId, BridgeDelivery,
-    BridgeError, CheckpointVersion, CompletionCursor, ContinuityGeneration, ContinuityRecord,
-    DurabilityPolicy, DurableAgentSpec, FencingToken, IdentityLifecycleState, IdentityRuntime,
-    IdentityRuntimeConfig, LeaseGrant, LocalContinuityStore, LocalLeaseProvider, MemberInspection,
+    BridgeError, CompletionCursor, DurabilityPolicy, DurableAgentSpec, IdentityRuntime,
+    IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider, MemberInspection,
     ResumeSessionOutcome, SessionBridge, SessionSnapshot,
 };
 
@@ -34,6 +36,9 @@ struct CountingInspectBridge {
     delay: Duration,
     fail_next: AtomicBool,
     committed_output: std::sync::Mutex<Option<String>>,
+    /// The members Core holds, as the tests bind them and this double's
+    /// creates, resumes and retires leave them.
+    core: core_members::CoreMembers,
 }
 
 impl CountingInspectBridge {
@@ -43,6 +48,7 @@ impl CountingInspectBridge {
             delay,
             fail_next: AtomicBool::new(false),
             committed_output: std::sync::Mutex::new(None),
+            core: core_members::CoreMembers::default(),
         }
     }
 
@@ -59,27 +65,84 @@ impl CountingInspectBridge {
 impl SessionBridge for CountingInspectBridge {
     async fn create_session(
         &self,
-        _identity: &AgentIdentity,
-        _runtime_id: &AgentRuntimeId,
-        _spec: &DurableAgentSpec,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
-        session_id: &meerkat_core::types::SessionId,
-    ) -> Result<meerkat_core::types::SessionId, BridgeError> {
-        Ok(session_id.clone())
+    ) -> Result<meerkat_meta::identity_first::MemberRuntimeBinding, BridgeError> {
+        let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+            .map_err(|error| BridgeError::Mob(error.to_string()))?;
+        let session_id = &meerkat_core::types::SessionId::new();
+        let binding = meerkat_meta::identity_first::MemberRuntimeBinding {
+            agent_runtime_id,
+            session_id: Some(session_id.clone()),
+        };
+        self.core.bind(identity, &binding, &spec.profile);
+        Ok(binding)
     }
 
     async fn resume_session(
         &self,
-        _identity: &AgentIdentity,
-        _runtime_id: &AgentRuntimeId,
-        _spec: &DurableAgentSpec,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
         session_id: &meerkat_core::types::SessionId,
-        _snapshot: &SessionSnapshot,
+        _resume_from_role: Option<&meerkat_mob::ProfileName>,
     ) -> Result<ResumeSessionOutcome, BridgeError> {
+        let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+            .map_err(|error| BridgeError::Mob(error.to_string()))?;
+        self.core.bind(
+            identity,
+            &meerkat_meta::identity_first::MemberRuntimeBinding {
+                agent_runtime_id: agent_runtime_id.clone(),
+                session_id: Some(session_id.clone()),
+            },
+            &spec.profile,
+        );
         Ok(ResumeSessionOutcome::Resumed {
             session_id: session_id.clone(),
+            agent_runtime_id,
         })
+    }
+
+    async fn live_member(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_meta::identity_first::MemberRuntimeBinding>, BridgeError> {
+        self.core.live_member(identity)
+    }
+
+    async fn live_member_scope(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+        self.core.live_member_scope(identity)
+    }
+
+    async fn ensure_member_live(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_meta::identity_first::MemberRuntimeBinding>, BridgeError> {
+        self.core.live_member(identity)
+    }
+
+    async fn member_binding_history(
+        &self,
+    ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+        self.core.history()
+    }
+
+    async fn last_member_binding(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+        self.core.last_member_binding(identity)
+    }
+
+    async fn identity_management(
+        &self,
+        _identity: &AgentIdentity,
+    ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+        Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
     }
 
     async fn deliver_admitted(
@@ -98,7 +161,8 @@ impl SessionBridge for CountingInspectBridge {
         Ok(SessionSnapshot { data: Vec::new() })
     }
 
-    async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+    async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+        self.core.retire(runtime_id);
         Ok(())
     }
 
@@ -106,8 +170,10 @@ impl SessionBridge for CountingInspectBridge {
         &self,
         runtime_id: &AgentRuntimeId,
     ) -> Result<MemberInspection, BridgeError> {
-        let read = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+        // Capture the output before counting the read: a test that sees the
+        // count knows what this read reports.
         let committed = self.committed_output.lock().unwrap().clone();
+        let read = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
         tokio::time::sleep(self.delay).await;
         if self.fail_next.swap(false, Ordering::SeqCst) {
             return Err(BridgeError::Mob(
@@ -139,38 +205,37 @@ fn make_runtime(bridge: Arc<CountingInspectBridge>) -> Arc<IdentityRuntime> {
     }))
 }
 
-async fn register_active(runtime: &IdentityRuntime, name: &str) -> AgentIdentity {
+/// Register `name` with Core holding its member live at generation 0
+/// (runtime id `rt:{name}:0`). Core binds the member first, so a wait woken
+/// by the registration already reads it.
+async fn register_active(
+    runtime: &IdentityRuntime,
+    bridge: &CountingInspectBridge,
+    name: &str,
+) -> AgentIdentity {
     let identity = AgentIdentity::parse(name).unwrap();
+    let profile = meerkat_mob::ProfileName::from("default");
+    bridge.core.bind_live(
+        &identity,
+        &profile,
+        0,
+        Some(meerkat_core::types::SessionId::new()),
+    );
     runtime
-        .register(
-            DurableAgentSpec {
-                identity: identity.clone(),
-                profile: meerkat_mob::ProfileName::from("default"),
-                addressability: AgentAddressability::Addressable,
-                display_name: None,
-                labels: BTreeMap::new(),
-                context: None,
-                additional_instructions: Vec::new(),
-                initial_message: None,
-                runtime_mode_override: None,
-                backend: None,
-                binding: None,
-                placement: None,
-            },
-            IdentityLifecycleState::Active,
-            Some(ContinuityRecord {
-                identity: identity.clone(),
-                agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{name}")).unwrap(),
-                session_id: meerkat_core::types::SessionId::new(),
-                generation: ContinuityGeneration::new(0),
-                checkpoint_version: CheckpointVersion::new(0),
-            }),
-            Some(LeaseGrant {
-                identity: identity.clone(),
-                fencing_token: FencingToken::new(1),
-                ttl: Duration::from_mins(5),
-            }),
-        )
+        .register(DurableAgentSpec {
+            identity: identity.clone(),
+            profile,
+            addressability: AgentAddressability::Addressable,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: None,
+            backend: None,
+            binding: None,
+            placement: None,
+        })
         .await;
     identity
 }
@@ -181,7 +246,7 @@ async fn register_active(runtime: &IdentityRuntime, name: &str) -> AgentIdentity
 async fn concurrent_inspections_of_one_identity_share_one_read() {
     let bridge = Arc::new(CountingInspectBridge::new(Duration::from_millis(300)));
     let runtime = make_runtime(Arc::clone(&bridge));
-    let calendar = register_active(&runtime, "calendar").await;
+    let calendar = register_active(&runtime, &bridge, "calendar").await;
 
     let (first, second) = tokio::join!(runtime.inspect(&calendar), runtime.inspect(&calendar));
     let (first, second) = (first.expect("first"), second.expect("second"));
@@ -194,7 +259,7 @@ async fn concurrent_inspections_of_one_identity_share_one_read() {
 async fn a_settled_inspection_is_never_reused() {
     let bridge = Arc::new(CountingInspectBridge::new(Duration::ZERO));
     let runtime = make_runtime(Arc::clone(&bridge));
-    let calendar = register_active(&runtime, "calendar").await;
+    let calendar = register_active(&runtime, &bridge, "calendar").await;
 
     runtime.inspect(&calendar).await.expect("first read");
     runtime.inspect(&calendar).await.expect("second read");
@@ -231,7 +296,7 @@ async fn sdk_wait_for_completion(
 async fn an_inspection_after_a_completion_reports_the_new_output() {
     let bridge = Arc::new(CountingInspectBridge::new(Duration::ZERO));
     let runtime = make_runtime(Arc::clone(&bridge));
-    let calendar = register_active(&runtime, "calendar").await;
+    let calendar = register_active(&runtime, &bridge, "calendar").await;
 
     bridge.commit_output("A");
     let baseline = runtime.completion_cursor(&calendar).await;
@@ -261,7 +326,7 @@ async fn an_inspection_after_a_completion_reports_the_new_output() {
 async fn a_read_in_flight_across_a_completion_is_not_joined_by_a_later_caller() {
     let bridge = Arc::new(CountingInspectBridge::new(Duration::from_millis(300)));
     let runtime = make_runtime(Arc::clone(&bridge));
-    let calendar = register_active(&runtime, "calendar").await;
+    let calendar = register_active(&runtime, &bridge, "calendar").await;
 
     bridge.commit_output("A");
     let before = tokio::spawn({
@@ -269,7 +334,15 @@ async fn a_read_in_flight_across_a_completion_is_not_joined_by_a_later_caller() 
         let calendar = calendar.clone();
         async move { runtime.inspect(&calendar).await }
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Turn B completes only once the first read is in flight (it has captured A).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while bridge.reads() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first read never started"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     bridge.commit_output("B");
     runtime.record_turn_completed(&calendar).await;
 
@@ -286,7 +359,7 @@ async fn a_read_in_flight_across_a_completion_is_not_joined_by_a_later_caller() 
 async fn a_failed_inspection_is_not_reused() {
     let bridge = Arc::new(CountingInspectBridge::new(Duration::ZERO));
     let runtime = make_runtime(Arc::clone(&bridge));
-    let calendar = register_active(&runtime, "calendar").await;
+    let calendar = register_active(&runtime, &bridge, "calendar").await;
 
     bridge.fail_next.store(true, Ordering::SeqCst);
     assert!(runtime.inspect(&calendar).await.is_err());
@@ -299,8 +372,8 @@ async fn a_failed_inspection_is_not_reused() {
 async fn inspections_of_different_identities_are_read_separately() {
     let bridge = Arc::new(CountingInspectBridge::new(Duration::from_millis(100)));
     let runtime = make_runtime(Arc::clone(&bridge));
-    let calendar = register_active(&runtime, "calendar").await;
-    let mail = register_active(&runtime, "mail").await;
+    let calendar = register_active(&runtime, &bridge, "calendar").await;
+    let mail = register_active(&runtime, &bridge, "mail").await;
 
     let (calendar_view, mail_view) =
         tokio::join!(runtime.inspect(&calendar), runtime.inspect(&mail));
@@ -319,7 +392,7 @@ async fn inspections_of_different_identities_are_read_separately() {
 async fn an_output_wait_with_nothing_committed_reads_once_and_times_out() {
     let bridge = Arc::new(CountingInspectBridge::new(Duration::ZERO));
     let runtime = make_runtime(Arc::clone(&bridge));
-    let calendar = register_active(&runtime, "calendar").await;
+    let calendar = register_active(&runtime, &bridge, "calendar").await;
 
     // The guard is virtual time too: a loop whose deadline is not on the
     // tokio clock, or that keeps re-reading, overruns it and fails here.
@@ -344,7 +417,7 @@ async fn an_output_wait_with_nothing_committed_reads_once_and_times_out() {
 async fn an_output_wait_wakes_on_the_completion_that_commits_the_output() {
     let bridge = Arc::new(CountingInspectBridge::new(Duration::ZERO));
     let runtime = make_runtime(Arc::clone(&bridge));
-    let calendar = register_active(&runtime, "calendar").await;
+    let calendar = register_active(&runtime, &bridge, "calendar").await;
 
     let wait = runtime.wait_for_output_containing(&calendar, "DONE", Duration::from_mins(10));
     let commit = async {
@@ -372,10 +445,13 @@ async fn an_output_wait_started_before_registration_reads_once_it_registers() {
     let wait = runtime.wait_for_output(&late, Duration::from_mins(10));
     let register = async {
         tokio::task::yield_now().await;
-        register_active(&runtime, "late").await;
+        register_active(&runtime, &bridge, "late").await;
     };
     let (output, ()) = tokio::join!(wait, register);
-    assert_eq!(output.expect("woken by the registration"), "rt:late read 1");
+    assert_eq!(
+        output.expect("woken by the registration"),
+        "rt:late:0 read 1"
+    );
     assert_eq!(
         bridge.reads(),
         1,

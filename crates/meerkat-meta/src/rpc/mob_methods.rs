@@ -1141,13 +1141,12 @@ pub(super) async fn handle_retire_member(
                     .retire_member_alias_tracked(&durable, &mid)
                     .await
                 {
-                    Ok(token) => JsonRpcResponse {
+                    Ok(()) => JsonRpcResponse {
                         jsonrpc: JSONRPC_VERSION.to_string(),
                         id: response_id,
                         result: Some(serde_json::json!({
                             "accepted": true,
                             "identity_first": true,
-                            "fencing_token": token.get(),
                         })),
                         error: None,
                     },
@@ -1403,14 +1402,14 @@ pub(super) async fn handle_respawn_member(
                     .reset_member_alias_tracked(&durable, &mid)
                     .await
                 {
-                    Ok(record) => JsonRpcResponse {
+                    Ok(binding) => JsonRpcResponse {
                         jsonrpc: JSONRPC_VERSION.to_string(),
                         id: response_id,
                         result: Some(serde_json::json!({
                             "accepted": true,
                             "identity_first": true,
-                            "session_id": record.session_id.to_string(),
-                            "generation": record.generation.get(),
+                            "session_id": binding.session_id().map(ToString::to_string),
+                            "generation": binding.generation().get(),
                         })),
                         error: None,
                     },

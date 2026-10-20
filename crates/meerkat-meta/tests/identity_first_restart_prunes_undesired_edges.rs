@@ -146,21 +146,17 @@ async fn boot(
     topology: Option<Arc<dyn TopologyProvider>>,
 ) -> Booted {
     std::fs::create_dir_all(state_path).expect("state root");
-    let session_store = Arc::new(
-        meerkat_store::SqliteSessionStore::open(state_path.join("sessions.sqlite3"))
-            .expect("open the session store"),
-    );
     let (storage, provenance) = persistent_mob_storage(state_path.join("mob.sqlite3"))
         .expect("open persistent mob storage");
     let spec = MobBootstrapSpec::persistent(
         definition.clone(),
         storage,
+        provenance,
         state_path.to_path_buf(),
         16,
-        session_store,
     )
+    .await
     .expect("compose persistent Meta stores")
-    .with_mob_storage_provenance(provenance)
     // Creates no agent child mob. It restarts in this process, which the
     // durable child-mob default refuses as a duplicate owner; explicit
     // ProcessBound keeps this test's cold-recovery oracle.
@@ -250,8 +246,8 @@ fn runtime_ids(
     outcomes
         .iter()
         .map(|(identity, outcome)| match outcome {
-            RestoreOutcome::Created { record, .. } | RestoreOutcome::Resumed { record, .. } => {
-                (record.agent_runtime_id.clone(), identity.clone())
+            RestoreOutcome::Created { binding, .. } | RestoreOutcome::Resumed { binding, .. } => {
+                (binding.agent_runtime_id.clone(), identity.clone())
             }
             other => panic!("{identity} did not materialize: {other:?}"),
         })

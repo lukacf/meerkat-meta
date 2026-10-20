@@ -311,9 +311,9 @@ MemoryRecord {
 EvidenceRef {
     session: SessionId,
     generation: ContinuityGeneration, // fresh-start boundaries are first-class:
-                                      //   the continuity store upserts one row per
-                                      //   identity, so session→generation is
-                                      //   otherwise unrecoverable after reset
+                                      //   a reset starts a fresh session at a new
+                                      //   generation, so the pair names one life
+                                      //   of the identity
     revision: RevisionId,             // content-addressed transcript revision that
                                       //   was head at capture time — provenance
                                       //   survives Hygienist rewrites (§8.6); all

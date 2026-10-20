@@ -93,7 +93,10 @@ fn doctor_reports_twins_and_live_durability_on_persistent_gateway() {
         "init failed: {init}"
     );
 
-    // Fabricate the split-brain twin next to the gateway's own sessions.db.
+    // Fabricate split-brain session twins beside the live gateway. Its own
+    // sessions live in Core's pair on runtime.sqlite, so both spellings are
+    // planted.
+    std::fs::write(state_dir.path().join("sessions.db"), b"").expect("twin file");
     std::fs::write(state_dir.path().join("sessions.sqlite"), b"").expect("twin file");
 
     let resp = gateway.rpc(json!({

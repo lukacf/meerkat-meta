@@ -6,8 +6,9 @@
 //!
 //! Capstone stress test that exercises everything at once: two mobs with
 //! cross-mob comms, identity-first lifecycle, mid-conversation shutdown/restore,
-//! member failure/recovery, topology changes, fencing races, and reset vs
-//! respawn semantics.
+//! member failure/recovery, topology changes, and reset vs respawn semantics.
+//! Every identity fact it checks (runtime id, session, generation) is Core's:
+//! the identity runtime keeps no continuity record, checkpoint or lease.
 //!
 //! Run:
 //! ```bash
@@ -33,11 +34,10 @@ use meerkat_meta::contact_directory::ContactDirectory;
 use meerkat_meta::identity_first::contracts::{AgentCustomizer, TopologyProvider};
 use meerkat_meta::identity_first::orchestrator::RestoreOutcome;
 use meerkat_meta::identity_first::{
-    AgentAddressability, AgentBuildContext, AgentBuildDraft, AgentIdentity, CheckpointVersion,
-    ContinuityGeneration, ContinuityRecord, ContinuityStore, ContinuityStoreError, CustomizerError,
-    DurabilityPolicy, DurableAgentSpec, FencingToken, IdentityLifecycleState, IdentityRuntime,
+    AgentAddressability, AgentBuildContext, AgentBuildDraft, AgentIdentity, ContinuityStore,
+    CustomizerError, DurabilityPolicy, DurableAgentSpec, IdentityLifecycleState, IdentityRuntime,
     IdentityRuntimeConfig, IdentityRuntimeError, LocalContinuityStore, LocalLeaseProvider,
-    ManagedPeerEdge, SessionBridge, SessionSnapshot, TopologyContext, TopologyError,
+    ManagedPeerEdge, MemberRuntimeBinding, SessionBridge, TopologyContext, TopologyError,
     wire_cross_mob_by_identity,
 };
 use meerkat_meta::mob_handle_runtime::SessionCreatedContext;
@@ -321,16 +321,9 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
     let author_continuity_path = temp.path().join("author_continuity.db");
     let critic_continuity_path = temp.path().join("critic_continuity.db");
 
-    // Shared session stores — survive across v1→v2 rebuild (like a persistent volume).
-    // Mob storage is in-memory; persistent_state covers sessions/runtime/blob/metadata surfaces.
-    let author_session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
-        meerkat_store::SqliteSessionStore::open(temp.path().join("author_sessions.db"))
-            .expect("author session store"),
-    );
-    let critic_session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
-        meerkat_store::SqliteSessionStore::open(temp.path().join("critic_sessions.db"))
-            .expect("critic session store"),
-    );
+    // Sessions survive the v1->v2 rebuild in each state directory's
+    // runtime.sqlite (like a persistent volume): persistent_state covers the
+    // session, runtime, blob, metadata and mob storage surfaces.
 
     let start = Instant::now();
 
@@ -351,7 +344,6 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
     let rt_authors = UnifiedRuntimeBuilder::default()
         .definition(author_definition(&model))
         .persistent_state(&author_state)
-        .session_store(author_session_store.clone())
         .comms(true)
         .contact_directory(dir.clone())
         .build()
@@ -361,7 +353,6 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
     let rt_critics = UnifiedRuntimeBuilder::default()
         .definition(critic_definition(&model))
         .persistent_state(&critic_state)
-        .session_store(critic_session_store.clone())
         .comms(true)
         .contact_directory(dir.clone())
         .build()
@@ -386,7 +377,8 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         .map(|bridge| Arc::new(bridge) as Arc<dyn SessionBridge>)
         .expect("critic bridge");
 
-    // Continuity stores (SQLite — survive across drops)
+    // The identity runtime config still takes a continuity store and a lease
+    // provider; both are ignored since 0.9.4 (Core's mob is the authority).
     let author_store = Arc::new(
         LocalContinuityStore::open(&author_continuity_path).expect("author continuity store"),
     );
@@ -394,7 +386,6 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         LocalContinuityStore::open(&critic_continuity_path).expect("critic continuity store"),
     );
 
-    // Lease providers (in-memory — fresh per "process")
     let author_leases = Arc::new(LocalLeaseProvider::new());
     let critic_leases = Arc::new(LocalLeaseProvider::new());
 
@@ -469,17 +460,17 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         .await
         .expect("critic restore_flow");
 
-    // Collect records for all 7 identities
-    let mut records: BTreeMap<String, ContinuityRecord> = BTreeMap::new();
+    // Collect Core's bindings for all 7 identities
+    let mut bindings: BTreeMap<String, MemberRuntimeBinding> = BTreeMap::new();
     for (name, result) in [("author", &author_result), ("critic", &critic_result)] {
         for (identity, outcome) in &result.outcomes {
             match outcome {
-                RestoreOutcome::Created { record, .. } => {
+                RestoreOutcome::Created { binding, .. } => {
                     eprintln!(
-                        "[Phase 1] {identity} created: rt={}, session={}",
-                        record.agent_runtime_id, record.session_id
+                        "[Phase 1] {identity} created: rt={}, session={:?}",
+                        binding.agent_runtime_id, binding.session_id
                     );
-                    records.insert(identity.to_string(), record.clone());
+                    bindings.insert(identity.to_string(), binding.clone());
                 }
                 other => {
                     panic!("[Phase 1] expected Created for {identity} in {name}, got {other:?}")
@@ -487,7 +478,7 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
             }
         }
     }
-    assert_eq!(records.len(), 7, "should have 7 identities total");
+    assert_eq!(bindings.len(), 7, "should have 7 identities total");
 
     // Verify topology-aware prompts
     let lead_author_draft = match author_result.outcomes.get(&id("lead:author")).unwrap() {
@@ -778,26 +769,15 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
     eprintln!("\n--- Phase 4: System drop + restore ---");
 
     // Record pre-crash state for all 7 identities
-    let pre_crash_sessions: BTreeMap<String, _> = records
+    let pre_crash_sessions: BTreeMap<String, _> = bindings
         .iter()
-        .map(|(k, r)| {
+        .map(|(k, b)| {
             (
                 k.clone(),
-                (r.session_id.clone(), r.agent_runtime_id.clone()),
+                (b.session_id.clone(), b.agent_runtime_id.clone()),
             )
         })
         .collect();
-
-    // Get a fencing token from writer:a for stale checkpoint test
-    let wa_status = author_irt
-        .status(&id("writer:a"))
-        .await
-        .expect("writer:a status");
-    let wa_old_fencing = wa_status
-        .lease
-        .as_ref()
-        .expect("writer:a should have lease")
-        .fencing_token;
 
     eprintln!("[Phase 4] Shutting down both runtimes (simulating crash)...");
     // Drop identity runtimes first (they hold bridge Arcs → MobHandle clones).
@@ -819,28 +799,8 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
     // is still claimed. This means in-process restart loses conversation history.
     meerkat_comms::InprocRegistry::global().clear();
 
-    // -- Fencing race: inject stale checkpoint --
-    eprintln!("[Phase 4] Stale checkpoint injection test...");
-    let stale_result = author_store
-        .save_session_snapshot(
-            &id("writer:a"),
-            &pre_crash_sessions["writer:a"].0,
-            ContinuityGeneration::new(0),
-            CheckpointVersion::new(999), // version doesn't matter — token is stale
-            FencingToken::new(wa_old_fencing.get().saturating_sub(1)), // stale token
-            &SessionSnapshot {
-                data: b"stale-data".to_vec(),
-            },
-        )
-        .await;
-    assert!(
-        matches!(
-            stale_result,
-            Err(ContinuityStoreError::StaleFencingToken { .. })
-        ),
-        "stale checkpoint should be rejected: {stale_result:?}"
-    );
-    eprintln!("[Phase 4] Stale checkpoint correctly REJECTED");
+    // The identity runtime writes no checkpoint, so there is no stale Meta
+    // checkpoint to inject: Core's session store and fence are the authority.
 
     // -- Rebuild both runtimes (ephemeral + shared session store) --
     eprintln!("[Phase 4] Rebuilding runtimes...");
@@ -850,7 +810,6 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
     let rt_authors = UnifiedRuntimeBuilder::default()
         .definition(author_definition(&model))
         .persistent_state(&author_state)
-        .session_store(author_session_store.clone())
         .comms(true)
         .contact_directory(dir2.clone())
         .build()
@@ -860,7 +819,6 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
     let rt_critics = UnifiedRuntimeBuilder::default()
         .definition(critic_definition(&model))
         .persistent_state(&critic_state)
-        .session_store(critic_session_store.clone())
         .comms(true)
         .contact_directory(dir2)
         .build()
@@ -883,7 +841,7 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         .map(|bridge| Arc::new(bridge) as Arc<dyn SessionBridge>)
         .expect("critic bridge v2");
 
-    // Fresh lease providers (old leases died with the "crashed" process)
+    // Ignored by the identity runtime, as above.
     let author_leases2 = Arc::new(LocalLeaseProvider::new());
     let critic_leases2 = Arc::new(LocalLeaseProvider::new());
 
@@ -904,10 +862,7 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         .dispatch_text(&id("lead:author"), "hello?")
         .await;
     assert!(
-        matches!(
-            pre_restore,
-            Err(IdentityRuntimeError::UnknownIdentity(_) | IdentityRuntimeError::NoActiveLease(_))
-        ),
+        matches!(pre_restore, Err(IdentityRuntimeError::UnknownIdentity(_))),
         "pre-restore dispatch should fail with structured error, got: {pre_restore:?}"
     );
     eprintln!("[Phase 4] Pre-restore dispatch correctly returned: {pre_restore:?}");
@@ -952,18 +907,10 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
             .unwrap_or_else(|| panic!("missing outcome for {identity_str}"));
 
         let (new_session, new_rt_id) = match outcome {
-            RestoreOutcome::Created { record, .. } | RestoreOutcome::Resumed { record, .. } => {
-                (&record.session_id, &record.agent_runtime_id)
+            RestoreOutcome::Created { binding, .. } | RestoreOutcome::Resumed { binding, .. } => {
+                (&binding.session_id, &binding.agent_runtime_id)
             }
-            RestoreOutcome::Dormant { record, .. } => {
-                let record = record.as_ref().unwrap_or_else(|| {
-                    panic!("{identity_str} restored dormant without continuity")
-                });
-                (&record.session_id, &record.agent_runtime_id)
-            }
-            RestoreOutcome::Broken(f) => {
-                panic!("{identity_str} restore failed: {f:?}")
-            }
+            other => panic!("{identity_str} did not wake after the restart: {other:?}"),
         };
 
         assert_eq!(
@@ -972,7 +919,7 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         );
         assert_eq!(
             new_session, old_session,
-            "{identity_str} should keep same SessionId: old={old_session}, new={new_session}"
+            "{identity_str} should keep same SessionId: old={old_session:?}, new={new_session:?}"
         );
     }
     eprintln!("[Phase 4] All 7 identities resumed with stable IDs");
@@ -1018,7 +965,7 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
     eprintln!("[Phase 4] writer:b responds after restore");
 
     eprintln!(
-        "[Phase 4] PASSED ({:.1}s) — stale checkpoint rejected, pre-restore error OK, all resumed",
+        "[Phase 4] PASSED ({:.1}s) - pre-restore error OK, all resumed",
         start.elapsed().as_secs_f64()
     );
 
@@ -1165,14 +1112,16 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         .await
         .expect("author restore_flow v4");
 
-    // writer:b should be re-created (was retired, continuity still in store)
+    // writer:b wakes again (it was retired; Core keeps its member history)
     let wb_v4 = match author_result4.outcomes.get(&id("writer:b")).unwrap() {
-        RestoreOutcome::Created { record, .. } | RestoreOutcome::Resumed { record, .. } => record,
+        RestoreOutcome::Created { binding, .. } | RestoreOutcome::Resumed { binding, .. } => {
+            binding
+        }
         other => panic!("unexpected writer:b outcome: {other:?}"),
     };
     eprintln!(
-        "[Phase 8] writer:b back: rt={}, gen={}, session={}",
-        wb_v4.agent_runtime_id, wb_v4.generation, wb_v4.session_id
+        "[Phase 8] writer:b back: rt={}, session={:?}",
+        wb_v4.agent_runtime_id, wb_v4.session_id
     );
 
     // Verify lead:author prompt is back to both writers
@@ -1230,38 +1179,49 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         .expect("critic restore_flow v3");
 
     let jy_pre_reset = match critic_result3.outcomes.get(&id("judge:y")).unwrap() {
-        RestoreOutcome::Created { record, .. } | RestoreOutcome::Resumed { record, .. } => {
-            record.clone()
+        RestoreOutcome::Created { binding, .. } | RestoreOutcome::Resumed { binding, .. } => {
+            binding.clone()
         }
         other => panic!("unexpected judge:y outcome: {other:?}"),
     };
-    let jy_old_gen = jy_pre_reset.generation;
-    let jy_old_session = jy_pre_reset.session_id.clone();
+    let jy_old_gen = critic_irt2
+        .status(&id("judge:y"))
+        .await
+        .expect("judge:y status before reset")
+        .generation
+        .expect("judge:y has a Core binding");
+    let jy_old_session = jy_pre_reset
+        .session_id
+        .clone()
+        .expect("judge:y is bound to a session");
     eprintln!("[Phase 9] judge:y pre-reset: gen={jy_old_gen}, session={jy_old_session}");
+    let jx_gen_before = critic_irt2
+        .status(&id("judge:x"))
+        .await
+        .expect("judge:x status before judge:y reset")
+        .generation;
 
-    // Now reset judge:y — destructive
-    let reset_record = critic_irt2
+    // Now reset judge:y, destructive: Core mints a fresh session at a
+    // higher generation, and the old session is never resumed again.
+    let reset_binding = critic_irt2
         .reset(&id("judge:y"))
         .await
         .expect("reset judge:y");
 
-    assert_eq!(
-        reset_record.generation,
-        ContinuityGeneration::new(jy_old_gen.get() + 1),
-        "reset should advance generation"
+    assert!(
+        reset_binding.generation() > jy_old_gen,
+        "reset should advance generation: old={jy_old_gen}, new={}",
+        reset_binding.generation()
     );
     assert_ne!(
-        reset_record.session_id, jy_old_session,
+        reset_binding.session_id(),
+        Some(&jy_old_session),
         "reset should mint new SessionId"
     );
-    assert_eq!(
-        reset_record.checkpoint_version,
-        CheckpointVersion::new(0),
-        "reset should reset checkpoint version to 0"
-    );
     eprintln!(
-        "[Phase 9] judge:y reset: new gen={}, new session={}",
-        reset_record.generation, reset_record.session_id
+        "[Phase 9] judge:y reset: new gen={}, new session={:?}",
+        reset_binding.generation(),
+        reset_binding.session_id()
     );
 
     // judge:y should have NO memory of DOLPHIN
@@ -1296,11 +1256,13 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         "judge:x should still be Active after judge:y reset"
     );
     assert_eq!(
-        jx_status.generation,
-        Some(ContinuityGeneration::new(0)),
+        jx_status.generation, jx_gen_before,
         "judge:x generation should be unchanged"
     );
-    eprintln!("[Phase 9] judge:x still Active gen=0 — unaffected by judge:y reset");
+    eprintln!(
+        "[Phase 9] judge:x still Active at gen={:?} - unaffected by judge:y reset",
+        jx_status.generation
+    );
 
     eprintln!(
         "[Phase 9] PASSED ({:.1}s) — reset vs respawn produce genuinely different outcomes",
@@ -1352,7 +1314,6 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         "║  KITCHEN SINK PASSED in {:.1}s                           ║",
         elapsed.as_secs_f64()
     );
-    eprintln!("║  7 identities, 2 mobs, system crash, fencing race,     ║");
     eprintln!("║  member dropout, respawn with memory, reset without,   ║");
     eprintln!("║  topology changes, cross-mob wiring — ALL verified.    ║");
     eprintln!("╚══════════════════════════════════════════════════════════╝");

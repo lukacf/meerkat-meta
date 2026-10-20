@@ -25,7 +25,6 @@
     clippy::uninlined_format_args
 )]
 
-use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -249,173 +248,12 @@ fn initialize_for_shutdown(gateway: &mut Gateway, state_dir: &tempfile::TempDir)
     assert_eq!(init["result"]["stdio_shutdown_horizon_ms"], 392_000);
 }
 
-fn answer_identity_provider_callback(
-    gateway: &mut Gateway,
-    message: &Value,
-    release_seen: &Cell<bool>,
-) {
-    let Some(method) = message.get("method").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(id) = message.get("id").cloned() else {
-        return;
-    };
-    let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
-
-    let result = match method {
-        "callback/roster_provider/roster" => json!([{
-            "identity": "agent:alpha",
-            "profile": "default",
-            "addressability": "addressable",
-            "display_name": null,
-            "labels": {},
-            "context": null,
-            "additional_instructions": []
-        }]),
-        "callback/continuity_store/resolve_many" => {
-            let mut states = serde_json::Map::new();
-            for identity in params["identities"].as_array().into_iter().flatten() {
-                let identity = identity.as_str().expect("identity string");
-                states.insert(identity.to_string(), json!({ "state": "uninitialized" }));
-            }
-            Value::Object(states)
-        }
-        "callback/continuity_store/load_session_snapshot" => Value::Null,
-        "callback/continuity_store/delete_session_snapshot_if_current_revision" => {
-            Value::Bool(false)
-        }
-        "callback/continuity_store/save_session_snapshot"
-        | "callback/continuity_store/upsert_continuity_record"
-        | "callback/continuity_store/delete_continuity_record" => Value::Null,
-        "callback/lease_provider/acquire_leases" => {
-            let mut acquisitions = serde_json::Map::new();
-            for identity in params["identities"].as_array().into_iter().flatten() {
-                let identity = identity.as_str().expect("identity string");
-                acquisitions.insert(
-                    identity.to_string(),
-                    json!({
-                        "result": "acquired",
-                        "identity": identity,
-                        "fencing_token": 101,
-                        "ttl": 600_000
-                    }),
-                );
-            }
-            Value::Object(acquisitions)
-        }
-        "callback/lease_provider/renew_leases" => {
-            let mut renewals = serde_json::Map::new();
-            for grant in params["grants"].as_array().into_iter().flatten() {
-                let identity = grant["identity"].as_str().expect("grant identity");
-                renewals.insert(
-                    identity.to_string(),
-                    json!({
-                        "result": "renewed",
-                        "identity": identity,
-                        "fencing_token": grant["fencing_token"],
-                        "ttl": grant["ttl"]
-                    }),
-                );
-            }
-            Value::Object(renewals)
-        }
-        "callback/lease_provider/release_leases" => {
-            assert_eq!(
-                params["grants"],
-                json!([{
-                    "identity": "agent:alpha",
-                    "fencing_token": 101,
-                    "ttl": 600_000
-                }]),
-                "shutdown must release the exact externally acquired grant"
-            );
-            release_seen.set(true);
-            Value::Null
-        }
-        other => panic!("unexpected identity provider callback: {other}"),
-    };
-    gateway.send(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
-}
-
 #[test]
 fn persistent_gateway_exits_after_stdin_eof() {
     let state_dir = tempfile::tempdir().expect("state dir");
     let mut gateway = Gateway::start();
     initialize_for_shutdown(&mut gateway, &state_dir);
 
-    gateway.close_stdin();
-    let status = gateway.wait_for_exit(WEDGE_BACKSTOP);
-    assert!(status.success(), "rpc_gateway exit status: {status}");
-}
-
-#[test]
-fn explicit_shutdown_keeps_callbacks_open_until_external_leases_are_released() {
-    let state_dir = tempfile::tempdir().expect("state dir");
-    let scratch_dir = tempfile::tempdir().expect("scratch dir");
-    let mut gateway = Gateway::start();
-    let release_seen = Cell::new(false);
-
-    gateway.send(json!({
-        "jsonrpc": "2.0",
-        "id": "init",
-        "method": "meta/init",
-        "params": {
-            "persistent_state": state_dir.path(),
-            "mob_config": MOB_CONFIG,
-            "has_roster_provider": true,
-            "has_continuity_store": true,
-            "has_lease_provider": true,
-            "scratch_dir": scratch_dir.path(),
-            "runtime_options": {
-                "demo_llm": true,
-                "identity_bootstrap_mode": { "mode": "eager_materialize" }
-            }
-        }
-    }));
-    let init = gateway
-        .wait_for(
-            WEDGE_BACKSTOP,
-            |gateway, message| {
-                answer_identity_provider_callback(gateway, message, &release_seen);
-            },
-            |message| is_response_with_id(message, "init"),
-        )
-        .expect("identity-first init response");
-    assert!(
-        init["result"]["contract_version"].is_string(),
-        "identity-first init failed: {init}"
-    );
-    assert_eq!(init["result"]["stdio_shutdown_handshake"], true);
-    assert_eq!(init["result"]["stdio_shutdown_horizon_ms"], 392_000);
-    assert!(
-        !release_seen.get(),
-        "bootstrap must retain its acquired lease"
-    );
-
-    gateway.send(json!({
-        "jsonrpc": "2.0",
-        "id": "shutdown",
-        "method": "meta/shutdown",
-        "params": {}
-    }));
-    let shutdown = gateway
-        .wait_for(
-            WEDGE_BACKSTOP,
-            |gateway, message| {
-                answer_identity_provider_callback(gateway, message, &release_seen);
-            },
-            |message| is_response_with_id(message, "shutdown"),
-        )
-        .expect("shutdown handshake response");
-
-    gateway_shutdown::assert_persistent_shutdown_completed(&shutdown, "explicit shutdown");
-    assert!(
-        release_seen.get(),
-        "shutdown response arrived before the external lease release callback"
-    );
-
-    // Match SDK behavior: close stdin only after the gateway confirms runtime
-    // cleanup, which also releases Tokio's blocking stdin helper.
     gateway.close_stdin();
     let status = gateway.wait_for_exit(WEDGE_BACKSTOP);
     assert!(status.success(), "rpc_gateway exit status: {status}");
@@ -529,41 +367,32 @@ fn rpc_dispatch_serves_requests_while_a_callback_is_pending() {
     );
 }
 
-/// Methods `answer_identity_provider_callback` knows how to answer with a
-/// schema-correct result. Everything else gets a `null` acknowledgement so a
-/// new optional callback verb cannot wedge this harness, EXCEPT
-/// `callback/build_agent`, which the recall regression deliberately withholds.
-const KNOWN_PROVIDER_CALLBACKS: &[&str] = &[
-    "callback/roster_provider/roster",
-    "callback/continuity_store/resolve_many",
-    "callback/continuity_store/load_session_snapshot",
-    "callback/continuity_store/delete_session_snapshot_if_current_revision",
-    "callback/continuity_store/save_session_snapshot",
-    "callback/continuity_store/upsert_continuity_record",
-    "callback/continuity_store/delete_continuity_record",
-    "callback/lease_provider/acquire_leases",
-    "callback/lease_provider/renew_leases",
-    "callback/lease_provider/release_leases",
-];
-
-fn answer_provider_callback_holding_builds(
-    gateway: &mut Gateway,
-    message: &Value,
-    release_seen: &Cell<bool>,
-) {
+/// Answer the roster callback with `agent:alpha` and acknowledge every other
+/// provider callback with `null`, EXCEPT `callback/build_agent`, which the tests
+/// answer (or deliberately withhold) themselves.
+fn answer_roster_callback_holding_builds(gateway: &mut Gateway, message: &Value) {
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return;
     };
     if method == "callback/build_agent" {
         return;
     }
-    if KNOWN_PROVIDER_CALLBACKS.contains(&method) {
-        answer_identity_provider_callback(gateway, message, release_seen);
+    let Some(id) = message.get("id").cloned() else {
         return;
-    }
-    if let Some(id) = message.get("id").cloned() {
-        gateway.send(json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null }));
-    }
+    };
+    let result = match method {
+        "callback/roster_provider/roster" => json!([{
+            "identity": "agent:alpha",
+            "profile": "default",
+            "addressability": "addressable",
+            "display_name": null,
+            "labels": {},
+            "context": null,
+            "additional_instructions": []
+        }]),
+        _ => Value::Null,
+    };
+    gateway.send(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
 }
 
 /// Declared-vs-resolved capability invariant, CREATE half (activation-41).
@@ -580,9 +409,7 @@ fn answer_provider_callback_holding_builds(
 #[test]
 fn callback_built_member_resolves_declared_workgraph_tools_on_create() {
     let state_dir = tempfile::tempdir().expect("state dir");
-    let scratch_dir = tempfile::tempdir().expect("scratch dir");
     let mut gateway = Gateway::start();
-    let release_seen = Cell::new(false);
 
     gateway.send(json!({
         "jsonrpc": "2.0",
@@ -592,10 +419,7 @@ fn callback_built_member_resolves_declared_workgraph_tools_on_create() {
             "persistent_state": state_dir.path(),
             "mob_config": MOB_CONFIG_WORKGRAPH,
             "has_roster_provider": true,
-            "has_continuity_store": true,
-            "has_lease_provider": true,
             "has_session_builder": true,
-            "scratch_dir": scratch_dir.path(),
             "runtime_options": {
                 "demo_llm": true,
                 "identity_bootstrap_mode": { "mode": "lazy_materialize" }
@@ -606,7 +430,7 @@ fn callback_built_member_resolves_declared_workgraph_tools_on_create() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_provider_callback_holding_builds(gateway, message, &release_seen);
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "init"),
         )
@@ -631,7 +455,7 @@ fn callback_built_member_resolves_declared_workgraph_tools_on_create() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_provider_callback_holding_builds(gateway, message, &release_seen);
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_callback_request(m, "callback/build_agent"),
         )
@@ -645,7 +469,7 @@ fn callback_built_member_resolves_declared_workgraph_tools_on_create() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_provider_callback_holding_builds(gateway, message, &release_seen);
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "dispatch"),
         )
@@ -665,7 +489,7 @@ fn callback_built_member_resolves_declared_workgraph_tools_on_create() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_provider_callback_holding_builds(gateway, message, &release_seen);
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "tools"),
         )
@@ -697,9 +521,7 @@ fn callback_built_member_resolves_declared_workgraph_tools_on_create() {
 #[test]
 fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
     let state_dir = tempfile::tempdir().expect("state dir");
-    let scratch_dir = tempfile::tempdir().expect("scratch dir");
     let mut gateway = Gateway::start();
-    let release_seen = Cell::new(false);
 
     gateway.send(json!({
         "jsonrpc": "2.0",
@@ -709,10 +531,7 @@ fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
             "persistent_state": state_dir.path(),
             "mob_config": MOB_CONFIG,
             "has_roster_provider": true,
-            "has_continuity_store": true,
-            "has_lease_provider": true,
             "has_session_builder": true,
-            "scratch_dir": scratch_dir.path(),
             "runtime_options": {
                 "demo_llm": true,
                 "agent_memory": true,
@@ -724,7 +543,7 @@ fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_provider_callback_holding_builds(gateway, message, &release_seen);
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "init"),
         )
@@ -750,7 +569,7 @@ fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_provider_callback_holding_builds(gateway, message, &release_seen);
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_callback_request(m, "callback/build_agent"),
         )
@@ -772,7 +591,7 @@ fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_provider_callback_holding_builds(gateway, message, &release_seen);
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "recall"),
         )
@@ -793,7 +612,7 @@ fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_provider_callback_holding_builds(gateway, message, &release_seen);
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "dispatch"),
         )
@@ -804,182 +623,10 @@ fn agent_memory_recall_answers_while_the_same_identity_build_is_parked() {
     );
 }
 
-/// A HOST-side continuity store that actually remembers what the gateway
-/// persisted through it, so a SECOND gateway process can resume from it.
-///
-/// `answer_identity_provider_callback` is deliberately amnesiac (resolve_many
-/// is always `uninitialized`); the cross-boot resume regression needs the
-/// real downstream app shape: `upsert_continuity_record` / `save_session_snapshot`
-/// payloads captured verbatim and echoed back on the next boot's
-/// `resolve_many` / `load_session_snapshot`.
-#[derive(Default)]
-struct HostContinuityState {
-    /// identity -> latest `ContinuityRecord` JSON, exactly as upserted.
-    records: RefCell<BTreeMap<String, Value>>,
-    /// session id -> latest `SessionSnapshot` JSON, exactly as saved.
-    snapshots: RefCell<BTreeMap<String, Value>>,
-}
-
-impl HostContinuityState {
-    fn record(&self, identity: &str) -> Option<Value> {
-        self.records.borrow().get(identity).cloned()
-    }
-
-    fn has_snapshot(&self) -> bool {
-        !self.snapshots.borrow().is_empty()
-    }
-}
-
-/// Stateful analogue of `answer_provider_callback_holding_builds`: continuity
-/// verbs read/write `state`, lease acquisition grants `fencing_token` (a new
-/// process acquiring the same identity presents a HIGHER token), and
-/// `callback/build_agent` is left for the test body to answer explicitly.
-fn answer_stateful_provider_callback_holding_builds(
-    gateway: &mut Gateway,
-    message: &Value,
-    state: &HostContinuityState,
-    fencing_token: u64,
-) {
-    let Some(method) = message.get("method").and_then(Value::as_str) else {
-        return;
-    };
-    if method == "callback/build_agent" {
-        return;
-    }
-    let Some(id) = message.get("id").cloned() else {
-        return;
-    };
-    let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
-
-    let result = match method {
-        "callback/roster_provider/roster" => json!([{
-            "identity": "agent:alpha",
-            "profile": "default",
-            "addressability": "addressable",
-            "display_name": null,
-            "labels": {},
-            "context": null,
-            "additional_instructions": []
-        }]),
-        "callback/continuity_store/resolve_many" => {
-            let records = state.records.borrow();
-            let mut states = serde_json::Map::new();
-            for identity in params["identities"].as_array().into_iter().flatten() {
-                let identity = identity.as_str().expect("identity string");
-                let resolve_state = match records.get(identity) {
-                    Some(record) => json!({ "state": "ready", "record": record }),
-                    None => json!({ "state": "uninitialized" }),
-                };
-                states.insert(identity.to_string(), resolve_state);
-            }
-            Value::Object(states)
-        }
-        // Reference shape for the callback added in 547ea908. `null` is a
-        // GENUINE absence; a bound session answers with named fields so an
-        // implementor never has to know a tuple order. Before this existed the
-        // bridge inherited the trait's `Ok(None)` default and every
-        // owner-authority pass silently registered nothing.
-        "callback/continuity_store/resolve_record_by_session" => {
-            let session_id = params["session_id"].as_str().unwrap_or_default();
-            let records = state.records.borrow();
-            match records
-                .values()
-                .find(|record| record["session_id"].as_str() == Some(session_id))
-            {
-                Some(record) => json!({
-                    "record": record,
-                    "fencing_token": fencing_token,
-                    "checkpoint_version": record["checkpoint_version"].as_u64().unwrap_or(0),
-                }),
-                None => Value::Null,
-            }
-        }
-        "callback/continuity_store/upsert_continuity_record" => {
-            let record = params["record"].clone();
-            let identity = record["identity"]
-                .as_str()
-                .expect("upserted record identity")
-                .to_string();
-            state.records.borrow_mut().insert(identity, record);
-            Value::Null
-        }
-        "callback/continuity_store/delete_continuity_record" => {
-            let identity = params["identity"].as_str().expect("record identity");
-            state.records.borrow_mut().remove(identity);
-            Value::Null
-        }
-        "callback/continuity_store/save_session_snapshot" => {
-            let session_id = params["session_id"]
-                .as_str()
-                .expect("snapshot session id")
-                .to_string();
-            state
-                .snapshots
-                .borrow_mut()
-                .insert(session_id, params["snapshot"].clone());
-            Value::Null
-        }
-        "callback/continuity_store/load_session_snapshot" => {
-            let session_id = params["session_id"].as_str().expect("snapshot session id");
-            state
-                .snapshots
-                .borrow()
-                .get(session_id)
-                .cloned()
-                .unwrap_or(Value::Null)
-        }
-        "callback/continuity_store/delete_session_snapshot_if_current_revision" => {
-            Value::Bool(false)
-        }
-        "callback/lease_provider/acquire_leases" => {
-            let mut acquisitions = serde_json::Map::new();
-            for identity in params["identities"].as_array().into_iter().flatten() {
-                let identity = identity.as_str().expect("identity string");
-                acquisitions.insert(
-                    identity.to_string(),
-                    json!({
-                        "result": "acquired",
-                        "identity": identity,
-                        "fencing_token": fencing_token,
-                        "ttl": 600_000
-                    }),
-                );
-            }
-            Value::Object(acquisitions)
-        }
-        "callback/lease_provider/renew_leases" => {
-            let mut renewals = serde_json::Map::new();
-            for grant in params["grants"].as_array().into_iter().flatten() {
-                let identity = grant["identity"].as_str().expect("grant identity");
-                renewals.insert(
-                    identity.to_string(),
-                    json!({
-                        "result": "renewed",
-                        "identity": identity,
-                        "fencing_token": grant["fencing_token"],
-                        "ttl": grant["ttl"]
-                    }),
-                );
-            }
-            Value::Object(renewals)
-        }
-        "callback/lease_provider/release_leases" => Value::Null,
-        // Any new optional callback verb gets a null acknowledgement so it
-        // cannot wedge this harness (mirrors the stateless answerer above).
-        _ => Value::Null,
-    };
-    gateway.send(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
-}
-
 /// Drive one materialization to completion: dispatch to `agent:alpha`, answer
 /// the held `callback/build_agent` with `{}`, and wait for the dispatch
-/// response, answering provider callbacks statefully throughout.
-fn dispatch_alpha_through_build(
-    gateway: &mut Gateway,
-    state: &HostContinuityState,
-    fencing_token: u64,
-    dispatch_id: &str,
-) -> Value {
+/// response, answering the roster callback throughout.
+fn dispatch_alpha_through_build(gateway: &mut Gateway, dispatch_id: &str) -> Value {
     gateway.send(json!({
         "jsonrpc": "2.0",
         "id": dispatch_id,
@@ -993,12 +640,7 @@ fn dispatch_alpha_through_build(
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    state,
-                    fencing_token,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_callback_request(m, "callback/build_agent"),
         )
@@ -1012,25 +654,132 @@ fn dispatch_alpha_through_build(
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    state,
-                    fencing_token,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, dispatch_id),
         )
         .expect("dispatch response after callback reply")
 }
 
+/// Answer the roster callback as `answer_roster_callback_holding_builds`
+/// does, and `callback/build_agent` with `{}`: for a process that may build
+/// a member on its own, such as one whose durable mob storage restores it.
+fn answer_roster_and_build_callbacks(gateway: &mut Gateway, message: &Value) {
+    if is_callback_request(message, "callback/build_agent") {
+        gateway.send(json!({
+            "jsonrpc": "2.0",
+            "id": message["id"].clone(),
+            "result": {}
+        }));
+    } else {
+        answer_roster_callback_holding_builds(gateway, message);
+    }
+}
+
+/// Dispatch to `agent:alpha` and wait for the dispatch response, answering a
+/// `callback/build_agent` if one comes, without requiring one.
+fn dispatch_alpha_answering_builds(gateway: &mut Gateway, dispatch_id: &str) -> Value {
+    gateway.send(json!({
+        "jsonrpc": "2.0",
+        "id": dispatch_id,
+        "method": "meta/dispatch",
+        "params": {
+            "identity": "agent:alpha",
+            "dispatch_input": { "content": "hello", "origin": "connector" }
+        }
+    }));
+    gateway
+        .wait_for(
+            WEDGE_BACKSTOP,
+            |gateway, message| {
+                answer_roster_and_build_callbacks(gateway, message);
+            },
+            |m| is_response_with_id(m, dispatch_id),
+        )
+        .expect("dispatch response")
+}
+
+/// Core's identity lease TTL (`IDENTITY_LEASE_MAX_TTL_MS`): a restarted
+/// process waits out the previous process's lease on an identity for at most
+/// this long after that process last renewed it.
+const IDENTITY_LEASE_TTL: Duration = Duration::from_secs(30);
+
+/// Poll `meta/status_identity` for `identity` until Core's reconciler has
+/// converged it (a runtime id, and an active intent revision equal to the
+/// desired one), answering every callback, builds included. Panics with the last
+/// status once the lease TTL plus `WEDGE_BACKSTOP` has passed.
+fn await_identity_converged(gateway: &mut Gateway, identity: &str) -> Value {
+    let deadline = Instant::now() + IDENTITY_LEASE_TTL + WEDGE_BACKSTOP;
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        let request_id = format!("converge-{attempt}");
+        gateway.send(json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "meta/status_identity",
+            "params": { "identity": identity }
+        }));
+        let status = gateway
+            .wait_for(
+                WEDGE_BACKSTOP,
+                |gateway, message| {
+                    answer_roster_and_build_callbacks(gateway, message);
+                },
+                |m| is_response_with_id(m, &request_id),
+            )
+            .expect("status_identity response")["result"]
+            .clone();
+        let convergence = &status["convergence"];
+        // Two absent revisions would compare equal: the active one must be a
+        // revision.
+        if status["agent_runtime_id"].is_string()
+            && convergence["active_intent_revision"].is_u64()
+            && convergence["active_intent_revision"] == convergence["desired_intent_revision"]
+        {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{identity} did not converge within the identity lease TTL plus \
+             {WEDGE_BACKSTOP:?}: {status}"
+        );
+        // Keep answering callbacks between the reads.
+        let _ = gateway.wait_for(
+            Duration::from_millis(250),
+            |gateway, message| {
+                answer_roster_and_build_callbacks(gateway, message);
+            },
+            |_| false,
+        );
+    }
+}
+
+/// The session `agent:alpha` is bound to, from `meta/status_identity`.
+fn session_id_of_alpha(gateway: &mut Gateway, request_id: &str) -> String {
+    gateway.send(json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "meta/status_identity",
+        "params": { "identity": "agent:alpha" }
+    }));
+    let status = gateway
+        .wait_for(
+            WEDGE_BACKSTOP,
+            |gateway, message| {
+                answer_roster_callback_holding_builds(gateway, message);
+            },
+            |m| is_response_with_id(m, request_id),
+        )
+        .expect("status_identity response");
+    status["result"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("agent:alpha must be bound to a session: {status}"))
+        .to_string()
+}
+
 /// Fetch `meta/identity/resolved_tools` for `agent:alpha` as a name list.
-fn resolved_tools_for_alpha(
-    gateway: &mut Gateway,
-    state: &HostContinuityState,
-    fencing_token: u64,
-    request_id: &str,
-) -> Vec<String> {
+fn resolved_tools_for_alpha(gateway: &mut Gateway, request_id: &str) -> Vec<String> {
     gateway.send(json!({
         "jsonrpc": "2.0",
         "id": request_id,
@@ -1041,12 +790,7 @@ fn resolved_tools_for_alpha(
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    state,
-                    fencing_token,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, request_id),
         )
@@ -1076,22 +820,25 @@ fn resolved_tools_for_alpha(
 /// EXPLICIT current-profile setting wins, and creation-era metadata fills
 /// only categories the current profile leaves `Inherit`.
 ///
-/// Two real gateway processes share one host-side continuity store (this
-/// test's stateful callback answerer) and one persistent-state + scratch dir:
+/// Two real gateway processes share one persistent-state dir and its durable
+/// mob storage:
 ///
 /// - PHASE 1 (create era): profile WITHOUT workgraph; dispatch materializes
-///   `agent:alpha` via `callback/build_agent`, the turn checkpoints through
-///   `save_session_snapshot`/`upsert_continuity_record`, graceful shutdown.
+///   `agent:alpha` via `callback/build_agent`, the turn commits its session,
+///   graceful shutdown.
+/// - Between the phases the stored definition advances to the workgraph
+///   profile, as a later release's one-shot definition update does: the store
+///   pins the definition a launch must match, and declaring the mob storage
+///   in memory with a roster under `persistent_state` is refused.
 /// - PHASE 2 (resume era): new process, profile WITH `tools.workgraph = true`;
-///   `resolve_many` now answers `ready` with the phase-1 record (a HIGHER
-///   fencing token models the new process acquiring the same identity), the
+///   the durable mob storage restores the member when the mob lifts during
+///   init and builds it through the host SessionBuilder there, so phase 2
+///   answers that build (`lazy_materialize` defers only the roster pass). The
 ///   member RESUMES the phase-1 session, and its resolved tool surface must
 ///   carry `workgraph_*`.
 #[test]
-fn ephemeral_mob_storage_resumed_member_resolves_tool_category_declared_after_creation() {
+fn durable_mob_storage_resumed_member_resolves_tool_category_declared_after_creation() {
     let state_dir = tempfile::tempdir().expect("state dir");
-    let scratch_dir = tempfile::tempdir().expect("scratch dir");
-    let continuity = HostContinuityState::default();
 
     // ------------------------------------------------------------------
     // PHASE 1: create era. Workgraph is ABSENT from the profile.
@@ -1105,18 +852,9 @@ fn ephemeral_mob_storage_resumed_member_resolves_tool_category_declared_after_cr
             "persistent_state": state_dir.path(),
             "mob_config": MOB_CONFIG,
             "has_roster_provider": true,
-            "has_continuity_store": true,
-            "has_lease_provider": true,
             "has_session_builder": true,
-            "scratch_dir": scratch_dir.path(),
             "runtime_options": {
                 "demo_llm": true,
-                // Declared in-memory mob storage. A persistent mob storage
-                // PINS mob_config, because Meerkat refuses a definition that
-                // disagrees with the persisted spec store, so changing the
-                // profile across restarts requires declaring mob state
-                // ephemeral. That trade is the point of this contract.
-                "mob_storage": { "storage": "memory" },
                 "identity_bootstrap_mode": { "mode": "lazy_materialize" }
             }
         }
@@ -1125,12 +863,7 @@ fn ephemeral_mob_storage_resumed_member_resolves_tool_category_declared_after_cr
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    101,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "init1"),
         )
@@ -1140,7 +873,7 @@ fn ephemeral_mob_storage_resumed_member_resolves_tool_category_declared_after_cr
         "phase-1 init failed: {init}"
     );
 
-    let dispatch = dispatch_alpha_through_build(&mut gateway, &continuity, 101, "dispatch1");
+    let dispatch = dispatch_alpha_through_build(&mut gateway, "dispatch1");
     assert!(
         dispatch.get("result").is_some(),
         "phase-1 dispatch must succeed so agent:alpha is Active: {dispatch}"
@@ -1148,7 +881,7 @@ fn ephemeral_mob_storage_resumed_member_resolves_tool_category_declared_after_cr
 
     // Create-era baseline: the profile does not declare workgraph, so the
     // created member's resolved surface must not carry it.
-    let phase1_tools = resolved_tools_for_alpha(&mut gateway, &continuity, 101, "tools1");
+    let phase1_tools = resolved_tools_for_alpha(&mut gateway, "tools1");
     assert!(
         phase1_tools
             .iter()
@@ -1156,29 +889,11 @@ fn ephemeral_mob_storage_resumed_member_resolves_tool_category_declared_after_cr
         "phase-1 profile has no workgraph, resolved surface must not either: {phase1_tools:?}"
     );
 
-    // The turn persists through the host store (blob-canonical path); make
-    // sure a snapshot actually landed before we shut the process down.
-    if !continuity.has_snapshot() {
-        let save = gateway
-            .wait_for(
-                WEDGE_BACKSTOP,
-                |gateway, message| {
-                    answer_stateful_provider_callback_holding_builds(
-                        gateway,
-                        message,
-                        &continuity,
-                        101,
-                    );
-                },
-                |m| is_callback_request(m, "callback/continuity_store/save_session_snapshot"),
-            )
-            .expect("phase-1 session snapshot save callback");
-        answer_stateful_provider_callback_holding_builds(&mut gateway, &save, &continuity, 101);
-    }
+    let phase1_session_id = session_id_of_alpha(&mut gateway, "status1");
 
     // Graceful end of the create era: the explicit handshake keeps callback
-    // admission open through runtime shutdown (final flushes and the lease
-    // release round through the answerable host), then stdin EOF exits.
+    // admission open through runtime shutdown (final flushes through the
+    // answerable host), then stdin EOF exits.
     gateway.send(json!({
         "jsonrpc": "2.0",
         "id": "shutdown1",
@@ -1189,41 +904,22 @@ fn ephemeral_mob_storage_resumed_member_resolves_tool_category_declared_after_cr
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    101,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "shutdown1"),
         )
         .expect("phase-1 shutdown handshake response");
-    assert_eq!(
-        shutdown["result"]["shutdown"], true,
-        "phase-1 shutdown failed: {shutdown}"
-    );
+    gateway_shutdown::assert_persistent_shutdown_completed(&shutdown, "phase-1 shutdown");
     gateway.close_stdin();
     let status = gateway.wait_for_exit(WEDGE_BACKSTOP);
     assert!(status.success(), "rpc_gateway exit status: {status}");
     drop(gateway);
-
-    let phase1_record = continuity
-        .record("agent:alpha")
-        .expect("phase 1 must have upserted a continuity record for agent:alpha");
-    let phase1_session_id = phase1_record["session_id"]
-        .as_str()
-        .expect("continuity record session_id")
-        .to_string();
-    assert!(
-        continuity.has_snapshot(),
-        "phase 1 must have saved a session snapshot through the host store"
-    );
+    advance_stored_definition(state_dir.path(), MOB_CONFIG_WORKGRAPH);
 
     // ------------------------------------------------------------------
-    // PHASE 2: resume era. The profile now DECLARES workgraph; the stateful
-    // store makes agent:alpha resolve `ready` with the phase-1 record, so
-    // the build is a RESUME by construction, not a recreation.
+    // PHASE 2: resume era. The profile now DECLARES workgraph; agent:alpha's
+    // persisted binding makes the build a RESUME by construction, not a
+    // recreation.
     // ------------------------------------------------------------------
     let mut gateway = Gateway::start();
     gateway.send(json!({
@@ -1234,32 +930,21 @@ fn ephemeral_mob_storage_resumed_member_resolves_tool_category_declared_after_cr
             "persistent_state": state_dir.path(),
             "mob_config": MOB_CONFIG_WORKGRAPH,
             "has_roster_provider": true,
-            "has_continuity_store": true,
-            "has_lease_provider": true,
             "has_session_builder": true,
-            "scratch_dir": scratch_dir.path(),
             "runtime_options": {
                 "demo_llm": true,
-                // Declared in-memory mob storage. A persistent mob storage
-                // PINS mob_config, because Meerkat refuses a definition that
-                // disagrees with the persisted spec store, so changing the
-                // profile across restarts requires declaring mob state
-                // ephemeral. That trade is the point of this contract.
-                "mob_storage": { "storage": "memory" },
                 "identity_bootstrap_mode": { "mode": "lazy_materialize" }
             }
         }
     }));
+    // The durable mob storage restores the member that was live at the last
+    // stop when the mob lifts during init, and builds it through the host
+    // SessionBuilder there, as it has since Meta 0.9.0: answer that build.
     let init = gateway
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    102,
-                );
+                answer_roster_and_build_callbacks(gateway, message);
             },
             |m| is_response_with_id(m, "init2"),
         )
@@ -1269,7 +954,9 @@ fn ephemeral_mob_storage_resumed_member_resolves_tool_category_declared_after_cr
         "phase-2 init failed: {init}"
     );
 
-    let dispatch = dispatch_alpha_through_build(&mut gateway, &continuity, 102, "dispatch2");
+    // The restored member is live already: the dispatch answers a build
+    // callback if one comes, without requiring one.
+    let dispatch = dispatch_alpha_answering_builds(&mut gateway, "dispatch2");
     assert!(
         dispatch.get("result").is_some(),
         "phase-2 dispatch must succeed so the resumed member is Active: {dispatch}"
@@ -1279,7 +966,7 @@ fn ephemeral_mob_storage_resumed_member_resolves_tool_category_declared_after_cr
     // the category declared AFTER its creation. At the 0.8.20 pin this list
     // never contains workgraph_* (creation-era metadata.tooling overwrote the
     // explicit profile declaration on resume).
-    let phase2_tools = resolved_tools_for_alpha(&mut gateway, &continuity, 102, "tools2");
+    let phase2_tools = resolved_tools_for_alpha(&mut gateway, "tools2");
     assert!(
         phase2_tools
             .iter()
@@ -1302,12 +989,7 @@ fn ephemeral_mob_storage_resumed_member_resolves_tool_category_declared_after_cr
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    102,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "status2"),
         )
@@ -1319,23 +1001,48 @@ fn ephemeral_mob_storage_resumed_member_resolves_tool_category_declared_after_cr
     );
 }
 
+/// Advance the stored definition in `state_dir`'s durable mob storage to
+/// `definition`, as a later release's one-shot definition update does, then
+/// wait until the store has closed.
+fn advance_stored_definition(state_dir: &std::path::Path, definition: &str) {
+    let path = state_dir.join("event_log.sqlite3");
+    let definition = meerkat_mob::MobDefinition::from_toml(definition).expect("definition");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let storage = meerkat_mob::MobStorage::persistent(&path).expect("open the mob store");
+        let receipt = storage
+            .update_definition(1, definition)
+            .await
+            .expect("advance the stored definition");
+        assert_eq!(receipt.epoch, 2, "{receipt:?}");
+    });
+    drop(runtime);
+    // The store's connection worker closes on its own thread after the store
+    // is dropped; the exclusive fence waits for it.
+    drop(
+        meerkat_sqlite::ExclusiveFence::acquire(&path, Duration::from_secs(30))
+            .expect("the advanced store closed"),
+    );
+}
+
 /// CONTRACT: a PERSISTENT mob storage pins `mob_config`. Two gateway processes
 /// over the same state dir, second one carrying a changed definition, must be
 /// refused with the typed actionable divergence error before the mob actuates.
 ///
 /// This is the other half of
-/// `ephemeral_mob_storage_resumed_member_resolves_tool_category_declared_after_creation`.
+/// `durable_mob_storage_resumed_member_resolves_tool_category_declared_after_creation`.
 /// Durable mob storage is what makes adopted identity declarations survive a
-/// restart, and Meerkat 0.8.26 refuses a definition that disagrees with the
-/// persisted spec store on both create and resume
-/// (`sync_definition_with_spec_store`). So the two properties cannot both hold
-/// on one storage, and the operator has to be told which one they have rather
-/// than discovering it as an internal error naming two stores.
+/// restart, and Meerkat refuses a definition that disagrees with the persisted
+/// spec store on both create and resume (`sync_definition_with_spec_store`).
+/// A changed profile reaches the store through a definition update, never by
+/// launching with it, and the operator is told so rather than discovering it
+/// as an internal error naming two stores.
 #[test]
 fn persistent_mob_storage_refuses_changed_definition_on_the_same_state_dir() {
     let state_dir = tempfile::tempdir().expect("state dir");
-    let scratch_dir = tempfile::tempdir().expect("scratch dir");
-    let continuity = HostContinuityState::default();
 
     // PHASE 1: create era, persistent mob storage (the default on a
     // persistent_state launch), definition WITHOUT workgraph.
@@ -1348,10 +1055,7 @@ fn persistent_mob_storage_refuses_changed_definition_on_the_same_state_dir() {
             "persistent_state": state_dir.path(),
             "mob_config": MOB_CONFIG,
             "has_roster_provider": true,
-            "has_continuity_store": true,
-            "has_lease_provider": true,
             "has_session_builder": true,
-            "scratch_dir": scratch_dir.path(),
             "runtime_options": {
                 "demo_llm": true,
                 "identity_bootstrap_mode": { "mode": "lazy_materialize" }
@@ -1362,12 +1066,7 @@ fn persistent_mob_storage_refuses_changed_definition_on_the_same_state_dir() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    101,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "init1"),
         )
@@ -1387,12 +1086,7 @@ fn persistent_mob_storage_refuses_changed_definition_on_the_same_state_dir() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    101,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "shutdown1"),
         )
@@ -1413,10 +1107,7 @@ fn persistent_mob_storage_refuses_changed_definition_on_the_same_state_dir() {
             "persistent_state": state_dir.path(),
             "mob_config": MOB_CONFIG_WORKGRAPH,
             "has_roster_provider": true,
-            "has_continuity_store": true,
-            "has_lease_provider": true,
             "has_session_builder": true,
-            "scratch_dir": scratch_dir.path(),
             "runtime_options": {
                 "demo_llm": true,
                 "identity_bootstrap_mode": { "mode": "lazy_materialize" }
@@ -1427,12 +1118,7 @@ fn persistent_mob_storage_refuses_changed_definition_on_the_same_state_dir() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    102,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "init2"),
         )
@@ -1478,8 +1164,6 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
     const MOB_ID: &str = "gateway-concurrent-dispatch-test";
     const ALIAS: &str = "agent:alpha";
     let state_dir = tempfile::tempdir().expect("state dir");
-    let scratch_dir = tempfile::tempdir().expect("scratch dir");
-    let continuity = HostContinuityState::default();
 
     let init_params = |id: &str| {
         json!({
@@ -1490,10 +1174,7 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
                 "persistent_state": state_dir.path(),
                 "mob_config": MOB_CONFIG,
                 "has_roster_provider": true,
-                "has_continuity_store": true,
-                "has_lease_provider": true,
                 "has_session_builder": true,
-                "scratch_dir": scratch_dir.path(),
                 "runtime_options": {
                     "demo_llm": true,
                     "identity_bootstrap_mode": { "mode": "lazy_materialize" }
@@ -1527,12 +1208,7 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    101,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "init1"),
         )
@@ -1542,46 +1218,35 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         "phase-1 init failed: {init}"
     );
 
-    let dispatch = dispatch_alpha_through_build(&mut gateway, &continuity, 101, "dispatch1");
+    let dispatch = dispatch_alpha_through_build(&mut gateway, "dispatch1");
     assert!(
         dispatch.get("result").is_some(),
         "phase-1 dispatch must succeed so {ALIAS} has a bridge session: {dispatch}"
     );
-    let session_id = continuity
-        .record(ALIAS)
-        .expect("phase 1 must have upserted a continuity record")["session_id"]
-        .as_str()
-        .expect("continuity record session_id")
-        .to_string();
+    let session_id = session_id_of_alpha(&mut gateway, "status0");
 
     // Declarations are keyed on the STABLE durable identity. The runtime id is
     // read only to prove it CHANGES across the process boundary: it is a
     // per-binding incarnation, so durable state keyed on it could not survive a
     // restart. That is the whole point of the contract under test.
-    let rpc_result =
-        |gateway: &mut Gateway, id: &str, method: &str, params: Value, cb: u64| -> Value {
-            gateway.send(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": method,
-                "params": params
-            }));
-            let status = gateway
-                .wait_for(
-                    WEDGE_BACKSTOP,
-                    |gateway, message| {
-                        answer_stateful_provider_callback_holding_builds(
-                            gateway,
-                            message,
-                            &continuity,
-                            cb,
-                        );
-                    },
-                    |m| is_response_with_id(m, id),
-                )
-                .expect("status_identity response");
-            status["result"].clone()
-        };
+    let rpc_result = |gateway: &mut Gateway, id: &str, method: &str, params: Value| -> Value {
+        gateway.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }));
+        let status = gateway
+            .wait_for(
+                WEDGE_BACKSTOP,
+                |gateway, message| {
+                    answer_roster_callback_holding_builds(gateway, message);
+                },
+                |m| is_response_with_id(m, id),
+            )
+            .expect("status_identity response");
+        status["result"].clone()
+    };
     let runtime_identity = |status: &Value| -> String {
         status["agent_runtime_id"]
             .as_str()
@@ -1593,7 +1258,6 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         "status1",
         "meta/status_identity",
         json!({ "identity": ALIAS }),
-        101,
     ));
     // Adoption must state the EXACT existing baseline. `meta/status_identity`
     // does not project runtime_mode, so read it from the member surface, which
@@ -1606,13 +1270,7 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
     // rejected as a change. So echo the live entry exactly rather than guessing
     // a mode, and take labels from the ROSTER entry, not from
     // status_identity (whose labels are the identity's and are empty here).
-    let members = rpc_result(
-        &mut gateway,
-        "members1",
-        "meta/list_members",
-        json!({}),
-        101,
-    );
+    let members = rpc_result(&mut gateway, "members1", "meta/list_members", json!({}));
     let entry = members
         .as_array()
         .unwrap_or_else(|| panic!("list_members must return an array: {members}"))
@@ -1675,12 +1333,7 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    101,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "adopt1"),
         )
@@ -1713,12 +1366,7 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    101,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "apply1"),
         )
@@ -1740,12 +1388,7 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    101,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "shutdown1"),
         )
@@ -1765,12 +1408,7 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    102,
-                );
+                answer_roster_and_build_callbacks(gateway, message);
             },
             |m| is_response_with_id(m, "init2"),
         )
@@ -1780,18 +1418,18 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         "phase-2 init failed: {init}"
     );
 
+    // The previous process's incarnation still holds the identity's lease:
+    // Core releases no identity lease at shutdown, so the new process reads
+    // the identity `await_lease`, with no runtime id, until that lease
+    // expires (`IDENTITY_LEASE_TTL` after its last renewal) and Core's
+    // reconciler converges it. Await that rather than read it at once.
+    //
     // A plain restart RESUMES the same incarnation: the generation is minted
     // per identity by Meerkat and is preserved across process replacement, so
     // this is the same runtime id, not a new one. Asserted rather than assumed,
     // because the incarnation-change property is exercised by the respawn
     // below and this pins down which of the two is which.
-    let phase2_runtime = runtime_identity(&rpc_result(
-        &mut gateway,
-        "status2pre",
-        "meta/status_identity",
-        json!({ "identity": ALIAS }),
-        102,
-    ));
+    let phase2_runtime = runtime_identity(&await_identity_converged(&mut gateway, ALIAS));
     assert_eq!(
         phase1_runtime, phase2_runtime,
         "a restart resumes the same incarnation; a changed runtime id here would mean the \
@@ -1808,12 +1446,7 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    102,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "read2"),
         )
@@ -1847,12 +1480,7 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    102,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "status2"),
         )
@@ -1861,6 +1489,14 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         status["result"]["session_id"].as_str(),
         Some(session_id.as_str()),
         "the restarted process must keep the phase-1 session, not create a new one: {status}"
+    );
+    // The adoption left Core an identity intent row: the host manages this
+    // identity, and Meta's view says so after the restart (its lifecycle verbs
+    // refuse it typed).
+    assert_eq!(
+        status["result"]["intent_managed"],
+        json!(true),
+        "the adopted identity is host-managed after the restart: {status}"
     );
 
     // NOTE for whoever extends this: the incarnation-change property (durable
@@ -1872,204 +1508,6 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
     // respawn-capable fixture or a separate lane.
 }
 
-/// Owner-authority ordering on a persistent identity-first resume.
-///
-/// Three Meta-owned invariants, each of which was broken in production and
-/// each verified on a downstream app's production clone before being written down here:
-///
-/// 1. Owner authority is PUBLISHED before `MobRuntime::prepare`, because
-///    prepare runs durable-tail recovery and refuses a head-canonical session
-///    whose owner has no authoritative registration - a deliberate refusal no
-///    retry clears. Registration after prepare cannot reach it.
-/// 2. That publication is NON-ZERO on a store that has records. It silently
-///    published nothing for every SDK-hosted continuity store until the
-///    bridge forwarded `resolve_record_by_session`, because the trait's
-///    `Ok(None)` default is a negative that reads as fact.
-/// 3. Durable-authority convergence happens in the parked window, BEFORE
-///    activation, so the bounded explicit resume does not spend its budget on
-///    O(members) work.
-///
-/// The counts are the discriminators, not the boot succeeding: on a
-/// single-identity roster the boot can succeed with any of these broken, which
-/// is exactly how the first two shipped. Asserted on the gateway's own log
-/// rather than by timing, because a wall-clock assertion here would measure
-/// runner load - this suite has flaked that way before.
-#[test]
-fn persistent_identity_first_resume_publishes_owner_authority_before_prepare() {
-    let state_dir = tempfile::tempdir().expect("state dir");
-    let scratch_dir = tempfile::tempdir().expect("scratch dir");
-    let continuity = HostContinuityState::default();
-
-    let init_params = |id: &str| {
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "meta/init",
-            "params": {
-                "persistent_state": state_dir.path(),
-                "mob_config": MOB_CONFIG,
-                "has_roster_provider": true,
-                "has_continuity_store": true,
-                "has_lease_provider": true,
-                "has_session_builder": true,
-                "scratch_dir": scratch_dir.path(),
-                // No `mob_storage` override: a persistent launch defaults to
-                // PERSISTENT mob storage, which is what makes the event log
-                // survive the restart. An in-memory mob store always boots with
-                // an empty log, never defers the lift, and cannot reach this.
-                "runtime_options": {
-                    "demo_llm": true,
-                    "identity_bootstrap_mode": { "mode": "lazy_materialize" }
-                }
-            }
-        })
-    };
-
-    // PHASE 1: create era. The turn is what mints the durable session and its
-    // continuity record; without it the resume has no owner to publish and the
-    // test would pass for the wrong reason.
-    let mut gateway = Gateway::start();
-    gateway.send(init_params("init1"));
-    let init = gateway
-        .wait_for(
-            WEDGE_BACKSTOP,
-            |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    101,
-                );
-            },
-            |m| is_response_with_id(m, "init1"),
-        )
-        .expect("phase-1 init response");
-    assert!(
-        init["result"]["contract_version"].is_string(),
-        "phase-1 init failed: {init}"
-    );
-    let dispatch = dispatch_alpha_through_build(&mut gateway, &continuity, 101, "dispatch1");
-    assert!(
-        dispatch.get("result").is_some(),
-        "phase-1 dispatch must succeed so a durable session exists to resume: {dispatch}"
-    );
-    gateway.send(json!({
-        "jsonrpc": "2.0", "id": "shutdown1", "method": "meta/shutdown", "params": {}
-    }));
-    let shutdown = gateway
-        .wait_for(
-            WEDGE_BACKSTOP,
-            |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    101,
-                );
-            },
-            |m| is_response_with_id(m, "shutdown1"),
-        )
-        .expect("phase-1 shutdown handshake");
-    gateway_shutdown::assert_persistent_shutdown_completed(
-        &shutdown,
-        "phase-1 must stop with a completed cleanup, or phase 2 is testing something else",
-    );
-    gateway.close_stdin();
-    let status = gateway.wait_for_exit(WEDGE_BACKSTOP);
-    assert!(status.success(), "rpc_gateway exit status: {status}");
-    drop(gateway);
-    assert!(
-        !continuity.records.borrow().is_empty(),
-        "phase 1 must leave a continuity record, or the resume has no owner to publish and \
-         every count below would be trivially zero"
-    );
-
-    // PHASE 2: same state dir, same definition (persistent mob storage pins
-    // mob_config). This is the deferred identity-first resume.
-    let (mut gateway, stderr) =
-        Gateway::start_capturing_stderr("meerkat_meta=info,meerkat_mob=warn");
-    gateway.send(init_params("init2"));
-    let captured = || {
-        stderr
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    };
-    const CONVERGED_MARK: &str = "converged persisted runtime authority before mob activation";
-    // SCOPE, STATED PLAINLY: this waits for the pre-activation sequence to
-    // complete and asserts ITS ordering and counts. It does NOT assert that
-    // activation finishes.
-    //
-    // Activation completion is blocked upstream: the explicit-resume budget is
-    // a single-member-retire timeout covering O(members) work, including host
-    // agent-build round-trips the platform cannot bound (~9s each on a real
-    // host, ~150s for a 17-member roster inside 30s). Meerkat is fixing that
-    // with progress-based patience. Asserting it here would make a Meta test
-    // red for an upstream reason, and dropping the assertions below to make
-    // something green would hide the three defects they cover. So: assert what
-    // Meta owns, and say what is missing rather than quietly narrowing.
-    let reached = gateway.wait_for(
-        WEDGE_BACKSTOP,
-        |gateway, message| {
-            answer_stateful_provider_callback_holding_builds(gateway, message, &continuity, 101);
-        },
-        |_| captured().iter().any(|line| line.contains(CONVERGED_MARK)),
-    );
-    let lines = captured();
-    assert!(
-        reached.is_some() || lines.iter().any(|line| line.contains(CONVERGED_MARK)),
-        "phase-2 resume never reached the pre-activation convergence stage within \
-         {WEDGE_BACKSTOP:?}; {} stderr lines:\n{}",
-        lines.len(),
-        lines.join("\n")
-    );
-
-    let count_after = |needle: &str, field: &str| -> Option<u64> {
-        lines
-            .iter()
-            .find(|line| line.contains(needle))
-            .and_then(|line| line.split(field).nth(1))
-            .and_then(|rest| rest.split_whitespace().next())
-            .and_then(|value| value.parse::<u64>().ok())
-    };
-    let index_of = |needle: &str| lines.iter().position(|line| line.contains(needle));
-
-    const PUBLISHED: &str = "published persisted continuity owners before mob prepare";
-    const CONVERGED: &str = "converged persisted runtime authority before mob activation";
-
-    let published = count_after(PUBLISHED, "published=");
-    assert_eq!(
-        published,
-        Some(1),
-        "owner authority must be published before prepare for the one rostered identity; \
-         a zero here is the SDK-hosted inertia that shipped silently.\nstderr:\n{}",
-        lines.join("\n")
-    );
-    let converged = count_after(CONVERGED, "converged=");
-    assert!(
-        converged.is_some_and(|count| count > 0),
-        "durable authority must be converged in the parked window, before activation, or the \
-         bounded resume spends its budget on it. got {converged:?}\nstderr:\n{}",
-        lines.join("\n")
-    );
-
-    // Ordering is the invariant, not merely presence: publication AFTER prepare
-    // is exactly the arrangement that could not clear the durable-tail refusal.
-    let published_at = index_of(PUBLISHED).expect("publication line present");
-    let converged_at = index_of(CONVERGED).expect("convergence line present");
-    assert!(
-        published_at < converged_at,
-        "publication must precede convergence-and-activation: publication is a PREPARE-time \
-         precondition, convergence is an ACTIVATION-time one"
-    );
-
-    // Phase-2 init may still be in flight (see SCOPE above), so drop the pipe
-    // and reap rather than expecting a shutdown handshake.
-    gateway.close_stdin();
-    let _ = gateway.child.kill();
-    let _ = gateway.child.wait();
-}
-
 // ---------------------------------------------------------------------------
 // meta/reset_all on an identity-first gateway (item R7)
 // ---------------------------------------------------------------------------
@@ -2078,46 +1516,17 @@ fn persistent_identity_first_resume_publishes_owner_authority_before_prepare() {
 /// `default` profile.
 const RESET_ALL_IDENTITIES: [&str; 2] = ["agent:alpha", "agent:beta"];
 
-/// Host-side state for the reset_all regression: continuity records with the
-/// fencing token they were upserted under, session snapshots, and a token
-/// counter. Unlike [`HostContinuityState`] this mints a FRESH fencing token
-/// per acquisition: the reset path re-acquires the lease the identity already
-/// holds, and a real lease provider answers that with a newer token.
-struct ResetAllHostState {
-    /// identity -> (latest `ContinuityRecord` JSON, fencing token of the upsert)
-    records: RefCell<BTreeMap<String, (Value, u64)>>,
-    /// session id -> latest `SessionSnapshot` JSON
-    snapshots: RefCell<BTreeMap<String, Value>>,
-    next_fencing_token: Cell<u64>,
-}
-
-impl ResetAllHostState {
-    fn new() -> Self {
-        Self {
-            records: RefCell::new(BTreeMap::new()),
-            snapshots: RefCell::new(BTreeMap::new()),
-            next_fencing_token: Cell::new(101),
-        }
-    }
-}
-
-/// Stateful provider answerer for [`RESET_ALL_IDENTITIES`]. The init below
-/// declares no session builder, so the gateway builds the demo agents itself
-/// and `callback/build_agent` never arrives; every other host verb is answered
-/// from [`ResetAllHostState`].
-fn answer_reset_all_host_callbacks(
-    gateway: &mut Gateway,
-    message: &Value,
-    host: &ResetAllHostState,
-) {
+/// Provider answerer for [`RESET_ALL_IDENTITIES`]: the roster, and a `null`
+/// acknowledgement for any other host verb. The init below declares no session
+/// builder, so the gateway builds the demo agents itself and
+/// `callback/build_agent` never arrives.
+fn answer_reset_all_host_callbacks(gateway: &mut Gateway, message: &Value) {
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return;
     };
     let Some(id) = message.get("id").cloned() else {
         return;
     };
-    let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
-
     let result = match method {
         "callback/roster_provider/roster" => Value::Array(
             RESET_ALL_IDENTITIES
@@ -2135,113 +1544,6 @@ fn answer_reset_all_host_callbacks(
                 })
                 .collect(),
         ),
-        "callback/topology_provider/compute_edges" => json!([]),
-        "callback/continuity_store/resolve_many" => {
-            let records = host.records.borrow();
-            let mut states = serde_json::Map::new();
-            for identity in params["identities"].as_array().into_iter().flatten() {
-                let identity = identity.as_str().expect("identity string");
-                let resolve_state = match records.get(identity) {
-                    Some((record, _)) => json!({ "state": "ready", "record": record }),
-                    None => json!({ "state": "uninitialized" }),
-                };
-                states.insert(identity.to_string(), resolve_state);
-            }
-            Value::Object(states)
-        }
-        "callback/continuity_store/resolve_record_by_session" => {
-            let session_id = params["session_id"].as_str().unwrap_or_default();
-            let records = host.records.borrow();
-            match records
-                .values()
-                .find(|(record, _)| record["session_id"].as_str() == Some(session_id))
-            {
-                Some((record, fencing_token)) => json!({
-                    "record": record,
-                    "fencing_token": fencing_token,
-                    "checkpoint_version": record["checkpoint_version"].as_u64().unwrap_or(0),
-                }),
-                None => Value::Null,
-            }
-        }
-        "callback/continuity_store/upsert_continuity_record" => {
-            let record = params["record"].clone();
-            let identity = record["identity"]
-                .as_str()
-                .expect("upserted record identity")
-                .to_string();
-            let fencing_token = params["fencing_token"]
-                .as_u64()
-                .expect("upsert carries a fencing token");
-            host.records
-                .borrow_mut()
-                .insert(identity, (record, fencing_token));
-            Value::Null
-        }
-        "callback/continuity_store/delete_continuity_record" => {
-            let identity = params["identity"].as_str().expect("record identity");
-            host.records.borrow_mut().remove(identity);
-            Value::Null
-        }
-        "callback/continuity_store/save_session_snapshot" => {
-            let session_id = params["session_id"]
-                .as_str()
-                .expect("snapshot session id")
-                .to_string();
-            host.snapshots
-                .borrow_mut()
-                .insert(session_id, params["snapshot"].clone());
-            Value::Null
-        }
-        "callback/continuity_store/load_session_snapshot" => {
-            let session_id = params["session_id"].as_str().expect("snapshot session id");
-            host.snapshots
-                .borrow()
-                .get(session_id)
-                .cloned()
-                .unwrap_or(Value::Null)
-        }
-        "callback/continuity_store/delete_session_snapshot_if_current_revision" => {
-            let session_id = params["session_id"].as_str().expect("snapshot session id");
-            Value::Bool(host.snapshots.borrow_mut().remove(session_id).is_some())
-        }
-        "callback/lease_provider/acquire_leases" => {
-            let mut acquisitions = serde_json::Map::new();
-            for identity in params["identities"].as_array().into_iter().flatten() {
-                let identity = identity.as_str().expect("identity string");
-                let fencing_token = host.next_fencing_token.get();
-                host.next_fencing_token.set(fencing_token + 1);
-                acquisitions.insert(
-                    identity.to_string(),
-                    json!({
-                        "result": "acquired",
-                        "identity": identity,
-                        "fencing_token": fencing_token,
-                        "ttl": 600_000
-                    }),
-                );
-            }
-            Value::Object(acquisitions)
-        }
-        "callback/lease_provider/renew_leases" => {
-            let mut renewals = serde_json::Map::new();
-            for grant in params["grants"].as_array().into_iter().flatten() {
-                let identity = grant["identity"].as_str().expect("grant identity");
-                renewals.insert(
-                    identity.to_string(),
-                    json!({
-                        "result": "renewed",
-                        "identity": identity,
-                        "fencing_token": grant["fencing_token"],
-                        "ttl": grant["ttl"]
-                    }),
-                );
-            }
-            Value::Object(renewals)
-        }
-        "callback/lease_provider/release_leases" => Value::Null,
-        // Any new optional callback verb gets a null acknowledgement so it
-        // cannot wedge this harness (mirrors the stateful answerer above).
         _ => Value::Null,
     };
     gateway.send(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
@@ -2334,9 +1636,9 @@ fn decode_chunked_body(mut rest: &[u8]) -> Vec<u8> {
 }
 
 /// Issue one console RPC over HTTP while keeping the stdin callback loop
-/// alive. The handler behind `/console/rpc` round-trips host callbacks (lease
-/// acquire, continuity upsert, snapshot save) over stdout, so the POST must
-/// not run on the thread that answers them or the two wait on each other.
+/// alive. The handler behind `/console/rpc` may round-trip host callbacks over
+/// stdout, so the POST must not run on the thread that answers them or the two
+/// wait on each other.
 fn console_rpc_while_answering_callbacks(
     gateway: &mut Gateway,
     base_url: &str,
@@ -2392,11 +1694,7 @@ fn console_rpc_while_answering_callbacks(
 
 /// `meta/status_identity` for every identity in [`RESET_ALL_IDENTITIES`],
 /// keyed by identity.
-fn reset_all_identity_statuses(
-    gateway: &mut Gateway,
-    host: &ResetAllHostState,
-    tag: &str,
-) -> BTreeMap<String, Value> {
+fn reset_all_identity_statuses(gateway: &mut Gateway, tag: &str) -> BTreeMap<String, Value> {
     let mut statuses = BTreeMap::new();
     for identity in RESET_ALL_IDENTITIES {
         let request_id = format!("status-{tag}-{identity}");
@@ -2407,11 +1705,9 @@ fn reset_all_identity_statuses(
             "params": { "identity": identity }
         }));
         let response = gateway
-            .wait_for(
-                WEDGE_BACKSTOP,
-                |gateway, message| answer_reset_all_host_callbacks(gateway, message, host),
-                |m| is_response_with_id(m, &request_id),
-            )
+            .wait_for(WEDGE_BACKSTOP, answer_reset_all_host_callbacks, |m| {
+                is_response_with_id(m, &request_id)
+            })
             .unwrap_or_else(|| panic!("status_identity response for {identity} ({tag})"));
         assert_eq!(
             response["error"],
@@ -2444,8 +1740,6 @@ fn reset_all_identity_statuses(
 #[test]
 fn reset_all_resets_every_registered_identity_and_keeps_the_gateway_alive() {
     let state_dir = tempfile::tempdir().expect("state dir");
-    let scratch_dir = tempfile::tempdir().expect("scratch dir");
-    let host = ResetAllHostState::new();
     let (mut gateway, stderr) = Gateway::start_capturing_stderr("meerkat_meta=info");
     let captured = || {
         stderr
@@ -2462,9 +1756,6 @@ fn reset_all_resets_every_registered_identity_and_keeps_the_gateway_alive() {
             "persistent_state": state_dir.path(),
             "mob_config": MOB_CONFIG,
             "has_roster_provider": true,
-            "has_continuity_store": true,
-            "has_lease_provider": true,
-            "scratch_dir": scratch_dir.path(),
             "runtime_options": {
                 "demo_llm": true,
                 // Both identities must be LIVE before the call, so the reset
@@ -2477,11 +1768,9 @@ fn reset_all_resets_every_registered_identity_and_keeps_the_gateway_alive() {
         }
     }));
     let init = gateway
-        .wait_for(
-            WEDGE_BACKSTOP,
-            |gateway, message| answer_reset_all_host_callbacks(gateway, message, &host),
-            |m| is_response_with_id(m, "init"),
-        )
+        .wait_for(WEDGE_BACKSTOP, answer_reset_all_host_callbacks, |m| {
+            is_response_with_id(m, "init")
+        })
         .expect("init response");
     assert!(
         init["result"]["contract_version"].is_string(),
@@ -2493,7 +1782,7 @@ fn reset_all_resets_every_registered_identity_and_keeps_the_gateway_alive() {
         .unwrap_or_else(|| panic!("init result must carry http_base_url: {init}"))
         .to_string();
 
-    let before = reset_all_identity_statuses(&mut gateway, &host, "before");
+    let before = reset_all_identity_statuses(&mut gateway, "before");
     for identity in RESET_ALL_IDENTITIES {
         assert_eq!(
             before[identity]["state"],
@@ -2511,7 +1800,7 @@ fn reset_all_resets_every_registered_identity_and_keeps_the_gateway_alive() {
         &mut gateway,
         &base_url,
         json!({ "jsonrpc": "2.0", "id": "reset-all", "method": "meta/reset_all", "params": {} }),
-        |gateway, message| answer_reset_all_host_callbacks(gateway, message, &host),
+        answer_reset_all_host_callbacks,
     );
     assert_eq!(
         reset_all["error"],
@@ -2574,7 +1863,7 @@ fn reset_all_resets_every_registered_identity_and_keeps_the_gateway_alive() {
             "method": "meta/console/query_timeline",
             "params": { "limit": 400 }
         }),
-        |gateway, message| answer_reset_all_host_callbacks(gateway, message, &host),
+        answer_reset_all_host_callbacks,
     );
     let frames = timeline["result"]["frames"]
         .as_array()
@@ -2600,7 +1889,7 @@ fn reset_all_resets_every_registered_identity_and_keeps_the_gateway_alive() {
 
     // The durable fact: each identity is still registered, live, one
     // generation further, under a new incarnation.
-    let after = reset_all_identity_statuses(&mut gateway, &host, "after");
+    let after = reset_all_identity_statuses(&mut gateway, "after");
     for identity in RESET_ALL_IDENTITIES {
         assert_eq!(
             after[identity]["state"],
@@ -2623,11 +1912,9 @@ fn reset_all_resets_every_registered_identity_and_keeps_the_gateway_alive() {
         "jsonrpc": "2.0", "id": "shutdown", "method": "meta/shutdown", "params": {}
     }));
     let shutdown = gateway
-        .wait_for(
-            WEDGE_BACKSTOP,
-            |gateway, message| answer_reset_all_host_callbacks(gateway, message, &host),
-            |m| is_response_with_id(m, "shutdown"),
-        )
+        .wait_for(WEDGE_BACKSTOP, answer_reset_all_host_callbacks, |m| {
+            is_response_with_id(m, "shutdown")
+        })
         .expect("shutdown handshake after reset_all");
     gateway_shutdown::assert_persistent_shutdown_completed(&shutdown, "shutdown after reset_all");
     gateway.close_stdin();
@@ -2641,10 +1928,7 @@ fn reset_all_resets_every_registered_identity_and_keeps_the_gateway_alive() {
 /// (`memory`) on a fresh create and again after a normal stop and restart of
 /// the same identity and session. A profile with memory disabled never
 /// carries it.
-fn memory_recorder_catalogs_across_restart(
-    profile_memory: bool,
-    persistent_mob_storage: bool,
-) -> (Vec<String>, Vec<String>) {
+fn memory_recorder_catalogs_across_restart(profile_memory: bool) -> (Vec<String>, Vec<String>) {
     let mob_config = format!(
         r#"
 [mob]
@@ -2659,34 +1943,26 @@ comms = true
 memory = {profile_memory}
 "#
     );
-    let init_params = |state_dir: &tempfile::TempDir, scratch_dir: &tempfile::TempDir| {
-        let mut params = json!({
+    let init_params = |state_dir: &tempfile::TempDir| {
+        let params = json!({
             "persistent_state": state_dir.path(),
             "mob_config": mob_config,
             "has_roster_provider": true,
-            "has_continuity_store": true,
-            "has_lease_provider": true,
             "has_session_builder": true,
-            "scratch_dir": scratch_dir.path(),
             "runtime_options": {
                 "demo_llm": true,
                 "agent_memory": true,
-                "mob_storage": { "storage": "memory" },
                 "identity_bootstrap_mode": { "mode": "lazy_materialize" }
             }
         });
-        // Persistent mob storage (the default) restores the member natively
-        // at mob start, BEFORE any identity customization runs; the later
+        // Persistent mob storage (the default, and the only one a roster
+        // under `persistent_state` may use) restores the member natively at
+        // mob start, BEFORE any identity customization runs; the later
         // customized resume finds the member occupied and attaches it. Only
         // the stable per-identity tool dispatcher reaches that occupant.
-        if persistent_mob_storage && let Some(options) = params["runtime_options"].as_object_mut() {
-            options.remove("mob_storage");
-        }
         params
     };
     let state_dir = tempfile::tempdir().expect("state dir");
-    let scratch_dir = tempfile::tempdir().expect("scratch dir");
-    let continuity = HostContinuityState::default();
 
     // Boot 1: fresh create.
     let mut gateway = Gateway::start();
@@ -2694,18 +1970,13 @@ memory = {profile_memory}
         "jsonrpc": "2.0",
         "id": "init1",
         "method": "meta/init",
-        "params": init_params(&state_dir, &scratch_dir)
+        "params": init_params(&state_dir)
     }));
     let init = gateway
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    101,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "init1"),
         )
@@ -2714,29 +1985,13 @@ memory = {profile_memory}
         init["result"]["contract_version"].is_string(),
         "boot-1 init failed: {init}"
     );
-    let dispatch = dispatch_alpha_through_build(&mut gateway, &continuity, 101, "dispatch1");
+    let dispatch = dispatch_alpha_through_build(&mut gateway, "dispatch1");
     assert!(
         dispatch.get("result").is_some(),
         "boot-1 dispatch failed: {dispatch}"
     );
-    let fresh = resolved_tools_for_alpha(&mut gateway, &continuity, 101, "tools1");
-    if !continuity.has_snapshot() {
-        let save = gateway
-            .wait_for(
-                WEDGE_BACKSTOP,
-                |gateway, message| {
-                    answer_stateful_provider_callback_holding_builds(
-                        gateway,
-                        message,
-                        &continuity,
-                        101,
-                    );
-                },
-                |m| is_callback_request(m, "callback/continuity_store/save_session_snapshot"),
-            )
-            .expect("boot-1 session snapshot save callback");
-        answer_stateful_provider_callback_holding_builds(&mut gateway, &save, &continuity, 101);
-    }
+    let fresh = resolved_tools_for_alpha(&mut gateway, "tools1");
+    let session_id = session_id_of_alpha(&mut gateway, "status1");
     gateway.send(
         json!({ "jsonrpc": "2.0", "id": "shutdown1", "method": "meta/shutdown", "params": {} }),
     );
@@ -2744,34 +1999,16 @@ memory = {profile_memory}
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    101,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "shutdown1"),
         )
         .expect("boot-1 shutdown response");
-    if persistent_mob_storage {
-        gateway_shutdown::assert_persistent_shutdown_completed(&shutdown, "boot-1 shutdown");
-    } else {
-        assert_eq!(
-            shutdown["result"]["shutdown"], true,
-            "boot-1 shutdown failed: {shutdown}"
-        );
-    }
+    gateway_shutdown::assert_persistent_shutdown_completed(&shutdown, "boot-1 shutdown");
     gateway.close_stdin();
     let status = gateway.wait_for_exit(WEDGE_BACKSTOP);
     assert!(status.success(), "rpc_gateway exit status: {status}");
     drop(gateway);
-    let session_id = continuity
-        .record("agent:alpha")
-        .expect("boot 1 upserted agent:alpha's continuity record")["session_id"]
-        .as_str()
-        .expect("continuity record session_id")
-        .to_string();
 
     // Boot 2: normal restart of the same identity and session.
     let mut gateway = Gateway::start();
@@ -2779,7 +2016,7 @@ memory = {profile_memory}
         "jsonrpc": "2.0",
         "id": "init2",
         "method": "meta/init",
-        "params": init_params(&state_dir, &scratch_dir)
+        "params": init_params(&state_dir)
     }));
     // A native restore (persistent mob storage) rebuilds the member through
     // the host SessionBuilder during init: answer its build callback.
@@ -2798,12 +2035,7 @@ memory = {profile_memory}
                         "result": {}
                     }));
                 } else {
-                    answer_stateful_provider_callback_holding_builds(
-                        gateway,
-                        message,
-                        &continuity,
-                        102,
-                    );
+                    answer_roster_callback_holding_builds(gateway, message);
                 }
             },
             |m| is_response_with_id(m, "init2"),
@@ -2836,12 +2068,7 @@ memory = {profile_memory}
                         "result": {}
                     }));
                 } else {
-                    answer_stateful_provider_callback_holding_builds(
-                        gateway,
-                        message,
-                        &continuity,
-                        102,
-                    );
+                    answer_roster_callback_holding_builds(gateway, message);
                 }
             },
             |m| is_response_with_id(m, "dispatch2"),
@@ -2851,7 +2078,7 @@ memory = {profile_memory}
         dispatch.get("result").is_some(),
         "boot-2 dispatch failed: {dispatch}"
     );
-    let restored = resolved_tools_for_alpha(&mut gateway, &continuity, 102, "tools2");
+    let restored = resolved_tools_for_alpha(&mut gateway, "tools2");
     gateway.send(json!({
         "jsonrpc": "2.0",
         "id": "status2",
@@ -2862,12 +2089,7 @@ memory = {profile_memory}
         .wait_for(
             WEDGE_BACKSTOP,
             |gateway, message| {
-                answer_stateful_provider_callback_holding_builds(
-                    gateway,
-                    message,
-                    &continuity,
-                    102,
-                );
+                answer_roster_callback_holding_builds(gateway, message);
             },
             |m| is_response_with_id(m, "status2"),
         )
@@ -2881,22 +2103,8 @@ memory = {profile_memory}
 }
 
 #[test]
-fn memory_recorder_follows_memory_without_a_host_customizer_across_restart() {
-    let (fresh, restored) = memory_recorder_catalogs_across_restart(true, false);
-    assert!(
-        fresh.iter().any(|name| name == "memory"),
-        "memory enabled with no host customizer: the fresh member carries the recorder: {fresh:?}"
-    );
-    assert!(
-        restored.iter().any(|name| name == "memory"),
-        "memory enabled with no host customizer: the restarted member keeps the recorder: \
-         {restored:?}"
-    );
-}
-
-#[test]
 fn memory_disabled_profile_never_carries_the_recorder() {
-    let (fresh, restored) = memory_recorder_catalogs_across_restart(false, false);
+    let (fresh, restored) = memory_recorder_catalogs_across_restart(false);
     assert!(
         !fresh.iter().any(|name| name == "memory") && !restored.iter().any(|name| name == "memory"),
         "a memory-disabled profile never carries the recorder: fresh={fresh:?} \
@@ -2909,7 +2117,7 @@ fn memory_disabled_profile_never_carries_the_recorder() {
 /// The recorder must still be on it after the restart.
 #[test]
 fn memory_recorder_survives_a_native_restore_without_a_host_customizer() {
-    let (fresh, restored) = memory_recorder_catalogs_across_restart(true, true);
+    let (fresh, restored) = memory_recorder_catalogs_across_restart(true);
     assert!(
         fresh.iter().any(|name| name == "memory"),
         "the fresh member carries the recorder: {fresh:?}"

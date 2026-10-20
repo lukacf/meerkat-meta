@@ -4,15 +4,18 @@
 //! read (here: registered and materialized by another path in between) is
 //! never reported as held success. The held pass refuses it as `NotHeld`,
 //! no empty or partial held success is returned, and the member that was
-//! validly created stays intact: its continuity is not touched, and it is
-//! not parked Broken.
+//! validly created stays intact: Core keeps it live, and its view never
+//! reads `broken`.
 //!
 //! The pass's `Activate` linearizes its choice, not each member's native
 //! activation: a member whose first `activate()` poll comes after the
-//! deadline expires in Core while the pass stays activated, and stays Broken
-//! (never re-created unheld by the ordinary repair) until a fresh host
-//! completion; a member whose activation Core accepted before the deadline
-//! keeps its outcome when its Meta publication is delayed past the deadline.
+//! deadline expires in Core while the pass stays activated, and every wake
+//! outside a held pass refuses it typed (nothing re-creates it unheld) until
+//! a fresh host completion; a member whose activation Core accepted before
+//! the deadline keeps its outcome when its Meta publication is delayed past
+//! the deadline.
+//!
+//! Every assertion reads Core (the mob's roster), never a Meta copy.
 //!
 //! A held start queued for admission behind a shutdown's join of unrelated
 //! tracked work returns at its deadline, and at once when the owner closes.
@@ -25,9 +28,8 @@ use std::time::Duration;
 
 use crate::identity_first::held_bootstrap::{HeldActivationPark, arm_held_activation_park};
 use crate::identity_first::{
-    AgentIdentity, ContinuityRepairRequestOutcome, ContinuityResolveState, ContinuityStore,
-    HeldBootstrapRefusal, HeldBootstrapStart, IdentityLifecycleState, IdentityRuntimeError,
-    LocalContinuityStore, RestoreOutcome,
+    AgentIdentity, ContinuityStore, HeldBootstrapRefusal, HeldBootstrapStart,
+    IdentityLifecycleState, IdentityRuntimeError, LocalContinuityStore, RestoreOutcome,
 };
 
 use super::held_identity_test_support::{
@@ -38,15 +40,16 @@ use super::held_identity_test_support::{
 /// reach its hold and for the pass to choose `Activate` well before it.
 const HOLD: Duration = Duration::from_secs(5);
 
-async fn continuity_state(
-    continuity: &LocalContinuityStore,
-    identity: &AgentIdentity,
-) -> Option<ContinuityResolveState> {
-    continuity
-        .resolve_many(std::slice::from_ref(identity))
+/// Whether Core's mob holds a member for `identity` now.
+async fn core_holds_member(runtime: &super::UnifiedRuntime, identity: &AgentIdentity) -> bool {
+    runtime
+        .mob_handle()
+        .get_member(&crate::member_comms_id::roster_member_id_for_identity(
+            identity.as_str(),
+        ))
         .await
-        .expect("resolve continuity")
-        .remove(identity)
+        .expect("Core's roster read")
+        .is_some()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -68,18 +71,27 @@ async fn a_member_embodied_after_the_freshness_read_refuses_the_held_pass() {
     let competitor = Arc::clone(&identity_runtime);
     let competing_spec = member(&identity);
     let competing_identity = identity.clone();
+    // Whether Core held the competitor's member once its bounded wake
+    // returned: the member was embodied outside the held pass.
+    let embodied_outside = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let embodied_flag = Arc::clone(&embodied_outside);
     identity_runtime.set_held_after_freshness_hook(Box::new(move || {
         Box::pin(async move {
-            competitor
-                .register(competing_spec, IdentityLifecycleState::Dormant, None, None)
-                .await;
+            competitor.register(competing_spec).await;
             let _ = tokio::time::timeout(
                 Duration::from_secs(5),
                 competitor.materialize(&competing_identity),
             )
             .await;
+            if matches!(
+                competitor.core_live_member(&competing_identity).await,
+                Ok(Some(_))
+            ) {
+                embodied_flag.store(true, Ordering::SeqCst);
+            }
         })
     }));
+    let observer = Arc::clone(&identity_runtime);
     install_roster(&mut runtime, identity_runtime, &roster);
     let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let completion = Arc::clone(&completed);
@@ -102,14 +114,7 @@ async fn a_member_embodied_after_the_freshness_read_refuses_the_held_pass() {
             }),
         )
         .await;
-    let materialized_outside = matches!(
-        continuity
-            .resolve_many(std::slice::from_ref(&identity))
-            .await
-            .expect("resolve continuity")
-            .remove(&identity),
-        Some(ContinuityResolveState::Ready { .. })
-    );
+    let materialized_outside = embodied_outside.load(Ordering::SeqCst);
     if materialized_outside {
         // The competitor created the member between the freshness read and
         // the pass: the held pass must refuse it (`NotHeld`), never report an
@@ -130,36 +135,38 @@ async fn a_member_embodied_after_the_freshness_read_refuses_the_held_pass() {
         result.expect("the held bootstrap succeeds when nothing interleaves");
         assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
     }
+    assert_ne!(
+        observer
+            .status(&identity)
+            .await
+            .expect("status of the roster member")
+            .state,
+        IdentityLifecycleState::Broken,
+        "a valid member is never left broken by the held pass"
+    );
     assert!(
-        !matches!(
-            continuity
-                .resolve_many(std::slice::from_ref(&identity))
-                .await
-                .expect("resolve continuity")
-                .remove(&identity),
-            Some(ContinuityResolveState::Broken { .. })
-        ),
-        "a valid member is never parked Broken by the held pass"
+        core_holds_member(&runtime, &identity).await,
+        "the validly created member stays live in Core"
     );
     let _ = runtime.shutdown().await;
 }
 
-/// ADR case (a), with its repair continuation: the pass chooses `Activate`
+/// ADR case (a), with its wake continuation: the pass chooses `Activate`
 /// before the deadline, and one member's first `activate()` poll is held
-/// until after it. Core expires that member, whose failure keeps the expiry
-/// (and its abort's cleanup outcome) and projects it `Broken`. The pass's
-/// choice stays `Activate`: the start reports `Activated`, and the other
-/// member, whose activation Core accepted before the deadline, is published.
-/// The expired member then stays Broken: the ordinary continuity repair does
-/// not re-create it as an unheld member (a fresh session its host's
-/// completion never saw), because it owes its host a fresh held completion.
+/// until after it. Core expires that member, whose refusal keeps the expiry
+/// (and its abort's cleanup outcome). The pass's choice stays `Activate`: the
+/// start reports `Activated`, and the other member, whose activation Core
+/// accepted before the deadline, is published. Nothing re-creates the
+/// expired member as an unheld member (a fresh session its host's completion
+/// never saw): every wake outside a held pass refuses it typed, because it
+/// owes its host a fresh held completion.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_first_polled_after_the_deadline_expires_while_the_pass_stays_activated() {
     let dir = tempfile::tempdir().unwrap();
     let early = AgentIdentity::parse("held-poll-early").unwrap();
     let late = AgentIdentity::parse("held-poll-late").unwrap();
     let roster = vec![member(&early), member(&late)];
-    let (mut runtime, continuity) = held_runtime(&dir, "held-poll", &roster).await;
+    let (mut runtime, _continuity) = held_runtime(&dir, "held-poll", &roster).await;
     let (parked, release) = arm_held_activation_park(&late, HeldActivationPark::BeforeFirstPoll);
     let deadline = tokio::time::Instant::now() + HOLD;
     let bootstrap = tokio::time::timeout(
@@ -199,37 +206,28 @@ async fn a_member_first_polled_after_the_deadline_expires_while_the_pass_stays_a
         restored.outcomes.get(&early)
     );
     match restored.outcomes.get(&late) {
-        Some(RestoreOutcome::Broken(failure)) => assert!(
-            failure
-                .detail
+        Some(RestoreOutcome::Refused(error)) => assert!(
+            error
+                .to_string()
                 .contains("expired at its setup deadline without activation"),
-            "{}",
-            failure.detail
+            "{error}"
         ),
         other => panic!("the late member's expiry is its actual outcome: {other:?}"),
     }
-    assert!(matches!(
-        continuity_state(&continuity, &early).await,
-        Some(ContinuityResolveState::Ready { .. })
-    ));
-    // Repair continuation: the activated pass started the repair
-    // supervisor, whose first pass and an explicit request both leave the
-    // expired member alone.
+    assert!(core_holds_member(&runtime, &early).await);
+    // Wake continuation: a wake outside a held pass refuses the expired
+    // member typed, and nothing re-creates it unheld.
     let context = runtime
         .identity_first_context
         .clone()
         .expect("installed identity context");
-    assert_eq!(
-        context.request_continuity_repair().await,
-        ContinuityRepairRequestOutcome::NothingToRepair,
-        "an expired held member is not repairable as an ordinary create"
-    );
+    match context.runtime.materialize(&late).await {
+        Err(IdentityRuntimeError::HeldCompletionOwed { identity }) => assert_eq!(identity, late),
+        other => panic!("a wake outside a held pass refuses the expired member: {other:?}"),
+    }
     for _ in 0..30 {
         assert!(
-            !matches!(
-                continuity_state(&continuity, &late).await,
-                Some(ContinuityResolveState::Ready { .. })
-            ),
+            !core_holds_member(&runtime, &late).await,
             "the expired member is not re-created unheld"
         );
         assert_eq!(
@@ -246,25 +244,25 @@ async fn a_member_first_polled_after_the_deadline_expires_while_the_pass_stays_a
             .await
             .expect("late member status")
             .state,
-        IdentityLifecycleState::Broken,
-        "the expired member stays Broken until a fresh host completion"
+        IdentityLifecycleState::Dormant,
+        "Core holds no member for the expired member and no final refusal stands: it stays \
+         dormant until a fresh host completion"
     );
     let _ = runtime.shutdown().await;
 }
 
 /// ADR case (b), delayed Meta publication: Core's `activate()` accepted the
 /// member before the deadline and returned, and the member's Meta
-/// publication (the rest of its create: its session resolution and its
-/// continuity commit) is parked until after the deadline. This delays only
-/// Meta's side, after Core returned, not Core's own publication. The start
-/// reports `Activated` after the deadline, the member is published and
-/// committed, and nothing is reclassified as an expiry or rolled back.
+/// publication (the rest of its create) is parked until after the deadline.
+/// This delays only Meta's side, after Core returned, not Core's own
+/// publication. The start reports `Activated` after the deadline, Core holds
+/// the member, and nothing is reclassified as an expiry or rolled back.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_activation_accepted_before_the_deadline_keeps_its_delayed_meta_publication() {
     let dir = tempfile::tempdir().unwrap();
     let identity = AgentIdentity::parse("held-late-publication").unwrap();
     let roster = vec![member(&identity)];
-    let (mut runtime, continuity) = held_runtime(&dir, "held-late-publication", &roster).await;
+    let (mut runtime, _continuity) = held_runtime(&dir, "held-late-publication", &roster).await;
     let (parked, release) =
         arm_held_activation_park(&identity, HeldActivationPark::AfterNativeActivation);
     let deadline = tokio::time::Instant::now() + HOLD;
@@ -305,10 +303,7 @@ async fn an_activation_accepted_before_the_deadline_keeps_its_delayed_meta_publi
         "{:?}",
         restored.outcomes.get(&identity)
     );
-    assert!(matches!(
-        continuity_state(&continuity, &identity).await,
-        Some(ContinuityResolveState::Ready { .. })
-    ));
+    assert!(core_holds_member(&runtime, &identity).await);
     assert_eq!(runtime.mob_handle().list_members().await.len(), 1);
     let _ = runtime.shutdown().await;
 }

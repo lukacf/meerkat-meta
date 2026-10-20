@@ -15,14 +15,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use governed_support::*;
 use meerkat_meta::identity_first::contracts::{ContinuityStore, LeaseProvider};
 use meerkat_meta::identity_first::{
-    AgentAddressability, AgentRuntimeId, BoundGovernedInput, CheckpointVersion,
-    ContinuityGeneration, ContinuityRecord, DurabilityPolicy, DurableAgentSpec, FencingToken,
+    AgentAddressability, AgentRuntimeId, BoundGovernedInput, DurabilityPolicy, DurableAgentSpec,
     GovernedAdmission, GovernedBindContext, GovernedDeliveryCustody, GovernedEntryFence,
     GovernedEntryOutcome, GovernedEntryPermit, GovernedEntryRefusal, GovernedInputBinder,
-    GovernedInputError, GovernedSettlement, IdentityLifecycleState, IdentityRuntime,
-    IdentityRuntimeConfig, IdentityRuntimeError, LeaseGrant, LocalContinuityStore,
-    LocalLeaseProvider, MobSessionBridge, NativeInputAdmissionSettlement, SessionBridge,
-    TurnOutcome, TurnOutput, TurnTracking,
+    GovernedInputError, GovernedSettlement, IdentityRuntime, IdentityRuntimeConfig,
+    IdentityRuntimeError, LocalContinuityStore, LocalLeaseProvider, MobSessionBridge,
+    NativeInputAdmissionSettlement, SessionBridge, TurnOutcome, TurnOutput, TurnTracking,
 };
 
 /// The host's settlement custody: it records its one settlement, and a drop
@@ -333,10 +331,6 @@ mod losing {
             self.inner.raw_member_alias_exists(alias).await
         }
 
-        fn requires_resume_snapshot(&self) -> bool {
-            self.inner.requires_resume_snapshot()
-        }
-
         async fn recover_committed_boundary(
             &self,
             session_id: &meerkat_core::types::SessionId,
@@ -349,7 +343,7 @@ mod losing {
             identity: &AgentIdentity,
             spec: &DurableAgentSpec,
             draft: &AgentBuildDraft,
-        ) -> Result<ResetSuccessorBinding, BridgeError> {
+        ) -> Result<MemberRuntimeBinding, BridgeError> {
             self.inner
                 .reset_member_to_successor(identity, spec, draft)
                 .await
@@ -358,27 +352,22 @@ mod losing {
         async fn create_session(
             &self,
             identity: &AgentIdentity,
-            runtime_id: &AgentRuntimeId,
             spec: &DurableAgentSpec,
             draft: &AgentBuildDraft,
-            session_id: &meerkat_core::types::SessionId,
-        ) -> Result<meerkat_core::types::SessionId, BridgeError> {
-            self.inner
-                .create_session(identity, runtime_id, spec, draft, session_id)
-                .await
+        ) -> Result<MemberRuntimeBinding, BridgeError> {
+            self.inner.create_session(identity, spec, draft).await
         }
 
         async fn resume_session(
             &self,
             identity: &AgentIdentity,
-            runtime_id: &AgentRuntimeId,
             spec: &DurableAgentSpec,
             draft: &AgentBuildDraft,
             session_id: &meerkat_core::types::SessionId,
-            snapshot: &SessionSnapshot,
+            resume_from_role: Option<&meerkat_mob::ProfileName>,
         ) -> Result<ResumeSessionOutcome, BridgeError> {
             self.inner
-                .resume_session(identity, runtime_id, spec, draft, session_id, snapshot)
+                .resume_session(identity, spec, draft, session_id, resume_from_role)
                 .await
         }
 
@@ -508,6 +497,72 @@ mod losing {
             self.inner.inspect_member(runtime_id).await
         }
 
+        async fn live_member(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
+            self.inner.live_member(identity).await
+        }
+
+        async fn live_member_scope(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+            self.inner.live_member_scope(identity).await
+        }
+
+        async fn ensure_member_live(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
+            self.inner.ensure_member_live(identity).await
+        }
+
+        async fn identity_convergence_status(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<
+            meerkat_mob::identity::IdentityStoredObservation<
+                meerkat_mob::identity::IdentityConvergenceStatus,
+            >,
+            BridgeError,
+        > {
+            self.inner.identity_convergence_status(identity).await
+        }
+
+        async fn member_binding_history(
+            &self,
+        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+            self.inner.member_binding_history().await
+        }
+
+        async fn last_member_binding(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+            self.inner.last_member_binding(identity).await
+        }
+
+        async fn identity_management(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+            self.inner.identity_management(identity).await
+        }
+
+        async fn durable_identity_members(
+            &self,
+        ) -> Result<Vec<meerkat_mob::MemberBinding>, BridgeError> {
+            self.inner.durable_identity_members().await
+        }
+
+        async fn durable_session_held(
+            &self,
+            session_id: &meerkat_core::types::SessionId,
+        ) -> Result<bool, BridgeError> {
+            self.inner.durable_session_held(session_id).await
+        }
+
         async fn register_session_runtime_state(
             &self,
             session_id: &meerkat_core::types::SessionId,
@@ -606,37 +661,24 @@ async fn governed_runtime_composed(
         bridge: Some(bridge),
         default_timeout: None,
     }));
+    // Only the spec: the fixture's mob already holds the member live on its
+    // session, and Core's member history is the identity's binding.
     let identity = meerkat_meta::identity_first::AgentIdentity::parse(MEMBER).unwrap();
     runtime
-        .register(
-            DurableAgentSpec {
-                identity: identity.clone(),
-                profile: ProfileName::from("worker"),
-                addressability,
-                display_name: None,
-                labels: BTreeMap::new(),
-                context: None,
-                additional_instructions: Vec::new(),
-                initial_message: None,
-                runtime_mode_override: Some(MobRuntimeMode::TurnDriven),
-                backend: None,
-                binding: None,
-                placement: None,
-            },
-            IdentityLifecycleState::Active,
-            Some(ContinuityRecord {
-                identity: identity.clone(),
-                agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{identity}:0")).unwrap(),
-                session_id: fixture.session_id.clone(),
-                generation: ContinuityGeneration::new(0),
-                checkpoint_version: CheckpointVersion::new(0),
-            }),
-            Some(LeaseGrant {
-                identity: identity.clone(),
-                fencing_token: FencingToken::new(1),
-                ttl: Duration::from_mins(5),
-            }),
-        )
+        .register(DurableAgentSpec {
+            identity: identity.clone(),
+            profile: ProfileName::from("worker"),
+            addressability,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: Some(MobRuntimeMode::TurnDriven),
+            backend: None,
+            binding: None,
+            placement: None,
+        })
         .await;
     (runtime, identity)
 }

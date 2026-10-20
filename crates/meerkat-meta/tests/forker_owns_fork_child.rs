@@ -257,10 +257,6 @@ async fn boot(
     // library builder keeps mob state in memory), so raw members such as a
     // fork child survive a restart.
     std::fs::create_dir_all(state_path).expect("state dir");
-    let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
-        meerkat_store::SqliteSessionStore::open(state_path.join("sessions.sqlite3"))
-            .expect("session store"),
-    );
     let (mob_storage, provenance) = meerkat_meta::mob_composition_manifest::persistent_mob_storage(
         state_path.join("mob.sqlite3"),
     )
@@ -268,12 +264,12 @@ async fn boot(
     let spec = meerkat_meta::MobBootstrapSpec::persistent(
         MobDefinition::from_toml(&mob_toml(&script.mob_id)).expect("mob definition"),
         mob_storage,
+        provenance,
         state_path.to_path_buf(),
         16,
-        session_store,
     )
+    .await
     .expect("persistent spec")
-    .with_mob_storage_provenance(provenance)
     // Creates no agent child mob (a fork child is a member of this mob). The
     // restart test boots twice in this process, which the durable child-mob
     // default refuses as a duplicate owner of the child root; explicit
@@ -344,8 +340,8 @@ async fn boot(
     .await
     .expect("restore_flow");
     let runtime_id = match result.outcomes.get(&calendar).expect("calendar outcome") {
-        RestoreOutcome::Created { record, .. } | RestoreOutcome::Resumed { record, .. } => {
-            record.agent_runtime_id.clone()
+        RestoreOutcome::Created { binding, .. } | RestoreOutcome::Resumed { binding, .. } => {
+            binding.agent_runtime_id.clone()
         }
         other => panic!("calendar was not created: {other:?}"),
     };

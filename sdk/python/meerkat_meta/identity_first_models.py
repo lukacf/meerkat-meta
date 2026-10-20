@@ -179,22 +179,32 @@ class IdentityRestoreProgress:
     bootstrap status while the restore pass runs.
 
     ``stage`` is ``registered``, ``resuming``, ``minted``, ``resumed`` or
-    ``broken`` (callers must tolerate future values); ``kind`` is the typed
-    continuity failure kind when ``stage`` is ``broken``.
+    ``refused`` (callers must tolerate future values). A ``refused`` stage
+    carries the refusal's JSON-RPC ``code`` (the code the same refusal
+    answers a call with: ``-32051``, ``-32052``, ``-32053`` or ``-32603``)
+    and its ``kind`` when the refusal has one.
     """
 
     stage: str
     kind: str | None = None
+    code: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> IdentityRestoreProgress:
         if not isinstance(data, dict) or not isinstance(data.get("stage"), str):
             raise TypeError("restore progress must be an object with a string stage")
         kind = data.get("kind")
-        return cls(stage=data["stage"], kind=kind if isinstance(kind, str) else None)
+        code = data.get("code")
+        return cls(
+            stage=data["stage"],
+            kind=kind if isinstance(kind, str) else None,
+            code=code if isinstance(code, int) else None,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {"stage": self.stage}
+        if self.code is not None:
+            result["code"] = self.code
         if self.kind is not None:
             result["kind"] = self.kind
         return result
@@ -243,8 +253,50 @@ class IdentityBootstrapEntry:
 
 
 @dataclass(frozen=True)
+class FirstBootPendingRow:
+    """A row of the ``storage-migrate-native`` first-boot manifest that the
+    gateway has not carried out yet.
+
+    ``kind`` is ``"resume"`` (the identity resumes the session the migration
+    recorded) or ``"fresh"`` (it starts on a fresh session). ``waiting_for``
+    is ``"roster"`` (the identity list does not name the identity yet) or
+    ``"carry_out"`` (it does, and the row is not carried out yet). Newer
+    values are kept as sent.
+    """
+
+    identity: str
+    kind: str
+    waiting_for: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> FirstBootPendingRow:
+        if not isinstance(data, dict):
+            raise TypeError("first-boot pending row must be an object")
+        for key in ("identity", "kind", "waiting_for"):
+            if not isinstance(data.get(key), str):
+                raise TypeError(f"first-boot pending row requires a string {key}")
+        return cls(
+            identity=data["identity"],
+            kind=data["kind"],
+            waiting_for=data["waiting_for"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "identity": self.identity,
+            "kind": self.kind,
+            "waiting_for": self.waiting_for,
+        }
+
+
+@dataclass(frozen=True)
 class IdentityBootstrapStatus:
-    """Aggregate gateway bootstrap status returned by status/wait RPCs."""
+    """Aggregate gateway bootstrap status returned by status/wait RPCs.
+
+    ``first_boot_pending`` lists the first-boot manifest rows still to be
+    carried out after ``storage-migrate-native``; it is empty when none is
+    pending.
+    """
 
     mode: IdentityBootstrapMode
     complete: bool
@@ -255,6 +307,7 @@ class IdentityBootstrapStatus:
     timed_out: bool = False
     target: str | None = None
     startup_ready: bool | None = None
+    first_boot_pending: tuple[FirstBootPendingRow, ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> IdentityBootstrapStatus:
@@ -277,6 +330,9 @@ class IdentityBootstrapStatus:
         error = data.get("error") if "error" in data else None
         if error is not None and not isinstance(error, str):
             raise TypeError("identity bootstrap error must be a string")
+        pending_raw = data.get("first_boot_pending", [])
+        if not isinstance(pending_raw, list):
+            raise TypeError("identity bootstrap first_boot_pending must be a list")
         return cls(
             mode=mode,
             complete=_required_bool(data, "complete"),
@@ -294,6 +350,9 @@ class IdentityBootstrapStatus:
                 data,
                 "startup_ready",
                 default=None,
+            ),
+            first_boot_pending=tuple(
+                FirstBootPendingRow.from_dict(row) for row in pending_raw
             ),
         )
 
@@ -316,6 +375,10 @@ class IdentityBootstrapStatus:
             result["target"] = self.target
         if self.startup_ready is not None:
             result["startup_ready"] = self.startup_ready
+        if self.first_boot_pending:
+            result["first_boot_pending"] = [
+                row.to_dict() for row in self.first_boot_pending
+            ]
         return result
 
 
@@ -851,103 +914,158 @@ class AgentBuildDraft:
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class DurabilityPolicy:
-    """Durability policy for continuity store."""
+class WakeRefusal:
+    """Why the identity's last wake was refused; cleared by the next successful wake.
 
-    kind: str
-    max_loss_window_ms: int | None = None
+    ``code`` is ``-32051`` (``IDENTITY_UNRESUMABLE_CODE``) for a final refusal,
+    when the identity reads ``broken``, or ``-32603`` for a refusal held until
+    an operator acts, when it reads ``dormant``. ``session_id`` is the session
+    whose resume was refused. ``remedy`` names the way out:
+    ``"delete_identity"``, ``"repair_session"``, ``"resolve_role_migration"``
+    or ``"operator_review"``; a newer value is kept as sent.
+    """
+
+    code: int
+    session_id: str
+    remedy: str
 
     def to_dict(self) -> dict[str, Any]:
-        result: dict[str, Any] = {"kind": self.kind}
-        if self.max_loss_window_ms is not None:
-            result["max_loss_window_ms"] = self.max_loss_window_ms
-        return result
+        return {"code": self.code, "session_id": self.session_id, "remedy": self.remedy}
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> DurabilityPolicy:
-        # `.get()` with a default to match the TS parser, which defaults `kind`
-        # to the wire form `sync_write_through` rather than raising.
+    def from_dict(cls, data: dict[str, Any]) -> WakeRefusal:
+        code = data.get("code")
         return cls(
-            kind=str(data.get("kind", "sync_write_through")),
-            max_loss_window_ms=data.get("max_loss_window_ms"),
+            code=code if isinstance(code, int) else 0,
+            session_id=str(data.get("session_id", "")),
+            remedy=str(data.get("remedy", "")),
         )
 
 
 @dataclass(frozen=True)
-class LeaseInfo:
-    """Lease state for an identity."""
+class ReplacedSession:
+    """The session the last wake replaced with a fresh spawn.
 
-    fencing_token: int
-    ttl_remaining_ms: int
-    healthy: bool
+    Core held no durable session for the identity's last session
+    (``reason`` ``"absent"``; a newer reason is kept as sent), so the wake
+    started the identity fresh. Present until the next wake.
+    """
+
+    session_id: str
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"session_id": self.session_id, "reason": self.reason}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ReplacedSession:
+        return cls(
+            session_id=str(data.get("session_id", "")),
+            reason=str(data.get("reason", "")),
+        )
+
+
+@dataclass(frozen=True)
+class IdentityConvergence:
+    """Core's convergence status for an identity a host intent declaration manages.
+
+    The fields are Core's, unchanged: ``condition`` and ``decision`` are
+    Core's snake_case values (for example ``"converged"`` or ``"backoff"``)
+    and are kept as sent.
+    """
+
+    agent_identity: str
+    condition: str
+    observed_at_ms: int
+    desired_intent_revision: int | None = None
+    active_intent_revision: int | None = None
+    decision: str | None = None
+    detail: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "fencing_token": self.fencing_token,
-            "ttl_remaining_ms": self.ttl_remaining_ms,
-            "healthy": self.healthy,
+            "agent_identity": self.agent_identity,
+            "desired_intent_revision": self.desired_intent_revision,
+            "active_intent_revision": self.active_intent_revision,
+            "decision": self.decision,
+            "condition": self.condition,
+            "observed_at_ms": self.observed_at_ms,
+            "detail": self.detail,
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> LeaseInfo:
-        # `.get()` with defaults to match the TS parser's graceful degradation
-        # instead of raising KeyError on a missing key from an older gateway.
+    def from_dict(cls, data: dict[str, Any]) -> IdentityConvergence:
+        observed_at_ms = data.get("observed_at_ms")
         return cls(
-            fencing_token=int(data.get("fencing_token", 0)),
-            ttl_remaining_ms=int(data.get("ttl_remaining_ms", 0)),
-            healthy=bool(data.get("healthy", False)),
+            agent_identity=str(data.get("agent_identity", "")),
+            condition=str(data.get("condition", "")),
+            observed_at_ms=observed_at_ms if isinstance(observed_at_ms, int) else 0,
+            desired_intent_revision=data.get("desired_intent_revision"),
+            active_intent_revision=data.get("active_intent_revision"),
+            decision=data.get("decision"),
+            detail=data.get("detail"),
         )
 
 
-@dataclass(frozen=True)
-class ContinuityHealth:
-    """Continuity store health for an identity."""
-
-    store_reachable: bool
-    durability_policy: DurabilityPolicy
-    last_checkpoint_version: int | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        result: dict[str, Any] = {
-            "store_reachable": self.store_reachable,
-            "durability_policy": self.durability_policy.to_dict(),
-        }
-        if self.last_checkpoint_version is not None:
-            result["last_checkpoint_version"] = self.last_checkpoint_version
-        return result
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> ContinuityHealth:
-        # `.get()` with defaults to match the TS parser's graceful degradation.
-        return cls(
-            store_reachable=bool(data.get("store_reachable", False)),
-            durability_policy=DurabilityPolicy.from_dict(data.get("durability_policy", {})),
-            last_checkpoint_version=data.get("last_checkpoint_version"),
-        )
+def _view_part(data: dict[str, Any], key: str, part: Any) -> Any:
+    """Parse one optional identity-view object (``convergence``,
+    ``wake_refusal`` or ``replaced_session``); ``None`` when it is absent."""
+    raw = data.get(key)
+    return part.from_dict(raw) if isinstance(raw, dict) else None
 
 
 @dataclass(frozen=True)
 class IdentityStatus:
-    """Full identity status (TYPE-18)."""
+    """Full identity status (TYPE-18).
+
+    Core's mob machine holds the identity's session and generation; the
+    status reads them per call. ``state`` is ``"active"`` (Core holds a live
+    member), ``"dormant"`` (it holds none) or ``"broken"`` (it holds none and
+    the last wake was refused for good, see :attr:`wake_refusal`).
+    ``agent_runtime_id`` is ``None`` when the identity is not live;
+    ``session_id`` and ``generation`` are ``None`` when Core holds no binding
+    for it.
+    """
 
     identity: str
     state: str
     agent_runtime_id: str | None = None
     session_id: str | None = None
     profile: str | None = None
+    #: ``"autonomous_host"`` or ``"turn_driven"``.
+    runtime_mode: str | None = None
     addressability: str = "addressable"
     display_name: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     generation: int | None = None
-    checkpoint_version: int | None = None
-    lease: LeaseInfo | None = None
-    continuity_health: ContinuityHealth | None = None
+    #: ``{"reason", "artifact_refusal"?}`` while a restored member's customizer
+    #: tools are not published yet.
+    customizer_tools_pending: dict[str, Any] | None = None
+    #: ``True`` when a host intent declaration in Core manages the identity;
+    #: Meta's lifecycle verbs then refuse it with
+    #: :class:`~meerkat_meta.errors.IdentityHostAdoptedError`.
+    intent_managed: bool = False
+    #: Core's convergence status, when :attr:`intent_managed` is set and Core
+    #: could read it.
+    convergence: IdentityConvergence | None = None
+    #: The last refused wake, until a wake succeeds.
+    wake_refusal: WakeRefusal | None = None
+    #: The session the last wake replaced with a fresh spawn, until the next
+    #: wake.
+    replaced_session: ReplacedSession | None = None
     #: The exact delivery scope to persist before a scoped dispatch
     #: (``dispatch(..., expected_scope=)``); ``None`` when none can be
     #: captured, with the reason in :attr:`delivery_scope_unavailable`.
     delivery_scope: DeliveryScope | None = None
     #: ``{"kind", "reason"}`` when :attr:`delivery_scope` is ``None``.
     delivery_scope_unavailable: dict[str, Any] | None = None
+    #: Core's mob member id of the identity's last binding: the roster
+    #: member id, Meta's comms-safe encoding of the identity (the identity
+    #: itself when it is already a valid comms name, ``mk--...`` otherwise,
+    #: as for an identity with a ``:``), from the same binding as
+    #: :attr:`session_id`; ``None`` when Core holds no binding for the
+    #: identity.
+    member_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -955,23 +1073,30 @@ class IdentityStatus:
             "state": self.state,
             "addressability": self.addressability,
             "labels": dict(self.labels),
+            "intent_managed": self.intent_managed,
         }
         if self.agent_runtime_id is not None:
             result["agent_runtime_id"] = self.agent_runtime_id
         if self.session_id is not None:
             result["session_id"] = self.session_id
+        if self.member_id is not None:
+            result["member_id"] = self.member_id
         if self.profile is not None:
             result["profile"] = self.profile
+        if self.runtime_mode is not None:
+            result["runtime_mode"] = self.runtime_mode
         if self.display_name is not None:
             result["display_name"] = self.display_name
         if self.generation is not None:
             result["generation"] = self.generation
-        if self.checkpoint_version is not None:
-            result["checkpoint_version"] = self.checkpoint_version
-        if self.lease is not None:
-            result["lease"] = self.lease.to_dict()
-        if self.continuity_health is not None:
-            result["continuity_health"] = self.continuity_health.to_dict()
+        if self.customizer_tools_pending is not None:
+            result["customizer_tools_pending"] = dict(self.customizer_tools_pending)
+        if self.convergence is not None:
+            result["convergence"] = self.convergence.to_dict()
+        if self.wake_refusal is not None:
+            result["wake_refusal"] = self.wake_refusal.to_dict()
+        if self.replaced_session is not None:
+            result["replaced_session"] = self.replaced_session.to_dict()
         if self.delivery_scope is not None:
             result["delivery_scope"] = self.delivery_scope.to_dict()
         if self.delivery_scope_unavailable is not None:
@@ -980,8 +1105,6 @@ class IdentityStatus:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> IdentityStatus:
-        lease_raw = data.get("lease")
-        ch_raw = data.get("continuity_health")
         delivery_scope: DeliveryScope | None = None
         unavailable_raw = data.get("delivery_scope_unavailable")
         delivery_scope_unavailable = (
@@ -998,20 +1121,27 @@ class IdentityStatus:
                     "kind": "unsupported_delivery_scope_version",
                     "reason": str(exc),
                 }
+        pending_raw = data.get("customizer_tools_pending")
         # `.get()` with defaults to match the TS parser's graceful degradation.
         return cls(
             identity=str(data.get("identity", "")),
             state=str(data.get("state", "")),
             agent_runtime_id=data.get("agent_runtime_id"),
             session_id=data.get("session_id"),
+            member_id=data.get("member_id"),
             profile=data.get("profile"),
+            runtime_mode=data.get("runtime_mode"),
             addressability=data.get("addressability", "addressable"),
             display_name=data.get("display_name"),
             labels=dict(data.get("labels") or {}),
             generation=data.get("generation"),
-            checkpoint_version=data.get("checkpoint_version"),
-            lease=LeaseInfo.from_dict(lease_raw) if lease_raw else None,
-            continuity_health=ContinuityHealth.from_dict(ch_raw) if ch_raw else None,
+            customizer_tools_pending=(
+                dict(pending_raw) if isinstance(pending_raw, dict) else None
+            ),
+            intent_managed=data.get("intent_managed") is True,
+            convergence=_view_part(data, "convergence", IdentityConvergence),
+            wake_refusal=_view_part(data, "wake_refusal", WakeRefusal),
+            replaced_session=_view_part(data, "replaced_session", ReplacedSession),
             delivery_scope=delivery_scope,
             delivery_scope_unavailable=delivery_scope_unavailable,
         )
@@ -1040,10 +1170,11 @@ class CompletionCursor:
     This cursor is the comparable atom instead — never derived from output
     content, a content hash, a timestamp, or a per-poll uuid.
 
-    ``epoch`` is the identity's lease fencing token (the runtime incarnation
-    this count belongs to); ``turns`` counts turns observed as completed
-    within it. Turn counts are not comparable across incarnations, so classify
-    with :meth:`progress_since` rather than comparing ``turns`` directly.
+    ``epoch`` is Core's fence for the identity's live member (the runtime
+    incarnation this count belongs to); ``turns`` counts turns observed as
+    completed within it. Turn counts are not comparable across
+    incarnations, so classify with :meth:`progress_since` rather than
+    comparing ``turns`` directly.
     """
 
     epoch: int = 0
@@ -1236,11 +1367,13 @@ class DeliveryScope:
 
     Persist it (``to_dict()``) before a scoped dispatch, and pass the same
     scope to ``dispatch(..., expected_scope=)`` and ``recover_delivery``. It
-    pins the Meta continuity (runtime id, generation, lease fencing token)
+    pins the identity's live member as Core holds it (runtime id, Core's
+    member generation, and Core's fence token in ``lease_fencing_token``)
     and meerkat's native member scope (``member``, opaque and versioned on
     its own). It is a selector and stale-binding guard: the gateway
     re-validates every atom and refuses a moved scope with
-    :class:`~meerkat_meta.errors.StaleScopeError`.
+    :class:`~meerkat_meta.errors.StaleScopeError`. A scope persisted by Meta
+    0.9.3 holds Meta's own atoms and is refused as stale.
     """
 
     identity: str
@@ -1550,7 +1683,12 @@ class AwaitedTurn:
 
 @dataclass(frozen=True)
 class IdentityInspection:
-    """Rich inspection of an identity's current execution state."""
+    """Rich inspection of an identity's current execution state.
+
+    ``agent_runtime_id``, ``session_id``, ``member_id``,
+    :attr:`intent_managed`, :attr:`convergence`, :attr:`wake_refusal` and
+    :attr:`replaced_session` read as on :class:`IdentityStatus`.
+    """
 
     identity: str
     output_preview: str | None = None
@@ -1567,24 +1705,47 @@ class IdentityInspection:
     #: the field — in both cases the caller must not read absence as "no turns
     #: yet".
     completion_cursor: CompletionCursor | None = None
+    agent_runtime_id: str | None = None
+    session_id: str | None = None
+    intent_managed: bool = False
+    convergence: IdentityConvergence | None = None
+    wake_refusal: WakeRefusal | None = None
+    replaced_session: ReplacedSession | None = None
+    member_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "identity": self.identity,
             "is_final": self.is_final,
             "peer_reachable_count": self.peer_reachable_count,
+            "intent_managed": self.intent_managed,
         }
+        if self.agent_runtime_id is not None:
+            result["agent_runtime_id"] = self.agent_runtime_id
+        if self.session_id is not None:
+            result["session_id"] = self.session_id
+        if self.member_id is not None:
+            result["member_id"] = self.member_id
         if self.output_preview is not None:
             result["output_preview"] = self.output_preview
         if self.preview_unavailable is not None:
             result["preview_unavailable"] = self.preview_unavailable
         if self.completion_cursor is not None:
             result["completion_cursor"] = self.completion_cursor.to_dict()
+        if self.convergence is not None:
+            result["convergence"] = self.convergence.to_dict()
+        if self.wake_refusal is not None:
+            result["wake_refusal"] = self.wake_refusal.to_dict()
+        if self.replaced_session is not None:
+            result["replaced_session"] = self.replaced_session.to_dict()
         return result
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> IdentityInspection:
         unavailable = data.get("preview_unavailable")
+        runtime_id = data.get("agent_runtime_id")
+        session_id = data.get("session_id")
+        member_id = data.get("member_id")
         return cls(
             identity=data["identity"],
             output_preview=data.get("output_preview"),
@@ -1592,6 +1753,13 @@ class IdentityInspection:
             is_final=bool(data.get("is_final", False)),
             peer_reachable_count=int(data.get("peer_reachable_count", 0)),
             completion_cursor=_completion_cursor_from(data, "completion_cursor"),
+            agent_runtime_id=runtime_id if isinstance(runtime_id, str) else None,
+            session_id=session_id if isinstance(session_id, str) else None,
+            member_id=member_id if isinstance(member_id, str) else None,
+            intent_managed=data.get("intent_managed") is True,
+            convergence=_view_part(data, "convergence", IdentityConvergence),
+            wake_refusal=_view_part(data, "wake_refusal", WakeRefusal),
+            replaced_session=_view_part(data, "replaced_session", ReplacedSession),
         )
 
 
@@ -1600,8 +1768,7 @@ class ConsoleIdentityRecord:
     """One roster member from ``meta/console/list_identities``.
 
     The typed identity -> session map: ``session_id`` is the member's
-    current durable binding. This is the supported replacement for reading
-    the continuity store directly.
+    current durable binding.
 
     ``labels`` are display data: ``labels["role"]`` keeps the roster
     provider's own value (often human role prose) and falls back to the
@@ -1620,6 +1787,11 @@ class ConsoleIdentityRecord:
     session_id: str | None = None
     topology_peers: list[str] = field(default_factory=list)
     labels: dict[str, str] = field(default_factory=dict)
+    #: Core's mob member id of the identity's last binding (Meta's
+    #: comms-safe encoding of the identity), as on
+    #: :attr:`IdentityStatus.member_id`; ``None`` when unknown, and for
+    #: a raw runtime-alias record.
+    member_id: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ConsoleIdentityRecord:
@@ -1634,4 +1806,5 @@ class ConsoleIdentityRecord:
             session_id=data.get("session_id"),
             topology_peers=[str(peer) for peer in data.get("topology_peers", [])],
             labels={str(k): str(v) for k, v in (data.get("labels") or {}).items()},
+            member_id=data.get("member_id"),
         )

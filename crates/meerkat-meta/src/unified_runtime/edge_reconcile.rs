@@ -136,6 +136,15 @@ impl UnifiedRuntime {
                     )),
                 ));
             }
+            crate::member_comms_id::refuse_runtime_plane_member(
+                &crate::member_comms_id::mob_member_id_str(&alias),
+                spec.labels.as_ref(),
+            )
+            .map_err(|message| {
+                UnifiedRuntimeReconcileError::Mob(
+                    crate::mob_handle_runtime::MobRuntimeError::InvalidConfig(message),
+                )
+            })?;
             spec.identity = meerkat_mob::AgentIdentity::from(alias.as_str());
             decoded_specs.push(spec);
         }

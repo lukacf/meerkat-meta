@@ -41,7 +41,9 @@ mod model;
 pub use controller::{
     AccessController, AccessPublicationAlreadyJoined, AccessView, AgentResourceAttributes,
 };
-pub(crate) use controller::{AccessEditError, AccessEditPrecondition, AccessMutation};
+pub(crate) use controller::{
+    AccessEditError, AccessEditPrecondition, AccessMutation, CapturedLineageLink, LiveAccessView,
+};
 pub use engine::{AccessDecision, AccessPrincipal, AccessResource, evaluate_access};
 pub use model::{
     ACCESS_ACTIONS, ACTION_ACCESS_ADMIN, ACTION_AGENT_MEMORY_ADMIN, ACTION_AGENT_MEMORY_DELETE,

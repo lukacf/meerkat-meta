@@ -79,6 +79,7 @@ from .identity_first_models import (
     IdentityBootstrapMode,
     IdentityBootstrapState,
     IdentityBootstrapStatus,
+    FirstBootPendingRow,
     MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY,
     RegisteredSpec,
     RoleMigrationDeclaration,
@@ -108,7 +109,6 @@ from .errors import (
     MOB_EVENTS_STALE_CURSOR_CODE,
     CAPABILITY_UNAVAILABLE_CODE,
     CONSOLE_TIMELINE_REPLAY_UNAVAILABLE_CODE,
-    LEASE_LOST_CODE,
     REGISTERED_SPEC_CHANGED_CODE,
     MEMORY_BACKEND_UNAVAILABLE_CODE,
     STALE_DELIVERY_SCOPE_CODE,
@@ -119,6 +119,10 @@ from .errors import (
     MEMBER_RELOAD_REQUIRED_KIND,
     WORKGRAPH_CONFLICT_CODE,
     WORKGRAPH_UNAVAILABLE_CODE,
+    IDENTITY_HISTORY_UNAVAILABLE_CODE,
+    IDENTITY_HOST_ADOPTED_CODE,
+    IDENTITY_UNRESUMABLE_CODE,
+    IDENTITY_WAKE_HELD_KINDS,
     CapabilityUnavailableError,
     CompositionProvenanceError,
     MemberReloadRequiredError,
@@ -126,7 +130,6 @@ from .errors import (
     ContractMismatchError,
     InitInProgressError,
     InitOutcomeUnknownError,
-    LeaseLostError,
     RegisteredSpecChangedError,
     MemoryBackendUnavailableError,
     MobEventsStaleError,
@@ -142,6 +145,10 @@ from .errors import (
     GatewayChildEndedError,
     GatewayCleanup,
     GatewayStartupCleanupError,
+    IdentityHistoryUnavailableError,
+    IdentityHostAdoptedError,
+    IdentityUnresumableError,
+    IdentityWakeHeldError,
     TurnFailedError,
     TurnNotDeliveredError,
     TurnOutputTruncatedWarning,
@@ -284,7 +291,7 @@ from .events import (
 )
 
 # Config modules (importable as meerkat_meta.auth, etc.)
-from .config import auth, event_log, memory, runtime_store, session_store
+from .config import auth, event_log, memory, runtime_store
 
 # Rich tool-result content blocks for callback tool handlers.
 from .tool_content import (
@@ -313,6 +320,7 @@ __all__ = [
     "IdentityBootstrapEntry",
     "IdentityRestoreProgress",
     "IdentityBootstrapStatus",
+    "FirstBootPendingRow",
     "ConsoleIdentityRecord",
     "MAX_IDENTITY_BACKGROUND_WARM_CONCURRENCY",
     # Identity-first customizer boundary
@@ -366,7 +374,6 @@ __all__ = [
     "MOB_EVENTS_STALE_CURSOR_CODE",
     "CAPABILITY_UNAVAILABLE_CODE",
     "CONSOLE_TIMELINE_REPLAY_UNAVAILABLE_CODE",
-    "LEASE_LOST_CODE",
     "REGISTERED_SPEC_CHANGED_CODE",
     "MEMORY_BACKEND_UNAVAILABLE_CODE",
     "STALE_DELIVERY_SCOPE_CODE",
@@ -377,9 +384,12 @@ __all__ = [
     "MEMBER_RELOAD_REQUIRED_KIND",
     "WORKGRAPH_CONFLICT_CODE",
     "WORKGRAPH_UNAVAILABLE_CODE",
+    "IDENTITY_HISTORY_UNAVAILABLE_CODE",
+    "IDENTITY_HOST_ADOPTED_CODE",
+    "IDENTITY_UNRESUMABLE_CODE",
+    "IDENTITY_WAKE_HELD_KINDS",
     "CapabilityUnavailableError",
     "ConsoleTimelineReplayUnavailableError",
-    "LeaseLostError",
     "StaleScopeError",
     "RegisteredSpecChangedError",
     "MemoryBackendUnavailableError",
@@ -388,6 +398,10 @@ __all__ = [
     "MemberReloadRequiredError",
     "WorkGraphConflictError",
     "WorkGraphUnavailableError",
+    "IdentityHistoryUnavailableError",
+    "IdentityHostAdoptedError",
+    "IdentityUnresumableError",
+    "IdentityWakeHeldError",
     "ContractMismatchError",
     "InitInProgressError",
     "InitOutcomeUnknownError",
@@ -555,5 +569,4 @@ __all__ = [
     "event_log",
     "memory",
     "runtime_store",
-    "session_store",
 ]

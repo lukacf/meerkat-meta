@@ -108,6 +108,17 @@ pub(crate) trait MobStopTarget {
     async fn stop(&self) -> Result<(), MobError>;
 }
 
+/// MobMachine's answer to a Stop on a mob that is already stopped.
+fn already_stopped(error: &MobError) -> bool {
+    matches!(
+        error,
+        MobError::InvalidTransition {
+            from: meerkat_mob::MobState::Stopped,
+            to: meerkat_mob::MobState::Stopped,
+        }
+    )
+}
+
 /// Settle the mob's active flow runs as needed and stop it (module docs).
 pub(crate) async fn settle_flow_runs_then_stop<T: MobStopTarget>(
     target: &T,
@@ -122,6 +133,9 @@ pub(crate) async fn settle_flow_runs_then_stop<T: MobStopTarget>(
         let mut commits = target.machine_commits();
         let refusal = match target.stop().await {
             Ok(()) => return Ok(()),
+            // A mob that is already stopped needs no Stop: teardown goes on
+            // as for a mob it stopped, rather than reporting an unclean stop.
+            Err(error) if already_stopped(&error) => return Ok(()),
             Err(refusal @ MobError::InvalidTransition { .. }) => refusal,
             Err(error) => return Err(error),
         };
@@ -162,6 +176,7 @@ pub(crate) async fn settle_flow_runs_then_stop<T: MobStopTarget>(
             commits = target.machine_commits();
             match target.stop().await {
                 Ok(()) => return Ok(()),
+                Err(error) if already_stopped(&error) => return Ok(()),
                 Err(refusal @ MobError::InvalidTransition { .. }) => {
                     last_refusal = Some(refusal);
                 }
@@ -393,6 +408,25 @@ mod tests {
         settle_flow_runs_then_stop(&target, MOB_STOP_FLOW_SETTLE_BUDGET)
             .await
             .expect("stopped");
+        assert_eq!(target.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(target.cancels.load(Ordering::SeqCst), 0, "nothing settled");
+    }
+
+    /// A Stop on a mob that is already stopped is a stopped mob, not an
+    /// unclean stop: teardown goes on, with nothing settled.
+    #[tokio::test(start_paused = true)]
+    async fn a_mob_already_stopped_counts_as_stopped() {
+        let target = FakeTarget::new(
+            vec![RunId::new()],
+            true,
+            vec![Err(MobError::InvalidTransition {
+                from: MobState::Stopped,
+                to: MobState::Stopped,
+            })],
+        );
+        settle_flow_runs_then_stop(&target, MOB_STOP_FLOW_SETTLE_BUDGET)
+            .await
+            .expect("an already stopped mob is stopped");
         assert_eq!(target.stop_calls.load(Ordering::SeqCst), 1);
         assert_eq!(target.cancels.load(Ordering::SeqCst), 0, "nothing settled");
     }

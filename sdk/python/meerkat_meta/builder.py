@@ -18,7 +18,6 @@ class MetaBuilderConfig:
     prepared_application_bundle: bytes | None = None
     prepared_application_digest: str | None = None
     session_builder: Any | None = None
-    session_store: Any | None = None
     error_callback: Any | None = None
     job_credential_resolver: Any | None = None
     event_log: Any | None = None
@@ -34,6 +33,7 @@ class MetaBuilderConfig:
     access_config_path: str | None = None
     meerkat_config_path: str | None = None
     workgraph_enabled: bool | str | None = None
+    fork_instruction_policy: str | None = None
     routing_config_path: str | None = None
     host_runnables: list[str] = field(default_factory=list)
     installed_artifacts: list[ToolArtifactRef] | None = None
@@ -53,9 +53,6 @@ class MetaBuilderConfig:
     persistent_state: str | None = None
     declare_spec_update_expected_revision: int | None = None
     # Identity-first provider fields (REQ-44)
-    continuity_store: Any | None = None
-    lease_provider: Any | None = None
-    scratch_dir: str | None = None
     roster_provider: Any | None = None
     role_migrations: list[dict[str, str]] | None = None
     application_tool_policies: list[str] | None = None
@@ -75,7 +72,7 @@ class MetaBuilder:
         runtime = await (
             Meta.builder()
             .mob("config/mob.toml")
-            .session_service(builder, store)
+            .session_service(builder)
             .roster(my_roster)
             .build()
         )
@@ -116,9 +113,8 @@ class MetaBuilder:
         self._config.prepared_application_digest = digest
         return self
 
-    def session_service(self, builder: Any, store: Any = None) -> MetaBuilder:
+    def session_service(self, builder: Any) -> MetaBuilder:
         self._config.session_builder = builder
-        self._config.session_store = store
         return self
 
     def event_log(self, config: Any = None, *, storage: Any = None, **kwargs: Any) -> MetaBuilder:
@@ -337,6 +333,22 @@ class MetaBuilder:
         memory-backed.
         """
         self._config.workgraph_enabled = enabled if isinstance(enabled, str) else bool(enabled)
+        return self
+
+    def fork_instruction_policy(self, policy: str) -> MetaBuilder:
+        """Set what a fork of a member with activated host instructions does.
+
+        Emitted as ``runtime_options.fork_instruction_policy``:
+        ``"require_explicit_activation"`` (the gateway default when unset),
+        ``"reactivate_inherited"`` (the fork re-activates, in the child, every
+        key that was effective in the source at the fork) or ``"refuse"``.
+        """
+        if policy not in ("require_explicit_activation", "reactivate_inherited", "refuse"):
+            raise ValueError(
+                "fork_instruction_policy must be 'require_explicit_activation', "
+                "'reactivate_inherited' or 'refuse'"
+            )
+        self._config.fork_instruction_policy = policy
         return self
 
     def routing(self, config_path: str) -> MetaBuilder:
@@ -851,21 +863,6 @@ class MetaBuilder:
         self._config.declare_spec_update_expected_revision = expected_revision
         return self
 
-    def continuity_store(self, provider: Any) -> MetaBuilder:
-        """Set an external continuity store provider."""
-        self._config.continuity_store = provider
-        return self
-
-    def lease_provider(self, provider: Any) -> MetaBuilder:
-        """Set an external lease provider."""
-        self._config.lease_provider = provider
-        return self
-
-    def scratch_dir(self, path: str) -> MetaBuilder:
-        """Set the scratch directory for non-authoritative local state."""
-        self._config.scratch_dir = path
-        return self
-
     def role_migrations(
         self, declarations: Iterable[RoleMigrationDeclaration | dict[str, str]]
     ) -> MetaBuilder:
@@ -1014,17 +1011,17 @@ class MetaBuilder:
         return self
 
     def roster(self, provider: Any) -> MetaBuilder:
-        """Set the roster provider for identity-first continuity."""
+        """Set the identity-first roster provider."""
         self._config.roster_provider = provider
         return self
 
     def topology_provider(self, provider: Any) -> MetaBuilder:
-        """Set the topology provider for identity-first continuity."""
+        """Set the identity-first topology provider."""
         self._config.topology_provider = provider
         return self
 
     def agent_customizer(self, customizer: Any) -> MetaBuilder:
-        """Set the agent customizer for identity-first continuity."""
+        """Set the identity-first agent customizer."""
         self._config.agent_customizer = customizer
         return self
 
@@ -1092,30 +1089,6 @@ class MetaBuilder:
                 "identity_bootstrap_mode() requires roster() because every "
                 "explicit bootstrap mode is identity-first"
             )
-        has_external = (
-            self._config.continuity_store is not None
-            or self._config.lease_provider is not None
-            or self._config.scratch_dir is not None
-        )
-        if self._config.persistent_state and has_external:
-            raise ValueError(
-                "persistent_state and continuity_store/lease_provider/scratch_dir "
-                "are mutually exclusive — use one path or the other"
-            )
-        if has_external:
-            missing = []
-            if self._config.continuity_store is None:
-                missing.append("continuity_store")
-            if self._config.lease_provider is None:
-                missing.append("lease_provider")
-            if self._config.scratch_dir is None:
-                missing.append("scratch_dir")
-            if missing:
-                raise ValueError(
-                    "external-authoritative path requires continuity_store() + "
-                    "lease_provider() + scratch_dir(); missing: "
-                    + ", ".join(missing)
-                )
 
     def _apply_convention_defaults(self) -> None:
         """Fill in conventional config paths when not explicitly set.

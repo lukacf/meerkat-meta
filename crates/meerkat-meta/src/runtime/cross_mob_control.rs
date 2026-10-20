@@ -2852,62 +2852,52 @@ async fn serve_one(
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::identity_first::core_test_bridge::{CoreReadsBridge, register_live};
     use crate::identity_first::{
-        AgentAddressability, AgentIdentity, AgentRuntimeId, CheckpointVersion,
-        ContinuityGeneration, ContinuityRecord, DurabilityPolicy, DurableAgentSpec, FencingToken,
-        IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig, LeaseGrant,
-        LocalContinuityStore, LocalLeaseProvider,
+        AgentAddressability, AgentIdentity, DurabilityPolicy, DurableAgentSpec, IdentityRuntime,
+        IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider,
     };
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     struct EchoHandler;
 
+    /// An identity runtime over a Core that holds `worker`'s member live at
+    /// generation 0: its current runtime alias is `rt:worker:0`.
     async fn identity_runtime_with_current_alias()
     -> Result<Arc<IdentityRuntime>, Box<dyn std::error::Error + Send + Sync>> {
+        let bridge = Arc::new(CoreReadsBridge::default());
         let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "cross-mob-control-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(bridge.clone()),
             default_timeout: None,
         }));
-        let identity = AgentIdentity::parse("worker")?;
-        runtime
-            .register(
-                DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: AgentRuntimeId::parse("rt:worker:0")?,
-                    session_id: meerkat_core::types::SessionId::new(),
-                    generation: ContinuityGeneration::new(0),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                Some(LeaseGrant {
-                    identity,
-                    fencing_token: FencingToken::new(1),
-                    ttl: Duration::from_mins(1),
-                }),
-            )
-            .await;
+        register_live(
+            &runtime,
+            &bridge.core,
+            DurableAgentSpec {
+                identity: AgentIdentity::parse("worker")?,
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
         Ok(runtime)
     }
 

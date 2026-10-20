@@ -438,6 +438,102 @@ async fn classic_recorder_survives_alongside_mob_tool_categories() {
 }
 
 // ---------------------------------------------------------------------------
+// A spawn customizer the host set on its MobBootstrapSpec keeps running when
+// the builder turns classic agent memory on: the host's customizer runs
+// first, then the memory customizer.
+// ---------------------------------------------------------------------------
+
+/// Labels every member spawn the way a host spawn customizer may.
+struct HostLabelCustomizer;
+
+impl meerkat_mob::SpawnMemberCustomizer for HostLabelCustomizer {
+    fn customize_spawn(
+        &self,
+        _ctx: &meerkat_mob::SpawnCustomizationContext,
+        spec: &mut SpawnMemberSpec,
+    ) -> Result<(), meerkat_mob::MobError> {
+        spec.labels
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .insert("host_customizer".to_string(), "ran".to_string());
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn classic_memory_keeps_the_spawn_customizer_a_bootstrap_spec_carries() {
+    let memory_dir = tempfile::tempdir().expect("memory dir");
+    let store = SqliteAgentMemoryStore::open(memory_dir.path()).expect("sqlite store");
+    let session_dir = tempfile::tempdir().expect("session dir");
+    let client = CaptureClient::default();
+    let spec = meerkat_meta::MobBootstrapSpec::ephemeral(
+        test_definition(),
+        meerkat_mob::MobStorage::in_memory(),
+        session_dir.path().to_path_buf(),
+        4,
+        None,
+    )
+    .expect("ephemeral bootstrap spec")
+    .with_options(meerkat_meta::MobBootstrapOptions {
+        allow_ephemeral_sessions: true,
+        notify_orchestrator_on_resume: true,
+        default_llm_client: Some(Arc::new(client.clone())),
+    })
+    .with_spawn_member_customizer(Arc::new(HostLabelCustomizer));
+    let runtime = Box::pin(
+        UnifiedRuntime::builder()
+            .mob_spec(spec)
+            .module_config(meerkat_meta::MetaConfig {
+                modules: Vec::new(),
+                discovery: meerkat_meta::DiscoverySpec {
+                    namespace: "classic-memory-host-customizer".to_string(),
+                    modules: Vec::new(),
+                },
+                pre_spawn: Vec::new(),
+            })
+            .timeout(Duration::from_secs(5))
+            .agent_memory(Arc::new(store), AgentMemoryConfig::default())
+            .build(),
+    )
+    .await
+    .expect("classic runtime with a host spawn customizer and agent memory must build");
+
+    runtime
+        .spawn_many(vec![SpawnMemberSpec::from_wire(
+            "worker".to_string(),
+            "helper".to_string(),
+            None,
+            None,
+            None,
+        )])
+        .await
+        .expect("spawn member on the classic path");
+    let labels = runtime
+        .mob_handle()
+        .list_members()
+        .await
+        .into_iter()
+        .find(|member| member.agent_identity.as_str() == "helper")
+        .expect("the spawned member is listed")
+        .labels;
+    meerkat_meta::send_message_on_mob(&runtime.mob_handle(), "helper", "hello".to_string())
+        .await
+        .expect("send message");
+    let captured = client.wait_for_request(1).await;
+    runtime.mob_handle().stop().await.expect("stop");
+
+    assert_eq!(
+        labels.get("host_customizer").map(String::as_str),
+        Some("ran"),
+        "the host's spawn customizer ran on the member: {labels:?}"
+    );
+    assert!(
+        captured[0].tool_names.iter().any(|name| name == "memory"),
+        "the memory recorder tool is registered on the member: {:?}",
+        captured[0].tool_names
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Per-turn ambient injection is Off/no-op on the classic path: even the
 // explicit `budgeted` opt-in must not prepend memory into delivered turns
 // (there is no classic send-path hook yet — documented follow-up).

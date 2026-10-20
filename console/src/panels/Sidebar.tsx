@@ -313,6 +313,7 @@ export const __sidebarTest = {
   sidebarPinnedFamilyPinIds,
   pruneStaleSidebarStorage,
   safeConsoleHref,
+  deriveStateAttr,
   SIDEBAR_PINS_STORAGE_PREFIX,
   SIDEBAR_SECTION_ORDER_STORAGE_PREFIX,
   SIDEBAR_SUBGROUP_ORDER_STORAGE_PREFIX,
@@ -990,7 +991,7 @@ function deriveStateAttr(agent: ConsoleAgent): "active" | "degraded" | "retired"
   const degraded = agent.labels?.console_degraded === "true" ||
                    state.includes("degrade") ||
                    state === "needs_repair" ||
-                   agent.lease_healthy === false;
+                   state === "broken";
   if (degraded) return "degraded";
   return "active";
 }

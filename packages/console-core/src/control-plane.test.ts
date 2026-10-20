@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 
 import {
   normalizeConsoleInteractionRejectedError,
@@ -63,8 +65,6 @@ test("normalizeIdentityStatusRow and response phase trim data without inventing 
       addressability: "addressable",
       labels: { team: " console ", empty: "   ", " ": "ignored" },
       generation: 4,
-      checkpoint_version: 8,
-      lease_healthy: true,
     }),
     {
       identity: "identity:luka",
@@ -74,8 +74,6 @@ test("normalizeIdentityStatusRow and response phase trim data without inventing 
       addressability: "addressable",
       labels: { team: "console" },
       generation: 4,
-      checkpoint_version: 8,
-      lease_healthy: true,
     },
   );
 
@@ -207,14 +205,8 @@ test("normalize inspect views and typed console errors", () => {
       labels: { role: " primary " },
       continuity: {
         generation: 4,
-        checkpoint_version: 8,
         session_id: " session-1 ",
         agent_runtime_id: " runtime-1 ",
-      },
-      lease: {
-        fencing_token: 12,
-        ttl_remaining_ms: 9000,
-        healthy: true,
       },
       topology_peers: [" peer-a ", "", "peer-b"],
       is_final: false,
@@ -228,14 +220,8 @@ test("normalize inspect views and typed console errors", () => {
       labels: { role: "primary" },
       continuity: {
         generation: 4,
-        checkpoint_version: 8,
         session_id: "session-1",
         agent_runtime_id: "runtime-1",
-      },
-      lease: {
-        fencing_token: 12,
-        ttl_remaining_ms: 9000,
-        healthy: true,
       },
       topology_peers: ["peer-a", "peer-b"],
       is_final: false,
@@ -527,6 +513,82 @@ test("session_repair hold rides the status row and the inspect view and wins the
   );
   assert.equal(normalizeIdentitySessionRepair({ ...hold, apply_command: "" }), null);
   assert.equal(normalizeIdentitySessionRepair(null), null);
+});
+
+// 0.9.4: Meta keeps no continuity copy and holds no leases, so the identity
+// rows lost checkpoint_version, continuity_health, lease_healthy and lease.
+// A 0.9.4 gateway first sends them as JSON null and later not at all; a 0.9.3
+// gateway still sends values. The mirror reads all three shapes the same way.
+const DEAD_IDENTITY_KEYS = ["checkpoint_version", "continuity_health", "lease_healthy", "lease"];
+const STATUS_ROW = {
+  identity: "identity:luka",
+  state: "active",
+  addressability: "addressable",
+  labels: {},
+  generation: 4,
+};
+const DEAD_KEY_SHAPES: Array<[string, Record<string, unknown>]> = [
+  ["null", { checkpoint_version: null, continuity_health: null, lease_healthy: null, lease: null }],
+  ["absent", {}],
+  [
+    "0.9.3 values",
+    {
+      checkpoint_version: 8,
+      continuity_health: { store_reachable: true },
+      lease_healthy: true,
+      lease: { fencing_token: 12, ttl_remaining_ms: 9000, healthy: true },
+    },
+  ],
+];
+
+for (const [shape, deadKeys] of DEAD_KEY_SHAPES) {
+  test(`identity status row reads the removed keys sent as ${shape}`, () => {
+    const row = normalizeIdentityStatusRow({ ...STATUS_ROW, ...deadKeys });
+    assert.deepEqual(row, STATUS_ROW);
+  });
+
+  test(`identity inspect view reads the removed keys sent as ${shape}`, () => {
+    const continuityDead = shape === "absent" ? {} : { checkpoint_version: deadKeys.checkpoint_version };
+    const view = normalizeIdentityInspectViewState({
+      ...STATUS_ROW,
+      ...deadKeys,
+      continuity: { generation: 4, session_id: "s-1", agent_runtime_id: "rt-1", ...continuityDead },
+    });
+    assert.deepEqual(view, {
+      ...STATUS_ROW,
+      continuity: { generation: 4, session_id: "s-1", agent_runtime_id: "rt-1" },
+    });
+  });
+}
+
+test("no console source names a removed identity key", () => {
+  const root = path.basename(process.cwd()) === "console"
+    ? path.resolve(process.cwd(), "..")
+    : process.cwd();
+  const sourceDirs = [
+    ...fs.readdirSync(path.join(root, "packages"), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(root, "packages", entry.name, "src")),
+    path.join(root, "console", "src"),
+  ].filter((dir) => fs.existsSync(dir));
+  assert.ok(sourceDirs.length >= 3, `found only ${sourceDirs.join(", ")}`);
+  const sourceFiles = (dir: string): string[] =>
+    fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) return sourceFiles(fullPath);
+      return /\.(ts|tsx)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name) ? [fullPath] : [];
+    });
+  // The removed identity fields, and the vocabulary of the removed
+  // continuity store and lease provider.
+  const removed = new RegExp(
+    `\\b(${DEAD_IDENTITY_KEYS.filter((key) => key !== "lease").join("|")}|fencing_token|ttl_remaining_ms)\\b`
+      + "|continuity[ _-]?store|lease[ _-]?provider|request[ _-]?continuity[ _-]?repair|checkpoint[ _-]?version",
+    "i",
+  );
+  const hits = sourceDirs.flatMap(sourceFiles).flatMap((file) =>
+    fs.readFileSync(file, "utf8").split("\n").flatMap((line, index) =>
+      removed.test(line) ? [`${path.relative(root, file)}:${index + 1}: ${line.trim()}`] : []));
+  assert.deepEqual(hits, []);
 });
 
 test("normalizeIdentityStatusRow carries the unobserved marker of a pending row", () => {

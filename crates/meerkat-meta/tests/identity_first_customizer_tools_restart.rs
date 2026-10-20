@@ -340,12 +340,13 @@ async fn a_failed_early_customize_is_pending_until_the_materialization_publishes
     let state = temp.path().join("state");
     first_boot("customizer-tools-restart-b", &state).await;
 
-    // Lazy bootstrap keeps the member unmaterialized after the restore, so
-    // the pending state is observable; the early (first) call fails.
+    // Both publications before the lift fail (the mob build's early one and
+    // the bootstrap's), so the pending state is observable after the restore;
+    // so does the first send's.
     let capture = CaptureClient::default();
     let customizer = Arc::new(ToolCustomizer {
         calls: AtomicUsize::new(0),
-        fail_calls: BTreeSet::from([1]),
+        fail_calls: BTreeSet::from([1, 2, 3]),
     });
     let runtime = boot(
         "customizer-tools-restart-b",
@@ -364,14 +365,42 @@ async fn a_failed_early_customize_is_pending_until_the_materialization_publishes
         pending
             .reason
             .contains("pre-activation customize_build failed")
-            && pending.reason.contains("host refused build 1"),
+            && pending.reason.contains("host refused build 2"),
         "{pending:?}"
     );
-    // Lazy: nothing has registered the restored member's runtime yet, and
-    // the materialization publishes (releasing the hold) before it registers.
-    assert_eq!(member_run_starts_held(&runtime).await, None);
+    // Core restores the member live at activation (it ran at the last stop),
+    // and it registers with its run starts held until its tools are
+    // published.
+    assert_eq!(member_run_starts_held(&runtime).await, Some(true));
 
-    // Materialization (here driven by a send) publishes and clears it.
+    // A send whose publication fails (the third build) is refused as
+    // retryable: nothing is queued behind the hold.
+    let refused = identity_runtime
+        .send(
+            &id(MEMBER),
+            &meerkat_core::ContentInput::Text("refused".to_string()),
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(meerkat_meta::identity_first::IdentityRuntimeError::IdentityWakeRetryable { .. })
+        ),
+        "{refused:?}"
+    );
+    let status = identity_runtime.status(&id(MEMBER)).await.expect("status");
+    let pending = status
+        .customizer_tools_pending
+        .expect("the failed publication stays recorded");
+    assert!(
+        pending.reason.contains("host refused build 3"),
+        "{pending:?}"
+    );
+    assert_eq!(member_run_starts_held(&runtime).await, Some(true));
+    assert_eq!(capture.count(), 0, "nothing ran behind the hold");
+
+    // The next send's delivery publishes them (the fourth build), which
+    // clears the pending state and releases the hold.
     identity_runtime
         .send(
             &id(MEMBER),
@@ -388,6 +417,56 @@ async fn a_failed_early_customize_is_pending_until_the_materialization_publishes
         "the released hold never reached the member's registration"
     );
     assert!(resolved_tools(&runtime).await.contains(&TOOL.to_string()));
+    assert!(capture.last().expect("captured request").contains(TOOL));
+    runtime.shutdown().await;
+}
+
+/// The mob build's early publication fails, so meerkat stages a run-start
+/// hold for the restored member, and the bootstrap's own publication before
+/// the lift succeeds. The hold is released once the mob is live: the member
+/// runs with its tools, and nothing stays pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publication_before_the_lift_releases_the_hold_the_mob_build_staged() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    first_boot("customizer-tools-restart-c", &state).await;
+
+    let capture = CaptureClient::default();
+    let customizer = Arc::new(ToolCustomizer {
+        calls: AtomicUsize::new(0),
+        fail_calls: BTreeSet::from([1]),
+    });
+    let runtime = boot(
+        "customizer-tools-restart-c",
+        &state,
+        capture.clone(),
+        customizer.clone(),
+        IdentityBootstrapMode::LazyMaterialize,
+    )
+    .await;
+    assert_eq!(
+        customizer.calls.load(Ordering::SeqCst),
+        2,
+        "the mob build's early publication and the bootstrap's"
+    );
+    let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+    let status = identity_runtime.status(&id(MEMBER)).await.expect("status");
+    assert!(status.customizer_tools_pending.is_none(), "{status:?}");
+    assert_eq!(
+        member_run_starts_held(&runtime).await,
+        Some(false),
+        "the hold the mob build staged is released once the mob is live"
+    );
+    assert!(resolved_tools(&runtime).await.contains(&TOOL.to_string()));
+
+    identity_runtime
+        .send(
+            &id(MEMBER),
+            &meerkat_core::ContentInput::Text("after the restart".to_string()),
+        )
+        .await
+        .expect("send boot-2 turn");
+    wait_for_turn(&capture, 1, "boot 2's first turn").await;
     assert!(capture.last().expect("captured request").contains(TOOL));
     runtime.shutdown().await;
 }

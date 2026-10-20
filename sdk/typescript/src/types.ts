@@ -775,7 +775,7 @@ export function parseMemberReloadResult(raw: unknown): MemberReloadResult {
  * `actorLoop.state` is `"live" | "stalled" | "terminated" | "unobserved"`;
  * `openStallId` is set while a stall is open. `durability` is `"ready"` or
  * `{ reload_required: { operation, reason } }` once the gateway can observe
- * it, and `null` before that.
+ * it, and `null` before that. `generation` is Core's member generation.
  */
 export interface MemberHealth {
   readonly identity: string;
@@ -793,6 +793,11 @@ export interface MemberHealth {
    *  `refused` carries meerkat's reason (store not healthy). */
   readonly lastReload: Readonly<Record<string, unknown>> | null;
   readonly durability: unknown | null;
+  /**
+   * The identity's last refused wake, as on `IdentityStatus`; `null` when its
+   * last wake was not refused.
+   */
+  readonly wakeRefusal: WakeRefusal | null;
 }
 
 export function parseMemberHealth(raw: unknown): MemberHealth {
@@ -821,6 +826,10 @@ export function parseMemberHealth(raw: unknown): MemberHealth {
         ? (d.last_reload as Record<string, unknown>)
         : null,
     durability: d.durability === undefined ? null : d.durability,
+    wakeRefusal:
+      d.wake_refusal !== null && typeof d.wake_refusal === "object"
+        ? parseWakeRefusal(d.wake_refusal)
+        : null,
   };
 }
 
@@ -2429,7 +2438,7 @@ export function parseErrorEvent(raw: unknown): ErrorEvent {
 }
 
 // =========================================================================
-// Identity-First Continuity Types
+// Identity-First Types
 // =========================================================================
 
 // -- DurableAgentSpec (REQ-46) --------------------------------------------
@@ -2958,74 +2967,6 @@ export function agentBuildDraftToDict(
   return result;
 }
 
-// -- LeaseInfo (REQ-49b) --------------------------------------------------
-
-export interface LeaseInfo {
-  readonly fencingToken: number;
-  readonly ttlRemainingMs: number;
-  readonly healthy: boolean;
-}
-
-function parseLeaseInfo(raw: unknown): LeaseInfo | null {
-  if (raw == null || typeof raw !== "object") return null;
-  const d = raw as Record<string, unknown>;
-  return {
-    fencingToken: Number(d.fencing_token ?? 0),
-    ttlRemainingMs: Number(d.ttl_remaining_ms ?? 0),
-    healthy: Boolean(d.healthy ?? false),
-  };
-}
-
-// -- DurabilityPolicy (REQ-49b) -------------------------------------------
-
-export interface DurabilityPolicy {
-  readonly kind: "syncWriteThrough" | "asyncReplicated" | "bufferedExport";
-  readonly maxLossWindowMs?: number;
-}
-
-function parseDurabilityPolicy(raw: unknown): DurabilityPolicy {
-  const d = asRecord(raw);
-  const wireKind = String(d.kind ?? "sync_write_through");
-  let kind: DurabilityPolicy["kind"];
-  switch (wireKind) {
-    case "async_replicated":
-      kind = "asyncReplicated";
-      break;
-    case "buffered_export":
-      kind = "bufferedExport";
-      break;
-    default:
-      kind = "syncWriteThrough";
-      break;
-  }
-  const result: DurabilityPolicy = { kind };
-  if (kind === "bufferedExport" && d.max_loss_window_ms !== undefined) {
-    return { kind, maxLossWindowMs: Number(d.max_loss_window_ms) };
-  }
-  return result;
-}
-
-// -- ContinuityHealth (REQ-49b) -------------------------------------------
-
-export interface ContinuityHealth {
-  readonly storeReachable: boolean;
-  readonly durabilityPolicy: DurabilityPolicy;
-  readonly lastCheckpointVersion: number | null;
-}
-
-function parseContinuityHealth(raw: unknown): ContinuityHealth | null {
-  if (raw == null || typeof raw !== "object") return null;
-  const d = raw as Record<string, unknown>;
-  return {
-    storeReachable: Boolean(d.store_reachable ?? false),
-    durabilityPolicy: parseDurabilityPolicy(d.durability_policy),
-    lastCheckpointVersion:
-      typeof d.last_checkpoint_version === "number"
-        ? d.last_checkpoint_version
-        : null,
-  };
-}
-
 // -- CompletionCursor -----------------------------------------------------
 
 /**
@@ -3037,8 +2978,9 @@ function parseContinuityHealth(raw: unknown): ContinuityHealth | null {
  * cursor is the comparable atom instead — never derived from output content, a
  * content hash, a timestamp, or a per-poll uuid.
  *
- * `epoch` is the identity's lease fencing token (the runtime incarnation this
- * count belongs to); `turns` counts turns observed as completed within it.
+ * `epoch` is Core's fence for the identity's live member (the runtime
+ * incarnation this count belongs to); `turns` counts turns observed as
+ * completed within it.
  * Turn counts are not comparable across incarnations, so classify with
  * {@link completionProgressSince} rather than comparing `turns` directly.
  */
@@ -3223,10 +3165,13 @@ export const DELIVERY_SCOPE_VERSION = 1 as const;
  *
  * Persist it ({@link deliveryScopeToDict}) before a scoped dispatch, and pass
  * the same scope to `dispatch(..., { expectedScope })` and
- * `recoverDelivery`. It pins the Meta continuity (runtime id, generation,
- * lease fencing token) and meerkat's native member scope (`member`, opaque
+ * `recoverDelivery`. It pins the identity's live member as Core holds it
+ * (runtime id, Core's member generation, and Core's fence token in
+ * `leaseFencingToken`) and meerkat's native member scope (`member`, opaque
  * and versioned on its own). A selector and stale-binding guard: the gateway
  * re-validates every atom and refuses a moved scope with `StaleScopeError`.
+ * A scope persisted by Meta 0.9.3 holds Meta's own atoms and is refused as
+ * stale.
  */
 export interface DeliveryScope {
   readonly version: number;
@@ -3545,6 +3490,20 @@ export interface IdentityInspection {
    * field — in both cases absence must not be read as "no turns yet".
    */
   readonly completionCursor: CompletionCursor | null;
+  /** As on `IdentityStatus`. */
+  readonly agentRuntimeId: string | null;
+  /** As on `IdentityStatus`. */
+  readonly sessionId: string | null;
+  /** As on `IdentityStatus`. */
+  readonly memberId?: string | null;
+  /** As on `IdentityStatus`. */
+  readonly intentManaged: boolean;
+  /** As on `IdentityStatus`. */
+  readonly convergence: IdentityConvergence | null;
+  /** As on `IdentityStatus`. */
+  readonly wakeRefusal: WakeRefusal | null;
+  /** As on `IdentityStatus`. */
+  readonly replacedSession: ReplacedSession | null;
 }
 
 export function parseIdentityInspection(raw: unknown): IdentityInspection {
@@ -3558,6 +3517,10 @@ export function parseIdentityInspection(raw: unknown): IdentityInspection {
     isFinal: Boolean(d.is_final ?? false),
     peerReachableCount: Number(d.peer_reachable_count ?? 0),
     completionCursor: parseOptionalCompletionCursor(d.completion_cursor),
+    agentRuntimeId: optionalString(d.agent_runtime_id),
+    sessionId: optionalString(d.session_id),
+    memberId: optionalString(d.member_id),
+    ...parseIdentityViewParts(d),
   };
 }
 
@@ -3578,24 +3541,124 @@ export function identityInspectionToDict(
   if (inspection.completionCursor !== null) {
     out.completion_cursor = completionCursorToDict(inspection.completionCursor);
   }
+  if (inspection.agentRuntimeId !== null) {
+    out.agent_runtime_id = inspection.agentRuntimeId;
+  }
+  if (inspection.sessionId !== null) {
+    out.session_id = inspection.sessionId;
+  }
+  if (inspection.memberId != null) {
+    out.member_id = inspection.memberId;
+  }
+  out.intent_managed = inspection.intentManaged;
+  if (inspection.convergence !== null) {
+    out.convergence = identityConvergenceToDict(inspection.convergence);
+  }
+  if (inspection.wakeRefusal !== null) {
+    out.wake_refusal = {
+      code: inspection.wakeRefusal.code,
+      session_id: inspection.wakeRefusal.sessionId,
+      remedy: inspection.wakeRefusal.remedy,
+    };
+  }
+  if (inspection.replacedSession !== null) {
+    out.replaced_session = {
+      session_id: inspection.replacedSession.sessionId,
+      reason: inspection.replacedSession.reason,
+    };
+  }
   return out;
 }
 
 // -- IdentityStatus (REQ-49b) ---------------------------------------------
 
+/**
+ * An identity's view state: Core holds a live member for it (`active`), holds
+ * none (`dormant`), or holds none and the last wake was refused for good
+ * (`broken`, see `IdentityStatus.wakeRefusal`). A newer gateway may send a
+ * state not listed here.
+ */
+export type IdentityViewState = "active" | "dormant" | "broken";
+
+/**
+ * Why the identity's last wake was refused; cleared by the next successful
+ * wake. `code` is `-32051` (`IDENTITY_UNRESUMABLE_CODE`) for a final refusal,
+ * when the identity reads `broken`, or `-32603` for a refusal held until an
+ * operator acts, when it reads `dormant`. `sessionId` is the session whose
+ * resume was refused. `remedy` names the way out; a newer value is kept as
+ * sent.
+ */
+export interface WakeRefusal {
+  readonly code: number;
+  readonly sessionId: string;
+  readonly remedy:
+    | "delete_identity"
+    | "repair_session"
+    | "resolve_role_migration"
+    | "operator_review"
+    | (string & {});
+}
+
+/**
+ * The session the last wake replaced with a fresh spawn: Core held no durable
+ * session for the identity's last session (`reason` `"absent"`; a newer
+ * reason is kept as sent). Present until the next wake.
+ */
+export interface ReplacedSession {
+  readonly sessionId: string;
+  readonly reason: "absent" | (string & {});
+}
+
+/**
+ * Core's convergence status for an identity a host intent declaration
+ * manages. The fields are Core's, unchanged: `condition` and `decision` are
+ * Core's snake_case values (for example `"converged"` or `"backoff"`) and are
+ * kept as sent.
+ */
+export interface IdentityConvergence {
+  readonly agentIdentity: string;
+  readonly desiredIntentRevision: number | null;
+  readonly activeIntentRevision: number | null;
+  readonly decision: string | null;
+  readonly condition: string;
+  readonly observedAtMs: number;
+  readonly detail: string | null;
+}
+
+/**
+ * Full identity status. Core's mob machine holds the identity's session and
+ * generation; the status reads them per call. `agentRuntimeId` is `null` when
+ * the identity is not live; `sessionId` and `generation` are `null` when Core
+ * holds no binding for it.
+ */
 export interface IdentityStatus {
   readonly identity: string;
-  readonly lifecycleState: string;
-  readonly agentRuntimeId: string;
-  readonly sessionId: string;
+  readonly lifecycleState: IdentityViewState | (string & {});
+  readonly agentRuntimeId: string | null;
+  readonly sessionId: string | null;
   readonly profile: string;
+  /** `"autonomous_host"` or `"turn_driven"`; `null` when not reported. */
+  readonly runtimeMode: string | null;
   readonly addressability: string;
   readonly displayName: string | null;
   readonly labels: Readonly<Record<string, string>>;
-  readonly generation: number;
-  readonly checkpointVersion: number;
-  readonly lease: LeaseInfo | null;
-  readonly continuityHealth: ContinuityHealth | null;
+  readonly generation: number | null;
+  /**
+   * `{ reason, artifact_refusal? }` while a restored member's customizer
+   * tools are not published yet; `null` otherwise.
+   */
+  readonly customizerToolsPending: Readonly<Record<string, unknown>> | null;
+  /**
+   * `true` when a host intent declaration in Core manages the identity;
+   * Meta's lifecycle verbs then refuse it with `IdentityHostAdoptedError`.
+   */
+  readonly intentManaged: boolean;
+  /** Core's convergence status, when `intentManaged` is set and Core could read it. */
+  readonly convergence: IdentityConvergence | null;
+  /** The last refused wake, until a wake succeeds. */
+  readonly wakeRefusal: WakeRefusal | null;
+  /** The session the last wake replaced with a fresh spawn, until the next wake. */
+  readonly replacedSession: ReplacedSession | null;
   /**
    * The exact delivery scope to persist before a scoped dispatch
    * (`dispatch(..., { expectedScope })`); `null` when none can be captured,
@@ -3604,6 +3667,14 @@ export interface IdentityStatus {
   readonly deliveryScope?: DeliveryScope | null;
   /** `{ kind, reason }` when `deliveryScope` is `null`. */
   readonly deliveryScopeUnavailable?: DeliveryScopeUnavailable | null;
+  /**
+   * Core's mob member id of the identity's last binding: the roster member
+   * id, Meta's comms-safe encoding of the identity (the identity itself when
+   * it is already a valid comms name, `mk--...` otherwise, as for an identity
+   * with a `:`), from the same binding as `sessionId`; `null` when Core holds
+   * no binding for the identity.
+   */
+  readonly memberId?: string | null;
 }
 
 export interface DeliveryScopeUnavailable {
@@ -3640,224 +3711,89 @@ export function parseIdentityStatus(raw: unknown): IdentityStatus {
     deliveryScopeUnavailable,
     identity: String(d.identity ?? ""),
     lifecycleState: String(d.state ?? ""),
-    agentRuntimeId: String(d.agent_runtime_id ?? ""),
-    sessionId: String(d.session_id ?? ""),
+    agentRuntimeId: typeof d.agent_runtime_id === "string" ? d.agent_runtime_id : null,
+    sessionId: typeof d.session_id === "string" ? d.session_id : null,
+    memberId: typeof d.member_id === "string" ? d.member_id : null,
     profile: String(d.profile ?? ""),
+    runtimeMode: optionalString(d.runtime_mode),
     addressability: String(d.addressability ?? "addressable"),
     displayName: typeof d.display_name === "string" ? d.display_name : null,
     labels: asStringRecord(d.labels),
-    generation: Number(d.generation ?? 0),
-    checkpointVersion: Number(d.checkpoint_version ?? 0),
-    lease: parseLeaseInfo(d.lease),
-    continuityHealth: parseContinuityHealth(d.continuity_health),
+    generation: typeof d.generation === "number" ? d.generation : null,
+    customizerToolsPending:
+      d.customizer_tools_pending !== null && typeof d.customizer_tools_pending === "object"
+        ? { ...asRecord(d.customizer_tools_pending) }
+        : null,
+    ...parseIdentityViewParts(d),
   };
 }
 
-// -- ContinuityRecord (REQ-49c) -------------------------------------------
-
-export interface ContinuityRecord {
-  readonly identity: string;
-  readonly agentRuntimeId: string;
-  readonly sessionId: string;
-  readonly generation: number;
-  /**
-   * Monotonic for (identity, generation). It advances across session rotations
-   * and resets only after destructive reset advances generation.
-   */
-  readonly checkpointVersion: number;
+/**
+ * The identity-view parts `IdentityStatus` and `IdentityInspection` share:
+ * `intent_managed` (always sent) and the optional `convergence`,
+ * `wake_refusal` and `replaced_session` objects.
+ */
+function parseIdentityViewParts(d: Record<string, unknown>): {
+  intentManaged: boolean;
+  convergence: IdentityConvergence | null;
+  wakeRefusal: WakeRefusal | null;
+  replacedSession: ReplacedSession | null;
+} {
+  const part = <T>(value: unknown, parse: (raw: unknown) => T): T | null =>
+    value !== null && typeof value === "object" ? parse(value) : null;
+  return {
+    intentManaged: d.intent_managed === true,
+    convergence: part(d.convergence, parseIdentityConvergence),
+    wakeRefusal: part(d.wake_refusal, parseWakeRefusal),
+    replacedSession: part(d.replaced_session, parseReplacedSession),
+  };
 }
 
-export function parseContinuityRecord(raw: unknown): ContinuityRecord {
+export function identityConvergenceToDict(
+  convergence: IdentityConvergence,
+): Record<string, unknown> {
+  return {
+    agent_identity: convergence.agentIdentity,
+    desired_intent_revision: convergence.desiredIntentRevision,
+    active_intent_revision: convergence.activeIntentRevision,
+    decision: convergence.decision,
+    condition: convergence.condition,
+    observed_at_ms: convergence.observedAtMs,
+    detail: convergence.detail,
+  };
+}
+
+export function parseReplacedSession(raw: unknown): ReplacedSession {
   const d = asRecord(raw);
   return {
-    identity: String(d.identity ?? ""),
-    agentRuntimeId: String(d.agent_runtime_id ?? ""),
     sessionId: String(d.session_id ?? ""),
-    generation: Number(d.generation ?? 0),
-    checkpointVersion: Number(d.checkpoint_version ?? 0),
+    reason: String(d.reason ?? ""),
   };
 }
 
-export function continuityRecordToDict(
-  record: ContinuityRecord,
-): Record<string, unknown> {
-  return {
-    identity: record.identity,
-    agent_runtime_id: record.agentRuntimeId,
-    session_id: record.sessionId,
-    generation: record.generation,
-    checkpoint_version: record.checkpointVersion,
-  };
+function optionalNumber(value: unknown): number | null {
+  return typeof value === "number" ? value : null;
 }
 
-// -- ContinuityFailure (REQ-49c) ------------------------------------------
-
-export interface ContinuityFailure {
-  readonly identity: string;
-  readonly kind: string;
-  readonly record?: ContinuityRecord;
-  readonly detail: string;
-}
-
-export function parseContinuityFailure(raw: unknown): ContinuityFailure {
+export function parseWakeRefusal(raw: unknown): WakeRefusal {
   const d = asRecord(raw);
   return {
-    identity: String(d.identity ?? ""),
-    kind: String(d.kind ?? ""),
-    record: d.record != null ? parseContinuityRecord(d.record) : undefined,
-    detail: String(d.detail ?? ""),
+    code: typeof d.code === "number" ? d.code : 0,
+    sessionId: String(d.session_id ?? ""),
+    remedy: String(d.remedy ?? ""),
   };
 }
 
-// -- ContinuityResolveState (REQ-49c) -------------------------------------
-
-export interface ContinuityResolveState {
-  readonly state: "uninitialized" | "ready" | "broken";
-  readonly record?: ContinuityRecord;
-  readonly failure?: ContinuityFailure;
-}
-
-export function parseContinuityResolveState(
-  raw: unknown,
-): ContinuityResolveState {
-  const d = asRecord(raw);
-  const state = String(d.state ?? "uninitialized") as ContinuityResolveState["state"];
-  return {
-    state,
-    record: d.record != null ? parseContinuityRecord(d.record) : undefined,
-    failure: d.failure != null ? parseContinuityFailure(d.failure) : undefined,
-  };
-}
-
-// -- SessionSnapshot (REQ-49c) --------------------------------------------
-
-export interface SessionSnapshot {
-  readonly data: Uint8Array;
-}
-
-export function parseSessionSnapshot(raw: unknown): SessionSnapshot {
-  const d = asRecord(raw);
-  const b64 = String(d.data ?? "");
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return { data: bytes };
-}
-
-export function sessionSnapshotToDict(
-  snap: SessionSnapshot,
-): Record<string, string> {
-  let binary = "";
-  for (let i = 0; i < snap.data.length; i++) {
-    binary += String.fromCharCode(snap.data[i]);
-  }
-  return { data: btoa(binary) };
-}
-
-// -- LeaseGrant (REQ-49c) -------------------------------------------------
-
-export interface LeaseGrant {
-  readonly identity: string;
-  readonly fencingToken: number;
-  readonly ttlMs: number;
-}
-
-export function parseLeaseGrant(raw: unknown): LeaseGrant {
+export function parseIdentityConvergence(raw: unknown): IdentityConvergence {
   const d = asRecord(raw);
   return {
-    identity: String(d.identity ?? ""),
-    fencingToken: Number(d.fencing_token ?? 0),
-    ttlMs: Number(d.ttl ?? d.ttl_ms ?? 0),
-  };
-}
-
-export function leaseGrantToDict(grant: LeaseGrant): Record<string, unknown> {
-  return {
-    identity: grant.identity,
-    fencing_token: grant.fencingToken,
-    ttl: grant.ttlMs,
-  };
-}
-
-// -- LeaseAcquireResult (REQ-49c) -----------------------------------------
-
-export interface LeaseAcquireResult {
-  readonly status: "acquired" | "alreadyHeld";
-  readonly identity?: string;
-  readonly grant?: LeaseGrant;
-  readonly holder?: string;
-}
-
-export function parseLeaseAcquireResult(raw: unknown): LeaseAcquireResult {
-  const d = asRecord(raw);
-  const wireStatus = String(d.result ?? d.status ?? "acquired");
-  const status = wireStatus === "already_held" ? "alreadyHeld" as const : "acquired" as const;
-  return {
-    status,
-    identity: typeof d.identity === "string" ? d.identity : undefined,
-    grant: d.grant != null
-      ? parseLeaseGrant(d.grant)
-      : status === "acquired"
-        ? parseLeaseGrant(d)
-        : undefined,
-    holder: typeof d.holder === "string" ? d.holder : undefined,
-  };
-}
-
-export function leaseAcquireResultToDict(
-  result: LeaseAcquireResult,
-): Record<string, unknown> {
-  if (result.status === "alreadyHeld") {
-    return {
-      result: "already_held",
-      identity: result.identity ?? result.grant?.identity ?? "",
-      holder: result.holder ?? "",
-    };
-  }
-  const grant = result.grant;
-  return {
-    result: "acquired",
-    ...(grant ? leaseGrantToDict(grant) : {}),
-  };
-}
-
-// -- LeaseRenewResult (REQ-49c) -------------------------------------------
-
-export interface LeaseRenewResult {
-  readonly status: "renewed" | "lost";
-  readonly identity?: string;
-  readonly grant?: LeaseGrant;
-}
-
-export function parseLeaseRenewResult(raw: unknown): LeaseRenewResult {
-  const d = asRecord(raw);
-  const status = String(d.result ?? d.status ?? "renewed") as LeaseRenewResult["status"];
-  return {
-    status,
-    identity: typeof d.identity === "string" ? d.identity : undefined,
-    grant: d.grant != null
-      ? parseLeaseGrant(d.grant)
-      : status === "renewed"
-        ? parseLeaseGrant(d)
-        : undefined,
-  };
-}
-
-export function leaseRenewResultToDict(
-  result: LeaseRenewResult,
-): Record<string, unknown> {
-  if (result.status === "lost") {
-    return {
-      result: "lost",
-      identity: result.identity ?? result.grant?.identity ?? "",
-    };
-  }
-  const grant = result.grant;
-  return {
-    result: "renewed",
-    ...(grant ? leaseGrantToDict(grant) : {}),
+    agentIdentity: String(d.agent_identity ?? ""),
+    desiredIntentRevision: optionalNumber(d.desired_intent_revision),
+    activeIntentRevision: optionalNumber(d.active_intent_revision),
+    decision: optionalString(d.decision),
+    condition: String(d.condition ?? ""),
+    observedAtMs: typeof d.observed_at_ms === "number" ? d.observed_at_ms : 0,
+    detail: optionalString(d.detail),
   };
 }
 
@@ -3866,94 +3802,13 @@ export function leaseRenewResultToDict(
 /**
  * Deadline/cancellation context for a gateway-hosted provider callback.
  *
- * Authority-mutating providers must observe `signal` before committing. A
- * rejected or aborted callback is pre-commit and must not publish replacement
- * lease or continuity authority after cancellation.
+ * A provider that commits side effects must observe `signal` before
+ * committing. A rejected or aborted callback is pre-commit.
  */
 export interface ProviderCallbackContext {
   readonly signal: AbortSignal;
   /** Absolute Unix timestamp in milliseconds for the host callback deadline. */
   readonly deadlineMs: number;
-}
-
-export interface ContinuityStore {
-  resolveMany(identities: string[]): Promise<Record<string, ContinuityResolveState>>;
-  loadSessionSnapshot(sessionId: string): Promise<SessionSnapshot | null>;
-  /**
-   * Resolve the record bound to `sessionId`, with the facts a registration carries.
-   *
-   * Return `null` for an AUTHORITATIVE absence only. THROW if this store cannot
-   * answer. The platform requires the two to be distinguishable: both
-   * owner-authority passes read `null` as "this identity has no durable owner"
-   * and skip, so answering `null` because the question was never implemented
-   * silently disables owner pre-registration.
-   */
-  resolveRecordBySession(
-    sessionId: string,
-    context?: ProviderCallbackContext,
-  ): Promise<{
-    record: ContinuityRecord;
-    fencingToken: number;
-    checkpointVersion: number;
-  } | null>;
-  /**
-   * Return the immutable owner of this exact session, including retained history.
-   * Providers retaining rotated-away sessions must implement this method and
-   * throw on conflicting ownership. When omitted, only current bindings can be
-   * resolved through resolveRecordBySession.
-   */
-  sessionOwner?(
-    sessionId: string,
-    context?: ProviderCallbackContext,
-  ): Promise<string | null>;
-  /** Save only if fencingToken is current and version advances the identity/generation head. */
-  saveSessionSnapshot(
-    identity: string,
-    sessionId: string,
-    generation: number,
-    version: number,
-    fencingToken: number,
-    snapshot: SessionSnapshot,
-    context?: ProviderCallbackContext,
-  ): Promise<void>;
-  /** Persist the binding without rewinding checkpointVersion on session rebind. */
-  upsertContinuityRecord(
-    record: ContinuityRecord,
-    fencingToken: number,
-    context?: ProviderCallbackContext,
-  ): Promise<void>;
-  deleteContinuityRecord(
-    identity: string,
-    fencingToken: number,
-    context?: ProviderCallbackContext,
-  ): Promise<void>;
-  deleteSessionSnapshotIfCurrentRevision?(
-    sessionId: string,
-    expectedCurrentRevision: string,
-    context?: ProviderCallbackContext,
-  ): Promise<boolean>;
-}
-
-export interface LeaseProvider {
-  acquireLeases(
-    identities: string[],
-    runtimeInstance: string,
-    context?: ProviderCallbackContext,
-  ): Promise<Record<string, LeaseAcquireResult>>;
-  /**
-   * Renew atomically from the caller's perspective. A rejected Promise is a
-   * pre-commit failure and MUST leave every input grant unchanged. Every
-   * returned `renewed` or `lost` result is committed for that identity before
-   * the Promise resolves.
-   */
-  renewLeases(
-    grants: LeaseGrant[],
-    context?: ProviderCallbackContext,
-  ): Promise<Record<string, LeaseRenewResult>>;
-  releaseLeases(
-    grants: LeaseGrant[],
-    context?: ProviderCallbackContext,
-  ): Promise<void>;
 }
 
 export interface RosterProvider {
@@ -4645,12 +4500,15 @@ export function workGraphAttentionPauseOptionsToDict(
 /**
  * Typed eager-restore progress for one identity, published on the bootstrap
  * status while the restore pass runs. `stage` is `registered`, `resuming`,
- * `minted`, `resumed` or `broken` (tolerate future values); `kind` is the
- * typed continuity failure kind when `stage` is `broken`.
+ * `minted`, `resumed` or `refused` (tolerate future values). A `refused`
+ * stage carries the refusal's JSON-RPC `code` (the code the same refusal
+ * answers a call with: `-32051`, `-32052`, `-32053` or `-32603`) and its
+ * `kind` when the refusal has one.
  */
 export interface IdentityRestoreProgress {
   readonly stage: string;
   readonly kind: string | null;
+  readonly code: number | null;
 }
 
 /** Bootstrap progress for one durable identity. */
@@ -4663,7 +4521,25 @@ export interface IdentityBootstrapEntry {
   readonly restore: IdentityRestoreProgress | null;
 }
 
-/** Identity bootstrap snapshot (`meta/status_identity_bootstrap`). */
+/**
+ * A row of the `storage-migrate-native` first-boot manifest that the gateway
+ * has not carried out yet. `kind` is `"resume"` (the identity resumes the
+ * session the migration recorded) or `"fresh"` (it starts on a fresh
+ * session). `waitingFor` is `"roster"` (the identity list does not name the
+ * identity yet) or `"carry_out"` (it does, and the row is not carried out
+ * yet). Newer values are kept as sent.
+ */
+export interface FirstBootPendingRow {
+  readonly identity: string;
+  readonly kind: "resume" | "fresh" | (string & {});
+  readonly waitingFor: "roster" | "carry_out" | (string & {});
+}
+
+/**
+ * Identity bootstrap snapshot (`meta/status_identity_bootstrap`).
+ * `firstBootPending` lists the first-boot manifest rows still to be carried
+ * out after `storage-migrate-native`; it is empty when none is pending.
+ */
 export interface IdentityBootstrapStatus {
   readonly mode: Readonly<Record<string, unknown>>;
   readonly complete: boolean;
@@ -4675,6 +4551,20 @@ export interface IdentityBootstrapStatus {
   readonly timedOut: boolean | null;
   readonly target: string | null;
   readonly startupReady: boolean | null;
+  readonly firstBootPending: readonly FirstBootPendingRow[];
+}
+
+/**
+ * Every row the gateway sends is kept, so the pending count stays exact; a
+ * field that is not a string reads as `""` (identity) or `"unknown"`.
+ */
+export function parseFirstBootPendingRow(raw: unknown): FirstBootPendingRow {
+  const d = asRecord(raw);
+  return {
+    identity: typeof d.identity === "string" ? d.identity : "",
+    kind: typeof d.kind === "string" ? d.kind : "unknown",
+    waitingFor: typeof d.waiting_for === "string" ? d.waiting_for : "unknown",
+  };
 }
 
 export function parseIdentityRestoreProgress(
@@ -4683,7 +4573,11 @@ export function parseIdentityRestoreProgress(
   if (typeof raw !== "object" || raw === null) return null;
   const d = raw as Record<string, unknown>;
   if (typeof d.stage !== "string") return null;
-  return { stage: d.stage, kind: typeof d.kind === "string" ? d.kind : null };
+  return {
+    stage: d.stage,
+    kind: typeof d.kind === "string" ? d.kind : null,
+    code: typeof d.code === "number" ? d.code : null,
+  };
 }
 
 export function parseIdentityBootstrapStatus(raw: unknown): IdentityBootstrapStatus {
@@ -4712,5 +4606,8 @@ export function parseIdentityBootstrapStatus(raw: unknown): IdentityBootstrapSta
     timedOut: typeof d.timed_out === "boolean" ? d.timed_out : null,
     target: typeof d.target === "string" ? d.target : null,
     startupReady: typeof d.startup_ready === "boolean" ? d.startup_ready : null,
+    firstBootPending: Array.isArray(d.first_boot_pending)
+      ? d.first_boot_pending.map(parseFirstBootPendingRow)
+      : [],
   };
 }

@@ -19,7 +19,6 @@ async function makeRuntime(answer: unknown | (() => never)) {
   const rt = new MetaRuntime({
     mobConfigPath: null,
     sessionBuilder: null,
-    sessionStore: null,
     errorCallback: null,
     eventLog: null,
     consoleConfigPath: null,
@@ -35,9 +34,6 @@ async function makeRuntime(answer: unknown | (() => never)) {
     gatewayBin: null,
     modules: [],
     persistentState: null,
-    continuityStore: null,
-    leaseProvider: null,
-    scratchDir: null,
     rosterProvider: null,
     agentCustomizer: null,
     topologyProvider: null,

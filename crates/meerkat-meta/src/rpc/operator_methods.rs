@@ -574,7 +574,11 @@ fn compaction_admission_is_uncertain(error: &crate::identity_first::IdentityRunt
         error,
         IdentityRuntimeError::AdmissionBacklogFull { .. }
             | IdentityRuntimeError::ReloadRequired { .. }
-            | IdentityRuntimeError::NoActiveLease(_)
+            | IdentityRuntimeError::IdentityUnresumable { .. }
+            | IdentityRuntimeError::IdentityHistoryUnavailable { .. }
+            | IdentityRuntimeError::IdentityWakeRetryable { .. }
+            | IdentityRuntimeError::IdentityHostAdopted { .. }
+            | IdentityRuntimeError::WakeHeld { .. }
             | IdentityRuntimeError::InvalidState { .. }
             | IdentityRuntimeError::StaleRuntimeAlias { .. }
             | IdentityRuntimeError::PostAdmissionSuperseded { .. }
@@ -716,7 +720,7 @@ impl CompactOperation {
             },
             None => None,
         };
-        let (record, incarnation) = match runtime
+        let (session_id, incarnation) = match runtime
             .rebuild_compaction_owner(
                 &self.identity,
                 &initial,
@@ -734,7 +738,6 @@ impl CompactOperation {
                 return self.error("compact_member_rebuild_failed", "floor_install", error);
             }
         };
-        let session_id = record.session_id;
         let key = format!("meta-compact:{}", self.operation_id);
         let input = crate::identity_first::DispatchInput::system(
             "[meta-gateway operator verb compact_member] Maintenance turn: transcript compaction \
@@ -982,10 +985,9 @@ impl CompactOperation {
 /// A Dormant/never-materialized identity skips the retire and goes straight
 /// to materialization. Deliberately NOT `restore_flow`: that is fleet-scoped
 /// (it overwrites the runtime's desired peer edges from the roster it is
-/// handed), while this verb must touch exactly one identity. Fails typed when
-/// the durable continuity binding needed for a same-session resume is
-/// incomplete - materializing a fresh session would abandon the transcript
-/// this verb exists to compact.
+/// handed), while this verb must touch exactly one identity. The wake resumes
+/// Core's last binding of the identity; a session Core refuses to
+/// resume fails typed rather than starting fresh.
 #[cfg(test)]
 async fn rebuild_member_for_fresh_build(
     ctx: &IdentityFirstContext,
@@ -1002,50 +1004,29 @@ async fn rebuild_member_for_fresh_build(
         .state;
     if state == IdentityLifecycleState::Active {
         match expected_alias {
-            Some(alias) => identity_rt
-                .retire_member_alias_tracked(identity, alias)
-                .await
-                .map(|_| ()),
-            None => identity_rt.retire_tracked(identity).await.map(|_| ()),
+            Some(alias) => {
+                identity_rt
+                    .retire_member_alias_tracked(identity, alias)
+                    .await
+            }
+            None => identity_rt.retire_tracked(identity).await,
         }
         .map_err(|err| format!("quiesce retire: {err}"))?;
     }
-    // Reproject the entry as Dormant with the DURABLE continuity binding so
-    // `materialize` (which refuses Retiring) resumes the SAME durable
-    // session. The store record is read after the retire because retire runs
-    // a final checkpoint - the stored row carries the freshest checkpoint
-    // version.
-    let resolved = identity_rt
-        .continuity_store()
-        .resolve_many(std::slice::from_ref(identity))
-        .await
-        .map_err(|err| format!("continuity resolve after quiesce: {err}"))?;
-    let record = match resolved.get(identity) {
-        Some(crate::identity_first::ContinuityResolveState::Ready { record }) => record.clone(),
-        Some(crate::identity_first::ContinuityResolveState::Broken { failure }) => {
-            return Err(format!(
-                "identity {} has broken continuity ({}); cannot rebuild onto the same durable \
-                 session",
-                identity.as_str(),
-                failure.detail
-            ));
-        }
-        Some(crate::identity_first::ContinuityResolveState::Uninitialized) | None => {
-            return Err(format!(
-                "identity {} has no durable continuity record; cannot rebuild onto the same \
-                 durable session",
-                identity.as_str()
-            ));
-        }
-    };
-    identity_rt
-        .register(spec, IdentityLifecycleState::Dormant, Some(record), None)
-        .await;
+    // Adopt the current spec; the wake resumes Core's last binding of the
+    // identity, the SAME durable session, through a fresh build.
+    identity_rt.register(spec).await;
     identity_rt
         .materialize_tracked(identity)
         .await
-        .map(|record| record.session_id)
-        .map_err(|err| format!("re-materialization: {err}"))
+        .map_err(|err| format!("re-materialization: {err}"))?
+        .map(|scope| scope.session_id().clone())
+        .ok_or_else(|| {
+            format!(
+                "identity {} has no Core session to rebuild onto",
+                identity.as_str()
+            )
+        })
 }
 
 /// `meta/bound_member_transcript`: one audited keep-last-N transcript
@@ -1378,10 +1359,9 @@ mod tests {
     }
 
     use crate::identity_first::{
-        AgentAddressability, ContinuityGeneration, ContinuityRecord, ContinuityStore,
-        DurabilityPolicy, DurableAgentSpec, IdentityLifecycleState, IdentityRuntime,
-        IdentityRuntimeConfig, LeaseAcquireResult, LeaseProvider, LocalContinuityStore,
-        LocalLeaseProvider, MobSessionBridge, RosterContext, RosterError, RosterProvider,
+        AgentAddressability, DurabilityPolicy, DurableAgentSpec, IdentityRuntime,
+        IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider, MobSessionBridge,
+        RosterContext, RosterError, RosterProvider,
     };
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1799,6 +1779,21 @@ mod tests {
     /// compaction-floor registry shared into the RPC context - exactly the
     /// rpc_gateway composition, minus the stdio callback bridge.
     async fn operator_verb_harness(member: &str, mob_id: &str) -> OperatorVerbHarness {
+        operator_verb_harness_with_fork_policy(
+            member,
+            mob_id,
+            meerkat_core::ForkInstructionPolicy::default(),
+        )
+        .await
+    }
+
+    /// [`operator_verb_harness`] with the host's fork instruction policy for
+    /// the mob's member forks.
+    async fn operator_verb_harness_with_fork_policy(
+        member: &str,
+        mob_id: &str,
+        fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
+    ) -> OperatorVerbHarness {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let state = temp_dir.path().join("state");
         std::fs::create_dir_all(&state).expect("state dir");
@@ -1863,6 +1858,7 @@ comms = true
         )
         .with_session_runtime_adapter(Arc::clone(&adapter))
         .expect("acquire the fixture session runtime owner")
+        .with_fork_instruction_policy(fork_instruction_policy)
         .with_options(crate::mob_handle_runtime::MobBootstrapOptions {
             allow_ephemeral_sessions: true,
             notify_orchestrator_on_resume: true,
@@ -1929,50 +1925,16 @@ comms = true
             )
             .await
             .expect("member kickoff settled");
-        let member_session = handle
-            .resolve_bridge_session_id_observation(&roster_identity)
-            .await
-            .expect("member session id");
-
         // Durable identity authority over that member, bridged by the
-        // production MobSessionBridge (the gateway wiring).
+        // production MobSessionBridge (the gateway wiring). Core's journal
+        // binds the member spawned above; the identity runtime reads its
+        // status, runtime id and session from there.
         let public_member_alias =
             crate::member_comms_id::runtime_alias_str(&roster_id).into_owned();
         let identity = durable_identity;
-        // The roster identity and the runtime BINDING are different things now.
-        // The roster row is the durable identity's encoding; the binding is a
-        // generated `rt:{identity}:{generation}` incarnation. This harness needs
-        // both, and used to conflate them because they were the same string.
-        let runtime_alias = format!("rt:{}:0", identity.as_str());
         let continuity_store =
             Arc::new(LocalContinuityStore::in_memory().expect("continuity store"));
         let lease_provider = Arc::new(LocalLeaseProvider::new());
-        let lease_results = LeaseProvider::acquire_leases(
-            lease_provider.as_ref(),
-            std::slice::from_ref(&identity),
-            "operator-verb-test",
-        )
-        .await
-        .expect("acquire identity lease");
-        let lease = match lease_results.get(&identity) {
-            Some(LeaseAcquireResult::Acquired(lease)) => lease.clone(),
-            other => panic!("expected acquired identity lease, got {other:?}"),
-        };
-        let record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(&runtime_alias)
-                .expect("runtime alias"),
-            session_id: member_session,
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-        };
-        ContinuityStore::upsert_continuity_record(
-            continuity_store.as_ref(),
-            &record,
-            lease.fencing_token,
-        )
-        .await
-        .expect("persist identity continuity");
         let bridge = MobSessionBridge::with_session_service(handle.clone(), concrete.clone());
         let floors = bridge.compaction_floors();
         let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
@@ -1984,14 +1946,7 @@ comms = true
             bridge: Some(Arc::new(bridge)),
             default_timeout: None,
         }));
-        identity_runtime
-            .register(
-                worker_spec(&identity),
-                IdentityLifecycleState::Active,
-                Some(record),
-                Some(lease),
-            )
-            .await;
+        identity_runtime.register(worker_spec(&identity)).await;
 
         // Install the identity authority on the unified runtime so its
         // identity health monitor drives the completion cursor from member
@@ -2188,6 +2143,7 @@ comms = true
             .identity_runtime
             .roster_inspect()
             .await
+            .expect("roster inspect")
             .remove(&harness.identity)
             .expect("registered spec")
             .0;
@@ -2501,9 +2457,12 @@ comms = true
             .status(&harness.identity)
             .await
             .expect("status");
+        // Core retired the member and nothing revived it: Dormant (there is
+        // no Retiring state; a retired identity is Dormant until its next
+        // wake).
         assert_eq!(
             after.state,
-            crate::identity_first::IdentityLifecycleState::Retiring
+            crate::identity_first::IdentityLifecycleState::Dormant
         );
         assert!(harness.floors.get(&harness.identity).is_none());
         assert_eq!(after.session_id, retired.session_id);
@@ -2540,9 +2499,12 @@ comms = true
             .status(&harness.identity)
             .await
             .expect("status");
+        // Core retired the member and nothing revived it: Dormant (there is
+        // no Retiring state; a retired identity is Dormant until its next
+        // wake).
         assert_eq!(
             after.state,
-            crate::identity_first::IdentityLifecycleState::Retiring
+            crate::identity_first::IdentityLifecycleState::Dormant
         );
         assert!(harness.floors.get(&harness.identity).is_none());
         harness.teardown().await;
@@ -3268,6 +3230,179 @@ comms = true
             "{page:#?}"
         );
 
+        harness.teardown().await;
+    }
+
+    /// Seed one committed turn, activate one keyed host instruction on the
+    /// member through `meta/member_activate_instruction`, and return the
+    /// member's roster identity, the source a mob fork names.
+    async fn seed_activated_source(
+        harness: &OperatorVerbHarness,
+        member: &str,
+    ) -> meerkat_mob::ids::AgentIdentity {
+        let service: Arc<dyn crate::memory::hygienist::TranscriptEditSessionService> =
+            Arc::clone(&harness.concrete) as _;
+        const SEED_TURN: &str = "seed one committed turn";
+        harness.run_turn(SEED_TURN.to_string()).await;
+        let session_id = harness
+            .identity_runtime
+            .status(&harness.identity)
+            .await
+            .expect("identity status")
+            .session_id
+            .expect("identity session");
+        wait_for_durable_turn(&service, &session_id, SEED_TURN).await;
+        let activation = instruction_activation(
+            "r1",
+            "a1",
+            serde_json::json!({"kind": "absent"}),
+            None,
+            "Answer in French.",
+        );
+        let response = rpc(
+            harness,
+            "meta/member_activate_instruction",
+            serde_json::json!({ "identity": harness.member_alias, "activation": activation }),
+        )
+        .await;
+        assert!(response["error"].is_null(), "{response:#?}");
+        meerkat_mob::ids::AgentIdentity::from(
+            crate::member_comms_id::mob_member_id_str(member).into_owned(),
+        )
+    }
+
+    /// The call `fork_off` makes: a fork that starts its own first turn. Like
+    /// Meerkat's `fork_off`, it forks a turn-driven child whatever the role
+    /// profile's runtime mode is, since the bounded first turn tracks its
+    /// completion.
+    async fn self_starting_fork(
+        harness: &OperatorVerbHarness,
+        source: &meerkat_mob::ids::AgentIdentity,
+    ) -> Result<meerkat_mob::ForkMemberBoundedRunOutcome, meerkat_mob::BoundedMemberRunError> {
+        harness
+            .runtime
+            .mob_handle()
+            .fork_member_then_run_bounded(
+                source,
+                meerkat_mob::SpawnMemberSpec::new(
+                    meerkat_mob::ProfileName::from("worker"),
+                    meerkat_mob::ids::AgentIdentity::from("fork-a"),
+                )
+                .with_runtime_mode(meerkat_mob::MobRuntimeMode::TurnDriven)
+                .with_initial_message("Summarize the conversation so far."),
+                None,
+                "summary",
+                4096,
+                meerkat_core::DurableForkSourceAdmission::Quiescent,
+            )
+            .await
+    }
+
+    fn assert_policy_refusal(
+        outcome: Result<
+            meerkat_mob::ForkMemberBoundedRunOutcome,
+            meerkat_mob::BoundedMemberRunError,
+        >,
+    ) {
+        match outcome {
+            Err(meerkat_mob::BoundedMemberRunError::Admission(
+                meerkat_mob::MobError::ForkInstructionRefused { refusal, .. },
+            )) => assert_eq!(
+                refusal.cause,
+                meerkat_core::ForkInstructionRefusalCause::PolicyRefuses,
+                "{refusal:?}"
+            ),
+            other => panic!("expected the typed fork instruction refusal, got {other:?}"),
+        }
+    }
+
+    async fn assert_no_fork_member(harness: &OperatorVerbHarness) {
+        assert!(
+            harness
+                .runtime
+                .mob_handle()
+                .list_members()
+                .await
+                .iter()
+                .all(|entry| entry.agent_identity.as_str() != "fork-a"),
+            "a refused fork commits nothing"
+        );
+    }
+
+    /// Meerkat's default: a self-starting fork of a member with an activated
+    /// host instruction is refused, typed, before anything is committed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_off_of_an_activated_member_is_refused_typed_by_default() {
+        let harness = operator_verb_harness_with_fork_policy(
+            "worker:main",
+            "fork-policy-default",
+            meerkat_core::ForkInstructionPolicy::RequireExplicitActivation,
+        )
+        .await;
+        let source = seed_activated_source(&harness, "worker:main").await;
+        assert_policy_refusal(self_starting_fork(&harness, &source).await);
+        assert_no_fork_member(&harness).await;
+        harness.teardown().await;
+    }
+
+    /// The host opted in: the fork re-activates the inherited key in the
+    /// child, and the child's first turn runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_off_of_an_activated_member_runs_when_the_host_opts_in() {
+        let harness = operator_verb_harness_with_fork_policy(
+            "worker:main",
+            "fork-policy-reactivate",
+            meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+        )
+        .await;
+        let source = seed_activated_source(&harness, "worker:main").await;
+        let outcome = self_starting_fork(&harness, &source).await;
+        assert!(outcome.is_ok(), "the re-activated child runs: {outcome:?}");
+        harness.teardown().await;
+    }
+
+    /// `refuse`: every fork that would inherit an activation is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_off_of_an_activated_member_is_refused_under_refuse() {
+        let harness = operator_verb_harness_with_fork_policy(
+            "worker:main",
+            "fork-policy-refuse",
+            meerkat_core::ForkInstructionPolicy::Refuse,
+        )
+        .await;
+        let source = seed_activated_source(&harness, "worker:main").await;
+        assert_policy_refusal(self_starting_fork(&harness, &source).await);
+        assert_no_fork_member(&harness).await;
+        harness.teardown().await;
+    }
+
+    /// Meerkat's default leaves a host-driven fork to the host: the console
+    /// fork commits the child, and the host activates it before its first
+    /// turn (the child's first turn alone is refused until it does).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_console_fork_of_an_activated_member_commits_under_the_default() {
+        let harness = operator_verb_harness_with_fork_policy(
+            "worker:main",
+            "fork-policy-console",
+            meerkat_core::ForkInstructionPolicy::RequireExplicitActivation,
+        )
+        .await;
+        seed_activated_source(&harness, "worker:main").await;
+        let fork = harness
+            .runtime
+            .fork_member(
+                &harness.member_alias,
+                meerkat_mob::SpawnMemberSpec::new(
+                    meerkat_mob::ProfileName::from("worker"),
+                    meerkat_mob::ids::AgentIdentity::from("fork-b"),
+                ),
+                None,
+            )
+            .await;
+        assert!(
+            fork.is_ok(),
+            "a host-driven fork commits under the default: {fork:?}"
+        );
         harness.teardown().await;
     }
 

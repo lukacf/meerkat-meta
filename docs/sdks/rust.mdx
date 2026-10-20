@@ -294,6 +294,31 @@ agents create.
 `observe` is synchronous and must not block, and a panic in it propagates on
 the deciding task (the member's turn).
 
+### Fork instruction policy
+
+A fork of a member with activated host instructions does with them what the
+host's fork instruction policy says (the values are in the `runtime_options`
+row `fork_instruction_policy` of the
+[configuration reference](/reference/configuration)). Set it with the builder:
+
+```rust
+use meerkat_core::ForkInstructionPolicy;
+use meerkat_meta::UnifiedRuntime;
+
+let runtime = UnifiedRuntime::builder()
+    .definition_path("config/mob.toml")
+    .fork_instruction_policy(ForkInstructionPolicy::ReactivateInherited)
+    .build()
+    .await?;
+```
+
+The builder applies it to its mob for persistent, scratch and temp-dir
+launches, on create and on resume. Unset, Meerkat's default
+(`RequireExplicitActivation`) applies. A builder given an already-built
+`mob_spec(...)` refuses it with
+`UnifiedRuntimeBuilderError::ConflictingConfiguration`: set it on that spec
+with `MobBootstrapSpec::with_fork_instruction_policy`.
+
 ## Module routing
 
 ### `route_module_call`

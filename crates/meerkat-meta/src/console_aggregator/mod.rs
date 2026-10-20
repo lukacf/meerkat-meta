@@ -6,12 +6,16 @@ mod tool_application_projection;
 mod assistant_message_identity_tests;
 pub(crate) mod faults;
 #[cfg(test)]
+mod member_frame_access_tests;
+#[cfg(test)]
 mod provenance_search_tests;
 #[cfg(test)]
 mod provenance_store_revision_tests;
 mod query_error;
 #[cfg(test)]
 mod runtime_notice_tests;
+#[cfg(test)]
+mod runtime_plane_writer_tests;
 mod send_recovery;
 #[cfg(test)]
 mod send_recovery_tests;
@@ -63,12 +67,13 @@ pub use store::{
     InMemoryConsoleLogStore, SqliteConsoleLogStore,
 };
 pub use types::{
-    AppendDisposition, AppendOutcome, ConsoleCursor, ConsoleFrame, ConsoleFrameMemberProvenance,
-    ConsoleFrameSource, ConsoleFrameSourceKind, ConsoleFrameStatus, ConsoleIdentityInspection,
-    ConsoleIdentityRecord, ConsoleInteractionAccepted, ConsoleReplayUnavailable,
-    ConsoleSendRequest, ConsoleTimelineEvent, ConsoleTimelineMode, ConsoleTimelinePage,
-    ConsoleTimelineQuery, ConsoleTimelineWindowPage, ConsoleTimelineWindowQuery, ConsoleTurnOrigin,
-    ConsoleVisibility, IdentityFirstReservation, NewConsoleFrame,
+    AppendDisposition, AppendOutcome, ConsoleCursor, ConsoleFrame, ConsoleFrameLineageLink,
+    ConsoleFrameMemberProvenance, ConsoleFrameSource, ConsoleFrameSourceKind, ConsoleFrameStatus,
+    ConsoleIdentityInspection, ConsoleIdentityRecord, ConsoleInteractionAccepted,
+    ConsoleReplayUnavailable, ConsoleSendRequest, ConsoleTimelineEvent, ConsoleTimelineMode,
+    ConsoleTimelinePage, ConsoleTimelineQuery, ConsoleTimelineWindowPage,
+    ConsoleTimelineWindowQuery, ConsoleTurnOrigin, ConsoleVisibility, IdentityFirstReservation,
+    NewConsoleFrame,
 };
 
 const TIMELINE_CHANNEL_CAP: usize = 1024;
@@ -179,20 +184,23 @@ struct AggregatorInner {
     // contain no transcript or lifecycle authority.
     session_history_projection_locks:
         std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Last COMPLETED backfill's pre-read session write epoch, keyed by the
-    /// session's watermark runtime key. While the runtime's epoch witness for
-    /// the session is unchanged, the periodic discovery loop skips the
-    /// backfill outright — the historical shape re-read (and re-deserialized)
-    /// every member's full session document each pass, plus one watermark
-    /// row write, on a fully idle gateway. Entries are dropped with their
-    /// runtime; a missing entry or an epoch-less runtime always reads.
-    session_backfill_epochs: std::sync::Mutex<BTreeMap<String, u64>>,
-    /// Per-session durable write epoch at which an UNSETTLED assistant
-    /// refresh (the member was not yet idle) last completed its full history
-    /// read. An unsettled pass restores positive frames only, so a later
-    /// unsettled pass over the same epoch has nothing to add and skips the
-    /// full-document read; a settled pass always reads.
-    session_pending_read_epochs: std::sync::Mutex<BTreeMap<String, u64>>,
+    /// Per-session committed boundary authority at which the last completed
+    /// session-history backfill ran, keyed by the session's watermark runtime
+    /// key. While the runtime's durable store answers the same authority for
+    /// the session, the periodic discovery loop skips the backfill outright:
+    /// nothing committed moved, so the full session read and the watermark
+    /// row write would add nothing. Entries are dropped with their runtime; a
+    /// missing entry, or a runtime whose store does not answer the authority
+    /// as a bounded read, always reads.
+    session_backfill_authorities:
+        std::sync::Mutex<BTreeMap<String, meerkat_runtime::RuntimeSessionAuthority>>,
+    /// Per-session committed boundary authority at which an UNSETTLED
+    /// assistant refresh (the member was not yet idle) last completed its
+    /// full history read. An unsettled pass restores positive frames only,
+    /// so a later unsettled pass over the same authority has nothing to add
+    /// and skips the full-document read; a settled pass always reads.
+    session_pending_read_authorities:
+        std::sync::Mutex<BTreeMap<String, meerkat_runtime::RuntimeSessionAuthority>>,
     member_provenance: std::sync::Mutex<MemberProvenanceCache>,
     member_provenance_searches: std::sync::Mutex<MemberProvenanceSearchCache>,
     notice_observations: std::sync::Mutex<NoticeObservationCache>,
@@ -206,22 +214,13 @@ struct AggregatorInner {
     status_unknown_redrives: std::sync::Mutex<BTreeSet<(uuid::Uuid, String, String, String)>>,
     #[cfg(test)]
     status_unknown_redrive_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    /// Retry keys with an armed drain re-drive (one waiter per key): the
-    /// member was idle with durable work still landing (`Draining`), and the
-    /// session's next durable write that leaves it drained re-drives the
-    /// refresh. Trailing commits raise no member event of their own.
-    drain_redrives: std::sync::Mutex<BTreeSet<(uuid::Uuid, String, String, String)>>,
+    /// Retry keys with a queued moved-boundary re-drive: a completed pass whose
+    /// session's committed boundary moved during its read re-reads once at
+    /// the new boundary instead of waiting for a discovery tick and
+    /// watermark expiry.
+    moved_boundary_redrives: std::sync::Mutex<BTreeSet<(uuid::Uuid, String, String, String)>>,
     #[cfg(test)]
-    drain_redrive_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    /// Test seam: replaces the runtime's drained read for drain re-drives.
-    #[cfg(test)]
-    drain_probe_override: std::sync::Mutex<Option<DrainProbe>>,
-    /// Retry keys with a queued epoch re-drive: a completed pass whose
-    /// session write epoch moved during its read re-reads once at the new
-    /// epoch instead of waiting for a discovery tick and watermark expiry.
-    epoch_redrives: std::sync::Mutex<BTreeSet<(uuid::Uuid, String, String, String)>>,
-    #[cfg(test)]
-    epoch_redrive_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    moved_boundary_redrive_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Session-history backfill jobs spawned or armed and not yet finished
     /// (see [`BackfillActivity`]). Zero means every pass the aggregator owes
     /// has run: [`MetaConsoleAggregator::history_backfill_converged`].
@@ -478,16 +477,171 @@ fn console_member_for_resolved_member(
     }
 }
 
+/// Capture a live member's provenance, with its spawn lineage, and retain it
+/// for the member's incarnation (its session).
+async fn capture_member_provenance(
+    inner: &AggregatorInner,
+    resolved: &ResolvedConsoleMember,
+    record: &ConsoleIdentityRecord,
+) -> ConsoleFrameMemberProvenance {
+    let lineage = Box::pin(capture_member_lineage(resolved, record)).await;
+    retain_member_provenance_with_lineage(inner, resolved, record, lineage)
+}
+
+/// The most links a captured lineage holds: the member and seven ancestors,
+/// the bound the access rules walk.
+const CAPTURED_LINEAGE_DEPTH: usize = 8;
+
+/// The member's spawn lineage as the console owner captures it with a
+/// frame: the member first, then each ancestor its registry-verified
+/// `spawned_by` label names, parent first.
+///
+/// An ancestor is captured only from the incarnation the spawn registry
+/// bound to the lineage (`spawned_by_session`: the session that performed
+/// the spawn), read from the same roster the member was resolved from. An
+/// ancestor that is not live under that incarnation, or a lineage with no
+/// bound incarnation, is recorded without attributes and the walk stops
+/// there: the access decision then fails closed under any deny its bare
+/// identity cannot decide. A later member under the parent's identity is
+/// never captured in its place.
+async fn capture_member_lineage(
+    resolved: &ResolvedConsoleMember,
+    record: &ConsoleIdentityRecord,
+) -> Vec<ConsoleFrameLineageLink> {
+    let namespace = resolved.entry.identity_namespace.as_str();
+    let mut lineage = vec![lineage_link_for_record(
+        record,
+        namespace,
+        resolved.member.role.as_str(),
+    )];
+    let mut visited = BTreeSet::from([record.identity.clone()]);
+    let mut child_labels = record.labels.clone();
+    let mut sources: Option<Vec<ResolvedConsoleMember>> = None;
+    while lineage.len() < CAPTURED_LINEAGE_DEPTH {
+        let Some(parent) = child_labels
+            .get(crate::console_spawn::SPAWNED_BY_LABEL)
+            .map(|parent| parent.trim().to_string())
+            .filter(|parent| !parent.is_empty())
+        else {
+            break;
+        };
+        let parent_identity = apply_namespace(&parent, namespace);
+        if !visited.insert(parent_identity.clone()) {
+            break;
+        }
+        let bound_session = child_labels
+            .get(crate::console_spawn::SPAWNED_BY_SESSION_LABEL)
+            .map(|session| session.trim().to_string())
+            .filter(|session| !session.is_empty());
+        let mut confirmed = None;
+        if let Some(bound_session) = bound_session.as_deref() {
+            if sources.is_none() {
+                sources = Some(
+                    Box::pin(member_sources_for_entry_including_hidden(&resolved.entry)).await,
+                );
+            }
+            for candidate in sources.iter().flatten() {
+                let roster_id = candidate.member.agent_identity.as_str();
+                let alias_name = crate::member_comms_id::runtime_alias_str(roster_id);
+                let alias: &str = alias_name.as_ref();
+                let durable =
+                    crate::member_comms_id::durable_identity_label(&candidate.member.labels)
+                        .unwrap_or(alias);
+                if roster_id != parent && alias != parent && durable != parent {
+                    continue;
+                }
+                let Some(candidate_record) =
+                    Box::pin(identity_record_for_resolved_member(candidate)).await
+                else {
+                    continue;
+                };
+                if candidate_record.session_id.as_deref() == Some(bound_session) {
+                    confirmed = Some((candidate_record, candidate.member.role.to_string()));
+                    break;
+                }
+            }
+        }
+        match confirmed {
+            Some((parent_record, role)) => {
+                lineage.push(lineage_link_for_record(&parent_record, namespace, &role));
+                child_labels = parent_record.labels;
+            }
+            None => {
+                lineage.push(ConsoleFrameLineageLink {
+                    identity: parent_identity,
+                    agent_id: None,
+                    role: None,
+                    labels: None,
+                });
+                break;
+            }
+        }
+    }
+    lineage
+}
+
+/// One captured lineage link, in the namespace the access attribute cache
+/// uses for the same member (identity, runtime member id and the
+/// `spawned_by` label are namespaced alike).
+fn lineage_link_for_record(
+    record: &ConsoleIdentityRecord,
+    namespace: &str,
+    role: &str,
+) -> ConsoleFrameLineageLink {
+    let mut labels = record.labels.clone();
+    if let Some(parent) = labels.get_mut(crate::console_spawn::SPAWNED_BY_LABEL) {
+        *parent = apply_namespace(parent, namespace);
+    }
+    ConsoleFrameLineageLink {
+        identity: record.identity.clone(),
+        agent_id: Some(apply_namespace(&record.runtime_member_id, namespace)),
+        role: Some(role.to_string()),
+        labels: Some(labels),
+    }
+}
+
+/// Retain a provenance whose lineage holds only the member itself, with any
+/// parent it names unconfirmed.
+#[cfg(test)]
 fn retain_member_provenance(
     inner: &AggregatorInner,
     resolved: &ResolvedConsoleMember,
     record: &ConsoleIdentityRecord,
+) -> ConsoleFrameMemberProvenance {
+    let namespace = resolved.entry.identity_namespace.as_str();
+    let mut lineage = vec![lineage_link_for_record(
+        record,
+        namespace,
+        resolved.member.role.as_str(),
+    )];
+    if let Some(parent) = record
+        .labels
+        .get(crate::console_spawn::SPAWNED_BY_LABEL)
+        .map(|parent| parent.trim().to_string())
+        .filter(|parent| !parent.is_empty())
+    {
+        lineage.push(ConsoleFrameLineageLink {
+            identity: apply_namespace(&parent, namespace),
+            agent_id: None,
+            role: None,
+            labels: None,
+        });
+    }
+    retain_member_provenance_with_lineage(inner, resolved, record, lineage)
+}
+
+fn retain_member_provenance_with_lineage(
+    inner: &AggregatorInner,
+    resolved: &ResolvedConsoleMember,
+    record: &ConsoleIdentityRecord,
+    lineage: Vec<ConsoleFrameLineageLink>,
 ) -> ConsoleFrameMemberProvenance {
     let provenance = ConsoleFrameMemberProvenance {
         identity: record.clone(),
         member: console_member_for_resolved_member(resolved, record),
         primary_mob_id: resolved.entry.runtime.handle().mob_id().to_string(),
         source_mob_id: resolved.source_mob_id.clone(),
+        lineage,
     };
     // A stale identity refresh must not restore a predecessor's witnesses.
     let entries = inner
@@ -500,23 +654,23 @@ fn retain_member_provenance(
     {
         return provenance;
     }
-    let shared = Arc::new(provenance.clone());
-    let mut retained = inner
+    // Retained per incarnation only: a witness keyed by the identity alone
+    // could later be handed to another member under the same identity.
+    let Some(session_id) = record.session_id.clone() else {
+        return provenance;
+    };
+    inner
         .member_provenance
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    retained.insert(
-        (
-            record.runtime_key.clone(),
-            record.identity.clone(),
-            record.session_id.clone(),
-        ),
-        shared.clone(),
-    );
-    retained.insert(
-        (record.runtime_key.clone(), record.identity.clone(), None),
-        shared,
-    );
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            (
+                record.runtime_key.clone(),
+                record.identity.clone(),
+                Some(session_id),
+            ),
+            Arc::new(provenance.clone()),
+        );
     provenance
 }
 
@@ -527,13 +681,19 @@ async fn member_provenance_for_identity(
     session_id: Option<&str>,
     refresh: bool,
 ) -> Option<ConsoleFrameMemberProvenance> {
-    if identity == "__console__" || identity == SYSTEM_EVENT_IDENTITY {
+    if crate::console_contracts::is_runtime_plane_identity(identity) {
         return None;
     }
+    // A witness belongs to the incarnation that wrote the frame, and only the
+    // frame's session names it. A frame that names no session records none,
+    // and is decided as uncaptured: a member live under the identity now, a
+    // retained witness and the durable search could all be another member
+    // under the same identity than the one that wrote it.
+    let session_id = session_id?;
     let key = (
         entry.runtime_key.clone(),
         identity.to_string(),
-        session_id.map(str::to_string),
+        Some(session_id.to_string()),
     );
     let cached = inner
         .member_provenance
@@ -549,10 +709,8 @@ async fn member_provenance_for_identity(
         let Some(record) = identity_record_for_resolved_member(&resolved).await else {
             continue;
         };
-        if record.identity == identity
-            && session_id.is_none_or(|id| record.session_id.as_deref() == Some(id))
-        {
-            return Some(retain_member_provenance(inner, &resolved, &record));
+        if record.identity == identity && record.session_id.as_deref() == Some(session_id) {
+            return Some(Box::pin(capture_member_provenance(inner, &resolved, &record)).await);
         }
     }
     if cached.is_some() {
@@ -560,7 +718,7 @@ async fn member_provenance_for_identity(
     }
     // A missing live member still needs its durable policy witness. Cache only
     // a verified log prefix, never the absence of the member itself.
-    recover_member_provenance(inner, entry, identity, session_id, key).await
+    recover_member_provenance(inner, entry, identity, Some(session_id), key).await
 }
 
 async fn recover_member_provenance(
@@ -817,8 +975,8 @@ impl MetaConsoleAggregator {
                 session_backfill_permits: Arc::new(Semaphore::new(
                     options.max_concurrent_session_backfills,
                 )),
-                session_backfill_epochs: std::sync::Mutex::new(BTreeMap::new()),
-                session_pending_read_epochs: std::sync::Mutex::new(BTreeMap::new()),
+                session_backfill_authorities: std::sync::Mutex::new(BTreeMap::new()),
+                session_pending_read_authorities: std::sync::Mutex::new(BTreeMap::new()),
                 session_history_projection_locks: std::sync::Mutex::new(BTreeMap::new()),
                 tool_application_projections: tokio::sync::Mutex::new(BTreeMap::new()),
                 member_provenance: std::sync::Mutex::new(MemberProvenanceCache::new(
@@ -831,14 +989,9 @@ impl MetaConsoleAggregator {
                 status_unknown_redrives: std::sync::Mutex::new(BTreeSet::new()),
                 #[cfg(test)]
                 status_unknown_redrive_tasks: std::sync::Mutex::new(Vec::new()),
-                drain_redrives: std::sync::Mutex::new(BTreeSet::new()),
+                moved_boundary_redrives: std::sync::Mutex::new(BTreeSet::new()),
                 #[cfg(test)]
-                drain_redrive_tasks: std::sync::Mutex::new(Vec::new()),
-                #[cfg(test)]
-                drain_probe_override: std::sync::Mutex::new(None),
-                epoch_redrives: std::sync::Mutex::new(BTreeSet::new()),
-                #[cfg(test)]
-                epoch_redrive_tasks: std::sync::Mutex::new(Vec::new()),
+                moved_boundary_redrive_tasks: std::sync::Mutex::new(Vec::new()),
                 backfill_activity: tokio::sync::watch::Sender::new(0),
                 notice_observations: std::sync::Mutex::new(NoticeObservationCache::new(
                     NOTICE_OBSERVATION_CACHE_LIMIT,
@@ -910,8 +1063,8 @@ impl MetaConsoleAggregator {
                 targeted_session_backfills: tokio::sync::Mutex::new(BTreeMap::new()),
                 opportunistic_session_backfills: tokio::sync::Mutex::new(BTreeSet::new()),
                 session_backfill_permits: owner.session_backfill_permits.clone(),
-                session_backfill_epochs: std::sync::Mutex::new(BTreeMap::new()),
-                session_pending_read_epochs: std::sync::Mutex::new(BTreeMap::new()),
+                session_backfill_authorities: std::sync::Mutex::new(BTreeMap::new()),
+                session_pending_read_authorities: std::sync::Mutex::new(BTreeMap::new()),
                 session_history_projection_locks: std::sync::Mutex::new(BTreeMap::new()),
                 tool_application_projections: tokio::sync::Mutex::new(BTreeMap::new()),
                 member_provenance: std::sync::Mutex::new(MemberProvenanceCache::new(
@@ -924,14 +1077,9 @@ impl MetaConsoleAggregator {
                 status_unknown_redrives: std::sync::Mutex::new(BTreeSet::new()),
                 #[cfg(test)]
                 status_unknown_redrive_tasks: std::sync::Mutex::new(Vec::new()),
-                drain_redrives: std::sync::Mutex::new(BTreeSet::new()),
+                moved_boundary_redrives: std::sync::Mutex::new(BTreeSet::new()),
                 #[cfg(test)]
-                drain_redrive_tasks: std::sync::Mutex::new(Vec::new()),
-                #[cfg(test)]
-                drain_probe_override: std::sync::Mutex::new(None),
-                epoch_redrives: std::sync::Mutex::new(BTreeSet::new()),
-                #[cfg(test)]
-                epoch_redrive_tasks: std::sync::Mutex::new(Vec::new()),
+                moved_boundary_redrive_tasks: std::sync::Mutex::new(Vec::new()),
                 backfill_activity: tokio::sync::watch::Sender::new(0),
                 notice_observations: std::sync::Mutex::new(NoticeObservationCache::new(
                     NOTICE_OBSERVATION_CACHE_LIMIT,
@@ -1153,20 +1301,19 @@ impl MetaConsoleAggregator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|(key, _, _), _| key != &runtime_key);
-        // Registration replaces any prior runtime under this key, and epoch
-        // counters are per-process starting at zero: a witness recorded
-        // against the old runtime could coincide with the new counter and
-        // wrongly suppress its first backfill, so drop them here as well as
-        // on unregister.
+        // Registration replaces any prior runtime under this key, possibly
+        // over a different durable store: an authority recorded against the
+        // old runtime could equal the new runtime's and wrongly suppress its
+        // first backfill, so drop them here as well as on unregister.
         {
             let prefix = format!("{runtime_key}:session-history:");
             self.inner
-                .session_backfill_epochs
+                .session_backfill_authorities
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .retain(|key, _| !key.starts_with(&prefix));
             self.inner
-                .session_pending_read_epochs
+                .session_pending_read_authorities
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .retain(|key, _| !key.starts_with(&prefix));
@@ -1329,18 +1476,18 @@ impl MetaConsoleAggregator {
         {
             let _ = shutdown.send(true);
         }
-        // Drop this runtime's backfill epoch witnesses: a later re-register
-        // gets a fresh runtime whose epoch counter restarts, and a stale
-        // equal-valued witness would wrongly suppress its first backfill.
+        // Drop this runtime's backfill authorities: a later re-register gets
+        // a fresh runtime, possibly over a different durable store, and a
+        // stale equal authority would wrongly suppress its first backfill.
         {
             let prefix = format!("{runtime_key}:session-history:");
             self.inner
-                .session_backfill_epochs
+                .session_backfill_authorities
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .retain(|key, _| !key.starts_with(&prefix));
             self.inner
-                .session_pending_read_epochs
+                .session_pending_read_authorities
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .retain(|key, _| !key.starts_with(&prefix));
@@ -1560,7 +1707,7 @@ impl MetaConsoleAggregator {
             };
             let Some(status) = identity_runtime
                 .statuses()
-                .await
+                .await?
                 .into_iter()
                 .find(|status| {
                     status
@@ -1718,7 +1865,10 @@ impl MetaConsoleAggregator {
                     self.inner.clone(),
                     SessionBackfillTarget {
                         assistant_refresh: AssistantHistoryRefreshReason::PositiveOnly,
-                        provenance: Some(retain_member_provenance(&self.inner, &resolved, &record)),
+                        provenance: Some(
+                            Box::pin(capture_member_provenance(&self.inner, &resolved, &record))
+                                .await,
+                        ),
                         entry: resolved.entry.clone(),
                         record: record.clone(),
                         session_id,
@@ -1790,7 +1940,7 @@ impl MetaConsoleAggregator {
             )
             .into());
         }
-        if let Some((entry, identity_runtime, parsed_identity, mut record)) =
+        if let Some((entry, identity_runtime, parsed_identity, record)) =
             durable_matches.into_iter().next()
         {
             let durable_live_records = Box::pin(self.live_records_for_durable_record(
@@ -1810,19 +1960,6 @@ impl MetaConsoleAggregator {
             {
                 return Err(ambiguous_error.into());
             }
-            if let Some(rebound_record) = self_heal_durable_session_mismatch(
-                &entry,
-                &identity_runtime,
-                &parsed_identity,
-                identity,
-                &record,
-                &durable_live_records,
-            )
-            .await
-            .map_err(ConsoleLogError::from)?
-            {
-                record = rebound_record;
-            }
             if let Some(stale_error) =
                 stale_durable_record_error(identity, &record, &durable_live_records)
             {
@@ -1830,7 +1967,7 @@ impl MetaConsoleAggregator {
             }
             let cleanup_entry = entry.clone();
             let include_current = !identity_runtime.has_session_bridge();
-            let (_, cleanup_error) = identity_runtime
+            let cleanup_error = identity_runtime
                 .retire_and_cleanup_live_members_tracked(
                     &parsed_identity,
                     None,
@@ -1881,7 +2018,7 @@ impl MetaConsoleAggregator {
                 continue;
             }
             if let Some(stale_error) =
-                reconcile_stale_live_record_binding(&resolved.entry, identity, &record).await
+                stale_live_record_binding_error(&resolved.entry, identity, &record).await
             {
                 return Err(stale_error.into());
             }
@@ -1895,7 +2032,7 @@ impl MetaConsoleAggregator {
                         format!("retire failed for {identity}: {err}").into()
                     },
                 )?;
-                let mut durable_record = identity_record_for_status(&resolved.entry, &status);
+                let durable_record = identity_record_for_status(&resolved.entry, &status);
                 let durable_live_records = Box::pin(self.live_records_for_durable_record(
                     &resolved.entry,
                     identity,
@@ -1912,19 +2049,6 @@ impl MetaConsoleAggregator {
                     ambiguous_live_alias_error(&record.identity, &visible_durable_live_records)
                 {
                     return Err(ambiguous_error.into());
-                }
-                if let Some(rebound_record) = self_heal_durable_session_mismatch(
-                    &resolved.entry,
-                    identity_runtime,
-                    &parsed_identity,
-                    identity,
-                    &durable_record,
-                    &durable_live_records,
-                )
-                .await
-                .map_err(ConsoleLogError::from)?
-                {
-                    durable_record = rebound_record;
                 }
                 if let Some(stale_error) =
                     stale_durable_record_error(identity, &durable_record, &durable_live_records)
@@ -2020,6 +2144,74 @@ impl MetaConsoleAggregator {
         &self,
         query: ConsoleTimelineWindowQuery,
     ) -> ConsoleTimelineQueryResult<ConsoleTimelineWindowPage> {
+        Box::pin(self.query_timeline_windowed_scan(
+            query,
+            None,
+            TIMELINE_MAX_RAW_SCAN_FRAMES,
+            FrameProjection::ForView,
+        ))
+        .await
+    }
+
+    /// [`Self::query_timeline_windowed`] for one caller: `frame_filter`
+    /// decides each stored frame, with its captured member provenance,
+    /// inside the scan and before the frame is projected, so the page limit
+    /// counts only frames the caller may see.
+    pub(crate) async fn query_timeline_windowed_for(
+        &self,
+        query: ConsoleTimelineWindowQuery,
+        frame_filter: Option<&TimelineFrameFilter<'_>>,
+    ) -> ConsoleTimelineQueryResult<ConsoleTimelineWindowPage> {
+        Box::pin(self.query_timeline_windowed_scan(
+            query,
+            frame_filter,
+            TIMELINE_MAX_RAW_SCAN_FRAMES,
+            FrameProjection::ForView,
+        ))
+        .await
+    }
+
+    /// [`Self::query_timeline_windowed_for`] returning the stored frames
+    /// unprojected, for a stream that decides each frame again, under the
+    /// policy committed before it is sent, and projects it then.
+    pub(crate) async fn query_timeline_windowed_stored_for(
+        &self,
+        query: ConsoleTimelineWindowQuery,
+        frame_filter: Option<&TimelineFrameFilter<'_>>,
+    ) -> ConsoleTimelineQueryResult<ConsoleTimelineWindowPage> {
+        Box::pin(self.query_timeline_windowed_scan(
+            query,
+            frame_filter,
+            TIMELINE_MAX_RAW_SCAN_FRAMES,
+            FrameProjection::Stored,
+        ))
+        .await
+    }
+
+    /// [`Self::query_timeline_windowed_for`] under a smaller raw scan budget.
+    #[cfg(test)]
+    pub(crate) async fn query_timeline_windowed_for_with_scan_budget(
+        &self,
+        query: ConsoleTimelineWindowQuery,
+        frame_filter: Option<&TimelineFrameFilter<'_>>,
+        scan_budget: usize,
+    ) -> ConsoleTimelineQueryResult<ConsoleTimelineWindowPage> {
+        Box::pin(self.query_timeline_windowed_scan(
+            query,
+            frame_filter,
+            scan_budget,
+            FrameProjection::ForView,
+        ))
+        .await
+    }
+
+    async fn query_timeline_windowed_scan(
+        &self,
+        query: ConsoleTimelineWindowQuery,
+        frame_filter: Option<&TimelineFrameFilter<'_>>,
+        scan_budget: usize,
+        projection: FrameProjection,
+    ) -> ConsoleTimelineQueryResult<ConsoleTimelineWindowPage> {
         self.reject_after_cursor_beyond_store_frontier(query.after.as_ref())
             .await?;
         if query.after.is_none()
@@ -2038,7 +2230,7 @@ impl MetaConsoleAggregator {
                 );
             }
         }
-        Box::pin(self.query_timeline_visible(query)).await
+        Box::pin(self.query_timeline_visible(query, frame_filter, scan_budget, projection)).await
     }
 
     async fn reject_after_cursor_beyond_store_frontier(
@@ -2065,6 +2257,9 @@ impl MetaConsoleAggregator {
     async fn query_timeline_visible(
         &self,
         query: ConsoleTimelineWindowQuery,
+        frame_filter: Option<&TimelineFrameFilter<'_>>,
+        scan_budget: usize,
+        projection: FrameProjection,
     ) -> ConsoleTimelineQueryResult<ConsoleTimelineWindowPage> {
         let requested_limit = query.limit.clamp(1, TIMELINE_RAW_SCAN_PAGE_LIMIT);
         let mut scan_query = query.clone();
@@ -2145,6 +2340,7 @@ impl MetaConsoleAggregator {
                 ))
                 .await
                 .unwrap_or(false)
+                    && frame_filter.is_none_or(|visible| visible(&frame))
                 {
                     match query.mode {
                         ConsoleTimelineMode::Since => {
@@ -2179,14 +2375,19 @@ impl MetaConsoleAggregator {
             if visible_frames.len() >= requested_limit {
                 break;
             }
-            if scanned >= TIMELINE_MAX_RAW_SCAN_FRAMES {
+            if scanned >= scan_budget {
                 if query.mode == ConsoleTimelineMode::Recent && visible_frames.is_empty() {
-                    // An empty recent response gives callers no before cursor
-                    // with which to continue. Report a failed query instead of
-                    // making older visible history silently unreachable.
-                    return Err(ConsoleTimelineQueryError::Operational(
-                        "timeline visibility scan exceeded its bounded budget".into(),
-                    ));
+                    // Nothing visible within the budget: answer the shape of
+                    // an empty visible page, with a before cursor at the
+                    // oldest frame scanned so the caller can continue into
+                    // older history. Not an error: an error would tell the
+                    // caller that frames it may not see exist.
+                    return Ok(ConsoleTimelineWindowPage {
+                        frames: Vec::new(),
+                        next_cursor: scan_query.before.clone().or(next_cursor),
+                        latest_cursor,
+                        exhausted: false,
+                    });
                 }
                 break;
             }
@@ -2203,10 +2404,13 @@ impl MetaConsoleAggregator {
         }
 
         Ok(ConsoleTimelineWindowPage {
-            frames: visible_frames
-                .into_iter()
-                .map(|frame| self.project_frame_for_view(frame))
-                .collect(),
+            frames: match projection {
+                FrameProjection::ForView => visible_frames
+                    .into_iter()
+                    .map(|frame| self.project_frame_for_view(frame))
+                    .collect(),
+                FrameProjection::Stored => visible_frames,
+            },
             next_cursor: match query.mode {
                 ConsoleTimelineMode::Since if since_stopped_at_visible_limit => {
                     since_last_delivered_cursor.or(since_last_scanned_cursor)
@@ -2284,8 +2488,7 @@ impl MetaConsoleAggregator {
                             || record.runtime_member_id == frame.identity)
                 });
                 if !identity_known
-                    && frame.identity != "__console__"
-                    && frame.identity != SYSTEM_EVENT_IDENTITY
+                    && !crate::console_contracts::is_runtime_plane_identity(&frame.identity)
                 {
                     // Self-heal: the read model has never seen this identity
                     // (e.g. ensure_member mid-run). Debounced internally; a
@@ -2507,16 +2710,17 @@ impl MetaConsoleAggregator {
             ))
             .await
             .map(|sid| sid.to_string());
-        let provenance = identity_record_for_resolved_member(&resolved)
-            .await
-            .map(|record| {
+        let provenance = match identity_record_for_resolved_member(&resolved).await {
+            Some(record) => {
                 let owner = self
                     .inner
                     .projection_owner
                     .as_deref()
                     .unwrap_or(&self.inner);
-                retain_member_provenance(owner, &resolved, &record)
-            });
+                Some(Box::pin(capture_member_provenance(owner, &resolved, &record)).await)
+            }
+            None => None,
+        };
         let mut new_frame = NewConsoleFrame {
             id: Some(frame_id),
             dedupe_key,
@@ -3116,7 +3320,7 @@ impl MetaConsoleAggregator {
                 "ambiguous durable identity alias {identity}: candidates [{candidates}]"
             )));
         }
-        if let Some((entry, identity_runtime, parsed_identity, mut record)) =
+        if let Some((entry, _identity_runtime, _parsed_identity, record)) =
             durable_matches.into_iter().next()
         {
             let live_records = Box::pin(self.live_records_for_identity(identity)).await;
@@ -3127,19 +3331,6 @@ impl MetaConsoleAggregator {
                 &live_records,
             ))
             .await;
-            if let Some(rebound_record) = self_heal_durable_session_mismatch(
-                &entry,
-                &identity_runtime,
-                &parsed_identity,
-                identity,
-                &record,
-                &durable_live_records,
-            )
-            .await
-            .map_err(ConsoleSendError::InvalidRequest)?
-            {
-                record = rebound_record;
-            }
             if let Some(stale_error) =
                 stale_durable_record_error(identity, &record, &durable_live_records)
             {
@@ -3278,8 +3469,7 @@ impl MetaConsoleAggregator {
                 let resolved = matches.swap_remove(index);
                 if let Some(record) = identity_record_for_resolved_member(&resolved).await
                     && let Some(stale_error) =
-                        reconcile_stale_live_record_binding(&resolved.entry, identity, &record)
-                            .await
+                        stale_live_record_binding_error(&resolved.entry, identity, &record).await
                 {
                     return Err(ConsoleSendError::InvalidRequest(stale_error));
                 }
@@ -3304,7 +3494,7 @@ impl MetaConsoleAggregator {
             let resolved = matches.swap_remove(index);
             if let Some(record) = identity_record_for_resolved_member(&resolved).await
                 && let Some(stale_error) =
-                    reconcile_stale_live_record_binding(&resolved.entry, identity, &record).await
+                    stale_live_record_binding_error(&resolved.entry, identity, &record).await
             {
                 return Err(ConsoleSendError::InvalidRequest(stale_error));
             }
@@ -3332,7 +3522,7 @@ impl MetaConsoleAggregator {
         };
         if let Some(record) = identity_record_for_resolved_member(&resolved).await
             && let Some(stale_error) =
-                reconcile_stale_live_record_binding(&resolved.entry, identity, &record).await
+                stale_live_record_binding_error(&resolved.entry, identity, &record).await
         {
             return Err(ConsoleSendError::InvalidRequest(stale_error));
         }
@@ -3395,7 +3585,7 @@ impl MetaConsoleAggregator {
                 candidates,
             });
         }
-        let Some((entry, identity_runtime, parsed_identity, mut durable_record)) =
+        let Some((entry, _identity_runtime, _parsed_identity, durable_record)) =
             durable_matches.into_iter().next()
         else {
             return Ok(None);
@@ -3407,19 +3597,6 @@ impl MetaConsoleAggregator {
             &live_records,
         ))
         .await;
-        if let Some(rebound_record) = self_heal_durable_session_mismatch(
-            &entry,
-            &identity_runtime,
-            &parsed_identity,
-            identity,
-            &durable_record,
-            &durable_live_records,
-        )
-        .await
-        .map_err(ConsoleSendError::InvalidRequest)?
-        {
-            durable_record = rebound_record;
-        }
         Ok(stale_durable_record_error(
             identity,
             &durable_record,
@@ -3704,21 +3881,24 @@ async fn visible_live_records_for_entry(
     visible
 }
 
-/// Read-only counterpart of [`reconcile_stale_live_record_binding`].
-///
-/// Same detection, zero authority mutation: where the reconciling form would
-/// rebind a session-only split-brain, this one reports it. Console reads are
-/// projections - a rebind suspends the identity, re-acquires its lease and
-/// advances its continuity fence, and a failed fence advance parks the
-/// identity `Broken`. No `agent.view` grant may reach that. The reconciling
-/// form stays on the delivery/retire write paths.
+/// A live console record that names an identity whose Core binding moved
+///: the identity's status and the live member are both Core's, so a
+/// mismatch is a binding that changed between the two reads. Reads and the
+/// delivery/retire write paths report it alike; nothing is rebound, and the
+/// caller retries against the binding Core holds now.
 async fn stale_live_record_binding_error(
     entry: &RuntimeEntry,
     requested_identity: &str,
     live_record: &ConsoleIdentityRecord,
 ) -> Option<String> {
     let identity_runtime = entry.identity_runtime.as_ref()?;
-    for status in identity_runtime.statuses().await {
+    // No binding can be vouched for without Core's member history: refuse
+    // rather than act on a record nobody checked.
+    let statuses = match identity_runtime.statuses().await {
+        Ok(statuses) => statuses,
+        Err(error) => return Some(error.to_string()),
+    };
+    for status in statuses {
         // Identity-level, and a binding must exist. Comparing an
         // AgentRuntimeId spelling against a stable roster id never matched, so
         // this loop skipped every record and the stale-binding paths went
@@ -3744,137 +3924,6 @@ async fn stale_live_record_binding_error(
         }
     }
     None
-}
-
-/// Write-path reconciliation: heals a session-only split-brain by rebinding
-/// durable authority to the live session. Only legitimate from a write
-/// (delivery, retire) - see [`stale_live_record_binding_error`] for the read
-/// projection.
-async fn reconcile_stale_live_record_binding(
-    entry: &RuntimeEntry,
-    requested_identity: &str,
-    live_record: &ConsoleIdentityRecord,
-) -> Option<String> {
-    let identity_runtime = entry.identity_runtime.as_ref()?;
-    for status in identity_runtime.statuses().await {
-        // Identity-level, and a binding must exist. Comparing an
-        // AgentRuntimeId spelling against a stable roster id never matched, so
-        // this loop skipped every record and the stale-binding paths went
-        // silent.
-        let matches_runtime = status.agent_runtime_id.is_some()
-            && crate::member_comms_id::live_member_is_identity(
-                &live_record.runtime_member_id,
-                status.identity.as_str(),
-            );
-        if !matches_runtime {
-            continue;
-        }
-        let durable_record = identity_record_for_status(entry, &status);
-        if let Some(session_mismatch) =
-            stale_durable_session_mismatch(&durable_record, std::slice::from_ref(live_record))
-        {
-            let Some(live_session_id) = session_mismatch.session_id.as_deref() else {
-                continue;
-            };
-            let Ok(session_id) = meerkat_core::types::SessionId::parse(live_session_id) else {
-                return Some(format!(
-                    "stale durable identity alias {requested_identity}: live console alias resolves to invalid session {live_session_id}"
-                ));
-            };
-            return match identity_runtime
-                .rebind_session_after_live_respawn_member_alias_tracked(
-                    &status.identity,
-                    durable_record.runtime_member_id.as_str(),
-                    session_id,
-                )
-                .await
-            {
-                Ok(_) => {
-                    tracing::warn!(
-                        requested_identity,
-                        identity = %durable_record.identity,
-                        runtime_member_id = %durable_record.runtime_member_id,
-                        old_session_id = durable_record.session_id.as_deref().unwrap_or("<none>"),
-                        new_session_id = session_mismatch.session_id.as_deref().unwrap_or("<none>"),
-                        "self-healed stale durable identity alias session mismatch"
-                    );
-                    None
-                }
-                Err(err) => Some(format!(
-                    "stale durable identity alias {requested_identity}: failed to rebind {} to live session {}: {err}",
-                    durable_record.identity,
-                    session_mismatch.session_id.as_deref().unwrap_or("<none>")
-                )),
-            };
-        }
-        if let Some(stale_error) = stale_durable_record_error(
-            requested_identity,
-            &durable_record,
-            std::slice::from_ref(live_record),
-        ) {
-            return Some(stale_error);
-        }
-    }
-    None
-}
-
-/// Write-path repair of a durable/live session split-brain.
-///
-/// WRITE PATHS ONLY. This suspends the identity, re-acquires its lease and
-/// advances its continuity fence; a failed advance leaves the identity
-/// `Broken`. Console reads must not call it - they report the condition
-/// through `stale_durable_record_error` and let the next delivery or retire
-/// perform the repair.
-async fn self_heal_durable_session_mismatch(
-    entry: &RuntimeEntry,
-    identity_runtime: &Arc<crate::identity_first::IdentityRuntime>,
-    parsed_identity: &crate::identity_first::AgentIdentity,
-    requested_identity: &str,
-    durable: &ConsoleIdentityRecord,
-    live_records: &[ConsoleIdentityRecord],
-) -> Result<Option<ConsoleIdentityRecord>, String> {
-    let Some(session_mismatch) = stale_durable_session_mismatch(durable, live_records) else {
-        return Ok(None);
-    };
-    let Some(live_session_id) = session_mismatch.session_id.as_deref() else {
-        return Ok(None);
-    };
-    let session_id = meerkat_core::types::SessionId::parse(live_session_id).map_err(|err| {
-        format!(
-            "stale durable identity alias {requested_identity}: live console alias resolves to invalid session {live_session_id}: {err}"
-        )
-    })?;
-    identity_runtime
-        .rebind_session_after_live_respawn_member_alias_tracked(
-            parsed_identity,
-            durable.runtime_member_id.as_str(),
-            session_id,
-        )
-        .await
-        .map_err(|err| {
-            format!(
-                "stale durable identity alias {requested_identity}: failed to rebind {} to live session {}: {err}",
-                durable.identity, live_session_id
-            )
-        })?;
-    tracing::warn!(
-        requested_identity,
-        identity = %durable.identity,
-        runtime_member_id = %durable.runtime_member_id,
-        old_session_id = durable.session_id.as_deref().unwrap_or("<none>"),
-        new_session_id = live_session_id,
-        "self-healed stale durable identity alias session mismatch"
-    );
-    let status = identity_runtime
-        .status(parsed_identity)
-        .await
-        .map_err(|err| {
-            format!(
-                "stale durable identity alias {requested_identity}: failed to reload rebound identity {}: {err}",
-                durable.identity
-            )
-        })?;
-    Ok(Some(identity_record_for_status(entry, &status)))
 }
 
 fn stale_durable_session_mismatch<'a>(
@@ -4218,7 +4267,7 @@ async fn collect_identity_records(
         if let Some(identity_runtime) = entry.identity_runtime.as_ref() {
             let topology_peers =
                 identity_runtime_topology_peers(entry, identity_runtime.as_ref()).await;
-            for status in identity_runtime.statuses().await {
+            for status in identity_runtime.statuses().await? {
                 let mut record = identity_record_for_status(entry, &status);
                 record.topology_peers = topology_peers
                     .get(&record.identity)
@@ -4253,7 +4302,7 @@ async fn collect_identity_records(
         };
         for resolved in members {
             if let Some(record) = identity_record_for_resolved_member(&resolved).await {
-                retain_member_provenance(inner, &resolved, &record);
+                Box::pin(capture_member_provenance(inner, &resolved, &record)).await;
                 if Box::pin(resolved_member_visible(&resolved, &record)).await {
                     identities.push(record);
                 }
@@ -4699,13 +4748,17 @@ async fn backfill_session_history(
         let Some(record) = identity_record_for_resolved_member(&resolved).await else {
             continue;
         };
+        if runtime_plane_history_target(&record) {
+            continue;
+        }
         if !Box::pin(resolved_member_visible(&resolved, &record)).await {
             continue;
         }
         let Some(session_id) = record.session_id.clone() else {
             continue;
         };
-        let provenance = Some(retain_member_provenance(&inner, &resolved, &record));
+        let provenance =
+            Some(Box::pin(capture_member_provenance(&inner, &resolved, &record)).await);
         targets.push(SessionBackfillTarget {
             assistant_refresh: assistant_refresh.clone(),
             provenance,
@@ -4715,6 +4768,22 @@ async fn backfill_session_history(
         });
     }
     backfill_session_history_targets(inner, targets, force_refresh).await
+}
+
+/// Whether a member's session history would be recorded under a
+/// runtime-plane identity: such a member (one created before every creation
+/// path refused those identities) gets no history frames.
+fn runtime_plane_history_target(record: &ConsoleIdentityRecord) -> bool {
+    if !crate::console_contracts::is_runtime_plane_identity(&record.identity) {
+        return false;
+    }
+    crate::console_contracts::warn_runtime_plane_member_drop(
+        &record.runtime_member_id,
+        None,
+        &record.identity,
+        "session history",
+    );
+    true
 }
 
 #[derive(Clone)]
@@ -6135,6 +6204,13 @@ where
             assistant_history_refresh::AssistantHistoryRefreshGate,
         > + Send,
 {
+    // A member under a runtime-plane identity (one created before every
+    // creation path refused them) gets no history frames from any target
+    // source: the identity list and inspection paths skip it here, before
+    // reading anything, as the discovery pass does.
+    if runtime_plane_history_target(&target.record) {
+        return Ok(());
+    }
     let _permit = inner
         .session_backfill_permits
         .clone()
@@ -6202,23 +6278,23 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(assistant_retry_key.clone());
     }
-    // Steady-state gate: observe the runtime's per-session durable write
-    // epoch BEFORE any read. If the last completed backfill saw this same
-    // epoch, nothing durable moved through this process since — skip the
-    // watermark read, the full-document session read, and the watermark
-    // refresh write entirely. Observing before the read keeps invalidation
-    // safe: a write racing this backfill lands a newer epoch, so the next
-    // pass re-reads.
-    let write_epoch = entry.runtime.session_document_write_epoch(&session_id);
+    // Steady-state gate: read the session's committed boundary authority
+    // from the durable runtime store BEFORE any read. If the last completed
+    // backfill saw this same authority, nothing committed moved since: skip
+    // the watermark read, the full-document session read, and the watermark
+    // refresh write entirely. Reading it before the history keeps
+    // invalidation safe: a commit racing this backfill moves the authority,
+    // so the next pass re-reads.
+    let boundary_authority = entry.runtime.session_boundary_authority(&session_id).await;
     if !force_refresh
         && !assistant_refresh_requested
-        && let Some(epoch) = write_epoch
+        && let Some(authority) = boundary_authority.as_ref()
     {
-        let epochs = inner
-            .session_backfill_epochs
+        let authorities = inner
+            .session_backfill_authorities
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if epochs.get(&watermark_runtime_key) == Some(&epoch) {
+        if authorities.get(&watermark_runtime_key) == Some(authority) {
             return Ok(());
         }
     }
@@ -6255,11 +6331,11 @@ where
         .runtime
         .settled_notice_attempts(&session_id, &notice_observation.attempt_strings())
         .await;
-    // Only a failure-free pass may admit the pre-read epoch: recording it on
-    // a failure would suppress retries until the next durable write.
+    // Only a failure-free pass may admit the pre-read authority: recording it
+    // on a failure would suppress retries until the next commit.
     let mut completed_cleanly = true;
     // A failure is distinct from an unsettled refresh: only a failure-free
-    // unsettled pass may record its read epoch below.
+    // unsettled pass may record its read authority below.
     let mut backfill_failed = false;
     let mut unsettled_refresh = false;
     loop {
@@ -6311,16 +6387,18 @@ where
                 },
             );
         }
-        // Durable work is still landing: the drain re-drives the settled
-        // refresh. A draining pass skips its read, which would be read again
-        // once that work lands; a running pass still restores positive frames.
+        // Durable work is still landing: the member's next typed change
+        // re-drives the settled refresh, and the discovery loop reads again
+        // once the committed boundary moves. A draining pass skips its read,
+        // which would be read again once that work lands; a running pass
+        // still restores positive frames.
         if matches!(
             assistant_refresh_gate,
             assistant_history_refresh::AssistantHistoryRefreshGate::Draining
                 | assistant_history_refresh::AssistantHistoryRefreshGate::Running
         ) {
             if runtime_entry_is_current(&inner, &entry) {
-                arm_drain_redrive(
+                arm_status_unknown_redrive(
                     &inner,
                     assistant_retry_key.clone(),
                     SessionBackfillTarget {
@@ -6373,8 +6451,8 @@ where
         }
         // An unsettled refresh (the member is not idle yet, e.g. a staged or
         // running turn) can only restore positive frames. When the last
-        // failure-free unsettled pass already read this exact durable write
-        // epoch, re-reading the whole document every discovery tick adds
+        // failure-free unsettled pass already read at this exact committed
+        // boundary, re-reading the whole document every discovery tick adds
         // nothing: skip it and leave the retry armed, so the pass that
         // observes the member settled still performs its read. An explicit
         // forced refresh always reads.
@@ -6385,13 +6463,13 @@ where
                     | assistant_history_refresh::AssistantHistoryRefreshGate::StatusUnknown
                     | assistant_history_refresh::AssistantHistoryRefreshGate::Running
             )
-            && let Some(epoch) = write_epoch
+            && let Some(authority) = boundary_authority.as_ref()
             && inner
-                .session_pending_read_epochs
+                .session_pending_read_authorities
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&watermark_runtime_key)
-                == Some(&epoch)
+                == Some(authority)
         {
             break;
         }
@@ -6665,6 +6743,20 @@ where
                 message.clone(),
             );
             for mut frame in frames {
+                // One member's history can derive a frame under another
+                // identity: a spawn call's initial message is projected under
+                // the member the call names, whether the spawn ran or was
+                // refused. No member holds a runtime-plane identity: drop such
+                // a frame and go on with the rest of the history.
+                if crate::console_contracts::is_runtime_plane_identity(&frame.identity) {
+                    crate::console_contracts::warn_runtime_plane_member_drop(
+                        &record.runtime_member_id,
+                        None,
+                        &frame.identity,
+                        "session history",
+                    );
+                    continue;
+                }
                 let current_canonical = assistant_identity_history
                     && frame.identity == record.identity
                     && frame.session_id.as_deref() == Some(session_id.as_str());
@@ -6727,7 +6819,7 @@ where
     if !completed_cleanly
         && unsettled_refresh
         && !backfill_failed
-        && let Some(epoch) = write_epoch
+        && let Some(authority) = boundary_authority.clone()
     {
         let registrations = inner
             .runtimes
@@ -6738,37 +6830,40 @@ where
             .is_some_and(|current| current.registration_id == entry.registration_id)
         {
             inner
-                .session_pending_read_epochs
+                .session_pending_read_authorities
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(watermark_runtime_key.clone(), epoch);
+                .insert(watermark_runtime_key.clone(), authority);
         }
     }
-    if completed_cleanly && let Some(epoch) = write_epoch {
-        let registrations = inner
-            .runtimes
-            .read()
-            .map_err(|_| runtime_registry_lock_error())?;
-        if registrations
-            .get(&entry.runtime_key)
-            .is_none_or(|current| current.registration_id != entry.registration_id)
-        {
+    if completed_cleanly && let Some(authority) = boundary_authority {
+        let registered = {
+            let registrations = inner
+                .runtimes
+                .read()
+                .map_err(|_| runtime_registry_lock_error())?;
+            registrations
+                .get(&entry.runtime_key)
+                .is_some_and(|current| current.registration_id == entry.registration_id)
+        };
+        if !registered {
             return Ok(());
         }
         inner
-            .session_backfill_epochs
+            .session_backfill_authorities
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(watermark_runtime_key, epoch);
+            .insert(watermark_runtime_key, authority.clone());
         // The image this pass verified is older than the durable document if
-        // the session's epoch moved during the read: re-read now, not on a
-        // later tick once the fresh watermark expires.
+        // the session's committed boundary moved during the read: re-read
+        // now, not on a later tick once the fresh watermark expires.
         if entry
             .runtime
-            .session_document_write_epoch(&session_id)
-            .is_some_and(|now| now != epoch)
+            .session_boundary_authority(&session_id)
+            .await
+            .is_some_and(|now| now != authority)
         {
-            arm_epoch_redrive(
+            arm_moved_boundary_redrive(
                 &inner,
                 assistant_retry_key,
                 SessionBackfillTarget {
@@ -6955,177 +7050,13 @@ fn backfill_owner(inner: &Arc<AggregatorInner>) -> &Arc<AggregatorInner> {
     inner.projection_owner.as_ref().unwrap_or(inner)
 }
 
-/// Where the session's durable work stands, read when a drain re-drive
-/// wakes. Injected in tests.
-type DrainProbe = Arc<
-    dyn Fn(
-            RuntimeEntry,
-            String,
-        ) -> futures::future::BoxFuture<'static, assistant_history_refresh::DrainState>
-        + Send
-        + Sync,
->;
-
-/// Arm one re-drive for a refresh whose gate read `Draining`: the member is
-/// idle on the session but inputs are still queued or a commit is pending.
-/// Each run of a queued burst, each trailing commit, and each receipt
-/// finalization lands through a session-scoped durable write, so the waiter
-/// wakes on the session's write epoch (a typed transition, never a timer),
-/// re-reads whether the session has drained (see `SessionDrainTracker`), and
-/// re-drives the refresh once it has. A mob lifecycle change (stop, retire,
-/// destroy) wakes it too: a member no longer bound to the session and live,
-/// or a session the runtime no longer holds or can progress, is refreshed at
-/// once from what is durable, so no exit path leaves a waiter armed forever. Without a write-epoch witness the member's
-/// own events and machine changes re-drive it.
-fn arm_drain_redrive(
-    inner: &Arc<AggregatorInner>,
-    retry_key: (uuid::Uuid, String, String, String),
-    target: SessionBackfillTarget,
-) {
-    let Some(changes) = target.entry.runtime.session_write_epoch_changes() else {
-        arm_status_unknown_redrive(inner, retry_key, target);
-        return;
-    };
-    let tracker = Arc::new(tokio::sync::Mutex::new(
-        assistant_history_refresh::SessionDrainTracker::default(),
-    ));
-    let probe: DrainProbe = Arc::new(move |entry, session_id| {
-        let tracker = Arc::clone(&tracker);
-        Box::pin(async move { tracker.lock().await.state(&entry, &session_id).await })
-    });
-    #[cfg(test)]
-    let probe = inner
-        .drain_probe_override
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-        .unwrap_or(probe);
-    arm_drain_redrive_with(inner, retry_key, target, changes, probe);
-}
-
-fn arm_drain_redrive_with(
-    inner: &Arc<AggregatorInner>,
-    retry_key: (uuid::Uuid, String, String, String),
-    target: SessionBackfillTarget,
-    mut changes: tokio::sync::watch::Receiver<u64>,
-    drained: DrainProbe,
-) {
-    if !inner.options.session_history_backfill_enabled {
-        return;
-    }
-    if !inner
-        .drain_redrives
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(retry_key.clone())
-    {
-        return;
-    }
-    // Mark both change sources seen BEFORE the first read: a write or a
-    // lifecycle change after that read still wakes the waiter, so neither the
-    // drain nor a stop can slip between the gate's read and this arm.
-    changes.borrow_and_update();
-    let mut lifecycle = target.entry.runtime.handle().machine_state_changes();
-    // The cloned receiver starts from the handle's last-seen version: consume
-    // the change it has not seen yet (as `arm_status_unknown_redrive` does).
-    let _ = futures::FutureExt::now_or_never(lifecycle.changed());
-    let redrive_inner = Arc::clone(inner);
-    let activity = BackfillActivity::begin(inner);
-    let task = tokio::spawn(async move {
-        let _activity = activity;
-        let session_id = target.session_id.clone();
-        let mut seen_epoch = target
-            .entry
-            .runtime
-            .session_document_write_epoch(&session_id);
-        let mut lifecycle_changed = false;
-        let fire = loop {
-            if !runtime_entry_is_current(&redrive_inner, &target.entry) {
-                break false;
-            }
-            match drained(target.entry.clone(), session_id.clone()).await {
-                assistant_history_refresh::DrainState::Drained
-                | assistant_history_refresh::DrainState::Stalled => break true,
-                assistant_history_refresh::DrainState::Draining
-                | assistant_history_refresh::DrainState::NoAnswer => {}
-            }
-            // A stop, retire or destroy abandons the queue and may unregister
-            // the session without a write this process sees. After a lifecycle
-            // change, a member that is no longer bound to the session and live
-            // will not drain it: read what is durable now.
-            if std::mem::take(&mut lifecycle_changed)
-                && !Box::pin(assistant_history_refresh::member_still_progressing(
-                    &target.entry,
-                    &target.record,
-                    &session_id,
-                ))
-                .await
-            {
-                break true;
-            }
-            // Wait for this session's next durable write (its inputs, commits
-            // and receipts land through one) or a mob lifecycle change. Writes
-            // to other sessions wake the epoch receiver but leave this
-            // session's epoch unchanged, so they are skipped. A closed source
-            // can report nothing more: read what is durable now.
-            let closed = loop {
-                tokio::select! {
-                    changed = changes.changed() => {
-                        if changed.is_err() {
-                            break true;
-                        }
-                        let epoch = target.entry.runtime.session_document_write_epoch(&session_id);
-                        if epoch != seen_epoch {
-                            seen_epoch = epoch;
-                            break false;
-                        }
-                    }
-                    changed = lifecycle.changed() => {
-                        if changed.is_err() {
-                            break true;
-                        }
-                        lifecycle_changed = true;
-                        break false;
-                    }
-                }
-            };
-            if closed {
-                break runtime_entry_is_current(&redrive_inner, &target.entry);
-            }
-        };
-        redrive_inner
-            .drain_redrives
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&retry_key);
-        if fire
-            && let Err(error) = Box::pin(run_targeted_session_history_backfill(
-                redrive_inner,
-                target,
-                false,
-            ))
-            .await
-        {
-            tracing::warn!(error = %error, "console drained assistant-history re-drive failed");
-        }
-    });
-    #[cfg(test)]
-    inner
-        .drain_redrive_tasks
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(task);
-    #[cfg(not(test))]
-    drop(task);
-}
-
-/// Queue one re-read for a completed pass whose session write epoch moved
-/// during its read: the image it verified is already behind the durable
-/// document. The re-drive reads at once (forced past the epoch and
-/// watermark gates, which would otherwise hold it until a discovery tick and
-/// watermark expiry) and runs only because the epoch moved, so it cannot
-/// loop: a pass that ends at the epoch it read queues nothing.
-fn arm_epoch_redrive(
+/// Queue one re-read for a completed pass whose session's committed boundary
+/// moved during its read: the image it verified is already behind the
+/// durable document. The re-drive reads at once (forced past the authority
+/// and watermark gates, which would otherwise hold it until a discovery tick
+/// and watermark expiry) and runs only because the boundary moved, so it
+/// cannot loop: a pass that ends at the boundary it read queues nothing.
+fn arm_moved_boundary_redrive(
     inner: &Arc<AggregatorInner>,
     retry_key: (uuid::Uuid, String, String, String),
     target: SessionBackfillTarget,
@@ -7134,7 +7065,7 @@ fn arm_epoch_redrive(
         return;
     }
     if !inner
-        .epoch_redrives
+        .moved_boundary_redrives
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(retry_key.clone())
@@ -7146,7 +7077,7 @@ fn arm_epoch_redrive(
     let task = tokio::spawn(async move {
         let _activity = activity;
         redrive_inner
-            .epoch_redrives
+            .moved_boundary_redrives
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&retry_key);
@@ -7158,12 +7089,12 @@ fn arm_epoch_redrive(
             ))
             .await
         {
-            tracing::warn!(error = %error, "console moved-epoch session-history re-drive failed");
+            tracing::warn!(error = %error, "console moved-boundary session-history re-drive failed");
         }
     });
     #[cfg(test)]
     inner
-        .epoch_redrive_tasks
+        .moved_boundary_redrive_tasks
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(task);
@@ -7398,13 +7329,17 @@ async fn session_backfill_targets_for_identity(
             let Some(record) = identity_record_for_resolved_member(&resolved).await else {
                 continue;
             };
+            if runtime_plane_history_target(&record) {
+                continue;
+            }
             if !Box::pin(resolved_member_visible(&resolved, &record)).await {
                 continue;
             }
             let Some(session_id) = record.session_id.clone() else {
                 continue;
             };
-            let provenance = Some(retain_member_provenance(inner, &resolved, &record));
+            let provenance =
+                Some(Box::pin(capture_member_provenance(inner, &resolved, &record)).await);
             targets.push(SessionBackfillTarget {
                 assistant_refresh: AssistantHistoryRefreshReason::PositiveOnly,
                 provenance,
@@ -7465,14 +7400,14 @@ async fn append_source_gap(
     reason: String,
     policy: Arc<dyn ConsoleVisibilityPolicy>,
 ) -> ConsoleLogResult<()> {
-    append_and_emit_with_policy(
+    append_and_emit_runtime_plane(
         inner,
         NewConsoleFrame {
             id: None,
             dedupe_key: format!("source-gap:{runtime_key}:{}", current_time_ms()),
             timestamp_ms: current_time_ms(),
             runtime_key: runtime_key.to_string(),
-            identity: "__console__".to_string(),
+            identity: crate::console_contracts::CONSOLE_GAP_IDENTITY.to_string(),
             conversation_id: None,
             session_id: None,
             kind: "replay_unavailable".to_string(),
@@ -7620,7 +7555,22 @@ async fn project_console_event(
     } else {
         None
     };
-    append_and_emit_with_policy(&inner, frame, entry.visibility_policy.clone()).await?;
+    if frame.identity == SYSTEM_EVENT_IDENTITY {
+        // The runtime's event store writes only its own events under the
+        // system identity; it refuses every member event under one.
+        append_and_emit_runtime_plane(&inner, frame, entry.visibility_policy.clone()).await?;
+    } else if crate::console_contracts::is_runtime_plane_identity(&frame.identity) {
+        // No runtime event carries the gap-marker identity: drop it, and
+        // still advance past it below.
+        crate::console_contracts::warn_runtime_plane_member_drop(
+            &frame.identity,
+            None,
+            &frame.identity,
+            "runtime console events",
+        );
+    } else {
+        append_and_emit_with_policy(&inner, frame, entry.visibility_policy.clone()).await?;
+    }
     inner
         .store
         .record_source_watermark(
@@ -7666,7 +7616,7 @@ fn console_event_should_refresh_session_history(frame: &NewConsoleFrame) -> bool
 }
 
 fn console_event_should_start_session_history_backfill(frame: &NewConsoleFrame) -> bool {
-    if frame.identity == SYSTEM_EVENT_IDENTITY {
+    if crate::console_contracts::is_runtime_plane_identity(&frame.identity) {
         return false;
     }
     matches!(
@@ -7722,7 +7672,36 @@ async fn append_and_emit(
     append_and_emit_with_policy(inner, frame, policy).await
 }
 
+/// Append a frame attributed to a member. A runtime-plane identity is
+/// refused: the console treats frames under one as the runtime's own, and
+/// only [`append_and_emit_runtime_plane`] writes those.
 async fn append_and_emit_with_policy(
+    inner: &AggregatorInner,
+    frame: NewConsoleFrame,
+    policy: Arc<dyn ConsoleVisibilityPolicy>,
+) -> ConsoleLogResult<AppendOutcome> {
+    if crate::console_contracts::is_runtime_plane_identity(&frame.identity) {
+        return Err(format!(
+            "refusing a member frame under the runtime-plane identity '{}'",
+            frame.identity
+        )
+        .into());
+    }
+    append_and_emit_frame(inner, frame, policy).await
+}
+
+/// Append one of the runtime's own frames under a runtime-plane identity: a
+/// source-gap marker, or a runtime event the runtime's event store recorded
+/// under the system identity.
+async fn append_and_emit_runtime_plane(
+    inner: &AggregatorInner,
+    frame: NewConsoleFrame,
+    policy: Arc<dyn ConsoleVisibilityPolicy>,
+) -> ConsoleLogResult<AppendOutcome> {
+    append_and_emit_frame(inner, frame, policy).await
+}
+
+async fn append_and_emit_frame(
     inner: &AggregatorInner,
     mut frame: NewConsoleFrame,
     policy: Arc<dyn ConsoleVisibilityPolicy>,
@@ -8995,6 +8974,178 @@ fn normalize_transcript_fingerprint_text(text: &str) -> String {
         .to_string()
 }
 
+/// A caller's decision on one stored timeline frame, applied inside the
+/// aggregator's scan before the frame is projected.
+pub(crate) type TimelineFrameFilter<'a> = dyn Fn(&ConsoleFrame) -> bool + Send + Sync + 'a;
+
+/// Whether a timeline query returns frames projected for the view (policy
+/// redaction applied, provenance removed) or as stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameProjection {
+    ForView,
+    Stored,
+}
+
+/// `agent.view` for one caller on one stored timeline frame. This is the
+/// one decision every timeline surface applies (window, RPC page, stream
+/// snapshot and live frames, update markers), always to the frame as
+/// stored, before it is projected:
+///
+/// - a frame under a runtime-plane identity (gap markers, identity-less
+///   memory events) is decided by that identity, as before: no member writes
+///   under one, since every creation path refuses those names and every
+///   member writer drops a member event that would take one;
+/// - a member frame with captured provenance is decided by the captured
+///   lineage, under the most restrictive rule
+///   ([`crate::access::AccessView::can_view_captured_member`]);
+/// - a member frame without it fails closed under any applicable deny its
+///   bare identity cannot decide
+///   ([`crate::access::AccessView::can_view_uncaptured_member`]).
+pub(crate) fn timeline_frame_visible_to(
+    view: &crate::access::AccessView,
+    frame: &ConsoleFrame,
+) -> bool {
+    if !view.enforced() {
+        return true;
+    }
+    // An update marker cannot reveal a frame the same view hides.
+    if frame.kind == "frame_updated" {
+        let Some(value) = frame.payload.get("frame") else {
+            return false;
+        };
+        let Ok(mut updated) = serde_json::from_value::<ConsoleFrame>(value.clone()) else {
+            return false;
+        };
+        // Only the owner writes update markers (a synthetic source). A frame
+        // embedded in any other frame's payload is ingested data: provenance
+        // in it is never accepted as the owner's capture.
+        if frame.source.kind != ConsoleFrameSourceKind::Synthetic {
+            updated.source.member_provenance = None;
+        }
+        if !timeline_frame_visible_to(view, &updated) {
+            return false;
+        }
+    }
+    if crate::console_contracts::is_runtime_plane_identity(&frame.identity) {
+        return view.can_view_agent(&frame.identity);
+    }
+    match frame
+        .source
+        .member_provenance
+        .as_ref()
+        .filter(|provenance| provenance.identity.identity == frame.identity)
+    {
+        Some(provenance) => view.can_view_captured_member(&captured_lineage(provenance)),
+        None => view.can_view_uncaptured_member(&frame.identity),
+    }
+}
+
+/// The access decision's input for a captured provenance. A provenance
+/// captured before lineage was holds only the member's record: the member
+/// is decided by it, and any parent it names counts as unconfirmed.
+fn captured_lineage(
+    provenance: &ConsoleFrameMemberProvenance,
+) -> Vec<crate::access::CapturedLineageLink> {
+    if provenance.lineage.is_empty() {
+        let record = &provenance.identity;
+        let mut lineage = vec![crate::access::CapturedLineageLink {
+            identity: record.identity.clone(),
+            attributes: Some(crate::access::AgentResourceAttributes {
+                identity: record.identity.clone(),
+                agent_id: Some(record.runtime_member_id.clone()),
+                role: Some(provenance.member.role.clone()),
+                labels: record.labels.clone(),
+            }),
+        }];
+        if let Some(parent) = record
+            .labels
+            .get(crate::console_spawn::SPAWNED_BY_LABEL)
+            .map(|parent| parent.trim().to_string())
+            .filter(|parent| !parent.is_empty())
+        {
+            lineage.push(crate::access::CapturedLineageLink {
+                identity: parent,
+                attributes: None,
+            });
+        }
+        return lineage;
+    }
+    provenance
+        .lineage
+        .iter()
+        .map(|link| crate::access::CapturedLineageLink {
+            identity: link.identity.clone(),
+            attributes: link
+                .labels
+                .as_ref()
+                .map(|labels| crate::access::AgentResourceAttributes {
+                    identity: link.identity.clone(),
+                    agent_id: link.agent_id.clone(),
+                    role: link.role.clone(),
+                    labels: labels.clone(),
+                }),
+        })
+        .collect()
+}
+
+/// One caller's [`timeline_frame_visible_to`] over the frames of one
+/// request, cached per (runtime, identity, captured provenance): a restricted
+/// caller scanning many hidden frames decides each distinct member context
+/// once.
+pub(crate) struct TimelineFrameDecider {
+    view: crate::access::AccessView,
+    decisions: std::sync::Mutex<HashMap<FrameDecisionKey, bool>>,
+}
+
+/// (runtime key, frame identity, encoded captured provenance).
+type FrameDecisionKey = (String, String, Option<String>);
+
+impl TimelineFrameDecider {
+    pub(crate) fn new(view: crate::access::AccessView) -> Self {
+        Self {
+            view,
+            decisions: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn visible(&self, frame: &ConsoleFrame) -> bool {
+        if !self.view.enforced() {
+            return true;
+        }
+        // Update markers carry a second frame; they are decided whole.
+        if frame.kind == "frame_updated" {
+            return timeline_frame_visible_to(&self.view, frame);
+        }
+        let provenance = match frame.source.member_provenance.as_ref() {
+            Some(provenance) => match serde_json::to_string(provenance) {
+                Ok(encoded) => Some(encoded),
+                Err(_) => return timeline_frame_visible_to(&self.view, frame),
+            },
+            None => None,
+        };
+        let key = (
+            frame.runtime_key.clone(),
+            frame.identity.clone(),
+            provenance,
+        );
+        if let Some(visible) = self
+            .decisions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .copied()
+        {
+            return visible;
+        }
+        let visible = timeline_frame_visible_to(&self.view, frame);
+        self.decisions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, visible);
+        visible
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CachedIdentityVisibility {
     Visible,
@@ -9070,8 +9221,8 @@ async fn frame_is_visible_cached(
     // resolve, so the per-identity gate below would hide them from every
     // global timeline query. They skip straight to the visibility policy;
     // ABAC still filters them per-caller in the RPC layer
-    // (`retain_visible_timeline_frames`).
-    if frame.identity != "__console__" && frame.identity != SYSTEM_EVENT_IDENTITY {
+    // (`timeline_frame_visible_to`).
+    if !crate::console_contracts::is_runtime_plane_identity(&frame.identity) {
         let cache_key = (frame.runtime_key.clone(), frame.identity.clone());
         let identity_visibility =
             if let Some(cached) = identity_visibility_cache.get(&cache_key).copied() {
@@ -9168,6 +9319,7 @@ async fn identity_record_for_member(
         runtime_key: entry.runtime_key.clone(),
         runtime_member_id,
         session_id,
+        member_id: None,
         visibility,
         addressable,
         health: if addressable {
@@ -9216,26 +9368,16 @@ fn identity_record_for_status(
             status.state,
             crate::identity_first::IdentityLifecycleState::Active
                 | crate::identity_first::IdentityLifecycleState::Dormant
-                | crate::identity_first::IdentityLifecycleState::Uninitialized
         );
     let visibility = match status.state {
-        crate::identity_first::IdentityLifecycleState::Retiring => {
-            ConsoleVisibility::RetiredReadable
-        }
-        crate::identity_first::IdentityLifecycleState::Broken
-        | crate::identity_first::IdentityLifecycleState::Suspended => {
-            ConsoleVisibility::Unreachable
-        }
+        crate::identity_first::IdentityLifecycleState::Broken => ConsoleVisibility::Unreachable,
         _ if addressable => ConsoleVisibility::Addressable,
         _ => ConsoleVisibility::Hidden,
     };
     let health = match status.state {
         crate::identity_first::IdentityLifecycleState::Active => "ready",
         crate::identity_first::IdentityLifecycleState::Dormant => "dormant",
-        crate::identity_first::IdentityLifecycleState::Uninitialized => "uninitialized",
         crate::identity_first::IdentityLifecycleState::Broken => "broken",
-        crate::identity_first::IdentityLifecycleState::Suspended => "suspended",
-        crate::identity_first::IdentityLifecycleState::Retiring => "retired",
     }
     .to_string();
     let display_name = status
@@ -9250,6 +9392,7 @@ fn identity_record_for_status(
         runtime_key: entry.runtime_key.clone(),
         runtime_member_id,
         session_id: status.session_id.as_ref().map(ToString::to_string),
+        member_id: status.member_id.clone(),
         visibility,
         addressable,
         health,
@@ -9471,6 +9614,14 @@ fn validate_send_request(request: &ConsoleSendRequest) -> Result<(), ConsoleSend
         return Err(ConsoleSendError::InvalidRequest(
             "identity must be non-empty".to_string(),
         ));
+    }
+    // No member holds a runtime-plane identity; a send to one would record a
+    // member frame under the console's own identity.
+    if crate::console_contracts::is_runtime_plane_identity(request.identity.trim()) {
+        return Err(ConsoleSendError::InvalidRequest(format!(
+            "identity '{}' is reserved for the console's runtime events",
+            request.identity.trim()
+        )));
     }
     if request.origin.trim().is_empty() {
         return Err(ConsoleSendError::InvalidRequest(
@@ -9742,6 +9893,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::identity_first::core_test_bridge::{CoreReadsBridge, register_live};
     use crate::mob_handle_runtime::MobBootstrapSpec;
 
     #[derive(Debug)]
@@ -11364,17 +11516,18 @@ comms = true
         Arc<UnifiedRuntime>,
         DelayedHistorySessionService,
     ) {
-        build_stress_runtime_with_write_epochs(member_count, history_delay, false).await
+        build_stress_runtime_with_durable_runtime_store(member_count, history_delay, None).await
     }
 
-    /// [`build_stress_runtime`], optionally composed with a durable
-    /// write-epoch witness (as both gateways compose it). Nothing in the
-    /// fixture writes through the witnessed store, so every observed epoch
-    /// stays unchanged for the whole test.
-    pub(super) async fn build_stress_runtime_with_write_epochs(
+    /// [`build_stress_runtime`], optionally composed with a durable runtime
+    /// store (as both gateways compose one) that answers session-boundary
+    /// authority reads. The fixture's sessions never commit through it, so a
+    /// session's committed authority moves only when a test commits one
+    /// ([`commit_fixture_session_boundary`]).
+    pub(super) async fn build_stress_runtime_with_durable_runtime_store(
         member_count: usize,
         history_delay: Duration,
-        write_epochs: bool,
+        durable_runtime_store: Option<Arc<dyn meerkat_runtime::RuntimeStore>>,
     ) -> (
         tempfile::TempDir,
         Arc<UnifiedRuntime>,
@@ -11414,12 +11567,8 @@ comms = true
                     meerkat_core::Provider::OpenAI,
                 ))),
             });
-        if write_epochs {
-            let (_witnessed_store, epochs) =
-                crate::mob_handle_runtime::epoch_tracking_runtime_store(Arc::new(
-                    meerkat_runtime::InMemoryRuntimeStore::new(),
-                ));
-            spec = spec.with_session_write_epochs(&epochs);
+        if let Some(store) = durable_runtime_store.as_ref() {
+            spec = spec.with_durable_runtime_store(store);
         }
         let runtime = Arc::new(
             UnifiedRuntime::bootstrap(
@@ -11450,6 +11599,31 @@ comms = true
                 .expect("member spawns");
         }
         (temp_dir, runtime, delayed_service)
+    }
+
+    /// Commit one session boundary for `session_id` to a fixture's durable
+    /// runtime store, so the session's committed authority moves to a new
+    /// revision. `note` varies the committed document.
+    pub(super) async fn commit_fixture_session_boundary(
+        store: &dyn meerkat_runtime::RuntimeStore,
+        session_id: &str,
+        note: &str,
+    ) {
+        let session_id = SessionId::parse(session_id).expect("fixture session id parses");
+        let mut session = meerkat_core::Session::with_id(session_id.clone());
+        session.push(Message::User(meerkat_core::types::UserMessage::text(note)));
+        let bytes = session
+            .to_persisted_bytes()
+            .expect("fixture session serializes");
+        meerkat_runtime::RuntimeStore::commit_session_snapshot(
+            store,
+            &meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
+            meerkat_runtime::store::SerializedSessionSnapshot {
+                session_snapshot: Arc::new(bytes),
+            },
+        )
+        .await
+        .expect("fixture session boundary commits");
     }
 
     pub(super) fn runtime_entry_for_test(
@@ -11493,6 +11667,7 @@ comms = true
             runtime_key: "runtime-cache".to_string(),
             runtime_member_id: identity.to_string(),
             session_id: Some(format!("session-{identity}")),
+            member_id: None,
             visibility: ConsoleVisibility::Addressable,
             addressable: true,
             health: "ready".to_string(),
@@ -11706,48 +11881,7 @@ comms = true
         identities: &[(&str, SessionId)],
     ) -> Result<Arc<crate::identity_first::IdentityRuntime>, Box<dyn std::error::Error + Send + Sync>>
     {
-        let runtime = identity_runtime_for_test(&[]).await?;
-        for (identity, session_id) in identities {
-            let identity = crate::identity_first::AgentIdentity::parse(identity)?;
-            let record = crate::identity_first::ContinuityRecord {
-                identity: identity.clone(),
-                agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(&format!(
-                    "rt:{}:0",
-                    identity.as_str()
-                ))?,
-                session_id: session_id.clone(),
-                generation: crate::identity_first::ContinuityGeneration::new(0),
-                checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-            };
-            runtime
-                .register(
-                    crate::identity_first::DurableAgentSpec {
-                        identity: identity.clone(),
-                        profile: meerkat_mob::ProfileName::from("worker"),
-                        addressability: crate::identity_first::AgentAddressability::Addressable,
-                        display_name: None,
-                        labels: BTreeMap::new(),
-                        context: None,
-                        additional_instructions: Vec::new(),
-                        initial_message: None,
-                        runtime_mode_override: None,
-                        backend: None,
-                        binding: None,
-                        placement: None,
-                    },
-                    crate::identity_first::IdentityLifecycleState::Active,
-                    Some(record),
-                    None,
-                )
-                .await;
-        }
-        Ok(runtime)
-    }
-
-    async fn identity_runtime_for_test(
-        identities: &[&str],
-    ) -> Result<Arc<crate::identity_first::IdentityRuntime>, Box<dyn std::error::Error + Send + Sync>>
-    {
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: Arc::new(
@@ -11757,49 +11891,48 @@ comms = true
                 runtime_instance_id: "console-aggregator-identity-test".to_string(),
                 has_runtime_store: true,
                 durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
+                bridge: Some(core_bridge.clone()),
                 default_timeout: None,
             },
         ));
-        for identity in identities {
+        for (identity, session_id) in identities {
             let identity = crate::identity_first::AgentIdentity::parse(identity)?;
-            let record = crate::identity_first::ContinuityRecord {
-                identity: identity.clone(),
-                agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(&format!(
-                    "rt:{}:0",
-                    identity.as_str()
-                ))?,
-                session_id: SessionId::new(),
-                generation: crate::identity_first::ContinuityGeneration::new(0),
-                checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-            };
-            runtime
-                .register(
-                    crate::identity_first::DurableAgentSpec {
-                        identity: identity.clone(),
-                        profile: meerkat_mob::ProfileName::from("worker"),
-                        addressability: crate::identity_first::AgentAddressability::Addressable,
-                        display_name: None,
-                        labels: BTreeMap::new(),
-                        context: None,
-                        additional_instructions: Vec::new(),
-                        initial_message: None,
-                        runtime_mode_override: None,
-                        backend: None,
-                        binding: None,
-                        placement: None,
-                    },
-                    crate::identity_first::IdentityLifecycleState::Active,
-                    Some(record),
-                    Some(crate::identity_first::LeaseGrant {
-                        identity,
-                        fencing_token: crate::identity_first::FencingToken::new(1),
-                        ttl: Duration::from_mins(5),
-                    }),
-                )
-                .await;
+            register_live(
+                &runtime,
+                &core_bridge.core,
+                crate::identity_first::DurableAgentSpec {
+                    identity: identity.clone(),
+                    profile: meerkat_mob::ProfileName::from("worker"),
+                    addressability: crate::identity_first::AgentAddressability::Addressable,
+                    display_name: None,
+                    labels: BTreeMap::new(),
+                    context: None,
+                    additional_instructions: Vec::new(),
+                    initial_message: None,
+                    runtime_mode_override: None,
+                    backend: None,
+                    binding: None,
+                    placement: None,
+                },
+                0,
+                session_id.clone(),
+            )
+            .await?;
         }
         Ok(runtime)
+    }
+
+    /// An identity runtime over a Core that holds each identity's member at
+    /// generation 0, bound to a fresh session.
+    async fn identity_runtime_for_test(
+        identities: &[&str],
+    ) -> Result<Arc<crate::identity_first::IdentityRuntime>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let identities = identities
+            .iter()
+            .map(|identity| (*identity, SessionId::new()))
+            .collect::<Vec<_>>();
+        identity_runtime_for_test_with_sessions(&identities).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11913,6 +12046,7 @@ comms = true
             .await
             .ok_or("live member has no bridge session")?;
 
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: Arc::new(
@@ -11922,42 +12056,32 @@ comms = true
                 runtime_instance_id: "namespaced-runtime-alias-retire-test".to_string(),
                 has_runtime_store: true,
                 durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
+                bridge: Some(core_bridge.clone()),
                 default_timeout: None,
             },
         ));
         let durable_identity = crate::identity_first::AgentIdentity::parse("review:owned")?;
-        identity_runtime
-            .register(
-                crate::identity_first::DurableAgentSpec {
-                    identity: durable_identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: crate::identity_first::AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                crate::identity_first::IdentityLifecycleState::Active,
-                Some(crate::identity_first::ContinuityRecord {
-                    identity: durable_identity.clone(),
-                    agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(runtime_alias)?,
-                    session_id: live_session_id,
-                    generation: crate::identity_first::ContinuityGeneration::new(0),
-                    checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-                }),
-                Some(crate::identity_first::LeaseGrant {
-                    identity: durable_identity.clone(),
-                    fencing_token: crate::identity_first::FencingToken::new(1),
-                    ttl: Duration::from_mins(5),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            crate::identity_first::DurableAgentSpec {
+                identity: durable_identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            live_session_id,
+        )
+        .await?;
 
         let aggregator = MetaConsoleAggregator::in_memory();
         aggregator.register_runtime_handles_with_policy(
@@ -11977,7 +12101,7 @@ comms = true
         );
         assert_eq!(
             identity_runtime.status(&durable_identity).await?.state,
-            crate::identity_first::IdentityLifecycleState::Retiring,
+            crate::identity_first::IdentityLifecycleState::Dormant,
             "retirement must advance the durable lifecycle authority"
         );
         let raw_member = runtime
@@ -11993,7 +12117,8 @@ comms = true
         assert_eq!(
             raw_member.status,
             meerkat_mob::MobMemberStatus::Active,
-            "a bridge-less durable retire proves the aggregator did not fall through to raw Mob"
+            "the test bridge retires only in Core's history, so an Active raw member proves the \
+             aggregator did not fall through to raw Mob"
         );
 
         let _ = runtime.mob_handle().stop().await;
@@ -12033,6 +12158,7 @@ comms = true
             .resolve_bridge_session_id_observation(&crate::member_comms_id::mob_member_id(DURABLE))
             .await
             .ok_or("live member has no bridge session")?;
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: Arc::new(
@@ -12042,44 +12168,32 @@ comms = true
                 runtime_instance_id: "aggregator-current-alias-test".to_string(),
                 has_runtime_store: true,
                 durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
+                bridge: Some(core_bridge.clone()),
                 default_timeout: None,
             },
         ));
         let durable_identity = crate::identity_first::AgentIdentity::parse(DURABLE)?;
-        identity_runtime
-            .register(
-                crate::identity_first::DurableAgentSpec {
-                    identity: durable_identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: crate::identity_first::AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                crate::identity_first::IdentityLifecycleState::Active,
-                Some(crate::identity_first::ContinuityRecord {
-                    identity: durable_identity.clone(),
-                    agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(&format!(
-                        "rt:{DURABLE}:0"
-                    ))?,
-                    session_id: live_session_id,
-                    generation: crate::identity_first::ContinuityGeneration::new(0),
-                    checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-                }),
-                Some(crate::identity_first::LeaseGrant {
-                    identity: durable_identity.clone(),
-                    fencing_token: crate::identity_first::FencingToken::new(1),
-                    ttl: Duration::from_mins(5),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            crate::identity_first::DurableAgentSpec {
+                identity: durable_identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            live_session_id,
+        )
+        .await?;
         let aggregator = MetaConsoleAggregator::in_memory();
         aggregator.register_runtime_handles_with_policy(
             "runtime-a",
@@ -12133,7 +12247,7 @@ comms = true
         );
         assert_eq!(
             identity_runtime.status(&durable_identity).await?.state,
-            crate::identity_first::IdentityLifecycleState::Retiring,
+            crate::identity_first::IdentityLifecycleState::Dormant,
             "the current alias must retire through the durable lifecycle authority"
         );
 
@@ -13055,6 +13169,7 @@ comms = true
         )
         .await;
 
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: Arc::new(
@@ -13064,45 +13179,32 @@ comms = true
                 runtime_instance_id: "console-aggregator-stale-durable-test".to_string(),
                 has_runtime_store: true,
                 durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
+                bridge: Some(core_bridge.clone()),
                 default_timeout: None,
             },
         ));
         let identity = crate::identity_first::AgentIdentity::parse("review:singleton")?;
-        let record = crate::identity_first::ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(
-                "rt:review:singleton:1",
-            )?,
-            session_id: SessionId::new(),
-            generation: crate::identity_first::ContinuityGeneration::new(1),
-            checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-        };
-        identity_runtime
-            .register(
-                crate::identity_first::DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: crate::identity_first::AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                crate::identity_first::IdentityLifecycleState::Active,
-                Some(record),
-                Some(crate::identity_first::LeaseGrant {
-                    identity,
-                    fencing_token: crate::identity_first::FencingToken::new(7),
-                    ttl: Duration::from_mins(5),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            crate::identity_first::DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            1,
+            SessionId::new(),
+        )
+        .await?;
 
         let aggregator = MetaConsoleAggregator::in_memory();
         aggregator
@@ -13214,136 +13316,6 @@ comms = true
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn identity_first_alias_self_heals_session_only_split_brain()
-    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let runtime = build_empty_runtime("identity-session-rebind-test").await;
-        let mut labels = BTreeMap::new();
-        labels.insert("agent_identity".to_string(), "review:singleton".to_string());
-        spawn_trusted_identity_projected_member(
-            &runtime,
-            SpawnMemberSpec::from_wire(
-                "worker".to_string(),
-                "rt:review:singleton:0".to_string(),
-                Some("You are the live Review Agent.".into()),
-                None,
-                None,
-            )
-            .with_labels(labels),
-        )
-        .await;
-        let live_session_id = runtime
-            .mob_handle()
-            .resolve_bridge_session_id_observation(&crate::member_comms_id::mob_member_id(
-                "rt:review:singleton:0",
-            ))
-            .await
-            .expect("live member has bridge session");
-
-        let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
-            crate::identity_first::IdentityRuntimeConfig {
-                continuity_store: Arc::new(
-                    crate::identity_first::LocalContinuityStore::in_memory()?
-                ),
-                lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
-                runtime_instance_id: "console-aggregator-session-rebind-test".to_string(),
-                has_runtime_store: true,
-                durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
-                default_timeout: None,
-            },
-        ));
-        let identity = crate::identity_first::AgentIdentity::parse("review:singleton")?;
-        let stale_session_id = SessionId::new();
-        assert_ne!(stale_session_id, live_session_id);
-        let record = crate::identity_first::ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(
-                "rt:review:singleton:0",
-            )?,
-            session_id: stale_session_id,
-            generation: crate::identity_first::ContinuityGeneration::new(1),
-            checkpoint_version: crate::identity_first::CheckpointVersion::new(3),
-        };
-        identity_runtime
-            .register(
-                crate::identity_first::DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: crate::identity_first::AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                crate::identity_first::IdentityLifecycleState::Active,
-                Some(record),
-                Some(crate::identity_first::LeaseGrant {
-                    identity: identity.clone(),
-                    fencing_token: crate::identity_first::FencingToken::new(7),
-                    ttl: Duration::from_mins(5),
-                }),
-            )
-            .await;
-
-        let aggregator = MetaConsoleAggregator::in_memory();
-        aggregator
-            .inner
-            .runtimes
-            .write()
-            .expect("runtime registry")
-            .insert(
-                "runtime-a".to_string(),
-                RuntimeEntry {
-                    registration_id: uuid::Uuid::new_v4(),
-                    runtime_key: "runtime-a".to_string(),
-                    identity_namespace: String::new(),
-                    runtime: runtime.mob_runtime().clone(),
-                    identity_runtime: Some(identity_runtime.clone()),
-                    identity_owner: None,
-                    console_events: runtime.console_events(),
-                    visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
-                },
-            );
-
-        aggregator
-            .reserve_identity_first_interaction(
-                ConsoleSendRequest {
-                    identity: "review:singleton".to_string(),
-                    content: json!("hello"),
-                    origin: "console:test".to_string(),
-                    idempotency_key: "session-rebind-reserve".to_string(),
-                    handling_mode: Some("queue".to_string()),
-                    origin_kind: None,
-                    skill_refs: Vec::new(),
-                },
-                None,
-            )
-            .await
-            .expect("session-only split-brain should self-heal before reserve");
-
-        let rebound_status = identity_runtime.status(&identity).await?;
-        assert_eq!(rebound_status.session_id, Some(live_session_id.clone()));
-
-        let inspection = aggregator
-            .inspect_identity("review:singleton")
-            .await?
-            .expect("rebound identity should inspect");
-        let live_session_string = live_session_id.to_string();
-        assert_eq!(
-            inspection.identity.session_id.as_deref(),
-            Some(live_session_string.as_str())
-        );
-
-        let _ = runtime.mob_handle().stop().await;
-        Ok(())
-    }
-
     /// A console READ is a projection, never a repair.
     ///
     /// `inspect_identity` backs three `agent.view`-permissioned console
@@ -13379,6 +13351,7 @@ comms = true
             .await
             .expect("live member has bridge session");
 
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: Arc::new(
@@ -13388,47 +13361,34 @@ comms = true
                 runtime_instance_id: "console-aggregator-read-projection-test".to_string(),
                 has_runtime_store: true,
                 durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
+                bridge: Some(core_bridge.clone()),
                 default_timeout: None,
             },
         ));
         let identity = crate::identity_first::AgentIdentity::parse("review:singleton")?;
         let stale_session_id = SessionId::new();
         assert_ne!(stale_session_id, live_session_id);
-        let record = crate::identity_first::ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(
-                "rt:review:singleton:0",
-            )?,
-            session_id: stale_session_id.clone(),
-            generation: crate::identity_first::ContinuityGeneration::new(1),
-            checkpoint_version: crate::identity_first::CheckpointVersion::new(3),
-        };
-        identity_runtime
-            .register(
-                crate::identity_first::DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: crate::identity_first::AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                crate::identity_first::IdentityLifecycleState::Active,
-                Some(record),
-                Some(crate::identity_first::LeaseGrant {
-                    identity: identity.clone(),
-                    fencing_token: crate::identity_first::FencingToken::new(7),
-                    ttl: Duration::from_mins(5),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            crate::identity_first::DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            stale_session_id.clone(),
+        )
+        .await?;
 
         let aggregator = MetaConsoleAggregator::in_memory();
         aggregator
@@ -13477,34 +13437,6 @@ comms = true
             after.generation, before.generation,
             "a console read must not advance the continuity generation"
         );
-        assert_eq!(
-            after.lease.as_ref().map(|lease| lease.fencing_token),
-            before.lease.as_ref().map(|lease| lease.fencing_token),
-            "a console read must not re-lease or advance the fencing token"
-        );
-
-        // Observable outcome preserved: the repair still happens, on the
-        // canonical delivery write path.
-        aggregator
-            .reserve_identity_first_interaction(
-                ConsoleSendRequest {
-                    identity: "review:singleton".to_string(),
-                    content: json!("hello"),
-                    origin: "console:test".to_string(),
-                    idempotency_key: "session-read-projection-reserve".to_string(),
-                    handling_mode: Some("queue".to_string()),
-                    origin_kind: None,
-                    skill_refs: Vec::new(),
-                },
-                None,
-            )
-            .await
-            .expect("the write path must still heal the split-brain");
-        assert_eq!(
-            identity_runtime.status(&identity).await?.session_id,
-            Some(live_session_id),
-            "delivery is the canonical place the rebind happens"
-        );
 
         let _ = runtime.mob_handle().stop().await;
         Ok(())
@@ -13529,6 +13461,7 @@ comms = true
         )
         .await;
 
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: Arc::new(
@@ -13538,45 +13471,32 @@ comms = true
                 runtime_instance_id: "console-aggregator-wrong-projection-test".to_string(),
                 has_runtime_store: true,
                 durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
+                bridge: Some(core_bridge.clone()),
                 default_timeout: None,
             },
         ));
         let identity = crate::identity_first::AgentIdentity::parse("review:singleton")?;
-        let record = crate::identity_first::ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(
-                "rt:review:singleton:0",
-            )?,
-            session_id: SessionId::new(),
-            generation: crate::identity_first::ContinuityGeneration::new(1),
-            checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-        };
-        identity_runtime
-            .register(
-                crate::identity_first::DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: crate::identity_first::AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                crate::identity_first::IdentityLifecycleState::Active,
-                Some(record),
-                Some(crate::identity_first::LeaseGrant {
-                    identity,
-                    fencing_token: crate::identity_first::FencingToken::new(7),
-                    ttl: Duration::from_mins(5),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            crate::identity_first::DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            SessionId::new(),
+        )
+        .await?;
 
         let aggregator = MetaConsoleAggregator::in_memory();
         aggregator
@@ -13713,6 +13633,7 @@ comms = true
         )
         .await;
 
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: Arc::new(
@@ -13722,44 +13643,32 @@ comms = true
                 runtime_instance_id: "console-aggregator-hidden-wrong-projection-test".to_string(),
                 has_runtime_store: true,
                 durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
+                bridge: Some(core_bridge.clone()),
                 default_timeout: None,
             },
         ));
         let identity = crate::identity_first::AgentIdentity::parse("review:singleton")?;
-        identity_runtime
-            .register(
-                crate::identity_first::DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: crate::identity_first::AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                crate::identity_first::IdentityLifecycleState::Active,
-                Some(crate::identity_first::ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(
-                        "rt:review:singleton:0",
-                    )?,
-                    session_id: SessionId::new(),
-                    generation: crate::identity_first::ContinuityGeneration::new(1),
-                    checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-                }),
-                Some(crate::identity_first::LeaseGrant {
-                    identity,
-                    fencing_token: crate::identity_first::FencingToken::new(7),
-                    ttl: Duration::from_mins(5),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            crate::identity_first::DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            SessionId::new(),
+        )
+        .await?;
 
         let aggregator = MetaConsoleAggregator::in_memory();
         aggregator
@@ -13821,6 +13730,8 @@ comms = true
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let hidden_runtime = build_empty_runtime("runtime-id-hidden-match-test").await;
         let visible_runtime = build_empty_runtime("runtime-id-visible-match-test").await;
+        let hidden_core = Arc::new(CoreReadsBridge::default());
+        let visible_core = Arc::new(CoreReadsBridge::default());
         let hidden_identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: Arc::new(
@@ -13830,7 +13741,7 @@ comms = true
                 runtime_instance_id: "runtime-id-hidden-match-test".to_string(),
                 has_runtime_store: true,
                 durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
+                bridge: Some(hidden_core.clone()),
                 default_timeout: None,
             },
         ));
@@ -13843,45 +13754,36 @@ comms = true
                 runtime_instance_id: "runtime-id-visible-match-test".to_string(),
                 has_runtime_store: true,
                 durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
+                bridge: Some(visible_core.clone()),
                 default_timeout: None,
             },
         ));
-        for identity_runtime in [&hidden_identity_runtime, &visible_identity_runtime] {
+        for (identity_runtime, core_bridge) in [
+            (&hidden_identity_runtime, &hidden_core),
+            (&visible_identity_runtime, &visible_core),
+        ] {
             let identity = crate::identity_first::AgentIdentity::parse("review:singleton")?;
-            identity_runtime
-                .register(
-                    crate::identity_first::DurableAgentSpec {
-                        identity: identity.clone(),
-                        profile: meerkat_mob::ProfileName::from("worker"),
-                        addressability: crate::identity_first::AgentAddressability::Addressable,
-                        display_name: None,
-                        labels: BTreeMap::new(),
-                        context: None,
-                        additional_instructions: Vec::new(),
-                        initial_message: None,
-                        runtime_mode_override: None,
-                        backend: None,
-                        binding: None,
-                        placement: None,
-                    },
-                    crate::identity_first::IdentityLifecycleState::Active,
-                    Some(crate::identity_first::ContinuityRecord {
-                        identity: identity.clone(),
-                        agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(
-                            "rt:review:singleton:0",
-                        )?,
-                        session_id: SessionId::new(),
-                        generation: crate::identity_first::ContinuityGeneration::new(1),
-                        checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-                    }),
-                    Some(crate::identity_first::LeaseGrant {
-                        identity,
-                        fencing_token: crate::identity_first::FencingToken::new(7),
-                        ttl: Duration::from_mins(5),
-                    }),
-                )
-                .await;
+            register_live(
+                identity_runtime,
+                &core_bridge.core,
+                crate::identity_first::DurableAgentSpec {
+                    identity: identity.clone(),
+                    profile: meerkat_mob::ProfileName::from("worker"),
+                    addressability: crate::identity_first::AgentAddressability::Addressable,
+                    display_name: None,
+                    labels: BTreeMap::new(),
+                    context: None,
+                    additional_instructions: Vec::new(),
+                    initial_message: None,
+                    runtime_mode_override: None,
+                    backend: None,
+                    binding: None,
+                    placement: None,
+                },
+                0,
+                SessionId::new(),
+            )
+            .await?;
         }
 
         let aggregator = MetaConsoleAggregator::in_memory();
@@ -13970,6 +13872,7 @@ comms = true
             )
             .await;
 
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: Arc::new(
@@ -13979,45 +13882,32 @@ comms = true
                 runtime_instance_id: "console-aggregator-cross-source-test".to_string(),
                 has_runtime_store: true,
                 durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
+                bridge: Some(core_bridge.clone()),
                 default_timeout: None,
             },
         ));
         let identity = crate::identity_first::AgentIdentity::parse("review:singleton")?;
-        let record = crate::identity_first::ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(
-                "rt:review:singleton:0",
-            )?,
-            session_id: SessionId::new(),
-            generation: crate::identity_first::ContinuityGeneration::new(1),
-            checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-        };
-        identity_runtime
-            .register(
-                crate::identity_first::DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: crate::identity_first::AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                crate::identity_first::IdentityLifecycleState::Active,
-                Some(record),
-                Some(crate::identity_first::LeaseGrant {
-                    identity,
-                    fencing_token: crate::identity_first::FencingToken::new(7),
-                    ttl: Duration::from_mins(5),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            crate::identity_first::DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            SessionId::new(),
+        )
+        .await?;
 
         let aggregator = MetaConsoleAggregator::in_memory();
         aggregator
@@ -14082,6 +13972,7 @@ comms = true
             .await
             .expect("bound generation has a bridge session");
 
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: Arc::new(
@@ -14091,42 +13982,32 @@ comms = true
                 runtime_instance_id: "console-aggregator-respawn-send-authority-test".to_string(),
                 has_runtime_store: true,
                 durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
+                bridge: Some(core_bridge.clone()),
                 default_timeout: None,
             },
         ));
         let identity = crate::identity_first::AgentIdentity::parse("builder")?;
-        identity_runtime
-            .register(
-                crate::identity_first::DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: crate::identity_first::AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                crate::identity_first::IdentityLifecycleState::Active,
-                Some(crate::identity_first::ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: crate::identity_first::AgentRuntimeId::parse("rt:builder:1")?,
-                    session_id: bound_session_id.clone(),
-                    generation: crate::identity_first::ContinuityGeneration::new(1),
-                    checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-                }),
-                Some(crate::identity_first::LeaseGrant {
-                    identity,
-                    fencing_token: crate::identity_first::FencingToken::new(9),
-                    ttl: Duration::from_mins(5),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            crate::identity_first::DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            1,
+            bound_session_id.clone(),
+        )
+        .await?;
 
         let aggregator = MetaConsoleAggregator::in_memory();
         aggregator
@@ -14235,6 +14116,17 @@ comms = true
         )
         .await;
 
+        // Core's binding names the first duplicate's own session, so the
+        // durable binding matches exactly one of the two live aliases.
+        let bound_session_id = runtime
+            .mob_handle()
+            .resolve_bridge_session_id_observation(&crate::member_comms_id::mob_member_id(
+                "rt:review:singleton:0",
+            ))
+            .await
+            .expect("the first duplicate has a bridge session");
+
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: Arc::new(
@@ -14244,44 +14136,32 @@ comms = true
                 runtime_instance_id: "console-aggregator-ambiguous-durable-test".to_string(),
                 has_runtime_store: true,
                 durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
+                bridge: Some(core_bridge.clone()),
                 default_timeout: None,
             },
         ));
         let identity = crate::identity_first::AgentIdentity::parse("review:singleton")?;
-        identity_runtime
-            .register(
-                crate::identity_first::DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: crate::identity_first::AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                crate::identity_first::IdentityLifecycleState::Active,
-                Some(crate::identity_first::ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(
-                        "rt:review:singleton:0",
-                    )?,
-                    session_id: SessionId::new(),
-                    generation: crate::identity_first::ContinuityGeneration::new(1),
-                    checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-                }),
-                Some(crate::identity_first::LeaseGrant {
-                    identity,
-                    fencing_token: crate::identity_first::FencingToken::new(8),
-                    ttl: Duration::from_mins(5),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            crate::identity_first::DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            bound_session_id,
+        )
+        .await?;
 
         let aggregator = MetaConsoleAggregator::in_memory();
         aggregator
@@ -14620,6 +14500,121 @@ comms = true
         Ok(())
     }
 
+    /// The same once-only listing over Core's real member reads: the
+    /// identity runtime sits on the mob's own bridge, so the one row carries
+    /// Core's runtime alias and session for the identity, and after a reset
+    /// the one row moves to the successor's alias and session while the old
+    /// alias is listed nowhere.
+    #[tokio::test]
+    async fn identity_first_list_identities_lists_a_live_identity_once_over_core()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let runtime = build_empty_runtime("identity-live-once-core").await;
+        let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
+            crate::identity_first::IdentityRuntimeConfig {
+                continuity_store: Arc::new(
+                    crate::identity_first::LocalContinuityStore::in_memory()?
+                ),
+                lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
+                runtime_instance_id: "identity-live-once-core".to_string(),
+                has_runtime_store: true,
+                durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                bridge: Some(Arc::new(crate::identity_first::MobSessionBridge::new(
+                    runtime.mob_handle(),
+                ))),
+                default_timeout: None,
+            },
+        ));
+        let alpha = crate::identity_first::AgentIdentity::parse("agent:alpha")?;
+        identity_runtime
+            .register(crate::identity_first::DurableAgentSpec {
+                identity: alpha.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            })
+            .await;
+        identity_runtime
+            .materialize(&alpha)
+            .await?
+            .ok_or("Core holds agent:alpha live after the wake")?;
+        let aggregator = MetaConsoleAggregator::in_memory();
+        aggregator.register_runtime_handles_with_policy(
+            "identity-first",
+            "",
+            runtime.mob_runtime().clone(),
+            Some(identity_runtime.clone()),
+            runtime.console_events(),
+            Arc::new(AllowAllConsoleVisibilityPolicy),
+        );
+
+        // Core's runtime alias and session for the identity, as its status
+        // reads them.
+        let core_binding = |status: crate::identity_first::IdentityStatus| {
+            status
+                .agent_runtime_id
+                .map(|alias| alias.to_string())
+                .zip(status.session_id.map(|session| session.to_string()))
+                .ok_or("Core holds agent:alpha live on a session")
+        };
+        let (alias, session) = core_binding(identity_runtime.status(&alpha).await?)?;
+        assert!(alias.starts_with("rt:agent:alpha:"), "{alias}");
+        let identities = aggregator.list_identities_fresh().await?;
+        let rows = identities
+            .iter()
+            .filter(|record| record.identity == "agent:alpha")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a live identity lists once over Core's reads: {identities:#?}"
+        );
+        assert_eq!(rows[0].runtime_member_id, alias);
+        assert_eq!(rows[0].session_id.as_deref(), Some(session.as_str()));
+
+        let reset = identity_runtime.reset(&alpha).await?;
+        let (successor_alias, successor_session) =
+            core_binding(identity_runtime.status(&alpha).await?)?;
+        assert_eq!(
+            reset.session_id().map(ToString::to_string).as_deref(),
+            Some(successor_session.as_str()),
+            "the reset's binding is the one the status reads"
+        );
+        assert_ne!(successor_alias, alias, "a reset moves Core's generation");
+        assert_ne!(successor_session, session, "a reset binds a fresh session");
+        let identities = aggregator.list_identities_fresh().await?;
+        let rows = identities
+            .iter()
+            .filter(|record| record.identity == "agent:alpha")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the reset identity still lists once: {identities:#?}"
+        );
+        assert_eq!(rows[0].runtime_member_id, successor_alias);
+        assert_eq!(
+            rows[0].session_id.as_deref(),
+            Some(successor_session.as_str())
+        );
+        assert!(
+            identities
+                .iter()
+                .all(|record| record.runtime_member_id != alias),
+            "the alias the reset retired is listed nowhere: {identities:#?}"
+        );
+
+        let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn list_identities_serves_hot_cache_while_identity_refresh_is_in_flight() {
         let aggregator = MetaConsoleAggregator::in_memory();
@@ -14789,7 +14784,7 @@ comms = true
     /// namespacing (`frame_from_console_event` must not rewrite `_system`
     /// to `ns/_system`). ABAC is unaffected: under an enforced config the
     /// RPC layer still filters `_system` frames per caller via
-    /// `retain_visible_timeline_frames` (covered in tests/access_control.rs).
+    /// `timeline_frame_visible_to` (covered in tests/access_control.rs).
     #[tokio::test]
     async fn host_redaction_precedes_store_broadcast_and_view_send_reservation() {
         struct RedactSecret;
@@ -14824,7 +14819,9 @@ comms = true
         );
         frame.runtime_key = "default".into();
         frame.identity = SYSTEM_EVENT_IDENTITY.into();
-        let stored = append_and_emit(&view.inner, frame)
+        let policy = capture_host_payload_policy(&view.inner, &frame.runtime_key, None)
+            .expect("host payload policy");
+        let stored = append_and_emit_runtime_plane(&view.inner, frame, policy)
             .await
             .expect("append")
             .frame;
@@ -14918,7 +14915,7 @@ comms = true
                 .is_err(),
             "missing producer cannot silently use AllowAll"
         );
-        let first = append_and_emit_with_policy(&aggregator.inner, frame.clone(), policy.clone())
+        let first = append_and_emit_runtime_plane(&aggregator.inner, frame.clone(), policy.clone())
             .await
             .expect("already admitted source")
             .frame;
@@ -14932,7 +14929,7 @@ comms = true
             .expect("registry")
             .insert("runtime-a".into(), replacement);
         frame.dedupe_key = "replaced-source".into();
-        let second = append_and_emit_with_policy(&aggregator.inner, frame, policy)
+        let second = append_and_emit_runtime_plane(&aggregator.inner, frame, policy)
             .await
             .expect("captured policy")
             .frame;
@@ -15010,6 +15007,361 @@ comms = true
             Some(current),
             "stale refresh cannot overwrite the replacement's witness"
         );
+        runtime.shutdown().await;
+    }
+
+    /// R-d: a console event is ingested data. Provenance-shaped fields in it
+    /// never become the stored frame's member provenance; the owner's own
+    /// capture is the only source, and no live member is captured here.
+    #[tokio::test]
+    async fn an_ingested_console_event_cannot_supply_member_provenance() {
+        let runtime = build_empty_runtime("ingested-provenance").await;
+        let owner = MetaConsoleAggregator::in_memory();
+        let mut entry = runtime_entry_for_test("default", &runtime);
+        entry.identity_namespace.clear();
+        owner
+            .inner
+            .runtimes
+            .write()
+            .expect("registry")
+            .insert("default".into(), entry);
+        let claimed = json!({
+            "identity": {"identity": "claimed-member", "display_name": "claimed",
+                "runtime_key": "default", "runtime_member_id": "claimed-member",
+                "session_id": "claimed-session", "visibility": "addressable",
+                "addressable": true, "health": "ready", "labels": {"tier": "public"}},
+            "member": {"agent_identity": "claimed-member", "role": "worker",
+                "state": "running", "wired_to": [], "labels": {"tier": "public"}},
+            "primary_mob_id": "claimed", "source_mob_id": "claimed"
+        });
+        project_console_event(
+            owner.inner.clone(),
+            "default",
+            crate::console_contracts::ConsoleIdentityEventEnvelope {
+                event_id: "ingested-provenance".into(),
+                interaction_id: None,
+                identity: "claimed-member".into(),
+                event_type: "text_delta".into(),
+                timestamp_ms: 1000,
+                data: json!({
+                    "delta": "hello",
+                    "session_id": "claimed-session",
+                    "member_provenance": claimed.clone(),
+                    "source": {"kind": "synthetic", "member_provenance": claimed},
+                }),
+            },
+        )
+        .await
+        .expect("ingested");
+        let stored = owner
+            .store()
+            .query_frames(ConsoleTimelineQuery::default())
+            .await
+            .expect("read")
+            .frames;
+        let frame = stored
+            .iter()
+            .find(|frame| frame.source_event_id.as_deref() == Some("ingested-provenance"))
+            .expect("stored frame");
+        assert_eq!(frame.source.kind, ConsoleFrameSourceKind::ConsoleEvent);
+        assert_eq!(frame.source.member_provenance, None);
+        runtime.shutdown().await;
+    }
+
+    /// Embedder path: a member of a namespaced registered runtime. The owner
+    /// captures its attributes under the registration's namespace, and the
+    /// captured attributes decide the stored frame for a denied caller whose
+    /// shared cache knows nothing of the member.
+    #[tokio::test]
+    async fn a_namespaced_runtime_member_frame_is_decided_by_the_owner_capture() {
+        let runtime = build_single_member_runtime().await;
+        let aggregator = MetaConsoleAggregator::in_memory();
+        let entry = runtime_entry_for_test("runtime-a", &runtime);
+        aggregator
+            .inner
+            .runtimes
+            .write()
+            .expect("registry")
+            .insert("runtime-a".into(), entry.clone());
+        let resolved = member_sources_for_entry_including_hidden(&entry)
+            .await
+            .into_iter()
+            .next()
+            .expect("member");
+        let mut record = identity_record_for_resolved_member(&resolved)
+            .await
+            .expect("identity");
+        assert!(record.identity.starts_with("test/"), "{record:#?}");
+        record.labels.insert("tier".into(), "secret".into());
+        let provenance = capture_member_provenance(&aggregator.inner, &resolved, &record).await;
+        assert_eq!(provenance.lineage[0].identity, record.identity);
+        assert_eq!(
+            provenance.lineage[0].agent_id.as_deref(),
+            Some(apply_namespace(&record.runtime_member_id, "test").as_str())
+        );
+        let mut frame = counterpart_lineage_frame("namespaced-secret", "text_delta", json!({}));
+        frame.identity = record.identity.clone();
+        frame.conversation_id = Some(record.identity.clone());
+        frame.session_id = record.session_id.clone();
+        frame.source.member_provenance = Some(provenance);
+        let stored = aggregator
+            .store()
+            .append_if_absent(frame)
+            .await
+            .expect("frame")
+            .frame;
+        let controller = crate::access::AccessController::new(crate::access::AccessControlConfig {
+            enabled: true,
+            admins: vec!["root@example.test".to_string()],
+            rules: vec![
+                crate::access::AccessRule {
+                    id: "everyone-views".to_string(),
+                    actions: vec!["agent.view".to_string()],
+                    agents: vec!["*".to_string()],
+                    ..crate::access::AccessRule::default()
+                },
+                crate::access::AccessRule {
+                    id: "hide-secret".to_string(),
+                    effect: crate::access::AccessEffect::Deny,
+                    actions: vec!["agent.view".to_string()],
+                    match_labels: BTreeMap::from([("tier".to_string(), "secret".to_string())]),
+                    ..crate::access::AccessRule::default()
+                },
+            ],
+            ..crate::access::AccessControlConfig::default()
+        })
+        .expect("controller");
+        let caller = controller.view_for_subject(None);
+        assert!(!caller.knows_agent(&record.identity));
+        assert!(!timeline_frame_visible_to(&caller, &stored));
+        assert!(timeline_frame_visible_to(
+            &controller.view_for_subject(Some("root@example.test")),
+            &stored
+        ));
+        runtime.shutdown().await;
+    }
+
+    /// R-e: a frame that names no session never takes a witness retained
+    /// for an earlier incarnation under the same identity; it records none.
+    #[tokio::test]
+    async fn a_session_less_frame_never_takes_an_earlier_incarnation_s_witness() {
+        let runtime = build_single_member_runtime().await;
+        let aggregator = MetaConsoleAggregator::in_memory();
+        let entry = runtime_entry_for_test("runtime-a", &runtime);
+        aggregator
+            .inner
+            .runtimes
+            .write()
+            .expect("registry")
+            .insert("runtime-a".into(), entry.clone());
+        let resolved = member_sources_for_entry_including_hidden(&entry)
+            .await
+            .into_iter()
+            .next()
+            .expect("member");
+        let mut earlier = identity_record_for_resolved_member(&resolved)
+            .await
+            .expect("identity");
+        earlier.session_id = Some("earlier-incarnation".into());
+        earlier.labels.insert("tier".into(), "public".into());
+        let witness = retain_member_provenance(&aggregator.inner, &resolved, &earlier);
+        // The identity-only key an earlier owner kept for the same member.
+        aggregator
+            .inner
+            .member_provenance
+            .lock()
+            .expect("cache")
+            .insert(
+                ("runtime-a".into(), earlier.identity.clone(), None),
+                Arc::new(witness),
+            );
+        let captured = member_provenance_for_identity(
+            &aggregator.inner,
+            &entry,
+            &earlier.identity,
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            captured.as_ref().is_none_or(|provenance| {
+                provenance.identity.session_id.as_deref() != Some("earlier-incarnation")
+                    && provenance.identity.labels.get("tier").map(String::as_str) != Some("public")
+            }),
+            "a session-less frame took an earlier incarnation's witness: {captured:#?}"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// R-e (L1): the member that wrote a session-less frame left, and a later
+    /// member with neutral labels is live under the same identity. The frame
+    /// records no member provenance, so a label deny refuses it on the
+    /// window, the RPC page (the same query) and the stream decision, while
+    /// an admin still reads it.
+    #[tokio::test]
+    async fn a_session_less_frame_records_no_provenance_while_a_namesake_is_live() {
+        let runtime = build_single_member_runtime().await;
+        let aggregator = MetaConsoleAggregator::in_memory();
+        let entry = runtime_entry_for_test("runtime-a", &runtime);
+        aggregator
+            .inner
+            .runtimes
+            .write()
+            .expect("registry")
+            .insert("runtime-a".into(), entry.clone());
+        let resolved = member_sources_for_entry_including_hidden(&entry)
+            .await
+            .into_iter()
+            .next()
+            .expect("member");
+        let live = identity_record_for_resolved_member(&resolved)
+            .await
+            .expect("identity");
+        assert!(!live.labels.contains_key("tier"), "{live:#?}");
+        project_console_event(
+            aggregator.inner.clone(),
+            "runtime-a",
+            crate::console_contracts::ConsoleIdentityEventEnvelope {
+                event_id: "session-less-frame".into(),
+                interaction_id: None,
+                identity: live.runtime_member_id.clone(),
+                event_type: "text_delta".into(),
+                timestamp_ms: 1000,
+                data: json!({ "delta": "written by an earlier member" }),
+            },
+        )
+        .await
+        .expect("projected");
+        let stored = aggregator
+            .store()
+            .query_frames(ConsoleTimelineQuery::default())
+            .await
+            .expect("read")
+            .frames
+            .into_iter()
+            .find(|frame| frame.source_event_id.as_deref() == Some("session-less-frame"))
+            .expect("stored frame");
+        assert_eq!(stored.identity, live.identity);
+        assert_eq!(stored.session_id, None);
+        assert_eq!(stored.source.member_provenance, None);
+
+        let controller = crate::access::AccessController::new(crate::access::AccessControlConfig {
+            enabled: true,
+            admins: vec!["root@example.test".to_string()],
+            rules: vec![
+                crate::access::AccessRule {
+                    id: "everyone-views".to_string(),
+                    actions: vec!["agent.view".to_string()],
+                    agents: vec!["*".to_string()],
+                    ..crate::access::AccessRule::default()
+                },
+                crate::access::AccessRule {
+                    id: "hide-secret".to_string(),
+                    effect: crate::access::AccessEffect::Deny,
+                    actions: vec!["agent.view".to_string()],
+                    match_labels: BTreeMap::from([("tier".to_string(), "secret".to_string())]),
+                    ..crate::access::AccessRule::default()
+                },
+            ],
+            ..crate::access::AccessControlConfig::default()
+        })
+        .expect("controller");
+        let caller = controller.view_for_subject(None);
+        let admin = controller.view_for_subject(Some("root@example.test"));
+        // Stream decision (snapshot and live frames).
+        assert!(!timeline_frame_visible_to(&caller, &stored));
+        assert!(timeline_frame_visible_to(&admin, &stored));
+        // Window and RPC page: the identity-scoped query with the decider.
+        let query = ConsoleTimelineWindowQuery {
+            identity: Some(live.identity.clone()),
+            mode: ConsoleTimelineMode::Recent,
+            limit: 200,
+            ..ConsoleTimelineWindowQuery::default()
+        };
+        let window = |view: crate::access::AccessView| {
+            let aggregator = aggregator.clone();
+            let query = query.clone();
+            async move {
+                let decider = TimelineFrameDecider::new(view);
+                let filter: &TimelineFrameFilter<'_> =
+                    &|frame: &ConsoleFrame| decider.visible(frame);
+                aggregator
+                    .query_timeline_windowed_for(query, Some(filter))
+                    .await
+                    .expect("window")
+                    .frames
+                    .into_iter()
+                    .filter(|frame| frame.source_event_id.as_deref() == Some("session-less-frame"))
+                    .count()
+            }
+        };
+        assert_eq!(window(caller).await, 0);
+        assert_eq!(window(admin).await, 1);
+        runtime.shutdown().await;
+    }
+
+    /// C3 + R-e: an ancestor is captured only from the incarnation the
+    /// child's lineage binds (the spawning session). A live member under the
+    /// parent's identity in another session is recorded unconfirmed, without
+    /// attributes; the bound incarnation is captured with its own.
+    #[tokio::test]
+    async fn spawn_ancestors_are_captured_only_from_the_bound_incarnation() {
+        let runtime = build_single_member_runtime().await;
+        let entry = runtime_entry_for_test("runtime-a", &runtime);
+        let parent = member_sources_for_entry_including_hidden(&entry)
+            .await
+            .into_iter()
+            .next()
+            .expect("member");
+        let parent_record = identity_record_for_resolved_member(&parent)
+            .await
+            .expect("parent identity");
+        let parent_session = parent_record
+            .session_id
+            .clone()
+            .expect("a live member has a session");
+        let parent_name = parent_record.runtime_member_id.clone();
+        let child_record = |bound_session: &str| ConsoleIdentityRecord {
+            identity: "test/child".into(),
+            display_name: "child".into(),
+            runtime_key: "runtime-a".into(),
+            runtime_member_id: "child".into(),
+            session_id: Some("child-session".into()),
+            member_id: None,
+            visibility: ConsoleVisibility::RetiredReadable,
+            addressable: false,
+            health: "retired".into(),
+            topology_peers: Vec::new(),
+            labels: BTreeMap::from([
+                (
+                    crate::console_spawn::SPAWNED_BY_LABEL.to_string(),
+                    parent_name.clone(),
+                ),
+                (
+                    crate::console_spawn::SPAWNED_BY_SESSION_LABEL.to_string(),
+                    bound_session.to_string(),
+                ),
+            ]),
+        };
+
+        let bound = capture_member_lineage(&parent, &child_record(&parent_session)).await;
+        assert_eq!(bound.len(), 2, "{bound:#?}");
+        assert_eq!(bound[1].identity, parent_record.identity);
+        assert_eq!(
+            bound[1].labels.as_ref(),
+            Some(&{
+                let mut labels = parent_record.labels.clone();
+                if let Some(grandparent) = labels.get_mut(crate::console_spawn::SPAWNED_BY_LABEL) {
+                    *grandparent = apply_namespace(grandparent, "test");
+                }
+                labels
+            })
+        );
+
+        let other = capture_member_lineage(&parent, &child_record("an-earlier-parent")).await;
+        assert_eq!(other.len(), 2, "{other:#?}");
+        assert_eq!(other[1].identity, parent_record.identity);
+        assert_eq!(other[1].labels, None, "a later namesake was captured");
         runtime.shutdown().await;
     }
 
@@ -17227,11 +17579,22 @@ comms = true
     }
 
     #[tokio::test]
-    async fn stale_captured_backfill_target_cannot_read_publish_or_admit_epoch_after_replacement() {
-        let (_temp, runtime, service) = build_stress_runtime(0, Duration::ZERO).await;
+    async fn stale_captured_backfill_target_cannot_read_publish_or_admit_authority_after_replacement()
+     {
+        // The session has a committed boundary authority, so a current
+        // registration's pass would admit it.
+        let durable: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let (_temp, runtime, service) = build_stress_runtime_with_durable_runtime_store(
+            0,
+            Duration::ZERO,
+            Some(durable.clone()),
+        )
+        .await;
         let store = Arc::new(CountingConsoleLogStore::new());
         let aggregator = MetaConsoleAggregator::new(store.clone());
         let session = SessionId::new();
+        commit_fixture_session_boundary(durable.as_ref(), &session.to_string(), "committed").await;
         let predecessor = runtime_entry_for_test("registration-test", &runtime);
         aggregator
             .inner
@@ -17255,12 +17618,14 @@ comms = true
         let reads_before = service.read_calls();
         let watermark_key =
             session_history_watermark_runtime_key(&predecessor.runtime_key, &session.to_string());
-        aggregator
-            .inner
-            .session_backfill_epochs
-            .lock()
-            .expect("epochs")
-            .insert(watermark_key.clone(), 77);
+        assert!(
+            predecessor
+                .runtime
+                .session_boundary_authority(&session.to_string())
+                .await
+                .is_some(),
+            "precondition: the session's committed authority is readable"
+        );
         assert!(!runtime_entry_is_current(&aggregator.inner, &predecessor));
         assert!(runtime_entry_is_current(&aggregator.inner, &successor));
         backfill_one_session_history(aggregator.inner.clone(), captured, true)
@@ -17270,14 +17635,23 @@ comms = true
         assert_eq!(store.source_watermark_calls(), 0);
         assert_eq!(store.record_watermark_calls.load(Ordering::SeqCst), 0);
         assert!(stored_notice_snapshots(&aggregator).await.is_empty());
-        assert_eq!(
-            aggregator
+        assert!(
+            !aggregator
                 .inner
-                .session_backfill_epochs
+                .session_backfill_authorities
                 .lock()
-                .expect("epochs")
-                .get(&watermark_key),
-            Some(&77)
+                .expect("authorities")
+                .contains_key(&watermark_key),
+            "a stale target admits no completed authority"
+        );
+        assert!(
+            !aggregator
+                .inner
+                .session_pending_read_authorities
+                .lock()
+                .expect("authorities")
+                .contains_key(&watermark_key),
+            "a stale target admits no pending-read authority"
         );
         assert_eq!(
             service.scripted_reads.lock().expect("scripted reads").len(),
@@ -20146,6 +20520,7 @@ comms = true
             initial_message: None,
             labels: BTreeMap::new(),
             spawned_by: Some("ops-lead".to_string()),
+            spawned_by_session: None,
             via_tool: "mob_spawn_member".to_string(),
         })
         .await;
@@ -20317,6 +20692,7 @@ comms = true
             initial_message: Some(json!("Kick off the person hunt")),
             labels: BTreeMap::from([("group".to_string(), "workers".to_string())]),
             spawned_by: Some("ops-lead".to_string()),
+            spawned_by_session: None,
             via_tool: "mob_spawn_member".to_string(),
         };
         sink.project_spawned_member(&seed).await;

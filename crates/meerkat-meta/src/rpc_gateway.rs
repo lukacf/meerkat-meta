@@ -189,6 +189,12 @@ struct GatewayRuntimeOptions {
     /// a candidate boot the stored mob definition when the supplied one
     /// differs (logged, degraded health). Absent, such a candidate refuses.
     candidate_definition: crate::mob_composition_manifest::CandidateDefinition,
+    /// `runtime_options.fork_instruction_policy`: what a fork of a member
+    /// with activated host instructions does with them:
+    /// `"require_explicit_activation"` (absent: Meerkat's default),
+    /// `"reactivate_inherited"` or `"refuse"`. Applied to the gateway's mob
+    /// on every build and resume.
+    fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
     /// `runtime_options.compaction = {"auto_compact_threshold": 120000, ...}`:
     /// the host-level session-compaction policy for every agent this gateway
     /// builds. Absent, the gateway inherits meerkat's model-aware default
@@ -279,10 +285,9 @@ type GatewayOpenAiLiveOption = crate::public_live_config::PublicLiveRegistration
 /// `runtime_options.workgraph` wire forms. Booleans keep the original
 /// semantics (on with defaulted store placement / off). A string is an
 /// explicit DIRECTORY for the durable store — `workgraph.sqlite3` is created
-/// inside it. The explicit form exists for identity-first launches that
-/// persist through an SDK-hosted continuity store (`has_continuity_store`
-/// without `persistent_state`): those have no state dir to default to, so a
-/// bare `true` silently rides a memory store.
+/// inside it. The explicit form gives a launch without `persistent_state` a
+/// durable workgraph: such a launch has no state dir to default to, so a
+/// bare `true` rides a memory store.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum GatewayWorkgraphOption {
     #[default]
@@ -467,6 +472,7 @@ impl Default for GatewayRuntimeOptions {
             declare_spec_update: None,
             composition_authority: crate::mob_composition_manifest::CompositionAuthority::default(),
             candidate_definition: crate::mob_composition_manifest::CandidateDefinition::default(),
+            fork_instruction_policy: meerkat_core::ForkInstructionPolicy::default(),
             compaction: None,
             host_config: None,
             http_listen: crate::gateway_composition::DEFAULT_GATEWAY_HTTP_LISTEN,
@@ -665,6 +671,37 @@ const RUNTIME_OPTIONS_ONLY_KEYS: [&str; 4] = [
     "http_public_base_url",
     "meerkat_config_path",
 ];
+
+/// `meta/init` params of the SDK-hosted continuity path that 0.9.4 removed:
+/// a host-side continuity store, lease provider and scratch directory. Meta
+/// keeps no session or identity copy of its own any more, so there is nothing
+/// for a host store to back.
+const REMOVED_CONTINUITY_INIT_KEYS: [&str; 3] =
+    ["has_continuity_store", "has_lease_provider", "scratch_dir"];
+
+/// Refuse every removed SDK-hosted continuity init param by name, whatever
+/// its value: an SDK that still sends one was built for the removed path and
+/// must not start on a different storage shape than its host expects.
+fn refuse_removed_continuity_init_params(params: &Value) -> Result<(), String> {
+    let removed: Vec<&str> = REMOVED_CONTINUITY_INIT_KEYS
+        .into_iter()
+        .filter(|key| params.get(key).is_some())
+        .collect();
+    if removed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "init param(s) {} were removed in Meta 0.9.4: SDK-hosted continuity (a host \
+         continuity store, lease provider and scratch_dir) is no longer supported; Meta \
+         keeps sessions and identities in the persistent_state directory. Remove them, and \
+         set persistent_state for durable sessions. To move an SDK-hosted 0.9.3 \
+         installation, export its continuity with 0.9.3 still installed, then run `{}` \
+         (see {})",
+        removed.join(", "),
+        crate::storage_layout::NATIVE_STORAGE_MIGRATION_VERB,
+        crate::storage_layout::NATIVE_STORAGE_MIGRATION_GUIDE,
+    ))
+}
 
 fn refuse_misplaced_runtime_options(params: &Value) -> Result<(), String> {
     let misplaced: Vec<&str> = RUNTIME_OPTIONS_ONLY_KEYS
@@ -1171,6 +1208,44 @@ mod tests {
             crate::mob_composition_manifest::CompositionAuthority::Authoritative
         );
         assert_eq!(quiet.declare_spec_update, None);
+    }
+
+    /// `runtime_options.fork_instruction_policy` reaches the parsed options;
+    /// absent is Meerkat's default and an unknown name refuses.
+    #[test]
+    fn fork_instruction_policy_option_parses_and_refuses_unknown_names() {
+        use meerkat_core::ForkInstructionPolicy;
+        let quiet = parse_gateway_runtime_options(&json!({ "runtime_options": {} }), None)
+            .expect("empty options");
+        assert_eq!(
+            quiet.fork_instruction_policy,
+            ForkInstructionPolicy::RequireExplicitActivation
+        );
+        for (name, policy) in [
+            (
+                "require_explicit_activation",
+                ForkInstructionPolicy::RequireExplicitActivation,
+            ),
+            (
+                "reactivate_inherited",
+                ForkInstructionPolicy::ReactivateInherited,
+            ),
+            ("refuse", ForkInstructionPolicy::Refuse),
+        ] {
+            let parsed = parse_gateway_runtime_options(
+                &json!({ "runtime_options": { "fork_instruction_policy": name } }),
+                None,
+            )
+            .expect("a policy name parses");
+            assert_eq!(parsed.fork_instruction_policy, policy, "{name}");
+        }
+        let unknown = parse_gateway_runtime_options(
+            &json!({ "runtime_options": { "fork_instruction_policy": "inherit" } }),
+            None,
+        )
+        .err()
+        .expect("an unknown name refuses");
+        assert!(unknown.contains("fork_instruction_policy"), "{unknown}");
     }
 
     /// `mob_composition.candidate_definition` reaches the parsed options, is
@@ -1739,6 +1814,83 @@ default_binding = "local"
                 .unwrap_or_default();
             assert!(error.contains(&format!("runtime_options.{key}")), "{error}");
         }
+    }
+
+    /// 0.9.4 removed SDK-hosted continuity: each of its init params is refused
+    /// by name whatever its value (an explicit `false` or `null` included), and
+    /// the refusal names the migration verb. Params without them pass.
+    #[test]
+    fn removed_sdk_hosted_continuity_init_params_are_refused_by_name() {
+        assert_eq!(
+            refuse_removed_continuity_init_params(&json!({
+                "persistent_state": "/srv/meta",
+                "has_roster_provider": true,
+            })),
+            Ok(())
+        );
+        for key in REMOVED_CONTINUITY_INIT_KEYS {
+            for value in [
+                json!(true),
+                json!(false),
+                Value::Null,
+                json!("/srv/scratch"),
+            ] {
+                let error = refuse_removed_continuity_init_params(&json!({ key: value }))
+                    .err()
+                    .unwrap_or_default();
+                assert!(error.contains(key), "{error}");
+                assert!(error.contains("removed in Meta 0.9.4"), "{error}");
+                assert!(
+                    error.contains(crate::storage_layout::NATIVE_STORAGE_MIGRATION_VERB),
+                    "{error}"
+                );
+            }
+        }
+        let error = refuse_removed_continuity_init_params(&json!({
+            "has_continuity_store": true,
+            "has_lease_provider": true,
+            "scratch_dir": "/srv/scratch",
+        }))
+        .err()
+        .unwrap_or_default();
+        for key in REMOVED_CONTINUITY_INIT_KEYS {
+            assert!(error.contains(key), "{error}");
+        }
+    }
+
+    /// Under `persistent_state`, sessions live in the runtime store under the
+    /// state directory, so an in-memory runtime store is refused, and so is
+    /// in-memory mob storage while a roster provider is registered (its
+    /// identity bindings would not survive a restart the sessions survive).
+    /// A process-local launch keeps both declarations.
+    #[test]
+    fn persistent_state_refuses_in_memory_session_and_roster_stores() {
+        let parse = |runtime_options: Value| {
+            parse_gateway_runtime_options(&json!({ "runtime_options": runtime_options }), None)
+                .expect("runtime options")
+        };
+        let memory_runtime = parse(json!({ "runtime_store": { "storage": "memory" } }));
+        let refused = refuse_in_memory_stores_under_persistent_state(&memory_runtime, true, false)
+            .expect_err("an in-memory runtime store under persistent_state");
+        assert!(
+            refused.contains("runtime_options.runtime_store"),
+            "{refused}"
+        );
+        refuse_in_memory_stores_under_persistent_state(&memory_runtime, false, false)
+            .expect("a process-local launch keeps the declaration");
+
+        let memory_mobs = parse(json!({ "mob_storage": { "storage": "memory" } }));
+        let refused = refuse_in_memory_stores_under_persistent_state(&memory_mobs, true, true)
+            .expect_err("in-memory mob storage with a roster under persistent_state");
+        assert!(refused.contains("runtime_options.mob_storage"), "{refused}");
+        refuse_in_memory_stores_under_persistent_state(&memory_mobs, true, false)
+            .expect("without a roster provider the mob storage declaration stands");
+        refuse_in_memory_stores_under_persistent_state(&memory_mobs, false, true)
+            .expect("a process-local launch keeps the declaration");
+
+        let defaults = parse(json!({}));
+        refuse_in_memory_stores_under_persistent_state(&defaults, true, true)
+            .expect("the durable defaults start");
     }
 
     /// M4: `runtime_store` accepts only the explicit in-memory declaration;
@@ -2916,16 +3068,14 @@ default_binding = "local"
 
     /// Regression for the 1 Hz `durable callback health projection failed
     /// ... list_runtime_delivery_authorities` WARN. The gateway hands the
-    /// detached job runtime the epoch-tracking runtime-store facade (both
-    /// composition paths, SDK-hosted continuity store included), and the
-    /// facade did not forward the one cross-runtime delivery read, so every
-    /// delivery-driver tick failed on the trait default. Every tick must now
-    /// count, and nothing may be classified as unsupported.
+    /// detached job runtime its composed runtime store, and a store wrapper
+    /// that did not forward the one cross-runtime delivery read made every
+    /// delivery-driver tick fail on the trait default. Every tick must count,
+    /// and nothing may be classified as unsupported.
     #[tokio::test]
-    async fn health_projection_counts_the_runtime_inbox_through_the_epoch_tracking_facade() {
-        let (runtime_store, _epochs) = crate::mob_handle_runtime::epoch_tracking_runtime_store(
-            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
-        );
+    async fn health_projection_counts_the_runtime_inbox_through_the_composed_store() {
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
         let runtime = detached_runtime_over(runtime_store);
         for tick in 0..3 {
             let projection = runtime
@@ -4925,29 +5075,20 @@ comms = true
 
     impl ForkScenarioRuntime {
         /// The gateway's persistent callback composition (a
-        /// `StdioCallbackAgentBuilder` inside a `PersistentSessionService`,
-        /// durable session projection, persistent mob storage) over `state`,
-        /// with a scripted model and host.
+        /// `StdioCallbackAgentBuilder` inside a `PersistentSessionService`
+        /// over the native session pair on `runtime.sqlite`, persistent mob
+        /// storage) over `state`, with a scripted model and host.
         async fn boot(
             state: &std::path::Path,
             blob_store: Arc<dyn meerkat_core::BlobStore>,
             response: Value,
         ) -> Self {
-            let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
-                meerkat_store::SqliteSessionStore::open(state.join("session-store.sqlite3"))
-                    .expect("session store"),
-            );
-            let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
-                meerkat_runtime::store::SqliteRuntimeStore::new(
-                    state.join("runtime-store.sqlite3"),
+            let (session_store, runtime_store) =
+                crate::mob_handle_runtime::open_native_session_pair(
+                    state,
+                    &crate::storage_provider::default_meerkat_level_realm(),
                 )
-                .expect("runtime store"),
-            );
-            let (runtime_store, epochs) =
-                crate::mob_handle_runtime::epoch_tracking_runtime_store_with_durable_projection(
-                    runtime_store,
-                    session_store.clone(),
-                );
+                .expect("native session pair");
             let adapter = Arc::new(
                 meerkat_runtime::MeerkatMachine::persistent(
                     Arc::clone(&runtime_store),
@@ -4987,8 +5128,7 @@ comms = true
                 service,
             )
             .with_mob_storage_provenance(provenance)
-            .with_session_write_epochs(&epochs)
-            .with_runtime_authority_prewarm(&runtime_store)
+            .with_durable_runtime_store(&runtime_store)
             .with_runtime_archived_terminal_authority(Arc::clone(&runtime_store))
             .with_session_runtime_adapter(adapter.clone())
             .expect("acquire the RPC gateway fixture session runtime owner")
@@ -6998,12 +7138,12 @@ comms = true
         opted_in.accepted.store(true, Ordering::Release);
 
         let progress = opted_in
-            .progress_notification(InitPhase::Prewarm)
+            .progress_notification(InitPhase::Restore)
             .expect("progress");
         assert_eq!(progress["method"], INIT_PROGRESS_METHOD);
         assert_eq!(
             progress["params"],
-            json!({ "init_id": "init-9", "phase": "prewarm" })
+            json!({ "init_id": "init-9", "phase": "restore" })
         );
 
         let before = opted_in.failed_line(-32602, "refused", None);
@@ -8532,6 +8672,7 @@ fn parse_gateway_runtime_options(
         "runtime_store",
         "mob_storage",
         "mob_composition",
+        "fork_instruction_policy",
         "declare_spec_update",
         "compaction",
         "session_identity_config_root",
@@ -8913,6 +9054,9 @@ fn parse_gateway_runtime_options(
         parsed.candidate_definition =
             parse_gateway_candidate_definition(composition, parsed.composition_authority)?;
     }
+    if let Some(policy) = runtime_options.get("fork_instruction_policy") {
+        parsed.fork_instruction_policy = parse_gateway_fork_instruction_policy(policy)?;
+    }
     if let Some(declare) = runtime_options.get("declare_spec_update") {
         parsed.declare_spec_update = Some(parse_gateway_declare_spec_update(declare)?);
     }
@@ -9009,6 +9153,44 @@ fn parse_gateway_runtime_options(
         }
     }
     Ok(parsed)
+}
+
+/// Refuse a persistent launch that declares an in-memory store whose loss
+/// the state directory cannot survive: a declared in-memory runtime store
+/// (sessions live in Core's runtime store under the state directory), and
+/// in-memory mob storage while a roster provider is registered (the
+/// roster's identity bindings live in the mob storage, so they would not
+/// survive a restart while the sessions do). A launch without
+/// `persistent_state` keeps both in memory by design.
+fn refuse_in_memory_stores_under_persistent_state(
+    options: &GatewayRuntimeOptions,
+    persistent: bool,
+    has_roster_provider: bool,
+) -> Result<(), String> {
+    if !persistent {
+        return Ok(());
+    }
+    if options.runtime_store_ephemeral {
+        return Err(
+            "runtime_options.runtime_store declares an in-memory runtime store, but \
+             persistent_state is set: sessions live in the runtime store under the state \
+             directory, so a persistent launch keeps it there. Remove \
+             runtime_options.runtime_store, or omit persistent_state for a process-local \
+             launch"
+                .to_string(),
+        );
+    }
+    if options.mob_storage_ephemeral && has_roster_provider {
+        return Err(
+            "runtime_options.mob_storage declares in-memory mob storage while a roster \
+             provider is registered and persistent_state is set: the roster's identity \
+             bindings live in the mob storage, so they would not survive a restart while the \
+             sessions do. Remove runtime_options.mob_storage to keep mob storage durable \
+             under the state directory"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// A `runtime_options` path that opts into a feature: an absent or null path
@@ -9307,6 +9489,20 @@ fn parse_gateway_candidate_definition(
         );
     }
     Ok(policy)
+}
+
+/// `runtime_options.fork_instruction_policy`: one of the policy's wire
+/// names. Anything else refuses initialization, so a gateway never runs a
+/// fork instruction policy its host did not name.
+fn parse_gateway_fork_instruction_policy(
+    value: &Value,
+) -> Result<meerkat_core::ForkInstructionPolicy, String> {
+    serde_json::from_value(value.clone()).map_err(|_| {
+        format!(
+            "unsupported runtime_options.fork_instruction_policy {value} (use \
+             'require_explicit_activation' (the default), 'reactivate_inherited' or 'refuse')"
+        )
+    })
 }
 
 fn parse_gateway_declare_spec_update(value: &Value) -> Result<u64, String> {
@@ -10672,10 +10868,10 @@ const INIT_PROGRESS_METHOD: &str = "meta/init_progress";
 const INIT_SETTLED_METHOD: &str = "meta/init_settled";
 
 /// A startup phase reported as `meta/init_progress`. Boundaries follow the
-/// native init order: storage open, preliminary owner publication, runtime
+/// native init order: storage open, the early roster callback, runtime
 /// prepare with module startup, the identity roster callback, owner
-/// registration, persisted-authority prewarm, activation, roster restore,
-/// schedules, serving setup, and failure cleanup.
+/// registration, activation, roster restore, schedules, serving setup, and
+/// failure cleanup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum InitPhase {
@@ -10683,15 +10879,14 @@ enum InitPhase {
     /// stores). Everything before this phase is positive evidence for
     /// `durable_effects: "none"`.
     Storage,
-    /// Roster callback and persisted-owner publication before prepare.
+    /// The early roster callback before prepare, whose refusal refuses the
+    /// activation before any runtime exists.
     OwnerPublication,
     /// Runtime and storage prepare, including module startup.
     Prepare,
     /// Roster provider callback for identity bootstrap.
     Roster,
     RegisterOwners,
-    /// Persisted-authority convergence; deliberately unbounded.
-    Prewarm,
     Activate,
     Restore,
     /// Schedule driver and the remaining runtime wiring.
@@ -10708,7 +10903,6 @@ impl From<crate::UnifiedRuntimeBootstrapPhase> for InitPhase {
         use crate::UnifiedRuntimeBootstrapPhase as P;
         match phase {
             P::RegisterPersistedOwners => Self::RegisterOwners,
-            P::PrewarmPersistedAuthority => Self::Prewarm,
             P::Activate => Self::Activate,
             P::RestoreRoster => Self::Restore,
             P::FailureCleanup => Self::Cleanup,
@@ -15192,6 +15386,10 @@ struct GatewayRunResources {
     init_abort_report: Option<UnifiedRuntimeShutdownReport>,
     /// The caller guard's retained `begin_close` outcome, when it was dropped.
     caller_close: Option<GatewayCallerClose>,
+    /// The persistent state directory's claim (see [`crate::state_dir_claim`]).
+    /// Declared last so it drops after everything above, once `finish` has
+    /// shut the runtime down.
+    state_dir_claim: Option<crate::state_dir_claim::StateDirClaim>,
 }
 
 impl GatewayRunResources {
@@ -15649,9 +15847,9 @@ async fn next_gateway_admission(
 /// synchronously FIRST: [`GatewayHostComposition::begin_close`], whose
 /// outcome is kept in the run's close record (`host_begin`, where an earlier
 /// failure is never replaced by a later success, and which `finish` does not
-/// repeat). Only then are the callback's settlement, the members' aborts and
-/// the identities' cleanup joined, and the runtime shut down; `finish` still
-/// joins the host's close.
+/// repeat). Only then are the callback's settlement and the members' aborts
+/// (each until Core has settled it) joined, and the runtime shut down;
+/// `finish` still joins the host's close.
 async fn bootstrap_identity_roster_held(
     runtime: &mut UnifiedRuntime,
     host: Arc<dyn GatewayHostComposition>,
@@ -15843,21 +16041,6 @@ external_addressable = true
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let has_continuity_store = params
-        .get("has_continuity_store")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let has_lease_provider = params
-        .get("has_lease_provider")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let scratch_dir = params
-        .get("scratch_dir")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from);
-
     // The path authority for this boot. Without persistent_state the layout
     // is an explicitly declared-ephemeral scratch root (per-process, under
     // the OS temp dir) — recorded in the layout summary, never a silent
@@ -15870,6 +16053,8 @@ external_addressable = true
             crate::storage_layout::default_ephemeral_scratch_root(),
         ),
     };
+    crate::native_startup::refuse_session_database_override(&storage_layout)
+        .map_err(|error| fail_init(&request_id, STORAGE_RESOLUTION_CODE, error.to_string()))?;
 
     // 3. Both physical stdio owners notify the same retained gateway driver.
     let (stdio, stdio_observation) = GatewayStdioOwner::new(host.cloned());
@@ -15926,28 +16111,8 @@ external_addressable = true
     if let Some(session) = init_session() {
         session.accept();
     }
-    if (has_continuity_store || has_lease_provider || scratch_dir.is_some())
-        && !(has_continuity_store && has_lease_provider && scratch_dir.is_some())
-    {
-        let mut missing = Vec::new();
-        if !has_continuity_store {
-            missing.push("continuity_store");
-        }
-        if !has_lease_provider {
-            missing.push("lease_provider");
-        }
-        if scratch_dir.is_none() {
-            missing.push("scratch_dir");
-        }
-        return Err(fail_init(
-            &request_id,
-            -32602,
-            format!(
-                "external-authoritative path requires continuity_store + lease_provider + scratch_dir; missing: {}",
-                missing.join(", ")
-            ),
-        ));
-    }
+    refuse_removed_continuity_init_params(&params)
+        .map_err(|error| fail_init(&request_id, -32602, error))?;
 
     // A top-level `http_listen` / `allow_remote` / `http_public_base_url` /
     // `meerkat_config_path` is meta_gateway's shape; here they live inside
@@ -15956,6 +16121,12 @@ external_addressable = true
         .map_err(|error| fail_init(&request_id, -32602, error))?;
     let mut gateway_options = parse_gateway_runtime_options(&params, persistent_state.as_deref())
         .map_err(|e| fail_init(&request_id, -32602, e))?;
+    refuse_in_memory_stores_under_persistent_state(
+        &gateway_options,
+        persistent_state.is_some(),
+        has_roster_provider,
+    )
+    .map_err(|error| fail_init(&request_id, STORAGE_RESOLUTION_CODE, error))?;
     // HTTP listener exposure gate, before any bootstrap work: a refused
     // non-loopback `http_listen` costs the init reply and nothing else.
     http_bind_gate(&gateway_options)
@@ -16013,10 +16184,10 @@ external_addressable = true
         resources.init_aborted_for_shutdown = true;
         return Ok(());
     }
-    // The detached callback-job store is the first thing that touches the
-    // persistent state directory; it opens AFTER the listener is bound so a
-    // refused or failed bind leaves nothing on disk (the taken-port test
-    // asserts the directory is absent).
+    // The state-directory claim and then the detached callback-job store are
+    // the first things that touch the persistent state directory; they come
+    // AFTER the listener is bound so a refused or failed bind leaves nothing
+    // on disk (the taken-port test asserts the directory is absent).
     // The installation's meerkat-level realm, resolved once with the layout:
     // the Meta default for a fresh installation, the recorded value for an
     // adopted one. An unresolvable realm refuses init; it never defaults.
@@ -16053,6 +16224,24 @@ external_addressable = true
     // closes and settles before cleanup is reported (see
     // `crate::member_mcp_custody`).
     let member_mcp_custody = crate::member_mcp_custody::MemberMcpCustody::new();
+    // One Meta runtime per state directory: claim it before any store opens
+    // in it. The claim lives with this run's resources, which drop after the
+    // runtime is shut down.
+    if let Some(state_path) = persistent_state.as_ref() {
+        let claim = crate::state_dir_claim::StateDirClaim::acquire(state_path)
+            .map_err(|error| fail_init(&request_id, STORAGE_RESOLUTION_CODE, error.to_string()))?;
+        resources.state_dir_claim = Some(claim);
+        // Still before any store opens: no other process hosts runtimes here,
+        // the layout is native, and identity bindings still have their
+        // runtime store (see `crate::native_startup`). The mob store is the
+        // durable one composed below, unless mob storage is declared
+        // in-memory.
+        let mob_store =
+            (!gateway_options.mob_storage_ephemeral).then(|| storage_layout.event_log_db());
+        crate::native_startup::refuse_unready_state_dir(state_path, mob_store.as_deref())
+            .await
+            .map_err(|error| fail_init(&request_id, STORAGE_RESOLUTION_CODE, error.to_string()))?;
+    }
     let callback_job_store: Option<Arc<dyn meerkat::DetachedJobStore>> = persistent_state
         .as_ref()
         .map(|state_path| {
@@ -16202,71 +16391,45 @@ external_addressable = true
             }
             false => None,
         };
-    // The bundled local lease provider's monotonic fencing counter must resume
-    // ABOVE the persisted high-water on restart. Otherwise it resets to 1 and
-    // restore presents a stale token that the store's compare-and-set rejects
-    // ("stale fencing token: presented 1, current N"), aborting boot on every
-    // restart with existing history. Capture the local store's high-water here
-    // and seed the lease provider with it below.
-    let mut local_default_lease_provider: Option<
-        Arc<dyn crate::identity_first::contracts::LeaseProvider>,
-    > = None;
+    // The identity substrate is always the local one (SDK-hosted continuity
+    // was removed in 0.9.4). Its fencing counter resumes ABOVE the persisted
+    // high-water on restart (see gateway_wiring::open_identity_substrate):
+    // otherwise restore presents a stale token the store's compare-and-set
+    // rejects, aborting boot on every restart with existing history.
+    let identity_substrate = if has_roster_provider {
+        let db_path = match storage_layout.continuity_db() {
+            Ok(resolved) => resolved.path,
+            Err(e) => {
+                return Err(fail_init(
+                    &request_id,
+                    STORAGE_RESOLUTION_CODE,
+                    e.to_string(),
+                ));
+            }
+        };
+        if storage_layout.is_declared_ephemeral()
+            && let Err(e) = std::fs::create_dir_all(storage_layout.state_dir())
+        {
+            return Err(fail_init(
+                &request_id,
+                STORAGE_RESOLUTION_CODE,
+                format!("failed to create the declared-ephemeral scratch root: {e}"),
+            ));
+        }
+        Some(
+            crate::gateway_wiring::open_identity_substrate(&db_path)
+                .await
+                .map_err(|e| fail_init(&request_id, STORAGE_RESOLUTION_CODE, e))?,
+        )
+    } else {
+        None
+    };
     let identity_continuity_store: Option<Arc<dyn crate::identity_first::ContinuityStore>> =
-        if has_roster_provider {
-            Some(if has_continuity_store {
-                Arc::new(crate::identity_first::GatewayContinuityStore::new(
-                    bridge.clone(),
-                ))
-            } else {
-                let db_path = match storage_layout.continuity_db() {
-                    Ok(resolved) => resolved.path,
-                    Err(e) => {
-                        return Err(fail_init(
-                            &request_id,
-                            STORAGE_RESOLUTION_CODE,
-                            e.to_string(),
-                        ));
-                    }
-                };
-                if storage_layout.is_declared_ephemeral()
-                    && let Err(e) = std::fs::create_dir_all(storage_layout.state_dir())
-                {
-                    return Err(fail_init(
-                        &request_id,
-                        STORAGE_RESOLUTION_CODE,
-                        format!("failed to create the declared-ephemeral scratch root: {e}"),
-                    ));
-                }
-                let substrate = crate::gateway_wiring::open_identity_substrate(&db_path)
-                    .await
-                    .map_err(|e| fail_init(&request_id, STORAGE_RESOLUTION_CODE, e))?;
-                local_default_lease_provider = Some(substrate.lease_provider);
-                substrate.continuity_store
-            })
-        } else {
-            None
-        };
+        identity_substrate
+            .as_ref()
+            .map(|substrate| Arc::clone(&substrate.continuity_store));
     let identity_lease_provider: Option<Arc<dyn crate::identity_first::contracts::LeaseProvider>> =
-        if has_roster_provider {
-            Some(if has_lease_provider {
-                Arc::new(crate::identity_first::GatewayLeaseProvider::new(
-                    bridge.clone(),
-                )) as Arc<dyn crate::identity_first::contracts::LeaseProvider>
-            } else {
-                // From the shared substrate: fencing counter resumes above the
-                // persisted high-water (see gateway_wiring::open_identity_substrate).
-                local_default_lease_provider
-                    .clone()
-                    .expect("local substrate initialized with the continuity store")
-            })
-        } else {
-            None
-        };
-    let identity_session_store_adapter = identity_continuity_store.as_ref().map(|store| {
-        Arc::new(crate::identity_first::ContinuitySessionStoreAdapter::new(
-            store.clone(),
-        ))
-    });
+        identity_substrate.map(|substrate| substrate.lease_provider);
 
     init_progress.enter(InitPhase::OwnerPublication);
     if shutdown_requested.load(Ordering::Acquire) {
@@ -16277,74 +16440,25 @@ external_addressable = true
         resources.init_aborted_for_shutdown = true;
         return Ok(());
     }
-    // Publish persisted owner authority BEFORE the bootstrap spec is built.
-    //
-    // `MobRuntime::prepare` runs durable-tail recovery and commits runtime
-    // boundaries, and a head-canonical session whose owning identity has no
-    // authoritative registration is refused there BY DESIGN ("a deliberate
-    // refusal, not a store failure: no retry of the write will succeed").
-    // `register_persisted_continuity_owners` runs AFTER prepare, so it cannot
-    // reach exactly the stores that need it: a resume whose durable tail is
-    // behind its committed authority. Confirmed against a production clone,
-    // whose first boot dies precisely there.
-    //
-    // Best-effort and idempotent, deliberately: this only ever publishes a
-    // registration that would otherwise happen later, and `register_session`
-    // refuses an identity/generation change or a fencing regression, so the
-    // later pass re-publishing the same facts is a no-op. A substrate that
-    // cannot answer is therefore a WARN, not a boot failure - the same rule
-    // `register_persisted_continuity_owners` already applies to itself.
-    // Failing closed here would regress every boot that works today.
-    if let (Some(store), Some(adapter)) = (
-        identity_continuity_store.as_ref(),
-        identity_session_store_adapter.as_ref(),
-    ) {
-        use crate::identity_first::{IdentityRuntime, RosterContext};
+    // A prepared application's roster refusal refuses the activation before
+    // any runtime exists. `RosterContext` carries no mob state, so resolving
+    // the roster this early is contract-preserving; nothing is registered
+    // yet, so there are no previous identities to report. Any other roster
+    // failure is the identity runtime's to report on its own roster pass.
+    if has_roster_provider {
         let roster_provider = gateway_roster_provider(bridge.clone(), prepared.as_ref());
-        // `RosterContext` carries no mob state, so resolving the roster this
-        // early is contract-preserving. Nothing is registered yet, so there are
-        // no previous identities to report.
-        let roster_context = RosterContext {
+        let roster_context = crate::identity_first::RosterContext {
             mob_definition: Some(definition.clone()),
             previous_identities: Vec::new(),
         };
-        match roster_provider.roster(&roster_context).await {
-            Ok(roster) => {
-                match IdentityRuntime::resolve_persisted_owner_states(store, &roster).await {
-                    Ok(states) => {
-                        if let Err(error) =
-                            IdentityRuntime::publish_persisted_owner_states(adapter, &states).await
-                        {
-                            tracing::warn!(
-                                %error,
-                                resolved = states.len(),
-                                "publishing persisted owner authority before prepare failed; \
-                                 durable-tail recovery may refuse an unregistered owner"
-                            );
-                        }
-                    }
-                    Err(error) => tracing::warn!(
-                        %error,
-                        rostered = roster.len(),
-                        "resolving persisted owner authority before prepare failed; \
-                         durable-tail recovery may refuse an unregistered owner"
-                    ),
-                }
-            }
-            // A prepared application's roster refusal refuses the activation
-            // before any runtime exists.
-            Err(error @ crate::identity_first::RosterError::Refused(_)) => {
-                return Err(fail_init(
-                    &request_id,
-                    -32602,
-                    format!("prepared_application roster refused: {error}"),
-                ));
-            }
-            Err(error) => tracing::warn!(
-                %error,
-                "roster unavailable before prepare, so no persisted owner authority could be \
-                 published; durable-tail recovery may refuse an unregistered owner"
-            ),
+        if let Err(error @ crate::identity_first::RosterError::Refused(_)) =
+            roster_provider.roster(&roster_context).await
+        {
+            return Err(fail_init(
+                &request_id,
+                -32602,
+                format!("prepared_application roster refused: {error}"),
+            ));
         }
     }
 
@@ -16361,6 +16475,9 @@ external_addressable = true
     let mut gateway_transcript_edit_service: Option<
         Arc<dyn crate::memory::hygienist::TranscriptEditSessionService>,
     > = None;
+    // The persistent launch's session store: the agent memory stack reads
+    // transcripts through this same handle.
+    let mut gateway_session_store: Option<Arc<dyn meerkat::SessionStore>> = None;
     // D50 S1: the host's grant owner is installed when the runtime machine is
     // constructed below; a spec cannot take one afterwards.
     let grant_configuration = match host {
@@ -16405,42 +16522,19 @@ external_addressable = true
                 format!("failed to create persistent state directory: {e}"),
             ));
         }
-        let sqlite_path = match storage_layout.session_db() {
-            Ok(resolved) => resolved.path,
-            Err(e) => {
-                return Err(fail_init(
-                    &request_id,
-                    STORAGE_RESOLUTION_CODE,
-                    e.to_string(),
-                ));
-            }
-        };
-        let session_store_kind = if identity_session_store_adapter.is_some() {
-            "ContinuitySessionStoreAdapter"
-        } else {
-            "SqliteSessionStore"
-        };
-        let session_store: Arc<dyn meerkat::SessionStore> =
-            if let Some(adapter) = identity_session_store_adapter.clone() {
-                adapter
-            } else {
-                match meerkat_store::SqliteSessionStore::open(sqlite_path) {
-                    Ok(s) => Arc::new(s),
-                    Err(e) => {
-                        return Err(fail_init(
-                            &request_id,
-                            STORAGE_RESOLUTION_CODE,
-                            format!("failed to open SQLite session store: {e}"),
-                        ));
-                    }
-                }
-            };
+        // Core's HeadCanonical pair on `runtime.sqlite`: the session store and
+        // the runtime store share the one database, as Core's realm composes
+        // them. Fail-closed (M4): an open failure is an init error.
+        let (session_store, runtime_store) =
+            crate::mob_handle_runtime::open_native_session_pair(state_path, &composition_realm)
+                .map_err(|error| {
+                    fail_init(&request_id, STORAGE_RESOLUTION_CODE, error.to_string())
+                })?;
         // H2: probe the incremental capability on the same Arc the session
-        // service receives below — identity-first launches ride the
-        // continuity adapter, which persists whole-blob only.
+        // service receives below.
         let session_store_incremental = crate::storage_health::probe_session_store_incremental(
             &session_store,
-            session_store_kind,
+            "SqliteSessionStore",
         );
         // This is the persistent launch branch: the runtime store 25 lines
         // below is fail-closed persistent for exactly this reason ("must be
@@ -16539,78 +16633,13 @@ external_addressable = true
             };
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(Base64BlobStoreAdapter::new(binary_blob_store.clone()));
-        // Persistent runtime store — must be Some() on the session service
-        // so archive/retire can mutate the authoritative session, and must
-        // be persistent so resume works across gateway restart.
-        //
-        // Fail-closed (M4): an open failure is an init error; the in-memory
-        // form exists only as the explicit
-        // `runtime_options.runtime_store = {"storage": "memory"}` declaration
-        // (the former silent fallback left resume and archive broken long
-        // after boot).
-        let runtime_db_path = storage_layout.runtime_db();
         // The typed source of the repair commands in a session repair hold:
-        // the exact database this launch opens, or none for the declared
-        // in-memory store.
-        let runtime_store_locator = (!gateway_options.runtime_store_ephemeral).then(|| {
-            crate::storage_health::RuntimeStoreLocator::SqliteFile {
-                path: runtime_db_path.clone(),
-            }
+        // the exact database this launch opened.
+        let runtime_store_locator = Some(crate::storage_health::RuntimeStoreLocator::SqliteFile {
+            path: storage_layout.runtime_db(),
         });
-        let (runtime_store, runtime_store_slot): (
-            Arc<dyn meerkat_runtime::RuntimeStore>,
-            crate::storage_health::StorageSlotSummary,
-        ) = if gateway_options.runtime_store_ephemeral {
-            (
-                Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
-                crate::storage_health::StorageSlotSummary::declared_ephemeral(
-                    "runtime",
-                    "InMemoryRuntimeStore",
-                    "explicitly declared via runtime_options.runtime_store: sessions do not \
-                     survive gateway restart",
-                ),
-            )
-        } else {
-            match meerkat_runtime::store::SqliteRuntimeStore::new(&runtime_db_path) {
-                Ok(store) => (
-                    Arc::new(store) as Arc<dyn meerkat_runtime::RuntimeStore>,
-                    crate::storage_health::StorageSlotSummary::persistent(
-                        "runtime",
-                        "SqliteRuntimeStore",
-                    ),
-                ),
-                Err(err) => {
-                    return Err(fail_init(
-                        &request_id,
-                        STORAGE_RESOLUTION_CODE,
-                        crate::storage_health::RuntimeStoreResolutionError {
-                            path: runtime_db_path.clone(),
-                            message: err.to_string(),
-                        }
-                        .to_string(),
-                    ));
-                }
-            }
-        };
-        // Wrap the runtime store in the write-epoch facade BEFORE the machine
-        // and session service capture it, and thread the witness into the
-        // bootstrap spec below. Without it `MobBootstrapSpec::new` leaves the
-        // witness absent and the console session-history epoch gate is
-        // disabled — the 5s discovery loop then re-reads and re-validates
-        // every member's whole session document forever (~0.3 core per idle
-        // durable member at production document sizes; the 0.8.4 idle
-        // driver on this externally-composed path).
-        //
-        // The facade also owns the durable session projection at meerkat
-        // 0.8.11 (the session service no longer writes the SessionStore
-        // itself) and every-boot runtime-authority re-minting from that
-        // durable store - a reset/lost runtime store reseeds instead of
-        // refusing resume.
-        let (runtime_store, session_write_epochs) =
-            crate::mob_handle_runtime::epoch_tracking_runtime_store_with_durable_projection(
-                runtime_store,
-                session_store.clone(),
-            );
+        let runtime_store_slot =
+            crate::storage_health::StorageSlotSummary::persistent("runtime", "SqliteRuntimeStore");
         let adapter = Arc::new(
             crate::mob_handle_runtime::persistent_runtime_machine(
                 Arc::clone(&runtime_store),
@@ -16833,6 +16862,7 @@ external_addressable = true
         // Keep the CONCRETE typed service for the firing host (the runtime-backed
         // host needs PersistentSessionService<StdioCallbackAgentBuilder>, not the
         // erased Arc<dyn MobSessionService> the spec consumes).
+        gateway_session_store = Some(Arc::clone(&session_store));
         let concrete_service = Arc::new(meerkat_session::PersistentSessionService::new(
             callback_builder,
             gateway_options.max_sessions,
@@ -16896,15 +16926,13 @@ external_addressable = true
             // an unreachable API, one layer down.
             .with_composition_authority(gateway_options.composition_authority)
             .with_candidate_definition(gateway_options.candidate_definition)
+            .with_fork_instruction_policy(gateway_options.fork_instruction_policy)
             .with_optional_tool_consequence_policy_registry(
                 tool_consequence_policy_registry.clone(),
             )
             .with_optional_child_application_tool_policy(child_application_tool_policy.clone())
-            .with_session_write_epochs(&session_write_epochs)
-            // The SAME facade handed to MeerkatMachine::persistent above.
-            // The durable-authority convergence memo is per-facade, so a
-            // different instance here would warm nothing.
-            .with_runtime_authority_prewarm(&runtime_store)
+            // The SAME store handed to MeerkatMachine::persistent above.
+            .with_durable_runtime_store(&runtime_store)
             // Resume-seam reads must carry the runtime store's archived
             // terminal (at 0.8.11 archive stamps the catalog/lifecycle row,
             // never the session body).
@@ -16952,18 +16980,7 @@ external_addressable = true
         // <state_path>/blobs); record it plus the H2 probe result and the
         // per-slot census (M4) for the health surfaces.
         let mut slots = vec![
-            if identity_session_store_adapter.is_some() {
-                crate::storage_health::StorageSlotSummary::persistent(
-                    "sessions",
-                    "ContinuitySessionStoreAdapter",
-                )
-                .with_detail("sessions ride the identity continuity store")
-            } else {
-                crate::storage_health::StorageSlotSummary::persistent(
-                    "sessions",
-                    "SqliteSessionStore",
-                )
-            },
+            crate::storage_health::StorageSlotSummary::persistent("sessions", "SqliteSessionStore"),
             runtime_store_slot,
             crate::storage_health::blob_slot_summary(
                 crate::storage_health::BlobDurability::PersistentDisk,
@@ -16987,18 +17004,10 @@ external_addressable = true
             slots.push(agent_memory_census_slot(agent_memory));
         }
         if identity_continuity_store.is_some() {
-            slots.push(if has_continuity_store {
-                crate::storage_health::StorageSlotSummary::persistent(
-                    "continuity",
-                    "GatewayContinuityStore (SDK-hosted)",
-                )
-                .with_detail("durability rides with the SDK-hosted continuity store")
-            } else {
-                crate::storage_health::StorageSlotSummary::persistent(
-                    "continuity",
-                    "LocalContinuityStore",
-                )
-            });
+            slots.push(crate::storage_health::StorageSlotSummary::persistent(
+                "continuity",
+                "LocalContinuityStore",
+            ));
         }
         slots.extend(crate::storage_health::scratch_ring_buffer_slots());
         if let Some(announcements) = announcements.as_ref() {
@@ -17042,32 +17051,16 @@ external_addressable = true
         // Process-local mode keeps sessions and runtime state in memory.
         // The supported persistent service/machine pair does not require
         // durable session files on read-only container filesystems.
-        let temp_dir = if scratch_dir.is_none() {
-            Some(tempfile::tempdir().expect("create temp dir for agent working space"))
-        } else {
-            None
-        };
-        let agent_workspace = scratch_dir
-            .as_deref()
-            .or_else(|| temp_dir.as_ref().map(|dir| dir.path()))
-            .expect("scratch dir or temp dir");
-        if let Err(err) = std::fs::create_dir_all(agent_workspace) {
-            return Err(fail_init(
-                &request_id,
-                STORAGE_RESOLUTION_CODE,
-                format!("failed to create scratch directory: {err}"),
-            ));
-        }
+        let temp_dir = Some(tempfile::tempdir().expect("create temp dir for agent working space"));
+        let agent_workspace = temp_dir
+            .as_ref()
+            .map(|dir| dir.path())
+            .expect("temp dir for agent working space");
         let binary_blob_store: Arc<dyn BinaryBlobStore> = Arc::new(ObjectStoreBlobStore::memory());
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(Base64BlobStoreAdapter::new(binary_blob_store.clone()));
         let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
-        // Same write-epoch facade as the persistent path: the console
-        // discovery gate is composition-independent, and the witness is
-        // sound for any store as long as every write goes through it.
-        let (runtime_store, session_write_epochs) =
-            crate::mob_handle_runtime::epoch_tracking_runtime_store(runtime_store);
         let adapter = Arc::new(
             crate::mob_handle_runtime::persistent_runtime_machine(
                 Arc::clone(&runtime_store),
@@ -17171,40 +17164,16 @@ external_addressable = true
                     ),
                 }
             }
-            GatewayWorkgraphOption::Enabled => {
-                if has_continuity_store {
-                    // Identity-first launch persisting through the
-                    // SDK-hosted continuity store: everything else about
-                    // it is durable, but the continuity store is a stdio
-                    // callback (no local db path to co-locate a default
-                    // workgraph.sqlite3 with), so the workgraph silently
-                    // rides memory unless a path is configured.
-                    tracing::warn!(
-                        "workgraph is MEMORY-BACKED for this launch: the continuity store \
-                             is SDK-hosted (no local path) and no persistent_state dir is set, \
-                             so goals, work items and attention bindings will NOT survive a \
-                             gateway restart. Set runtime_options.workgraph to a directory \
-                             path (or provide persistent_state) to place a durable \
-                             workgraph.sqlite3.",
-                    );
-                }
-                (
-                    Some(crate::workgraph_wiring::ephemeral_workgraph_service(
-                        &schedule_owner_id,
-                    )),
-                    crate::storage_health::StorageSlotSummary::declared_ephemeral(
-                        "workgraph",
-                        "MemoryWorkGraphStore",
-                        if has_continuity_store {
-                            "memory-backed on an otherwise durable identity-first launch: set \
-                             runtime_options.workgraph to a directory (or persistent_state) \
-                             for a durable store"
-                        } else {
-                            "declared by the ephemeral launch mode"
-                        },
-                    ),
-                )
-            }
+            GatewayWorkgraphOption::Enabled => (
+                Some(crate::workgraph_wiring::ephemeral_workgraph_service(
+                    &schedule_owner_id,
+                )),
+                crate::storage_health::StorageSlotSummary::declared_ephemeral(
+                    "workgraph",
+                    "MemoryWorkGraphStore",
+                    "declared by the ephemeral launch mode",
+                ),
+            ),
         };
         // One admission slot per builder that carries the tool surface;
         // the bootstrap spec registers them all so every dispatcher gets
@@ -17224,148 +17193,38 @@ external_addressable = true
             None,
             &gateway_options,
         );
-        // Heal seam (2026-07-29 incident): captured from the CONCRETE
-        // persistent service below; the erased MobSessionService does not
-        // carry the heal API.
-        let mut committed_boundary_recoverer: Option<
-            Arc<dyn crate::identity_first::CommittedBoundaryRecoverer>,
-        > = None;
-        // Set by both construction branches below.
-        let controller_pin_source: Option<Arc<dyn crate::identity_first::ControllerPinSource>>;
-        // The session builder whose factory builds the members: its own default
-        // decorator cell, for the member taint composition.
-        let host_default_decorator;
-        let mut session_store_incremental: Option<bool> = None;
-        let session_service: Arc<dyn meerkat_mob::MobSessionService> =
-            if let Some(session_adapter) = identity_session_store_adapter.clone() {
-                let session_store: Arc<dyn meerkat::SessionStore> = session_adapter.clone();
-                // H2: identity-first launches persist sessions through the
-                // continuity adapter — whole-blob only; make it loud.
-                session_store_incremental =
-                    Some(crate::storage_health::probe_session_store_incremental(
-                        &session_store,
-                        "ContinuitySessionStoreAdapter",
-                    ));
-                let mut factory = AgentFactory::new(agent_workspace)
-                    .builtins(false)
-                    .shell(shell)
-                    .comms(true)
-                    .mcp_apps(gateway_options.console_ui.mcp_apps_sandbox_url.is_some())
-                    .session_store(Arc::new(meerkat::MemoryStore::new()));
-                if image_generation {
-                    factory = factory.with_image_generation_machine(
-                        crate::mob_handle_runtime::weak_image_generation_machine(&adapter),
-                    );
-                }
-                // Exclusive session-identity root, when declared. See
-                // `GatewayRuntimeOptions::session_identity_config_root`.
-                if let Some(root) = gateway_options.session_identity_config_root.as_ref() {
-                    factory = factory.user_config_root(root.clone());
-                }
-                // The host composes this factory's MCP constructions, and installs its
-                // operation refusal observer, before it is cloned for live or consumed
-                // by its builder.
-                let factory = crate::gateway_mcp_composition::compose_gateway_member_factory(
-                    host,
-                    crate::gateway_mcp_composition::GatewayFactoryKind::ContinuityBacked,
-                    factory,
-                    &adapter,
-                    &composition_storage,
-                    &member_mcp_custody,
+        let concrete = Arc::new(meerkat_session::PersistentSessionService::new(
+            callback_builder,
+            gateway_options.max_sessions,
+            process_local_session_store,
+            Arc::clone(&runtime_store),
+            blob_store.clone(),
+        ));
+        concrete
+            .acquire_canonical_runtime_adapter(Some(Arc::clone(&adapter)))
+            .map_err(|error| {
+                fail_init(
+                    &request_id,
+                    STORAGE_RESOLUTION_CODE,
+                    format!(
+                        "failed to acquire the process-local gateway session runtime owner: {error}"
+                    ),
                 )
-                .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?;
-                let mut inner_builder = crate::gateway_mcp_composition::gateway_member_builder(
-                    factory,
-                    gateway_agent_config(&gateway_options),
-                    &adapter,
-                    &composition_storage,
-                );
-                host_default_decorator =
-                    Arc::clone(&inner_builder.default_agent_llm_client_decorator);
-                inner_builder.default_session_store = Some(Arc::new(
-                    meerkat_store::StoreAdapter::new(session_store.clone()),
-                ));
-                inner_builder.default_blob_store = Some(blob_store.clone());
-                inner_builder.default_detached_job_store = Some(Arc::clone(&job_store));
-                inner_builder.default_mob_tools = Arc::clone(&agent_mob_tools_slot);
-                inner_builder.default_shell_job_delivery_projector = Some(
-                    runtime_delivery.shell_job_projector(Arc::clone(&job_store), &meerkat_realm),
-                );
-                if let Some(service) = workgraph_service.as_ref() {
-                    workgraph_admission_slots.push(
-                        crate::workgraph_wiring::install_workgraph_tools(&inner_builder, service),
-                    );
-                }
-                // The continuity-backed builder verifies callback artifacts
-                // against the same installed set as its siblings.
-                let callback_builder = StdioCallbackAgentBuilder::for_gateway(
-                    inner_builder,
-                    bridge.clone(),
-                    has_session_builder,
-                    Some(session_store.clone()),
-                    None,
-                    &gateway_options,
-                );
-                let concrete = Arc::new(meerkat_session::PersistentSessionService::new(
-                    callback_builder,
-                    gateway_options.max_sessions,
-                    session_store,
-                    Arc::clone(&runtime_store),
-                    blob_store.clone(),
-                ));
-                concrete
-                    .acquire_canonical_runtime_adapter(Some(Arc::clone(&adapter)))
-                    .map_err(|error| {
-                        fail_init(
-                            &request_id,
-                            STORAGE_RESOLUTION_CODE,
-                            format!(
-                                "failed to acquire the continuity-backed gateway \
-                                 session runtime owner: {error}"
-                            ),
-                        )
-                    })?;
-                committed_boundary_recoverer = Some(Arc::clone(&concrete) as _);
-                controller_pin_source = Some(Arc::clone(&concrete) as _);
-                gateway_transcript_edit_service = Some(Arc::clone(&concrete) as _);
-                concrete
-            } else {
-                let concrete = Arc::new(meerkat_session::PersistentSessionService::new(
-                    callback_builder,
-                    gateway_options.max_sessions,
-                    process_local_session_store,
-                    Arc::clone(&runtime_store),
-                    blob_store.clone(),
-                ));
-                concrete
-                    .acquire_canonical_runtime_adapter(Some(Arc::clone(&adapter)))
-                    .map_err(|error| {
-                        fail_init(
-                            &request_id,
-                            STORAGE_RESOLUTION_CODE,
-                            format!(
-                                "failed to acquire the process-local gateway \
-                                 session runtime owner: {error}"
-                            ),
-                        )
-                    })?;
-                controller_pin_source = Some(Arc::clone(&concrete) as _);
-                host_default_decorator = process_local_host_default_decorator;
-                concrete
-            };
+            })?;
+        let controller_pin_source: Arc<dyn crate::identity_first::ControllerPinSource> =
+            Arc::clone(&concrete) as _;
+        let session_service: Arc<dyn meerkat_mob::MobSessionService> = concrete;
 
         let mut spec = MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
             .with_member_mcp_custody(Arc::clone(&member_mcp_custody))
-            .with_host_default_agent_llm_client_decorator(host_default_decorator)
+            .with_host_default_agent_llm_client_decorator(process_local_host_default_decorator)
             .with_optional_tool_consequence_policy_registry(
                 tool_consequence_policy_registry.clone(),
             )
             .with_optional_child_application_tool_policy(child_application_tool_policy.clone())
-            .with_session_write_epochs(&session_write_epochs)
-            // The SAME facade handed to MeerkatMachine::persistent above.
-            // The durable-authority convergence memo is per-facade, so a
-            // different instance here would warm nothing.
-            .with_runtime_authority_prewarm(&runtime_store)
+            .with_fork_instruction_policy(gateway_options.fork_instruction_policy)
+            // The SAME store handed to MeerkatMachine::persistent above.
+            .with_durable_runtime_store(&runtime_store)
             .with_session_runtime_adapter(adapter.clone())
             .map_err(|error| {
                 fail_init(
@@ -17389,8 +17248,7 @@ external_addressable = true
                 notify_orchestrator_on_resume: true,
                 default_llm_client: default_llm_client.clone(),
             });
-        spec.committed_boundary_recoverer = committed_boundary_recoverer;
-        spec.controller_pin_source = controller_pin_source;
+        spec.controller_pin_source = Some(controller_pin_source);
         for slot in workgraph_admission_slots {
             spec = spec.with_workgraph_admission_slot(slot);
         }
@@ -17399,23 +17257,14 @@ external_addressable = true
         }
         spec.runtime_adapter = Some(adapter);
         spec.binary_blob_store = Some(binary_blob_store);
-        // In-memory blobs are the declared choice of this launch mode; the
-        // H2 flag is only set when the identity adapter backs a persistent
-        // session service above.
+        // In-memory sessions and blobs are the declared choice of this launch
+        // mode, so there is no persistence capability to probe.
         let mut slots = vec![
-            if identity_session_store_adapter.is_some() {
-                crate::storage_health::StorageSlotSummary::persistent(
-                    "sessions",
-                    "ContinuitySessionStoreAdapter",
-                )
-                .with_detail("sessions ride the identity continuity store")
-            } else {
-                crate::storage_health::StorageSlotSummary::declared_ephemeral(
-                    "sessions",
-                    "MemoryStore",
-                    "declared by the ephemeral launch mode",
-                )
-            },
+            crate::storage_health::StorageSlotSummary::declared_ephemeral(
+                "sessions",
+                "MemoryStore",
+                "declared by the ephemeral launch mode",
+            ),
             crate::storage_health::StorageSlotSummary::declared_ephemeral(
                 "runtime",
                 "InMemoryRuntimeStore",
@@ -17446,19 +17295,13 @@ external_addressable = true
             gateway_event_log_slot(&gateway_options),
         ];
         if identity_continuity_store.is_some() {
-            slots.push(if has_continuity_store {
-                crate::storage_health::StorageSlotSummary::persistent(
-                    "continuity",
-                    "GatewayContinuityStore (SDK-hosted)",
-                )
-                .with_detail("durability rides with the SDK-hosted continuity store")
-            } else {
+            slots.push(
                 crate::storage_health::StorageSlotSummary::declared_ephemeral(
                     "continuity",
                     "LocalContinuityStore",
                     "backed by the declared-ephemeral scratch root",
-                )
-            });
+                ),
+            );
         }
         slots.extend(crate::storage_health::scratch_ring_buffer_slots());
         // Declared, not omitted: this launch has no persistent_state dir, so
@@ -17474,7 +17317,7 @@ external_addressable = true
         spec.resolved_storage = Some(
             crate::storage_health::ResolvedStorageSummary::new(
                 crate::storage_health::BlobDurability::DeclaredEphemeral,
-                session_store_incremental,
+                None,
             )
             // The declared-ephemeral scratch root is still this runtime's
             // own state dir: a doctor request over it may see the census.
@@ -17676,6 +17519,21 @@ external_addressable = true
     if let Some(access) = gateway_options.access.take() {
         runtime.set_access_controller(access);
     }
+    // The Console's session fence record (revoked sessions, principals whose
+    // tokens never expire) lives in the persistent state directory, in a
+    // file of its own. Without persistent state there is none: a revocation
+    // is refused rather than lost at the next start.
+    if persistent_state.is_some() && !storage_layout.is_declared_ephemeral() {
+        let fences = crate::ConsoleSessionFences::open_in_state_dir(storage_layout.state_dir())
+            .map_err(|error| {
+                fail_init(
+                    &request_id,
+                    STORAGE_RESOLUTION_CODE,
+                    format!("failed to open the console session fence record: {error}"),
+                )
+            })?;
+        runtime.set_console_session_fences(fences);
+    }
     // Without an enforced access controller the Flow Editor refuses host
     // deploys unless the launch opted in.
     if flow_editor_host_deploy {
@@ -17728,20 +17586,15 @@ external_addressable = true
         // uses the raw bootstrap path (not UnifiedRuntimeBuilder), so
         // session_bridge() won't be set — build it directly.
         let mob_handle = crate::gateway_wiring::identity_mob_handle(runtime);
-        let mut identity_bridge = if let Some(adapter) = identity_session_store_adapter.clone() {
-            crate::identity_first::MobSessionBridge::with_continuity_session_store(
-                mob_handle.clone(),
-                adapter,
-                runtime.mob_runtime().session_service().cloned(),
-            )
-        } else if let Some(session_service) = runtime.mob_runtime().session_service().cloned() {
-            crate::identity_first::MobSessionBridge::with_session_service(
-                mob_handle.clone(),
-                session_service,
-            )
-        } else {
-            crate::identity_first::MobSessionBridge::new(mob_handle.clone())
-        };
+        let mut identity_bridge =
+            if let Some(session_service) = runtime.mob_runtime().session_service().cloned() {
+                crate::identity_first::MobSessionBridge::with_session_service(
+                    mob_handle.clone(),
+                    session_service,
+                )
+            } else {
+                crate::identity_first::MobSessionBridge::new(mob_handle.clone())
+            };
         // Heal seam (2026-07-29 incident): the continuity repair supervisor
         // asks this recoverer to commit the durable head before declaring an
         // identity healed; without it, heal is a cosmetic entry reset that
@@ -17777,8 +17630,7 @@ external_addressable = true
                 continuity_store,
                 lease_provider,
                 runtime_instance_id: format!("gateway-{}", std::process::id()),
-                has_runtime_store: identity_session_store_adapter.is_some()
-                    || persistent_state.is_some(),
+                has_runtime_store: persistent_state.is_some(),
                 durability_policy: DurabilityPolicy::SyncWriteThrough,
                 bridge: Some(bridge_arc),
                 default_timeout: None,
@@ -17786,6 +17638,14 @@ external_addressable = true
             .with_runtime_services(AgentRuntimeServices::new(mob_handle)),
         );
         irt.set_error_hook(Some(gateway_error_hook.clone()));
+        // The native storage migration leaves the first-boot manifest of a
+        // migrated state directory there; the first roster compile carries
+        // it out.
+        irt.set_first_boot_state_dir(persistent_state.clone());
+        // A held bootstrap's held-completion marks live in the same
+        // directory, so a restart keeps them; without one they stay in
+        // memory.
+        irt.set_held_completion_state_dir(persistent_state.clone());
         irt.set_customizer_tool_registry(customizer_tool_registry.clone())
             .await;
         // A member parked with a session repair hold names the exact
@@ -17873,35 +17733,7 @@ external_addressable = true
                                         .to_string(),
                                 ));
                             }
-                            Some(
-                                if let Some(adapter) = identity_session_store_adapter.clone() {
-                                    adapter
-                                } else {
-                                    // Second handle on the same session
-                                    // database the mob bridge persists to;
-                                    // WAL keeps the read-side safe.
-                                    let session_db = match storage_layout.session_db() {
-                                        Ok(resolved) => resolved.path,
-                                        Err(e) => {
-                                            return Err(fail_init(
-                                                &request_id,
-                                                STORAGE_RESOLUTION_CODE,
-                                                e.to_string(),
-                                            ));
-                                        }
-                                    };
-                                    match meerkat_store::SqliteSessionStore::open(session_db) {
-                                        Ok(store) => Arc::new(store),
-                                        Err(e) => {
-                                            return Err(fail_init(
-                                                &request_id,
-                                                STORAGE_RESOLUTION_CODE,
-                                                format!("agent memory session store: {e}"),
-                                            ));
-                                        }
-                                    }
-                                },
-                            )
+                            gateway_session_store.clone()
                         } else {
                             None
                         };
@@ -19424,12 +19256,6 @@ mod native_host_cleanup_tests {
         let state = directory.path().to_path_buf();
         let layout =
             crate::storage_layout::MetaStorageLayout::with_injected_roots(state.clone(), None);
-        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
-            meerkat_store::SqliteSessionStore::open(
-                layout.session_db().expect("session locator").path,
-            )
-            .expect("session store"),
-        );
         let (storage, provenance) =
             crate::mob_composition_manifest::persistent_mob_storage(layout.event_log_db())
                 .expect("persistent mob storage");
@@ -19438,9 +19264,9 @@ mod native_host_cleanup_tests {
             "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n"
         ))
         .expect("mob definition");
-        let spec = MobBootstrapSpec::persistent(definition, storage, state, 4, session_store)
+        let spec = MobBootstrapSpec::persistent(definition, storage, provenance, state, 4)
+            .await
             .expect("persistent spec")
-            .with_mob_storage_provenance(provenance)
             .with_options(crate::mob_handle_runtime::MobBootstrapOptions {
                 allow_ephemeral_sessions: true,
                 notify_orchestrator_on_resume: true,
@@ -21330,8 +21156,7 @@ mod held_bootstrap_close_tests {
         IdentityRuntimeError,
     };
     use crate::unified_runtime::held_identity_test_support::{
-        ParkingContinuityStore, held_runtime, held_runtime_with_customizer, member,
-        stage_running_mob_activation,
+        held_runtime, held_runtime_with_customizer, member, stage_running_mob_activation,
     };
 
     /// The setup deadline: room for the member to reach its hold first, also
@@ -21640,27 +21465,84 @@ mod held_bootstrap_close_tests {
             .expect("the runtime shuts down once the callback has settled");
     }
 
-    /// A customizer recording each pre-lift tool publication in the probe's
-    /// log.
-    struct RecordingCustomizer(Arc<HeldCloseProbe>);
+    /// One parked publication: the sender told when it parks, and the
+    /// release.
+    type ParkedPublication = (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+
+    /// A customizer recording each customizer call in the probe's log, whose
+    /// next call can be parked until the test releases it: a blocked host
+    /// customizer under the prepared customizer-tool publication, the first
+    /// prepared step that runs host code.
+    struct ParkingCustomizer {
+        probe: Arc<HeldCloseProbe>,
+        park: std::sync::Mutex<Option<ParkedPublication>>,
+        /// Set once the parked call has returned: its exit witness, so a
+        /// dropped (cancelled) publication is told apart from a settled one.
+        parked_returned: std::sync::atomic::AtomicBool,
+    }
+
+    impl ParkingCustomizer {
+        fn new(probe: &Arc<HeldCloseProbe>) -> Arc<Self> {
+            Arc::new(Self {
+                probe: Arc::clone(probe),
+                park: std::sync::Mutex::new(None),
+                parked_returned: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        /// Park the next customizer call until the returned sender is used or
+        /// dropped; the returned receiver is told when it has parked.
+        fn park_next_publication(
+            &self,
+        ) -> (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            *self.park.lock().unwrap() = Some((entered_tx, release_rx));
+            (entered_rx, release_tx)
+        }
+
+        /// Whether the parked call has returned.
+        fn parked_publication_returned(&self) -> bool {
+            self.parked_returned
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
 
     #[async_trait]
-    impl crate::identity_first::AgentCustomizer for RecordingCustomizer {
+    impl crate::identity_first::AgentCustomizer for ParkingCustomizer {
         async fn customize_build(
             &self,
             _context: &crate::identity_first::AgentBuildContext,
             spec: &DurableAgentSpec,
             _draft: &mut crate::identity_first::AgentBuildDraft,
         ) -> Result<(), crate::identity_first::CustomizerError> {
-            self.0.record(&format!("customize:{}", spec.identity));
+            let parked = self.park.lock().unwrap().take();
+            if let Some((entered, release)) = parked {
+                self.probe
+                    .record(&format!("publication_parked:{}", spec.identity));
+                let _ = entered.send(());
+                let _ = release.await;
+                self.parked_returned
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return Ok(());
+            }
+            self.probe.record(&format!("customize:{}", spec.identity));
             Ok(())
         }
     }
 
     /// A held runtime with a prepared mob's activation staged, whose
-    /// persisted-owner registration reads a store the test can block. The
-    /// probe's log records the prepared steps (registration, customizer
-    /// publication, prewarm, lift) and the failure shutdown.
+    /// customizer-tool publication (the first prepared step that runs host
+    /// code, before the lift) calls a customizer the test can block. The
+    /// probe's log records the prepared steps (the phase that publishes the
+    /// customizer tools, each customizer call, the lift) and the failure
+    /// shutdown.
     async fn blocked_prepared_runtime(
         prefix: &str,
         probe: &Arc<HeldCloseProbe>,
@@ -21668,17 +21550,18 @@ mod held_bootstrap_close_tests {
         tempfile::TempDir,
         UnifiedRuntime,
         Vec<DurableAgentSpec>,
-        Arc<ParkingContinuityStore>,
+        Arc<ParkingCustomizer>,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let roster = vec![member(&AgentIdentity::parse(prefix).unwrap())];
-        let store = Arc::new(ParkingContinuityStore::new());
+        let customizer = ParkingCustomizer::new(probe);
         let mut runtime = held_runtime_with_customizer(
             &dir,
             prefix,
             &roster,
-            Arc::clone(&store) as Arc<dyn crate::identity_first::ContinuityStore>,
-            Arc::new(RecordingCustomizer(Arc::clone(probe))),
+            Arc::new(crate::identity_first::LocalContinuityStore::in_memory().unwrap())
+                as Arc<dyn crate::identity_first::ContinuityStore>,
+            Arc::clone(&customizer) as Arc<dyn crate::identity_first::AgentCustomizer>,
         )
         .await;
         let observer = Arc::clone(probe);
@@ -21686,9 +21569,6 @@ mod held_bootstrap_close_tests {
             match phase {
                 crate::UnifiedRuntimeBootstrapPhase::RegisterPersistedOwners => {
                     observer.record("register_owners");
-                }
-                crate::UnifiedRuntimeBootstrapPhase::PrewarmPersistedAuthority => {
-                    observer.record("prewarm");
                 }
                 crate::UnifiedRuntimeBootstrapPhase::Activate => observer.record("lift"),
                 crate::UnifiedRuntimeBootstrapPhase::FailureCleanup => {
@@ -21698,39 +21578,37 @@ mod held_bootstrap_close_tests {
             }
         })));
         stage_running_mob_activation(&mut runtime);
-        (dir, runtime, roster, store)
+        (dir, runtime, roster, customizer)
     }
 
-    /// Whether the probe's log shows a prepared step after registration
-    /// (customizer publication, prewarm, lift) or a host completion.
+    /// The probe's log entries of a step after the parked publication: an
+    /// unparked customizer call (a further publication, or a
+    /// materialization's build), the lift, or a host completion.
     fn later_setup_steps(events: &[String]) -> Vec<String> {
         events
             .iter()
             .filter(|event| {
-                event.starts_with("customize:")
-                    || *event == "prewarm"
-                    || *event == "lift"
-                    || event.starts_with("asked")
+                event.starts_with("customize:") || *event == "lift" || event.starts_with("asked")
             })
             .cloned()
             .collect()
     }
 
-    /// The bounded entry covers a prepared mob's activation too. A
-    /// continuity store that blocks the persisted-owner registration (the
-    /// first prepared step, before the roster pass) does not keep the
-    /// gateway past its deadline: the host's admission is closed at the
-    /// deadline while that registration is still blocked, and only then does
-    /// the gateway wait for the setup's settlement and shut the runtime
-    /// down. The blocked registration runs to its end; nothing after it
-    /// starts once the deadline has passed: no customizer publication, no
-    /// prewarm, no lift, no host completion.
+    /// The bounded entry covers a prepared mob's activation too. A host
+    /// customizer that blocks the customizer-tool publication (the first
+    /// prepared step that runs host code, before the lift and the roster
+    /// pass) does not keep the gateway past its deadline: the host's
+    /// admission is closed at the deadline while that publication is still
+    /// blocked, and only then does the gateway wait for the setup's
+    /// settlement and shut the runtime down. The blocked publication runs to
+    /// its end; nothing after it starts once the deadline has passed: no
+    /// further customizer call, no lift, no host completion.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_blocked_prepared_activation_still_closes_the_host_at_the_deadline() {
         let probe = HeldCloseProbe::new(Callback::LateOk);
-        let (_dir, mut runtime, roster, store) =
+        let (_dir, mut runtime, roster, customizer) =
             blocked_prepared_runtime("held-close-prepared", &probe).await;
-        let (parked, release) = store.park_next_resolve();
+        let (parked, release) = customizer.park_next_publication();
         let host: Arc<dyn GatewayHostComposition> = probe.clone();
         let mut host_begin = None;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -21741,8 +21619,8 @@ mod held_bootstrap_close_tests {
         let releasing = async {
             tokio::time::timeout_at(deadline, parked)
                 .await
-                .expect("the registration reads the store before the deadline")
-                .expect("the read parks");
+                .expect("the publication calls the host customizer before the deadline")
+                .expect("the publication parks");
             tokio::time::timeout_at(deadline + Duration::from_secs(2), async {
                 while !probe
                     .events()
@@ -21752,7 +21630,7 @@ mod held_bootstrap_close_tests {
                 }
             })
             .await
-            .expect("the host is closed at the deadline while the registration is blocked");
+            .expect("the host is closed at the deadline while the publication is blocked");
             assert!(tokio::time::Instant::now() >= deadline);
             assert!(
                 !probe.events().contains(&"failure_cleanup".to_string()),
@@ -21773,32 +21651,38 @@ mod held_bootstrap_close_tests {
             "{error}"
         );
         let register = probe.position("register_owners");
+        let parked_at = probe.position("publication_parked:held-close-prepared");
         let close = probe.position("begin_close:init_failed");
         let cleanup = probe.position("failure_cleanup");
-        assert!(register < close && close < cleanup, "{:?}", probe.events());
+        assert!(
+            register < parked_at && parked_at < close && close < cleanup,
+            "{:?}",
+            probe.events()
+        );
+        assert!(customizer.parked_publication_returned());
         assert_eq!(
             later_setup_steps(&probe.events()),
             Vec::<String>::new(),
-            "no customizer publication, prewarm, lift or host completion after the Abort"
+            "no further customizer call, lift or host completion after the Abort"
         );
         assert_eq!(host_begin, Some(Ok(())));
     }
 
     /// A caller lost while a prepared activation is blocked in its
-    /// persisted-owner registration is the setup's terminal `Abort`. The
-    /// registration (already entered) runs to its end when the store answers,
-    /// well before the deadline, and nothing after it starts: no customizer
-    /// publication, no prewarm, no lift, no host completion. The absence is
+    /// customizer-tool publication is the setup's terminal `Abort`. The
+    /// publication (already entered) runs to its end when the host customizer
+    /// returns, well before the deadline, and nothing after it starts: no
+    /// further customizer call, no lift, no host completion. The absence is
     /// asserted only after the setup's tracked operation actually settled
     /// (its join, before the deadline and before any shutdown), and the
-    /// store's exit witness proves the entered registration returned rather
-    /// than being dropped.
+    /// customizer's exit witness proves the entered publication returned
+    /// rather than being dropped.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_caller_lost_during_a_blocked_prepared_activation_starts_no_later_step() {
         let probe = HeldCloseProbe::new(Callback::LateOk);
-        let (_dir, mut runtime, roster, store) =
+        let (_dir, mut runtime, roster, customizer) =
             blocked_prepared_runtime("held-close-prepared-lost", &probe).await;
-        let (parked, release) = store.park_next_resolve();
+        let (parked, release) = customizer.park_next_publication();
         let host: Arc<dyn GatewayHostComposition> = probe.clone();
         let mut host_begin = None;
         let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
@@ -21811,14 +21695,14 @@ mod held_bootstrap_close_tests {
                 &mut host_begin,
             );
             tokio::select! {
-                _ = bootstrap => panic!("the setup cannot settle while its registration is blocked"),
-                parked = parked => parked.expect("the registration parks"),
+                _ = bootstrap => panic!("the setup cannot settle while its publication is blocked"),
+                parked = parked => parked.expect("the publication parks"),
             }
             // The caller goes away here, well before the deadline.
         }
-        // The setup's tracked operation still owns the entered registration:
+        // The setup's tracked operation still owns the entered publication:
         // a join of the runtime's tracked operations stays pending while the
-        // registration is held.
+        // publication is held.
         let identity_runtime = Arc::clone(
             runtime
                 .identity_runtime_ref()
@@ -21828,20 +21712,20 @@ mod held_bootstrap_close_tests {
             Box::pin(async move { identity_runtime.join_foreground_operations().await });
         assert!(
             futures::poll!(joining.as_mut()).is_pending(),
-            "the setup still holds its entered registration"
+            "the setup still holds its entered publication"
         );
-        assert!(!store.parked_read_returned());
+        assert!(!customizer.parked_publication_returned());
         release
             .send(())
-            .expect("the entered registration still waits for its release");
+            .expect("the entered publication still waits for its release");
         // The same join completes once the setup has actually settled,
         // before the original deadline and before any shutdown.
         tokio::time::timeout_at(deadline, joining)
             .await
-            .expect("the setup settles before its deadline once the registration returns");
+            .expect("the setup settles before its deadline once the publication returns");
         assert!(
-            store.parked_read_returned(),
-            "the entered registration ran to its end"
+            customizer.parked_publication_returned(),
+            "the entered publication ran to its end"
         );
         let events = probe.events();
         assert!(
@@ -21851,7 +21735,7 @@ mod held_bootstrap_close_tests {
         assert_eq!(
             later_setup_steps(&events),
             Vec::<String>::new(),
-            "no customizer publication, prewarm, lift or host completion after the caller's loss"
+            "no further customizer call, lift or host completion after the caller's loss"
         );
         let _report = tokio::time::timeout(Duration::from_mins(1), runtime.shutdown())
             .await
@@ -22124,19 +22008,11 @@ mob = true
         let state = temp.path();
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
-            meerkat_store::SqliteSessionStore::open(state.join("session-store.sqlite3"))
-                .expect("session store"),
-        );
-        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
-            meerkat_runtime::store::SqliteRuntimeStore::new(state.join("runtime-store.sqlite3"))
-                .expect("runtime store"),
-        );
-        let (runtime_store, epochs) =
-            crate::mob_handle_runtime::epoch_tracking_runtime_store_with_durable_projection(
-                runtime_store,
-                session_store.clone(),
-            );
+        let (session_store, runtime_store) = crate::mob_handle_runtime::open_native_session_pair(
+            state,
+            &crate::storage_provider::default_meerkat_level_realm(),
+        )
+        .expect("native session pair");
         let adapter = Arc::new(
             meerkat_runtime::MeerkatMachine::persistent(
                 Arc::clone(&runtime_store),
@@ -22190,8 +22066,7 @@ mob = true
             .with_mob_storage_provenance(provenance)
             // The helpers' implicit child mobs live with this process.
             .with_child_mob_storage(crate::ChildMobStorage::ProcessBound)
-            .with_session_write_epochs(&epochs)
-            .with_runtime_authority_prewarm(&runtime_store)
+            .with_durable_runtime_store(&runtime_store)
             .with_runtime_archived_terminal_authority(Arc::clone(&runtime_store))
             .with_session_runtime_adapter(adapter)
             .expect("session runtime owner")

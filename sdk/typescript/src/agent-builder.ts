@@ -31,29 +31,18 @@ import {
 } from "./jobs.js";
 import {
   parseErrorEvent,
-  parseContinuityRecord,
-  parseSessionSnapshot,
-  parseLeaseGrant,
   parseAgentBuildContext,
   parseRosterContext,
   parseDurableAgentSpec,
   parseAgentBuildDraft,
   agentBuildDraftToDict,
   durableAgentSpecToDict,
-  sessionSnapshotToDict,
-  leaseGrantToDict,
-  leaseAcquireResultToDict,
-  leaseRenewResultToDict,
   managedPeerEdgeToDict,
   type ErrorEvent,
   type SessionCreatedContext,
-  type ContinuityStore,
-  continuityRecordToDict,
-  type LeaseProvider,
   type RosterProvider,
   type AgentCustomizer,
   type TopologyProvider,
-  type LeaseGrant,
   type ProviderCallbackContext,
 } from "./types.js";
 
@@ -114,8 +103,6 @@ export class CallbackDispatcher {
   // Latest customizer scope per identity, so a restore can release the prior
   // scope (the gateway has no scope-release signal — newest-wins semantics).
   private readonly _customizerScopeByIdentity = new Map<string, string>();
-  private _continuityStore: ContinuityStore | null = null;
-  private _leaseProvider: LeaseProvider | null = null;
   private _rosterProvider: RosterProvider | null = null;
   private _agentCustomizer: AgentCustomizer | null = null;
   private _topologyProvider: TopologyProvider | null = null;
@@ -137,14 +124,6 @@ export class CallbackDispatcher {
 
   registerErrorCallback(callback: ErrorCallback): void {
     this._errorCallback = callback;
-  }
-
-  registerContinuityStore(store: ContinuityStore): void {
-    this._continuityStore = store;
-  }
-
-  registerLeaseProvider(provider: LeaseProvider): void {
-    this._leaseProvider = provider;
   }
 
   registerRosterProvider(provider: RosterProvider): void {
@@ -366,197 +345,6 @@ export class CallbackDispatcher {
 
     if (method === "callback/job/cancel") {
       return this._cancelJob(params);
-    }
-
-    // -- Continuity callbacks -----------------------------------------------
-
-    if (method === "callback/continuity_store/resolve_many") {
-      if (this._continuityStore === null) {
-        throw new Error("no ContinuityStore registered");
-      }
-      const identities = Array.isArray(params.identities)
-        ? params.identities.map(String)
-        : [];
-      return this._continuityStore.resolveMany(identities);
-    }
-
-    if (method === "callback/continuity_store/load_session_snapshot") {
-      if (this._continuityStore === null) {
-        throw new Error("no ContinuityStore registered");
-      }
-      const sessionId = String(params.session_id ?? "");
-      const snap = await this._continuityStore.loadSessionSnapshot(sessionId);
-      if (snap === null) return null;
-      return sessionSnapshotToDict(snap);
-    }
-
-    if (method === "callback/continuity_store/resolve_record_by_session") {
-      if (this._continuityStore === null) {
-        throw new Error("no ContinuityStore registered");
-      }
-      const sessionId = String(params.session_id ?? "");
-      const handler = this._continuityStore.resolveRecordBySession;
-      if (!handler) {
-        // Loud, not null: see the interface doc. A null would read as an
-        // authoritative absence and silently disable owner pre-registration.
-        throw new Error(
-          "ContinuityStore.resolveRecordBySession is required: owner pre-registration " +
-            "cannot distinguish 'no record' from 'cannot answer' without it",
-        );
-      }
-      const bound = await handler.call(this._continuityStore, sessionId, callbackContext);
-      if (bound === null || bound === undefined) return null;
-      return {
-        record: continuityRecordToDict(bound.record),
-        fencing_token: bound.fencingToken,
-        checkpoint_version: bound.checkpointVersion,
-      };
-    }
-
-    if (method === "callback/continuity_store/session_owner") {
-      if (this._continuityStore === null) {
-        throw new Error("no ContinuityStore registered");
-      }
-      const sessionId = String(params.session_id ?? "");
-      const handler = this._continuityStore.sessionOwner;
-      if (handler) {
-        const owner = await handler.call(this._continuityStore, sessionId, callbackContext);
-        if (owner !== null && typeof owner !== "string") {
-          throw new Error("ContinuityStore.sessionOwner must return an identity string or null");
-        }
-        return owner;
-      }
-      // Older providers support current bindings only. Historical ownership
-      // requires the explicit sessionOwner capability described by the API.
-      const resolver = this._continuityStore.resolveRecordBySession;
-      if (!resolver) {
-        throw new Error("ContinuityStore cannot resolve session ownership");
-      }
-      const bound = await resolver.call(this._continuityStore, sessionId, callbackContext);
-      if (bound === null) return null;
-      if (bound.record.sessionId !== sessionId) {
-        throw new Error("session owner lookup returned a different session");
-      }
-      return bound.record.identity;
-    }
-
-    if (method === "callback/continuity_store/delete_session_snapshot_if_current_revision") {
-      if (this._continuityStore === null) {
-        throw new Error("no ContinuityStore registered");
-      }
-      const sessionId = String(params.session_id ?? "");
-      const expectedCurrentRevision = String(params.expected_current_revision ?? "");
-      const handler = this._continuityStore.deleteSessionSnapshotIfCurrentRevision;
-      if (!handler) return false;
-      return handler.call(
-        this._continuityStore,
-        sessionId,
-        expectedCurrentRevision,
-        callbackContext,
-      );
-    }
-
-    if (method === "callback/continuity_store/save_session_snapshot") {
-      if (this._continuityStore === null) {
-        throw new Error("no ContinuityStore registered");
-      }
-      const identity = String(params.identity ?? "");
-      const sessionId = String(params.session_id ?? "");
-      const generation = Number(params.generation ?? 0);
-      const version = Number(params.version ?? params.checkpoint_version ?? 0);
-      const fencingToken = Number(params.fencing_token ?? 0);
-      const snapshot = typeof params.snapshot === "string"
-        ? parseSessionSnapshot({ data: params.snapshot })
-        : parseSessionSnapshot(params.snapshot);
-      await this._continuityStore.saveSessionSnapshot(
-        identity,
-        sessionId,
-        generation,
-        version,
-        fencingToken,
-        snapshot,
-        callbackContext,
-      );
-      return null;
-    }
-
-    if (method === "callback/continuity_store/upsert_continuity_record") {
-      if (this._continuityStore === null) {
-        throw new Error("no ContinuityStore registered");
-      }
-      const record = parseContinuityRecord(params.record);
-      const fencingToken = Number(params.fencing_token ?? 0);
-      await this._continuityStore.upsertContinuityRecord(
-        record,
-        fencingToken,
-        callbackContext,
-      );
-      return null;
-    }
-
-    if (method === "callback/continuity_store/delete_continuity_record") {
-      if (this._continuityStore === null) {
-        throw new Error("no ContinuityStore registered");
-      }
-      const identity = String(params.identity ?? "");
-      const fencingToken = Number(params.fencing_token ?? 0);
-      await this._continuityStore.deleteContinuityRecord(
-        identity,
-        fencingToken,
-        callbackContext,
-      );
-      return null;
-    }
-
-    // -- Lease callbacks ----------------------------------------------------
-
-    if (method === "callback/lease_provider/acquire_leases") {
-      if (this._leaseProvider === null) {
-        throw new Error("no LeaseProvider registered");
-      }
-      const identities = Array.isArray(params.identities)
-        ? params.identities.map(String)
-        : [];
-      const runtimeInstance = String(params.runtime_instance ?? "");
-      const result = await this._leaseProvider.acquireLeases(
-        identities,
-        runtimeInstance,
-        callbackContext,
-      );
-      return Object.fromEntries(
-        Object.entries(result).map(([identity, value]) => [
-          identity,
-          leaseAcquireResultToDict({ identity, ...value }),
-        ]),
-      );
-    }
-
-    if (method === "callback/lease_provider/renew_leases") {
-      if (this._leaseProvider === null) {
-        throw new Error("no LeaseProvider registered");
-      }
-      const rawGrants = Array.isArray(params.grants) ? params.grants : [];
-      const grants: LeaseGrant[] = rawGrants.map(parseLeaseGrant);
-      const result = await this._leaseProvider.renewLeases(
-        grants,
-        callbackContext,
-      );
-      return Object.fromEntries(
-        Object.entries(result).map(([identity, value]) => [
-          identity,
-          leaseRenewResultToDict({ identity, ...value }),
-        ]),
-      );
-    }
-
-    if (method === "callback/lease_provider/release_leases") {
-      if (this._leaseProvider === null) {
-        throw new Error("no LeaseProvider registered");
-      }
-      const rawGrants = Array.isArray(params.grants) ? params.grants : [];
-      const grants: LeaseGrant[] = rawGrants.map(parseLeaseGrant);
-      await this._leaseProvider.releaseLeases(grants, callbackContext);
-      return null;
     }
 
     // -- Roster callback ----------------------------------------------------

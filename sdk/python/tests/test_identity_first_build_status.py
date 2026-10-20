@@ -1,15 +1,13 @@
-"""TDD tests for AgentBuildContext/Draft/ToolDef (REQ-43a) and IdentityStatus/Health (REQ-43b)."""
+"""TDD tests for AgentBuildContext/Draft/ToolDef (REQ-43a) and IdentityStatus (REQ-43b)."""
 import pytest
 
 from meerkat_meta.identity_first_models import (
     AgentBuildContext,
     AgentBuildDraft,
-    ContinuityHealth,
-    DurabilityPolicy,
     ExternalToolDef,
     IdentityStatus,
-    LeaseInfo,
     ManagedPeerEdge,
+    WakeRefusal,
 )
 
 
@@ -178,100 +176,8 @@ class TestAgentBuildDraft:
 
 
 # ---------------------------------------------------------------------------
-# REQ-43b: IdentityStatus, LeaseInfo, ContinuityHealth, DurabilityPolicy
+# REQ-43b: IdentityStatus
 # ---------------------------------------------------------------------------
-
-
-class TestDurabilityPolicy:
-    def test_sync_write_through(self):
-        p = DurabilityPolicy(kind="sync_write_through")
-        assert p.kind == "sync_write_through"
-        assert p.max_loss_window_ms is None
-
-    def test_buffered_export(self):
-        p = DurabilityPolicy(kind="buffered_export", max_loss_window_ms=5000)
-        assert p.max_loss_window_ms == 5000
-
-    def test_to_dict_without_max_loss(self):
-        d = DurabilityPolicy(kind="async_replicated").to_dict()
-        assert d == {"kind": "async_replicated"}
-
-    def test_to_dict_with_max_loss(self):
-        d = DurabilityPolicy(kind="buffered_export", max_loss_window_ms=1000).to_dict()
-        assert d == {"kind": "buffered_export", "max_loss_window_ms": 1000}
-
-    def test_from_dict(self):
-        p = DurabilityPolicy.from_dict({"kind": "sync_write_through"})
-        assert p.kind == "sync_write_through"
-
-    def test_round_trip(self):
-        original = DurabilityPolicy(kind="buffered_export", max_loss_window_ms=3000)
-        restored = DurabilityPolicy.from_dict(original.to_dict())
-        assert restored == original
-
-
-class TestLeaseInfo:
-    def test_fields(self):
-        li = LeaseInfo(fencing_token=42, ttl_remaining_ms=30000, healthy=True)
-        assert li.fencing_token == 42
-        assert li.ttl_remaining_ms == 30000
-        assert li.healthy is True
-
-    def test_to_dict(self):
-        d = LeaseInfo(fencing_token=1, ttl_remaining_ms=5000, healthy=False).to_dict()
-        assert d == {"fencing_token": 1, "ttl_remaining_ms": 5000, "healthy": False}
-
-    def test_from_dict(self):
-        li = LeaseInfo.from_dict({
-            "fencing_token": 99, "ttl_remaining_ms": 10000, "healthy": True,
-        })
-        assert li.fencing_token == 99
-
-    def test_round_trip(self):
-        original = LeaseInfo(fencing_token=7, ttl_remaining_ms=60000, healthy=True)
-        restored = LeaseInfo.from_dict(original.to_dict())
-        assert restored == original
-
-
-class TestContinuityHealth:
-    def test_fields(self):
-        ch = ContinuityHealth(
-            store_reachable=True,
-            durability_policy=DurabilityPolicy(kind="sync_write_through"),
-            last_checkpoint_version=5,
-        )
-        assert ch.store_reachable is True
-        assert ch.last_checkpoint_version == 5
-
-    def test_to_dict(self):
-        ch = ContinuityHealth(
-            store_reachable=False,
-            durability_policy=DurabilityPolicy(kind="async_replicated"),
-        )
-        d = ch.to_dict()
-        assert d["store_reachable"] is False
-        assert d["durability_policy"] == {"kind": "async_replicated"}
-        assert "last_checkpoint_version" not in d
-
-    def test_from_dict(self):
-        ch = ContinuityHealth.from_dict({
-            "store_reachable": True,
-            "durability_policy": {"kind": "sync_write_through"},
-            "last_checkpoint_version": 10,
-        })
-        assert ch.last_checkpoint_version == 10
-        assert ch.durability_policy.kind == "sync_write_through"
-
-    def test_round_trip(self):
-        original = ContinuityHealth(
-            store_reachable=True,
-            durability_policy=DurabilityPolicy(
-                kind="buffered_export", max_loss_window_ms=2000,
-            ),
-            last_checkpoint_version=3,
-        )
-        restored = ContinuityHealth.from_dict(original.to_dict())
-        assert restored == original
 
 
 class TestIdentityStatus:
@@ -286,24 +192,15 @@ class TestIdentityStatus:
             display_name="Triage",
             labels={"env": "prod"},
             generation=0,
-            checkpoint_version=3,
-            lease=LeaseInfo(fencing_token=42, ttl_remaining_ms=30000, healthy=True),
-            continuity_health=ContinuityHealth(
-                store_reachable=True,
-                durability_policy=DurabilityPolicy(kind="sync_write_through"),
-                last_checkpoint_version=3,
-            ),
         )
         assert status.identity == "triage:main"
         assert status.labels == {"env": "prod"}
-        assert status.lease.fencing_token == 42
-        assert status.continuity_health.store_reachable is True
 
     def test_minimal_status(self):
-        status = IdentityStatus(identity="a:main", state="uninitialized")
+        status = IdentityStatus(identity="a:main", state="dormant")
         assert status.agent_runtime_id is None
-        assert status.lease is None
-        assert status.continuity_health is None
+        assert status.intent_managed is False
+        assert status.wake_refusal is None
 
     def test_from_dict_full(self):
         status = IdentityStatus.from_dict({
@@ -316,34 +213,19 @@ class TestIdentityStatus:
             "display_name": "Triage",
             "labels": {"env": "prod"},
             "generation": 2,
-            "checkpoint_version": 5,
-            "lease": {
-                "fencing_token": 10,
-                "ttl_remaining_ms": 15000,
-                "healthy": True,
-            },
-            "continuity_health": {
-                "store_reachable": True,
-                "durability_policy": {
-                    "kind": "buffered_export",
-                    "max_loss_window_ms": 5000,
-                },
-                "last_checkpoint_version": 5,
-            },
+            "intent_managed": False,
+            "wake_refusal": None,
         })
         assert status.identity == "triage:main"
         assert status.addressability == "internal_only"
-        assert status.lease.fencing_token == 10
-        assert status.continuity_health.durability_policy.kind == "buffered_export"
-        assert status.continuity_health.durability_policy.max_loss_window_ms == 5000
+        assert status.generation == 2
 
     def test_from_dict_minimal(self):
         status = IdentityStatus.from_dict({
             "identity": "a:main",
-            "state": "uninitialized",
+            "state": "dormant",
         })
         assert status.identity == "a:main"
-        assert status.lease is None
 
     def test_round_trip(self):
         original = IdentityStatus(
@@ -354,17 +236,10 @@ class TestIdentityStatus:
             profile="worker",
             labels={"role": "compute"},
             generation=1,
-            checkpoint_version=10,
-            lease=LeaseInfo(fencing_token=5, ttl_remaining_ms=20000, healthy=True),
-            continuity_health=ContinuityHealth(
-                store_reachable=True,
-                durability_policy=DurabilityPolicy(kind="sync_write_through"),
-                last_checkpoint_version=10,
-            ),
+            wake_refusal=WakeRefusal(code=-32051, session_id="s-x", remedy="delete_identity"),
         )
         restored = IdentityStatus.from_dict(original.to_dict())
+        assert restored == original
         assert restored.identity == original.identity
         assert restored.state == original.state
         assert restored.labels == original.labels
-        assert restored.lease.fencing_token == original.lease.fencing_token
-        assert restored.continuity_health.durability_policy.kind == "sync_write_through"

@@ -216,13 +216,17 @@ pub enum ScopeMismatch {
     RuntimeId,
     /// The identity's continuity generation moved (a reset or rebind).
     Generation,
-    /// The identity's lease is held under a different fencing token, or is
-    /// not held healthily.
+    /// The identity runs under a different Core fence. Since 0.9.4 the
+    /// scope's lease-token slot carries Core's fence, and Meta holds no
+    /// lease.
     LeaseFencingToken,
     /// The native member scope does not name this identity's member.
     Member,
-    /// meerkat refused the native scope at admission: the member's session,
-    /// runtime incarnation or fence moved.
+    /// The member's session, runtime incarnation or fence moved: meerkat
+    /// refused the native scope at admission, or a scoped retirement found
+    /// the identity bound to another session or member incarnation. Also a
+    /// scope captured at another incarnation of the mob (one destroyed and
+    /// created again under its id).
     MemberBinding,
 }
 
@@ -319,6 +323,96 @@ impl ScopedDeliveryError {
     }
 }
 
+/// Why a retirement at a scope
+/// ([`super::IdentityRuntime::retire_at_scope_tracked`]) did not retire.
+///
+/// `Unsupported`, `StaleScope`, `Rejected` and `Refused` refuse to retire
+/// the scope's member. Core retires the member's `spawned_by` descendants
+/// first and checks the scope in every step, so a `StaleScope` or `Rejected`
+/// Core reaches after its first step leaves the descendants it already
+/// retired retired. `Retire` is the retirement's own failure, or a
+/// retirement whose outcome is unknown.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ScopedRetireError {
+    /// The session bridge has no scoped seam, or the identity is externally
+    /// bound: its scope cannot be checked. Nothing was retired.
+    Unsupported { detail: String },
+    /// Core found another incarnation of the identity current, the scope's
+    /// incarnation current under another session, or the scope captured at
+    /// another incarnation of the mob. Final for this scope: capture it
+    /// again. The scope's member was not retired; when
+    /// Core found it after its first step (a successor minted while the
+    /// cascade ran), the descendants it retired before stay retired.
+    StaleScope {
+        mismatch: ScopeMismatch,
+        detail: String,
+    },
+    /// The scope's member was not retired: a scope of another identity or
+    /// member, Core's live scope that could not be read, a mob that is not
+    /// running, or a runtime that no longer admits identity operations (it
+    /// is shutting down, or its mob is closed). Meta refuses the first two
+    /// before Core is asked; when Core refuses after its first step (the mob
+    /// stopping while the cascade ran), the descendants it retired before
+    /// stay retired.
+    Rejected { detail: String },
+    /// Refused by Meta before Core was asked, with the identity runtime's
+    /// typed error: a host-adopted identity
+    /// ([`super::IdentityRuntimeError::IdentityHostAdopted`]: Core holds its
+    /// identity intent row, so no Meta verb retires it), or one whose
+    /// identity history Core could not read
+    /// ([`super::IdentityRuntimeError::IdentityHistoryUnavailable`]).
+    /// Nothing was retired.
+    Refused(super::IdentityRuntimeError),
+    /// meerkat's retirement of the scope's incarnation failed or is stuck.
+    /// Also the tracked operation ending without a result (it panicked),
+    /// after which whether the identity was retired is unknown: read its
+    /// status.
+    Retire(super::IdentityRuntimeError),
+}
+
+impl ScopedRetireError {
+    /// The scoped-delivery refusal a scope check answered, as a refusal to
+    /// retire.
+    pub(crate) fn from_scope_refusal(error: ScopedDeliveryError) -> Self {
+        match error {
+            ScopedDeliveryError::Unsupported { detail } => Self::Unsupported { detail },
+            ScopedDeliveryError::StaleScope { mismatch, detail } => {
+                Self::StaleScope { mismatch, detail }
+            }
+            ScopedDeliveryError::Rejected { detail }
+            | ScopedDeliveryError::Uncertain { detail } => Self::Rejected { detail },
+        }
+    }
+}
+
+impl std::fmt::Display for ScopedRetireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported { detail } => write!(f, "scoped retirement unsupported: {detail}"),
+            Self::StaleScope { mismatch, detail } => {
+                write!(
+                    f,
+                    "stale retirement scope ({}): {detail}",
+                    mismatch.as_str()
+                )
+            }
+            Self::Rejected { detail } => write!(f, "scoped retirement rejected: {detail}"),
+            Self::Refused(error) => write!(f, "scoped retirement refused: {error}"),
+            Self::Retire(error) => write!(f, "retirement failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ScopedRetireError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Refused(error) | Self::Retire(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 /// What a scoped dispatch's admission proved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -382,7 +476,8 @@ pub enum ScopedRecoveryUnresolved {
     EvidenceReadTimedOut,
     /// The mob's durable member history never bound the scope's runtime
     /// incarnation, fence and session together, so the named session was
-    /// not read.
+    /// not read. This includes a scope captured at another incarnation of the
+    /// mob, and a version-1 scope the mob's incarnation does not honour.
     ScopeBindingUnproven,
 }
 
@@ -510,7 +605,12 @@ impl ScopedRecovery {
                     meerkat_mob::ScopedRecoveryUnresolved::EvidenceReadTimedOut => {
                         ScopedRecoveryUnresolved::EvidenceReadTimedOut
                     }
-                    meerkat_mob::ScopedRecoveryUnresolved::ScopeBindingUnproven => {
+                    // Core holds no binding of the scope's member in this mob
+                    // incarnation either way: the scope was captured at
+                    // another incarnation of the mob, or is a version-1 scope
+                    // this incarnation does not honour. Nothing was read.
+                    meerkat_mob::ScopedRecoveryUnresolved::ScopeBindingUnproven
+                    | meerkat_mob::ScopedRecoveryUnresolved::IncarnationNotHosted => {
                         ScopedRecoveryUnresolved::ScopeBindingUnproven
                     }
                     other => ScopedRecoveryUnresolved::OriginalOwnerUnavailable {

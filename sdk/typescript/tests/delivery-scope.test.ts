@@ -49,7 +49,6 @@ async function scriptedRuntime(replies: Record<string, Reply[]>) {
   const rt = new MetaRuntime({
     mobConfigPath: null,
     sessionBuilder: null,
-    sessionStore: null,
     errorCallback: null,
     eventLog: null,
     consoleConfigPath: null,
@@ -65,9 +64,6 @@ async function scriptedRuntime(replies: Record<string, Reply[]>) {
     gatewayBin: null,
     modules: [],
     persistentState: null,
-    continuityStore: null,
-    leaseProvider: null,
-    scratchDir: null,
     rosterProvider: null,
     agentCustomizer: null,
     topologyProvider: null,

@@ -215,8 +215,7 @@ async fn authorize_session_in_namespace(
                 let session_id =
                     meerkat_core::SessionId::parse(&request.session_id).map_err(|_| ())?;
                 let owner = owner
-                    .continuity_store()
-                    .session_owner(&session_id)
+                    .core_session_owner(&session_id)
                     .await
                     .map_err(|_| ())?;
                 if owner.as_ref() != Some(&identity) {
@@ -558,6 +557,7 @@ mod tests {
 
     fn state(runtime: Option<MobRuntime>) -> ConsoleJsonState {
         ConsoleJsonState {
+            session_fences: crate::auth::session_fence::ConsoleSessionFences::detached(),
             decisions: RuntimeDecisionState::local_console(
                 crate::ConsolePolicy {
                     require_app_auth: false,
@@ -779,19 +779,6 @@ mcp_apps_sandbox_url = " "
         let owner = empty_identity_control_test_runtime("mcp-app-custody")?;
         register_identity_control_test_binding(&owner, "review:apps", member, session.clone())
             .await?;
-        owner
-            .continuity_store()
-            .save_session_snapshot(
-                &crate::identity_first::AgentIdentity::parse("review:apps")?,
-                &session,
-                crate::identity_first::ContinuityGeneration::new(0),
-                crate::identity_first::CheckpointVersion::new(1),
-                crate::identity_first::FencingToken::new(1),
-                &crate::identity_first::SessionSnapshot {
-                    data: serde_json::to_vec(&meerkat_core::Session::with_id(session.clone()))?,
-                },
-            )
-            .await?;
         let mut state = state(Some(runtime.clone()));
         state.identity_runtime = Some(crate::identity_first::PublicIdentityRuntime::new(
             owner.clone(),
@@ -818,7 +805,8 @@ mcp_apps_sandbox_url = " "
         )
         .await?;
         assert!(receipt.revalidate_async().await.is_err());
-        // Retained canonical ownership permits historical display after the
+        // Retained canonical ownership (Core's history still binds the old
+        // session to the identity) permits historical display after the
         // identity rotates, while the old actor cannot authorize new IO.
         assert!(
             authorize_session(&state, &request(&session), Operation::Resolve)
@@ -829,6 +817,109 @@ mcp_apps_sandbox_url = " "
             authorize_session(&state, &request(&session), Operation::ReadResource)
                 .await
                 .is_err()
+        );
+        Ok(())
+    }
+
+    /// An identity-first member's app reads authorize on the session Core
+    /// binds it to, over the mob's own bridge rather than a scripted double:
+    /// the live session reads and calls tools, a session Core never bound is
+    /// refused, and after a reset the old session still resolves through
+    /// Core's history while only the successor's session reads.
+    #[tokio::test]
+    async fn identity_first_app_reads_authorize_on_cores_session_over_the_mob_bridge()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use super::super::tests::build_empty_console_test_runtime;
+        let (_directory, runtime) = build_empty_console_test_runtime("mcp-app-core").await?;
+        let owner = Arc::new(crate::identity_first::IdentityRuntime::new(
+            crate::identity_first::IdentityRuntimeConfig {
+                continuity_store: Arc::new(
+                    crate::identity_first::LocalContinuityStore::in_memory()?
+                ),
+                lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
+                runtime_instance_id: "mcp-app-core".to_string(),
+                has_runtime_store: true,
+                durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                bridge: Some(Arc::new(crate::identity_first::MobSessionBridge::new(
+                    runtime.handle(),
+                ))),
+                default_timeout: None,
+            },
+        ));
+        let identity = crate::identity_first::AgentIdentity::parse("review:apps")?;
+        owner
+            .register(crate::identity_first::DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: std::collections::BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            })
+            .await;
+        let scope = owner
+            .materialize(&identity)
+            .await?
+            .ok_or("Core holds review:apps live after the wake")?;
+        let live = scope.session_id().clone();
+        let mut state = state(Some(runtime.clone()));
+        state.identity_runtime = Some(crate::identity_first::PublicIdentityRuntime::new(
+            owner.clone(),
+            runtime.clone(),
+        ));
+        for (operation, name) in [
+            (Operation::ReadResource, "read_resource"),
+            (Operation::CallTool, "call_tool"),
+        ] {
+            assert!(
+                authorize_session(&state, &request(&live), operation)
+                    .await
+                    .is_ok(),
+                "Core's live session must authorize {name}"
+            );
+        }
+        let unbound = meerkat_core::SessionId::new();
+        for (operation, name) in [
+            (Operation::Resolve, "resolve"),
+            (Operation::ReadResource, "read_resource"),
+        ] {
+            assert!(
+                authorize_session(&state, &request(&unbound), operation)
+                    .await
+                    .is_err(),
+                "a session Core never bound must refuse {name}"
+            );
+        }
+
+        let successor = owner.reset(&identity).await?;
+        let successor = successor
+            .session_id()
+            .cloned()
+            .ok_or("a reset binds the identity to a fresh session")?;
+        assert_ne!(successor, live);
+        assert!(
+            authorize_session(&state, &request(&live), Operation::ReadResource)
+                .await
+                .is_err(),
+            "the session the reset retired must not read"
+        );
+        assert!(
+            authorize_session(&state, &request(&live), Operation::Resolve)
+                .await
+                .is_ok(),
+            "Core's history still owns the retired session for display"
+        );
+        assert!(
+            authorize_session(&state, &request(&successor), Operation::ReadResource)
+                .await
+                .is_ok(),
+            "the successor's session must read"
         );
         Ok(())
     }

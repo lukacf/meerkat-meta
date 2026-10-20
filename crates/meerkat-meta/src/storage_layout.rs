@@ -109,6 +109,22 @@ pub const GATEWAY_HOME_DIR_NAME: &str = "meerkat-meta";
 /// directory: `rpc_gateway` persists the `local_json` ledger at
 /// `<persistent_state>/<this name>`.
 pub const MEMORY_LEDGER_FILE_NAME: &str = "memory-ledger-state.json";
+/// The lock file in a state directory through which one Meta runtime holds
+/// the directory (see [`crate::state_dir_claim`]).
+pub const STATE_DIR_LOCK_FILE_NAME: &str = "meta-runtime.lock";
+
+/// The one-shot offline verb that moves a pre-0.9.4 state directory onto
+/// Meerkat's native session storage.
+pub const NATIVE_STORAGE_MIGRATION_VERB: &str = "meta_gateway storage-migrate-native";
+
+/// The verb that moves a separate session database into a state directory's
+/// layout (named by [`StorageLayoutError::SessionDatabaseOverrideRetired`]).
+pub const SESSION_DATABASE_IMPORT_VERB: &str = "meta_gateway storage-migrate";
+
+/// Where an operator reads how to run [`NATIVE_STORAGE_MIGRATION_VERB`]
+/// (and, for an SDK-hosted 0.9.3 installation, the export that precedes it).
+pub const NATIVE_STORAGE_MIGRATION_GUIDE: &str =
+    "docs/guides/upgrading-to-0-9-4.mdx#continuity-stores-and-lease-providers-are-removed";
 
 /// The nine top-level database locators the layout owns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +249,7 @@ pub enum StateDirDurability {
 
 /// Typed layout refusals.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StorageLayoutError {
     /// Two spellings of the same store exist in the state directory. The
     /// resolver refuses to choose (opening one would fork history; renaming
@@ -276,6 +293,50 @@ pub enum StorageLayoutError {
         value: Option<String>,
         reason: String,
     },
+    /// Another Meta runtime, in this process or another, holds the state
+    /// directory (see [`crate::state_dir_claim`]).
+    StateDirInUse { state_dir: PathBuf },
+    /// The state directory or its lock file could not be created or locked.
+    StateDirUnavailable { state_dir: PathBuf, detail: String },
+    /// Another process still hosts runtimes on the state directory: Core's
+    /// execution-custody lock on `runtime.sqlite` is held (see
+    /// [`crate::native_startup`]).
+    RuntimeInUse { state_dir: PathBuf, file: PathBuf },
+    /// Whether another process hosts runtimes on the state directory could
+    /// not be checked.
+    RuntimeLockUnreadable {
+        state_dir: PathBuf,
+        file: PathBuf,
+        detail: String,
+    },
+    /// The state directory's stores still have the 0.9.3 layout:
+    /// [`NATIVE_STORAGE_MIGRATION_VERB`] converts them first.
+    NativeStorageMigrationRequired {
+        state_dir: PathBuf,
+        status: crate::storage_migrate_native::NativeLayoutStatus,
+    },
+    /// Identity bindings name sessions, but `runtime.sqlite` is missing or
+    /// holds no session: the runtime store was lost or replaced.
+    RuntimeStoreMissing {
+        state_dir: PathBuf,
+        bound_identities: usize,
+    },
+    /// A startup check could not read one of the state directory's stores.
+    StartupProbeUnreadable {
+        state_dir: PathBuf,
+        file: PathBuf,
+        detail: String,
+    },
+    /// The layout names a separate session database (a `store_path` with a
+    /// file extension that is not an existing directory). Sessions live in
+    /// `runtime.sqlite` under the state directory, so no separate session
+    /// database is opened.
+    SessionDatabaseOverrideRetired { path: PathBuf, state_dir: PathBuf },
+    /// A persistent composition was given mob storage without saying whether
+    /// it outlives the process: no provenance from
+    /// [`crate::mob_composition_manifest::persistent_mob_storage`], and no
+    /// [`crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral`].
+    MobStorageUndeclared { state_dir: PathBuf },
 }
 
 impl Display for StorageLayoutError {
@@ -393,6 +454,83 @@ impl Display for StorageLayoutError {
                  directory holding the path above",
                 path.display()
             ),
+            Self::StateDirInUse { state_dir } => write!(
+                f,
+                "state directory {} is in use by another Meta runtime",
+                state_dir.display()
+            ),
+            Self::StateDirUnavailable { state_dir, detail } => write!(
+                f,
+                "cannot claim state directory {}: {detail}",
+                state_dir.display()
+            ),
+            Self::RuntimeInUse { state_dir, file } => write!(
+                f,
+                "state directory {} is in use: another process still hosts runtimes there \
+                 ({} is locked); stop it before starting this runtime",
+                state_dir.display(),
+                file.display()
+            ),
+            Self::RuntimeLockUnreadable {
+                state_dir,
+                file,
+                detail,
+            } => write!(
+                f,
+                "cannot check whether another process hosts runtimes in state directory {} \
+                 ({}): {detail}",
+                state_dir.display(),
+                file.display()
+            ),
+            Self::NativeStorageMigrationRequired { state_dir, status } => write!(
+                f,
+                "state directory {dir} must be migrated before this version opens it: {status}. \
+                 Stop every process that uses it, run `{NATIVE_STORAGE_MIGRATION_VERB} \
+                 --state-dir {dir}` to see the plan, then run it again with `--apply` \
+                 (see {NATIVE_STORAGE_MIGRATION_GUIDE})",
+                dir = state_dir.display()
+            ),
+            Self::RuntimeStoreMissing {
+                state_dir,
+                bound_identities,
+            } => write!(
+                f,
+                "state directory {} has {bound_identities} identity binding(s) that name a \
+                 session, but its runtime.sqlite is missing or holds no session; restore \
+                 runtime.sqlite together with its -wal file from the backup taken with the rest \
+                 of the directory",
+                state_dir.display()
+            ),
+            Self::StartupProbeUnreadable {
+                state_dir,
+                file,
+                detail,
+            } => write!(
+                f,
+                "cannot check state directory {} before startup ({}): {detail}",
+                state_dir.display(),
+                file.display()
+            ),
+            Self::SessionDatabaseOverrideRetired { path, state_dir } => write!(
+                f,
+                "store_path names the session database {path}, but this version keeps sessions \
+                 in runtime.sqlite under the state directory {dir} and opens no separate session \
+                 database. If {path} holds sessions, first run `{SESSION_DATABASE_IMPORT_VERB} \
+                 --state-dir {dir} --session-db {path} --apply` (it moves the file into the \
+                 layout), then `{NATIVE_STORAGE_MIGRATION_VERB} --state-dir {dir}` (a dry run; \
+                 run it again with `--apply`). Then pass the state directory {dir} as \
+                 store_path",
+                path = path.display(),
+                dir = state_dir.display()
+            ),
+            Self::MobStorageUndeclared { state_dir } => write!(
+                f,
+                "the persistent composition over state directory {} was given mob storage \
+                 without a provenance: pass the pair that persistent_mob_storage(path) returns \
+                 for durable mob storage, or MobStorageProvenance::declared_ephemeral() for \
+                 in-memory mob storage",
+                state_dir.display()
+            ),
         }
     }
 }
@@ -449,12 +587,14 @@ impl MetaStorageLayout {
     }
 
     /// Standalone construction from a gateway `store_path` init parameter:
-    /// a path with a file extension is an explicit session-database override
-    /// (its parent becomes the state directory); otherwise it is the state
-    /// directory itself. This is the one place that interprets the
-    /// `store_path` escape hatch — call sites never sniff extensions.
+    /// an existing directory is the state directory whatever its name
+    /// (`/srv/meta.d`); otherwise a path with a file extension is an explicit
+    /// session-database override (its parent becomes the state directory),
+    /// and any other path is the state directory itself. This is the one
+    /// place that interprets the `store_path` escape hatch - call sites never
+    /// sniff extensions.
     pub fn standalone_from_store_path(store_path: &Path, gateway_home: PathBuf) -> Self {
-        if store_path.extension().is_some() {
+        if store_path.extension().is_some() && !store_path.is_dir() {
             let state_dir = store_path
                 .parent()
                 .map_or_else(|| PathBuf::from("."), Path::to_path_buf);

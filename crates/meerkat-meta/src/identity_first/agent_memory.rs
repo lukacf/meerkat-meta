@@ -600,9 +600,9 @@ impl AgentMemoryRuntimeInjector {
         }
     }
 
-    /// Bind the continuity generation to a session for the Distiller's
-    /// `EvidenceRef`s (§7.1 — reset boundaries are first-class; the
-    /// generation is only knowable runtime-side).
+    /// Bind Core's member generation to a session for the Distiller's
+    /// `EvidenceRef`s (§7.1: reset boundaries are first-class; the runtime
+    /// reads the generation from Core's member history).
     pub fn note_session_generation(
         &self,
         identity: &AgentIdentity,

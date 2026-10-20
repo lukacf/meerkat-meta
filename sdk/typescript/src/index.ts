@@ -28,7 +28,7 @@
 // -- Builder + Runtime ----------------------------------------------------
 
 export { Meta, MetaBuilder } from "./builder.js";
-export type { MetaBuilderConfig } from "./builder.js";
+export type { ForkInstructionPolicy, MetaBuilderConfig } from "./builder.js";
 export {
   LIVE_EXECUTION_CLIENT_CONTEXT_V1,
   LIVE_EXECUTION_FUNCTION_BRIDGE_V1,
@@ -171,7 +171,6 @@ export {
   MOB_EVENTS_STALE_CURSOR_CODE,
   CAPABILITY_UNAVAILABLE_CODE,
   CONSOLE_TIMELINE_REPLAY_UNAVAILABLE_CODE,
-  LEASE_LOST_CODE,
   STALE_DELIVERY_SCOPE_CODE,
   REGISTERED_SPEC_CHANGED_CODE,
   MEMORY_BACKEND_UNAVAILABLE_CODE,
@@ -182,9 +181,12 @@ export {
   MEMBER_RELOAD_REQUIRED_KIND,
   WORKGRAPH_UNAVAILABLE_CODE,
   WORKGRAPH_CONFLICT_CODE,
+  IDENTITY_UNRESUMABLE_CODE,
+  IDENTITY_HISTORY_UNAVAILABLE_CODE,
+  IDENTITY_HOST_ADOPTED_CODE,
+  IDENTITY_WAKE_HELD_KINDS,
   CapabilityUnavailableError,
   ConsoleTimelineReplayUnavailableError,
-  LeaseLostError,
   StaleScopeError,
   RegisteredSpecChangedError,
   MemoryBackendUnavailableError,
@@ -195,6 +197,10 @@ export {
   InitInProgressError,
   WorkGraphUnavailableError,
   WorkGraphConflictError,
+  IdentityUnresumableError,
+  IdentityHistoryUnavailableError,
+  IdentityHostAdoptedError,
+  IdentityWakeHeldError,
   ContractMismatchError,
   NotConnectedError,
   TurnFailedError,
@@ -309,6 +315,9 @@ export {
   parseAgentBuildDraft,
   agentBuildDraftToDict,
   parseIdentityStatus,
+  parseWakeRefusal,
+  parseReplacedSession,
+  parseIdentityConvergence,
   parseIdentityInspection,
   identityInspectionToDict,
   parseSendResult,
@@ -323,21 +332,10 @@ export {
   parseCompletionCursor,
   parseIdentityBootstrapStatus,
   parseIdentityRestoreProgress,
+  parseFirstBootPendingRow,
   completionCursorToDict,
   completionProgressSince,
   parseTurnResult,
-  parseContinuityRecord,
-  continuityRecordToDict,
-  parseContinuityFailure,
-  parseContinuityResolveState,
-  parseSessionSnapshot,
-  sessionSnapshotToDict,
-  parseLeaseGrant,
-  leaseGrantToDict,
-  parseLeaseAcquireResult,
-  leaseAcquireResultToDict,
-  parseLeaseRenewResult,
-  leaseRenewResultToDict,
   parseBlobUploadResult,
   // WorkGraph parsers + option toDict helpers
   parseWorkGraphOwnerKey,
@@ -482,10 +480,15 @@ export type {
   AgentBuildDraft,
   AgentBuildDraftToolOptions,
   IdentityStatus,
+  IdentityViewState,
+  WakeRefusal,
+  ReplacedSession,
+  IdentityConvergence,
   IdentityInspection,
   IdentityBootstrapEntry,
   IdentityBootstrapStatus,
   IdentityRestoreProgress,
+  FirstBootPendingRow,
   SendResult,
   DispatchResult,
   DeliveryScope,
@@ -501,19 +504,7 @@ export type {
   TurnState,
   TurnUnavailable,
   AwaitedTurn,
-  LeaseInfo,
-  DurabilityPolicy,
-  ContinuityHealth,
-  ContinuityRecord,
-  ContinuityFailure,
-  ContinuityResolveState,
-  SessionSnapshot,
-  LeaseGrant,
-  LeaseAcquireResult,
-  LeaseRenewResult,
   // Provider interfaces
-  ContinuityStore,
-  LeaseProvider,
   RosterProvider,
   AgentCustomizer,
   TopologyProvider,
@@ -586,7 +577,7 @@ export type {
 
 // -- Config modules -------------------------------------------------------
 
-export { auth, eventLog, memory, runtimeStore, sessionStore } from "./config/index.js";
+export { auth, eventLog, memory, runtimeStore } from "./config/index.js";
 
 // -- Module authoring helpers ---------------------------------------------
 

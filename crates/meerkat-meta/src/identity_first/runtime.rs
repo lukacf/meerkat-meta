@@ -1,22 +1,24 @@
-//! Identity-first runtime: delivery, status, lifecycle, and ownership enforcement.
+//! Identity-first runtime: delivery, status and lifecycle over Core's mob.
 //!
-//! This module implements the behavioral core of identity-first continuity:
-//! - Delivery: `send()` and `dispatch()` with addressability and lease enforcement
-//! - Status: `status()` returning `IdentityStatus`
-//! - Lifecycle: `retire()`, `respawn()`, `reset()`, `delete_identity()`
-//! - Ownership: lease tracking, fencing, and invariant enforcement
+//! Meta keeps no durable identity state: Core's mob owns each
+//! member's identity, generation, fence and session binding, and its journal
+//! owns each identity's history. This module provides:
+//! - Delivery: `send()` and `dispatch()` with addressability enforcement
+//! - Status: `status()`, built from Core's facts on every read
+//! - Lifecycle: the wake door, `retire()`, `respawn()`, `reset()` and
+//!   `delete_identity()`, each through Core's verbs
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
 use meerkat_core::types::{HandlingMode, SessionId};
-use tokio::sync::{Mutex, Notify, RwLock, broadcast, oneshot, watch};
+use tokio::sync::{Mutex, RwLock, broadcast, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::agent_memory::{
@@ -24,29 +26,31 @@ use super::agent_memory::{
     AgentMemoryRuntimeInjector, NewAgentMemory,
 };
 use super::bridge::{
-    BridgeAdmissionError, BridgeError, BridgeTurnError, CommittedBoundaryRepair,
-    ResumeRejectionKind, SessionBridge, archived_not_revivable_park_reason,
+    BridgeAdmissionError, BridgeError, BridgeTurnError, ResumeRejectionKind, SessionBridge,
 };
 use super::contracts::{
     AgentCustomizer, ContinuityStore, LeaseProvider, RosterProvider, TopologyProvider,
 };
 use super::delivery_scope::{
     DeliveryScope, ScopeMismatch, ScopedDeliveryError, ScopedDispatchReceipt, ScopedRecovery,
+    ScopedRetireError,
+};
+use super::first_boot_manifest::{
+    FirstBootManifest, FirstBootManifestRefusal, FirstBootRow, FirstBootRowKind, FirstBootRowState,
 };
 use super::types::registered_spec_digest;
 use super::types::{
     AgentAddressability, AgentBuildContext, AgentBuildDraft, AgentIdentity, AgentRuntimeId,
-    AgentRuntimeServices, CheckpointVersion, CompletionCursor, CompletionProgress, CompletionWait,
-    ContinuityFailure, ContinuityFailureKind, ContinuityGeneration, ContinuityHealth,
-    ContinuityRecord, ContinuityStoreError, ContinuityUnrecoverable, CustomizerToolsPending,
-    DeliveryErrorClass, DeliveryErrorRecord, DispatchAdmission, DispatchInput, DurabilityPolicy,
-    DurableAgentSpec, FencingToken, HostRejectedBuildPark, IdentityBootstrapEntry,
-    IdentityBootstrapMode, IdentityBootstrapState, IdentityBootstrapStatus, IdentityLifecycleState,
-    IdentityRestoreProgress, IdentityStatus, LeaseGrant, LeaseInfo, ManagedPeerEdge,
-    MemberHealthReport, MemberReloadDisposition, MemberReloadOutcome, NotAddressable,
-    RegisteredSpec, ReloadAttemptOutcome, ReloadAttemptRecord, RosterContext, SendAdmission,
-    SessionRepairRequired, SessionRepairScope, SessionSnapshot, Ticketed, TopologyContext,
-    TurnOutcome, TurnOutput, TurnTicket, TurnTracking, TurnUntrackable, TurnWait,
+    AgentRuntimeServices, CompletionCursor, CompletionProgress, CompletionWait,
+    ContinuityGeneration, CustomizerToolsPending, DeliveryErrorClass, DeliveryErrorRecord,
+    DispatchAdmission, DispatchInput, DurabilityPolicy, DurableAgentSpec, FencingToken,
+    FirstBootPendingRow, FirstBootWait, IdentityBootstrapEntry, IdentityBootstrapMode,
+    IdentityBootstrapState, IdentityBootstrapStatus, IdentityLifecycleState,
+    IdentityRestoreProgress, IdentityStatus, ManagedPeerEdge, MemberHealthReport,
+    MemberReloadDisposition, MemberReloadOutcome, NotAddressable, RegisteredSpec,
+    ReloadAttemptOutcome, ReloadAttemptRecord, RosterContext, SendAdmission, SessionRepairRequired,
+    SessionRepairScope, Ticketed, TopologyContext, TurnOutcome, TurnOutput, TurnTicket,
+    TurnTracking, TurnUntrackable, TurnWait,
 };
 use crate::actor_loop_health::{ActorLoopHealth, ActorLoopHealthKind, ActorLoopHealthReport};
 use crate::memory::records::{
@@ -231,8 +235,8 @@ fn refuse_unless_registered_row(
 }
 
 /// Tracking reported for a ticketed delivery whose lane recorded none (the
-/// identity has no session bridge or no bound runtime, so nothing was
-/// delivered to track).
+/// identity has no bound runtime, so nothing was delivered to track). A
+/// runtime without a session bridge refuses the send instead.
 fn untracked_delivery() -> TurnTracking {
     TurnTracking::Unavailable(TurnUntrackable::NotDelivered)
 }
@@ -328,40 +332,19 @@ async fn bounded_peer_wiring_by<T>(
 /// The runtime bindings a managed-topology plan was made against.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PeerBindingEpoch {
-    /// Every identity with a continuity record, to its runtime id.
-    known: BTreeMap<AgentIdentity, AgentRuntimeId>,
-    /// The Active subset of `known`.
+    /// Each registered identity Core holds a live member for, to the
+    /// member's runtime id, read from Core.
     active: BTreeMap<AgentIdentity, AgentRuntimeId>,
 }
 
 impl PeerBindingEpoch {
-    /// Whether none of `identities` changed binding (runtime id or activity)
-    /// between `self` and `current`.
+    /// Whether none of `identities` changed binding (runtime id or
+    /// liveness) between `self` and `current`.
     fn unchanged_for(&self, current: &Self, identities: &BTreeSet<AgentIdentity>) -> bool {
-        identities.iter().all(|identity| {
-            self.known.get(identity) == current.known.get(identity)
-                && self.active.get(identity) == current.active.get(identity)
-        })
+        identities
+            .iter()
+            .all(|identity| self.active.get(identity) == current.active.get(identity))
     }
-}
-
-/// The binding epoch of an entries table (see [`PeerBindingEpoch`]).
-fn peer_binding_epoch_of(entries: &BTreeMap<AgentIdentity, IdentityEntry>) -> PeerBindingEpoch {
-    let mut epoch = PeerBindingEpoch::default();
-    for (identity, entry) in entries {
-        let Some(record) = entry.continuity.as_ref() else {
-            continue;
-        };
-        epoch
-            .known
-            .insert(identity.clone(), record.agent_runtime_id.clone());
-        if entry.state == IdentityLifecycleState::Active {
-            epoch
-                .active
-                .insert(identity.clone(), record.agent_runtime_id.clone());
-        }
-    }
-    epoch
 }
 
 /// Outcome of one plan / wire / revalidate pass over the managed topology.
@@ -599,8 +582,37 @@ fn admission_phase_error(
             waited,
             command,
         },
-        other @ (BridgeAdmissionError::ResumeRejected { .. }
-        | BridgeAdmissionError::ProviderAuthRejected { .. }) => {
+        BridgeAdmissionError::ResumeRejected {
+            kind:
+                ResumeRejectionKind::Unavailable {
+                    reason: meerkat_mob::error::SessionResumeUnavailableReason::Absent,
+                },
+            session_id,
+            detail,
+        } => IdentityRuntimeError::IdentitySessionAbsent {
+            identity,
+            session_id,
+            detail,
+        },
+        // Core's other resume refusals keep their wake classification:
+        // final, held or retryable, by kind and never by text.
+        BridgeAdmissionError::ResumeRejected {
+            kind,
+            session_id,
+            detail,
+        } => {
+            let session = session_id.clone();
+            classify_wake_failure(
+                &identity,
+                Some(&session),
+                BridgeError::ResumeRejected {
+                    kind,
+                    session_id,
+                    detail,
+                },
+            )
+        }
+        other @ BridgeAdmissionError::ProviderAuthRejected { .. } => {
             IdentityRuntimeError::AdmissionFailed {
                 identity,
                 detail: other.to_string(),
@@ -672,6 +684,35 @@ fn ingress_phase_error(identity: &AgentIdentity, err: BridgeError) -> IdentityRu
             session_id,
             stage,
         },
+        BridgeError::ResumeRejected {
+            kind:
+                ResumeRejectionKind::Unavailable {
+                    reason: meerkat_mob::error::SessionResumeUnavailableReason::Absent,
+                },
+            session_id,
+            detail,
+        } => IdentityRuntimeError::IdentitySessionAbsent {
+            identity,
+            session_id,
+            detail,
+        },
+        // Core's other resume refusals keep their wake classification.
+        BridgeError::ResumeRejected {
+            kind,
+            session_id,
+            detail,
+        } => {
+            let session = session_id.clone();
+            classify_wake_failure(
+                &identity,
+                Some(&session),
+                BridgeError::ResumeRejected {
+                    kind,
+                    session_id,
+                    detail,
+                },
+            )
+        }
         other => IdentityRuntimeError::Internal(format!("bridge deliver: {other}")),
     }
 }
@@ -727,6 +768,72 @@ fn turn_phase_error(identity: &AgentIdentity, err: BridgeTurnError) -> IdentityR
         }
         BridgeTurnError::PostAdmissionResolutionFailed(detail) => {
             IdentityRuntimeError::PostAdmissionResolutionFailed { identity, detail }
+        }
+    }
+}
+
+/// Why Core cannot resume an identity's last session. Each is
+/// Core's durable answer at rest (`SessionResumeUnavailableReason`), matched
+/// by kind and never by text; no retry changes it. Core's `Absent` is not
+/// here: a session that was never persisted holds nothing to lose, so the
+/// wake spawns fresh instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnresumableReason {
+    /// The document is intact but archived, and its runtime lifecycle refuses
+    /// revival.
+    ArchivedNotRevivable,
+    /// Positive durable authority or lifecycle rows exist without a
+    /// materializable session body.
+    ContradictoryDurableAuthority,
+}
+
+impl UnresumableReason {
+    /// The wire token (`data.reason` of `IDENTITY_UNRESUMABLE_CODE`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ArchivedNotRevivable => "archived_not_revivable",
+            Self::ContradictoryDurableAuthority => "contradictory_durable_authority",
+        }
+    }
+}
+
+/// Why Core held an identity's resume. The
+/// durable session is kept in every case and every later wake tries again;
+/// the hold is recorded for the views until one succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WakeHold {
+    /// Core withheld the session's durable resume
+    /// ([`meerkat_core::service::DurableResumeHold`]). An audited-endpoint
+    /// divergence is repaired with `rkat session repair-wholeblob`, then
+    /// `meta/reload_member`. Core re-runs its tail recovery on every resume
+    /// and has no command for the other holds, so they stay until the
+    /// durable evidence changes.
+    DurableResume(meerkat_core::service::DurableResumeHold),
+    /// Core cannot prove which committed boundary of the session is
+    /// authoritative (`SessionResumeUnavailableReason::CommittedBoundaryUnprovable`);
+    /// the durable copies are retained for reconciliation.
+    CommittedBoundaryUnprovable,
+    /// The roster profile moved off the role Core last ran the identity
+    /// under, and this activation declared no such migration (Meta never
+    /// infers one), or Core refused the declared migration.
+    RoleMigrationNotApplied,
+}
+
+impl WakeHold {
+    /// What the operator does next.
+    #[must_use]
+    pub const fn remedy(self) -> super::types::WakeRefusalRemedy {
+        match self {
+            Self::DurableResume(
+                meerkat_core::service::DurableResumeHold::AuditedEndpointDivergence,
+            ) => super::types::WakeRefusalRemedy::RepairSession,
+            Self::DurableResume(_) | Self::CommittedBoundaryUnprovable => {
+                super::types::WakeRefusalRemedy::OperatorReview
+            }
+            Self::RoleMigrationNotApplied => super::types::WakeRefusalRemedy::ResolveRoleMigration,
         }
     }
 }
@@ -856,19 +963,6 @@ pub enum IdentityRuntimeError {
         identity: AgentIdentity,
         detail: String,
     },
-    /// Operation rejected: no active lease for this identity.
-    NoActiveLease(AgentIdentity),
-    /// Fail-closed single-embodiment guard: the identity's durable lease is
-    /// held by another live runtime instance — a second live embodiment is
-    /// refused, loudly and with the holder named. This is a POLICY point,
-    /// not a structural assumption: multi-bind / forked-session semantics
-    /// (future work) relax exactly this arm.
-    AlreadyEmbodied {
-        identity: AgentIdentity,
-        holder: String,
-    },
-    /// Operation rejected: lease was lost.
-    LeaseLost(AgentIdentity),
     /// The send named the registered row its input was authored from, and
     /// the identity's registered row is no longer that row. Checked under
     /// the identity's lifecycle lock before delivery: NOTHING was submitted.
@@ -892,29 +986,8 @@ pub enum IdentityRuntimeError {
         identity: AgentIdentity,
         detail: String,
     },
-    /// Continuity store error.
-    Store(ContinuityStoreError),
-    /// Lease provider error.
-    Lease(super::types::LeaseError),
     /// Duplicate identities in roster.
     DuplicateIdentity(AgentIdentity),
-    /// Stale fencing token on checkpoint.
-    StaleFencingToken {
-        identity: AgentIdentity,
-        presented: FencingToken,
-        current: FencingToken,
-    },
-    /// Stale checkpoint version.
-    StaleCheckpointVersion {
-        identity: AgentIdentity,
-        presented: CheckpointVersion,
-        current: CheckpointVersion,
-    },
-    StaleContinuityGeneration {
-        identity: AgentIdentity,
-        presented: ContinuityGeneration,
-        current: ContinuityGeneration,
-    },
     /// A lifecycle request named an old generated runtime alias after the
     /// durable identity had already advanced to another generation.
     StaleRuntimeAlias {
@@ -930,17 +1003,6 @@ pub enum IdentityRuntimeError {
         identity: AgentIdentity,
         baseline: CompletionCursor,
         observed: CompletionCursor,
-    },
-    /// The identity is parked because its build was DETERMINISTICALLY
-    /// rejected: either the host answered the app-side `callback/build_agent`
-    /// round trip with an error (the candidate-mode effect gate class), or
-    /// provider authentication refused the build with a credential kind no
-    /// unattended retry can change (a missing secret). No automatic retry: a
-    /// roster/policy (spec) change clears the park; `reason` carries the
-    /// rejection for operators.
-    HostRejectedBuild {
-        identity: AgentIdentity,
-        reason: String,
     },
     /// A held identity bootstrap refused its roster, or its pass ended
     /// before the host was asked to complete: no member of a refused roster
@@ -960,16 +1022,123 @@ pub enum IdentityRuntimeError {
     /// A held bootstrap's member that the pass did not publish owes its host
     /// a fresh held completion: an ordinary (unheld) embodiment would publish
     /// a new instance whose finished surface the host's completion never saw,
-    /// so it is refused and the identity stays Broken here until a held pass
-    /// that covers it completes it.
+    /// so every wake outside a held pass that covers it refuses it typed,
+    /// until such a pass completes it.
     HeldCompletionOwed {
         identity: AgentIdentity,
     },
-    /// A concrete member resume reached a typed terminal refusal. The
-    /// continuity record is preserved and the failure remains attributable to
-    /// this identity when an eager fleet restore converts it into a visible
-    /// `RestoreOutcome::Broken`.
-    EmbodimentRejected(Box<ContinuityFailure>),
+    /// The identity's last session cannot be resumed: Core
+    /// answered that it is archived beyond revival, or that its durable
+    /// authority contradicts its body. Nothing was spawned and no retry can
+    /// change the answer; `delete_identity` starts a fresh life. JSON-RPC
+    /// `IDENTITY_UNRESUMABLE_CODE`.
+    IdentityUnresumable {
+        identity: AgentIdentity,
+        session_id: SessionId,
+        reason: UnresumableReason,
+        detail: String,
+    },
+    /// The identity's history could not be read from Core, or its resume
+    /// failed on a transient fault. Nothing was spawned, and a
+    /// read fault is never taken as "no history": the next wake retries.
+    /// JSON-RPC `IDENTITY_HISTORY_UNAVAILABLE_CODE`.
+    IdentityHistoryUnavailable {
+        identity: AgentIdentity,
+        detail: String,
+    },
+    /// Core's member history could not be read for a view over every
+    /// identity (`statuses`, `roster_inspect`): no status is reported rather
+    /// than an empty or guessed list. JSON-RPC
+    /// `IDENTITY_HISTORY_UNAVAILABLE_CODE`.
+    MemberHistoryUnavailable {
+        detail: String,
+    },
+    /// The first-boot manifest `storage-migrate-native` or `identity-reset`
+    /// left in the state directory cannot be used: the reader refused it.
+    /// Which identities it covers is unknown, so the roster compile refuses
+    /// every identity with it and no identity wakes; the gateway stays up,
+    /// and its bootstrap status names the file and the refusal. JSON-RPC
+    /// `STORAGE_RESOLUTION_CODE`.
+    FirstBootManifestUnreadable {
+        path: PathBuf,
+        detail: String,
+    },
+    /// Core's member history contradicts the identity's first-boot row
+    ///: Core's mob store is not the one the migration read.
+    /// Nothing was changed, the identity does not wake, and the row stays in
+    /// the manifest. JSON-RPC `STORAGE_RESOLUTION_CODE`.
+    FirstBootRowRefused {
+        identity: AgentIdentity,
+        kind: FirstBootRowKind,
+        /// The session the row names.
+        manifest_session: SessionId,
+        /// The session Core's last binding of the identity names, if any.
+        core_session: Option<SessionId>,
+        detail: String,
+    },
+    /// The identity still has a first-boot row to carry out, and
+    /// `operation` would start a life the row does not know: it is refused
+    /// until the row is carried out. `waiting_for` names the way out: a
+    /// roster that lists the identity (its compile carries the row out), or
+    /// the listed identity's wake. JSON-RPC `STORAGE_RESOLUTION_CODE`.
+    FirstBootRowPending {
+        identity: AgentIdentity,
+        kind: FirstBootRowKind,
+        waiting_for: FirstBootWait,
+        operation: &'static str,
+    },
+    /// The wake's resume failed on a transient fault (busy, I/O, a lock, an
+    /// unavailable store). Nothing was spawned, the durable session
+    /// is kept, and the next wake retries. Never a reason to delete the
+    /// identity. JSON-RPC `IDENTITY_HISTORY_UNAVAILABLE_CODE`.
+    IdentityWakeRetryable {
+        identity: AgentIdentity,
+        /// The session the wake was resuming or reviving, when it had one.
+        session_id: Option<SessionId>,
+        detail: String,
+    },
+    /// A delivery reached the identity's member, whose session Core holds no
+    /// durable copy of: the bridge's delivery repair refused it `Absent`
+    /// before retiring anything, so nothing was delivered and nothing was
+    /// disposed. Core never persisted that session, so nothing durable is
+    /// lost by replacing it: the identity's next delivery starts its fresh
+    /// life first, with this session as its replaced session. Deliver again.
+    /// JSON-RPC `IDENTITY_HISTORY_UNAVAILABLE_CODE`.
+    IdentitySessionAbsent {
+        identity: AgentIdentity,
+        /// The member's session Core holds no durable copy of.
+        session_id: SessionId,
+        detail: String,
+    },
+    /// The build of the identity's member was refused DETERMINISTICALLY: the
+    /// host answered the app-side `callback/build_agent` round trip with an
+    /// error (the candidate-mode effect gate class), provider authentication
+    /// refused it with a credential kind no unattended retry can change, or
+    /// the placement host's realm backend is not persistent while the
+    /// identity needs durable sessions. Returned on each attempt; nothing is
+    /// parked or recorded.
+    HostRejectedBuild {
+        identity: AgentIdentity,
+        reason: String,
+    },
+    /// Core holds an identity intent row for the identity: a host adopted
+    /// it, and Core's reconciler drives it. Meta's lifecycle verbs
+    /// refuse it, because a Meta command would make a second driver.
+    /// JSON-RPC `IDENTITY_HOST_ADOPTED_CODE`.
+    IdentityHostAdopted {
+        identity: AgentIdentity,
+    },
+    /// The wake's resume was held: Core withheld the
+    /// session's durable resume, or the roster profile moved off the role
+    /// Core last ran the identity under without a declared migration. The
+    /// durable session is kept, nothing was spawned, and the next wake tries
+    /// again; [`WakeHold::remedy`] names what the operator does.
+    WakeHeld {
+        identity: AgentIdentity,
+        session_id: SessionId,
+        hold: WakeHold,
+        detail: String,
+    },
     /// A managed-topology wiring call to the session bridge (a wire, unwire or
     /// wire inspection, each one a mob-actor round trip) was not observed
     /// within its budget. The reconcile or topology mutation that issued it
@@ -1085,13 +1254,6 @@ impl std::fmt::Display for IdentityRuntimeError {
                  superseded while it ran: {detail}; the turn RAN against an embodiment \
                  that no longer exists - do not retry, and its session was NOT rebound"
             ),
-            Self::NoActiveLease(id) => write!(f, "no active lease for {id}"),
-            Self::AlreadyEmbodied { identity, holder } => write!(
-                f,
-                "identity {identity} is already embodied by runtime instance '{holder}' \
-                 (single-embodiment guard: refusing a second live bind)"
-            ),
-            Self::LeaseLost(id) => write!(f, "lease lost for {id}"),
             Self::RegisteredSpecChanged { identity, .. } => write!(
                 f,
                 "the registered row of {identity} is no longer the row the input was \
@@ -1110,33 +1272,7 @@ impl std::fmt::Display for IdentityRuntimeError {
                 "dispatch to {identity} refused before bridge admission: invalid delivery \
                  identity ({detail}); dedup or typed refusal, never a degraded delivery"
             ),
-            Self::Store(err) => write!(f, "continuity store: {err}"),
-            Self::Lease(err) => write!(f, "lease provider: {err}"),
             Self::DuplicateIdentity(id) => write!(f, "duplicate identity in roster: {id}"),
-            Self::StaleFencingToken {
-                identity,
-                presented,
-                current,
-            } => write!(
-                f,
-                "stale fencing token for {identity}: presented {presented}, current {current}"
-            ),
-            Self::StaleCheckpointVersion {
-                identity,
-                presented,
-                current,
-            } => write!(
-                f,
-                "stale checkpoint version for {identity}: presented {presented}, current {current}"
-            ),
-            Self::StaleContinuityGeneration {
-                identity,
-                presented,
-                current,
-            } => write!(
-                f,
-                "stale continuity generation for {identity}: presented {presented}, current {current}"
-            ),
             Self::StaleRuntimeAlias {
                 identity,
                 requested,
@@ -1158,11 +1294,6 @@ impl std::fmt::Display for IdentityRuntimeError {
                 "completion baseline {baseline} for {identity} belongs to a superseded runtime \
                  incarnation (now {observed}); capture a fresh baseline"
             ),
-            Self::HostRejectedBuild { identity, reason } => write!(
-                f,
-                "identity {identity} is parked: its build was deterministically rejected \
-                 ({reason}); a roster/policy (spec) change clears the park"
-            ),
             Self::HeldBootstrapRefused(refusal) => {
                 write!(f, "held identity bootstrap refused: {refusal}")
             }
@@ -1176,12 +1307,131 @@ impl std::fmt::Display for IdentityRuntimeError {
             Self::HeldCompletionOwed { identity } => write!(
                 f,
                 "identity {identity} owes its host a fresh held completion: its held member \
-                 was not published, so it is not embodied unheld"
+                 was not published, so it is not embodied unheld. Run the host's held \
+                 bootstrap again (a pass that covers the identity publishes it); if the host \
+                 will never complete it, remove its mark from the state directory's \
+                 held-completion-owed directory"
             ),
-            Self::EmbodimentRejected(failure) => write!(
+            Self::IdentityUnresumable {
+                identity,
+                session_id,
+                reason,
+                detail,
+            } => write!(
                 f,
-                "identity {} embodiment was rejected: {}",
-                failure.identity, failure.detail
+                "identity {identity} cannot be woken: Core cannot resume its last session \
+                 {session_id} ({}: {detail}); nothing was spawned, and delete_identity \
+                 starts a fresh life",
+                reason.as_str()
+            ),
+            Self::IdentityHistoryUnavailable { identity, detail } => write!(
+                f,
+                "identity {identity}: {detail}; nothing was changed, retry"
+            ),
+            Self::MemberHistoryUnavailable { detail } => write!(
+                f,
+                "Core's member history could not be read: {detail}; no identity status is \
+                 reported, retry"
+            ),
+            Self::FirstBootManifestUnreadable { path, detail } => write!(
+                f,
+                "the first-boot manifest {} cannot be used ({detail}); no identity was woken. \
+                 Move it aside and keep it. If no 0.9.4 runtime has started on the directory \
+                 since storage-migrate-native --apply, restore the copy that run kept beside \
+                 it (storage-migrate-native.first-boot.json.pre-*.native-migration), then run \
+                 meta_gateway identity-reset again for every reset made since that run: \
+                 identity-reset keeps no copy, so the restored file lacks them. If a runtime \
+                 has started since, restore no older copy (its rows were carried out \
+                 already): start with no manifest and run identity-reset again for each reset \
+                 made since the last start. Removing the manifest also drops a migration row \
+                 still pending for an identity no roster listed since: that identity starts \
+                 fresh when it is added back, and nothing reports it, so compare against the \
+                 last meta_gateway identity-census output before removing it",
+                path.display()
+            ),
+            Self::FirstBootRowRefused {
+                identity,
+                kind,
+                manifest_session,
+                core_session,
+                detail,
+            } => write!(
+                f,
+                "identity {identity} was not woken: its first-boot {kind} row names session \
+                 {manifest_session}, but Core's member history contradicts it ({detail}; \
+                 Core's last session: {}). Core's mob store is not the one \
+                 storage-migrate-native migrated; nothing was changed",
+                core_session
+                    .as_ref()
+                    .map_or_else(|| "none".to_string(), ToString::to_string)
+            ),
+            Self::FirstBootRowPending {
+                identity,
+                kind,
+                waiting_for,
+                operation,
+            } => write!(
+                f,
+                "identity {identity} still has a first-boot {kind} row to carry out, so \
+                 {operation} is refused; nothing was changed. {}",
+                match waiting_for {
+                    FirstBootWait::Roster => {
+                        "Add the identity to the roster: the roster compile carries the row \
+                         out. Then retry"
+                    }
+                    FirstBootWait::CarryOut => {
+                        "Wake the identity: its wake carries the row out, or answers why it \
+                         cannot. Then retry"
+                    }
+                }
+            ),
+            Self::IdentityWakeRetryable {
+                identity,
+                session_id: Some(session_id),
+                detail,
+            } => write!(
+                f,
+                "identity {identity} was not woken: resuming session {session_id} failed \
+                 transiently ({detail}); nothing was spawned, retry the wake"
+            ),
+            Self::IdentityWakeRetryable {
+                identity,
+                session_id: None,
+                detail,
+            } => write!(
+                f,
+                "identity {identity} was not woken: Core's wake failed transiently \
+                 ({detail}); nothing was spawned, retry the wake"
+            ),
+            Self::IdentitySessionAbsent {
+                identity,
+                session_id,
+                detail,
+            } => write!(
+                f,
+                "identity {identity}'s member is bound to session {session_id}, which Core \
+                 holds no durable copy of ({detail}); nothing was delivered. The next \
+                 delivery starts the identity's fresh life first, so deliver again"
+            ),
+            Self::HostRejectedBuild { identity, reason } => write!(
+                f,
+                "the build of identity {identity} was deterministically rejected ({reason}); \
+                 a roster or policy change is needed before it can be woken"
+            ),
+            Self::IdentityHostAdopted { identity } => write!(
+                f,
+                "identity {identity} is adopted by its host: Core holds its identity intent \
+                 and drives it, so Meta's lifecycle verbs refuse it"
+            ),
+            Self::WakeHeld {
+                identity,
+                session_id,
+                detail,
+                ..
+            } => write!(
+                f,
+                "identity {identity} was not woken: Core held the resume of session \
+                 {session_id} ({detail}); the session is kept and nothing was spawned"
             ),
             Self::PeerWiringTimedOut { operation, waited } => write!(
                 f,
@@ -1198,61 +1448,23 @@ impl std::fmt::Display for IdentityRuntimeError {
     }
 }
 
-/// The role-migration refusal that still holds for an action on `spec`:
-/// `entry` is Broken on the exact embodiment the refusal was recorded for,
-/// and `spec` is the spec it was refused against. Every consumer passes the
-/// spec it is about to act on (the entry's current spec, or a pass's
-/// incoming roster spec), so a changed spec never inherits the refusal.
-fn role_migration_refusal_for<'a>(
-    entry: &'a IdentityEntry,
-    spec: &DurableAgentSpec,
-) -> Option<&'a RoleMigrationRefusal> {
-    if entry.state != IdentityLifecycleState::Broken {
-        return None;
-    }
-    let refusal = entry.role_migration_refusal.as_ref()?;
-    let same_embodiment = entry.continuity.as_ref().is_some_and(|record| {
-        record.session_id == refusal.session_id && record.generation == refusal.generation
-    });
-    (same_embodiment && refusal.spec_digest == durable_spec_digest(spec)).then_some(refusal)
-}
-
-/// Digest of the exact roster spec, for [`HostRejectedBuildPark`] scoping.
-/// Process-local (std hasher over the canonical JSON form): the park itself
-/// is in-memory, so cross-process stability is not required.
-pub(crate) fn durable_spec_digest(spec: &DurableAgentSpec) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    match serde_json::to_string(spec) {
-        Ok(json) => json.hash(&mut hasher),
-        // A roster spec is plain data; serialization cannot realistically
-        // fail. Degrade to "spec never changes" rather than panicking.
-        Err(_) => spec.identity.as_str().hash(&mut hasher),
-    }
-    hasher.finish()
-}
-
 /// A build failure whose root cause is the HOST's own answer: the
 /// `callback/build_agent` round trip COMPLETED and the app returned an error
 /// (rpc_gateway mints `callback/build_agent failed: callback error: <host
-/// message>` for exactly this case — see `StdioCallbackBridge::call`).
+/// message>` for exactly this case; see `StdioCallbackBridge::call`).
 /// Transport-tier callback failures ("callback transport closed", timeouts,
-/// dropped channels) deliberately do NOT match: those are retryable and stay
-/// on the existing reconcile/repair lanes (their backoff is the upstream
-/// meerkat fix, not this park).
+/// dropped channels) deliberately do NOT match: those are retryable.
 pub(crate) fn is_host_rejected_build_error(detail: &str) -> bool {
     detail.contains("callback/build_agent failed: callback error:")
 }
 
 /// Whether a typed provider-auth kind is a DETERMINISTIC build wall: a fact
-/// about configuration that no unattended retry can change, so the identity
-/// parks with the reason instead of heal-looping through the continuity
-/// repair supervisor (a missing key used to burn a full build per attempt,
-/// forever, with the cause visible nowhere). The remaining kinds describe
-/// credential STATE that can change out of band (a lease refreshes, a login
-/// completes, an I/O fault clears, the credential store answers again), so
-/// they stay on the existing repair lanes. Exhaustive on purpose: a new kind
-/// must be classified here.
+/// about configuration that no unattended retry can change, so the wake
+/// refuses with the reason instead of reporting a retryable fault. The
+/// remaining kinds describe credential STATE that can change out of band (a
+/// lease refreshes, a login completes, an I/O fault clears, the credential
+/// store answers again), so the next wake retries them. Exhaustive on
+/// purpose: a new kind must be classified here.
 pub(crate) const fn is_deterministic_provider_auth_kind(kind: meerkat_core::AuthErrorKind) -> bool {
     use meerkat_core::AuthErrorKind;
     match kind {
@@ -1281,19 +1493,27 @@ pub(crate) const fn is_deterministic_provider_auth_kind(kind: meerkat_core::Auth
     }
 }
 
-/// The park reason for a build the bridge refused DETERMINISTICALLY, or
-/// `None` when the failure may resolve on its own and belongs on the repair
-/// lanes. Two walls are recognised: the typed provider-auth refusal
+/// The refusal reason for a build the bridge refused DETERMINISTICALLY, or
+/// `None` when the failure may resolve on its own (the next wake retries it).
+/// Three walls are recognised: the typed provider-auth refusal
 /// ([`BridgeError::ProviderAuthRejected`] with a kind
-/// [`is_deterministic_provider_auth_kind`] accepts) and the host's own
-/// `callback/build_agent` answer ([`is_host_rejected_build_error`], the one
-/// place a string probe remains because `rpc_gateway` mints that text).
+/// [`is_deterministic_provider_auth_kind`] accepts), the placement host's
+/// typed refusal for a realm backend that is not persistent
+/// ([`BridgeError::RealmBackendUnavailable`]; the reason names the remedy),
+/// and the host's own `callback/build_agent` answer
+/// ([`is_host_rejected_build_error`], the one place a string probe remains
+/// because `rpc_gateway` mints that text).
 pub(crate) fn deterministic_build_rejection_reason(error: &BridgeError) -> Option<String> {
     match error {
         BridgeError::ProviderAuthRejected { failure, detail } => {
             is_deterministic_provider_auth_kind(failure.kind)
-                .then(|| provider_auth_park_reason(failure, detail))
+                .then(|| provider_auth_refusal_reason(failure, detail))
         }
+        BridgeError::RealmBackendUnavailable { detail } => Some(format!(
+            "{detail}; a durable identity needs durable sessions on the host it is placed \
+             on: run that host with a persistent realm backend, or remove the identity's \
+             placement"
+        )),
         other => {
             let detail = other.to_string();
             is_host_rejected_build_error(&detail).then_some(detail)
@@ -1301,17 +1521,212 @@ pub(crate) fn deterministic_build_rejection_reason(error: &BridgeError) -> Optio
     }
 }
 
-/// One producer text for the provider-auth park so operators see a stable,
-/// greppable reason with the operator path inline.
-fn provider_auth_park_reason(
+/// Whether a failed resume is Core's typed answer that no durable session
+/// exists for the id (`SessionResumeUnavailableReason::Absent`). Such a
+/// session was never persisted and holds nothing to lose, so the wake spawns
+/// fresh instead of refusing.
+fn resume_refused_absent(error: &BridgeError) -> bool {
+    matches!(
+        error,
+        BridgeError::ResumeRejected {
+            kind: ResumeRejectionKind::Unavailable {
+                reason: meerkat_mob::error::SessionResumeUnavailableReason::Absent,
+            },
+            ..
+        }
+    )
+}
+
+/// A resume refusal Core gave no typed reason for (`Other`), which only
+/// Core's durable read can tell apart from a transient fault.
+fn resume_refused_untyped(error: &BridgeError) -> bool {
+    matches!(
+        error,
+        BridgeError::ResumeRejected {
+            kind: ResumeRejectionKind::Other,
+            ..
+        }
+    )
+}
+
+/// The runtime-plane reservation on identity-first member creation: an
+/// identity the console would attribute to `_system` or `__console__` is
+/// refused as a host-rejected build
+/// ([`crate::member_comms_id::refuse_runtime_plane_identity`]), typed on
+/// every attempt and never recorded, before anything is built.
+fn refuse_runtime_plane_creation(identity: &AgentIdentity) -> Result<(), IdentityRuntimeError> {
+    crate::member_comms_id::refuse_runtime_plane_identity(identity).map_err(|reason| {
+        IdentityRuntimeError::HostRejectedBuild {
+            identity: identity.clone(),
+            reason,
+        }
+    })
+}
+
+/// Classify a failed resume or revival of `identity`,
+/// by kind and never by text:
+/// - Core's durable answer that the last session cannot be resumed
+///   (archived beyond revival, or contradictory durable authority) is FINAL:
+///   `IdentityUnresumable`, remedy `delete_identity`;
+/// - a resume Core held (a durable resume hold, an unprovable committed
+///   boundary, a role migration it did not apply) is HELD: `WakeHeld`, the
+///   session kept;
+/// - the host's deterministic build refusal is `HostRejectedBuild`, typed on
+///   every attempt and not recorded;
+/// - an identity intent row the bridge found (a host adopted the identity
+///   after the wake's own check) is `IdentityHostAdopted`;
+/// - everything else (Core's refused tail recovery, authority that changed
+///   mid-load, a member that moved under the bridge's reads, busy, I/O, a
+///   lock, a stringified Core error) is retryable and never suggests
+///   deleting anything.
+///
+/// Core's `Absent` never reaches here as a refusal: the wake spawns fresh
+/// first ([`resume_refused_absent`]).
+fn classify_wake_failure(
+    identity: &AgentIdentity,
+    session_id: Option<&SessionId>,
+    error: BridgeError,
+) -> IdentityRuntimeError {
+    use meerkat_core::service::DurableResumeHold;
+    use meerkat_mob::error::SessionResumeUnavailableReason as Unavailable;
+
+    if let Some(reason) = deterministic_build_rejection_reason(&error) {
+        return IdentityRuntimeError::HostRejectedBuild {
+            identity: identity.clone(),
+            reason,
+        };
+    }
+    if matches!(error, BridgeError::HostAdopted { .. }) {
+        return IdentityRuntimeError::IdentityHostAdopted {
+            identity: identity.clone(),
+        };
+    }
+    let detail = error.to_string();
+    let retryable = |session_id: Option<&SessionId>| IdentityRuntimeError::IdentityWakeRetryable {
+        identity: identity.clone(),
+        session_id: session_id.cloned(),
+        detail: detail.clone(),
+    };
+    let held = |session_id: &SessionId, hold: WakeHold| IdentityRuntimeError::WakeHeld {
+        identity: identity.clone(),
+        session_id: session_id.clone(),
+        hold,
+        detail: detail.clone(),
+    };
+    if let BridgeError::SessionRepairRequired { session_id, .. } = &error {
+        return held(
+            session_id,
+            WakeHold::DurableResume(DurableResumeHold::AuditedEndpointDivergence),
+        );
+    }
+    let (BridgeError::ResumeRejected { kind, .. }, Some(session_id)) = (&error, session_id) else {
+        return retryable(session_id);
+    };
+    let unresumable = |reason: UnresumableReason| IdentityRuntimeError::IdentityUnresumable {
+        identity: identity.clone(),
+        session_id: session_id.clone(),
+        reason,
+        detail: detail.clone(),
+    };
+    match kind {
+        ResumeRejectionKind::Unavailable { reason } => match reason {
+            Unavailable::ArchivedNotRevivable => {
+                unresumable(UnresumableReason::ArchivedNotRevivable)
+            }
+            Unavailable::ContradictoryDurableAuthority => {
+                unresumable(UnresumableReason::ContradictoryDurableAuthority)
+            }
+            Unavailable::CommittedBoundaryUnprovable => {
+                held(session_id, WakeHold::CommittedBoundaryUnprovable)
+            }
+            // The store's authority moved while the body loaded: the next
+            // attempt reads it again. `Absent` spawned fresh before this
+            // classifier; reaching here it is read as transient.
+            Unavailable::AuthorityChangedDuringMaterialization | Unavailable::Absent => {
+                retryable(Some(session_id))
+            }
+        },
+        // Core's own doc: retry after the conflicting runtime quiesces.
+        ResumeRejectionKind::Held {
+            hold: DurableResumeHold::RecoveryRefused,
+        } => retryable(Some(session_id)),
+        ResumeRejectionKind::Held { hold } => held(session_id, WakeHold::DurableResume(*hold)),
+        ResumeRejectionKind::RoleMigrationNotApplied => {
+            held(session_id, WakeHold::RoleMigrationNotApplied)
+        }
+        _ => retryable(Some(session_id)),
+    }
+}
+
+/// The refusal the views record for a failed wake, or `None`
+/// for a refusal the next wake retries. Only the final refusal and Core's
+/// holds are recorded; the code is the one the wake answered.
+fn wake_refusal_of(error: &IdentityRuntimeError) -> Option<super::types::WakeRefusal> {
+    let (session_id, remedy) = match error {
+        IdentityRuntimeError::IdentityUnresumable { session_id, .. } => {
+            (session_id, super::types::WakeRefusalRemedy::DeleteIdentity)
+        }
+        IdentityRuntimeError::WakeHeld {
+            session_id, hold, ..
+        } => (session_id, hold.remedy()),
+        _ => return None,
+    };
+    Some(super::types::WakeRefusal {
+        code: crate::rpc::identity_error_code(error),
+        session_id: session_id.clone(),
+        remedy,
+    })
+}
+
+/// Name a stale scoped retire's mismatch as a scoped dispatch names it.
+/// meerkat refuses "another incarnation is current" with the current fence
+/// only: when the live member read before the retire runs under another
+/// runtime id, the mismatch is `RuntimeId`; otherwise only Core's fence
+/// moved (`LeaseFencingToken`).
+fn name_stale_retire_mismatch(
+    error: ScopedRetireError,
+    live: Option<&meerkat_mob::MemberDeliveryScope>,
+    scope: &meerkat_mob::MemberDeliveryScope,
+) -> ScopedRetireError {
+    match error {
+        ScopedRetireError::StaleScope {
+            mismatch: ScopeMismatch::LeaseFencingToken,
+            detail,
+        } if live.is_some_and(|live| live.runtime_id() != scope.runtime_id()) => {
+            ScopedRetireError::StaleScope {
+                mismatch: ScopeMismatch::RuntimeId,
+                detail,
+            }
+        }
+        error => error,
+    }
+}
+
+/// Meta's public spelling (`rt:{identity}:{generation}`) of a Core runtime
+/// id, the one the session bridge keys its member bookkeeping by.
+fn meta_runtime_id(
+    runtime_id: &meerkat_mob::AgentRuntimeId,
+) -> Result<AgentRuntimeId, IdentityRuntimeError> {
+    AgentRuntimeId::parse(&crate::member_comms_id::public_runtime_alias(runtime_id)).map_err(
+        |error| {
+            IdentityRuntimeError::Internal(format!(
+                "Core runtime id {runtime_id} has no public alias: {error}"
+            ))
+        },
+    )
+}
+
+/// One producer text for a deterministic provider-auth refusal so operators
+/// see a stable, greppable reason with the operator path inline.
+fn provider_auth_refusal_reason(
     failure: &meerkat_core::service::SessionProviderAuthFailure,
     detail: &str,
 ) -> String {
     format!(
         "{} (typed AuthErrorKind `{}`): a credential/binding fact no unattended retry can \
-         change, so this identity is parked instead of heal-looping. Operator path: supply \
-         the credential or fix the binding for provider `{}`, then restart the gateway (the \
-         park is process-local) or change the roster spec. Refusal: {detail}",
+         change, so the wake is refused. Operator path: supply the credential or fix the \
+         binding for provider `{}`, then wake the identity again or change the roster spec. \
+         Refusal: {detail}",
         failure.public_message(),
         failure.kind.as_str(),
         failure.provider.as_str()
@@ -1365,28 +1780,127 @@ impl IdentityRuntimeError {
             Self::ReloadTimedOut { stage, .. } => Some(serde_json::json!({
                 "kind": "mob_member_reload_timed_out", "stage": stage,
             })),
+            Self::IdentityUnresumable {
+                identity,
+                session_id,
+                reason,
+                ..
+            } => Some(serde_json::json!({
+                "kind": "identity_unresumable", "identity": identity,
+                "session_id": session_id.to_string(), "reason": reason.as_str(),
+                "remedy": "delete_identity", "retryable": false,
+            })),
+            Self::IdentityHistoryUnavailable { identity, .. } => Some(serde_json::json!({
+                "kind": "identity_history_unavailable", "identity": identity,
+                "retryable": true,
+            })),
+            Self::MemberHistoryUnavailable { .. } => Some(serde_json::json!({
+                "kind": "identity_history_unavailable", "retryable": true,
+            })),
+            Self::FirstBootManifestUnreadable { path, .. } => Some(serde_json::json!({
+                "kind": "first_boot_manifest_unreadable", "path": path.display().to_string(),
+                "retryable": false,
+            })),
+            Self::FirstBootRowRefused {
+                identity,
+                kind,
+                manifest_session,
+                core_session,
+                ..
+            } => Some(serde_json::json!({
+                "kind": "first_boot_row_refused", "identity": identity,
+                "row_kind": kind, "manifest_session": manifest_session.to_string(),
+                "core_session": core_session.as_ref().map(ToString::to_string),
+                "retryable": false,
+            })),
+            Self::FirstBootRowPending {
+                identity,
+                kind,
+                waiting_for,
+                operation,
+            } => Some(serde_json::json!({
+                "kind": "first_boot_row_pending", "identity": identity, "row_kind": kind,
+                "waiting_for": waiting_for, "operation": operation,
+                "remedy": match waiting_for {
+                    FirstBootWait::Roster => "add_to_roster",
+                    FirstBootWait::CarryOut => "wake_identity",
+                },
+                "retryable": true,
+            })),
+            Self::IdentityWakeRetryable {
+                identity,
+                session_id,
+                ..
+            } => Some(serde_json::json!({
+                "kind": "identity_wake_retryable", "identity": identity,
+                "session_id": session_id.as_ref().map(ToString::to_string), "retryable": true,
+            })),
+            Self::IdentitySessionAbsent {
+                identity,
+                session_id,
+                ..
+            } => Some(serde_json::json!({
+                "kind": "identity_session_absent", "identity": identity,
+                "session_id": session_id.to_string(), "retryable": true,
+            })),
+            Self::IdentityHostAdopted { identity } => Some(serde_json::json!({
+                "kind": "identity_host_adopted", "identity": identity, "retryable": false,
+            })),
             // The typed repair hold rides the same `durable_resume_hold` key
             // meerkat uses on every surface, so a caller classifies this
             // exactly as it would classify meerkat's own -32013 refusal.
-            Self::EmbodimentRejected(failure)
-                if failure.kind == ContinuityFailureKind::RepairRequired =>
-            {
-                Some(serde_json::json!({
-                    "kind": "mob_member_session_repair_required",
-                    meerkat_core::service::SessionError::DURABLE_RESUME_HOLD_KEY:
-                        meerkat_core::service::DurableResumeHold::AuditedEndpointDivergence.as_str(),
-                    "session_id": failure
-                        .record
-                        .as_ref()
-                        .map(|record| record.session_id.to_string()),
-                    "content_retained": true,
-                    "retryable": false,
-                    "operator_path": [
-                        SessionRepairRequired::REPAIR_SUBCOMMAND,
-                        "meta/reload_member",
-                    ],
-                }))
-            }
+            Self::WakeHeld {
+                session_id,
+                hold:
+                    WakeHold::DurableResume(
+                        meerkat_core::service::DurableResumeHold::AuditedEndpointDivergence,
+                    ),
+                ..
+            } => Some(serde_json::json!({
+                "kind": "mob_member_session_repair_required",
+                meerkat_core::service::SessionError::DURABLE_RESUME_HOLD_KEY:
+                    meerkat_core::service::DurableResumeHold::AuditedEndpointDivergence.as_str(),
+                "session_id": session_id.to_string(),
+                "content_retained": true,
+                "retryable": false,
+                "operator_path": [
+                    SessionRepairRequired::REPAIR_SUBCOMMAND,
+                    "meta/reload_member",
+                ],
+            })),
+            // Core's other durable holds carry Core's own hold projection.
+            Self::WakeHeld {
+                identity,
+                session_id,
+                hold: WakeHold::DurableResume(hold),
+                ..
+            } => Some(serde_json::json!({
+                "kind": "mob_member_session_resume_held", "identity": identity,
+                meerkat_core::service::SessionError::DURABLE_RESUME_HOLD_KEY: hold.as_str(),
+                "session_id": session_id.to_string(), "content_retained": true,
+                "retryable": false,
+            })),
+            Self::WakeHeld {
+                identity,
+                session_id,
+                hold: WakeHold::CommittedBoundaryUnprovable,
+                ..
+            } => Some(serde_json::json!({
+                "kind": "mob_member_session_resume_held", "identity": identity,
+                "resume_unavailable_reason": "committed_boundary_unprovable",
+                "session_id": session_id.to_string(), "content_retained": true,
+                "retryable": false,
+            })),
+            Self::WakeHeld {
+                identity,
+                session_id,
+                hold: WakeHold::RoleMigrationNotApplied,
+                ..
+            } => Some(serde_json::json!({
+                "kind": "identity_role_migration_refused", "identity": identity,
+                "session_id": session_id.to_string(), "content_retained": true,
+                "retryable": false,
+            })),
             Self::PeerWiringTimedOut { operation, waited } => Some(serde_json::json!({
                 "kind": "peer_wiring_timed_out", "operation": operation,
                 "waited_ms": u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
@@ -1407,67 +1921,14 @@ impl IdentityRuntimeError {
     }
 }
 
-impl From<ContinuityStoreError> for IdentityRuntimeError {
-    fn from(err: ContinuityStoreError) -> Self {
-        match err {
-            ContinuityStoreError::StaleFencingToken {
-                identity,
-                presented,
-                current,
-            } => Self::StaleFencingToken {
-                identity,
-                presented,
-                current,
-            },
-            ContinuityStoreError::StaleCheckpointVersion {
-                identity,
-                presented,
-                current,
-            } => Self::StaleCheckpointVersion {
-                identity,
-                presented,
-                current,
-            },
-            ContinuityStoreError::StaleContinuityGeneration {
-                identity,
-                presented,
-                current,
-            } => Self::StaleContinuityGeneration {
-                identity,
-                presented,
-                current,
-            },
-            other => Self::Store(other),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Per-identity runtime state
 // ---------------------------------------------------------------------------
 
-/// A declared role migration the bridge refused for an identity's exact spec
-/// (`ContinuityFailureKind::RoleMigrationNotApplied`). The refusal is a
-/// deterministic wall for that spec and this activation's declaration, and it
-/// refused before any destructive step: the member the mob restored under its
-/// durable role stays live.
-#[derive(Debug, Clone)]
-pub(crate) struct RoleMigrationRefusal {
-    /// The refusal detail, reported again as the typed restore outcome of
-    /// every later pass that keeps the identity Broken.
-    pub reason: String,
-    /// Digest of the exact [`DurableAgentSpec`] the declaration was refused
-    /// against.
-    pub spec_digest: u64,
-    /// The durable session and generation whose resume was refused. A
-    /// superseding embodiment (a reset, a respawn, a later successful
-    /// resume) is a different identity state the refusal never described,
-    /// so the park holds only while the entry still names this exact one.
-    pub session_id: meerkat_core::types::SessionId,
-    pub generation: ContinuityGeneration,
-}
-
-/// Tracks the live state for a single identity within the runtime.
+/// Meta's own facts about one identity: its roster policy and this process's
+/// diagnostics. No Core fact is kept here: whether the identity is
+/// live, and its runtime id, session, generation and fence, are read from
+/// Core on every call.
 #[derive(Debug, Clone)]
 pub(crate) struct IdentityEntry {
     pub spec: DurableAgentSpec,
@@ -1477,74 +1938,25 @@ pub(crate) struct IdentityEntry {
     /// lock, so a pass that wins that lock cannot be mistaken for either its
     /// predecessor or successor merely because the global status epoch moved.
     pub bootstrap_generation: u64,
-    pub state: IdentityLifecycleState,
-    pub continuity: Option<ContinuityRecord>,
-    pub lease: Option<LeaseEntry>,
-    /// Exact authority that a completed lower-plane transition tried and
-    /// failed to release. This is deliberately separate from `lease`: Broken
-    /// identities must not advertise or renew active authority, but repair
-    /// still needs the exact fencing token to retry the provider release
-    /// before any reacquire attempt.
-    pub pending_lease_release: Option<LeaseGrant>,
-    pub checkpoint_version: CheckpointVersion,
-    /// Whether a durable runtime_store is available (affects dispatch ack semantics).
-    pub has_runtime_store: bool,
-    /// Terminal heal verdict from the bridge's heal authority. While set,
-    /// the continuity repair supervisor must not re-attempt this identity and
-    /// reconcile must not cosmetically reset it to Dormant — either would
-    /// restart the 2026-07-29 heal/re-Break loop. Cleared by any non-Broken
-    /// lifecycle projection (a real recovery or an operator reset).
-    pub continuity_unrecoverable: Option<ContinuityUnrecoverable>,
-    /// Typed park for a build the host deterministically rejected (the
-    /// candidate-mode effect gate class). While set AND the recorded spec
-    /// digest still matches `spec`, materialization fails fast typed (no
-    /// bridge/callback churn) and the repair supervisor skips the identity.
-    /// A changed spec clears it — the retry is then permitted.
-    pub host_rejected_build_park: Option<HostRejectedBuildPark>,
-    /// Typed park for a refused declared role migration. While set AND the
-    /// recorded spec digest still matches the desired spec, the repair
-    /// supervisor skips the identity and reconcile does not clean up its
-    /// lower plane: that lower plane is the live member the refusal kept,
-    /// and retiring it is the destructive step the refusal exists to
-    /// prevent. A changed spec or any non-Broken projection clears it.
-    pub role_migration_refusal: Option<RoleMigrationRefusal>,
-    /// Typed "session needs repair" hold: meerkat's audited-endpoint
-    /// divergence reported by a resume, a registration reload, or the heal
-    /// authority. While set, the repair supervisor skips the identity and
-    /// reconcile keeps its Broken projection; the reload verb is the one
-    /// door that re-attempts the resume (after the operator's repair).
-    /// Cleared by any non-Broken lifecycle projection.
-    pub session_repair_required: Option<SessionRepairRequired>,
+    /// The last wake refused for good or held for the operator,
+    /// cleared by the next successful wake or when a lifecycle verb starts on
+    /// a member Core holds live. Process-local and never read as truth:
+    /// every wake asks Core again.
+    pub wake_refusal: Option<super::types::WakeRefusal>,
+    /// The session the last wake replaced with a fresh one because Core holds
+    /// no durable session for it, until the next wake or the next
+    /// lifecycle verb on the live member.
+    pub replaced_session: Option<super::types::ReplacedSession>,
     /// The most recent delivery failure for this identity, cleared by the
     /// next successful delivery. Read by `meta/member_health` so an
     /// operator learns WHY sends fail without spending an admission budget.
     pub last_delivery_error: Option<DeliveryErrorRecord>,
     /// The most recent reload attempt and how it ended (see `member_health`).
     pub last_reload: Option<ReloadAttemptRecord>,
-}
-
-/// Tracks a held lease for an identity.
-#[derive(Debug, Clone)]
-pub(crate) struct LeaseEntry {
-    pub fencing_token: FencingToken,
-    pub ttl: Duration,
-    pub acquired_at: Instant,
-}
-
-impl LeaseEntry {
-    pub fn is_expired(&self) -> bool {
-        self.acquired_at.elapsed() > self.ttl
-    }
-
-    pub fn ttl_remaining(&self) -> Duration {
-        self.ttl.saturating_sub(self.acquired_at.elapsed())
-    }
-
-    pub fn is_healthy(&self) -> bool {
-        // Healthy if more than 20% TTL remains
-        let remaining = self.ttl_remaining();
-        remaining > self.ttl / 5
-    }
+    /// A member session a delivery found Core holds no durable copy of
+    /// (`IdentitySessionAbsent`): the next delivery to that same session
+    /// starts the identity's fresh life first.
+    pub absent_delivery_session: Option<SessionId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1554,50 +1966,15 @@ impl LeaseEntry {
 /// Events emitted for a specific identity, used by `subscribe()`.
 #[derive(Debug, Clone)]
 pub enum IdentityEvent {
-    /// Lifecycle state changed.
+    /// The identity's view state changed through a verb of this runtime.
     StateChanged {
         identity: AgentIdentity,
         new_state: IdentityLifecycleState,
-    },
-    /// Lease acquired or renewed.
-    LeaseUpdated {
-        identity: AgentIdentity,
-        fencing_token: FencingToken,
-    },
-    /// Lease lost.
-    LeaseLost { identity: AgentIdentity },
-    /// Checkpoint completed.
-    CheckpointCompleted {
-        identity: AgentIdentity,
-        version: CheckpointVersion,
-    },
-    /// Resume could not reuse a persisted runtime binding and materialization
-    /// fresh-spawned a member instead.
-    ResumeFallback {
-        identity: AgentIdentity,
-        reason: super::bridge::ResumeFallbackReason,
     },
 }
 
 /// Per-identity event channel capacity.
 const IDENTITY_EVENT_CHANNEL_CAPACITY: usize = 64;
-const DEFAULT_LEASE_RENEWAL_MAX_POLL_INTERVAL: Duration = Duration::from_mins(1);
-const DEFAULT_LEASE_RENEWAL_MIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
-/// Base delay for the lease-renewal failure backoff. The renewal tick's
-/// normal cadence is TTL-derived (down to a 10ms floor), so a lease provider
-/// that errors persistently would otherwise retry — and warn — at that floor
-/// rate. On failure we back off from this base, doubling toward the max poll
-/// interval, so a backend outage can't spin the renewal task.
-const LEASE_RENEWAL_FAILURE_BACKOFF_BASE: Duration = Duration::from_secs(1);
-
-fn lease_renewal_failure_backoff(
-    consecutive_failures: u32,
-    max_poll_interval: Duration,
-) -> Duration {
-    LEASE_RENEWAL_FAILURE_BACKOFF_BASE
-        .saturating_mul(1u32 << consecutive_failures.min(6))
-        .min(max_poll_interval)
-}
 
 // ---------------------------------------------------------------------------
 // IdentityRuntime
@@ -1605,10 +1982,18 @@ fn lease_renewal_failure_backoff(
 
 /// Configuration for the identity-first runtime.
 pub struct IdentityRuntimeConfig {
+    /// Ignored; removed before 0.9.4. The identity runtime keeps
+    /// no durable identity state of its own: Core's mob is the authority.
     pub continuity_store: Arc<dyn ContinuityStore>,
+    /// Ignored; removed before 0.9.4. Core's realm lock and
+    /// hosting claim are the host exclusivity.
     pub lease_provider: Arc<dyn LeaseProvider>,
     pub runtime_instance_id: String,
+    /// Whether the composition has a durable runtime store (dispatch
+    /// acknowledgements report durability from it).
     pub has_runtime_store: bool,
+    /// Ignored; removed before 0.9.4 (it was the continuity
+    /// store's declared durability).
     pub durability_policy: DurabilityPolicy,
     /// Optional session bridge for real session delivery. When `None`,
     /// delivery operations validate invariants but do not forward to
@@ -1630,6 +2015,30 @@ pub struct IdentityFirstRuntimeContext {
     pub customizer: Option<Arc<dyn AgentCustomizer>>,
     mob_definition: Option<meerkat_mob::MobDefinition>,
     bootstrap_mode: IdentityBootstrapMode,
+}
+
+/// Why `spec`'s member cannot be held, if it cannot: only a fresh, locally
+/// created member whose first turn waits can be.
+fn held_spec_refusal(
+    spec: &DurableAgentSpec,
+) -> Option<super::held_bootstrap::HeldBootstrapRefusal> {
+    use super::held_bootstrap::HeldBootstrapRefusal as Refusal;
+    let identity = spec.identity.clone();
+    if spec.placement.is_some() {
+        return Some(Refusal::Placed { identity });
+    }
+    if matches!(spec.backend, Some(meerkat_mob::MobBackendKind::External))
+        || matches!(
+            spec.binding.as_ref(),
+            Some(meerkat_contracts::WireRuntimeBinding::External { .. })
+        )
+    {
+        return Some(Refusal::ExternallyBound { identity });
+    }
+    if spec.initial_message.is_some() {
+        return Some(Refusal::InitialMessage { identity });
+    }
+    None
 }
 
 impl IdentityFirstRuntimeContext {
@@ -1757,8 +2166,7 @@ impl IdentityFirstRuntimeContext {
             self.runtime.fail_identity_bootstrap(generation, &error);
             return Err(error);
         }
-        self.apply_roster_controlled(generation, roster, RestorePassOrigin::Host)
-            .await
+        self.apply_roster_controlled(generation, roster).await
     }
 
     /// [`Self::bootstrap_roster`] with every freshly created roster member
@@ -1770,18 +2178,19 @@ impl IdentityFirstRuntimeContext {
     /// the pass's choice `Activate`: Core then accepts or expires each
     /// member's own activation against the same deadline, so each member
     /// keeps its actual outcome (an expired one is `Broken`, and the choice
-    /// stays `Activate`). Anything else aborts each member (their
-    /// embodiments clean up their identity custody once Core has settled
-    /// them) and fails the bootstrap. Only the eager bootstrap mode can hold
+    /// stays `Activate`). Anything else aborts each member (its embodiment
+    /// fails once Core has settled the member, which Core never publishes)
+    /// and fails the bootstrap. Only the eager bootstrap mode can hold
     /// its members.
     ///
     /// The call is bounded by the setup deadline: at a terminal `Abort` it
     /// returns [`super::held_bootstrap::HeldBootstrapStart::Unsettled`] at
     /// once, while the identity runtime's tracked foreground operation keeps
-    /// owning the members' aborts, the join of a still running `complete`
-    /// and the identities' cleanup. After the pass's choice `Activate` it
-    /// waits for the roster pass, through each member's actual activation
-    /// or expiry, and returns its per-member result.
+    /// owning the members' aborts (each until Core has settled it), the join of
+    /// a still running `complete` and the marking of each member the pass did
+    /// not publish as owing a fresh held completion. After the pass's choice
+    /// `Activate` it waits for the roster pass, through each member's actual
+    /// activation or expiry, and returns its per-member result.
     pub async fn bootstrap_roster_held<F, Fut>(
         self: &Arc<Self>,
         roster: &[DurableAgentSpec],
@@ -1826,6 +2235,116 @@ impl IdentityFirstRuntimeContext {
             + 'static,
         Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
     {
+        let context = Arc::clone(self);
+        let roster = roster.to_vec();
+        self.start_held_setup(terminal, prelude, move |terminal, abandonment| async move {
+            context
+                .bootstrap_roster_held_owned(&roster, terminal, complete, abandonment)
+                .await
+        })
+        .await
+    }
+
+    /// Add one fresh member to the running roster, held at its producer
+    /// hold point until the host has completed its application from the
+    /// member's finished surface, while every other member keeps running.
+    ///
+    /// The one-member counterpart of [`Self::bootstrap_roster_held`]: the
+    /// same bootstrap controller, the same one terminal decision (deadline
+    /// first, then the caller's loss, then `complete`), the same tracked
+    /// settlement and the same [`super::held_bootstrap::HeldBootstrapStart`],
+    /// whose activated result carries this member's outcome only. It
+    /// registers and embodies `spec`'s identity alone: it never reconciles
+    /// the roster, never changes the managed peer edges, and runs in either
+    /// bootstrap mode (in lazy mode, too, it embodies the member at once).
+    /// The identity must be fresh as a held roster bootstrap reads it: Core
+    /// never spawned it since the latest mob reset and no first-boot row
+    /// names it
+    /// ([`super::held_bootstrap::HeldBootstrapRefusal::ExistingContinuity`]
+    /// otherwise; a failed read of Core's member history is never taken as
+    /// fresh). An identity Core holds an identity intent row for is the
+    /// host's and is refused with
+    /// [`IdentityRuntimeError::IdentityHostAdopted`]. A placed, externally
+    /// bound or initial-message member is refused, as in a held bootstrap. A member that settles without being
+    /// held (embodied outside the add after its freshness read) refuses the
+    /// add as `NotHeld`, and the host is never asked.
+    ///
+    /// The roster provider stays the owner of the desired roster, and the
+    /// next roster pass retires a member its result does not list. List the
+    /// spec in the provider from inside `complete`: the add holds the
+    /// bootstrap controller until it ends, so no pass of the attached
+    /// context reads the listing before the member is held and completed. A
+    /// spec listed before the add can be read by a pass the host did not
+    /// start (a `meta/reconcile_identity`),
+    /// which would embody the member unheld. Two paths run outside the
+    /// controller, and so outside that guarantee: `meta/reconcile_identity`
+    /// on an RPC context that is not attached to the unified runtime reads
+    /// the roster and restores it with no controller, and a host's own
+    /// [`Self::bootstrap_roster`] applies the roster it is given, so a
+    /// roster resolved before the add and applied after it retires the
+    /// member. When the add ends
+    /// [`super::held_bootstrap::HeldBootstrapStart::Unsettled`], unlist the
+    /// spec: the aborted member owes its host a held completion, and every
+    /// pass refuses it
+    /// ([`IdentityRuntimeError::HeldCompletionOwed`]). A caller that goes
+    /// away while `complete` runs after listing never sees `Unsettled`: the
+    /// add aborts and the member stays listed and refused, so the host
+    /// unlists it on its recovery path. Refresh the
+    /// topology afterwards when the topology provider wires the member.
+    ///
+    /// The add publishes no bootstrap generation: until the next roster
+    /// pass, [`IdentityRuntime::identity_bootstrap_status`] does not list
+    /// the added member, and its counts and `ready` do not cover it. The
+    /// add's own result is its outcome.
+    pub async fn add_member_held<F, Fut>(
+        self: &Arc<Self>,
+        spec: DurableAgentSpec,
+        deadline: meerkat_mob::HeldSpawnDeadline,
+        complete: F,
+    ) -> Result<super::held_bootstrap::HeldBootstrapStart, IdentityRuntimeError>
+    where
+        F: FnOnce(
+                Vec<super::held_bootstrap::HeldIdentityMember>,
+                super::held_bootstrap::HeldCompletion,
+            ) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let context = Arc::clone(self);
+        self.start_held_setup(
+            Arc::new(super::held_bootstrap::HeldTerminal::new(deadline)),
+            None,
+            move |terminal, abandonment| async move {
+                context
+                    .add_member_held_owned(spec, terminal, complete, abandonment)
+                    .await
+            },
+        )
+        .await
+    }
+
+    /// Start a held setup (`prelude`, then `setup`) in the identity
+    /// runtime's tracked foreground owner, bounded by `terminal`, and wait
+    /// for its terminal decision.
+    async fn start_held_setup<S, SFut>(
+        &self,
+        terminal: Arc<super::held_bootstrap::HeldTerminal>,
+        prelude: Option<super::held_bootstrap::HeldSetupPrelude>,
+        setup: S,
+    ) -> Result<super::held_bootstrap::HeldBootstrapStart, IdentityRuntimeError>
+    where
+        S: FnOnce(
+                Arc<super::held_bootstrap::HeldTerminal>,
+                super::held_bootstrap::HeldAbandonment,
+            ) -> SFut
+            + Send
+            + 'static,
+        SFut: std::future::Future<
+                Output = Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError>,
+            > + Send
+            + 'static,
+    {
         // The setup runs in the identity runtime's tracked foreground owner,
         // not in the caller's future. A caller that goes away before the
         // pass's terminal decision abandons it: the owned task aborts every
@@ -1841,8 +2360,6 @@ impl IdentityFirstRuntimeContext {
         // `Abort`: whatever setup step is entered then runs to its end, and
         // no later one starts.
         let guard = AbandonOnDrop::new(abandonment.clone(), Arc::clone(&terminal));
-        let context = Arc::clone(self);
-        let roster = roster.to_vec();
         let owned_terminal = Arc::clone(&terminal);
         // Admission into the tracked owner is bounded by the same terminal
         // decision (deadline first) and by the runtime's closure: the start
@@ -1856,9 +2373,7 @@ impl IdentityFirstRuntimeContext {
                     if let Some(prelude) = prelude {
                         prelude.await?;
                     }
-                    context
-                        .bootstrap_roster_held_owned(&roster, owned_terminal, complete, abandonment)
-                        .await
+                    setup(owned_terminal, abandonment).await
                 },
                 async {
                     terminal.aborted().await;
@@ -1902,31 +2417,15 @@ impl IdentityFirstRuntimeContext {
         Fut: std::future::Future<Output = Result<(), String>>,
     {
         use super::held_bootstrap::HeldBootstrapRefusal as Refusal;
-        use super::held_bootstrap::{
-            HeldCompletion, HeldCompletionOutcome, HeldCreatePass, HeldDecision, deadline_reached,
-        };
+        use super::held_bootstrap::{HeldCreatePass, HeldDecision};
         let refused = |refusal: Refusal| IdentityRuntimeError::HeldBootstrapRefused(refusal);
         if self.bootstrap_mode.is_lazy() {
             return Err(refused(Refusal::LazyMode));
         }
         // Only fresh, locally created, deferred members can be held: refuse
         // a roster with any other member rather than publish it unheld.
-        for spec in roster {
-            let identity = spec.identity.clone();
-            if spec.placement.is_some() {
-                return Err(refused(Refusal::Placed { identity }));
-            }
-            if matches!(spec.backend, Some(meerkat_mob::MobBackendKind::External))
-                || matches!(
-                    spec.binding.as_ref(),
-                    Some(meerkat_contracts::WireRuntimeBinding::External { .. })
-                )
-            {
-                return Err(refused(Refusal::ExternallyBound { identity }));
-            }
-            if spec.initial_message.is_some() {
-                return Err(refused(Refusal::InitialMessage { identity }));
-            }
+        if let Some(refusal) = roster.iter().find_map(held_spec_refusal) {
+            return Err(refused(refusal));
         }
         // A setup whose terminal decision is already `Abort` (its deadline
         // passed, or its caller went away, while the setup before this pass
@@ -1948,31 +2447,163 @@ impl IdentityFirstRuntimeContext {
             self.runtime.fail_identity_bootstrap(generation, &error);
             return Err(error);
         }
+        // Fresh means Core never spawned the identity (no binding since
+        // the latest mob reset) and no first-boot row names a session for
+        // it. A read fault is never taken as fresh.
         let identities: Vec<_> = roster.iter().map(|spec| spec.identity.clone()).collect();
-        let existing = match self
-            .runtime
-            .continuity_store
-            .resolve_many(&identities)
-            .await
-        {
-            Ok(existing) => existing,
-            Err(error) => {
-                let error = IdentityRuntimeError::Internal(format!(
-                    "held identity bootstrap could not read the roster's continuity: {error}"
-                ));
+        for spec in roster {
+            let existing = match self.runtime.core_last_binding(&spec.identity).await {
+                Ok(existing) => existing,
+                Err(error) => {
+                    let error = IdentityRuntimeError::Internal(format!(
+                        "held identity bootstrap could not read Core's member history: {error}"
+                    ));
+                    self.runtime.fail_identity_bootstrap(generation, &error);
+                    return Err(error);
+                }
+            };
+            let first_boot_row = match self.runtime.pending_first_boot_row(&spec.identity).await {
+                Ok(row) => row,
+                Err(error) => {
+                    self.runtime.fail_identity_bootstrap(generation, &error);
+                    return Err(error);
+                }
+            };
+            if existing.is_some() || first_boot_row.is_some() {
+                let error = refused(Refusal::ExistingContinuity {
+                    identity: spec.identity.clone(),
+                });
                 self.runtime.fail_identity_bootstrap(generation, &error);
                 return Err(error);
             }
-        };
-        if let Some((identity, _)) = existing.iter().find(|(_, state)| {
-            !matches!(state, super::types::ContinuityResolveState::Uninitialized)
-        }) {
-            let error = refused(Refusal::ExistingContinuity {
-                identity: identity.clone(),
-            });
+        }
+        self.run_held_after_freshness_hook().await;
+        // A setup whose terminal decision is already `Abort` (its deadline
+        // passed, or its caller went away, while the controller and the
+        // roster's continuity were read) starts no member.
+        if terminal.current() == Some(HeldDecision::Abort) {
+            let error = refused(terminal.abort_refusal());
             self.runtime.fail_identity_bootstrap(generation, &error);
             return Err(error);
         }
+        let pass = Arc::new(HeldCreatePass::new(
+            terminal,
+            identities.clone(),
+            super::orchestrator::identity_restore_concurrency(),
+        ));
+        if let Err(error) = self.install_held_create_pass(&pass) {
+            self.runtime.fail_identity_bootstrap(generation, &error);
+            return Err(error);
+        }
+        // Every roster identity owes its host this pass's completion until
+        // the pass publishes its member. Core keeps nothing for a member
+        // before its activation, so the marks are written durably before any
+        // member exists: a process that stops while a member is held keeps
+        // them.
+        if let Err(error) = self.runtime.mark_held_completion_owed(&identities).await {
+            *self
+                .runtime
+                .held_create_pass
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            self.runtime.fail_identity_bootstrap(generation, &error);
+            return Err(error);
+        }
+        self.join_held_pass(
+            &pass,
+            abandonment,
+            complete,
+            self.apply_roster_controlled(generation, roster),
+        )
+        .await
+    }
+
+    async fn add_member_held_owned<F, Fut>(
+        &self,
+        spec: DurableAgentSpec,
+        terminal: Arc<super::held_bootstrap::HeldTerminal>,
+        complete: F,
+        abandonment: super::held_bootstrap::HeldAbandonment,
+    ) -> Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError>
+    where
+        F: FnOnce(
+            Vec<super::held_bootstrap::HeldIdentityMember>,
+            super::held_bootstrap::HeldCompletion,
+        ) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        use super::held_bootstrap::HeldBootstrapRefusal as Refusal;
+        use super::held_bootstrap::{HeldCreatePass, HeldDecision};
+        let refused = |refusal: Refusal| IdentityRuntimeError::HeldBootstrapRefused(refusal);
+        if let Some(refusal) = held_spec_refusal(&spec) {
+            return Err(refused(refusal));
+        }
+        if terminal.current() == Some(HeldDecision::Abort) {
+            return Err(refused(terminal.abort_refusal()));
+        }
+        // The freshness decision is made under the runtime's one bootstrap
+        // controller, so no roster pass and no other held setup runs between
+        // it and the member's held creation. A member embodied outside the
+        // controller after this read (a lazy materialization) settles
+        // without being held, and the add refuses (`NotHeld`).
+        let _controller = self.runtime.bootstrap_controller.lock().await;
+        if self.runtime.bootstrap_shutdown.load(Ordering::Acquire) {
+            return Err(IdentityRuntimeError::Internal(
+                "identity bootstrap is shutting down".to_string(),
+            ));
+        }
+        let identity = spec.identity.clone();
+        // An identity Core holds an identity intent row for is the host's:
+        // no Meta verb adds it.
+        self.runtime.refuse_host_adopted(&identity).await?;
+        // Fresh means what it means for a held roster bootstrap: Core never
+        // spawned the identity (no binding since the latest mob reset) and no
+        // first-boot row names a session for it. A read fault is never taken
+        // as fresh.
+        let existing = self
+            .runtime
+            .core_last_binding(&identity)
+            .await
+            .map_err(|error| {
+                IdentityRuntimeError::Internal(format!(
+                    "held member add could not read Core's member history: {error}"
+                ))
+            })?;
+        let first_boot_row = self.runtime.pending_first_boot_row(&identity).await?;
+        if existing.is_some() || first_boot_row.is_some() {
+            return Err(refused(Refusal::ExistingContinuity { identity }));
+        }
+        self.run_held_after_freshness_hook().await;
+        // A terminal `Abort` recorded while the controller and the
+        // continuity were read starts no member.
+        if terminal.current() == Some(HeldDecision::Abort) {
+            return Err(refused(terminal.abort_refusal()));
+        }
+        let pass = Arc::new(HeldCreatePass::new(terminal, [identity.clone()], 1));
+        self.install_held_create_pass(&pass)?;
+        // The added member owes its host this add's completion until the
+        // add publishes it, durably and before the member exists, as for a
+        // held roster pass. The add opened no bootstrap generation.
+        if let Err(error) = self.runtime.mark_held_completion_owed(&[identity]).await {
+            *self
+                .runtime
+                .held_create_pass
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            return Err(error);
+        }
+        self.join_held_pass(
+            &pass,
+            abandonment,
+            complete,
+            super::orchestrator::add_member_flow(&self.runtime, &spec, self.customizer.as_deref()),
+        )
+        .await
+    }
+
+    /// Test seam: run the hook a test set to run right after a held
+    /// setup's freshness read.
+    async fn run_held_after_freshness_hook(&self) {
         #[cfg(test)]
         {
             let hook = self
@@ -1985,44 +2616,61 @@ impl IdentityFirstRuntimeContext {
                 hook().await;
             }
         }
-        // A setup whose terminal decision is already `Abort` (its deadline
-        // passed, or its caller went away, while the controller and the
-        // roster's continuity were read) starts no member.
-        if terminal.current() == Some(HeldDecision::Abort) {
-            let error = refused(terminal.abort_refusal());
-            self.runtime.fail_identity_bootstrap(generation, &error);
-            return Err(error);
+    }
+
+    /// Make `pass` the runtime's one held pass, or refuse while another one
+    /// is in progress.
+    fn install_held_create_pass(
+        &self,
+        pass: &Arc<super::held_bootstrap::HeldCreatePass>,
+    ) -> Result<(), IdentityRuntimeError> {
+        let mut slot = self
+            .runtime
+            .held_create_pass
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_some() {
+            return Err(IdentityRuntimeError::Internal(
+                "a held identity bootstrap is already in progress".to_string(),
+            ));
         }
-        let pass = Arc::new(HeldCreatePass::new(
-            terminal,
-            identities,
-            super::orchestrator::identity_restore_concurrency(),
-        ));
-        {
-            let mut slot = self
-                .runtime
-                .held_create_pass
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if slot.is_some() {
-                let error = IdentityRuntimeError::Internal(
-                    "a held identity bootstrap is already in progress".to_string(),
-                );
-                self.runtime.fail_identity_bootstrap(generation, &error);
-                return Err(error);
-            }
-            *slot = Some(Arc::clone(&pass));
-        }
+        *slot = Some(Arc::clone(pass));
+        Ok(())
+    }
+
+    /// Run an installed held pass to its end: `body` embodies the pass's
+    /// members while the producer waits until every one of them is held,
+    /// asks `complete` and records the pass's one terminal decision. Both
+    /// are joined, never dropped, and the runtime's held pass is cleared
+    /// once they have settled.
+    async fn join_held_pass<F, Fut, B>(
+        &self,
+        pass: &super::held_bootstrap::HeldCreatePass,
+        abandonment: super::held_bootstrap::HeldAbandonment,
+        complete: F,
+        body: B,
+    ) -> Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError>
+    where
+        F: FnOnce(
+            Vec<super::held_bootstrap::HeldIdentityMember>,
+            super::held_bootstrap::HeldCompletion,
+        ) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+        B: std::future::Future<
+                Output = Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError>,
+            >,
+    {
+        use super::held_bootstrap::HeldBootstrapRefusal as Refusal;
+        use super::held_bootstrap::{HeldCompletion, HeldCompletionOutcome, deadline_reached};
+        let refused = |refusal: Refusal| IdentityRuntimeError::HeldBootstrapRefused(refusal);
         let bootstrap = async {
-            let result = self
-                .apply_roster_controlled(generation, roster, RestorePassOrigin::Host)
-                .await;
+            let result = body.await;
             pass.end();
             result
         };
         let producer = async {
-            // Every roster member held, deadline first (also when all are
-            // already held), or the caller's loss.
+            // Every member held, deadline first (also when all are already
+            // held), or the caller's loss.
             let held = tokio::select! {
                 biased;
                 held = pass.wait_held() => held,
@@ -2123,28 +2771,15 @@ impl IdentityFirstRuntimeContext {
         Ok(())
     }
 
+    /// One roster compile pass: one attempt per identity, no retry
+    /// loop and no timer. A refused identity stays refused, typed, until the
+    /// next pass (boot or a roster refresh) or a direct wake asks Core again.
     async fn apply_roster_controlled(
         &self,
         generation: u64,
         roster: &[DurableAgentSpec],
-        origin: RestorePassOrigin,
     ) -> Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError> {
-        // The whole pass is one embodiment burst, held until its settle
-        // trigger below is sent: a deferred repair pass waiting for zero in
-        // flight then consumes every trigger the pass raised, instead of
-        // starting in a gap between members (or before `RestorePassSettled`)
-        // and running once more on the late trigger.
-        let _burst = self.runtime.enter_embodiment_burst();
-        let result = self.apply_roster_pass(generation, roster).await;
-        // A settled pass released every store writer it held, so a Broken
-        // identity's retry can now succeed. The supervisor's own passes do not
-        // re-trigger it (that would loop on a persistent failure); the
-        // embodiments they settle do, through `EmbodimentSettled`.
-        if origin == RestorePassOrigin::Host {
-            self.runtime
-                .trigger_continuity_repair(ContinuityRepairTrigger::RestorePassSettled);
-        }
-        result
+        self.apply_roster_pass(generation, roster).await
     }
 
     async fn apply_roster_pass(
@@ -2224,22 +2859,11 @@ impl IdentityFirstRuntimeContext {
     pub async fn refresh_desired_topology(
         &self,
     ) -> Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError> {
-        self.refresh_desired_topology_from(RestorePassOrigin::Host)
-            .await
-    }
-
-    /// Ask the continuity repair supervisor for a pass now. The supervisor
-    /// retries Broken identities only on typed triggers; this is the host's
-    /// explicit one.
-    pub async fn request_continuity_repair(&self) -> ContinuityRepairRequestOutcome {
-        self.runtime
-            .trigger_continuity_repair(ContinuityRepairTrigger::Requested);
-        self.runtime.continuity_repair_request_outcome().await
+        self.refresh_desired_topology_from().await
     }
 
     async fn refresh_desired_topology_from(
         &self,
-        origin: RestorePassOrigin,
     ) -> Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError> {
         // One runtime owns one controller from roster discovery through task
         // installation. Provider calls are user code and can be slow; publish
@@ -2269,8 +2893,7 @@ impl IdentityFirstRuntimeContext {
             }
         };
 
-        self.apply_roster_controlled(generation, &roster, origin)
-            .await
+        self.apply_roster_controlled(generation, &roster).await
     }
 
     /// Cancellation-safe reconcile for RPC/host request boundaries.
@@ -2286,615 +2909,6 @@ impl IdentityFirstRuntimeContext {
             .run_tracked_foreground(async move { context.refresh_desired_topology().await })
             .await
     }
-
-    /// Background repair for Broken identities. A rejected resume degrades the
-    /// identity to Broken while preserving the durable session; the documented
-    /// contract is "the next reconcile retries the resume" — but without this
-    /// task, nothing runs that reconcile: delivery refuses Broken identities
-    /// (REQ-13 fails loudly), `materialize` refuses the Broken state, and the
-    /// only retries were a manual `meta/reconcile_identity` RPC or a process
-    /// restart. A downstream app on 0.7.23 sat with 14 preserved-but-parked identities
-    /// because of exactly that gap.
-    ///
-    /// The supervisor has no timer. It runs one pass when it starts (the boot
-    /// pass has just settled) and then waits for a typed
-    /// [`ContinuityRepairTrigger`]: another identity's embodiment settled (a
-    /// resume or a fresh durable mint committed, releasing the store writer
-    /// it held), a host restore or reconcile pass settled (boot, a roster
-    /// refresh, `meta/reconcile_identity`), or a host asked
-    /// ([`Self::request_continuity_repair`]). Only when at least one identity
-    /// is Broken does a pass re-run [`Self::refresh_desired_topology`], the
-    /// same idempotent flow the reconcile RPC runs (eager: `restore_flow`
-    /// retries the resume; lazy: `lazy_register_flow` re-registers a
-    /// store-Ready identity as Dormant so on-demand materialization retries).
-    /// The supervisor's own passes never re-trigger it, so a persistent cause
-    /// costs one pass per real event, and a transient one (store writer
-    /// contention during a reseed boot) heals as soon as the contending
-    /// embodiment settles instead of after a doubling sleep.
-    pub fn spawn_broken_identity_repair_task(
-        self: Arc<Self>,
-        policy: ContinuityRepairPolicy,
-    ) -> JoinHandle<()> {
-        tokio::spawn(self.run_broken_identity_repair_loop(policy, None))
-    }
-
-    pub(crate) fn spawn_tracked_broken_identity_repair_task(
-        self: Arc<Self>,
-        policy: ContinuityRepairPolicy,
-    ) -> TrackedContinuityRepairTask {
-        let (cancel, receiver) = watch::channel(false);
-        let join = tokio::spawn(self.run_broken_identity_repair_loop(policy, Some(receiver)));
-        TrackedContinuityRepairTask { cancel, join }
-    }
-
-    async fn run_broken_identity_repair_loop(
-        self: Arc<Self>,
-        _policy: ContinuityRepairPolicy,
-        mut cancellation: Option<watch::Receiver<bool>>,
-    ) {
-        let _supervising = ContinuityRepairSupervising::enter(&self.runtime);
-        // Subscribe before the first pass so a trigger landing during it
-        // still wakes the next wait.
-        let mut triggers = self.runtime.subscribe_continuity_repair_triggers();
-        // Bounded non-identical retries (production 0.8.12-era evidence): a repair
-        // pass whose failure comes back byte-identical N times in a row is a
-        // deterministic wall, and each blind retry re-executes the pass's
-        // DESTRUCTIVE dispose steps against the same blocking precondition.
-        // Track consecutive per-identity failure signatures and park typed
-        // after [`REPAIR_IDENTICAL_FAILURE_PARK_ATTEMPTS`].
-        let mut identical_failure_streaks: HashMap<AgentIdentity, (String, u32)> = HashMap::new();
-        // The last-resort wake for transient causes with no typed signal
-        // ([`crate::fallback_wake`]); disarmed while nothing transient stands.
-        let mut fallback = crate::fallback_wake::FallbackWake::default();
-        // The supervisor starts once the boot pass settled, which is itself a
-        // trigger: one pass up front, then only on typed triggers.
-        let mut wake = Some(RepairWake::Trigger(
-            ContinuityRepairTrigger::RestorePassSettled,
-        ));
-        loop {
-            let current = match wake.take() {
-                Some(current) => current,
-                None => tokio::select! {
-                    changed = triggers.changed() => match changed {
-                        Ok(()) => match triggers.borrow_and_update().last {
-                            Some(trigger) => RepairWake::Trigger(trigger),
-                            None => continue,
-                        },
-                        Err(_) => return,
-                    },
-                    () = crate::fallback_wake::sleep_until(fallback.next_wake()),
-                        if fallback.next_wake().is_some() => RepairWake::Fallback,
-                    () = repair_cancelled(&mut cancellation) => return,
-                },
-            };
-            // Another embodiment in flight contends for the same store
-            // writers, and its settling is itself a trigger: defer the pass
-            // until none is in flight (the typed in-flight count reaching
-            // zero), so a warm-up burst of settles runs one pass, not one per
-            // member, and cannot trip the identical-failure park in seconds.
-            if !self.runtime.broken_identities().await.is_empty()
-                && !self
-                    .runtime
-                    .embodiments_settled_or_cancelled(&mut cancellation)
-                    .await
-            {
-                return;
-            }
-            // Triggers that landed before this pass are covered by it.
-            triggers.borrow_and_update();
-            match self
-                .continuity_repair_pass(&mut identical_failure_streaks, current)
-                .await
-            {
-                RepairPassVerdict::Settled => fallback.reset(),
-                RepairPassVerdict::Transient => {
-                    fallback.record_failure(tokio::time::Instant::now());
-                }
-            }
-            if cancellation
-                .as_ref()
-                .is_some_and(|cancellation| *cancellation.borrow())
-            {
-                return;
-            }
-        }
-    }
-
-    /// One repair pass over the Broken identities; reports whether a
-    /// transient cause with no typed signal still stands.
-    async fn continuity_repair_pass(
-        &self,
-        identical_failure_streaks: &mut HashMap<AgentIdentity, (String, u32)>,
-        wake: RepairWake,
-    ) -> RepairPassVerdict {
-        let broken = self.runtime.broken_identities().await;
-        if broken.is_empty() {
-            return RepairPassVerdict::Settled;
-        }
-        // Heal must be REAL before reconcile runs: reconcile alone only
-        // resets the runtime entry (lazy mode re-registers Dormant) while
-        // the durable head can stay an intra-turn projection that the
-        // next materialization re-Breaks — the measured 2026-07-29
-        // production heal/re-Break loop. Drive the bridge's heal
-        // authority FIRST; only identities whose durable head is (now)
-        // committed — or whose bridge has no heal seam — proceed.
-        let mut repairable = Vec::new();
-        let mut recovery_failures = 0usize;
-        for identity in &broken {
-            if self
-                .runtime
-                .continuity_unrecoverable(identity)
-                .await
-                .is_some()
-            {
-                // Terminal typed verdict already recorded: stable across
-                // calls, so re-healing every cycle is exactly the loop
-                // this replaces. Operators act on the surfaced reason.
-                continue;
-            }
-            if self
-                .runtime
-                .session_repair_required(identity)
-                .await
-                .is_some()
-            {
-                // The durable document needs the operator's sanctioned
-                // repair; the heal authority cannot even read it. Only
-                // `reload_member` after the repair re-attempts the resume.
-                continue;
-            }
-            if self
-                .runtime
-                .host_rejected_build_park(identity)
-                .await
-                .is_some()
-            {
-                // The host's gate rejects this exact spec
-                // deterministically: reattempting re-asks the same
-                // question and burns a build + callback round trip per
-                // cycle. A spec change clears the park (checked inside
-                // the accessor); until then this identity is parked, not
-                // repaired.
-                continue;
-            }
-            if self
-                .runtime
-                .role_migration_refusal(identity, None)
-                .await
-                .is_some()
-            {
-                // The bridge refused this spec's declared role migration
-                // before any destructive step and kept the restored member.
-                // A retry re-asks the same question, and its reconcile would
-                // retire that member: it stays Broken with its typed restore
-                // kind until the host changes the spec or the declaration.
-                continue;
-            }
-            if self.runtime.held_completion_owed(identity) {
-                // A held pass could not publish this member: an ordinary
-                // re-creation would publish a fresh instance around the
-                // host's configured held completion. It stays Broken until
-                // a held pass completes it.
-                continue;
-            }
-            match self.attempt_committed_boundary_recovery(identity).await {
-                BrokenRepairDisposition::Repairable => repairable.push(identity.clone()),
-                BrokenRepairDisposition::Unprovable | BrokenRepairDisposition::RepairRequired => {}
-                BrokenRepairDisposition::RetryLater => recovery_failures += 1,
-            }
-        }
-        if repairable.is_empty() {
-            // Nothing eligible this pass: every Broken identity carries a
-            // terminal verdict (no reconcile churn), or the heal authority
-            // itself failed transiently, which has no typed "reachable again"
-            // signal: arm the fallback wake.
-            if recovery_failures > 0 {
-                tracing::debug!(
-                    recovery_failures,
-                    "continuity repair: heal authority unavailable; arming the fallback wake"
-                );
-                return RepairPassVerdict::Transient;
-            }
-            return RepairPassVerdict::Settled;
-        }
-        tracing::info!(
-            broken = repairable.len(),
-            wake = wake.label(),
-            "continuity repair: retrying restore for Broken identities"
-        );
-        let pass = match self
-            .refresh_desired_topology_from(RestorePassOrigin::ContinuityRepair)
-            .await
-        {
-            Ok(pass) => pass,
-            Err(err) => {
-                // A roster provider or store blip: no typed signal says it
-                // cleared, so the fallback wake retries it.
-                tracing::warn!(
-                    error = %err,
-                    "continuity repair reconcile failed; arming the fallback wake"
-                );
-                return RepairPassVerdict::Transient;
-            }
-        };
-        let still_broken = self.runtime.repairable_broken_identities().await;
-        // A member still Broken on an unreachable store has no typed "store
-        // healthy" signal either; every other cause is retried by a typed
-        // trigger (a settled embodiment, a settled pass, a caller's demand).
-        let store_unavailable = still_broken.iter().any(|identity| {
-            matches!(
-                pass.outcomes.get(identity),
-                Some(super::orchestrator::RestoreOutcome::Broken(failure))
-                    if failure.kind == ContinuityFailureKind::StoreUnavailable
-            )
-        });
-        let healed = repairable
-            .iter()
-            .filter(|id| !still_broken.contains(id))
-            .count();
-        if healed > 0 {
-            tracing::info!(
-                healed,
-                still_broken = still_broken.len(),
-                "continuity repair healed identities"
-            );
-        }
-        for identity in &repairable {
-            if !still_broken.contains(identity) {
-                identical_failure_streaks.remove(identity);
-                continue;
-            }
-            let Some(super::orchestrator::RestoreOutcome::Broken(failure)) =
-                pass.outcomes.get(identity)
-            else {
-                // No comparable typed failure for this pass (the identity
-                // broke through a different door); a streak cannot be
-                // byte-compared across shapes.
-                identical_failure_streaks.remove(identity);
-                continue;
-            };
-            let signature = format!("{:?}: {}", failure.kind, failure.detail);
-            let streak = identical_failure_streaks
-                .entry(identity.clone())
-                .or_insert_with(|| (signature.clone(), 0));
-            if streak.0 == signature {
-                streak.1 += 1;
-            } else {
-                *streak = (signature.clone(), 1);
-            }
-            if streak.1 >= REPAIR_IDENTICAL_FAILURE_PARK_ATTEMPTS {
-                identical_failure_streaks.remove(identity);
-                tracing::error!(
-                    %identity,
-                    attempts = REPAIR_IDENTICAL_FAILURE_PARK_ATTEMPTS,
-                    blocking_failure = %signature,
-                    "continuity repair failed byte-identically on every attempt; \
-                     parking the identity typed instead of re-executing destructive \
-                     repair steps on a timer. Operator path back after fixing the \
-                     blocking failure: restart the gateway (the park is \
-                     process-local; boot re-attempts repair once) or reset the \
-                     identity via `meta/reset` (deliberate fresh start)"
-                );
-                if !self
-                    .runtime
-                    .mark_continuity_unrecoverable(
-                        identity,
-                        format!(
-                            "continuity repair parked after \
-                             {REPAIR_IDENTICAL_FAILURE_PARK_ATTEMPTS} consecutive \
-                             byte-identical repair failures; blocking failure: \
-                             {signature}. After fixing it, restart the gateway \
-                             (process-local park; boot re-attempts repair) or reset \
-                             the identity via `meta/reset`"
-                        ),
-                    )
-                    .await
-                {
-                    tracing::debug!(
-                        %identity,
-                        "identity left Broken before the repair park could be recorded"
-                    );
-                }
-            }
-        }
-        if store_unavailable || recovery_failures > 0 {
-            RepairPassVerdict::Transient
-        } else {
-            RepairPassVerdict::Settled
-        }
-    }
-
-    /// Ask the bridge's heal authority to drive this Broken identity's
-    /// durable session head to a strict-resume-acceptable committed boundary,
-    /// and translate the verdict into what the repair pass may do next.
-    async fn attempt_committed_boundary_recovery(
-        &self,
-        identity: &AgentIdentity,
-    ) -> BrokenRepairDisposition {
-        let Some(bridge) = self.runtime.bridge() else {
-            // Metadata-only runtime (tests): reconcile owns the retry.
-            return BrokenRepairDisposition::Repairable;
-        };
-        let Some(session_id) = self.runtime.continuity_session_id(identity).await else {
-            // No durable session bound (e.g. the store failed before a record
-            // existed): there is no head to heal; reconcile retries as before.
-            return BrokenRepairDisposition::Repairable;
-        };
-        match bridge.recover_committed_boundary(&session_id).await {
-            Ok(
-                CommittedBoundaryRepair::AlreadyCommitted | CommittedBoundaryRepair::Unsupported,
-            ) => BrokenRepairDisposition::Repairable,
-            Ok(CommittedBoundaryRepair::Recovered) => {
-                tracing::info!(
-                    %identity,
-                    %session_id,
-                    "continuity heal: recovery persisted a committed durable head; \
-                     proceeding to reconcile"
-                );
-                BrokenRepairDisposition::Repairable
-            }
-            Ok(CommittedBoundaryRepair::Unprovable { reason }) => {
-                tracing::error!(
-                    %identity,
-                    %session_id,
-                    reason = %reason,
-                    "continuity heal verdict: durable head unprovable; parking the \
-                     identity as Broken until an operator intervenes"
-                );
-                if !self
-                    .runtime
-                    .mark_continuity_unrecoverable(identity, reason)
-                    .await
-                {
-                    // The entry left Broken between the read and the mark
-                    // (an operator reset raced us); nothing to park.
-                    tracing::debug!(
-                        %identity,
-                        "unprovable verdict arrived after the identity left Broken"
-                    );
-                }
-                BrokenRepairDisposition::Unprovable
-            }
-            Ok(CommittedBoundaryRepair::RepairRequired { session_id, detail }) => {
-                tracing::error!(
-                    %identity,
-                    %session_id,
-                    detail = %detail,
-                    "continuity heal verdict: the durable document needs the sanctioned \
-                     audited-endpoint repair; parking the identity typed until the operator \
-                     repairs it and runs reload_member"
-                );
-                if !self
-                    .runtime
-                    .mark_session_repair_required(identity, session_id, detail)
-                    .await
-                {
-                    tracing::debug!(
-                        %identity,
-                        "repair-required verdict arrived after the identity left Broken"
-                    );
-                }
-                BrokenRepairDisposition::RepairRequired
-            }
-            Err(error) => {
-                // Only the error tier is retryable per the heal contract
-                // (Busy mid-turn, store I/O, CAS races).
-                tracing::warn!(
-                    %identity,
-                    %session_id,
-                    error = %error,
-                    "committed-boundary recovery failed; retrying next repair pass"
-                );
-                BrokenRepairDisposition::RetryLater
-            }
-        }
-    }
-}
-
-/// What the repair pass may do with one Broken identity after consulting the
-/// bridge's heal authority.
-enum BrokenRepairDisposition {
-    /// Reconcile may retry this identity now (head committed, recovered, or
-    /// no heal seam to consult).
-    Repairable,
-    /// Terminal typed verdict recorded; excluded until an operator clears it.
-    Unprovable,
-    /// Typed repair hold recorded: the durable document needs the operator's
-    /// sanctioned audited-endpoint repair; excluded until `reload_member`
-    /// resumes it after that repair.
-    RepairRequired,
-    /// The recovery attempt itself failed transiently; retry next pass.
-    RetryLater,
-}
-
-/// Runtime-owned repair supervisor with cooperative idle cancellation.
-///
-/// Cancellation is observed while sleeping or between passes. An active
-/// restore pass is joined to its explicit commit/rollback boundary instead of
-/// being raw-aborted after lease acquisition.
-pub(crate) struct TrackedContinuityRepairTask {
-    cancel: watch::Sender<bool>,
-    join: JoinHandle<()>,
-}
-
-impl TrackedContinuityRepairTask {
-    pub(crate) fn cancel(&self) {
-        let _ = self.cancel.send(true);
-    }
-
-    pub(crate) async fn cancel_and_join(self) {
-        self.cancel();
-        let _ = self.join.await;
-    }
-}
-
-/// Runtime-owned lease-renewal supervisor with cooperative cancellation.
-///
-/// Cancellation is observed while the supervisor is idle or between ticks.
-/// An in-flight renewal is always joined through publication of the provider's
-/// returned fencing token so final shutdown releases current authority.
-pub(crate) struct TrackedLeaseRenewalTask {
-    cancel: watch::Sender<bool>,
-    join: JoinHandle<()>,
-}
-
-impl TrackedLeaseRenewalTask {
-    pub(crate) fn cancel(&self) {
-        let _ = self.cancel.send(true);
-    }
-
-    pub(crate) async fn cancel_and_join(self) {
-        self.cancel();
-        let _ = self.join.await;
-    }
-}
-
-/// Consecutive byte-identical repair failures tolerated for one identity
-/// before the repair supervisor parks it typed
-/// ([`IdentityRuntime::mark_continuity_unrecoverable`]) instead of
-/// re-executing the pass's destructive dispose steps on a timer.
-const REPAIR_IDENTICAL_FAILURE_PARK_ATTEMPTS: u32 = 3;
-
-/// Configuration for [`IdentityFirstRuntimeContext::spawn_broken_identity_repair_task`].
-///
-/// The supervisor has no timer: it retries Broken identities when a typed
-/// [`ContinuityRepairTrigger`] fires, so there is no cadence to configure.
-#[derive(Debug, Clone, Default)]
-#[non_exhaustive]
-pub struct ContinuityRepairPolicy {}
-
-/// What woke the continuity repair supervisor. Each is an event after which
-/// a Broken identity's retry can succeed where the last attempt failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContinuityRepairTrigger {
-    /// Another identity's embodiment settled: a resume, or a fresh durable
-    /// mint, committed, releasing the store writer it held.
-    EmbodimentSettled,
-    /// A restore or reconcile pass the supervisor did not run itself (boot, a
-    /// roster refresh, `meta/reconcile_identity`) finished, releasing every
-    /// writer it held.
-    RestorePassSettled,
-    /// A host asked for a repair pass
-    /// ([`IdentityFirstRuntimeContext::request_continuity_repair`],
-    /// `meta/request_continuity_repair`).
-    Requested,
-    /// A caller's delivery or materialization was refused because the
-    /// identity is Broken: real demand for the identity.
-    DemandOnBroken,
-}
-
-/// Who ran a restore pass, so the repair supervisor's own passes do not
-/// trigger it again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RestorePassOrigin {
-    /// Boot, a roster refresh, or `meta/reconcile_identity`.
-    Host,
-    /// The continuity repair supervisor.
-    ContinuityRepair,
-}
-
-/// What woke one continuity repair pass (for the operator log).
-#[derive(Debug, Clone, Copy)]
-enum RepairWake {
-    Trigger(ContinuityRepairTrigger),
-    /// The last-resort wake armed by a transient cause with no typed signal.
-    Fallback,
-}
-
-impl RepairWake {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Trigger(ContinuityRepairTrigger::EmbodimentSettled) => "embodiment_settled",
-            Self::Trigger(ContinuityRepairTrigger::RestorePassSettled) => "restore_pass_settled",
-            Self::Trigger(ContinuityRepairTrigger::Requested) => "requested",
-            Self::Trigger(ContinuityRepairTrigger::DemandOnBroken) => "demand_on_broken",
-            Self::Fallback => "fallback_wake",
-        }
-    }
-}
-
-/// Whether a repair pass left a transient cause that has no typed signal
-/// (an unreachable heal authority, a failed pass, an unavailable store).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RepairPassVerdict {
-    Settled,
-    Transient,
-}
-
-/// Resolves when the supervisor is cancelled or its owner dropped the
-/// cancellation sender; never for an uncancellable supervisor.
-async fn repair_cancelled(cancellation: &mut Option<watch::Receiver<bool>>) {
-    let Some(cancellation) = cancellation.as_mut() else {
-        return std::future::pending().await;
-    };
-    loop {
-        if *cancellation.borrow_and_update() {
-            return;
-        }
-        if cancellation.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
-/// Marks a continuity repair supervisor as running for its lifetime, so a
-/// repair request can report whether anything will act on it.
-struct ContinuityRepairSupervising(Arc<IdentityRuntime>);
-
-impl ContinuityRepairSupervising {
-    fn enter(runtime: &Arc<IdentityRuntime>) -> Self {
-        runtime
-            .continuity_repair_supervisors
-            .fetch_add(1, Ordering::AcqRel);
-        Self(Arc::clone(runtime))
-    }
-}
-
-impl Drop for ContinuityRepairSupervising {
-    fn drop(&mut self) {
-        self.0
-            .continuity_repair_supervisors
-            .fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// Counts one embodiment, or one embodiment burst (a restore pass, a
-/// background warm), in flight for its lifetime (including a cancelled one),
-/// publishing the count so the repair supervisor can wait for zero.
-pub(super) struct EmbodimentInFlight<'a>(&'a watch::Sender<usize>);
-
-impl<'a> EmbodimentInFlight<'a> {
-    fn enter(count: &'a watch::Sender<usize>) -> Self {
-        count.send_modify(|count| *count += 1);
-        Self(count)
-    }
-}
-
-impl Drop for EmbodimentInFlight<'_> {
-    fn drop(&mut self) {
-        self.0.send_modify(|count| *count = count.saturating_sub(1));
-    }
-}
-
-/// What a continuity repair request reached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContinuityRepairRequestOutcome {
-    /// A running supervisor will run a pass for the repairable Broken
-    /// identities.
-    Scheduled,
-    /// No identity is Broken in a repairable way; there is nothing to repair.
-    NothingToRepair,
-    /// Repairable identities are Broken but no repair supervisor runs in this
-    /// runtime (an embedding that never started one).
-    NoSupervisor,
-}
-
-/// The supervisor's wake signal: a monotonic epoch and the latest cause.
-#[derive(Debug, Clone, Copy, Default)]
-struct ContinuityRepairWake {
-    epoch: u64,
-    last: Option<ContinuityRepairTrigger>,
 }
 
 /// Weak keyed locks serialize claims on the shared raw/durable alias
@@ -2973,23 +2987,27 @@ pub(crate) struct PendingRunTerminals {
     pub(crate) failed: u64,
 }
 
-/// The identity table, with a change signal: releasing a write lock wakes
-/// the completion waiters ([`IdentityRuntime::await_completion`]), which
-/// re-derive their cursor from the table (a lease incarnation change is an
-/// entry write). The signal carries no state and is never read as an event;
+/// The identity table, with a change signal: releasing a write lock, or a
+/// verb of this runtime moving an identity's Core member binding
+/// ([`Self::notify_binding_changed`]), wakes the completion waiters
+/// ([`IdentityRuntime::await_completion`]), which re-read their cursor and
+/// Core's fence. The signal carries no state and is never read as an event;
 /// a wake only means "re-read now".
 struct IdentityEntries {
     table: RwLock<BTreeMap<AgentIdentity, IdentityEntry>>,
     changed: watch::Sender<()>,
-    /// Each identity's current lease fencing token, as of the last write.
-    /// A write that moves it (a lease acquired, rotated or released) wakes
-    /// the [`Self::lease_observer`].
-    lease_tokens: StdMutex<BTreeMap<AgentIdentity, u64>>,
-    /// Told (an epoch bump) whenever any identity's lease fencing token
-    /// changes. The identity health monitor attaches a member's stream only
-    /// once the member's lease exists, so this is its typed wake for that
-    /// moment ([`IdentityRuntime::install_lease_observer`]).
-    lease_observer: StdRwLock<Option<watch::Sender<u64>>>,
+    /// Told (an epoch bump) whenever a verb of this runtime woke, retired or
+    /// replaced an identity's Core member. The identity health monitor
+    /// attaches a member's stream only once Core holds the member, so this is
+    /// its typed wake for that moment
+    /// ([`IdentityRuntime::install_member_binding_observer`]). A member Core
+    /// changes on its own (a host's reconciler) is found on the monitor's
+    /// next read, as before.
+    binding_observer: StdRwLock<Option<watch::Sender<u64>>>,
+    /// Bumped by every [`Self::notify_binding_changed`]: a managed-topology
+    /// commit refuses when a verb of this runtime moved a member between its
+    /// revalidation and its commit.
+    binding_sequence: AtomicU64,
 }
 
 impl IdentityEntries {
@@ -2997,8 +3015,8 @@ impl IdentityEntries {
         Self {
             table: RwLock::new(BTreeMap::new()),
             changed: watch::channel(()).0,
-            lease_tokens: StdMutex::new(BTreeMap::new()),
-            lease_observer: StdRwLock::new(None),
+            binding_observer: StdRwLock::new(None),
+            binding_sequence: AtomicU64::new(0),
         }
     }
 
@@ -3024,51 +3042,24 @@ impl IdentityEntries {
         self.changed.subscribe()
     }
 
-    /// Compare the table's lease fencing tokens with the last published ones
-    /// and wake the lease observer when any moved.
-    fn publish_lease_tokens(&self, table: &BTreeMap<AgentIdentity, IdentityEntry>) {
-        let leased = || {
-            table.iter().filter_map(|(identity, entry)| {
-                entry
-                    .lease
-                    .as_ref()
-                    .map(|lease| (identity, lease.fencing_token.get()))
-            })
-        };
-        let moved = {
-            let mut published = self
-                .lease_tokens
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Compared in place (both sides are identity-ordered); the map is
-            // rebuilt only when a lease actually moved.
-            let unchanged = leased().count() == published.len()
-                && leased().zip(published.iter()).all(
-                    |((identity, token), (published_identity, published_token))| {
-                        identity == published_identity && token == *published_token
-                    },
-                );
-            if !unchanged {
-                *published = leased()
-                    .map(|(identity, token)| (identity.clone(), token))
-                    .collect();
-            }
-            !unchanged
-        };
-        if moved {
-            self.wake_lease_observer();
-        }
-    }
-
-    fn wake_lease_observer(&self) {
+    /// A verb of this runtime moved an identity's Core member (woke, retired
+    /// or replaced it): wake the completion waiters and the binding observer.
+    fn notify_binding_changed(&self) {
+        self.binding_sequence.fetch_add(1, Ordering::AcqRel);
+        self.notify();
         if let Some(observer) = self
-            .lease_observer
+            .binding_observer
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
         {
             observer.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         }
+    }
+
+    /// How many member moves of this runtime's verbs were signalled so far.
+    fn binding_sequence(&self) -> u64 {
+        self.binding_sequence.load(Ordering::Acquire)
     }
 }
 
@@ -3093,7 +3084,6 @@ impl std::ops::DerefMut for IdentityEntriesWriteGuard<'_> {
 
 impl Drop for IdentityEntriesWriteGuard<'_> {
     fn drop(&mut self) {
-        self.entries.publish_lease_tokens(&self.guard);
         self.entries.changed.send_replace(());
     }
 }
@@ -3134,6 +3124,38 @@ impl IdentityEdgeOwnership {
 pub(crate) type HeldFreshnessHook =
     Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
 
+/// The durable held-completion marks as this process knows them (see
+/// [`super::held_bootstrap::HeldCompletionMarks`]).
+enum HeldMarks {
+    /// No state directory is configured: the marks live in memory only.
+    NoStateDir,
+    /// Not read yet: the first wake or held pass reads them into
+    /// `held_completion_owed`.
+    Unread(super::held_bootstrap::HeldCompletionMarks),
+    /// Read into `held_completion_owed`; new marks are written here.
+    Read(super::held_bootstrap::HeldCompletionMarks),
+}
+
+/// The first-boot manifest as this process knows it.
+enum FirstBootRows {
+    /// No state directory is configured, so there is no manifest.
+    NoStateDir,
+    /// The manifest in `state_dir` is not read yet: the first roster
+    /// compile, or the first wake, reads it.
+    Unread { state_dir: PathBuf },
+    /// The rows still to carry out, by identity, and the digest of the rows
+    /// the file holds; `file_stale` while the file still lists a row this
+    /// process carried out (its rewrite failed and is retried).
+    Pending {
+        state_dir: PathBuf,
+        rows: BTreeMap<AgentIdentity, FirstBootRow>,
+        file_rows_sha256: String,
+        file_stale: bool,
+    },
+    /// No manifest, or every row carried out and the file removed.
+    Settled,
+}
+
 /// Why this gateway's runtime does not serve a member it has registered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotServedHere {
@@ -3146,11 +3168,8 @@ pub(crate) enum NotServedHere {
 pub struct IdentityRuntime {
     entries: IdentityEntries,
     event_channels: RwLock<BTreeMap<AgentIdentity, broadcast::Sender<IdentityEvent>>>,
-    continuity_store: Arc<dyn ContinuityStore>,
-    lease_provider: Arc<dyn LeaseProvider>,
     runtime_instance_id: String,
     has_runtime_store: bool,
-    durability_policy: DurabilityPolicy,
     bridge: Option<Arc<dyn SessionBridge>>,
     reset_roster_source: StdRwLock<Option<ResetRosterSource>>,
     runtime_services: AgentRuntimeServices,
@@ -3195,13 +3214,10 @@ pub struct IdentityRuntime {
     /// without their customizer tools until materialization publishes.
     customizer_tools_pending: std::sync::RwLock<BTreeMap<AgentIdentity, CustomizerToolsPending>>,
     agent_memory: RwLock<Option<AgentMemoryRuntimeInjector>>,
-    lease_renewal_notify: Notify,
-    /// Exact grants whose restore task failed before an IdentityEntry existed.
-    /// These must outlive the failed task so reconcile or shutdown can retry
-    /// provider release instead of leaving invisible, non-expiring authority.
-    pending_unactivated_lease_releases: RwLock<Vec<LeaseGrant>>,
-    pending_unactivated_lease_release_gate: Mutex<()>,
     default_timeout: Duration,
+    /// Throttles best-effort warms (peer hydration, background warm) of an
+    /// identity whose last best-effort wake failed. A direct wake is never
+    /// throttled and always asks Core again.
     materialization_failure_backoff: RwLock<BTreeMap<AgentIdentity, MaterializationFailureBackoff>>,
     /// Host-declared `rkat` scope rendered into [`SessionRepairRequired`]
     /// commands; absent fields render as explicit placeholders.
@@ -3225,7 +3241,22 @@ pub struct IdentityRuntime {
     /// ended Broken in that pass): each owes its host a fresh held
     /// completion, and no embodiment outside a held pass that covers it
     /// creates it meanwhile. A held pass that publishes it discharges it.
+    /// With a state directory it also holds the durable marks read back
+    /// after a restart (`held_completion_marks`).
     held_completion_owed: StdMutex<BTreeSet<AgentIdentity>>,
+    /// Where the held-completion marks are kept durably, so a restart
+    /// keeps them.
+    held_completion_marks: StdMutex<HeldMarks>,
+    /// Serializes the first read of the durable held-completion marks.
+    held_completion_marks_reader: Mutex<()>,
+    /// The first-boot manifest: the rows of it this process has not
+    /// carried out yet. Process-local: each row is read against Core's
+    /// member history again before it is carried out.
+    first_boot: StdMutex<FirstBootRows>,
+    /// Serializes the rewrites of the first-boot manifest file.
+    first_boot_writer: Mutex<()>,
+    /// The pending first-boot rows as the bootstrap status reports them.
+    first_boot_status: StdMutex<Vec<FirstBootPendingRow>>,
     /// Test seam: runs in a held bootstrap right after its freshness read.
     #[cfg(test)]
     held_after_freshness_hook: StdMutex<Option<HeldFreshnessHook>>,
@@ -3235,12 +3266,11 @@ pub struct IdentityRuntime {
     foreground_operations: Mutex<JoinSet<()>>,
     foreground_cancel: watch::Sender<bool>,
     foreground_shutdown: AtomicBool,
-    /// Post-commit cleanup for reset-superseded bridge generations. The debt
-    /// is recorded before task spawn, survives task failure/timeout, and is
-    /// retried synchronously before shutdown can attest cleanup or release
-    /// identity fencing authority.
-    pending_reset_bridge_cleanups: Arc<RwLock<BTreeMap<String, PendingResetBridgeCleanup>>>,
-    reset_bridge_cleanup_tasks: Mutex<JoinSet<()>>,
+    /// Reset memory captures of outgoing sessions not yet run, keyed by the
+    /// session. A capture is recorded before its task spawns and leaves the
+    /// ledger only after it ran, so shutdown joins or reruns it.
+    pending_reset_memory_captures: Arc<RwLock<BTreeMap<String, PendingResetMemoryCapture>>>,
+    reset_memory_capture_tasks: Mutex<JoinSet<()>>,
     /// Per-identity completed-turn counters ([`CompletionCursor`]).
     ///
     /// RETAINED for the process lifetime — never pruned on retire, reset, or
@@ -3266,24 +3296,15 @@ pub struct IdentityRuntime {
     /// yet credited.
     completion_credit_locks:
         StdMutex<BTreeMap<AgentIdentity, std::sync::Weak<tokio::sync::Mutex<()>>>>,
-    /// Whether a completion drain was installed when the lease observer was
-    /// (the first lease-woken attach may replay only with one).
+    /// Whether a completion drain was installed when the member-binding
+    /// observer was (the first binding-woken attach may replay only with
+    /// one).
     #[cfg(test)]
-    lease_observer_saw_drain: std::sync::atomic::AtomicBool,
+    binding_observer_saw_drain: std::sync::atomic::AtomicBool,
     /// Fired whenever a ticketed turn is admitted (which may evict another)
     /// or settles, so [`Self::wait_for_turn`] waits on the change instead of
     /// polling the registry. Carries no state.
     turn_outcome_changes: Arc<watch::Sender<()>>,
-    /// Typed wake-ups for the continuity repair supervisor: bumped whenever
-    /// something happened that can let a Broken identity's retry succeed
-    /// ([`ContinuityRepairTrigger`]). The supervisor has no timer.
-    continuity_repair_triggers: watch::Sender<ContinuityRepairWake>,
-    /// Running continuity repair supervisors ([`ContinuityRepairSupervising`]).
-    continuity_repair_supervisors: AtomicUsize,
-    /// Embodiments (resumes and fresh mints) and embodiment bursts (restore
-    /// passes, background warms) in flight, published so the repair
-    /// supervisor waits for zero instead of contending with them.
-    embodiments_in_flight: watch::Sender<usize>,
     /// Member inspections shared per runtime incarnation ([`Self::inspect`]).
     inspections: StdMutex<BTreeMap<AgentRuntimeId, SharedInspection>>,
 }
@@ -3554,15 +3575,22 @@ pub(crate) struct DispatchOutcome {
     turn: Option<TurnTracking>,
 }
 
-/// Exact result of the one concrete embodiment door shared by eager restore,
-/// lazy foreground materialization, and background warming.
+/// Exact result of the one wake door shared by eager boot, lazy foreground
+/// wakes, and background warms.
 pub(crate) struct EmbodimentOutcome {
-    pub(crate) record: ContinuityRecord,
+    /// The binding Core committed for the member: its runtime id, and its
+    /// session (`None` for a peer-only member).
+    pub(crate) binding: super::bridge::MemberRuntimeBinding,
+    /// Core resumed the identity's committed session (`false`: a fresh
+    /// spawn).
     pub(crate) resumed: bool,
     pub(crate) draft: AgentBuildDraft,
-    /// The identity was already Active when the embodiment door ran (a
+    /// Core already held the member when the wake door ran (a revival or a
     /// converged re-validation, not a wake).
     pub(crate) already_active: bool,
+    /// The last session this wake replaced with a fresh one because Core
+    /// holds no durable session for it.
+    pub(crate) replaced_session: Option<SessionId>,
 }
 
 /// Eager-only inputs to the shared embodiment transaction. Lazy foreground
@@ -3588,6 +3616,81 @@ struct MaterializationFailureBackoff {
     error: String,
 }
 
+/// What Core's member history says of one identity, for the views.
+#[derive(Debug, Clone, Default)]
+struct CoreViewFacts {
+    /// Core holds the identity's member.
+    live: bool,
+    /// The live member's runtime id (Meta's public alias of Core's).
+    runtime_id: Option<AgentRuntimeId>,
+    /// The session of the identity's last binding, live or retired.
+    session_id: Option<SessionId>,
+    /// Core's mob member id of that binding.
+    member_id: Option<String>,
+    /// Core's generation of that binding.
+    generation: Option<meerkat_mob::Generation>,
+    /// Core holds an identity intent row for the identity.
+    intent_managed: bool,
+}
+
+impl CoreViewFacts {
+    /// Read `identity` out of `history` (`None` without a bridge: nothing
+    /// is live).
+    fn of(history: Option<&meerkat_mob::MemberBindingHistory>, identity: &AgentIdentity) -> Self {
+        let Some(history) = history else {
+            return Self::default();
+        };
+        let core_identity =
+            crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
+        let intent_managed = !matches!(
+            history.identity_management(&core_identity),
+            meerkat_mob::MemberIdentityManagement::CommandDriven
+        );
+        let Some(binding) = history.last_binding(&core_identity) else {
+            return Self {
+                intent_managed,
+                ..Self::default()
+            };
+        };
+        Self {
+            live: binding.is_live(),
+            runtime_id: live_binding_runtime_id(binding),
+            session_id: binding.session_id().cloned(),
+            member_id: Some(binding.identity().as_str().to_string()),
+            generation: Some(binding.generation()),
+            intent_managed,
+        }
+    }
+}
+
+/// Meta's public runtime id of a Core binding while Core holds it live
+/// (`rt:{identity}:{generation}`); `None` once the binding is retired.
+pub fn live_binding_runtime_id(binding: &meerkat_mob::MemberBinding) -> Option<AgentRuntimeId> {
+    if !binding.is_live() {
+        return None;
+    }
+    AgentRuntimeId::parse(&crate::member_comms_id::public_runtime_alias(
+        &meerkat_mob::ids::AgentRuntimeId::new(binding.identity().clone(), binding.generation()),
+    ))
+    .ok()
+}
+
+/// Whether `binding` carries Core's durable-identity marker for
+/// `identity`: keyed by the identity (every identity-first spawn and
+/// resume) or by its member id (Core's identity reconciler keys by the
+/// member it spawns).
+pub(crate) fn binding_carries_identity_marker(
+    binding: &meerkat_mob::MemberBinding,
+    identity: &AgentIdentity,
+) -> bool {
+    matches!(
+        binding.continuity_intent(),
+        meerkat_mob::SpawnContinuityIntent::DurableIdentity { continuity_key }
+            if continuity_key == identity.as_str()
+                || continuity_key == binding.identity().as_str()
+    )
+}
+
 #[derive(Clone)]
 struct PendingResetMemoryCapture {
     injector: AgentMemoryRuntimeInjector,
@@ -3611,38 +3714,6 @@ impl PendingResetMemoryCapture {
                 crate::memory::distiller::DistillCause::Reset,
             )
             .await;
-    }
-}
-
-#[derive(Clone)]
-struct PendingResetBridgeCleanup {
-    runtime_id: Option<AgentRuntimeId>,
-    session_id: Option<SessionId>,
-    memory_capture: Option<PendingResetMemoryCapture>,
-}
-
-impl PartialEq for PendingResetBridgeCleanup {
-    fn eq(&self, other: &Self) -> bool {
-        self.runtime_id == other.runtime_id && self.session_id == other.session_id
-    }
-}
-
-impl Eq for PendingResetBridgeCleanup {}
-
-impl PendingResetBridgeCleanup {
-    fn key(&self) -> String {
-        format!(
-            "{}|{}",
-            self.runtime_id
-                .as_ref()
-                .map(AgentRuntimeId::as_str)
-                .unwrap_or("-"),
-            self.session_id
-                .as_ref()
-                .map(std::string::ToString::to_string)
-                .as_deref()
-                .unwrap_or("-")
-        )
     }
 }
 
@@ -3689,6 +3760,142 @@ impl IdentityRuntime {
         }
     }
 
+    /// Point the runtime at its state directory, where the held-completion
+    /// marks are kept durably, one file per identity under
+    /// [`super::HELD_COMPLETION_OWED_DIR`]; the first wake or
+    /// held pass reads them. `None` keeps the marks in memory only, so a
+    /// restart forgets them.
+    pub fn set_held_completion_state_dir(&self, state_dir: Option<PathBuf>) {
+        *self
+            .held_completion_marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = match state_dir {
+            Some(state_dir) => HeldMarks::Unread(
+                super::held_bootstrap::HeldCompletionMarks::in_state_dir(&state_dir),
+            ),
+            None => HeldMarks::NoStateDir,
+        };
+    }
+
+    /// The durable held-completion marks, when a state directory keeps them.
+    fn held_completion_marks(&self) -> Option<super::held_bootstrap::HeldCompletionMarks> {
+        match &*self
+            .held_completion_marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            HeldMarks::NoStateDir => None,
+            HeldMarks::Unread(marks) | HeldMarks::Read(marks) => Some(marks.clone()),
+        }
+    }
+
+    /// Read the durable held-completion marks into `held_completion_owed`,
+    /// once. A marked identity that Core's member history binds was
+    /// published by the held pass that marked it (removing its mark did not
+    /// land), so it owes nothing and its mark is removed now. A read that
+    /// fails refuses the caller, and the next call reads again: which
+    /// identities owe a completion is unknown until then.
+    async fn load_held_completion_marks(&self) -> Result<(), IdentityRuntimeError> {
+        let unread = matches!(
+            &*self
+                .held_completion_marks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            HeldMarks::Unread(_)
+        );
+        if !unread {
+            return Ok(());
+        }
+        let _reader = self.held_completion_marks_reader.lock().await;
+        let marks = match &*self
+            .held_completion_marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            HeldMarks::Unread(marks) => marks.clone(),
+            HeldMarks::NoStateDir | HeldMarks::Read(_) => return Ok(()),
+        };
+        let reader = marks.clone();
+        let marked = tokio::task::spawn_blocking(move || reader.read())
+            .await
+            .map_err(|error| {
+                IdentityRuntimeError::Internal(format!(
+                    "reading the held-completion marks did not finish: {error}"
+                ))
+            })?
+            .map_err(|error| {
+                IdentityRuntimeError::Internal(format!(
+                    "reading the held-completion marks in {}: {error}",
+                    marks.dir().display()
+                ))
+            })?;
+        let mut owed = BTreeSet::new();
+        for identity in marked {
+            if self.bridge.is_some() && self.core_last_binding(&identity).await?.is_some() {
+                self.clear_held_completion_mark(&identity).await;
+                continue;
+            }
+            owed.insert(identity);
+        }
+        self.held_completion_owed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(owed);
+        *self
+            .held_completion_marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = HeldMarks::Read(marks);
+        Ok(())
+    }
+
+    /// Mark `identities` durably as owing their host a held completion,
+    /// before a held pass creates any of their members.
+    pub(crate) async fn mark_held_completion_owed(
+        &self,
+        identities: &[AgentIdentity],
+    ) -> Result<(), IdentityRuntimeError> {
+        self.load_held_completion_marks().await?;
+        let Some(marks) = self.held_completion_marks() else {
+            return Ok(());
+        };
+        let dir = marks.dir().display().to_string();
+        let marked = identities.to_vec();
+        tokio::task::spawn_blocking(move || marks.mark(&marked))
+            .await
+            .map_err(|error| {
+                IdentityRuntimeError::Internal(format!(
+                    "marking the held members did not finish: {error}"
+                ))
+            })?
+            .map_err(|error| {
+                IdentityRuntimeError::Internal(format!(
+                    "marking the held members in {dir}: {error}"
+                ))
+            })
+    }
+
+    /// Remove `identity`'s durable held-completion mark once a held pass
+    /// published its member. A removal that fails leaves a stale mark, which
+    /// the next read drops, since Core's member history then binds the
+    /// identity.
+    pub(crate) async fn clear_held_completion_mark(&self, identity: &AgentIdentity) {
+        let Some(marks) = self.held_completion_marks() else {
+            return;
+        };
+        let cleared = identity.clone();
+        let failure = match tokio::task::spawn_blocking(move || marks.clear(&cleared)).await {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => error.to_string(),
+            Err(error) => error.to_string(),
+        };
+        tracing::warn!(
+            %identity,
+            error = %failure,
+            "the held-completion mark of a published member was not removed; the next read \
+             of the marks drops it"
+        );
+    }
+
     /// Create a new identity runtime with the given configuration.
     pub fn new(config: IdentityRuntimeConfig) -> Self {
         let (bootstrap_status, _) = watch::channel(IdentityBootstrapStatus::empty(
@@ -3698,11 +3905,8 @@ impl IdentityRuntime {
         Self {
             entries: IdentityEntries::new(),
             event_channels: RwLock::new(BTreeMap::new()),
-            continuity_store: config.continuity_store,
-            lease_provider: config.lease_provider,
             runtime_instance_id: config.runtime_instance_id,
             has_runtime_store: config.has_runtime_store,
-            durability_policy: config.durability_policy,
             bridge: config.bridge,
             reset_roster_source: StdRwLock::new(None),
             runtime_services: AgentRuntimeServices::empty(),
@@ -3724,9 +3928,6 @@ impl IdentityRuntime {
             customizer_tools: RwLock::new(None),
             customizer_tools_pending: std::sync::RwLock::new(BTreeMap::new()),
             agent_memory: RwLock::new(None),
-            lease_renewal_notify: Notify::new(),
-            pending_unactivated_lease_releases: RwLock::new(Vec::new()),
-            pending_unactivated_lease_release_gate: Mutex::new(()),
             default_timeout: config.default_timeout.unwrap_or(Duration::from_secs(90)),
             materialization_failure_backoff: RwLock::new(BTreeMap::new()),
             session_repair_scope: StdRwLock::new(None),
@@ -3738,6 +3939,11 @@ impl IdentityRuntime {
             bootstrap_controller: Mutex::new(()),
             held_create_pass: StdMutex::new(None),
             held_completion_owed: StdMutex::new(BTreeSet::new()),
+            held_completion_marks: StdMutex::new(HeldMarks::NoStateDir),
+            held_completion_marks_reader: Mutex::new(()),
+            first_boot: StdMutex::new(FirstBootRows::NoStateDir),
+            first_boot_writer: Mutex::new(()),
+            first_boot_status: StdMutex::new(Vec::new()),
             #[cfg(test)]
             held_after_freshness_hook: StdMutex::new(None),
             bootstrap_task: Mutex::new(None),
@@ -3746,8 +3952,8 @@ impl IdentityRuntime {
             foreground_operations: Mutex::new(JoinSet::new()),
             foreground_cancel,
             foreground_shutdown: AtomicBool::new(false),
-            pending_reset_bridge_cleanups: Arc::new(RwLock::new(BTreeMap::new())),
-            reset_bridge_cleanup_tasks: Mutex::new(JoinSet::new()),
+            pending_reset_memory_captures: Arc::new(RwLock::new(BTreeMap::new())),
+            reset_memory_capture_tasks: Mutex::new(JoinSet::new()),
             completion_cursors: StdMutex::new(BTreeMap::new()),
             turn_outcomes: Arc::default(),
             turn_outcome_changes: Arc::new(watch::channel(()).0),
@@ -3755,10 +3961,7 @@ impl IdentityRuntime {
             pending_completion_drain: StdRwLock::new(None),
             completion_credit_locks: StdMutex::new(BTreeMap::new()),
             #[cfg(test)]
-            lease_observer_saw_drain: std::sync::atomic::AtomicBool::new(false),
-            continuity_repair_triggers: watch::channel(ContinuityRepairWake::default()).0,
-            continuity_repair_supervisors: AtomicUsize::new(0),
-            embodiments_in_flight: watch::channel(0).0,
+            binding_observer_saw_drain: std::sync::atomic::AtomicBool::new(false),
             inspections: StdMutex::new(BTreeMap::new()),
         }
     }
@@ -3896,7 +4099,7 @@ impl IdentityRuntime {
     fn replace_bootstrap_status(
         &self,
         expected_generation: u64,
-        status: IdentityBootstrapStatus,
+        mut status: IdentityBootstrapStatus,
     ) -> bool {
         let current_generation = self
             .bootstrap_generation
@@ -3905,6 +4108,12 @@ impl IdentityRuntime {
         if expected_generation != *current_generation {
             return false;
         }
+        // A new pass's snapshot keeps the first-boot rows still pending.
+        status.first_boot_pending = self
+            .first_boot_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         self.bootstrap_status.send_replace(status);
         true
     }
@@ -3937,29 +4146,26 @@ impl IdentityRuntime {
         mode: IdentityBootstrapMode,
         roster: &[DurableAgentSpec],
     ) {
-        let entries = self.entries.read().await;
-        let identities = roster
-            .iter()
-            .map(|spec| {
-                let lifecycle = entries.get(&spec.identity).map(|entry| entry.state);
-                let state = match lifecycle {
-                    Some(IdentityLifecycleState::Active) => IdentityBootstrapState::Active,
-                    _ if matches!(&mode, IdentityBootstrapMode::EagerMaterialize) => {
-                        IdentityBootstrapState::Warming
-                    }
-                    _ => IdentityBootstrapState::Dormant,
-                };
-                (
-                    spec.identity.clone(),
-                    IdentityBootstrapEntry {
-                        state,
-                        error: None,
-                        restore: None,
-                    },
-                )
-            })
-            .collect();
-        drop(entries);
+        let mut identities = BTreeMap::new();
+        for spec in roster {
+            // Core holds a live member for the identity: it starts Active.
+            let live = matches!(self.core_live_member(&spec.identity).await, Ok(Some(_)));
+            let state = if live {
+                IdentityBootstrapState::Active
+            } else if matches!(&mode, IdentityBootstrapMode::EagerMaterialize) {
+                IdentityBootstrapState::Warming
+            } else {
+                IdentityBootstrapState::Dormant
+            };
+            identities.insert(
+                spec.identity.clone(),
+                IdentityBootstrapEntry {
+                    state,
+                    error: None,
+                    restore: None,
+                },
+            );
+        }
         let mut status = IdentityBootstrapStatus {
             mode,
             complete: false,
@@ -3967,6 +4173,7 @@ impl IdentityRuntime {
             error: None,
             counts: Default::default(),
             identities,
+            first_boot_pending: Vec::new(),
         };
         status.refresh_aggregates();
         // A roster consisting only of already-active identities still has a
@@ -4105,18 +4312,32 @@ impl IdentityRuntime {
             IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency } => Some(concurrency),
             _ => None,
         };
+        // An unreadable first-boot manifest refuses every identity of the
+        // pass; the pass-level slot names the file and the refusal once.
+        let manifest_refusal = result.outcomes.values().find_map(|outcome| match outcome {
+            super::orchestrator::RestoreOutcome::Refused(error)
+                if matches!(
+                    error.as_ref(),
+                    IdentityRuntimeError::FirstBootManifestUnreadable { .. }
+                ) =>
+            {
+                Some(error.to_string())
+            }
+            _ => None,
+        });
         let mut status = IdentityBootstrapStatus {
             mode: mode.clone(),
             complete: background_concurrency.is_none(),
             ready: false,
-            error: None,
+            error: manifest_refusal,
             counts: Default::default(),
             identities: BTreeMap::new(),
+            first_boot_pending: Vec::new(),
         };
         for spec in roster {
             let broken_outcome = result.outcomes.get(&spec.identity).and_then(|outcome| {
-                if let super::orchestrator::RestoreOutcome::Broken(failure) = outcome {
-                    Some(failure.detail.clone())
+                if let super::orchestrator::RestoreOutcome::Refused(error) = outcome {
+                    Some(error.to_string())
                 } else {
                     None
                 }
@@ -4127,10 +4348,10 @@ impl IdentityRuntime {
                 .ok()
                 .map(|item| item.state);
             let (state, error) = match (broken_outcome, lifecycle) {
-                // A store-projected Broken result is itself authoritative.
-                // restore_flow intentionally does not fabricate a lifecycle
-                // entry for it, so consulting lifecycle alone would default
-                // to Dormant and make a terminal wait barrier time out.
+                // A refused wake settles the identity for this pass. The
+                // view reads Dormant after a refusal that is not final, so
+                // consulting it alone would make a terminal wait barrier
+                // time out.
                 (Some(detail), _) => (IdentityBootstrapState::Broken, Some(detail)),
                 (None, Some(IdentityLifecycleState::Active)) => {
                     (IdentityBootstrapState::Active, None)
@@ -4183,9 +4404,6 @@ impl IdentityRuntime {
         let runtime = Arc::clone(self);
         let (cancel, task_cancel) = watch::channel(false);
         let task = tokio::spawn(async move {
-            // The warm is one embodiment burst: the repair supervisor defers
-            // until all of it settled and then runs one pass.
-            let _burst = runtime.enter_embodiment_burst();
             stream::iter(identities.into_iter().map(|identity| {
                 let runtime = Arc::clone(&runtime);
                 let mut cancel = task_cancel.clone();
@@ -4261,10 +4479,7 @@ impl IdentityRuntime {
             entry.state = match lifecycle {
                 IdentityLifecycleState::Active => IdentityBootstrapState::Active,
                 IdentityLifecycleState::Broken => IdentityBootstrapState::Broken,
-                IdentityLifecycleState::Dormant
-                | IdentityLifecycleState::Retiring
-                | IdentityLifecycleState::Suspended
-                | IdentityLifecycleState::Uninitialized => IdentityBootstrapState::Dormant,
+                IdentityLifecycleState::Dormant => IdentityBootstrapState::Dormant,
             };
             entry.error = if entry.state == IdentityBootstrapState::Broken {
                 error
@@ -4275,10 +4490,10 @@ impl IdentityRuntime {
         });
     }
 
-    fn mark_bootstrap_materialization_finished(
+    fn mark_bootstrap_materialization_finished<T>(
         &self,
         identity: &AgentIdentity,
-        result: &Result<ContinuityRecord, IdentityRuntimeError>,
+        result: &Result<T, IdentityRuntimeError>,
         generation: Option<u64>,
     ) {
         self.modify_bootstrap_status(generation, |snapshot| {
@@ -4332,7 +4547,7 @@ impl IdentityRuntime {
                     entry.state = IdentityBootstrapState::Active;
                     entry.error = None;
                 }
-                IdentityRestoreProgress::Broken { .. } => {
+                IdentityRestoreProgress::Refused { .. } => {
                     entry.state = IdentityBootstrapState::Broken;
                     entry.error = error;
                 }
@@ -4356,25 +4571,31 @@ impl IdentityRuntime {
         &self,
         tracked: &IdentityBootstrapStatus,
     ) -> Vec<meerkat_mob::ids::AgentIdentity> {
-        let entries = self.entries.read().await;
-        tracked
-            .identities
-            .keys()
-            .filter_map(|identity| {
-                // The roster is keyed by the encoded DURABLE identity for every
-                // binding. This used to mirror the old spawn-side lowering
-                // (identity for external, runtime id for local); keeping that
-                // split would report member ids no roster row answers to, and
-                // the bootstrap status would look healthy while naming nothing.
-                let entry = entries.get(identity)?;
-                // A continuity row still gates inclusion: an identity with no
-                // binding is not a bootstrapped member.
-                entry.continuity.as_ref()?;
-                Some(crate::member_comms_id::roster_member_id_for_identity(
+        // The roster is keyed by the encoded DURABLE identity for every
+        // binding. This used to mirror the old spawn-side lowering (identity
+        // for external, runtime id for local); keeping that split would report
+        // member ids no roster row answers to, and the bootstrap status would
+        // look healthy while naming nothing.
+        let registered: Vec<AgentIdentity> = {
+            let entries = self.entries.read().await;
+            tracked
+                .identities
+                .keys()
+                .filter(|identity| entries.contains_key(*identity))
+                .cloned()
+                .collect()
+        };
+        let mut members = Vec::new();
+        for identity in registered {
+            // Core's history gates inclusion: an identity Core never spawned
+            // (since the latest mob reset) is not a bootstrapped member.
+            if matches!(self.core_last_binding(&identity).await, Ok(Some(_))) {
+                members.push(crate::member_comms_id::roster_member_id_for_identity(
                     identity.as_str(),
-                ))
-            })
-            .collect()
+                ));
+            }
+        }
+        members
     }
 
     pub async fn set_agent_customizer(&self, customizer: Option<Arc<dyn AgentCustomizer>>) {
@@ -4449,6 +4670,16 @@ impl IdentityRuntime {
             .cloned()
     }
 
+    /// Register every roster identity's customizer-tool dispatcher before the
+    /// mob is lifted, so Core's restart restore attaches it.
+    pub(crate) async fn ensure_customizer_tool_dispatchers(&self, roster: &[DurableAgentSpec]) {
+        if let Some(registry) = self.customizer_tools.read().await.clone() {
+            for spec in roster {
+                registry.ensure(&spec.identity);
+            }
+        }
+    }
+
     /// Publish each roster identity's customizer tools BEFORE the mob is
     /// lifted (#563). meerkat's restore at activation then builds every
     /// restored member with its tools already present: its tool scope is
@@ -4458,17 +4689,23 @@ impl IdentityRuntime {
     /// same atomic swap. A failure here is logged per identity and recorded as
     /// `IdentityStatus::customizer_tools_pending` until the materialization
     /// publishes.
+    ///
+    /// An identity already pending (the mob build's early publication
+    /// failed, so its restore holds the member's run starts) that publishes
+    /// here stays pending: the hold is still staged, and only
+    /// [`Self::release_customizer_tool_holds`] after the lift, or a later
+    /// publication, lets it go. Returns those identities.
     pub async fn prepublish_customizer_tools(
         &self,
         roster: &[DurableAgentSpec],
         customizer: Option<&dyn AgentCustomizer>,
-    ) {
+    ) -> Vec<AgentIdentity> {
         let Some(registry) = self.customizer_tools.read().await.clone() else {
-            return;
+            return Vec::new();
         };
         let installed = self.customizer.read().await.clone();
         let Some(customizer) = customizer.or(installed.as_deref()) else {
-            return;
+            return Vec::new();
         };
         let active_peers: Vec<AgentIdentity> = self.entries.read().await.keys().cloned().collect();
         let managed_edges = self.desired_peer_edges.read().await.clone();
@@ -4485,10 +4722,173 @@ impl IdentityRuntime {
             .customizer_tools_pending
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut release_owed = Vec::new();
         for spec in roster {
-            pending.remove(&spec.identity);
+            if failed.contains_key(&spec.identity) {
+                continue;
+            }
+            if pending.contains_key(&spec.identity) {
+                release_owed.push(spec.identity.clone());
+            }
         }
         pending.extend(failed);
+        release_owed
+    }
+
+    /// Release the run-start hold of each identity whose customizer tools
+    /// were published before the lift although the mob build's earlier
+    /// publication had failed (see [`Self::prepublish_customizer_tools`]).
+    /// Called once the mob is live, since meerkat staged the hold at the
+    /// build and a release must reach it. A failed release keeps the
+    /// identity pending with the reason.
+    pub(crate) async fn release_customizer_tool_holds(&self, identities: &[AgentIdentity]) {
+        let Some(bridge) = self.bridge.as_ref() else {
+            return;
+        };
+        for identity in identities {
+            let member_id = crate::member_comms_id::mob_member_id(identity.as_str());
+            match bridge
+                .release_member_run_starts_for_published_tools(&member_id)
+                .await
+            {
+                Ok(()) => {
+                    self.customizer_tools_pending
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(identity);
+                }
+                Err(error) => {
+                    let reason = format!("customizer tools published, but {error}");
+                    tracing::error!(
+                        %identity,
+                        %reason,
+                        "restored member stays held: it starts no run until the hold is released"
+                    );
+                    self.customizer_tools_pending
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(
+                            identity.clone(),
+                            CustomizerToolsPending {
+                                reason,
+                                artifact_refusal: None,
+                            },
+                        );
+                }
+            }
+        }
+    }
+
+    /// Publish the customizer tools of a member Core holds live while they
+    /// are still pending (every publication before the lift failed): meerkat
+    /// holds its run starts until they are published, and nothing rebuilds a
+    /// live member, so its wake or its delivery publishes them here, as a
+    /// materialization did. The publication releases the hold.
+    ///
+    /// While they cannot be published the wake or delivery is refused, so
+    /// nothing is admitted behind the hold: a refused build answers
+    /// `ToolArtifactRefused` or `IdentityWakeRetryable` and keeps the
+    /// identity pending with the new reason. The host's build is bounded by
+    /// the runtime's shutdown, like the other wake builds.
+    async fn publish_pending_customizer_tools(
+        &self,
+        identity: &AgentIdentity,
+        session_id: Option<&SessionId>,
+        operation: &'static str,
+    ) -> Result<(), IdentityRuntimeError> {
+        if self.customizer_tools_pending_for(identity).is_none() {
+            return Ok(());
+        }
+        let Some(customizer) = self.customizer.read().await.clone() else {
+            return Ok(());
+        };
+        let Some(spec) = self
+            .entries
+            .read()
+            .await
+            .get(identity)
+            .map(|entry| entry.spec.clone())
+        else {
+            return Ok(());
+        };
+        let refused = |detail: String| IdentityRuntimeError::IdentityWakeRetryable {
+            identity: identity.clone(),
+            session_id: session_id.cloned(),
+            detail,
+        };
+        let mut shutdown = self.foreground_cancel.subscribe();
+        if *shutdown.borrow() {
+            return Err(IdentityRuntimeError::Internal(format!(
+                "identity {operation} cancelled during shutdown before its customizer tools \
+                 were published"
+            )));
+        }
+        let build_context = AgentBuildContext {
+            identity: identity.clone(),
+            active_peers: self.entries.read().await.keys().cloned().collect(),
+            managed_edges: self.desired_peer_edges.read().await.clone(),
+            runtime_services: self.runtime_services(),
+        };
+        let mut draft = Self::base_build_draft(&spec);
+        let customize_result = {
+            let customize = customizer.customize_build(&build_context, &spec, &mut draft);
+            tokio::pin!(customize);
+            tokio::select! {
+                result = &mut customize => result,
+                changed = shutdown.changed() => {
+                    if changed.is_ok() && *shutdown.borrow() {
+                        return Err(IdentityRuntimeError::Internal(format!(
+                            "identity {operation} cancelled during shutdown before its \
+                             customizer tools were published"
+                        )));
+                    }
+                    customize.await
+                }
+            }
+        };
+        match customize_result {
+            Ok(()) => {
+                self.publish_customizer_tools(identity, &mut draft).await;
+                // A release that failed keeps the identity pending (and the
+                // member held): nothing is admitted behind it.
+                match self.customizer_tools_pending_for(identity) {
+                    None => Ok(()),
+                    Some(pending) => Err(refused(pending.reason)),
+                }
+            }
+            Err(error) => {
+                let reason = format!("customize_build failed: {error}");
+                let artifact_refusal = match &error {
+                    super::types::CustomizerError::ToolArtifactRefused(refusal) => {
+                        Some(refusal.as_ref().clone())
+                    }
+                    _ => None,
+                };
+                tracing::warn!(
+                    %identity,
+                    %reason,
+                    "live member's customizer tools are still unpublished; its {operation} is \
+                     refused until they are"
+                );
+                self.customizer_tools_pending
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        identity.clone(),
+                        CustomizerToolsPending {
+                            reason: reason.clone(),
+                            artifact_refusal,
+                        },
+                    );
+                if let super::types::CustomizerError::ToolArtifactRefused(refusal) = error {
+                    return Err(IdentityRuntimeError::ToolArtifactRefused(refusal));
+                }
+                Err(refused(format!(
+                    "the member's customizer tools are not published ({reason}); it starts no \
+                     run until they are, retry"
+                )))
+            }
+        }
     }
 
     /// Record identities whose customizer tools a pre-build publication could
@@ -4763,44 +5163,6 @@ impl IdentityRuntime {
         }
     }
 
-    /// Spawn a background supervisor that renews active identity leases before
-    /// they reach their TTL deadline.
-    pub fn spawn_lease_renewal_task(self: Arc<Self>) -> JoinHandle<()> {
-        self.remember_self_handle();
-        self.spawn_lease_renewal_task_with_poll_interval(DEFAULT_LEASE_RENEWAL_MAX_POLL_INTERVAL)
-    }
-
-    /// Spawn the runtime-owned renewal supervisor. Unlike the public
-    /// fire-and-forget helper, this handle cooperatively cancels while idle
-    /// and joins any in-flight renewal through provider, continuity-store,
-    /// bridge, and local-publication commit boundaries.
-    pub(crate) fn spawn_tracked_lease_renewal_task(self: Arc<Self>) -> TrackedLeaseRenewalTask {
-        self.spawn_tracked_lease_renewal_task_with_poll_interval(
-            DEFAULT_LEASE_RENEWAL_MAX_POLL_INTERVAL,
-        )
-    }
-
-    pub(crate) fn spawn_tracked_lease_renewal_task_with_poll_interval(
-        self: Arc<Self>,
-        max_poll_interval: Duration,
-    ) -> TrackedLeaseRenewalTask {
-        self.remember_self_handle();
-        let (cancel, receiver) = watch::channel(false);
-        let join = tokio::spawn(self.run_lease_renewal_loop(max_poll_interval, Some(receiver)));
-        TrackedLeaseRenewalTask { cancel, join }
-    }
-
-    /// Spawn a lease renewal supervisor with a caller-provided maximum poll
-    /// interval. Embedders can use this for shorter external lease TTLs; tests
-    /// use it to exercise renewal without waiting on wall-clock TTLs.
-    pub fn spawn_lease_renewal_task_with_poll_interval(
-        self: Arc<Self>,
-        max_poll_interval: Duration,
-    ) -> JoinHandle<()> {
-        self.remember_self_handle();
-        tokio::spawn(self.run_lease_renewal_loop(max_poll_interval, None))
-    }
-
     /// Remember the owning `Arc` (weakly) for detached post-admission work.
     fn remember_self_handle(self: &Arc<Self>) {
         let _ = self.self_handle.set(Arc::downgrade(self));
@@ -4809,153 +5171,6 @@ impl IdentityRuntime {
     /// The owning `Arc`, when an `Arc`-receiving entry point has run.
     fn shared_handle(&self) -> Option<Arc<Self>> {
         self.self_handle.get().and_then(std::sync::Weak::upgrade)
-    }
-
-    async fn run_lease_renewal_loop(
-        self: Arc<Self>,
-        max_poll_interval: Duration,
-        mut cancellation: Option<watch::Receiver<bool>>,
-    ) {
-        let max_poll_interval = max_poll_interval.max(DEFAULT_LEASE_RENEWAL_MIN_POLL_INTERVAL);
-        let mut consecutive_failures: u32 = 0;
-        loop {
-            if cancellation
-                .as_ref()
-                .is_some_and(|cancellation| *cancellation.borrow())
-            {
-                return;
-            }
-            let base = self.lease_renewal_sleep_interval(max_poll_interval).await;
-            // While the provider is failing, hold off at least the backoff
-            // delay so a persistent outage retries at a bounded rate instead
-            // of the TTL-derived floor (down to 10ms).
-            let sleep = if consecutive_failures > 0 {
-                base.max(lease_renewal_failure_backoff(
-                    consecutive_failures,
-                    max_poll_interval,
-                ))
-            } else {
-                base
-            };
-            if let Some(cancellation) = cancellation.as_mut() {
-                tokio::select! {
-                    () = tokio::time::sleep(sleep) => {}
-                    () = self.lease_renewal_notify.notified() => {}
-                    changed = cancellation.changed() => {
-                        match changed {
-                            Ok(()) if *cancellation.borrow() => return,
-                            Ok(()) => continue,
-                            Err(_) => return,
-                        }
-                    }
-                }
-            } else {
-                tokio::select! {
-                    () = tokio::time::sleep(sleep) => {}
-                    () = self.lease_renewal_notify.notified() => {}
-                }
-            }
-
-            // Do not select cancellation against this future. Once renewal
-            // has entered the provider, the returned token may already be
-            // authoritative; the runtime must publish that exact grant before
-            // shutdown performs its final release.
-            match self.renew_due_leases_once().await {
-                Ok(_) => consecutive_failures = 0,
-                Err(err) => {
-                    // Warn once, then debounce to debug so a backend outage
-                    // can't flood the log at the renewal cadence.
-                    if consecutive_failures == 0 {
-                        tracing::warn!(
-                            error = %err,
-                            "identity-first proactive lease renewal tick failed; backing off"
-                        );
-                    } else {
-                        tracing::debug!(
-                            error = %err,
-                            consecutive_failures,
-                            "identity-first lease renewal still failing; backing off"
-                        );
-                    }
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                }
-            }
-            if cancellation
-                .as_ref()
-                .is_some_and(|cancellation| *cancellation.borrow())
-            {
-                return;
-            }
-        }
-    }
-
-    async fn lease_renewal_sleep_interval(&self, max_poll_interval: Duration) -> Duration {
-        let entries = self.entries.read().await;
-        entries
-            .values()
-            .filter(|entry| entry.state == IdentityLifecycleState::Active)
-            .filter_map(|entry| entry.lease.as_ref())
-            .map(|lease| (lease.ttl / 10).max(DEFAULT_LEASE_RENEWAL_MIN_POLL_INTERVAL))
-            .min()
-            .unwrap_or(max_poll_interval)
-            .min(max_poll_interval)
-    }
-
-    /// Renew every active lease that has entered the runtime's renewal window.
-    pub async fn renew_due_leases_once(&self) -> Result<usize, IdentityRuntimeError> {
-        let due = {
-            let entries = self.entries.read().await;
-            entries
-                .iter()
-                .filter(|(_, entry)| entry.state == IdentityLifecycleState::Active)
-                .filter_map(|(identity, entry)| {
-                    entry
-                        .lease
-                        .as_ref()
-                        .filter(|lease| !lease.is_healthy())
-                        .map(|_| identity.clone())
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let mut renewed = 0;
-        let mut first_error = None;
-        for identity in due {
-            let lifecycle_lock = self.lifecycle_lock_for(&identity).await;
-            let _lifecycle_guard = lifecycle_lock.lock().await;
-            match self.ensure_active_lease(&identity).await {
-                Ok(_) => renewed += 1,
-                Err(err) => {
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
-                }
-            }
-        }
-        if let Some(err) = first_error {
-            Err(err)
-        } else {
-            Ok(renewed)
-        }
-    }
-
-    async fn release_uninstalled_materialize_lease(&self, grant: &LeaseGrant) -> Option<String> {
-        self.release_or_park_untracked_leases(std::slice::from_ref(grant))
-            .await
-            .err()
-            .map(|err| err.to_string())
-    }
-
-    async fn cancel_uninstalled_background_materialization(
-        &self,
-        grant: &LeaseGrant,
-    ) -> IdentityRuntimeError {
-        let cleanup_error = self.release_uninstalled_materialize_lease(grant).await;
-        IdentityRuntimeError::Internal(
-            cleanup_error
-                .map(|error| format!("{BACKGROUND_WARM_CANCELLED}; lease cleanup failed: {error}"))
-                .unwrap_or_else(|| BACKGROUND_WARM_CANCELLED.to_string()),
-        )
     }
 
     pub async fn set_desired_peer_edges(&self, edges: Vec<ManagedPeerEdge>) {
@@ -5033,16 +5248,10 @@ impl IdentityRuntime {
             return Ok(Vec::new());
         };
         let runtime_identities: BTreeMap<AgentRuntimeId, AgentIdentity> = self
-            .entries
-            .read()
+            .core_live_runtime_ids()
             .await
-            .iter()
-            .filter_map(|(identity, entry)| {
-                entry
-                    .continuity
-                    .as_ref()
-                    .map(|record| (record.agent_runtime_id.clone(), identity.clone()))
-            })
+            .into_iter()
+            .map(|(identity, runtime_id)| (runtime_id, identity))
             .collect();
         let runtime_edges = bridge.current_member_wires().await.map_err(|error| {
             IdentityRuntimeError::Internal(format!("bridge current_member_wires: {error}"))
@@ -5064,16 +5273,10 @@ impl IdentityRuntime {
             return Ok(Vec::new());
         };
         let runtime_identities: BTreeMap<AgentRuntimeId, AgentIdentity> = self
-            .entries
-            .read()
+            .core_live_runtime_ids()
             .await
-            .iter()
-            .filter_map(|(identity, entry)| {
-                entry
-                    .continuity
-                    .as_ref()
-                    .map(|record| (record.agent_runtime_id.clone(), identity.clone()))
-            })
+            .into_iter()
+            .map(|(identity, runtime_id)| (runtime_id, identity))
             .collect();
         let runtime_edges = bridge
             .current_member_wires_any_half()
@@ -5404,14 +5607,9 @@ impl IdentityRuntime {
             return Ok(false);
         }
         let active_identities = self
-            .entries
-            .read()
+            .core_live_runtime_ids()
             .await
-            .iter()
-            .filter_map(|(identity, entry)| {
-                (entry.state == IdentityLifecycleState::Active && entry.continuity.is_some())
-                    .then_some(identity.clone())
-            })
+            .into_keys()
             .collect::<BTreeSet<_>>();
         if pending_recovery_edges
             .iter()
@@ -5545,7 +5743,7 @@ impl IdentityRuntime {
             .collect();
         let epoch = self.peer_binding_epoch().await;
         let runtime_identities: BTreeMap<AgentRuntimeId, AgentIdentity> = epoch
-            .known
+            .active
             .iter()
             .map(|(identity, runtime_id)| (runtime_id.clone(), identity.clone()))
             .collect();
@@ -5843,23 +6041,26 @@ impl IdentityRuntime {
     }
 
     /// Commit managed-edge bookkeeping if none of `involved` changed binding
-    /// since `epoch`. The entries read lock is held across the revalidation
-    /// and the commit, so no binding change (every one is an entries write)
-    /// can interleave; this is what the endpoints' lifecycle locks used to
-    /// guarantee, without making any admission wait on a topology commit.
-    /// `managed_peer_edges` is only ever taken after `entries`, never while
-    /// awaiting it. Returns `None` (nothing committed) when the plan is stale.
+    /// since `epoch`: Core's live members are read again, and the commit
+    /// refuses when a verb of this runtime signalled a member move while
+    /// that read ran, so no move of ours interleaves with the commit. A
+    /// member Core moves on its own is found by the next reconcile, which
+    /// observes the live graph. No admission waits on a topology commit.
+    /// Returns `None` (nothing committed) when the plan is stale.
     async fn commit_managed_edges_if_current<R>(
         &self,
         epoch: &PeerBindingEpoch,
         involved: &BTreeSet<AgentIdentity>,
         commit: impl FnOnce(&mut BTreeSet<(AgentIdentity, AgentIdentity)>) -> R,
     ) -> Option<R> {
-        let entries = self.entries.read().await;
-        if !epoch.unchanged_for(&peer_binding_epoch_of(&entries), involved) {
+        let sequence = self.entries.binding_sequence();
+        if !epoch.unchanged_for(&self.peer_binding_epoch().await, involved) {
             return None;
         }
         let mut managed = self.managed_peer_edges.write().await;
+        if self.entries.binding_sequence() != sequence {
+            return None;
+        }
         Some(commit(&mut managed))
     }
 
@@ -5902,10 +6103,36 @@ impl IdentityRuntime {
         self.unsettled_peer_wiring.read().await.clone()
     }
 
-    /// One consistent snapshot of every registered identity's runtime binding:
-    /// the epoch a managed-topology plan is made against and revalidated with.
+    /// Every registered identity's live Core member: the epoch a
+    /// managed-topology plan is made against and revalidated with.
     async fn peer_binding_epoch(&self) -> PeerBindingEpoch {
-        peer_binding_epoch_of(&*self.entries.read().await)
+        PeerBindingEpoch {
+            active: self.core_live_runtime_ids().await,
+        }
+    }
+
+    /// Core's live runtime id of each registered identity (read per
+    /// call, never cached). An identity whose live member cannot be read is
+    /// left out, as if it were not live: a plan made on it replans, and the
+    /// next reconcile converges on the live graph.
+    async fn core_live_runtime_ids(&self) -> BTreeMap<AgentIdentity, AgentRuntimeId> {
+        let identities: Vec<AgentIdentity> = self.entries.read().await.keys().cloned().collect();
+        let mut live = BTreeMap::new();
+        for identity in identities {
+            match self.core_live_member(&identity).await {
+                Ok(Some(binding)) => {
+                    live.insert(identity, binding.agent_runtime_id);
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    %identity,
+                    %error,
+                    "managed topology: Core's live member could not be read; the identity is \
+                     treated as not live for this pass"
+                ),
+            }
+        }
+        live
     }
 
     /// Emit an event for the given identity. Best-effort — no error if no subscribers.
@@ -5985,124 +6212,55 @@ impl IdentityRuntime {
     // Registration / activation
     // -----------------------------------------------------------------------
 
-    /// Register an identity entry in the runtime, under its lifecycle lock:
-    /// replacing an entry replaces its registered row, which a governed or
-    /// row-checked send holding that lock delivers under.
-    pub async fn register(
-        &self,
-        spec: DurableAgentSpec,
-        state: IdentityLifecycleState,
-        continuity: Option<ContinuityRecord>,
-        lease: Option<LeaseGrant>,
-    ) {
+    /// Register (or re-register) an identity's roster spec, under its
+    /// lifecycle lock: replacing an entry replaces its registered row, which
+    /// a governed or row-checked send holding that lock delivers under. Meta
+    /// keeps no Core fact here. A recorded wake refusal survives a
+    /// re-registration, because it describes Core's session rather than the
+    /// spec, until the next successful wake.
+    pub async fn register(&self, spec: DurableAgentSpec) {
         let lifecycle_lock = self.lifecycle_lock_for(&spec.identity).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
-        self.register_locked(spec, state, continuity, lease).await;
+        self.register_locked(spec).await;
     }
 
     /// [`Self::register`]'s body for callers that already hold the
-    /// identity's lifecycle lock (roster registration, live rebind).
-    pub(crate) async fn register_locked(
-        &self,
-        spec: DurableAgentSpec,
-        state: IdentityLifecycleState,
-        continuity: Option<ContinuityRecord>,
-        lease: Option<LeaseGrant>,
-    ) {
+    /// identity's lifecycle lock (roster registration).
+    pub(crate) async fn register_locked(&self, spec: DurableAgentSpec) {
         let identity = spec.identity.clone();
         let bootstrap_generation = self.identity_bootstrap_status_with_generation().0;
-        let cpv = continuity
-            .as_ref()
-            .map(|r| r.checkpoint_version)
-            .unwrap_or(CheckpointVersion::new(0));
-        let lease_entry = lease.map(|g| LeaseEntry {
-            fencing_token: g.fencing_token,
-            ttl: g.ttl,
-            acquired_at: Instant::now(),
-        });
-        let has_active_lease = state == IdentityLifecycleState::Active && lease_entry.is_some();
         {
             let mut entries = self.entries.write().await;
-            // A terminal heal verdict is about the durable head, not this
-            // entry instance: re-projecting Broken (a repair retry, an eager
-            // reconcile) must not silently forget it, while any non-Broken
-            // projection is a real lifecycle transition that supersedes it
-            // (2026-07-29 heal/re-Break incident).
-            let continuity_unrecoverable = if state == IdentityLifecycleState::Broken {
-                entries
-                    .get(&identity)
-                    .and_then(|existing| existing.continuity_unrecoverable.clone())
-            } else {
-                None
-            };
-            // Same rule for the typed repair hold: it is about the durable
-            // document, so a re-projected Broken entry keeps it and any
-            // non-Broken projection (a successful resume) clears it.
-            let session_repair_required = if state == IdentityLifecycleState::Broken {
-                entries
-                    .get(&identity)
-                    .and_then(|existing| existing.session_repair_required.clone())
-            } else {
-                None
-            };
-            // A host-rejected-build park is about the SPEC, not this entry
-            // instance: re-registration (a reconcile pass, a repair retry)
-            // with the same spec must not forget it — retrying an unchanged
-            // spec against a deterministic gate re-burns a build + callback
-            // round trip for the same answer. A changed spec clears it.
-            let host_rejected_build_park = entries.get(&identity).and_then(|existing| {
-                existing
-                    .host_rejected_build_park
-                    .clone()
-                    .filter(|park| park.spec_digest == durable_spec_digest(&spec))
-            });
-            // A refused role migration is about the SPEC the declaration was
-            // refused against and the embodiment whose resume was refused: a
-            // re-projected Broken entry of that embodiment with that spec
-            // keeps it (a retry re-asks the same question), while a changed
-            // spec, another embodiment or any non-Broken projection clears it.
-            let role_migration_refusal = if state == IdentityLifecycleState::Broken {
-                entries.get(&identity).and_then(|existing| {
-                    existing.role_migration_refusal.clone().filter(|refusal| {
-                        refusal.spec_digest == durable_spec_digest(&spec)
-                            && continuity.as_ref().is_some_and(|record| {
-                                record.session_id == refusal.session_id
-                                    && record.generation == refusal.generation
-                            })
-                    })
+            let (wake_refusal, replaced_session, absent_delivery_session) = entries
+                .get(&identity)
+                .map(|existing| {
+                    (
+                        existing.wake_refusal.clone(),
+                        existing.replaced_session.clone(),
+                        existing.absent_delivery_session.clone(),
+                    )
                 })
-            } else {
-                None
-            };
-            let entry = IdentityEntry {
-                spec,
-                bootstrap_generation,
-                state,
-                continuity,
-                lease: lease_entry,
-                pending_lease_release: None,
-                checkpoint_version: cpv,
-                has_runtime_store: self.has_runtime_store,
-                continuity_unrecoverable,
-                host_rejected_build_park,
-                role_migration_refusal,
-                session_repair_required,
-                last_delivery_error: None,
-                last_reload: None,
-            };
-            entries.insert(identity.clone(), entry);
+                .unwrap_or_default();
+            entries.insert(
+                identity.clone(),
+                IdentityEntry {
+                    spec,
+                    bootstrap_generation,
+                    wake_refusal,
+                    replaced_session,
+                    last_delivery_error: None,
+                    last_reload: None,
+                    absent_delivery_session,
+                },
+            );
         }
-
-        // Create event channel for this identity
-        let (tx, _) = broadcast::channel(IDENTITY_EVENT_CHANNEL_CAPACITY);
+        // The event channel outlives a re-registration: its subscribers
+        // belong to the identity's life, not to the roster row.
         self.event_channels
             .write()
             .await
-            .insert(identity.clone(), tx);
-        if has_active_lease {
-            self.lease_renewal_notify.notify_one();
-        }
-        self.mark_bootstrap_from_lifecycle(&identity, state, None);
+            .entry(identity)
+            .or_insert_with(|| broadcast::channel(IDENTITY_EVENT_CHANNEL_CAPACITY).0);
     }
 
     async fn materialization_lock_for(&self, identity: &AgentIdentity) -> Arc<Mutex<()>> {
@@ -6133,6 +6291,11 @@ impl IdentityRuntime {
             .entry(identity.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// Whether a lifecycle verb holds `identity`'s lifecycle lock right now.
+    async fn lifecycle_verb_in_flight(&self, identity: &AgentIdentity) -> bool {
+        self.lifecycle_lock_for(identity).await.try_lock().is_err()
     }
 
     pub(crate) async fn lifecycle_lock_for(&self, identity: &AgentIdentity) -> Arc<Mutex<()>> {
@@ -6264,18 +6427,24 @@ impl IdentityRuntime {
                 .runtime
                 .ensure_expected_member_alias_current(&target.identity, &target.alias)
                 .await?;
-            let state = target
+            let wake_refusal = target
                 .runtime
                 .entries
                 .read()
                 .await
                 .get(&target.identity)
-                .map(|entry| entry.state)
+                .map(|entry| entry.wake_refusal.clone())
                 .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(target.identity.clone()))?;
-            if state != IdentityLifecycleState::Active {
+            // A member alias names a live Core member.
+            if target
+                .runtime
+                .core_live_member(&target.identity)
+                .await?
+                .is_none()
+            {
                 return Err(IdentityRuntimeError::InvalidState {
                     identity: target.identity,
-                    state,
+                    state: Self::view_state(false, wake_refusal.as_ref()),
                     operation: "mutate member alias",
                 });
             }
@@ -6546,20 +6715,28 @@ impl IdentityRuntime {
         Ok(receiver)
     }
 
-    /// Install the observer told (an epoch bump) whenever any identity's
-    /// lease fencing token changes, and bump it once so the observer
-    /// re-reads leases that predate the installation. The unified runtime
-    /// installs its identity health monitor's wake here.
-    pub(crate) fn install_lease_observer(&self, observer: watch::Sender<u64>) {
+    /// Install the observer told (an epoch bump) whenever a verb of this
+    /// runtime woke, retired or replaced an identity's Core member, and bump
+    /// it once so the observer re-reads members that predate the
+    /// installation. The unified runtime installs its identity health
+    /// monitor's wake here.
+    pub(crate) fn install_member_binding_observer(&self, observer: watch::Sender<u64>) {
         #[cfg(test)]
-        self.lease_observer_saw_drain
+        self.binding_observer_saw_drain
             .store(self.has_pending_completion_drain(), Ordering::Release);
         *self
             .entries
-            .lease_observer
+            .binding_observer
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
-        self.entries.wake_lease_observer();
+        self.entries.notify_binding_changed();
+    }
+
+    /// Whether a completion drain was installed when the member-binding
+    /// observer was.
+    #[cfg(test)]
+    pub(crate) fn binding_observer_installed_after_drain(&self) -> bool {
+        self.binding_observer_saw_drain.load(Ordering::Acquire)
     }
 
     pub(crate) fn close_foreground_operations(&self) {
@@ -6582,183 +6759,19 @@ impl IdentityRuntime {
         }
     }
 
-    /// Preserve exact grants acquired by a restore task that failed before it
-    /// could publish an [`IdentityEntry`]. Entry-scoped pending-release state
-    /// cannot represent this phase, so the runtime owns a small orphan-grant
-    /// ledger until reconcile or shutdown successfully releases it.
-    pub(crate) async fn park_unactivated_lease_releases(&self, grants: &[LeaseGrant]) {
-        let mut pending = self.pending_unactivated_lease_releases.write().await;
-        for grant in grants {
-            if !pending.iter().any(|parked| {
-                parked.identity == grant.identity && parked.fencing_token == grant.fencing_token
-            }) {
-                pending.push(grant.clone());
-            }
-        }
-    }
-
-    /// Release grants that do not yet have an IdentityEntry capable of
-    /// retaining retry state. A provider failure atomically transfers their
-    /// exact fencing tokens into the runtime-owned orphan ledger.
-    pub(crate) async fn release_or_park_untracked_leases(
-        &self,
-        grants: &[LeaseGrant],
-    ) -> Result<(), super::types::LeaseError> {
-        let _release_guard = self.pending_unactivated_lease_release_gate.lock().await;
-        match self.lease_provider.release_leases(grants).await {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.park_unactivated_lease_releases(grants).await;
-                Err(error)
-            }
-        }
-    }
-
-    /// Retry every grant parked before lifecycle publication. This runs under
-    /// the restore controller before any new batch acquisition, and again from
-    /// shutdown after all identity work has joined.
-    pub(crate) async fn release_parked_unactivated_leases(
-        &self,
-    ) -> Result<usize, IdentityRuntimeError> {
-        self.release_parked_unactivated_leases_matching(None).await
-    }
-
-    /// Retry parked pre-publication grants for one identity before a direct
-    /// lazy materialization attempts to acquire fresh authority. The caller
-    /// holds that identity's lifecycle lock, so another same-identity path
-    /// cannot park a replacement grant between this drain and acquisition.
-    async fn release_parked_unactivated_leases_for_identity(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Result<usize, IdentityRuntimeError> {
-        self.release_parked_unactivated_leases_matching(Some(identity))
-            .await
-    }
-
-    async fn release_parked_unactivated_leases_matching(
-        &self,
-        identity: Option<&AgentIdentity>,
-    ) -> Result<usize, IdentityRuntimeError> {
-        let _release_guard = self.pending_unactivated_lease_release_gate.lock().await;
-        let grants = self
-            .pending_unactivated_lease_releases
-            .read()
-            .await
-            .iter()
-            .filter(|grant| identity.is_none_or(|identity| grant.identity == *identity))
-            .cloned()
-            .collect::<Vec<_>>();
-        if grants.is_empty() {
-            return Ok(0);
-        }
-        self.lease_provider
-            .release_leases(&grants)
-            .await
-            .map_err(IdentityRuntimeError::Lease)?;
-        let mut pending = self.pending_unactivated_lease_releases.write().await;
-        pending.retain(|parked| {
-            !grants.iter().any(|released| {
-                released.identity == parked.identity
-                    && released.fencing_token == parked.fencing_token
-            })
-        });
-        Ok(grants.len())
-    }
-
-    /// Release every durable identity grant after the lower mob plane has
-    /// quiesced. Successful release clears the in-memory authority so the
-    /// method is idempotent; failures retain the exact grants for inspection
-    /// or a subsequent retry.
-    pub(crate) async fn release_all_leases_for_shutdown(
-        &self,
-    ) -> Result<usize, IdentityRuntimeError> {
-        let _parked_release_guard = self.pending_unactivated_lease_release_gate.lock().await;
-        let mut grants = self
-            .entries
-            .read()
-            .await
-            .iter()
-            .filter_map(|(identity, entry)| {
-                entry.pending_lease_release.clone().or_else(|| {
-                    entry.lease.as_ref().map(|lease| LeaseGrant {
-                        identity: identity.clone(),
-                        fencing_token: lease.fencing_token,
-                        ttl: lease.ttl,
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-        let parked_grants = self.pending_unactivated_lease_releases.read().await.clone();
-        for grant in parked_grants {
-            if !grants.iter().any(|existing| {
-                existing.identity == grant.identity && existing.fencing_token == grant.fencing_token
-            }) {
-                grants.push(grant);
-            }
-        }
-        if grants.is_empty() {
-            return Ok(0);
-        }
-
-        self.lease_provider
-            .release_leases(&grants)
-            .await
-            .map_err(IdentityRuntimeError::Lease)?;
-
-        let mut entries = self.entries.write().await;
-        let mut lifecycle_updates = Vec::new();
-        for grant in &grants {
-            if let Some(entry) = entries.get_mut(&grant.identity) {
-                let released_active_lease = entry
-                    .lease
-                    .as_ref()
-                    .is_some_and(|lease| lease.fencing_token == grant.fencing_token);
-                if released_active_lease {
-                    entry.lease = None;
-                }
-                if entry
-                    .pending_lease_release
-                    .as_ref()
-                    .is_some_and(|pending| pending.fencing_token == grant.fencing_token)
-                {
-                    entry.pending_lease_release = None;
-                }
-                if released_active_lease
-                    && matches!(
-                        entry.state,
-                        IdentityLifecycleState::Active | IdentityLifecycleState::Suspended
-                    )
-                {
-                    entry.state = IdentityLifecycleState::Dormant;
-                    lifecycle_updates.push(grant.identity.clone());
-                }
-            }
-        }
-        drop(entries);
-        let mut pending = self.pending_unactivated_lease_releases.write().await;
-        pending.retain(|parked| {
-            !grants.iter().any(|released| {
-                released.identity == parked.identity
-                    && released.fencing_token == parked.fencing_token
-            })
-        });
-        drop(pending);
-        for identity in lifecycle_updates {
-            self.mark_bootstrap_from_lifecycle(&identity, IdentityLifecycleState::Dormant, None);
-        }
-        Ok(grants.len())
-    }
-
-    /// Materialize a dormant identity into a concrete mob member/session.
+    /// Wake an identity: resume its committed session, or start it
+    /// fresh when Core holds no history for it.
     ///
-    /// This is the lazy counterpart to eager `restore_flow`: it performs the
-    /// expensive bridge create/resume and snapshot load only when an identity is
-    /// actually touched. Parallel calls for one identity coalesce on a
-    /// per-identity lock and re-check state after acquiring it.
+    /// The lazy counterpart to eager `restore_flow`: the build and Core's
+    /// spawn or resume happen only when an identity is touched. Parallel calls
+    /// for one identity coalesce on a per-identity lock. Returns Core's
+    /// delivery scope of the live member (runtime id, generation, fence,
+    /// session), read after the wake; `None` for a peer-only member, which
+    /// Core binds to no session.
     pub async fn materialize(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         self.materialize_with_expected_member_alias(identity, None)
             .await
     }
@@ -6767,7 +6780,7 @@ impl IdentityRuntime {
         &self,
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         self.materialize_with_expected_member_alias_after_inner(
             identity,
             expected_alias,
@@ -6776,7 +6789,8 @@ impl IdentityRuntime {
             TopologyAfterEmbody::Reconcile,
             &mut false,
         )
-        .await
+        .await?;
+        self.core_live_scope(identity).await
     }
 
     /// Materialize a Dormant/retired send or dispatch target on the admission
@@ -6807,9 +6821,9 @@ impl IdentityRuntime {
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
         expected_spec_digest: Option<&str>,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<(), IdentityRuntimeError> {
         let mut already_active = false;
-        let record = self
+        if let Err(error) = self
             .materialize_with_expected_member_alias_after_inner(
                 identity,
                 expected_alias,
@@ -6818,12 +6832,15 @@ impl IdentityRuntime {
                 TopologyAfterEmbody::DeferToPostAdmission,
                 &mut already_active,
             )
-            .await?;
-        // A concurrent materialization won: the target was already Active
-        // when the embodiment door ran, so this send woke nothing and is
-        // admitted first like any send to an Active target.
+            .await
+        {
+            return Err(self.admission_wake_refusal(identity, error).await);
+        }
+        // A concurrent wake won: Core already held the member when the wake
+        // door ran, so this send woke nothing and is admitted first like any
+        // send to a live target.
         if already_active {
-            return Ok(record);
+            return Ok(());
         }
         if let Err(error) = self.reconcile_target_topology_for_wake(identity).await {
             tracing::warn!(
@@ -6833,7 +6850,73 @@ impl IdentityRuntime {
                  post-admission hydration retries them"
             );
         }
-        Ok(record)
+        Ok(())
+    }
+
+    /// The refusal an admission's wake answers. A host-adopted identity is
+    /// never woken by Meta, but while Core still converges its present
+    /// intent (after a restart Core waits for the previous process's
+    /// identity lease) the refusal is retryable: nothing is queued, and the
+    /// same request, sent again, is delivered once Core holds its live
+    /// member. An absent intent, a
+    /// blocked or final convergence, and a read Meta cannot make keep the
+    /// final `IdentityHostAdopted`.
+    async fn admission_wake_refusal(
+        &self,
+        identity: &AgentIdentity,
+        error: IdentityRuntimeError,
+    ) -> IdentityRuntimeError {
+        if !matches!(error, IdentityRuntimeError::IdentityHostAdopted { .. }) {
+            return error;
+        }
+        match self.host_convergence_pending(identity).await {
+            Some(decision) => IdentityRuntimeError::IdentityWakeRetryable {
+                identity: identity.clone(),
+                session_id: None,
+                detail: format!(
+                    "a host adopted the identity and Core holds its present intent but no \
+                     live member yet (Core's decision: {decision}); Meta never wakes it and \
+                     queued nothing: send the request again once Core holds the member"
+                ),
+            },
+            None => error,
+        }
+    }
+
+    /// Core's decision for a host-adopted `identity` while its intent row
+    /// declares a live member and its convergence is neither blocked nor
+    /// final (`pending` before Core's first status row). `None` otherwise,
+    /// and whenever either read fails or does not read.
+    async fn host_convergence_pending(&self, identity: &AgentIdentity) -> Option<String> {
+        use meerkat_mob::identity::{
+            IdentityConvergenceCondition as Condition, IdentityStoredObservation as Observation,
+        };
+        let bridge = self.bridge.as_ref()?;
+        if bridge.identity_intent_present(identity).await.ok()? != Some(true) {
+            return None;
+        }
+        let status = match bridge.identity_convergence_status(identity).await.ok()? {
+            Observation::Missing => return Some("pending".to_string()),
+            Observation::Valid(status) => status,
+            Observation::Unsupported { .. } | Observation::Malformed { .. } => return None,
+        };
+        match status.condition() {
+            Condition::Pending
+            | Condition::Reconciling
+            | Condition::Suspended
+            | Condition::Backoff
+            | Condition::Converged => Some(
+                status
+                    .decision
+                    .and_then(|decision| serde_json::to_value(decision).ok())
+                    .and_then(|decision| decision.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "pending".to_string()),
+            ),
+            Condition::RepairBlocked
+            | Condition::Quarantined
+            | Condition::Tombstoned
+            | Condition::DrainBlocked => None,
+        }
     }
 
     /// Reconcile only `target`'s own managed edges, for the wake path.
@@ -6912,7 +6995,7 @@ impl IdentityRuntime {
         after_inner: F,
         topology: TopologyAfterEmbody,
         already_active: &mut bool,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError>
+    ) -> Result<(), IdentityRuntimeError>
     where
         F: Future<Output = ()>,
     {
@@ -6938,21 +7021,8 @@ impl IdentityRuntime {
             .await
             .map(|outcome| {
                 *already_active = outcome.already_active;
-                outcome.record
             });
         after_inner.await;
-        // A caller wanted this identity and it is parked Broken: that demand
-        // is a typed repair trigger (it would otherwise wait for an unrelated
-        // event in a steady deployment).
-        if matches!(
-            &result,
-            Err(IdentityRuntimeError::InvalidState {
-                state: IdentityLifecycleState::Broken,
-                ..
-            })
-        ) {
-            self.trigger_continuity_repair(ContinuityRepairTrigger::DemandOnBroken);
-        }
         if matches!(
             &result,
             Err(IdentityRuntimeError::Internal(message)) if message == BACKGROUND_WARM_CANCELLED
@@ -7000,516 +7070,11 @@ impl IdentityRuntime {
     pub async fn materialize_tracked(
         self: &Arc<Self>,
         identity: &AgentIdentity,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         let runtime = Arc::clone(self);
         let identity = identity.clone();
         self.run_tracked_foreground(async move { runtime.materialize(&identity).await })
             .await
-    }
-
-    /// Resolve the owner state for each rostered identity from durable
-    /// continuity, with NO write target required.
-    ///
-    /// Layer 1 of the pre-prepare registration path. Separated from publication
-    /// on purpose: `register_persisted_continuity_owners` publishes through
-    /// `SessionBridge`, which is a LATE indirection - it arrives with the
-    /// identity context, after `MobRuntime::prepare` has already run. Meerkat's
-    /// durable-tail recovery executes DURING prepare, so anything needing the
-    /// bridge is structurally too late for it, and the bridge's absence makes
-    /// that method return `Ok(0)`: a silent nothing that logs as a boot with
-    /// nothing to register. This function needs only the continuity store, which
-    /// the caller holds long before prepare.
-    ///
-    /// # Strictness depends on the store, deliberately
-    ///
-    /// On a store with an INCREMENTAL (head-canonical) channel, an unreadable
-    /// fact is TERMINAL. A Ready record followed by an error or an empty answer
-    /// from the exact session lookup returns `Err`, and the caller must fail this
-    /// boot attempt and retry rather than proceed. Skipping there reproduces the
-    /// exact defect this path exists to remove: publish nothing, run prepare,
-    /// let inner recovery commit, and let the projection hit the backstop - and
-    /// that boot is NOT byte-neutral, because the inner commit has already
-    /// landed by the time the refusal fires.
-    ///
-    /// On a blob-only store the older best-effort semantics stand, because there
-    /// is no head-canonical projection requiring the cursor.
-    ///
-    /// Only an EXPLICIT `Uninitialized` skips, on either store shape: a newly
-    /// added roster identity legitimately has no prior session and the ordinary
-    /// create path owns it. That is the creation path, not a degraded read.
-    ///
-    /// The other two non-Ready outcomes are NOT the creation path. `Broken` is
-    /// terminal on a head-canonical store, because the identity HAS durable
-    /// state. A MISSING map entry is terminal on both shapes, because the
-    /// `ContinuityStore` contract requires an entry per requested identity and
-    /// says a missing one is a provider error rather than an implicit
-    /// `Uninitialized`.
-    ///
-    /// Identity and generation come from the Ready record; the fencing token and
-    /// fence-current come from `resolve_record_by_session`. Both sources must
-    /// agree on identity AND session AND generation - a mismatch is always
-    /// `Err`, on any store, because publishing an authority the two sources
-    /// dispute is worse than refusing to boot.
-    pub async fn resolve_persisted_owner_states(
-        continuity_store: &Arc<dyn super::ContinuityStore>,
-        roster: &[DurableAgentSpec],
-    ) -> Result<
-        Vec<(
-            meerkat_core::types::SessionId,
-            super::adapters::SessionRuntimeState,
-        )>,
-        IdentityRuntimeError,
-    > {
-        // INV-06 FIRST, before any store read or publication. Roster uniqueness
-        // used to be validated in the later roster-registration path, which was
-        // downstream of everything; hoisting owner registration ahead of prepare
-        // also hoisted it ahead of that guard.
-        //
-        // What actually happens without it is WORSE than a misleading error, and
-        // I only learned that by mutating it out: the duplicated roster resolves
-        // to Ok([]) - no error at all. The resolver publishes nothing and lets
-        // prepare proceed, which is the original defect shape. My first comment
-        // here claimed it would surface later as an ownership conflict from a
-        // double register_session; the mutation disproved that, so the claim is
-        // corrected rather than left as a plausible-sounding rationale.
-        //
-        // Moving work earlier moves it before the checks that used to protect
-        // it. That is the same class as everything else this hoist touched.
-        Self::validate_roster_uniqueness(roster)?;
-        // The discriminator for strictness. A head-canonical store projects
-        // through the cursor, so an owner it cannot report is an owner whose
-        // recovery will refuse; a blob-only store has no such projection.
-        let head_canonical = continuity_store.as_incremental_sessions().is_some();
-        let mut states = Vec::new();
-        for spec in roster {
-            let identity = &spec.identity;
-            let resolved = match continuity_store
-                .resolve_many(std::slice::from_ref(identity))
-                .await
-            {
-                Ok(resolved) => resolved,
-                Err(error) if head_canonical => {
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "continuity resolution for {identity} failed before prepare on a \
-                         head-canonical store, so no owner state can be published and recovery \
-                         would refuse after an inner commit that is not byte-neutral; failing \
-                         this boot attempt instead: {error}"
-                    )));
-                }
-                Err(error) => {
-                    tracing::info!(
-                        %identity,
-                        %error,
-                        "continuity resolution unavailable before prepare on a blob-only store; \
-                         no owner state for this identity"
-                    );
-                    continue;
-                }
-            };
-            // THREE distinct outcomes, not two. Collapsing them into one skip
-            // treats a Broken identity as one that never existed, which is how a
-            // broken continuity head gets silently recreated instead of refused.
-            let record = match resolved.get(identity) {
-                // The ONLY creation path. resolve_many answered, and its answer
-                // is that this identity has never persisted a session.
-                Some(super::types::ContinuityResolveState::Uninitialized) => {
-                    tracing::info!(
-                        %identity,
-                        head_canonical,
-                        "continuity reports Uninitialized before prepare; ordinary create path \
-                         owns this identity"
-                    );
-                    continue;
-                }
-                Some(super::types::ContinuityResolveState::Ready { record }) => record,
-                // Broken is NOT a creation path: the identity HAS durable state
-                // and the store is telling us it cannot be used. Publishing
-                // nothing and letting prepare proceed means recovery meets an
-                // empty owner map for a session that exists.
-                Some(super::types::ContinuityResolveState::Broken { failure }) => {
-                    if head_canonical {
-                        return Err(IdentityRuntimeError::Internal(format!(
-                            "continuity for {identity} is Broken before prepare ({failure:?}), so \
-                             no owner state can be published and recovery would meet an empty \
-                             owner map for a session that exists; failing this boot attempt"
-                        )));
-                    }
-                    tracing::info!(
-                        %identity,
-                        ?failure,
-                        "continuity Broken before prepare on a blob-only store; no owner state"
-                    );
-                    continue;
-                }
-                // A PROVIDER ERROR on every store shape, not a capability
-                // difference. The ContinuityStore trait doc is explicit:
-                // "resolve_many MUST return an entry for every requested
-                // identity. Missing entries are treated as a provider error, not
-                // implicit Uninitialized." So this is terminal regardless of
-                // head_canonical - a store that violates its own contract has
-                // told us nothing about this identity, and inferring
-                // Uninitialized from silence is precisely what the contract
-                // forbids.
-                None => {
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "continuity resolution returned no entry for {identity} before prepare, \
-                         which its contract forbids: resolve_many must answer for every requested \
-                         identity and a missing entry is a provider error, not an implicit \
-                         Uninitialized"
-                    )));
-                }
-            };
-            let session_id = record.session_id.clone();
-            let bound = match continuity_store
-                .resolve_record_by_session(&session_id)
-                .await
-            {
-                Ok(bound) => bound,
-                Err(error) if head_canonical => {
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "continuity fence lookup for {identity} session {session_id} failed \
-                         before prepare on a head-canonical store after a Ready record; failing \
-                         this boot attempt rather than letting recovery commit and refuse: \
-                         {error}"
-                    )));
-                }
-                Err(error) => {
-                    tracing::info!(
-                        %identity,
-                        %session_id,
-                        %error,
-                        "continuity fence lookup unavailable before prepare on a blob-only \
-                         store; no owner state for this session"
-                    );
-                    continue;
-                }
-            };
-            let Some((bound_record, fencing_token, fence_current)) = bound else {
-                if head_canonical {
-                    // A Ready record naming a session the substrate will not
-                    // bind is not a creation path - the record asserts the
-                    // session exists. On a head-canonical store that is the
-                    // unreadable-fact case, and it is terminal.
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "continuity reports a Ready record for {identity} at session \
-                         {session_id} but the substrate binds no fence for it before prepare, \
-                         so no owner state can be published on a head-canonical store"
-                    )));
-                }
-                tracing::info!(
-                    %identity,
-                    %session_id,
-                    "no substrate fence binds this session before prepare on a blob-only store; \
-                     no owner state"
-                );
-                continue;
-            };
-            // Exact agreement on all three, on EITHER store shape. The
-            // pre-activation pass checked identity and session; generation is
-            // added because the published state CARRIES a generation, and a
-            // state whose generation came from one source while its fence came
-            // from another is an authority neither source asserted.
-            if bound_record.session_id != session_id
-                || bound_record.identity != *identity
-                || bound_record.generation != record.generation
-            {
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "continuity for {identity} resolves to session {session_id} generation {:?} \
-                     but the substrate binds that session to {}/{}/{:?}, so no owner state can \
-                     be resolved before prepare",
-                    record.generation,
-                    bound_record.identity,
-                    bound_record.session_id,
-                    bound_record.generation
-                )));
-            }
-            states.push((
-                session_id,
-                super::adapters::SessionRuntimeState {
-                    identity: identity.clone(),
-                    generation: bound_record.generation,
-                    fencing_token,
-                    checkpoint_version: fence_current,
-                },
-            ));
-        }
-        Ok(states)
-    }
-
-    /// Publish resolved persisted owner authority into the session store
-    /// BEFORE the mob is prepared.
-    ///
-    /// This exists for an ordering problem that `register_persisted_continuity_owners`
-    /// cannot solve, because it runs too late. Durable-tail recovery happens
-    /// INSIDE `MobRuntime::prepare` and commits runtime boundaries; a
-    /// head-canonical session whose owning identity has no authoritative
-    /// registration is refused there BY DESIGN ("this is a deliberate refusal,
-    /// not a store failure: no retry of the write will succeed"). Registration
-    /// after prepare is therefore unreachable for exactly the stores that need
-    /// it: a resume whose durable tail is behind its committed authority.
-    /// Verified against a production clone, whose first boot dies precisely
-    /// there.
-    ///
-    /// Idempotent by construction, which is why publishing here and registering
-    /// again later is safe: `register_session` refuses an identity or generation
-    /// change and a fencing regression, so a re-publish of the same facts is a
-    /// no-op rather than a second authority.
-    ///
-    /// Returns how many owners were published, so a caller can log a boot that
-    /// published none rather than leaving an absent effect indistinguishable
-    /// from an unconfigured one.
-    pub async fn publish_persisted_owner_states(
-        adapter: &Arc<super::adapters::ContinuitySessionStoreAdapter>,
-        states: &[(
-            meerkat_core::types::SessionId,
-            super::adapters::SessionRuntimeState,
-        )],
-    ) -> Result<usize, IdentityRuntimeError> {
-        let mut published = 0usize;
-        for (session_id, state) in states {
-            adapter
-                .register_session(session_id, state.clone())
-                .await
-                .map_err(|error| {
-                    IdentityRuntimeError::Internal(format!(
-                        "publishing the persisted owner of {} session {session_id} before \
-                         prepare: {error}",
-                        state.identity
-                    ))
-                })?;
-            published += 1;
-        }
-        tracing::info!(
-            published,
-            resolved = states.len(),
-            "published persisted continuity owners before mob prepare"
-        );
-        Ok(published)
-    }
-
-    /// Register the owning identity of every persisted session on the roster,
-    /// without materializing anything.
-    ///
-    /// This exists for exactly one ordering problem. Lifting a resumed mob from
-    /// `Stopped` to `Running` makes MobMachine revive its persisted sessions,
-    /// and a revived session whose owner has no authoritative registration is
-    /// correctly refused by the continuity adapter - so every restored member
-    /// comes back Broken. `embody_identity` already registers from the
-    /// authoritative record, but it registers and then SPAWNS, and spawning
-    /// needs a mob that is already Running. Hence a registration-only pass that
-    /// can run while the mob is still Stopped.
-    ///
-    /// The facts come from the continuity substrate's own
-    /// `resolve_record_by_session`, whose contract is that it returns "the same
-    /// facts registration would carry": the record, its fencing token, and the
-    /// substrate's fence-current version. Nothing is minted here, and this runs
-    /// inside the lifecycle owner rather than seeding durable identity state
-    /// from outside it.
-    ///
-    /// Best-effort per identity BY DESIGN. An identity with no durable record
-    /// has nothing to register and is not an error - it has never persisted a
-    /// session, so the ordinary create path owns it.
-    ///
-    /// Returns the sessions whose owners were registered, in roster order, so a
-    /// caller can log a boot that registered none AND reuse this exact set
-    /// without resolving continuity a second time. The set is deliberately the
-    /// registration's own output rather than a re-read: a second resolve could
-    /// disagree with what was actually published here, and a caller acting on
-    /// the disagreeing half would be operating on an authority nothing
-    /// registered.
-    pub async fn register_persisted_continuity_owners(
-        &self,
-        roster: &[DurableAgentSpec],
-    ) -> Result<Vec<meerkat_core::types::SessionId>, IdentityRuntimeError> {
-        let Some(bridge) = self.bridge.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let mut registered: Vec<meerkat_core::types::SessionId> = Vec::new();
-        // Instrumented per identity: on 2026-09-03 a production fleet's registration
-        // went from 49s to 170s for 17 identities with this function byte-identical,
-        // and this loop logged nothing, so nobody could say which of its three awaits
-        // had slowed. One INFO per identity with the three step durations, and one
-        // summary, so the next such regression names its step on the first launch.
-        let loop_started = std::time::Instant::now();
-        // Register every roster identity's customizer-tool dispatcher before
-        // the mob is lifted, so meerkat's restart restore attaches it (#563).
-        if let Some(registry) = self.customizer_tools.read().await.clone() {
-            for spec in roster {
-                registry.ensure(&spec.identity);
-            }
-        }
-        for spec in roster {
-            let identity = &spec.identity;
-            let identity_started = std::time::Instant::now();
-            // A substrate that cannot answer is not a boot failure. This pass
-            // only ever ADDS a registration that would otherwise happen later;
-            // when the facts are unavailable the pre-existing behaviour stands,
-            // including the downstream registration-required refusal. Failing
-            // the boot here would make an optional capability mandatory.
-            let resolve_started = std::time::Instant::now();
-            let resolved = match self
-                .continuity_store
-                .resolve_many(std::slice::from_ref(identity))
-                .await
-            {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    tracing::warn!(
-                        %identity,
-                        %error,
-                        "continuity resolution unavailable before activation; skipping owner \
-                         pre-registration for this identity"
-                    );
-                    continue;
-                }
-            };
-            let Some(super::types::ContinuityResolveState::Ready { record }) =
-                resolved.get(identity)
-            else {
-                continue;
-            };
-            let resolve_ms = resolve_started.elapsed().as_millis() as u64;
-            let session_id = record.session_id.clone();
-            // The substrate is the authority for the fence, not the record: the
-            // record's own checkpoint version is a checkpoint-time stamp and may
-            // trail the substrate's write counter, and registering a trailing
-            // version makes the next write present a stale one.
-            // Explicitly optional: the trait documents `None` both for "no
-            // record binds this session" AND for "the substrate does not
-            // support the lookup", with callers told to keep their
-            // registration-required refusal. A substrate without the fence
-            // table returns an ERROR rather than None, which is the same
-            // condition, so treat it the same way instead of failing the boot.
-            let continuity_started = std::time::Instant::now();
-            let bound = match self
-                .continuity_store
-                .resolve_record_by_session(&session_id)
-                .await
-            {
-                Ok(bound) => bound,
-                Err(error) => {
-                    tracing::warn!(
-                        %identity,
-                        %session_id,
-                        %error,
-                        "continuity fence lookup unavailable before activation; skipping owner \
-                         pre-registration for this session"
-                    );
-                    continue;
-                }
-            };
-            let Some((bound_record, fencing_token, fence_current)) = bound else {
-                continue;
-            };
-            if bound_record.session_id != session_id || bound_record.identity != *identity {
-                // The substrate binds this session to something other than what
-                // the roster resolution said. Registering either spelling would
-                // publish an authority neither source agrees on.
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "continuity for {identity} resolves to session {session_id} but the substrate \
-                     binds that session to {}/{}, so no owner registration can be published \
-                     before activation",
-                    bound_record.identity, bound_record.session_id
-                )));
-            }
-            let continuity_ms = continuity_started.elapsed().as_millis() as u64;
-            let publish_started = std::time::Instant::now();
-            bridge
-                .register_session_runtime_state(
-                    &session_id,
-                    identity,
-                    bound_record.generation,
-                    fence_current,
-                    fencing_token,
-                )
-                .await
-                .map_err(|error| {
-                    IdentityRuntimeError::Internal(format!(
-                        "registering the persisted owner of {identity} session {session_id} \
-                         before activation: {error}"
-                    ))
-                })?;
-            tracing::info!(
-                identity = %identity,
-                session_id = %session_id,
-                resolve_ms,
-                continuity_ms,
-                publish_ms = publish_started.elapsed().as_millis() as u64,
-                total_ms = identity_started.elapsed().as_millis() as u64,
-                "persisted continuity owner registered"
-            );
-            registered.push(session_id);
-        }
-        tracing::info!(
-            registered = registered.len(),
-            roster = roster.len(),
-            elapsed_ms = loop_started.elapsed().as_millis() as u64,
-            "persisted continuity owners registered"
-        );
-        Ok(registered)
-    }
-
-    /// Discharge the attach postcondition, converting an attached occupant into
-    /// a genuinely resumed one.
-    ///
-    /// A successful ATTACH is not yet a resume. The occupant must carry an
-    /// authoritative owning-identity registration before anything can commit a
-    /// runtime boundary, and only the continuity record holds the generation,
-    /// checkpoint version and fencing token that registration needs - which is
-    /// why the bridge cannot discharge this itself and reports
-    /// `AttachedPendingRegistration` instead of guessing.
-    ///
-    /// This is the ONE place that converts that variant into `Resumed`, because
-    /// forgetting the postcondition does not fail here: it surfaces far away, as
-    /// a head-canonical session refused for an unregistered owner during an
-    /// unrelated boundary commit. A caller that reimplements this can omit the
-    /// registration and still compile, still pass, and still break a later boot.
-    ///
-    /// Registration failure is retryable by construction: the occupant is
-    /// untouched, nothing is retired or replaced, and no `Resumed` is reported.
-    async fn complete_attach_postcondition(
-        &self,
-        outcome: super::bridge::ResumeSessionOutcome,
-        identity: &AgentIdentity,
-        record: &ContinuityRecord,
-        fencing_token: FencingToken,
-    ) -> Result<super::bridge::ResumeSessionOutcome, IdentityRuntimeError> {
-        let super::bridge::ResumeSessionOutcome::AttachedPendingRegistration { session_id } =
-            outcome
-        else {
-            return Ok(outcome);
-        };
-        // The record's generation, checkpoint version and fence are being
-        // published as the authority for THIS session. If the bridge attached a
-        // different one, registering would bind this identity's fence to a
-        // session its record does not name, so refuse instead.
-        if session_id != record.session_id {
-            return Err(IdentityRuntimeError::Internal(format!(
-                "attach reported session {session_id} but the continuity record for {identity} \
-                 binds {}, so registering this record's authority against it would publish a \
-                 binding the record does not name",
-                record.session_id
-            )));
-        }
-        if let Some(bridge) = self.bridge.as_ref() {
-            bridge
-                .register_session_runtime_state(
-                    &session_id,
-                    identity,
-                    record.generation,
-                    record.checkpoint_version,
-                    fencing_token,
-                )
-                .await
-                .map_err(|err| {
-                    IdentityRuntimeError::Internal(format!(
-                        "owner registration after attach of {session_id} failed, so the session \
-                         is not resumable yet (retryable: the occupant is untouched and retry is \
-                         idempotent): {err}"
-                    ))
-                })?;
-        }
-        Ok(super::bridge::ResumeSessionOutcome::Resumed { session_id })
     }
 
     /// Cancellation-safe compatibility restore used by embedders that pass
@@ -7538,7 +7103,7 @@ impl IdentityRuntime {
     pub async fn retire_tracked(
         self: &Arc<Self>,
         identity: &AgentIdentity,
-    ) -> Result<FencingToken, IdentityRuntimeError> {
+    ) -> Result<(), IdentityRuntimeError> {
         let runtime = Arc::clone(self);
         let identity = identity.clone();
         self.run_tracked_foreground(async move { runtime.retire(&identity).await })
@@ -7551,7 +7116,7 @@ impl IdentityRuntime {
         self: &Arc<Self>,
         identity: &AgentIdentity,
         expected_alias: &str,
-    ) -> Result<FencingToken, IdentityRuntimeError> {
+    ) -> Result<(), IdentityRuntimeError> {
         let runtime = Arc::clone(self);
         let identity = identity.clone();
         let expected_alias = expected_alias.to_string();
@@ -7572,7 +7137,7 @@ impl IdentityRuntime {
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
         cleanup: F,
-    ) -> Result<(FencingToken, T), IdentityRuntimeError>
+    ) -> Result<T, IdentityRuntimeError>
     where
         T: Send + 'static,
         F: FnOnce(Option<AgentRuntimeId>) -> Fut + Send + 'static,
@@ -7590,15 +7155,11 @@ impl IdentityRuntime {
                     .await?;
             }
             let retired_alias = runtime
-                .entries
-                .read()
-                .await
-                .get(&identity)
-                .and_then(|entry| entry.continuity.as_ref())
-                .map(|record| record.agent_runtime_id.clone());
-            let token = runtime.retire_locked(&identity).await?;
-            let metadata = cleanup(retired_alias).await;
-            Ok((token, metadata))
+                .core_live_member(&identity)
+                .await?
+                .map(|live| live.agent_runtime_id);
+            runtime.retire_locked(&identity).await?;
+            Ok(cleanup(retired_alias).await)
         })
         .await
     }
@@ -7607,7 +7168,7 @@ impl IdentityRuntime {
     pub async fn respawn_tracked(
         self: &Arc<Self>,
         identity: &AgentIdentity,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         let runtime = Arc::clone(self);
         let identity = identity.clone();
         self.run_tracked_foreground(async move { runtime.respawn(&identity).await })
@@ -7620,7 +7181,7 @@ impl IdentityRuntime {
         self: &Arc<Self>,
         identity: &AgentIdentity,
         expected_alias: &str,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         let runtime = Arc::clone(self);
         let identity = identity.clone();
         let expected_alias = expected_alias.to_string();
@@ -7664,16 +7225,16 @@ impl IdentityRuntime {
     /// Cancellation-safe identity-first respawn for RPC and console boundaries.
     ///
     /// A durable identity already owns an authoritative Meerkat session. Its
-    /// respawn operation therefore fences the old owner, refreshes the persisted
-    /// runtime state, and reactivates that exact continuity record in place. It
-    /// must not call the raw member-plane respawn convenience: that operation
-    /// creates a new session and would silently turn a non-destructive identity
-    /// recovery into a destructive reset.
+    /// respawn retires the member and wakes it onto that same session (Core
+    /// resumes it under a new generation). It must not call the raw
+    /// member-plane respawn convenience: that operation creates a new session
+    /// and would silently turn a non-destructive identity recovery into a
+    /// destructive reset.
     pub(crate) async fn respawn_identity_in_place_tracked(
         self: &Arc<Self>,
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         match expected_alias {
             Some(expected_alias) => {
                 self.respawn_member_alias_tracked(identity, expected_alias)
@@ -7683,50 +7244,11 @@ impl IdentityRuntime {
         }
     }
 
-    /// Cancellation-safe live-session rebind for RPC/host boundaries.
-    pub async fn rebind_session_after_live_respawn_tracked(
-        self: &Arc<Self>,
-        identity: &AgentIdentity,
-        session_id: SessionId,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
-        let runtime = Arc::clone(self);
-        let identity = identity.clone();
-        self.run_tracked_foreground(async move {
-            runtime
-                .rebind_session_after_live_respawn(&identity, session_id)
-                .await
-        })
-        .await
-    }
-
-    /// Cancellation-safe live-session rebind pinned to the generation that
-    /// initiated the lower-level member respawn.
-    pub async fn rebind_session_after_live_respawn_member_alias_tracked(
-        self: &Arc<Self>,
-        identity: &AgentIdentity,
-        expected_alias: &str,
-        session_id: SessionId,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
-        let runtime = Arc::clone(self);
-        let identity = identity.clone();
-        let expected_alias = expected_alias.to_string();
-        self.run_tracked_foreground(async move {
-            runtime
-                .rebind_session_after_live_respawn_with_expected_member_alias(
-                    &identity,
-                    Some(&expected_alias),
-                    session_id,
-                )
-                .await
-        })
-        .await
-    }
-
     /// Cancellation-safe destructive reset for RPC/host boundaries.
     pub async fn reset_tracked(
         self: &Arc<Self>,
         identity: &AgentIdentity,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<meerkat_mob::MemberBinding, IdentityRuntimeError> {
         let runtime = Arc::clone(self);
         let identity = identity.clone();
         self.run_tracked_foreground(async move { runtime.reset(&identity).await })
@@ -7739,7 +7261,7 @@ impl IdentityRuntime {
         self: &Arc<Self>,
         identity: &AgentIdentity,
         expected_alias: &str,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<meerkat_mob::MemberBinding, IdentityRuntimeError> {
         let runtime = Arc::clone(self);
         let identity = identity.clone();
         let expected_alias = expected_alias.to_string();
@@ -7755,7 +7277,7 @@ impl IdentityRuntime {
     pub async fn delete_identity_tracked(
         self: &Arc<Self>,
         identity: &AgentIdentity,
-    ) -> Result<(), IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberBinding>, IdentityRuntimeError> {
         let runtime = Arc::clone(self);
         let identity = identity.clone();
         self.run_tracked_foreground(async move { runtime.delete_identity(&identity).await })
@@ -7768,7 +7290,7 @@ impl IdentityRuntime {
         self: &Arc<Self>,
         identity: &AgentIdentity,
         expected_alias: &str,
-    ) -> Result<(), IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberBinding>, IdentityRuntimeError> {
         let runtime = Arc::clone(self);
         let identity = identity.clone();
         let expected_alias = expected_alias.to_string();
@@ -7804,13 +7326,12 @@ impl IdentityRuntime {
                     .ensure_expected_member_alias_current(&identity, expected_alias)
                     .await?;
             }
+            // The live member the delete replaces (a dormant identity has
+            // none): its captured concrete generation is cleaned up.
             let deleted_alias = runtime
-                .entries
-                .read()
-                .await
-                .get(&identity)
-                .and_then(|entry| entry.continuity.as_ref())
-                .map(|record| record.agent_runtime_id.clone());
+                .core_live_member(&identity)
+                .await?
+                .map(|binding| binding.agent_runtime_id);
             runtime.delete_identity_locked(&identity).await?;
             Ok(cleanup(deleted_alias).await)
         })
@@ -7826,7 +7347,7 @@ impl IdentityRuntime {
         identity: &AgentIdentity,
         cancellation: &mut watch::Receiver<bool>,
         generation: u64,
-    ) -> Option<Result<ContinuityRecord, IdentityRuntimeError>> {
+    ) -> Option<Result<(), IdentityRuntimeError>> {
         // Background warm is indirect hydration: a retired identity stays
         // retired until something addressed to it revives it.
         if let Some(err) = self.retired_terminal_refusal(identity, "materialize").await {
@@ -7843,7 +7364,7 @@ impl IdentityRuntime {
                 EmbodimentOverrides::default(),
             )
             .await
-            .map(|outcome| outcome.record);
+            .map(|_| ());
         if matches!(
             &result,
             Err(IdentityRuntimeError::Internal(message)) if message == BACKGROUND_WARM_CANCELLED
@@ -7889,11 +7410,897 @@ impl IdentityRuntime {
         .await
     }
 
+    // -----------------------------------------------------------------------
+    // Core facts: read per call, never cached
+    // -----------------------------------------------------------------------
+
+    /// The session bridge every Core read and lifecycle verb goes through.
+    /// Identity lifecycle needs Core's mob; a runtime without a bridge has
+    /// no member to wake.
+    fn core_bridge(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<&Arc<dyn SessionBridge>, IdentityRuntimeError> {
+        self.bridge.as_ref().ok_or_else(|| {
+            IdentityRuntimeError::Internal(format!(
+                "identity '{identity}': no session bridge is installed, so Core's mob cannot \
+                 wake, retire or read it"
+            ))
+        })
+    }
+
+    /// The identity Core's member history binds `session_id` to, live or
+    /// retired (Core's journal is the only record of who owns a
+    /// session). `Ok(None)` when no binding names the session, or without a
+    /// session bridge; a failed read is typed history-unavailable.
+    pub async fn core_session_owner(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<AgentIdentity>, IdentityRuntimeError> {
+        let Some(bridge) = self.bridge.as_ref() else {
+            return Ok(None);
+        };
+        let history = bridge.member_binding_history().await.map_err(|error| {
+            IdentityRuntimeError::MemberHistoryUnavailable {
+                detail: format!("reading the owner of session {session_id}: {error}"),
+            }
+        })?;
+        let Some(binding) = history.binding_for_session(session_id) else {
+            return Ok(None);
+        };
+        let durable =
+            crate::member_comms_id::durable_identity_for_roster_member(binding.identity().as_str());
+        AgentIdentity::parse(&durable).map(Some).map_err(|error| {
+            IdentityRuntimeError::Internal(format!(
+                "Core binds session {session_id} to '{durable}', which is not a valid identity: \
+                 {error}"
+            ))
+        })
+    }
+
+    /// Core's live member for `identity`: the runtime binding Core committed
+    /// (runtime id and session, `None` for a peer-only member), or `None`
+    /// while Core holds no member. Read-only: it revives nothing. A failed
+    /// read is typed history-unavailable, never "not live".
+    pub(crate) async fn core_live_member(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<super::bridge::MemberRuntimeBinding>, IdentityRuntimeError> {
+        let Some(bridge) = self.bridge.as_ref() else {
+            return Ok(None);
+        };
+        bridge.live_member(identity).await.map_err(|error| {
+            IdentityRuntimeError::IdentityHistoryUnavailable {
+                identity: identity.clone(),
+                detail: format!("reading Core's live member: {error}"),
+            }
+        })
+    }
+
+    /// Core's delivery scope of `identity`'s live member (runtime id,
+    /// generation, fence, session), or `None` while Core holds no
+    /// session-backed member. Core refuses the scope read of a member it
+    /// holds no session binding for, such as a retired one: when Core then
+    /// holds no live member either, there is no live scope.
+    pub(crate) async fn core_live_scope(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
+        let Some(bridge) = self.bridge.as_ref() else {
+            return Ok(None);
+        };
+        match bridge.live_member_scope(identity).await {
+            Ok(scope) => Ok(scope),
+            Err(error) => match bridge.live_member(identity).await {
+                Ok(None) => Ok(None),
+                _ => Err(IdentityRuntimeError::IdentityHistoryUnavailable {
+                    identity: identity.clone(),
+                    detail: format!("reading Core's live member scope: {error}"),
+                }),
+            },
+        }
+    }
+
+    /// `identity`'s latest binding since the latest mob reset, live or
+    /// retired; `None` when Core never spawned it since then (a wake
+    /// after a mob reset is fresh). A failed read is never "no history".
+    async fn core_last_binding(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberBinding>, IdentityRuntimeError> {
+        self.core_bridge(identity)?
+            .last_member_binding(identity)
+            .await
+            .map_err(|error| IdentityRuntimeError::IdentityHistoryUnavailable {
+                identity: identity.clone(),
+                detail: format!("reading Core's member history: {error}"),
+            })
+    }
+
+    /// Whether Core holds an identity intent row for `identity` (a host
+    /// adopted it, Present or Absent). Such an identity is read-only to every
+    /// Meta verb.
+    async fn core_identity_management(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<meerkat_mob::MemberIdentityManagement, IdentityRuntimeError> {
+        self.core_bridge(identity)?
+            .identity_management(identity)
+            .await
+            .map_err(|error| IdentityRuntimeError::IdentityHistoryUnavailable {
+                identity: identity.clone(),
+                detail: format!("reading Core's identity management: {error}"),
+            })
+    }
+
+    /// On every lifecycle verb: refuse an identity a host adopted. A read
+    /// fault refuses too (history unavailable): Meta never acts on an
+    /// identity it could not prove is its own.
+    pub(crate) async fn refuse_host_adopted(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<(), IdentityRuntimeError> {
+        if self.bridge.is_none() {
+            return Ok(());
+        }
+        match self.core_identity_management(identity).await? {
+            meerkat_mob::MemberIdentityManagement::CommandDriven => Ok(()),
+            meerkat_mob::MemberIdentityManagement::IntentManaged => {
+                Err(IdentityRuntimeError::IdentityHostAdopted {
+                    identity: identity.clone(),
+                })
+            }
+            // An intent row this build cannot read may declare anything:
+            // never act on it until it reads.
+            meerkat_mob::MemberIdentityManagement::IntentUnreadable => {
+                Err(IdentityRuntimeError::IdentityHistoryUnavailable {
+                    identity: identity.clone(),
+                    detail: "Core holds an identity intent row for the identity that this \
+                             build cannot read"
+                        .to_string(),
+                })
+            }
+            // A management kind this build does not know: never act on it.
+            _ => Err(IdentityRuntimeError::IdentityHistoryUnavailable {
+                identity: identity.clone(),
+                detail: "Core reports an identity management kind this build does not know"
+                    .to_string(),
+            }),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The first-boot manifest
+    // -----------------------------------------------------------------------
+
+    /// Point the runtime at its state directory, where
+    /// `storage-migrate-native` leaves the first-boot manifest of a migrated
+    /// state directory. The first roster compile (or wake) reads it; `None`
+    /// means there is none.
+    pub fn set_first_boot_state_dir(&self, state_dir: Option<PathBuf>) {
+        *self
+            .first_boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = match state_dir {
+            Some(state_dir) => FirstBootRows::Unread { state_dir },
+            None => FirstBootRows::NoStateDir,
+        };
+    }
+
+    /// Read the first-boot manifest, once. A manifest the reader refuses
+    /// fails typed (`FirstBootManifestUnreadable`) on every call until it
+    /// reads: which identities it covers is unknown, so nothing may wake.
+    pub(crate) async fn load_first_boot_manifest(&self) -> Result<(), IdentityRuntimeError> {
+        if !self.first_boot_unread() {
+            return Ok(());
+        }
+        let writer = self.first_boot_writer.lock().await;
+        let state_dir = match &*self
+            .first_boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            FirstBootRows::Unread { state_dir } => state_dir.clone(),
+            _ => return Ok(()),
+        };
+        let read_dir = state_dir.clone();
+        let manifest = tokio::task::spawn_blocking(move || FirstBootManifest::read(&read_dir))
+            .await
+            .map_err(|error| {
+                IdentityRuntimeError::Internal(format!(
+                    "reading the first-boot manifest did not finish: {error}"
+                ))
+            })?
+            .map_err(|error| IdentityRuntimeError::FirstBootManifestUnreadable {
+                path: error.path().to_path_buf(),
+                detail: error.refusal().to_string(),
+            })?;
+        *self
+            .first_boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = match manifest {
+            None => FirstBootRows::Settled,
+            Some(manifest) => {
+                let file_rows_sha256 = manifest.rows_sha256().to_string();
+                let rows = manifest
+                    .into_rows()
+                    .into_iter()
+                    .map(|row| (row.identity().clone(), row))
+                    .collect::<BTreeMap<_, _>>();
+                FirstBootRows::Pending {
+                    state_dir,
+                    // A manifest without rows is removed by the next
+                    // rewrite.
+                    file_stale: rows.is_empty(),
+                    rows,
+                    file_rows_sha256,
+                }
+            }
+        };
+        drop(writer);
+        self.publish_first_boot_pending().await;
+        Ok(())
+    }
+
+    fn first_boot_unread(&self) -> bool {
+        matches!(
+            &*self
+                .first_boot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            FirstBootRows::Unread { .. }
+        )
+    }
+
+    /// `identity`'s first-boot row still to carry out, if any (the manifest
+    /// is read first when nothing read it yet).
+    async fn pending_first_boot_row(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<FirstBootRow>, IdentityRuntimeError> {
+        self.load_first_boot_manifest().await?;
+        Ok(
+            match &*self
+                .first_boot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                FirstBootRows::Pending { rows, .. } => rows.get(identity).cloned(),
+                _ => None,
+            },
+        )
+    }
+
+    /// Whether `identity` has a first-boot row still to carry out, as the
+    /// manifest last read says.
+    pub(crate) fn has_pending_first_boot_row(&self, identity: &AgentIdentity) -> bool {
+        matches!(
+            &*self
+                .first_boot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            FirstBootRows::Pending { rows, .. } if rows.contains_key(identity)
+        )
+    }
+
+    /// Refuse `operation` while `identity` has a first-boot row to carry
+    /// out: it would start a life the row does not know.
+    async fn refuse_pending_first_boot_row(
+        &self,
+        identity: &AgentIdentity,
+        operation: &'static str,
+    ) -> Result<(), IdentityRuntimeError> {
+        match self.pending_first_boot_row(identity).await? {
+            Some(row) => Err(IdentityRuntimeError::FirstBootRowPending {
+                identity: identity.clone(),
+                kind: row.kind(),
+                waiting_for: self.first_boot_wait(identity).await,
+                operation,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// What `identity`'s pending first-boot row waits for: the roster, while
+    /// the roster does not list the identity; otherwise its carry-out.
+    async fn first_boot_wait(&self, identity: &AgentIdentity) -> FirstBootWait {
+        if self.entries.read().await.contains_key(identity) {
+            FirstBootWait::CarryOut
+        } else {
+            FirstBootWait::Roster
+        }
+    }
+
+    /// Carry out `identity`'s first-boot row, if it has one, before anything
+    /// wakes it. The caller holds the identity's lifecycle lock.
+    /// Core's member history decides ([`FirstBootRow::state_in`]):
+    /// - done: the row is settled and nothing changes;
+    /// - a `Fresh` row to do: the identity's fresh life starts as a reset
+    ///   starts it, keeping its liveness (Core replaces a live member by its
+    ///   successor, and gives a dormant identity a fresh session it retires
+    ///   at once), and the row is settled;
+    /// - a `Resume` row to do: returns the row's session, for the caller's
+    ///   wake to resume; the row is settled once that resume succeeds;
+    /// - contradicted: refused typed (`FirstBootRowRefused`); nothing
+    ///   changes and the row stays.
+    async fn first_boot_step_locked(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<SessionId>, IdentityRuntimeError> {
+        let Some(row) = self.pending_first_boot_row(identity).await? else {
+            return Ok(None);
+        };
+        let history = self
+            .core_bridge(identity)?
+            .member_binding_history()
+            .await
+            .map_err(|error| IdentityRuntimeError::IdentityHistoryUnavailable {
+                identity: identity.clone(),
+                detail: format!(
+                    "reading Core's member history for the identity's first-boot row: {error}"
+                ),
+            })?;
+        match row.state_in(&history) {
+            FirstBootRowState::Done => {
+                self.settle_first_boot_row(identity).await;
+                Ok(None)
+            }
+            FirstBootRowState::Contradicted {
+                core_session,
+                detail,
+            } => Err(IdentityRuntimeError::FirstBootRowRefused {
+                identity: identity.clone(),
+                kind: row.kind(),
+                manifest_session: row.session().clone(),
+                core_session,
+                detail,
+            }),
+            FirstBootRowState::ToDo => match row {
+                FirstBootRow::Resume { session, .. } => Ok(Some(session)),
+                FirstBootRow::Fresh { .. } => {
+                    let mut foreground_shutdown = self.foreground_cancel.subscribe();
+                    let live = self
+                        .start_fresh_life_locked(
+                            identity,
+                            &mut foreground_shutdown,
+                            "first-boot fresh start",
+                            None,
+                        )
+                        .await?;
+                    // A live member was replaced by its successor: the
+                    // views settle as after a reset. A dormant identity's
+                    // fresh life leaves it as it was registered.
+                    if live {
+                        self.settle_fresh_life(identity, true, None).await;
+                    }
+                    self.settle_first_boot_row(identity).await;
+                    Ok(None)
+                }
+            },
+        }
+    }
+
+    /// A delivery to a live member whose first-boot row is still pending
+    /// reads the row against Core's history again first: a done row
+    /// settles, a contradicted one refuses the delivery typed, and a `Fresh`
+    /// row still to do is carried out, replacing the member by its
+    /// successor. (A `Resume` row still to do has no live member; it refuses
+    /// as pending.) While the manifest is unread, any identity may have a
+    /// row in it: the delivery reads it first, and refuses typed while it
+    /// stays unreadable. Returns whether a row was read: the caller reads
+    /// Core's live member again, since it may be the successor now.
+    async fn first_boot_guard_live_locked(
+        &self,
+        identity: &AgentIdentity,
+        operation: &'static str,
+    ) -> Result<bool, IdentityRuntimeError> {
+        if !self.has_pending_first_boot_row(identity) && !self.first_boot_unread() {
+            return Ok(false);
+        }
+        match self.first_boot_step_locked(identity).await? {
+            None => Ok(true),
+            Some(_) => Err(IdentityRuntimeError::FirstBootRowPending {
+                identity: identity.clone(),
+                kind: FirstBootRowKind::Resume,
+                waiting_for: FirstBootWait::CarryOut,
+                operation,
+            }),
+        }
+    }
+
+    /// Carry out the pending first-boot rows of the identities a roster
+    /// compile just registered, before anything wakes them. Each
+    /// entry carries its identity's lifecycle reservation, held until its
+    /// row is carried out. A `Resume` row is carried out by the identity's
+    /// wake onto the row's session; a `Fresh` row by a fresh life that keeps
+    /// the identity's liveness. Returns each identity whose row was refused
+    /// or failed, with the typed error: its row stays pending, and the
+    /// identity's next wake or roster compile tries it again.
+    pub(crate) async fn carry_out_first_boot_rows(
+        &self,
+        registered: Vec<(DurableAgentSpec, tokio::sync::OwnedMutexGuard<()>)>,
+    ) -> Vec<(AgentIdentity, IdentityRuntimeError)> {
+        let failed = stream::iter(registered)
+            .map(|(spec, lifecycle_guard)| async move {
+                let result = self.carry_out_first_boot_row_locked(&spec).await;
+                drop(lifecycle_guard);
+                result.err().map(|error| (spec.identity, error))
+            })
+            .buffer_unordered(super::orchestrator::identity_restore_concurrency())
+            .filter_map(std::future::ready)
+            .collect::<Vec<_>>()
+            .await;
+        // A rewrite that failed before is retried once per compile.
+        self.rewrite_first_boot_manifest().await;
+        self.publish_first_boot_pending().await;
+        failed
+    }
+
+    async fn carry_out_first_boot_row_locked(
+        &self,
+        spec: &DurableAgentSpec,
+    ) -> Result<(), IdentityRuntimeError> {
+        let identity = &spec.identity;
+        let Some(row) = self.pending_first_boot_row(identity).await? else {
+            return Ok(());
+        };
+        match row.kind() {
+            // The wake door carries a `Resume` row out: it resumes the
+            // row's session and settles the row.
+            FirstBootRowKind::Resume => {
+                let mut bound_bootstrap_generation = None;
+                let result = self
+                    .embody_identity_locked(
+                        identity,
+                        None,
+                        None,
+                        None,
+                        &mut bound_bootstrap_generation,
+                        EmbodimentOverrides {
+                            spec: Some(spec),
+                            ..EmbodimentOverrides::default()
+                        },
+                    )
+                    .await;
+                self.mark_bootstrap_materialization_finished(
+                    identity,
+                    &result,
+                    bound_bootstrap_generation,
+                );
+                result.map(|_| ())
+            }
+            FirstBootRowKind::Fresh => self.first_boot_step_locked(identity).await.map(|_| ()),
+        }
+    }
+
+    /// Respawn, once and through the bridge, each identity of `listed`
+    /// whose live Core member lacks the durable-identity marker: a member
+    /// Meta 0.9.3 spawned (it never set one) that Core kept live across the
+    /// upgrade. Extension documents grant a member's sessions the identity
+    /// only on that marker, and the bridge's resume carries it.
+    ///
+    /// The roster compile runs this after its first-boot rows, on every
+    /// compile: a marked member is skipped, so a later compile does nothing.
+    /// One read of Core's member history picks the members
+    /// ([`Self::unmarked_live_session`]); a failed read respawns nothing and
+    /// the next compile reads again. An identity whose first-boot row is
+    /// still pending is left to its row. Each respawn takes the identity's
+    /// lifecycle lock and is the reload pair: the member retires (no memory
+    /// harvest: the session does not rotate) and the wake door resumes the
+    /// same session at a new generation, so the transcript is kept; the
+    /// member's queued inputs are captured before the retire and admitted to
+    /// the resumed session. A
+    /// not-live member is left alone: its next wake resumes it through the
+    /// bridge, which marks it. Returns each identity whose respawn failed,
+    /// with the typed error; the others go on.
+    pub(crate) async fn respawn_unmarked_identities(
+        &self,
+        listed: &[DurableAgentSpec],
+    ) -> Vec<(AgentIdentity, IdentityRuntimeError)> {
+        if listed.is_empty() {
+            return Vec::new();
+        }
+        let history = match self.core_view_history().await {
+            Ok(Some(history)) => history,
+            // Without a bridge Core holds no member of this runtime.
+            Ok(None) => return Vec::new(),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "reading Core's member history for members without the durable-identity \
+                     marker failed; nothing is respawned, and the next roster compile reads it \
+                     again"
+                );
+                return Vec::new();
+            }
+        };
+        let unmarked = listed
+            .iter()
+            .filter(|spec| !self.has_pending_first_boot_row(&spec.identity))
+            .filter_map(|spec| {
+                let session = Self::unmarked_live_session(&history, spec)?;
+                Some((spec.clone(), session))
+            })
+            .collect::<Vec<_>>();
+        stream::iter(unmarked)
+            .map(|(spec, session)| async move {
+                let lifecycle_lock = self.lifecycle_lock_for(&spec.identity).await;
+                let _lifecycle_guard = lifecycle_lock.lock().await;
+                let result = self.respawn_unmarked_locked(&spec, &session).await;
+                result.err().map(|error| (spec.identity, error))
+            })
+            .buffer_unordered(super::orchestrator::identity_restore_concurrency())
+            .filter_map(std::future::ready)
+            .collect::<Vec<_>>()
+            .await
+    }
+
+    /// The session of `spec`'s live Core member when that member lacks the
+    /// identity's durable-identity marker and a respawn through the bridge
+    /// can keep the session. `None` for a peer-only identity (no session to
+    /// keep), one an identity intent row manages (a host adopted it, or the
+    /// row does not read: no Meta verb acts on it), a member Core does not
+    /// hold live, a marked one, one without a session, and one whose role
+    /// is not the roster profile (the wake would hold it, retired). A member
+    /// skipped for its role stays unmarked, so extension documents refuse its
+    /// sessions until a declared migration respawns it.
+    fn unmarked_live_session(
+        history: &meerkat_mob::MemberBindingHistory,
+        spec: &DurableAgentSpec,
+    ) -> Option<SessionId> {
+        if durable_spec_uses_external_binding(spec) {
+            return None;
+        }
+        let member = crate::member_comms_id::roster_member_id_for_identity(spec.identity.as_str());
+        if history.identity_management(&member)
+            != meerkat_mob::MemberIdentityManagement::CommandDriven
+        {
+            return None;
+        }
+        let binding = history.last_binding(&member)?;
+        if !binding.is_live()
+            || binding_carries_identity_marker(binding, &spec.identity)
+            || *binding.role() != spec.profile
+        {
+            return None;
+        }
+        binding.session_id().cloned()
+    }
+
+    /// Respawn `spec`'s identity onto `session` under the caller's lifecycle
+    /// lock ([`Self::respawn_unmarked_identities`]). Nothing happens when
+    /// Core's live member no longer runs `session` (a verb moved it since
+    /// the history read), or when Core holds no durable copy of `session` or
+    /// the bridge cannot say (the wake would start a fresh session in its
+    /// place and lose the live member's transcript).
+    async fn respawn_unmarked_locked(
+        &self,
+        spec: &DurableAgentSpec,
+        session: &SessionId,
+    ) -> Result<(), IdentityRuntimeError> {
+        let identity = &spec.identity;
+        let still_live = self
+            .core_live_member(identity)
+            .await?
+            .is_some_and(|live| live.session_id.as_ref() == Some(session));
+        if !still_live {
+            return Ok(());
+        }
+        match self
+            .core_bridge(identity)?
+            .durable_session_held(session)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) | Err(BridgeError::Unsupported { .. }) => {
+                tracing::warn!(
+                    %identity,
+                    %session,
+                    "the identity's live member lacks the durable-identity marker, but nothing \
+                     vouches for a durable copy of its session; it is not respawned"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(IdentityRuntimeError::IdentityHistoryUnavailable {
+                    identity: identity.clone(),
+                    detail: format!(
+                        "reading Core's session state before respawning a member without the \
+                         durable-identity marker: {error}"
+                    ),
+                });
+            }
+        }
+        // The retire takes the member's queued inputs with it: they are
+        // captured first (the delivery repair's own capture) and admitted to
+        // the resumed session. A queue that cannot be observed leaves the
+        // member as it is, so no input is lost unseen.
+        let bridge = Arc::clone(self.core_bridge(identity)?);
+        let queued = match bridge.capture_queued_member_inputs(identity, session).await {
+            Ok(queued) => queued,
+            Err(error) => {
+                tracing::warn!(
+                    %identity,
+                    %session,
+                    %error,
+                    "the queue of a live member without the durable-identity marker could not \
+                     be observed; it is not respawned"
+                );
+                return Ok(());
+            }
+        };
+        tracing::info!(
+            %identity,
+            %session,
+            queued = queued.carryable(),
+            "respawning a live member without the durable-identity marker onto the same session"
+        );
+        if let Err(error) = self
+            .retire_locked_with_intent(identity, LifecycleRetireIntent::Reload)
+            .await
+        {
+            if queued.carryable() > 0 {
+                tracing::error!(
+                    %identity,
+                    lost = queued.carryable(),
+                    %error,
+                    "the retire before the respawn failed; the queued inputs captured before it \
+                     are lost if Core retired the member"
+                );
+            }
+            return Err(error);
+        }
+        let mut bound_bootstrap_generation = None;
+        let result = self
+            .embody_identity_locked(
+                identity,
+                None,
+                None,
+                None,
+                &mut bound_bootstrap_generation,
+                EmbodimentOverrides::default(),
+            )
+            .await;
+        self.mark_bootstrap_materialization_finished(identity, &result, bound_bootstrap_generation);
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if queued.carryable() > 0 {
+                    tracing::error!(
+                        %identity,
+                        lost = queued.carryable(),
+                        %error,
+                        "the wake after the retire failed; the queued inputs captured before the \
+                         retire are lost"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        match outcome.binding.session_id.as_ref() {
+            Some(resumed) => {
+                bridge
+                    .readmit_queued_member_inputs(identity, resumed, queued)
+                    .await;
+            }
+            None if queued.carryable() > 0 => tracing::error!(
+                %identity,
+                lost = queued.carryable(),
+                "the resumed member has no session to admit the captured queued inputs to; they \
+                 are lost"
+            ),
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// A first-boot row is carried out: it leaves the pending rows, and the
+    /// manifest file is rewritten without it (removed once none remains).
+    async fn settle_first_boot_row(&self, identity: &AgentIdentity) {
+        if let FirstBootRows::Pending {
+            rows, file_stale, ..
+        } = &mut *self
+            .first_boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            && rows.remove(identity).is_some()
+        {
+            *file_stale = true;
+        }
+        self.rewrite_first_boot_manifest().await;
+        self.publish_first_boot_pending().await;
+    }
+
+    /// Bring the manifest file in line with the rows still pending: rewrite
+    /// it without the carried-out ones, or remove it once none remains. A
+    /// failed rewrite is logged and retried by the next roster compile; the
+    /// carried-out rows stay done, since Core's history shows them.
+    async fn rewrite_first_boot_manifest(&self) {
+        let _writer = self.first_boot_writer.lock().await;
+        let (state_dir, expected, remaining) = match &*self
+            .first_boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            FirstBootRows::Pending {
+                state_dir,
+                rows,
+                file_rows_sha256,
+                file_stale: true,
+            } => (
+                state_dir.clone(),
+                file_rows_sha256.clone(),
+                rows.values().cloned().collect::<Vec<_>>(),
+            ),
+            _ => return,
+        };
+        let rewrite_dir = state_dir.clone();
+        let rewritten = tokio::task::spawn_blocking(move || {
+            FirstBootManifest::replace_rows(&rewrite_dir, &expected, remaining)
+        })
+        .await;
+        let mut first_boot = self
+            .first_boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match rewritten {
+            Ok(Ok(Some(manifest))) => {
+                if let FirstBootRows::Pending {
+                    rows,
+                    file_rows_sha256,
+                    file_stale,
+                    ..
+                } = &mut *first_boot
+                {
+                    *file_rows_sha256 = manifest.rows_sha256().to_string();
+                    // A row settled while the file was written is still in it.
+                    *file_stale = manifest.rows().len() != rows.len();
+                }
+            }
+            Ok(Ok(None)) => *first_boot = FirstBootRows::Settled,
+            Ok(Err(error))
+                if matches!(error.refusal(), FirstBootManifestRefusal::Changed { .. }) =>
+            {
+                tracing::warn!(
+                    %error,
+                    "the first-boot manifest changed under this process; it is read again before \
+                     the next wake or roster compile"
+                );
+                *first_boot = FirstBootRows::Unread { state_dir };
+            }
+            Ok(Err(error)) => tracing::warn!(
+                %error,
+                "a carried-out first-boot row is still in the manifest; the next roster compile \
+                 rewrites it"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                "the first-boot manifest rewrite did not finish; the next roster compile retries it"
+            ),
+        }
+    }
+
+    /// Publish the pending first-boot rows on the bootstrap status: each
+    /// waits for the roster, or (listed) for its carry-out to succeed.
+    async fn publish_first_boot_pending(&self) {
+        let pending = match &*self
+            .first_boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            FirstBootRows::Pending { rows, .. } => rows.values().cloned().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let published = {
+            let entries = self.entries.read().await;
+            pending
+                .iter()
+                .map(|row| FirstBootPendingRow {
+                    identity: row.identity().clone(),
+                    kind: row.kind(),
+                    waiting_for: if entries.contains_key(row.identity()) {
+                        FirstBootWait::CarryOut
+                    } else {
+                        FirstBootWait::Roster
+                    },
+                })
+                .collect::<Vec<_>>()
+        };
+        self.first_boot_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone_from(&published);
+        self.modify_bootstrap_status(None, |status| status.first_boot_pending = published);
+    }
+
+    /// Record a FINAL or HELD wake refusal for the views,
+    /// until the next successful wake. Process-local; never read as truth.
+    async fn record_wake_refusal(&self, identity: &AgentIdentity, error: &IdentityRuntimeError) {
+        let Some(refusal) = wake_refusal_of(error) else {
+            return;
+        };
+        let is_final = refusal.is_final();
+        if let Some(entry) = self.entries.write().await.get_mut(identity) {
+            entry.wake_refusal = Some(refusal);
+        }
+        if is_final {
+            self.emit_event(
+                identity,
+                IdentityEvent::StateChanged {
+                    identity: identity.clone(),
+                    new_state: IdentityLifecycleState::Broken,
+                },
+            )
+            .await;
+        }
+    }
+
+    /// A lifecycle verb is about to act on a member Core holds live (the
+    /// caller holds the identity's lifecycle lock and just read it live).
+    /// Neither a recorded wake refusal nor the last wake's replaced-session
+    /// note describes that member, so both go before Core is asked: no read
+    /// between the verb's Core steps (retire, then wake or spawn) shows the
+    /// identity Broken or names a replaced session.
+    async fn clear_wake_notes_of_live_member(&self, identity: &AgentIdentity) {
+        if let Some(entry) = self.entries.write().await.get_mut(identity) {
+            entry.wake_refusal = None;
+            entry.replaced_session = None;
+        }
+    }
+
+    /// A wake (or a fresh life) succeeded: drop any recorded refusal, wake
+    /// the binding observer and the completion waiters, and announce the
+    /// view's Active state.
+    async fn settle_successful_wake(
+        &self,
+        identity: &AgentIdentity,
+        replaced_session: Option<super::types::ReplacedSession>,
+    ) {
+        // The replaced-session marker is written with the settle, before the
+        // binding notify and the Active event, so a reader woken by either
+        // already sees it. A new member ends any absent-session note.
+        if let Some(entry) = self.entries.write().await.get_mut(identity) {
+            entry.wake_refusal = None;
+            entry.replaced_session = replaced_session;
+            entry.absent_delivery_session = None;
+        }
+        self.clear_materialization_backoff(identity).await;
+        self.entries.notify_binding_changed();
+        self.emit_event(
+            identity,
+            IdentityEvent::StateChanged {
+                identity: identity.clone(),
+                new_state: IdentityLifecycleState::Active,
+            },
+        )
+        .await;
+    }
+
+    /// Whether this runtime runs the live member Core's binding names: not
+    /// once it began shutting down, though Core keeps the binding live for
+    /// the next start.
+    fn runs_live_member(&self, core_live: bool) -> bool {
+        core_live && !self.foreground_shutdown.load(Ordering::Acquire)
+    }
+
+    /// The view state Core's facts give an identity right now.
+    fn view_state(
+        live: bool,
+        wake_refusal: Option<&super::types::WakeRefusal>,
+    ) -> IdentityLifecycleState {
+        if live {
+            IdentityLifecycleState::Active
+        } else if wake_refusal.is_some_and(super::types::WakeRefusal::is_final) {
+            IdentityLifecycleState::Broken
+        } else {
+            IdentityLifecycleState::Dormant
+        }
+    }
+
     /// [`Self::embody_identity`] for a caller that ALREADY holds this
-    /// identity's lifecycle lock (the reload verb runs retire and
-    /// re-materialize under one lock so no send can interleave). The
-    /// per-identity tokio mutex is not reentrant, so the body is split rather
-    /// than re-acquired.
+    /// identity's lifecycle lock (the reload verb runs retire and wake under
+    /// one lock so no send can interleave). The per-identity tokio mutex is
+    /// not reentrant, so the body is split rather than re-acquired.
     async fn embody_identity_locked(
         &self,
         identity: &AgentIdentity,
@@ -7903,13 +8310,6 @@ impl IdentityRuntime {
         bound_bootstrap_generation: &mut Option<u64>,
         overrides: EmbodimentOverrides<'_>,
     ) -> Result<EmbodimentOutcome, IdentityRuntimeError> {
-        let was_active = self
-            .entries
-            .read()
-            .await
-            .get(identity)
-            .is_some_and(|entry| entry.state == IdentityLifecycleState::Active);
-        let _in_flight = EmbodimentInFlight::enter(&self.embodiments_in_flight);
         let result = self
             .embody_identity_transaction(
                 identity,
@@ -7920,16 +8320,58 @@ impl IdentityRuntime {
                 overrides,
             )
             .await;
-        // A genuine embodiment (a resume, or a fresh mint) committed and
-        // released the store writer it held: a typed repair trigger. A
-        // converged Active identity re-validated by a pass is not one, so a
-        // repair pass cannot wake itself through its healthy members.
-        if result.is_ok() && !was_active {
-            self.trigger_continuity_repair(ContinuityRepairTrigger::EmbodimentSettled);
+        match &result {
+            Ok(outcome) if !outcome.already_active => {
+                let replaced = outcome.replaced_session.clone().map(|session_id| {
+                    super::types::ReplacedSession {
+                        session_id,
+                        reason: super::types::ReplacedSessionReason::Absent,
+                    }
+                });
+                self.settle_successful_wake(identity, replaced).await;
+            }
+            Ok(_) => {
+                if let Some(entry) = self.entries.write().await.get_mut(identity) {
+                    entry.wake_refusal = None;
+                }
+            }
+            Err(error) => self.record_wake_refusal(identity, error).await,
         }
         result
     }
 
+    /// Whether Core runs `identity`'s live member under a role other than
+    /// the roster profile `spec` names. Only an identity the history path
+    /// would resume is compared: a first-boot `Resume` row pins its own
+    /// session, and a peer-only identity always starts fresh.
+    async fn live_role_moved_off_profile(
+        &self,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
+        first_boot_row: bool,
+    ) -> Result<bool, IdentityRuntimeError> {
+        if first_boot_row || durable_spec_uses_external_binding(spec) {
+            return Ok(false);
+        }
+        Ok(self
+            .core_last_binding(identity)
+            .await?
+            .is_some_and(|binding| binding.role() != &spec.profile))
+    }
+
+    /// The one wake door: eager boot, lazy foreground wakes, background
+    /// warms and reloads all come here. Meta decides nothing Core owns:
+    /// - Core holds the member: make sure its live materialization exists
+    ///   (Core's own restore at boot, or an idle executor teardown); nothing
+    ///   is built or spawned.
+    /// - Otherwise Core's member history decides. The identity's last
+    ///   binding (since the latest mob reset) is resumed onto its
+    ///   committed session; no history, or a last session Core never
+    ///   persisted, is a fresh spawn. Core's durable refusal of the last
+    ///   session is typed `IdentityUnresumable`, never a silent fresh
+    ///   spawn; a held resume, or a profile change the host did not declare
+    ///   as a migration, is typed `WakeHeld`; a transient fault is
+    ///   retryable. One attempt, no retry loop.
     async fn embody_identity_transaction(
         &self,
         identity: &AgentIdentity,
@@ -7949,8 +8391,8 @@ impl IdentityRuntime {
         *bound_bootstrap_generation = Some(bootstrap_generation);
         // A background item belongs to one controller generation. If a newer
         // roster pass converged the entry before this item acquired lifecycle
-        // authority, treat the old work as cancelled instead of materializing
-        // the newer spec on behalf of a superseded pass.
+        // authority, treat the old work as cancelled instead of waking the
+        // newer spec on behalf of a superseded pass.
         if expected_bootstrap_generation.is_some_and(|expected| expected != bootstrap_generation) {
             return Err(IdentityRuntimeError::Internal(
                 BACKGROUND_WARM_CANCELLED.to_string(),
@@ -7966,63 +8408,104 @@ impl IdentityRuntime {
         let lock = self.materialization_lock_for(identity).await;
         let _guard = lock.lock().await;
 
-        let (spec, continuity, state) = {
+        let spec = {
             let entries = self.entries.read().await;
             let entry = entries
                 .get(identity)
                 .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            (
-                overrides
-                    .spec
-                    .cloned()
-                    .unwrap_or_else(|| entry.spec.clone()),
-                entry.continuity.clone(),
-                entry.state,
-            )
+            overrides
+                .spec
+                .cloned()
+                .unwrap_or_else(|| entry.spec.clone())
         };
         // A send authored from another registered row wakes nothing: this is
-        // the lifecycle-owned embodiment decision, under the identity's
-        // lifecycle lock, before readiness bookkeeping, lease or build.
+        // the lifecycle-owned wake decision, under the identity's lifecycle
+        // lock, before readiness bookkeeping or build.
         refuse_unless_registered_row(identity, &spec, overrides.expected_spec_digest)?;
-        if state == IdentityLifecycleState::Active {
-            // Converged eager restore still validates the time-sensitive
-            // external lease. This is part of the shared embodiment door, not
-            // a second restore implementation: healthy authority is reused,
-            // due authority is renewed, and lost authority parks this member.
-            let record = self.reuse_active_restore_state(&spec).await?;
-            self.clear_materialization_backoff(identity).await;
-            return Ok(EmbodimentOutcome {
-                already_active: true,
-                record,
-                resumed: true,
-                draft: AgentBuildDraft {
-                    model: None,
-                    system_prompt: None,
-                    additional_instructions: spec.additional_instructions.clone(),
-                    labels: spec.labels.clone(),
-                    app_context: spec.context.clone(),
-                    external_tools: Vec::new(),
-                    local_external_tools: Default::default(),
-                    provider_params: None,
-                    compaction_curator: Default::default(),
-                },
-            });
+        // Before anything acts: a host-adopted identity is read-only.
+        self.refuse_host_adopted(identity).await?;
+        let bridge = Arc::clone(self.core_bridge(identity)?);
+        // The first-boot manifest: the identity's pending row is
+        // carried out before anything wakes it. A `Fresh` row starts its
+        // fresh life here, and the wake resumes that; a `Resume` row pins
+        // the wake to the row's session.
+        let first_boot_resume = self.first_boot_step_locked(identity).await?;
+        // A `Resume` row names a session the migration carried into Core's
+        // session store. Core's session state is read before any resume, so
+        // a session Core holds no durable copy of is refused typed and never
+        // reaches a resume that could start a fresh life in its place.
+        if let Some(session_id) = first_boot_resume.as_ref() {
+            match bridge.durable_session_held(session_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(IdentityRuntimeError::FirstBootRowRefused {
+                        identity: identity.clone(),
+                        kind: FirstBootRowKind::Resume,
+                        manifest_session: session_id.clone(),
+                        core_session: None,
+                        detail: format!("Core holds no durable copy of session {session_id}"),
+                    });
+                }
+                Err(error) => {
+                    return Err(IdentityRuntimeError::IdentityHistoryUnavailable {
+                        identity: identity.clone(),
+                        detail: format!(
+                            "reading Core's session state for the identity's first-boot row: \
+                             {error}"
+                        ),
+                    });
+                }
+            }
         }
-        // Host-rejected-build park: the app-side gate answered this exact
-        // spec with a deterministic rejection. Fail fast typed — every
-        // attempt would otherwise burn a full member build plus a callback
-        // round trip for the same answer. A spec change clears the park
-        // (checked inside the accessor).
-        if let Some(park) = self.host_rejected_build_park(identity).await {
-            return Err(IdentityRuntimeError::HostRejectedBuild {
-                identity: identity.clone(),
-                reason: park.reason,
-            });
+
+        // Core holds the member: revive its live materialization if needed,
+        // while Core runs it under the roster's profile. The mob's own
+        // restore at boot keeps a member's durable role, so reviving a member
+        // that runs another role would make the roster's profile, and any
+        // migration this activation declared, a silent no-op. Such a member
+        // goes to the history path below, which applies a declared migration
+        // (the bridge restamps the live member) or refuses the change typed
+        // before anything is retired.
+        if let Some(live) = self.core_live_member(identity).await?
+            && !self
+                .live_role_moved_off_profile(identity, &spec, first_boot_resume.is_some())
+                .await?
+        {
+            match bridge.ensure_member_live(identity).await {
+                Ok(Some(binding)) => {
+                    self.refuse_unprojected_session(identity, &binding).await?;
+                    self.publish_pending_customizer_tools(
+                        identity,
+                        binding.session_id.as_ref(),
+                        "wake",
+                    )
+                    .await?;
+                    return Ok(EmbodimentOutcome {
+                        already_active: true,
+                        binding,
+                        resumed: true,
+                        draft: Self::base_build_draft(&spec),
+                        replaced_session: None,
+                    });
+                }
+                // The member left between the read and the revive: wake it
+                // from its history below.
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(classify_wake_failure(
+                        identity,
+                        live.session_id.as_ref(),
+                        error,
+                    ));
+                }
+            }
         }
+
         // A member a held pass could not publish owes its host a fresh held
-        // completion. Any embodiment outside a held pass that covers it would
-        // publish a new instance (a fresh session) that completion never saw,
-        // so it is refused typed and the identity stays Broken.
+        // completion. Any wake outside a held pass that covers it would
+        // publish a new instance that completion never saw, so it is refused
+        // typed. The durable marks are read first, so a restart keeps them.
+        self.load_held_completion_marks().await?;
         if self.held_completion_owed(identity)
             && self
                 .held_create_pass()
@@ -8032,93 +8515,80 @@ impl IdentityRuntime {
                 identity: identity.clone(),
             });
         }
-        let original_continuity = continuity.clone();
-        let continuity = if durable_spec_uses_external_binding(&spec) {
+
+        // What Core remembers of the identity. A peer-only (externally bound)
+        // identity has no session to resume and always starts fresh. A
+        // first-boot `Resume` row's identity has no binding yet.
+        let last = if first_boot_resume.is_some() || durable_spec_uses_external_binding(&spec) {
             None
         } else {
-            continuity
+            self.core_last_binding(identity).await?.and_then(|binding| {
+                binding
+                    .session_id()
+                    .cloned()
+                    .map(|session_id| (session_id, binding.role().clone()))
+            })
         };
-
-        match state {
-            // `Retiring` is the retired terminal form (see `retire_locked`): no
-            // live member, lease released, continuity record intact. The
-            // lifecycle lock held here means the in-transaction form cannot be
-            // observed, so re-materializing it is exactly the Dormant path and
-            // resumes the SAME durable session and generation.
-            IdentityLifecycleState::Dormant
-            | IdentityLifecycleState::Uninitialized
-            | IdentityLifecycleState::Retiring => {}
-            IdentityLifecycleState::Broken | IdentityLifecycleState::Suspended => {
-                return Err(IdentityRuntimeError::InvalidState {
-                    identity: identity.clone(),
-                    state,
-                    operation: "materialize",
-                });
+        // Meta never infers a role migration. A resume
+        // declares one only when the roster profile moved off the role Core
+        // last ran the identity under AND this activation's host declared
+        // exactly that migration; any other profile change is refused typed
+        // before Core is asked.
+        let resume = match last {
+            Some((session_id, last_role)) if last_role != spec.profile => {
+                let declared = bridge.declared_role_migration(identity);
+                if declared.as_ref() != Some(&last_role) {
+                    let detail = match declared {
+                        // A declaration from another predecessor does not
+                        // describe this member.
+                        Some(from_role) => format!(
+                            "declared role migration of {identity} from '{from_role}' to '{}' \
+                             was not applied: the role '{last_role}' Core last ran session \
+                             {session_id} under is not the declared predecessor role",
+                            spec.profile
+                        ),
+                        None => format!(
+                            "the roster profile '{}' differs from the role '{last_role}' Core \
+                             last ran session {session_id} under, and this activation declared \
+                             no migration from it",
+                            spec.profile
+                        ),
+                    };
+                    return Err(IdentityRuntimeError::WakeHeld {
+                        identity: identity.clone(),
+                        hold: WakeHold::RoleMigrationNotApplied,
+                        detail,
+                        session_id,
+                    });
+                }
+                Some((session_id, Some(last_role)))
             }
-            IdentityLifecycleState::Active => unreachable!("active handled above"),
+            Some((session_id, _)) => Some((session_id, None)),
+            None => first_boot_resume
+                .clone()
+                .map(|session_id| (session_id, None)),
+        };
+        // With no binding to resume this embodiment creates the identity's
+        // member. One the console would attribute to a runtime-plane
+        // identity is refused like every other creation path, before the
+        // readiness bookkeeping, the build customizer or Core sees it. Like
+        // the host's own build refusal it is answered typed on every attempt
+        // and never recorded, so a later wake refuses again and builds
+        // nothing. An identity Core holds a binding for resumes.
+        if resume.is_none() {
+            refuse_runtime_plane_creation(identity)?;
         }
+
         // Begin readiness bookkeeping only after ownership validation and
-        // only for an identity that will actually materialize. An old alias
-        // can now fail without a transient or terminal mutation of the
-        // replacement generation's bootstrap entry.
+        // only for an identity that will actually wake.
         self.mark_bootstrap_materialization_started(identity, Some(bootstrap_generation));
-
-        // A previous customization/installation failure can leave its exact
-        // unactivated grant parked when provider cleanup itself fails. Strict
-        // providers reject reacquisition while that grant still exists, so a
-        // direct lazy retry must drain this identity's orphan before acquiring
-        // fresh authority. Other identities' cleanup failures remain isolated.
-        self.release_parked_unactivated_leases_for_identity(identity)
-            .await?;
-
-        // Establish single-embodiment ownership before invoking arbitrary
-        // host customizer code, preserving the public ordering contract. No
-        // bridge/member state exists yet, so every exit below can still
-        // release this uninstalled grant explicitly.
-        let lease_results = self
-            .lease_provider
-            .acquire_leases(std::slice::from_ref(identity), &self.runtime_instance_id)
-            .await
-            .map_err(IdentityRuntimeError::Lease)?;
-        let grant = match lease_results.get(identity) {
-            Some(super::types::LeaseAcquireResult::Acquired(grant)) => grant.clone(),
-            Some(super::types::LeaseAcquireResult::AlreadyHeld { holder, .. }) => {
-                tracing::error!(
-                    %identity,
-                    holder = %holder,
-                    "single-embodiment guard: refusing to materialize an identity whose \
-                     durable lease is held by another live runtime instance"
-                );
-                return Err(IdentityRuntimeError::AlreadyEmbodied {
-                    identity: identity.clone(),
-                    holder: holder.clone(),
-                });
-            }
-            None => return Err(IdentityRuntimeError::NoActiveLease(identity.clone())),
-        };
-        if let Some(record) = continuity.as_ref()
-            && let Err(err) = self
-                .continuity_store
-                .upsert_continuity_record(record, grant.fencing_token)
-                .await
-        {
-            let cleanup_error = self.release_uninstalled_materialize_lease(&grant).await;
-            return Err(IdentityRuntimeError::Internal(format!(
-                "continuity upsert before materialize: {err}{}",
-                cleanup_error
-                    .as_ref()
-                    .map(|e| format!("; lease cleanup failed: {e}"))
-                    .unwrap_or_default(),
-            )));
-        }
-
         if cancellation
             .as_ref()
             .is_some_and(|cancellation| *cancellation.borrow())
         {
-            return Err(self
-                .cancel_uninstalled_background_materialization(&grant)
-                .await);
+            return Err(IdentityRuntimeError::Internal(
+                BACKGROUND_WARM_CANCELLED.to_string(),
+            ));
         }
 
         let active_peers = self.entries.read().await.keys().cloned().collect();
@@ -8129,17 +8599,7 @@ impl IdentityRuntime {
             managed_edges,
             runtime_services: self.runtime_services(),
         };
-        let mut draft = AgentBuildDraft {
-            model: None,
-            system_prompt: None,
-            additional_instructions: spec.additional_instructions.clone(),
-            labels: spec.labels.clone(),
-            app_context: spec.context.clone(),
-            external_tools: Vec::new(),
-            local_external_tools: Default::default(),
-            provider_params: None,
-            compaction_curator: Default::default(),
-        };
+        let mut draft = Self::base_build_draft(&spec);
         let installed_customizer = self.customizer.read().await.clone();
         let mut customized = false;
         if let Some(customizer) = overrides.customizer.or(installed_customizer.as_deref()) {
@@ -8151,10 +8611,9 @@ impl IdentityRuntime {
                     result = &mut customize => result,
                     changed = cancellation.changed() => {
                         if changed.is_ok() && *cancellation.borrow() {
-                            return Err(
-                                self.cancel_uninstalled_background_materialization(&grant)
-                                    .await,
-                            );
+                            return Err(IdentityRuntimeError::Internal(
+                                BACKGROUND_WARM_CANCELLED.to_string(),
+                            ));
                         }
                         customize.await
                     }
@@ -8163,24 +8622,11 @@ impl IdentityRuntime {
                 customize.await
             };
             if let Err(err) = customize_result {
-                let cleanup_error = self.release_uninstalled_materialize_lease(&grant).await;
-                // A refused artifact keeps its type through materialization.
+                // A refused artifact keeps its type through the wake.
                 if let super::types::CustomizerError::ToolArtifactRefused(refusal) = err {
-                    if let Some(cleanup_error) = cleanup_error {
-                        tracing::warn!(
-                            %cleanup_error,
-                            "lease cleanup after a refused callback artifact failed"
-                        );
-                    }
                     return Err(IdentityRuntimeError::ToolArtifactRefused(refusal));
                 }
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "customizer: {err}{}",
-                    cleanup_error
-                        .as_ref()
-                        .map(|e| format!("; lease cleanup failed: {e}"))
-                        .unwrap_or_default(),
-                )));
+                return Err(IdentityRuntimeError::Internal(format!("customizer: {err}")));
             }
             customized = true;
         }
@@ -8188,737 +8634,206 @@ impl IdentityRuntime {
             self.publish_customizer_tools(identity, &mut draft).await;
         }
 
-        #[cfg(feature = "extension-state")]
-        let extension_publication = match self
-            .bridge
-            .as_ref()
-            .map(|bridge| bridge.begin_extension_identity_publication(identity))
-            .transpose()
-        {
-            Ok(publication) => publication.flatten(),
-            Err(error) => {
-                let cleanup = self.release_uninstalled_materialize_lease(&grant).await;
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "identity publication preparation: {error}{}",
-                    cleanup
-                        .map(|error| format!("; lease cleanup failed: {error}"))
-                        .unwrap_or_default()
-                )));
-            }
-        };
-
-        let mut abandoned_session_registrations: Vec<SessionId> = Vec::new();
-        let mut resumed = false;
-        let mut record = if let Some(mut record) = continuity {
-            let resume_snapshot = if self
-                .bridge
-                .as_ref()
-                .is_none_or(|bridge| bridge.requires_resume_snapshot())
-            {
-                match self
-                    .continuity_store
-                    .load_session_snapshot(&record.session_id)
-                    .await
-                {
-                    Ok(snapshot) => snapshot,
-                    Err(err) => {
-                        let cleanup_error =
-                            self.release_uninstalled_materialize_lease(&grant).await;
-                        return Err(IdentityRuntimeError::Internal(format!(
-                            "load session snapshot before materialize: {err}{}",
-                            cleanup_error
-                                .as_ref()
-                                .map(|e| format!("; lease cleanup failed: {e}"))
-                                .unwrap_or_default(),
-                        )));
-                    }
-                }
-            } else {
-                None
-            };
-
-            if let Some(bridge) = self.bridge.as_ref() {
-                if let Err(err) = bridge
-                    .register_session_runtime_state(
-                        &record.session_id,
-                        identity,
-                        record.generation,
-                        record.checkpoint_version,
-                        grant.fencing_token,
-                    )
-                    .await
-                {
-                    let unregister_error = Self::unregister_bridge_session_runtime_states(
-                        bridge.as_ref(),
-                        std::slice::from_ref(&record.session_id),
-                    )
-                    .await;
-                    let cleanup_error = self.release_uninstalled_materialize_lease(&grant).await;
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "bridge register_session_runtime_state: {err}{}{}",
-                        unregister_error
-                            .as_ref()
-                            .map(|e| format!("; unregister session failed: {e}"))
-                            .unwrap_or_default(),
-                        cleanup_error
-                            .as_ref()
-                            .map(|e| format!("; lease cleanup failed: {e}"))
-                            .unwrap_or_default(),
-                    )));
-                }
-                let registered_session_id = record.session_id.clone();
-                let empty_snapshot = SessionSnapshot { data: Vec::new() };
-                let snapshot = resume_snapshot.as_ref().unwrap_or(&empty_snapshot);
-                let outcome = bridge
-                    .resume_session(
-                        identity,
-                        &record.agent_runtime_id,
-                        &spec,
-                        &draft,
-                        &record.session_id,
-                        snapshot,
-                    )
-                    .await;
-                // An attach that reconciled custody is NOT yet resumed. Register
-                // the owning identity from THIS record - the only authoritative
-                // source of the generation, checkpoint version and fencing token
-                // - before anything can commit a runtime boundary. Without it a
-                // head-canonical session reaches the continuity adapter with an
-                // unregistered owner and is correctly refused, far from here.
-                //
-                // Registration failure leaves a retryable pending state: no
-                // retire, no replacement, and never a Resumed report.
-                let outcome = match outcome {
-                    Ok(
-                        outcome
-                        @ super::bridge::ResumeSessionOutcome::AttachedPendingRegistration {
-                            ..
-                        },
-                    ) => {
-                        self.complete_attach_postcondition(
-                            outcome,
-                            identity,
-                            &record,
-                            grant.fencing_token,
-                        )
-                        .await?
-                    }
-                    Ok(outcome) => outcome,
-                    Err(err) => {
-                        // A rejected resume must NEVER abandon the durable
-                        // session (the transcript is the only copy). Keep the
-                        // identity → session binding intact — no retire, no
-                        // continuity rebind — mark the identity Broken with
-                        // the error attached so this send fails loudly, and
-                        // let the next reconcile retry the resume. Unregister
-                        // only the session-runtime-state bookkeeping (it is
-                        // re-registered on retry).
-                        tracing::error!(
-                            %identity,
-                            session_id = %registered_session_id,
-                            error = %err,
-                            "materialize resume rejected; marking identity Broken and preserving \
-                             the durable session for reconcile retry"
-                        );
-                        let unregister_error = Self::unregister_bridge_session_runtime_states(
-                            bridge.as_ref(),
-                            std::slice::from_ref(&registered_session_id),
-                        )
-                        .await;
-                        let lease_cleanup_error =
-                            self.release_uninstalled_materialize_lease(&grant).await;
-                        {
-                            let mut entries = self.entries.write().await;
-                            if let Some(entry) = entries.get_mut(identity) {
-                                entry.state = IdentityLifecycleState::Broken;
-                                entry.lease = None;
-                            }
-                        }
-                        self.emit_event(
-                            identity,
-                            IdentityEvent::StateChanged {
-                                identity: identity.clone(),
-                                new_state: IdentityLifecycleState::Broken,
-                            },
-                        )
-                        .await;
-                        if let Some(reason) = deterministic_build_rejection_reason(&err) {
-                            self.mark_host_rejected_build_park(identity, reason).await;
-                        }
-                        // Repair honesty (production rehearsal): the typed
-                        // ArchivedNotRevivable refusal is a stable,
-                        // deterministic wall - record the terminal verdict on
-                        // this FIRST refusal so the repair supervisor parks
-                        // instead of heal-looping (the roster heal succeeds,
-                        // this materialize precondition never does).
-                        if let BridgeError::ResumeRejected {
-                            kind: ResumeRejectionKind::ArchivedNotRevivable,
-                            detail,
-                        } = &err
-                            && !self
-                                .mark_continuity_unrecoverable(
-                                    identity,
-                                    archived_not_revivable_park_reason(
-                                        &registered_session_id,
-                                        detail,
-                                    ),
-                                )
-                                .await
-                        {
-                            tracing::debug!(
-                                %identity,
-                                "identity left Broken before the archived-not-revivable \
-                                 park could be recorded"
-                            );
-                        }
-                        // The audited-endpoint divergence is the same shape
-                        // of wall with a different exit: the operator's
-                        // sanctioned repair, then reload_member. Record the
-                        // typed hold with the exact commands on this FIRST
-                        // refusal so nothing retries against it.
-                        if let BridgeError::ResumeRejected {
-                            kind: ResumeRejectionKind::AuditedEndpointDivergence,
-                            detail,
-                        } = &err
-                            && !self
-                                .mark_session_repair_required(
-                                    identity,
-                                    registered_session_id.clone(),
-                                    detail.clone(),
-                                )
-                                .await
-                        {
-                            tracing::debug!(
-                                %identity,
-                                "identity left Broken before the session repair hold could \
-                                 be recorded"
-                            );
-                        }
-                        let detail = format!(
-                            "bridge resume_session rejected (identity degraded, durable session \
-                             preserved for reconcile retry): {err}{}{}",
-                            unregister_error
-                                .as_ref()
-                                .map(|e| format!("; unregister session failed: {e}"))
-                                .unwrap_or_default(),
-                            lease_cleanup_error
-                                .as_ref()
-                                .map(|e| format!("; lease cleanup failed: {e}"))
-                                .unwrap_or_default(),
-                        );
-                        let kind = match &err {
-                            BridgeError::ResumeRejected {
-                                kind: ResumeRejectionKind::ArchivedNotRevivable,
-                                ..
-                            } => ContinuityFailureKind::CheckpointUnrecoverable,
-                            BridgeError::ResumeRejected {
-                                kind: ResumeRejectionKind::AuditedEndpointDivergence,
-                                ..
-                            } => ContinuityFailureKind::RepairRequired,
-                            BridgeError::ResumeRejected {
-                                kind: ResumeRejectionKind::RoleMigrationNotApplied,
-                                ..
-                            } => ContinuityFailureKind::RoleMigrationNotApplied,
-                            _ => ContinuityFailureKind::ResumeRejected,
-                        };
-                        // A refused declared role migration kept the restored
-                        // member on purpose. Park it on this FIRST refusal, with
-                        // this exact detail, so no later pass retires that
-                        // member to re-ask the same question.
-                        if kind == ContinuityFailureKind::RoleMigrationNotApplied {
-                            self.mark_role_migration_refusal(identity, detail.clone(), &record)
-                                .await;
-                        }
-                        return Err(IdentityRuntimeError::EmbodimentRejected(Box::new(
-                            ContinuityFailure {
-                                identity: identity.clone(),
-                                kind,
-                                record: Some(record.clone()),
-                                detail,
-                            },
-                        )));
-                    }
-                };
-                resumed = outcome.fallback_reason().is_none();
-                if let Some(reason) = outcome.fallback_reason().cloned() {
-                    tracing::warn!(
-                        %identity,
-                        reason = ?reason,
-                        "lazy identity materialization fresh-spawned after typed resume fallback"
-                    );
-                    self.emit_event(
-                        identity,
-                        IdentityEvent::ResumeFallback {
-                            identity: identity.clone(),
-                            reason,
-                        },
-                    )
-                    .await;
-                }
-                let effective_session_id = outcome.session_id().clone();
-                if effective_session_id != registered_session_id {
-                    // §8.4 trigger (b): the resume fallback abandoned the
-                    // registered session — harvest it detached (materialize
-                    // is a hot path; the session store read stays valid).
-                    if let Some(injector) = self.agent_memory.read().await.as_ref() {
-                        let abandoned_key = registered_session_id.to_string();
-                        injector.note_session_generation(
-                            identity,
-                            &abandoned_key,
-                            record.generation.get(),
-                        );
-                        injector.spawn_rotation_distillation(
-                            identity,
-                            &abandoned_key,
-                            crate::memory::distiller::DistillCause::ResumeFallback,
-                        );
-                    }
-                    abandoned_session_registrations.push(registered_session_id);
-                }
-                record.session_id = effective_session_id;
-            } else {
-                resumed = resume_snapshot.is_some();
-            }
-            record
-        } else {
-            let new_runtime_id =
-                AgentRuntimeId::parse(&format!("rt:{identity}:0")).map_err(|err| {
-                    IdentityRuntimeError::Internal(format!("failed to mint runtime id: {err}"))
-                })?;
-            let mut record = ContinuityRecord {
-                identity: identity.clone(),
-                agent_runtime_id: new_runtime_id,
-                session_id: meerkat_core::types::SessionId::new(),
-                generation: ContinuityGeneration::new(0),
-                checkpoint_version: CheckpointVersion::new(0),
-            };
-            if let Err(err) = self
-                .continuity_store
-                .upsert_continuity_record(&record, grant.fencing_token)
+        let mut resumed = None;
+        let mut replaced_session = None;
+        if let Some((session_id, resume_from_role)) = resume {
+            match bridge
+                .resume_session(
+                    identity,
+                    &spec,
+                    &draft,
+                    &session_id,
+                    resume_from_role.as_ref(),
+                )
                 .await
             {
-                let cleanup_error = self.release_uninstalled_materialize_lease(&grant).await;
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "continuity upsert before materialize create: {err}{}",
-                    cleanup_error
-                        .as_ref()
-                        .map(|e| format!("; lease cleanup failed: {e}"))
-                        .unwrap_or_default(),
-                )));
-            }
-            if let Some(bridge) = self.bridge.as_ref() {
-                let provisional_session_id = record.session_id.clone();
-                if let Err(err) = bridge
-                    .register_session_runtime_state(
-                        &record.session_id,
-                        identity,
-                        record.generation,
-                        record.checkpoint_version,
-                        grant.fencing_token,
-                    )
-                    .await
-                    .map_err(|err| {
-                        IdentityRuntimeError::Internal(format!(
-                            "bridge register_session_runtime_state: {err}"
-                        ))
-                    })
-                {
-                    let unregister_error = Self::unregister_bridge_session_runtime_states(
-                        bridge.as_ref(),
-                        std::slice::from_ref(&provisional_session_id),
-                    )
-                    .await;
-                    let delete_error = self
-                        .continuity_store
-                        .delete_continuity_record(identity, grant.fencing_token)
-                        .await
-                        .err();
-                    let cleanup_error = self.release_uninstalled_materialize_lease(&grant).await;
-                    if let Some(delete_error) = delete_error {
-                        return Err(IdentityRuntimeError::Internal(format!(
-                            "{err}{}; tentative continuity cleanup failed: {delete_error}{}",
-                            unregister_error
-                                .as_ref()
-                                .map(|e| format!("; unregister session failed: {e}"))
-                                .unwrap_or_default(),
-                            cleanup_error
-                                .as_ref()
-                                .map(|e| format!("; lease cleanup failed: {e}"))
-                                .unwrap_or_default(),
-                        )));
-                    }
-                    if let Some(cleanup_error) = cleanup_error {
-                        return Err(IdentityRuntimeError::Internal(format!(
-                            "{err}{}; lease cleanup failed: {cleanup_error}",
-                            unregister_error
-                                .as_ref()
-                                .map(|e| format!("; unregister session failed: {e}"))
-                                .unwrap_or_default(),
-                        )));
-                    }
-                    if let Some(unregister_error) = unregister_error {
-                        return Err(IdentityRuntimeError::Internal(format!(
-                            "{err}; unregister session failed: {unregister_error}"
-                        )));
-                    }
-                    return Err(err);
-                }
-                let held_pass = self.held_create_pass().filter(|pass| pass.covers(identity));
-                let created_session_id = match held_pass {
-                    Some(pass) => {
-                        bridge
-                            .create_session_held(
-                                identity,
-                                &record.agent_runtime_id,
-                                &spec,
-                                &draft,
-                                &record.session_id,
-                                &pass,
-                            )
-                            .await
-                    }
-                    None => {
-                        bridge
-                            .create_session(
-                                identity,
-                                &record.agent_runtime_id,
-                                &spec,
-                                &draft,
-                                &record.session_id,
-                            )
-                            .await
-                    }
-                };
-                let created_session_id = match created_session_id {
-                    Ok(session_id) => Ok(session_id),
-                    // Typed on the FIRST attempt: the park is recorded and the
-                    // caller receives the same `HostRejectedBuild` a later
-                    // attempt fails fast with, so an in-band materialize (a
-                    // console send to a Dormant identity) surfaces the reason,
-                    // not `Internal` prose that happens to contain it.
-                    Err(err) => match deterministic_build_rejection_reason(&err) {
-                        Some(reason) => {
-                            self.mark_host_rejected_build_park(identity, reason.clone())
-                                .await;
-                            Err(IdentityRuntimeError::HostRejectedBuild {
+                Ok(outcome) => {
+                    if let Some(reason) = outcome.fallback_reason() {
+                        // Not for a first-boot row: Core's session state was
+                        // read first. Should Core's resume still have started
+                        // a fresh session, the row is refused, never settled.
+                        if first_boot_resume.is_some() {
+                            return Err(IdentityRuntimeError::FirstBootRowRefused {
                                 identity: identity.clone(),
-                                reason,
-                            })
+                                kind: FirstBootRowKind::Resume,
+                                manifest_session: session_id.clone(),
+                                core_session: Some(outcome.session_id().clone()),
+                                detail: format!(
+                                    "Core's resume started session {} in place of the row's \
+                                     session ({reason:?})",
+                                    outcome.session_id()
+                                ),
+                            });
                         }
-                        None => Err(IdentityRuntimeError::Internal(format!(
-                            "bridge create_session: {err}"
-                        ))),
-                    },
-                };
-                match created_session_id {
-                    Ok(session_id) => {
-                        if session_id != provisional_session_id {
-                            abandoned_session_registrations.push(provisional_session_id);
-                        }
-                        record.session_id = session_id;
-                    }
-                    Err(err) => {
-                        let unregister_error = Self::unregister_bridge_session_runtime_states(
-                            bridge.as_ref(),
-                            std::slice::from_ref(&provisional_session_id),
-                        )
-                        .await;
-                        let cleanup_error =
-                            bridge.retire_member(&record.agent_runtime_id).await.err();
-                        let delete_error = self
-                            .continuity_store
-                            .delete_continuity_record(identity, grant.fencing_token)
-                            .await
-                            .err();
-                        let lease_cleanup_error =
-                            self.release_uninstalled_materialize_lease(&grant).await;
-                        if unregister_error.is_some()
-                            || cleanup_error.is_some()
-                            || delete_error.is_some()
-                            || lease_cleanup_error.is_some()
-                        {
+                        // Only Core's own answer that it holds no durable
+                        // copy (never persisted) may replace a session. Any
+                        // other fallback would turn a session that exists
+                        // into a silent fresh spawn: refused typed, nothing
+                        // recorded.
+                        if !matches!(
+                            reason,
+                            super::bridge::ResumeFallbackReason::NeverPersisted { .. }
+                        ) {
                             return Err(IdentityRuntimeError::Internal(format!(
-                                "{err}{}{}{}{}",
-                                unregister_error
-                                    .as_ref()
-                                    .map(|e| format!("; unregister session failed: {e}"))
-                                    .unwrap_or_default(),
-                                cleanup_error
-                                    .as_ref()
-                                    .map(|e| format!("; cleanup retire failed: {e}"))
-                                    .unwrap_or_default(),
-                                delete_error
-                                    .as_ref()
-                                    .map(|e| format!("; tentative continuity cleanup failed: {e}"))
-                                    .unwrap_or_default(),
-                                lease_cleanup_error
-                                    .as_ref()
-                                    .map(|e| format!("; lease cleanup failed: {e}"))
-                                    .unwrap_or_default(),
+                                "identity {identity}: the bridge started session {} in place \
+                                 of session {session_id} for a reason other than Core's \
+                                 absent answer ({reason:?}); a session that exists is never \
+                                 replaced",
+                                outcome.session_id()
                             )));
                         }
-                        return Err(err);
+                        tracing::warn!(
+                            %identity,
+                            %session_id,
+                            reason = ?reason,
+                            "identity wake fresh-spawned after a typed resume fallback"
+                        );
+                        replaced_session = Some(session_id.clone());
+                    }
+                    resumed = Some((
+                        super::bridge::MemberRuntimeBinding {
+                            agent_runtime_id: outcome.agent_runtime_id().clone(),
+                            session_id: Some(outcome.session_id().clone()),
+                        },
+                        outcome.fallback_reason().is_none(),
+                    ));
+                }
+                // A first-boot `Resume` row names a session the migration
+                // carried into Core. Core holding none for it means Core's
+                // session store is not the migrated one: refused typed,
+                // never a fresh spawn.
+                Err(error) if first_boot_resume.is_some() && resume_refused_absent(&error) => {
+                    return Err(IdentityRuntimeError::FirstBootRowRefused {
+                        identity: identity.clone(),
+                        kind: FirstBootRowKind::Resume,
+                        manifest_session: session_id.clone(),
+                        core_session: None,
+                        detail: format!("Core holds no durable session {session_id} ({error})"),
+                    });
+                }
+                // Core holds no durable session for that id, so it was
+                // never persisted and there is nothing to lose: spawn fresh.
+                // The replaced session rides the outcome (A3), not just a log.
+                Err(error) if resume_refused_absent(&error) => {
+                    tracing::warn!(
+                        %identity,
+                        %session_id,
+                        "Core holds no durable session for the identity's last session; the \
+                         wake spawns a fresh one"
+                    );
+                    replaced_session = Some(session_id.clone());
+                }
+                // An untyped refusal on a runtime whose sessions live in
+                // memory only: the session was never persisted and went with
+                // its retired member, so the Absent rule above applies.
+                Err(error)
+                    if resume_refused_untyped(&error)
+                        && matches!(
+                            bridge.session_outlives_member(&session_id).await,
+                            Ok(false)
+                        ) =>
+                {
+                    tracing::warn!(
+                        %identity,
+                        %session_id,
+                        %error,
+                        "the runtime keeps sessions in memory only, so the identity's last \
+                         session went with its retired member; the wake spawns a fresh one"
+                    );
+                    replaced_session = Some(session_id.clone());
+                }
+                Err(error) => {
+                    return Err(classify_wake_failure(identity, Some(&session_id), error));
+                }
+            }
+        }
+        let (binding, resumed) = match resumed {
+            Some(resumed) => resumed,
+            None => {
+                // Nothing was resumed (no binding to resume, or Core holds
+                // no durable session for it), so this creates the member:
+                // the same reservation applies.
+                refuse_runtime_plane_creation(identity)?;
+                let held_pass = self.held_create_pass().filter(|pass| pass.covers(identity));
+                let created = match held_pass {
+                    Some(pass) => {
+                        bridge
+                            .create_session_held(identity, &spec, &draft, &pass)
+                            .await
+                    }
+                    None => bridge.create_session(identity, &spec, &draft).await,
+                };
+                match created {
+                    Ok(binding) => (binding, false),
+                    // Typed on every attempt, never recorded: the
+                    // host's build gate answers each wake again.
+                    Err(error) => {
+                        return Err(match deterministic_build_rejection_reason(&error) {
+                            Some(reason) => IdentityRuntimeError::HostRejectedBuild {
+                                identity: identity.clone(),
+                                reason,
+                            },
+                            None => IdentityRuntimeError::Internal(format!(
+                                "bridge create_session: {error}"
+                            )),
+                        });
                     }
                 }
             }
-            record
         };
-
-        if let Err(err) = self
-            .continuity_store
-            .upsert_continuity_record(&record, grant.fencing_token)
-            .await
-        {
-            let unregister_error = if let Some(bridge) = self.bridge.as_ref() {
-                let mut sessions_to_unregister = abandoned_session_registrations.clone();
-                sessions_to_unregister.push(record.session_id.clone());
-                Self::unregister_bridge_session_runtime_states(
-                    bridge.as_ref(),
-                    &sessions_to_unregister,
-                )
-                .await
-            } else {
-                None
-            };
-            let cleanup_error = if let Some(bridge) = self.bridge.as_ref() {
-                bridge.retire_member(&record.agent_runtime_id).await.err()
-            } else {
-                None
-            };
-            let restore_error = self
-                .restore_continuity_after_materialize_failure(
-                    identity,
-                    original_continuity.as_ref(),
-                    &grant,
-                )
-                .await;
-            let lease_cleanup_error = self.release_uninstalled_materialize_lease(&grant).await;
-            if unregister_error.is_some()
-                || cleanup_error.is_some()
-                || restore_error.is_some()
-                || lease_cleanup_error.is_some()
-            {
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "continuity upsert after materialize: {err}{}{}{}{}",
-                    unregister_error
-                        .as_ref()
-                        .map(|e| format!("; unregister session failed: {e}"))
-                        .unwrap_or_default(),
-                    cleanup_error
-                        .as_ref()
-                        .map(|e| format!("; cleanup retire failed: {e}"))
-                        .unwrap_or_default(),
-                    restore_error
-                        .as_ref()
-                        .map(|e| format!("; continuity rollback failed: {e}"))
-                        .unwrap_or_default(),
-                    lease_cleanup_error
-                        .as_ref()
-                        .map(|e| format!("; lease cleanup failed: {e}"))
-                        .unwrap_or_default(),
-                )));
-            }
-            return Err(IdentityRuntimeError::Internal(format!(
-                "continuity upsert after materialize: {err}"
-            )));
-        }
-        if let Some(bridge) = self.bridge.as_ref() {
-            let register_result = bridge
-                .register_session_runtime_state(
-                    &record.session_id,
-                    identity,
-                    record.generation,
-                    record.checkpoint_version,
-                    grant.fencing_token,
-                )
-                .await;
-            let effective_checkpoint_version = match register_result {
-                Ok(version) => version,
-                Err(err) => {
-                    let mut sessions_to_unregister = abandoned_session_registrations.clone();
-                    sessions_to_unregister.push(record.session_id.clone());
-                    let unregister_error = Self::unregister_bridge_session_runtime_states(
-                        bridge.as_ref(),
-                        &sessions_to_unregister,
-                    )
-                    .await;
-                    let cleanup_error = bridge.retire_member(&record.agent_runtime_id).await.err();
-                    let restore_error = self
-                        .restore_continuity_after_materialize_failure(
-                            identity,
-                            original_continuity.as_ref(),
-                            &grant,
-                        )
-                        .await;
-                    let lease_cleanup_error =
-                        self.release_uninstalled_materialize_lease(&grant).await;
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "bridge register actual session runtime state: {err}{}{}{}{}",
-                        unregister_error
-                            .as_ref()
-                            .map(|e| format!("; unregister session failed: {e}"))
-                            .unwrap_or_default(),
-                        cleanup_error
-                            .as_ref()
-                            .map(|e| format!("; cleanup retire failed: {e}"))
-                            .unwrap_or_default(),
-                        restore_error
-                            .as_ref()
-                            .map(|e| format!("; continuity rollback failed: {e}"))
-                            .unwrap_or_default(),
-                        lease_cleanup_error
-                            .as_ref()
-                            .map(|e| format!("; lease cleanup failed: {e}"))
-                            .unwrap_or_default(),
-                    )));
-                }
-            };
-            record.checkpoint_version = effective_checkpoint_version;
-            if let Some(err) = Self::unregister_bridge_session_runtime_states(
-                bridge.as_ref(),
-                &abandoned_session_registrations,
-            )
-            .await
-            {
-                let actual_unregister_error = Self::unregister_bridge_session_runtime_states(
-                    bridge.as_ref(),
-                    std::slice::from_ref(&record.session_id),
-                )
-                .await;
-                let unregister_error = actual_unregister_error
-                    .map(|actual_err| format!("{err}; actual session: {actual_err}"))
-                    .unwrap_or(err);
-                let cleanup_error = bridge.retire_member(&record.agent_runtime_id).await.err();
-                let restore_error = self
-                    .restore_continuity_after_materialize_failure(
-                        identity,
-                        original_continuity.as_ref(),
-                        &grant,
-                    )
-                    .await;
-                let lease_cleanup_error = self.release_uninstalled_materialize_lease(&grant).await;
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "bridge unregister abandoned session runtime state: {unregister_error}{}{}{}",
-                    cleanup_error
-                        .as_ref()
-                        .map(|e| format!("; cleanup retire failed: {e}"))
-                        .unwrap_or_default(),
-                    restore_error
-                        .as_ref()
-                        .map(|e| format!("; continuity rollback failed: {e}"))
-                        .unwrap_or_default(),
-                    lease_cleanup_error
-                        .as_ref()
-                        .map(|e| format!("; lease cleanup failed: {e}"))
-                        .unwrap_or_default(),
-                )));
-            }
-        }
-
-        {
-            let mut entries = self.entries.write().await;
-            let entry = entries
-                .get_mut(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            entry.continuity = Some(record.clone());
-            entry.lease = Some(Self::lease_entry_from_grant(&grant));
-            entry.state = IdentityLifecycleState::Active;
-            entry.checkpoint_version = record.checkpoint_version;
-            // A successful embodiment supersedes any refused one.
-            entry.role_migration_refusal = None;
-        }
-        self.emit_event(
-            identity,
-            IdentityEvent::StateChanged {
-                identity: identity.clone(),
-                new_state: IdentityLifecycleState::Active,
-            },
-        )
-        .await;
-        self.clear_materialization_backoff(identity).await;
-        #[cfg(feature = "extension-state")]
-        if let Some(publication) = extension_publication {
-            publication.publish();
+        if first_boot_resume.is_some() {
+            self.settle_first_boot_row(identity).await;
         }
         Ok(EmbodimentOutcome {
             already_active: false,
-            record,
+            binding,
             resumed,
             draft,
+            replaced_session,
         })
     }
 
-    /// Project one member-attributable embodiment failure into the durable
-    /// identity runtime without turning it into a fleet-level bootstrap
-    /// failure. The returned payload is the exact typed outcome installed by
-    /// eager restore. Pass-level roster, topology, and batch-store failures do
-    /// not enter this door.
-    pub(crate) async fn park_embodiment_failure(
-        &self,
-        identity: &AgentIdentity,
-        error: &IdentityRuntimeError,
-    ) -> ContinuityFailure {
-        let explicit_failure = match error {
-            IdentityRuntimeError::EmbodimentRejected(failure) => Some((**failure).clone()),
-            _ => None,
-        };
-        let (record, transitioned) = {
-            let mut entries = self.entries.write().await;
-            let record = entries
-                .get(identity)
-                .and_then(|entry| entry.continuity.clone());
-            let mut transitioned = false;
-            if let Some(entry) = entries.get_mut(identity) {
-                transitioned = entry.state != IdentityLifecycleState::Broken;
-                entry.state = IdentityLifecycleState::Broken;
-            }
-            (record, transitioned)
-        };
-        if transitioned {
-            self.emit_event(
-                identity,
-                IdentityEvent::StateChanged {
-                    identity: identity.clone(),
-                    new_state: IdentityLifecycleState::Broken,
-                },
-            )
-            .await;
+    /// The build draft a spec starts from before any customizer runs.
+    pub(crate) fn base_build_draft(spec: &DurableAgentSpec) -> AgentBuildDraft {
+        AgentBuildDraft {
+            model: None,
+            system_prompt: None,
+            additional_instructions: spec.additional_instructions.clone(),
+            labels: spec.labels.clone(),
+            app_context: spec.context.clone(),
+            external_tools: Vec::new(),
+            local_external_tools: Default::default(),
+            provider_params: None,
+            compaction_curator: Default::default(),
         }
-
-        explicit_failure.unwrap_or_else(|| ContinuityFailure {
-            identity: identity.clone(),
-            kind: match error {
-                IdentityRuntimeError::Store(_) => ContinuityFailureKind::StoreUnavailable,
-                _ => ContinuityFailureKind::EmbodimentFailed,
-            },
-            record,
-            detail: error.to_string(),
-        })
     }
 
-    /// A retired identity (`Retiring`, the terminal form left by
-    /// `retire_locked`) is revived ONLY by an operation addressed to it
-    /// (`send`, `dispatch`, `materialize`, `reload_member`). Indirect hydration
-    /// (a peer hand-off's `materialize_reachable_peers`, fleet
-    /// `materialize_all`, the background warm) must not silently bring a
-    /// retired member back; it is refused typed exactly as before #404 so the
-    /// initiator's cycle completes without the retired peer.
+    /// A retired identity (Core's last binding is Retired and Core holds no
+    /// member) is revived ONLY by an operation addressed to it (`send`,
+    /// `dispatch`, `materialize`, `reload_member`) or by the eager boot
+    /// compile. Indirect hydration (a peer hand-off's
+    /// `materialize_reachable_peers`, fleet `materialize_all`, the background
+    /// warm) must not silently bring a retired member back; it is refused
+    /// typed so the initiator's cycle completes without the retired peer. A
+    /// failed history read refuses too, typed: indirect hydration never
+    /// guesses.
     async fn retired_terminal_refusal(
         &self,
         identity: &AgentIdentity,
         operation: &'static str,
     ) -> Option<IdentityRuntimeError> {
-        let state = self
-            .entries
-            .read()
-            .await
-            .get(identity)
-            .map(|entry| entry.state)?;
-        (state == IdentityLifecycleState::Retiring).then(|| IdentityRuntimeError::InvalidState {
-            identity: identity.clone(),
-            state,
-            operation,
-        })
+        self.bridge.as_ref()?;
+        match self.core_last_binding(identity).await {
+            Ok(Some(binding)) if binding.state() == meerkat_mob::MemberBindingState::Retired => {
+                Some(IdentityRuntimeError::InvalidState {
+                    identity: identity.clone(),
+                    state: IdentityLifecycleState::Dormant,
+                    operation,
+                })
+            }
+            Ok(_) => None,
+            Err(error) => Some(error),
+        }
     }
 
     async fn best_effort_materialize_identity(
@@ -8926,7 +8841,7 @@ impl IdentityRuntime {
         identity: AgentIdentity,
         initiator: Option<&AgentIdentity>,
         operation: &'static str,
-    ) -> Option<ContinuityRecord> {
+    ) -> Option<meerkat_mob::MemberDeliveryScope> {
         let attempt_lock = self.best_effort_materialization_lock_for(&identity).await;
         let _attempt_guard = attempt_lock.lock().await;
 
@@ -8957,9 +8872,9 @@ impl IdentityRuntime {
         }
 
         match self.materialize(&identity).await {
-            Ok(record) => {
+            Ok(scope) => {
                 self.clear_materialization_backoff(&identity).await;
-                Some(record)
+                scope
             }
             Err(err) => {
                 tracing::warn!(
@@ -8981,10 +8896,8 @@ impl IdentityRuntime {
         &self,
     ) -> Vec<(
         AgentIdentity,
-        Result<ContinuityRecord, IdentityRuntimeError>,
+        Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError>,
     )> {
-        // One embodiment burst (see [`Self::enter_embodiment_burst`]).
-        let _burst = self.enter_embodiment_burst();
         let identities = self.registered_identities().await;
         stream::iter(identities.into_iter().map(|identity| async move {
             let result = self.materialize(&identity).await;
@@ -8995,14 +8908,15 @@ impl IdentityRuntime {
         .await
     }
 
-    /// Materialize all identities currently registered with the runtime.
+    /// Wake all identities currently registered with the runtime, returning
+    /// Core's delivery scope of each session-backed member woken.
     ///
     /// Fleet hydration is best-effort: one member that cannot build is skipped
     /// and surfaced through logs/error hooks rather than aborting unrelated
     /// members.
-    pub async fn materialize_all(&self) -> Result<Vec<ContinuityRecord>, IdentityRuntimeError> {
-        // One embodiment burst (see [`Self::enter_embodiment_burst`]).
-        let _burst = self.enter_embodiment_burst();
+    pub async fn materialize_all(
+        &self,
+    ) -> Result<Vec<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         let identities = self.registered_identities().await;
         let records = stream::iter(identities.into_iter().map(|identity| async move {
             self.best_effort_materialize_identity(identity, None, "materialize_all")
@@ -9031,14 +8945,14 @@ impl IdentityRuntime {
     /// with a partially materialized identity-first fleet.
     pub async fn materialize_all_required(
         &self,
-    ) -> Result<Vec<ContinuityRecord>, IdentityRuntimeError> {
+    ) -> Result<Vec<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         let results = self.materialize_all_records().await;
         let mut records = Vec::with_capacity(results.len());
         let mut failures = Vec::new();
 
         for (identity, result) in results {
             match result {
-                Ok(record) => records.push(record),
+                Ok(scope) => records.extend(scope),
                 Err(err) => failures.push(format!("{identity}: {err}")),
             }
         }
@@ -9065,7 +8979,7 @@ impl IdentityRuntime {
     /// none.
     pub(crate) async fn materialize_all_required_for_entered_flow(
         self: &Arc<Self>,
-    ) -> Result<Vec<ContinuityRecord>, IdentityRuntimeError> {
+    ) -> Result<Vec<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         let runtime = Arc::clone(self);
         self.run_tracked_foreground_with(ForegroundOwnerSource::Carried(None), async move {
             runtime.materialize_all_required().await
@@ -9076,7 +8990,7 @@ impl IdentityRuntime {
     /// Cancellation-safe strict fleet hydration for flow/request boundaries.
     pub async fn materialize_all_required_tracked(
         self: &Arc<Self>,
-    ) -> Result<Vec<ContinuityRecord>, IdentityRuntimeError> {
+    ) -> Result<Vec<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         let runtime = Arc::clone(self);
         self.run_tracked_foreground(async move { runtime.materialize_all_required().await })
             .await
@@ -9087,7 +9001,7 @@ impl IdentityRuntime {
     pub async fn materialize_reachable_peers(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<Vec<ContinuityRecord>, IdentityRuntimeError> {
+    ) -> Result<Vec<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         let peers = self.reachable_peer_identities(identity).await;
         let records = stream::iter(peers.into_iter().map(|peer| async move {
             self.best_effort_materialize_identity(
@@ -9117,7 +9031,7 @@ impl IdentityRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // Subscribe — REQ-06
+    // Subscribe - REQ-06
     // -----------------------------------------------------------------------
 
     /// Subscribe to identity-scoped events.
@@ -9158,156 +9072,6 @@ impl IdentityRuntime {
         Ok(())
     }
 
-    /// Release every exact provider grant retained by a Broken entry. The
-    /// caller owns this identity's lifecycle lock.
-    ///
-    /// Most failed lower-plane transitions already park authority in
-    /// `pending_lease_release`, but rollback of an originally Active entry can
-    /// deliberately retain its current grant in `lease` while projecting
-    /// Broken. Move that live grant into pending state before the provider await
-    /// so cancellation, a provider failure, and shutdown all retain the exact
-    /// fencing token. A failed release aborts reconcile before lazy registration
-    /// can overwrite the entry or restore can reacquire authority.
-    async fn release_broken_lease_locked(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Result<bool, IdentityRuntimeError> {
-        let pending = {
-            let mut entries = self.entries.write().await;
-            let entry = entries
-                .get(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            if entry.state != IdentityLifecycleState::Broken {
-                return Ok(false);
-            }
-
-            let existing_pending = entry.pending_lease_release.clone();
-            let retained_lease = entry.lease.as_ref().map(|lease| LeaseGrant {
-                identity: identity.clone(),
-                fencing_token: lease.fencing_token,
-                ttl: lease.ttl,
-            });
-            if let (Some(pending), Some(retained)) =
-                (existing_pending.as_ref(), retained_lease.as_ref())
-                && pending.fencing_token != retained.fencing_token
-            {
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "Broken identity {identity} retained conflicting fencing tokens {} and {}",
-                    pending.fencing_token, retained.fencing_token
-                )));
-            }
-
-            let grant = existing_pending.or(retained_lease);
-            if let Some(grant) = grant.as_ref() {
-                let entry = entries
-                    .get_mut(identity)
-                    .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-                entry.lease = None;
-                entry.pending_lease_release = Some(grant.clone());
-            }
-            grant
-        };
-        let Some(grant) = pending else {
-            return Ok(false);
-        };
-
-        if let Err(error) = self
-            .lease_provider
-            .release_leases(std::slice::from_ref(&grant))
-            .await
-        {
-            self.mark_bootstrap_from_lifecycle(
-                identity,
-                IdentityLifecycleState::Broken,
-                Some(format!("pending lease release retry: {error}")),
-            );
-            return Err(IdentityRuntimeError::Lease(error));
-        }
-
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(identity)
-            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-        match entry.pending_lease_release.as_ref() {
-            Some(current) if current.fencing_token == grant.fencing_token => {
-                entry.pending_lease_release = None;
-            }
-            Some(current) => {
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "pending lease release for {identity} changed from fencing token {} to {} under lifecycle authority",
-                    grant.fencing_token, current.fencing_token
-                )));
-            }
-            None => {
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "pending lease release for {identity} disappeared under lifecycle authority"
-                )));
-            }
-        }
-        Ok(true)
-    }
-
-    /// Prepare an existing Broken entry for metadata replacement while the
-    /// caller owns its lifecycle lock. The concrete member is disposed before
-    /// the exact retained provider grant is moved through the pending-release
-    /// ledger. A failure leaves the entry Broken and the authority visible for
-    /// retry or shutdown.
-    pub(crate) async fn prepare_broken_identity_for_registration(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Result<(), IdentityRuntimeError> {
-        self.cleanup_broken_lower_plane_locked(identity).await?;
-        self.release_broken_lease_locked(identity).await?;
-        Ok(())
-    }
-
-    /// Dispose the concrete member and its session-store authority retained by
-    /// a continuity-backed Broken entry. Lease loss is fail-closed at the
-    /// identity plane, but it cannot synchronously remove the lower member;
-    /// every roster reconcile that will reproject the Broken entry must do so
-    /// before abandoning or reusing the runtime alias. The real bridge treats
-    /// an already-retired member as success, and session unregister is
-    /// idempotent, making retries safe when a later exact-grant cleanup step
-    /// fails.
-    ///
-    /// This deliberately does not mutate `lease` or `pending_lease_release`:
-    /// provider authority is an independent exact-token cleanup obligation.
-    async fn cleanup_broken_lower_plane_locked(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Result<(), IdentityRuntimeError> {
-        let continuity = {
-            let entries = self.entries.read().await;
-            let entry = entries
-                .get(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            (entry.state == IdentityLifecycleState::Broken)
-                .then(|| entry.continuity.clone())
-                .flatten()
-        };
-        let (Some(bridge), Some(record)) = (self.bridge.as_ref(), continuity) else {
-            return Ok(());
-        };
-
-        let retire_error = bridge.retire_member(&record.agent_runtime_id).await.err();
-        let unregister_error = bridge
-            .unregister_session_runtime_state(&record.session_id)
-            .await
-            .err();
-        match (retire_error, unregister_error) {
-            (None, None) => Ok(()),
-            (retire_error, unregister_error) => Err(IdentityRuntimeError::Internal(format!(
-                "cleanup Broken lower-plane state for {identity}{}{}",
-                retire_error
-                    .map(|error| format!("; retire member: {error}"))
-                    .unwrap_or_default(),
-                unregister_error
-                    .map(|error| format!("; unregister session: {error}"))
-                    .unwrap_or_default()
-            ))),
-        }
-    }
-
     async fn accept_bootstrap_spec_locked(
         &self,
         spec: DurableAgentSpec,
@@ -9345,6 +9109,14 @@ impl IdentityRuntime {
     /// Internal deterministic seam used by concurrency regressions. The hook
     /// runs with each identity's lifecycle lock held and before the entry is
     /// inspected or mutated.
+    ///
+    /// The roster compile's member half: an identity the roster no
+    /// longer lists is retired on Core (Core keeps its history) and dropped
+    /// here; a profile change retires the live member so the next wake
+    /// resumes it under the new profile, declaring the role migration only
+    /// when the host did; any other spec change is a metadata hot
+    /// reload. Host-adopted identities are read-only: the compile never
+    /// retires one.
     async fn reconcile_roster_members_after_lifecycle_lock<H, F>(
         &self,
         roster: &[DurableAgentSpec],
@@ -9369,148 +9141,185 @@ impl IdentityRuntime {
             let lifecycle_lock = self.lifecycle_lock_for(identity).await;
             let _lifecycle_guard = lifecycle_lock.lock().await;
             after_lifecycle_lock(identity).await;
-            self.cleanup_broken_lower_plane_locked(identity).await?;
-            self.release_broken_lease_locked(identity).await?;
-            let state = self
-                .entries
-                .read()
-                .await
-                .get(identity)
-                .map(|entry| entry.state);
-            let Some(state) = state else {
+            if !self.entries.read().await.contains_key(identity) {
                 continue;
-            };
-            match state {
-                IdentityLifecycleState::Active => {
-                    self.retire_locked(identity).await?;
-                }
-                // `Retiring` here is the RETIRED terminal form: `retire_locked`
-                // leaves the entry in it after the mob member is gone and the
-                // lease released, and every lifecycle mutation (including this
-                // one) runs under the identity's lifecycle lock, so the
-                // in-transaction form is never observable from this arm. There
-                // is no live member left to retire; removal is the same
-                // bookkeeping as for a Dormant entry. Refusing it is how a
-                // retired identity got stuck for every later roster reconcile
-                // (meerkat-meta #404, a 2026-09-05 production incident).
-                IdentityLifecycleState::Dormant
-                | IdentityLifecycleState::Broken
-                | IdentityLifecycleState::Uninitialized
-                | IdentityLifecycleState::Retiring => {
-                    let lease = self
-                        .entries
-                        .read()
-                        .await
-                        .get(identity)
-                        .and_then(|entry| entry.lease.as_ref())
-                        .map(|lease| LeaseGrant {
-                            identity: identity.clone(),
-                            fencing_token: lease.fencing_token,
-                            ttl: lease.ttl,
-                        });
-                    if let Some(lease) = lease {
-                        self.lease_provider
-                            .release_leases(std::slice::from_ref(&lease))
-                            .await
-                            .map_err(IdentityRuntimeError::Lease)?;
-                    }
-                }
-                IdentityLifecycleState::Suspended => {
-                    return Err(IdentityRuntimeError::InvalidState {
-                        identity: identity.clone(),
-                        state,
-                        operation: "reconcile_roster_remove",
-                    });
-                }
             }
+            self.retire_unlisted_locked(identity).await?;
             self.event_channels.write().await.remove(identity);
             self.entries.write().await.remove(identity);
+        }
+
+        // A live Core member Meta spawned (marked
+        // `SpawnContinuityIntent::DurableIdentity`) that the roster no longer
+        // lists is retired too, even when this process never registered it:
+        // the roster dropped it while Meta was down.
+        for identity in self.core_unlisted_durable_members(&desired).await? {
+            let lifecycle_lock = self.lifecycle_lock_for(&identity).await;
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            after_lifecycle_lock(&identity).await;
+            if self.entries.read().await.contains_key(&identity) {
+                continue;
+            }
+            self.retire_unlisted_locked(&identity).await?;
+        }
+
+        // A live member Meta 0.9.3 spawned carries no marker, only the
+        // identity-first label; one the roster no longer lists is retired
+        // the same way. The label only ever retires, never grants.
+        for identity in self.core_unlisted_labelled_members(&desired).await {
+            let lifecycle_lock = self.lifecycle_lock_for(&identity).await;
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            after_lifecycle_lock(&identity).await;
+            if self.entries.read().await.contains_key(&identity) {
+                continue;
+            }
+            if let Err(error) = self.retire_unlisted_locked(&identity).await {
+                tracing::warn!(
+                    %identity,
+                    %error,
+                    "retiring a labelled member the roster no longer lists failed; the next \
+                     roster pass tries it again"
+                );
+            }
         }
 
         for (identity, desired_spec) in desired {
             let lifecycle_lock = self.lifecycle_lock_for(&identity).await;
             let _lifecycle_guard = lifecycle_lock.lock().await;
             after_lifecycle_lock(&identity).await;
-            // Initial bootstrap reaches this loop before lazy/eager restore has
-            // registered the desired identities. Pending-release recovery only
-            // applies to an existing lifecycle entry.
-            if !self.entries.read().await.contains_key(&identity) {
-                continue;
-            }
-            let reconciling_broken_entry = {
-                let entries = self.entries.read().await;
-                entries.get(&identity).is_some_and(|entry| {
-                    entry.state == IdentityLifecycleState::Broken
-                        // The lower plane of a refused role migration is the
-                        // live member the refusal kept. Retiring it here is
-                        // the destructive step the refusal exists to prevent,
-                        // so it stays while the desired spec is the one the
-                        // declaration was refused against.
-                        && role_migration_refusal_for(entry, &desired_spec).is_none()
-                })
-            };
-            if reconciling_broken_entry {
-                self.cleanup_broken_lower_plane_locked(&identity).await?;
-            }
-            // This runs before the same-spec fast path. A failed retire may
-            // leave the desired metadata unchanged while the physical member
-            // is already gone and its exact provider grant is still held.
-            self.release_broken_lease_locked(&identity).await?;
-            let current = self
+            // Initial bootstrap reaches this loop before the restore pass has
+            // registered the desired identities.
+            let current_spec = self
                 .entries
                 .read()
                 .await
                 .get(&identity)
-                .map(|entry| (entry.spec.clone(), entry.state));
-            let Some((current_spec, state)) = current else {
+                .map(|entry| entry.spec.clone());
+            let Some(current_spec) = current_spec else {
                 continue;
             };
-            if current_spec == desired_spec {
-                self.accept_bootstrap_spec_locked(desired_spec, generation)
-                    .await?;
-                continue;
-            }
-            // A retired (`Retiring`) entry has no live member: a profile change
-            // is adopted like on a Dormant entry and takes effect on the next
-            // materialization. Only a mid-transaction `Suspended` refuses.
-            if state == IdentityLifecycleState::Suspended {
-                return Err(IdentityRuntimeError::InvalidState {
-                    identity,
-                    state,
-                    operation: "reconcile_roster_replace",
-                });
-            }
             // REQ-33 and `compute_reconcile_actions` classify every
             // same-profile change (addressability, labels, display name,
-            // context, and instructions) as a metadata hot reload. Retiring
-            // an Active member here needlessly rotates its exact grant and can
-            // collide with a still-draining session during eager restore.
-            if current_spec.profile == desired_spec.profile {
+            // context, and instructions) as a metadata hot reload: the live
+            // member stays.
+            if current_spec == desired_spec || current_spec.profile == desired_spec.profile {
                 self.accept_bootstrap_spec_locked(desired_spec, generation)
                     .await?;
                 continue;
             }
-            match state {
-                IdentityLifecycleState::Active => {
-                    self.retire_locked(&identity).await?;
-                }
-                IdentityLifecycleState::Dormant
-                | IdentityLifecycleState::Broken
-                | IdentityLifecycleState::Uninitialized
-                | IdentityLifecycleState::Retiring => {}
-                IdentityLifecycleState::Suspended => {
-                    return Err(IdentityRuntimeError::InvalidState {
-                        identity,
-                        state,
-                        operation: "reconcile_roster_replace",
-                    });
-                }
+            // A reprofile retires the live member; the next wake resumes it
+            // under the new profile (with the role migration declared
+            // only when the host declared it, otherwise refused typed).
+            if self.compile_may_act_on(&identity).await?
+                && self.core_live_member(&identity).await?.is_some()
+            {
+                self.retire_locked(&identity).await?;
             }
             self.accept_bootstrap_spec_locked(desired_spec, generation)
                 .await?;
         }
 
         Ok(())
+    }
+
+    /// Whether the roster compile may change `identity`'s Core member: only
+    /// a command-driven identity. A host-adopted identity, or one whose
+    /// intent row Core cannot read, is read-only and never retired by
+    /// the compile.
+    async fn compile_may_act_on(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<bool, IdentityRuntimeError> {
+        if self.bridge.is_none() {
+            return Ok(false);
+        }
+        Ok(matches!(
+            self.core_identity_management(identity).await?,
+            meerkat_mob::MemberIdentityManagement::CommandDriven
+        ))
+    }
+
+    /// Retire an identity the roster no longer lists, under its lifecycle
+    /// lock: Core's live member retires and Core keeps its history. Nothing
+    /// to do when Core holds no live member or the identity is read-only to
+    /// the compile.
+    async fn retire_unlisted_locked(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<(), IdentityRuntimeError> {
+        if !self.compile_may_act_on(identity).await? {
+            return Ok(());
+        }
+        if self.core_live_member(identity).await?.is_none() {
+            return Ok(());
+        }
+        self.retire_locked(identity).await
+    }
+
+    /// Identities of Core's live Meta-marked members that the
+    /// roster does not list.
+    async fn core_unlisted_durable_members(
+        &self,
+        desired: &BTreeMap<AgentIdentity, DurableAgentSpec>,
+    ) -> Result<Vec<AgentIdentity>, IdentityRuntimeError> {
+        let Some(bridge) = self.bridge.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let members = bridge.durable_identity_members().await.map_err(|error| {
+            IdentityRuntimeError::Internal(format!(
+                "the roster compile could not read Core's durable identity members: {error}"
+            ))
+        })?;
+        let mut unlisted = Vec::new();
+        for binding in members.iter().filter(|binding| binding.is_live()) {
+            let durable = crate::member_comms_id::durable_identity_for_roster_member(
+                binding.identity().as_str(),
+            );
+            let identity = AgentIdentity::parse(&durable).map_err(|error| {
+                IdentityRuntimeError::Internal(format!(
+                    "Core's durable identity member '{durable}' is not a valid identity: {error}"
+                ))
+            })?;
+            if !desired.contains_key(&identity) {
+                unlisted.push(identity);
+            }
+        }
+        Ok(unlisted)
+    }
+
+    /// Identities of Core's members that carry the identity-first label
+    /// naming the identity their member id encodes and that the roster does
+    /// not list. A failed read lists none: the next roster pass reads again.
+    async fn core_unlisted_labelled_members(
+        &self,
+        desired: &BTreeMap<AgentIdentity, DurableAgentSpec>,
+    ) -> Vec<AgentIdentity> {
+        let Some(bridge) = self.bridge.as_ref() else {
+            return Vec::new();
+        };
+        let members = match bridge.identity_labelled_members().await {
+            Ok(members) => members,
+            // A bridge without the read shows no such members.
+            Err(BridgeError::Unsupported { .. }) => return Vec::new(),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the roster pass could not read Core's identity-labelled members; none is \
+                     retired, and the next pass reads them again"
+                );
+                return Vec::new();
+            }
+        };
+        members
+            .iter()
+            .filter_map(|member| {
+                AgentIdentity::parse(&crate::member_comms_id::durable_identity_for_roster_member(
+                    member.as_str(),
+                ))
+                .ok()
+            })
+            .filter(|identity| !desired.contains_key(identity))
+            .collect()
     }
 
     /// Adopt the roster's CURRENT spec for `identity` into the in-memory entry,
@@ -9584,62 +9393,6 @@ impl IdentityRuntime {
         Ok(())
     }
 
-    /// Update the lease for an identity.
-    pub async fn update_lease(
-        &self,
-        identity: &AgentIdentity,
-        grant: LeaseGrant,
-    ) -> Result<(), IdentityRuntimeError> {
-        let fencing_token = grant.fencing_token;
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(identity)
-            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-        entry.lease = Some(LeaseEntry {
-            fencing_token,
-            ttl: grant.ttl,
-            acquired_at: Instant::now(),
-        });
-        drop(entries);
-        self.lease_renewal_notify.notify_one();
-        self.emit_event(
-            identity,
-            IdentityEvent::LeaseUpdated {
-                identity: identity.clone(),
-                fencing_token,
-            },
-        )
-        .await;
-        Ok(())
-    }
-
-    /// Mark a lease as lost for an identity (INV-02).
-    pub async fn mark_lease_lost(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Result<(), IdentityRuntimeError> {
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(identity)
-            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-        entry.state = IdentityLifecycleState::Broken;
-        entry.lease = None;
-        drop(entries);
-        self.mark_bootstrap_from_lifecycle(
-            identity,
-            IdentityLifecycleState::Broken,
-            Some("external lease authority was lost".to_string()),
-        );
-        self.emit_event(
-            identity,
-            IdentityEvent::LeaseLost {
-                identity: identity.clone(),
-            },
-        )
-        .await;
-        Ok(())
-    }
-
     /// Test only: drops an identity's entry and event channel without
     /// recording anything, the way a concurrent durable delete leaves the
     /// table. Outside tests an identity leaves only through its recorded
@@ -9653,900 +9406,26 @@ impl IdentityRuntime {
         self.entries.write().await.remove(identity)
     }
 
-    /// Set the lifecycle state for an identity.
-    pub async fn set_state(
-        &self,
-        identity: &AgentIdentity,
-        state: IdentityLifecycleState,
-    ) -> Result<(), IdentityRuntimeError> {
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(identity)
-            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-        entry.state = state;
-        drop(entries);
-        if state == IdentityLifecycleState::Active {
-            self.lease_renewal_notify.notify_one();
-        }
-        self.emit_event(
-            identity,
-            IdentityEvent::StateChanged {
-                identity: identity.clone(),
-                new_state: state,
-            },
-        )
-        .await;
-        Ok(())
-    }
-
-    /// Fail the exact active embodiment when its live session has been torn
-    /// down underneath the identity layer. A stale close notification from a
-    /// replaced generation is ignored, while the current embodiment becomes
-    /// `Broken` so the existing continuity repair supervisor can rebuild it.
-    pub(crate) async fn mark_active_runtime_broken(
-        &self,
-        identity: &AgentIdentity,
-        expected_runtime_id: &str,
-        expected_fencing_token: u64,
-        detail: &str,
-    ) -> Result<bool, IdentityRuntimeError> {
-        let lifecycle_lock = self.lifecycle_lock_for(identity).await;
-        let _lifecycle_guard = lifecycle_lock.lock().await;
-        let changed = {
-            let mut entries = self.entries.write().await;
-            let entry = entries
-                .get_mut(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            let is_current_active = entry.state == IdentityLifecycleState::Active
-                && entry
-                    .continuity
-                    .as_ref()
-                    .is_some_and(|record| record.agent_runtime_id.as_str() == expected_runtime_id)
-                && entry
-                    .lease
-                    .as_ref()
-                    .is_some_and(|lease| lease.fencing_token.get() == expected_fencing_token);
-            if is_current_active {
-                // Retain the exact live lease. Broken repair owns lower-plane
-                // cleanup and releases that grant before rematerializing.
-                entry.state = IdentityLifecycleState::Broken;
-            }
-            is_current_active
-        };
-        if changed {
-            self.mark_bootstrap_from_lifecycle(
-                identity,
-                IdentityLifecycleState::Broken,
-                Some(detail.to_string()),
-            );
-            self.emit_event(
-                identity,
-                IdentityEvent::StateChanged {
-                    identity: identity.clone(),
-                    new_state: IdentityLifecycleState::Broken,
-                },
-            )
-            .await;
-        }
-        Ok(changed)
+    /// A member's agent event stream closed for good (its executor is gone).
+    /// Meta repairs nothing: Core still holds the member, and the next
+    /// wake or delivery revives it through Core (`ensure_member_live`). The
+    /// completion waiters are woken so they re-read Core's fence now rather
+    /// than at their deadline.
+    pub(crate) fn note_member_stream_closed(&self, identity: &AgentIdentity, detail: &str) {
+        tracing::info!(
+            %identity,
+            detail,
+            "member event stream closed; Core revives the member on its next wake or delivery"
+        );
+        self.entries.notify();
     }
 
     // -----------------------------------------------------------------------
     // Lease checking (INV-01, INV-02)
     // -----------------------------------------------------------------------
 
-    /// Check that the identity has an active, non-expired lease.
-    /// Returns the fencing token if valid.
-    fn check_lease(entry: &IdentityEntry) -> Result<FencingToken, IdentityRuntimeError> {
-        match &entry.lease {
-            Some(lease) if !lease.is_expired() => Ok(lease.fencing_token),
-            Some(_) => Err(IdentityRuntimeError::LeaseLost(entry.spec.identity.clone())),
-            None => Err(IdentityRuntimeError::NoActiveLease(
-                entry.spec.identity.clone(),
-            )),
-        }
-    }
-
-    fn lease_entry_from_grant(grant: &LeaseGrant) -> LeaseEntry {
-        LeaseEntry {
-            fencing_token: grant.fencing_token,
-            ttl: grant.ttl,
-            acquired_at: Instant::now(),
-        }
-    }
-
-    /// Transfer a provider-returned active grant into runtime ownership before
-    /// any fallible continuity or bridge projection. The provider call is the
-    /// authority commit: once it returns, retaining only the previous token is
-    /// unsafe because exact-token release would become a no-op.
-    async fn stage_active_grant(
-        &self,
-        identity: &AgentIdentity,
-        expected_previous: Option<FencingToken>,
-        grant: &LeaseGrant,
-    ) -> Result<Option<ContinuityRecord>, IdentityRuntimeError> {
-        let staged = {
-            let mut entries = self.entries.write().await;
-            (|| {
-                if grant.identity != *identity {
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "provider returned grant for {} while publishing active authority for {identity}",
-                        grant.identity
-                    )));
-                }
-                let entry = entries
-                    .get_mut(identity)
-                    .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-                if entry.state != IdentityLifecycleState::Active {
-                    return Err(IdentityRuntimeError::InvalidState {
-                        identity: identity.clone(),
-                        state: entry.state,
-                        operation: "stage_active_grant",
-                    });
-                }
-                let current = entry
-                    .lease
-                    .as_ref()
-                    .ok_or_else(|| IdentityRuntimeError::NoActiveLease(identity.clone()))?;
-                if let Some(expected) = expected_previous
-                    && current.fencing_token != expected
-                {
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "active lease for {identity} changed from fencing token {expected} to {} before renewed authority could be staged",
-                        current.fencing_token
-                    )));
-                }
-                if let Some(pending) = entry.pending_lease_release.as_ref() {
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "active identity {identity} already has pending fencing token {} while staging {}",
-                        pending.fencing_token, grant.fencing_token
-                    )));
-                }
-
-                let continuity = entry.continuity.clone();
-                // Broken + pending is the fail-closed intermediate state.
-                // The lifecycle lock prevents another operation from
-                // observing it as a completed transition, while a dropped
-                // caller still leaves repair/shutdown an exact token.
-                entry.state = IdentityLifecycleState::Broken;
-                entry.lease = None;
-                entry.pending_lease_release = Some(grant.clone());
-                Ok(continuity)
-            })()
-        };
-
-        match staged {
-            Ok(continuity) => Ok(continuity),
-            Err(error) => {
-                if let Err(cleanup_error) = self
-                    .release_or_park_untracked_leases(std::slice::from_ref(grant))
-                    .await
-                {
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "{error}; exact grant cleanup failed: {cleanup_error}"
-                    )));
-                }
-                Err(error)
-            }
-        }
-    }
-
-    async fn fail_staged_active_grant(
-        &self,
-        identity: &AgentIdentity,
-        grant: &LeaseGrant,
-        detail: String,
-    ) {
-        let retained_by_entry = {
-            let mut entries = self.entries.write().await;
-            entries.get_mut(identity).is_some_and(|entry| {
-                if entry
-                    .pending_lease_release
-                    .as_ref()
-                    .is_some_and(|pending| pending.fencing_token == grant.fencing_token)
-                {
-                    entry.state = IdentityLifecycleState::Broken;
-                    entry.lease = None;
-                    true
-                } else {
-                    false
-                }
-            })
-        };
-        if !retained_by_entry {
-            self.park_unactivated_lease_releases(std::slice::from_ref(grant))
-                .await;
-        }
-        self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Broken, Some(detail));
-        self.emit_event(
-            identity,
-            IdentityEvent::StateChanged {
-                identity: identity.clone(),
-                new_state: IdentityLifecycleState::Broken,
-            },
-        )
-        .await;
-    }
-
-    async fn suspend_bridge_continuity(
-        &self,
-        continuity: Option<&ContinuityRecord>,
-    ) -> Result<(), IdentityRuntimeError> {
-        let (Some(bridge), Some(record)) = (self.bridge.as_ref(), continuity) else {
-            return Ok(());
-        };
-        bridge
-            .suspend_session_runtime_state(&record.session_id)
-            .await
-            .map_err(|error| {
-                IdentityRuntimeError::Internal(format!(
-                    "suspend bridge session runtime state before authority rotation: {error}"
-                ))
-            })
-    }
-
-    async fn resume_bridge_continuity(
-        &self,
-        identity: &AgentIdentity,
-        continuity: Option<&ContinuityRecord>,
-        grant: &LeaseGrant,
-    ) -> Result<(), IdentityRuntimeError> {
-        let (Some(bridge), Some(record)) = (self.bridge.as_ref(), continuity) else {
-            return Ok(());
-        };
-        bridge
-            .register_session_runtime_state(
-                &record.session_id,
-                identity,
-                record.generation,
-                record.checkpoint_version,
-                grant.fencing_token,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| {
-                IdentityRuntimeError::Internal(format!(
-                    "resume bridge session runtime state after pre-commit renewal failure: {error}"
-                ))
-            })
-    }
-
-    async fn break_existing_active_grant(
-        &self,
-        identity: &AgentIdentity,
-        grant: &LeaseGrant,
-        detail: String,
-    ) {
-        let retained = {
-            let mut entries = self.entries.write().await;
-            entries.get_mut(identity).is_some_and(|entry| {
-                if entry
-                    .lease
-                    .as_ref()
-                    .is_some_and(|lease| lease.fencing_token == grant.fencing_token)
-                {
-                    entry.state = IdentityLifecycleState::Broken;
-                    entry.lease = None;
-                    entry.pending_lease_release = Some(grant.clone());
-                    true
-                } else {
-                    false
-                }
-            })
-        };
-        if !retained {
-            self.park_unactivated_lease_releases(std::slice::from_ref(grant))
-                .await;
-        }
-        self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Broken, Some(detail));
-        self.emit_event(
-            identity,
-            IdentityEvent::StateChanged {
-                identity: identity.clone(),
-                new_state: IdentityLifecycleState::Broken,
-            },
-        )
-        .await;
-    }
-
-    async fn commit_staged_active_grant(
-        &self,
-        identity: &AgentIdentity,
-        grant: &LeaseGrant,
-        continuity: Option<ContinuityRecord>,
-    ) -> Result<(), IdentityRuntimeError> {
-        let committed = {
-            let mut entries = self.entries.write().await;
-            match entries.get_mut(identity) {
-                Some(entry)
-                    if entry
-                        .pending_lease_release
-                        .as_ref()
-                        .is_some_and(|pending| pending.fencing_token == grant.fencing_token) =>
-                {
-                    if let Some(record) = continuity {
-                        entry.checkpoint_version = record.checkpoint_version;
-                        entry.continuity = Some(record);
-                    }
-                    entry.pending_lease_release = None;
-                    entry.lease = Some(Self::lease_entry_from_grant(grant));
-                    entry.state = IdentityLifecycleState::Active;
-                    entry.role_migration_refusal = None;
-                    Ok(())
-                }
-                Some(entry) => Err(IdentityRuntimeError::Internal(format!(
-                    "staged fencing token {} for {identity} was replaced before commit (state {:?})",
-                    grant.fencing_token, entry.state
-                ))),
-                None => Err(IdentityRuntimeError::UnknownIdentity(identity.clone())),
-            }
-        };
-        if let Err(error) = committed {
-            self.park_unactivated_lease_releases(std::slice::from_ref(grant))
-                .await;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    async fn publish_active_grant(
-        &self,
-        identity: &AgentIdentity,
-        expected_previous: Option<FencingToken>,
-        grant: &LeaseGrant,
-    ) -> Result<FencingToken, IdentityRuntimeError> {
-        let mut continuity = self
-            .stage_active_grant(identity, expected_previous, grant)
-            .await?;
-
-        // `ensure_active_lease` suspends before invoking the provider so no
-        // stale-token save can overlap the authority rotation. Keep this
-        // idempotent suspension here as a defensive boundary for callers that
-        // already hold a provider-returned active grant (restore compatibility).
-        if let Err(error) = self.suspend_bridge_continuity(continuity.as_ref()).await {
-            self.fail_staged_active_grant(identity, grant, error.to_string())
-                .await;
-            return Err(error);
-        }
-
-        if let Some(record) = continuity.as_mut() {
-            if let Err(error) = self
-                .continuity_store
-                .upsert_continuity_record(record, grant.fencing_token)
-                .await
-            {
-                let runtime_error = IdentityRuntimeError::Store(error);
-                self.fail_staged_active_grant(
-                    identity,
-                    grant,
-                    format!("active grant continuity publication failed: {runtime_error}"),
-                )
-                .await;
-                return Err(runtime_error);
-            }
-            if let Some(bridge) = self.bridge.as_ref() {
-                match bridge
-                    .register_session_runtime_state(
-                        &record.session_id,
-                        identity,
-                        record.generation,
-                        record.checkpoint_version,
-                        grant.fencing_token,
-                    )
-                    .await
-                {
-                    Ok(version) => {
-                        record.checkpoint_version = CheckpointVersion::new(
-                            record.checkpoint_version.get().max(version.get()),
-                        );
-                    }
-                    Err(error) => {
-                        let runtime_error = IdentityRuntimeError::Internal(format!(
-                            "bridge refresh session runtime state after active grant publication: {error}"
-                        ));
-                        let _ = self.suspend_bridge_continuity(Some(record)).await;
-                        self.fail_staged_active_grant(identity, grant, runtime_error.to_string())
-                            .await;
-                        return Err(runtime_error);
-                    }
-                }
-            }
-        }
-
-        let session_to_reference = continuity.as_ref().map(|record| record.session_id.clone());
-        if let Err(error) = self
-            .commit_staged_active_grant(identity, grant, continuity)
-            .await
-        {
-            if let (Some(bridge), Some(session_id)) =
-                (self.bridge.as_ref(), session_to_reference.as_ref())
-            {
-                let _ = bridge.suspend_session_runtime_state(session_id).await;
-            }
-            return Err(error);
-        }
-        self.lease_renewal_notify.notify_one();
-        self.emit_event(
-            identity,
-            IdentityEvent::LeaseUpdated {
-                identity: identity.clone(),
-                fencing_token: grant.fencing_token,
-            },
-        )
-        .await;
-        Ok(grant.fencing_token)
-    }
-
-    async fn ensure_active_lease(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Result<FencingToken, IdentityRuntimeError> {
-        let (grant, continuity) = {
-            let entries = self.entries.read().await;
-            let entry = entries
-                .get(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            let lease = match &entry.lease {
-                Some(lease) if lease.is_healthy() => return Ok(lease.fencing_token),
-                Some(lease) => lease,
-                None => return Err(IdentityRuntimeError::NoActiveLease(identity.clone())),
-            };
-            (
-                LeaseGrant {
-                    identity: identity.clone(),
-                    fencing_token: lease.fencing_token,
-                    ttl: lease.ttl,
-                },
-                entry.continuity.clone(),
-            )
-        };
-
-        // Drain every already-admitted persistence mutation before asking the
-        // provider to rotate N to N+1. Once this returns, all session-store
-        // mutations fail closed until register_session_runtime_state publishes
-        // the exact replacement token.
-        if let Err(suspend_error) = self.suspend_bridge_continuity(continuity.as_ref()).await {
-            if let Err(resume_error) = self
-                .resume_bridge_continuity(identity, continuity.as_ref(), &grant)
-                .await
-            {
-                self.break_existing_active_grant(
-                    identity,
-                    &grant,
-                    format!("{suspend_error}; bridge rollback failed: {resume_error}"),
-                )
-                .await;
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "{suspend_error}; bridge rollback failed: {resume_error}"
-                )));
-            }
-            return Err(suspend_error);
-        }
-
-        let renewed = match self
-            .lease_provider
-            .renew_leases(std::slice::from_ref(&grant))
-            .await
-        {
-            Ok(renewed) => renewed,
-            Err(error) => {
-                let runtime_error = IdentityRuntimeError::Lease(error);
-                if let Err(resume_error) = self
-                    .resume_bridge_continuity(identity, continuity.as_ref(), &grant)
-                    .await
-                {
-                    self.break_existing_active_grant(
-                        identity,
-                        &grant,
-                        format!("{runtime_error}; bridge rollback failed: {resume_error}"),
-                    )
-                    .await;
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "{runtime_error}; bridge rollback failed: {resume_error}"
-                    )));
-                }
-                return Err(runtime_error);
-            }
-        };
-        let renewed_grant = match renewed.get(identity) {
-            Some(super::types::LeaseRenewResult::Renewed(grant)) => grant.clone(),
-            Some(super::types::LeaseRenewResult::Lost { .. }) | None => {
-                self.mark_lease_lost(identity).await?;
-                return Err(IdentityRuntimeError::LeaseLost(identity.clone()));
-            }
-        };
-
-        self.publish_active_grant(identity, Some(grant.fencing_token), &renewed_grant)
-            .await
-    }
-
-    async fn mark_lifecycle_in_progress(
-        &self,
-        identity: &AgentIdentity,
-        state: IdentityLifecycleState,
-    ) -> Result<IdentityEntry, IdentityRuntimeError> {
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(identity)
-            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-        let snapshot = entry.clone();
-        entry.state = state;
-        entry.lease = None;
-        drop(entries);
-        self.mark_bootstrap_materialization_started(identity, None);
-        Ok(snapshot)
-    }
-
-    async fn restore_entry(&self, identity: &AgentIdentity, entry: IdentityEntry) {
-        let state = entry.state;
-        self.entries.write().await.insert(identity.clone(), entry);
-        self.mark_bootstrap_from_lifecycle(identity, state, None);
-    }
-
-    async fn restore_entry_with_grant(
-        &self,
-        identity: &AgentIdentity,
-        mut entry: IdentityEntry,
-        grant: &LeaseGrant,
-    ) {
-        let restore_live_lease = entry.state == IdentityLifecycleState::Active;
-        if let Some(record) = entry.continuity.as_ref() {
-            if let Err(err) = self
-                .continuity_store
-                .upsert_continuity_record(record, grant.fencing_token)
-                .await
-            {
-                tracing::warn!(
-                    %identity,
-                    error = %err,
-                    "failed to advance restored continuity fencing token after lifecycle failure"
-                );
-                entry.state = IdentityLifecycleState::Broken;
-            } else if let Some(bridge) = self.bridge.as_ref()
-                && let Err(err) = bridge
-                    .register_session_runtime_state(
-                        &record.session_id,
-                        identity,
-                        record.generation,
-                        record.checkpoint_version,
-                        grant.fencing_token,
-                    )
-                    .await
-            {
-                tracing::warn!(
-                    %identity,
-                    error = %err,
-                    "failed to refresh restored session runtime state after lifecycle failure"
-                );
-                entry.state = IdentityLifecycleState::Broken;
-            }
-        }
-        // Preserve ownership for an originally Active entry even if bridge
-        // repair marks it Broken; repair still needs the current fenced
-        // grant. Originally non-Active entries must not retain a lease that
-        // their restored local state does not expose.
-        let retain_grant = restore_live_lease;
-        entry.lease = retain_grant.then(|| Self::lease_entry_from_grant(grant));
-        if !retain_grant {
-            entry.pending_lease_release = Some(grant.clone());
-            match self
-                .lease_provider
-                .release_leases(std::slice::from_ref(grant))
-                .await
-            {
-                Ok(()) => entry.pending_lease_release = None,
-                Err(err) => {
-                    tracing::warn!(
-                        %identity,
-                        error = %err,
-                        "failed to release lifecycle rollback lease for non-active identity; exact grant parked for retry"
-                    );
-                    entry.state = IdentityLifecycleState::Broken;
-                }
-            }
-        }
-        self.restore_entry(identity, entry).await;
-        if retain_grant {
-            self.lease_renewal_notify.notify_one();
-        }
-    }
-
-    /// Reuse an already-active embodiment during roster reconciliation.
-    ///
-    /// The lifecycle reservation held by the restore controller makes this
-    /// snapshot stable. Crucially, this path preserves the exact live lease
-    /// grant instead of reacquiring/rotating authority for a member that is
-    /// already running.
-    pub(crate) async fn reuse_active_restore_state(
-        &self,
-        spec: &DurableAgentSpec,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
-        // The restore controller still owns this identity's lifecycle guard,
-        // so validate time-sensitive external authority before snapshotting or
-        // mutating the local projection. Healthy grants return unchanged;
-        // due grants publish their exact renewal, and Lost authority marks the
-        // identity Broken instead of reporting a successful active reconcile.
-        self.ensure_active_lease(&spec.identity).await?;
-
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(&spec.identity)
-            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(spec.identity.clone()))?;
-        if entry.state != IdentityLifecycleState::Active {
-            return Err(IdentityRuntimeError::InvalidState {
-                identity: spec.identity.clone(),
-                state: entry.state,
-                operation: "reuse active restore state",
-            });
-        }
-        if entry.lease.is_none() {
-            return Err(IdentityRuntimeError::NoActiveLease(spec.identity.clone()));
-        }
-        let record = entry.continuity.clone().ok_or_else(|| {
-            IdentityRuntimeError::Internal(format!(
-                "active identity {} has no continuity record",
-                spec.identity
-            ))
-        })?;
-        entry.spec = spec.clone();
-        Ok(record)
-    }
-
-    /// Publish a fail-closed local state and relinquish the fresh external
-    /// grant acquired for the failed lifecycle transaction.
-    ///
-    /// These ambiguous failure paths deliberately publish Broken with no local
-    /// lease. Keeping the matching provider grant alive would make that
-    /// projection a lie and could block another runtime from repairing the
-    /// identity until the provider TTL expires (forever for the bundled
-    /// single-process provider).
-    async fn restore_broken_entry_and_release_grant(
-        &self,
-        identity: &AgentIdentity,
-        mut entry: IdentityEntry,
-        grant: &LeaseGrant,
-    ) {
-        entry.state = IdentityLifecycleState::Broken;
-        entry.lease = None;
-        // Park the exact grant before the provider call. If release fails (or
-        // this future is abandoned after publication), reconcile/shutdown can
-        // retry the same fencing token instead of leaving an invisible owner.
-        entry.pending_lease_release = Some(grant.clone());
-        self.restore_entry(identity, entry).await;
-        match self
-            .lease_provider
-            .release_leases(std::slice::from_ref(grant))
-            .await
-        {
-            Ok(()) => {
-                let mut entries = self.entries.write().await;
-                if let Some(entry) = entries.get_mut(identity)
-                    && entry
-                        .pending_lease_release
-                        .as_ref()
-                        .is_some_and(|pending| pending.fencing_token == grant.fencing_token)
-                {
-                    entry.pending_lease_release = None;
-                }
-            }
-            Err(err) => {
-                self.mark_bootstrap_from_lifecycle(
-                    identity,
-                    IdentityLifecycleState::Broken,
-                    Some(format!("pending lease release: {err}")),
-                );
-                tracing::warn!(
-                    %identity,
-                    error = %err,
-                    "failed to release lease after lifecycle transaction became Broken; exact grant parked for retry"
-                );
-            }
-        }
-    }
-
-    async fn restore_broken_entry_with_fenced_store(
-        &self,
-        identity: &AgentIdentity,
-        mut entry: IdentityEntry,
-        grant: &LeaseGrant,
-    ) {
-        entry.state = IdentityLifecycleState::Broken;
-        entry.lease = None;
-        if let Some(record) = entry.continuity.as_ref()
-            && let Err(err) = self
-                .continuity_store
-                .upsert_continuity_record(record, grant.fencing_token)
-                .await
-        {
-            tracing::warn!(
-                %identity,
-                error = %err,
-                "failed to preserve fenced continuity record for broken identity"
-            );
-        }
-        self.restore_broken_entry_and_release_grant(identity, entry, grant)
-            .await;
-    }
-
-    /// A failed reset rollback means the caller's pre-reset entry is no
-    /// longer authoritative. Re-resolve under the lifecycle transaction and
-    /// publish only the store's actual record; if the store itself cannot be
-    /// read, fail closed without continuity rather than claiming the old
-    /// generation still owns the durable row.
-    async fn restore_broken_entry_from_authoritative_continuity(
-        &self,
-        identity: &AgentIdentity,
-        mut entry: IdentityEntry,
-        grant: &LeaseGrant,
-    ) {
-        let authoritative = self
-            .continuity_store
-            .resolve_many(std::slice::from_ref(identity))
-            .await;
-        entry.continuity = match authoritative {
-            Ok(resolved) => match resolved.get(identity) {
-                Some(super::types::ContinuityResolveState::Ready { record }) => {
-                    Some(record.clone())
-                }
-                Some(super::types::ContinuityResolveState::Broken { failure }) => {
-                    failure.record.clone()
-                }
-                Some(super::types::ContinuityResolveState::Uninitialized) | None => None,
-            },
-            Err(error) => {
-                tracing::warn!(
-                    %identity,
-                    error = %error,
-                    "failed to resolve authoritative continuity after reset rollback failure"
-                );
-                None
-            }
-        };
-        entry.checkpoint_version = entry
-            .continuity
-            .as_ref()
-            .map(|record| record.checkpoint_version)
-            .unwrap_or(CheckpointVersion::new(0));
-        self.restore_broken_entry_and_release_grant(identity, entry, grant)
-            .await;
-    }
-
-    async fn mark_rebind_failure_broken(
-        &self,
-        identity: &AgentIdentity,
-        mut entry: IdentityEntry,
-        grant: &LeaseGrant,
-        rebound_record: &ContinuityRecord,
-    ) {
-        entry.state = IdentityLifecycleState::Broken;
-        entry.lease = None;
-        entry.checkpoint_version = rebound_record.checkpoint_version;
-        entry.continuity = Some(rebound_record.clone());
-        if let Err(err) = self
-            .continuity_store
-            .upsert_continuity_record(rebound_record, grant.fencing_token)
-            .await
-        {
-            tracing::warn!(
-                %identity,
-                session_id = %rebound_record.session_id,
-                error = %err,
-                "failed to preserve rebound continuity after live respawn rebind failure"
-            );
-        }
-        self.restore_broken_entry_and_release_grant(identity, entry, grant)
-            .await;
-    }
-
-    async fn restore_entry_after_reset_bridge_failure(
-        &self,
-        identity: &AgentIdentity,
-        expected_attempt: &ContinuityRecord,
-        entry: IdentityEntry,
-        grant: &LeaseGrant,
-        force_broken: bool,
-    ) -> Option<ContinuityStoreError> {
-        let rollback_error = self
-            .continuity_store
-            .rollback_continuity_record(
-                expected_attempt,
-                entry.continuity.as_ref(),
-                grant.fencing_token,
-            )
-            .await
-            .err();
-        if rollback_error.is_some() {
-            self.restore_broken_entry_from_authoritative_continuity(identity, entry, grant)
-                .await;
-        } else if force_broken {
-            self.restore_broken_entry_and_release_grant(identity, entry, grant)
-                .await;
-        } else {
-            self.restore_entry_with_grant(identity, entry, grant).await;
-        }
-        rollback_error
-    }
-
-    async fn restore_continuity_after_materialize_failure(
-        &self,
-        identity: &AgentIdentity,
-        previous: Option<&ContinuityRecord>,
-        grant: &LeaseGrant,
-    ) -> Option<ContinuityStoreError> {
-        match previous {
-            Some(record) => self
-                .continuity_store
-                .upsert_continuity_record(record, grant.fencing_token)
-                .await
-                .err(),
-            None => self
-                .continuity_store
-                .delete_continuity_record(identity, grant.fencing_token)
-                .await
-                .err(),
-        }
-    }
-
-    async fn unregister_bridge_session_runtime_states(
-        bridge: &dyn SessionBridge,
-        session_ids: &[SessionId],
-    ) -> Option<String> {
-        let mut errors = Vec::new();
-        let mut seen = BTreeSet::new();
-        for session_id in session_ids {
-            if !seen.insert(session_id.to_string()) {
-                continue;
-            }
-            if let Err(err) = bridge.unregister_session_runtime_state(session_id).await {
-                errors.push(format!("{session_id}: {err}"));
-            }
-        }
-        (!errors.is_empty()).then(|| errors.join("; "))
-    }
-
-    async fn advance_existing_continuity_fence(
-        &self,
-        identity: &AgentIdentity,
-        entry: &IdentityEntry,
-        grant: &LeaseGrant,
-    ) -> Result<(), IdentityRuntimeError> {
-        if let Some(record) = entry.continuity.as_ref() {
-            self.continuity_store
-                .upsert_continuity_record(record, grant.fencing_token)
-                .await
-                .map_err(IdentityRuntimeError::Store)?;
-        }
-        let _ = identity;
-        Ok(())
-    }
-
-    async fn refresh_existing_session_runtime_state(
-        &self,
-        identity: &AgentIdentity,
-        record: &ContinuityRecord,
-        grant: &LeaseGrant,
-    ) -> Result<CheckpointVersion, IdentityRuntimeError> {
-        let Some(bridge) = self.bridge.as_ref() else {
-            return Ok(record.checkpoint_version);
-        };
-        bridge
-            .register_session_runtime_state(
-                &record.session_id,
-                identity,
-                record.generation,
-                record.checkpoint_version,
-                grant.fencing_token,
-            )
-            .await
-            .map_err(|err| {
-                IdentityRuntimeError::Internal(format!(
-                    "bridge refresh session runtime state: {err}"
-                ))
-            })
-    }
-
     // -----------------------------------------------------------------------
-    // Delivery: send() — REQ-01, REQ-03
+    // Delivery: send() - REQ-01, REQ-03
     // -----------------------------------------------------------------------
 
     /// Send conversational content and return only after the runtime has
@@ -11004,7 +9883,7 @@ impl IdentityRuntime {
         IdentityRuntimeError,
     > {
         use super::bridge::{GovernedDoor, GovernedInputError};
-        let should_materialize = {
+        {
             let entries = self.entries.read().await;
             let entry = entries
                 .get(identity)
@@ -11019,14 +9898,9 @@ impl IdentityRuntime {
                     addressability: entry.spec.addressability,
                 }));
             }
-            matches!(
-                entry.state,
-                IdentityLifecycleState::Dormant
-                    | IdentityLifecycleState::Uninitialized
-                    | IdentityLifecycleState::Retiring
-            )
-        };
-        if should_materialize {
+        }
+        // Core holds no live member: wake it through the one wake door.
+        if self.core_live_member(identity).await?.is_none() {
             self.materialize_for_admission(identity, expected_alias, None)
                 .await?;
         }
@@ -11040,28 +9914,22 @@ impl IdentityRuntime {
         // the lifecycle lock this operation holds through native submission
         // and which every row writer takes: the binder checks the row the
         // input is admitted under.
-        let (runtime_id, session_id, spec) = {
-            let entries = self.entries.read().await;
-            let entry = entries
-                .get(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            if entry.state != IdentityLifecycleState::Active {
-                let operation = match door {
-                    GovernedDoor::External => "send",
-                    GovernedDoor::TrustedHostInternal => "dispatch",
-                };
-                return Err(self.refuse_inactive_delivery(identity, entry.state, operation));
-            }
-            (
-                entry
-                    .continuity
-                    .as_ref()
-                    .map(|c| c.agent_runtime_id.clone()),
-                entry.continuity.as_ref().map(|c| c.session_id.clone()),
-                entry.spec.clone(),
-            )
+        let spec = self
+            .entries
+            .read()
+            .await
+            .get(identity)
+            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?
+            .spec
+            .clone();
+        let operation = match door {
+            GovernedDoor::External => "send",
+            GovernedDoor::TrustedHostInternal => "dispatch",
         };
-        let token = self.ensure_active_lease(identity).await?;
+        let (live, scope) = self.live_delivery_target(identity, operation).await?;
+        let runtime_id = Some(live.agent_runtime_id);
+        let session_id = live.session_id;
+        let token = Self::scope_fence(scope.as_ref());
         let completion_baseline = self.credited_completion_cursor(identity, token).await;
         if durable_spec_uses_external_binding(&spec) {
             return Err(IdentityRuntimeError::GovernedInput(
@@ -11737,8 +10605,8 @@ impl IdentityRuntime {
     /// [`Self::send_with_mode`] with a host-minted interaction id (meerkat
     /// 0.7.25 ask 15 addendum). The id rides `WorkSpec` into runtime
     /// admission, so the turn's live events and its committed transcript
-    /// messages carry the same identity the console stamped on its frames —
-    /// the exact live↔history join the console dedup needs. Only UUID-form
+    /// messages carry the same identity the console stamped on its frames -
+    /// the exact live<->history join the console dedup needs. Only UUID-form
     /// ids thread; others are delivered without one.
     pub async fn send_with_mode_and_interaction(
         &self,
@@ -11829,7 +10697,7 @@ impl IdentityRuntime {
             console_human,
             expected_spec_digest,
         } = request;
-        let should_materialize = {
+        {
             let entries = self.entries.read().await;
             let entry = entries
                 .get(identity)
@@ -11842,17 +10710,11 @@ impl IdentityRuntime {
                     addressability: entry.spec.addressability,
                 }));
             }
-            // A retired identity (`Retiring`, the terminal form) is
-            // re-materialized onto its recorded session exactly like a Dormant
-            // one; this is the operator's "retire then send" recovery path.
-            matches!(
-                entry.state,
-                IdentityLifecycleState::Dormant
-                    | IdentityLifecycleState::Uninitialized
-                    | IdentityLifecycleState::Retiring
-            )
-        };
-        if should_materialize {
+        }
+        // Core holds no live member (dormant, or retired: the operator's
+        // "retire then send" recovery path): wake it onto its committed
+        // session through the one wake door.
+        if self.core_live_member(identity).await?.is_none() {
             self.materialize_for_admission(identity, expected_alias, expected_spec_digest)
                 .await?;
         }
@@ -11868,16 +10730,13 @@ impl IdentityRuntime {
             let entry = entries
                 .get(identity)
                 .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            if entry.state != IdentityLifecycleState::Active {
-                return Err(self.refuse_inactive_delivery(identity, entry.state, "send"));
-            }
             // Every row writer takes this lifecycle lock, which the send
             // holds through delivery: the row checked here is the row the
             // input is delivered under.
             refuse_unless_registered_row(identity, &entry.spec, expected_spec_digest)?;
         }
-
-        let mut token = self.ensure_active_lease(identity).await?;
+        let (live, scope) = self.live_delivery_target(identity, "send").await?;
+        let mut token = Self::scope_fence(scope.as_ref());
         // Read the completion baseline BEFORE delivery is attempted. The turn
         // this send starts can only complete after this point, so a caller
         // waiting past the baseline cannot miss it. The converse ambiguity is
@@ -11900,20 +10759,17 @@ impl IdentityRuntime {
                 .get(identity)
                 .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
             (
-                entry
-                    .continuity
-                    .as_ref()
-                    .map(|c| c.agent_runtime_id.clone()),
+                Some(live.agent_runtime_id.clone()),
                 // Scopes the injector's cross-turn dedup + cumulative budget.
-                entry.continuity.as_ref().map(|c| c.session_id.to_string()),
-                entry.continuity.as_ref().map(|c| c.generation.get()),
+                live.session_id.as_ref().map(ToString::to_string),
+                scope.as_ref().map(|scope| scope.generation().get()),
                 interaction_id_for_delivery(&entry.spec, interaction_id),
                 // Resolved as meerkat resolves it at spawn (override, profile,
                 // default). Generic autonomous work has no user context slot;
                 // the explicit human boundary does.
                 self.effective_runtime_mode(&entry.spec),
                 console_human.is_some() && !durable_spec_uses_external_binding(&entry.spec),
-                entry.continuity.as_ref().map(|c| c.session_id.clone()),
+                live.session_id.clone(),
                 durable_spec_uses_external_binding(&entry.spec),
             )
         };
@@ -12057,7 +10913,9 @@ impl IdentityRuntime {
                                         self.record_delivery_error(identity, &reload_error).await;
                                         return Err(reload_error);
                                     }
-                                    token = self.ensure_active_lease(identity).await?;
+                                    token = self
+                                        .fence_after_delivery_reload(identity, rid, "send")
+                                        .await?;
                                     continue;
                                 }
                                 return Err(err);
@@ -12135,7 +10993,9 @@ impl IdentityRuntime {
                                         self.record_delivery_error(identity, &reload_error).await;
                                         return Err(reload_error);
                                     }
-                                    token = self.ensure_active_lease(identity).await?;
+                                    token = self
+                                        .fence_after_delivery_reload(identity, rid, "send")
+                                        .await?;
                                     continue;
                                 }
                                 return Err(err);
@@ -12226,7 +11086,9 @@ impl IdentityRuntime {
                                         self.record_delivery_error(identity, &reload_error).await;
                                         return Err(reload_error);
                                     }
-                                    token = self.ensure_active_lease(identity).await?;
+                                    token = self
+                                        .fence_after_delivery_reload(identity, rid, "send")
+                                        .await?;
                                     continue;
                                 }
                                 return Err(err);
@@ -12330,7 +11192,11 @@ impl IdentityRuntime {
                         // would have held throughout.
                         (Ok(delivered), None) => {
                             if let Some(rebound_token) = self
-                                .reconcile_delivered_session_locked(identity, delivered)
+                                .reconcile_delivered_session_locked(
+                                    identity,
+                                    live.session_id.as_ref(),
+                                    delivered,
+                                )
                                 .await?
                             {
                                 token = rebound_token;
@@ -12345,7 +11211,11 @@ impl IdentityRuntime {
                 }
             };
             if let Some(rebound_token) = self
-                .reconcile_delivered_session_locked(identity, delivered_session_id)
+                .reconcile_delivered_session_locked(
+                    identity,
+                    live.session_id.as_ref(),
+                    delivered_session_id,
+                )
                 .await?
             {
                 token = rebound_token;
@@ -12359,37 +11229,28 @@ impl IdentityRuntime {
         })
     }
 
-    /// The exact incarnation a delivery was admitted onto.
-    ///
-    /// Captured under the lifecycle lock at admission and compared under it
-    /// again after the turn, so any reset, retire or alias rebind during the
-    /// unlocked window is DETECTED rather than silently reconciled onto.
-    ///
-    /// THREE fields, all read from authoritative state: a fresh spawn moves
-    /// `runtime_id`, a resume moves `generation`, a lease re-acquisition moves
-    /// `fencing_token`.
-    ///
-    /// The member alias is deliberately NOT captured here. Deriving it from
-    /// `agent_runtime_id` would have made it a duplicate of a field already in
-    /// this struct rather than an independent signal, so it could never have
-    /// detected the alias divergence it was there for. The alias is instead
-    /// revalidated after relock by re-running the ORIGINAL expected alias
-    /// through `ensure_expected_member_alias_current`, which is the authority.
+    /// Capture `identity`'s current Core incarnation (runtime id, generation,
+    /// fence) for a later "did the owner change?" check. Every atom is Core's
+    /// live member scope at the read; an identity Core holds no
+    /// session-backed member for captures all-`None`.
     pub(crate) async fn capture_incarnation(
         &self,
         identity: &AgentIdentity,
     ) -> Result<CapturedIncarnation, IdentityRuntimeError> {
-        let entries = self.entries.read().await;
-        let entry = entries
-            .get(identity)
-            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-        Ok(CapturedIncarnation {
-            runtime_id: entry
-                .continuity
-                .as_ref()
-                .map(|c| c.agent_runtime_id.clone()),
-            generation: entry.continuity.as_ref().map(|c| c.generation.get()),
-            fencing_token: entry.lease.as_ref().map(|lease| lease.fencing_token),
+        if !self.entries.read().await.contains_key(identity) {
+            return Err(IdentityRuntimeError::UnknownIdentity(identity.clone()));
+        }
+        Ok(match self.core_live_scope(identity).await? {
+            Some(scope) => CapturedIncarnation {
+                runtime_id: Some(meta_runtime_id(scope.runtime_id())?),
+                generation: Some(scope.generation().get()),
+                fencing_token: Some(FencingToken::new(scope.fence_token().get())),
+            },
+            None => CapturedIncarnation {
+                runtime_id: None,
+                generation: None,
+                fencing_token: None,
+            },
         })
     }
 
@@ -12397,9 +11258,9 @@ impl IdentityRuntime {
     // Scope-bound delivery
     // -----------------------------------------------------------------------
 
-    /// Capture `identity`'s exact delivery scope: its Meta continuity
-    /// (runtime id, generation, lease fencing token) and meerkat's native
-    /// member scope (runtime incarnation, fence, session).
+    /// Capture `identity`'s exact delivery scope: Core's live member scope
+    /// (runtime incarnation, generation, fence, session), with its runtime
+    /// id, generation and fence also in the scope's v1 atom slots.
     ///
     /// Strictly observational: it materializes nothing, renews nothing and
     /// submits nothing. A host persists the scope before dispatching against
@@ -12408,25 +11269,24 @@ impl IdentityRuntime {
     /// # Errors
     ///
     /// [`ScopedDeliveryError::Unsupported`] without a scoped bridge seam or
-    /// for a member that cannot be scope-bound; `Rejected` for an unknown or
-    /// inactive identity, or one without continuity or a held lease.
+    /// for a member that cannot be scope-bound; `Rejected` for an unknown
+    /// identity, or one Core holds no live session-backed member for.
     pub async fn capture_delivery_scope(
         &self,
         identity: &AgentIdentity,
     ) -> Result<DeliveryScope, ScopedDeliveryError> {
-        let bridge = self.scoped_bridge()?;
+        self.scoped_bridge()?;
         self.refuse_unscopable_identity(identity).await?;
-        // No lifecycle lock: a capture racing a rebind can at worst pair atoms
-        // from two bindings, and such a scope fails the dispatch's own
-        // re-validation typed. A status read never waits behind a delivery.
-        let (runtime_id, generation, lease_fencing_token) =
+        // No lifecycle lock: every atom comes from one Core read, and a scope
+        // Core moved past fails the dispatch's own re-validation typed. A
+        // status read never waits behind a delivery.
+        let (runtime_id, generation, fence, member) =
             self.active_scope_continuity(identity).await?;
-        let member = bridge.capture_member_delivery_scope(&runtime_id).await?;
         Ok(DeliveryScope::new(
             identity.clone(),
             runtime_id,
             generation,
-            lease_fencing_token,
+            fence,
             member,
         ))
     }
@@ -12437,9 +11297,10 @@ impl IdentityRuntime {
     /// Requires a full delivery identity pair, used exactly as supplied (no
     /// canonicalization). Never materializes, repairs or retargets the
     /// identity and applies no delivery preparation (no defang, no ambient
-    /// memory, no injected context). Every scope atom is re-validated: the
-    /// Meta continuity here, the native session, incarnation and fence
-    /// inside meerkat's admission. A moved scope is refused as
+    /// memory, no injected context). Every scope atom is re-validated
+    /// against Core's live scope here (a persisted 0.9.3 scope, whose atoms
+    /// were Meta's, is refused), and the native session, incarnation and
+    /// fence again inside meerkat's admission. A moved scope is refused as
     /// [`ScopedDeliveryError::StaleScope`] with nothing submitted.
     ///
     /// `input.origin` is not consulted: the scoped path has no origin-specific
@@ -12462,7 +11323,7 @@ impl IdentityRuntime {
         self.refuse_unscopable_identity(identity).await?;
         let lifecycle_lock = self.lifecycle_lock_for(identity).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
-        let (runtime_id, generation, _) = self.active_scope_continuity(identity).await?;
+        let (runtime_id, generation, fence, _) = self.active_scope_continuity(identity).await?;
         if &runtime_id != scope.agent_runtime_id() {
             return Err(ScopedDeliveryError::StaleScope {
                 mismatch: ScopeMismatch::RuntimeId,
@@ -12481,18 +11342,13 @@ impl IdentityRuntime {
                 ),
             });
         }
-        // The same ownership check every delivery runs. A renewal that keeps
-        // the token is the same owner; any other token is not this scope.
-        let token = self.ensure_active_lease(identity).await.map_err(|error| {
-            ScopedDeliveryError::Rejected {
-                detail: error.to_string(),
-            }
-        })?;
-        if token != scope.lease_fencing_token() {
+        // Core's fence in the v1 token slot: any other value is another
+        // incarnation, or a 0.9.3 scope whose slot held Meta's lease token.
+        if fence != scope.lease_fencing_token() {
             return Err(ScopedDeliveryError::StaleScope {
                 mismatch: ScopeMismatch::LeaseFencingToken,
                 detail: format!(
-                    "identity '{identity}' holds lease token {token}, the scope names {}",
+                    "identity '{identity}' runs under Core fence {fence}, the scope names {}",
                     scope.lease_fencing_token()
                 ),
             });
@@ -12542,6 +11398,152 @@ impl IdentityRuntime {
             .recover_at_scope(scope.member(), &delivery_identity, Instant::now() + timeout)
             .await?;
         Ok(ScopedRecovery::from_native(recovery.into_parts().1))
+    }
+
+    /// Retire `identity` only while it still runs at `scope`, a delivery
+    /// scope the host captured with [`Self::capture_delivery_scope`].
+    ///
+    /// Cancellation-safe, like [`Self::retire_tracked`]. Core decides: the
+    /// scope's native member scope goes to meerkat's scoped retire
+    /// (`MobHandle::retire_at_scope`). It retires exactly the member
+    /// incarnation the scope names, with [`Self::retire_tracked`]'s
+    /// process-tree semantics: the member's `spawned_by` descendants, the
+    /// member, then the descendants again. Each step checks the scope in the
+    /// same actor command that retires, so a successor minted while the call
+    /// runs (a respawn, a reset, a wake after a retire) is never retired
+    /// through an older scope. Meta holds no lease and writes no continuity
+    /// record for it. Under the identity's lifecycle lock, an ordinary
+    /// retire's memory hooks run first while the scope still names the live
+    /// member.
+    ///
+    /// Returns the Core fence of the incarnation the scope names. `Ok` is
+    /// meerkat's terminal barrier: that incarnation is retired, or no
+    /// incarnation of the identity is current and none is still retiring,
+    /// so a retry after a lost reply converges to `Ok`, as does a first call
+    /// for an identity that is already retired.
+    ///
+    /// # Errors
+    ///
+    /// [`ScopedRetireError`]. The scope's member is not retired when the call
+    /// answers:
+    /// - `Unsupported`: the bridge has no scoped seam, or the identity is
+    ///   externally bound;
+    /// - `Refused`: a host-adopted identity (Core holds its identity intent
+    ///   row) or one whose identity history Core could not read;
+    /// - `Rejected`: a scope of another identity or member, a runtime that no
+    ///   longer admits identity operations, or a mob that is not running;
+    /// - `StaleScope`: another incarnation of the identity is current
+    ///   (`RuntimeId` when it runs under another runtime id,
+    ///   `LeaseFencingToken` when only Core's fence moved), or the scope's
+    ///   incarnation is current under another session (`MemberBinding`).
+    ///
+    /// Meta answers `Unsupported`, `Refused` and the scope check's
+    /// `Rejected` before Core is asked, so nothing is retired. Core retires
+    /// the member's `spawned_by` descendants before the member and checks the
+    /// scope in every step: a `StaleScope` or `Rejected` it reaches after its
+    /// first step (a successor minted, or the mob stopping, while the
+    /// cascade runs) leaves the descendants it already retired retired.
+    ///
+    /// `Retire` is meerkat's retirement failing or stuck, or the tracked
+    /// operation ending without a result.
+    pub async fn retire_at_scope_tracked(
+        self: &Arc<Self>,
+        identity: &AgentIdentity,
+        scope: &DeliveryScope,
+    ) -> Result<FencingToken, ScopedRetireError> {
+        let runtime = Arc::clone(self);
+        let identity = identity.clone();
+        let scope = scope.clone();
+        // A runtime that admits no operation (it is shutting down, or its
+        // mob is closed) refuses before any of the retirement runs.
+        let receiver = self
+            .start_tracked_foreground_with(ForegroundOwnerSource::Acquire, async move {
+                Ok(runtime.retire_at_scope(&identity, &scope).await)
+            })
+            .await
+            .map_err(|error| ScopedRetireError::Rejected {
+                detail: error.to_string(),
+            })?;
+        match receiver.await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => Err(ScopedRetireError::Retire(error)),
+            // The operation ended without its result (it panicked): whether
+            // the identity was retired is unknown.
+            Err(_) => Err(ScopedRetireError::Retire(IdentityRuntimeError::Internal(
+                "tracked foreground identity operation terminated without a result".to_string(),
+            ))),
+        }
+    }
+
+    /// [`Self::retire_at_scope_tracked`]'s body, in its tracked operation.
+    async fn retire_at_scope(
+        &self,
+        identity: &AgentIdentity,
+        scope: &DeliveryScope,
+    ) -> Result<FencingToken, ScopedRetireError> {
+        let refused = ScopedRetireError::from_scope_refusal;
+        Self::ensure_scope_identity(identity, scope).map_err(refused)?;
+        Self::ensure_scope_member(scope).map_err(refused)?;
+        let bridge = self.scoped_bridge().map_err(refused)?;
+        // A host-adopted identity is the host's: no Meta verb retires it.
+        self.refuse_host_adopted(identity)
+            .await
+            .map_err(ScopedRetireError::Refused)?;
+        self.refuse_unscopable_identity(identity)
+            .await
+            .map_err(refused)?;
+        // Core's native scope is the authority: the retired incarnation's
+        // public runtime id and fence are its, whatever Meta atoms the
+        // persisted scope carries.
+        let member = scope.member();
+        let runtime_id =
+            meta_runtime_id(member.runtime_id()).map_err(|error| ScopedRetireError::Rejected {
+                detail: error.to_string(),
+            })?;
+        let lifecycle_lock = self.lifecycle_lock_for(identity).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        // Core decides, step by step, which incarnation the scope names. Meta
+        // runs an ordinary retire's memory hooks only while the scope names
+        // the live member, before Core retires it.
+        let live = match self.core_live_scope(identity).await {
+            Ok(scope) => scope,
+            // Core refuses the scope read of a member it holds no session
+            // binding for, such as a retired one. With no live member there
+            // is no live scope: the call goes on to Core, whose answer for a
+            // scope no incarnation is current at is `Ok`. Any other failure
+            // to read refuses here, before Core is asked.
+            Err(error) => match self.core_live_member(identity).await {
+                Ok(None) => None,
+                Ok(Some(_)) | Err(_) => {
+                    return Err(ScopedRetireError::Rejected {
+                        detail: error.to_string(),
+                    });
+                }
+            },
+        };
+        let retires_live = live.as_ref() == Some(member);
+        if retires_live {
+            self.clear_wake_notes_of_live_member(identity).await;
+            self.distill_before_retire(identity, Some(member.session_id()))
+                .await;
+        }
+        bridge
+            .retire_at_scope(&runtime_id, member)
+            .await
+            .map_err(|error| name_stale_retire_mismatch(error, live.as_ref(), member))?;
+        if retires_live {
+            self.entries.notify_binding_changed();
+            self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Dormant, None);
+            self.emit_event(
+                identity,
+                IdentityEvent::StateChanged {
+                    identity: identity.clone(),
+                    new_state: IdentityLifecycleState::Dormant,
+                },
+            )
+            .await;
+        }
+        Ok(FencingToken::new(member.fence_token().get()))
     }
 
     fn scoped_bridge(&self) -> Result<&Arc<dyn SessionBridge>, ScopedDeliveryError> {
@@ -12614,49 +11616,54 @@ impl IdentityRuntime {
         }
     }
 
-    /// The continuity atoms of an ACTIVE identity, read without changing
-    /// anything: the scoped path never materializes an inactive identity.
+    /// The scope atoms of `identity`'s live Core member, read without
+    /// changing anything (the scoped path never wakes an identity): Core's
+    /// runtime id (as Meta's public alias), Core's generation and Core's
+    /// fence in the v1 slots, plus
+    /// Core's native member scope.
     async fn active_scope_continuity(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<(AgentRuntimeId, ContinuityGeneration, FencingToken), ScopedDeliveryError> {
-        let entries = self.entries.read().await;
-        let entry = entries
-            .get(identity)
-            .ok_or_else(|| ScopedDeliveryError::Rejected {
-                detail: format!("unknown identity: {identity}"),
-            })?;
-        if entry.state != IdentityLifecycleState::Active {
+    ) -> Result<
+        (
+            AgentRuntimeId,
+            ContinuityGeneration,
+            FencingToken,
+            meerkat_mob::MemberDeliveryScope,
+        ),
+        ScopedDeliveryError,
+    > {
+        if !self.entries.read().await.contains_key(identity) {
             return Err(ScopedDeliveryError::Rejected {
-                detail: format!(
-                    "identity '{identity}' is {:?}, not active; scoped delivery never \
-                     materializes an identity",
-                    entry.state
-                ),
+                detail: format!("unknown identity: {identity}"),
             });
         }
-        let continuity =
-            entry
-                .continuity
-                .as_ref()
-                .ok_or_else(|| ScopedDeliveryError::Rejected {
-                    detail: format!("identity '{identity}' has no continuity record"),
-                })?;
-        let lease = entry
-            .lease
-            .as_ref()
+        let scope = self
+            .core_live_scope(identity)
+            .await
+            .map_err(|error| ScopedDeliveryError::Rejected {
+                detail: error.to_string(),
+            })?
             .ok_or_else(|| ScopedDeliveryError::Rejected {
-                detail: format!("identity '{identity}' holds no lease"),
+                detail: format!(
+                    "Core holds no live session-backed member for identity '{identity}'; scoped \
+                     delivery never wakes an identity"
+                ),
+            })?;
+        let runtime_id =
+            meta_runtime_id(scope.runtime_id()).map_err(|error| ScopedDeliveryError::Rejected {
+                detail: error.to_string(),
             })?;
         Ok((
-            continuity.agent_runtime_id.clone(),
-            continuity.generation,
-            lease.fencing_token,
+            runtime_id,
+            ContinuityGeneration::new(scope.generation().get()),
+            FencingToken::new(scope.fence_token().get()),
+            scope,
         ))
     }
 
     // -----------------------------------------------------------------------
-    // Delivery: dispatch() — REQ-02
+    // Delivery: dispatch() - REQ-02
     // -----------------------------------------------------------------------
 
     /// Dispatch internal content to any identity (Addressable or InternalOnly).
@@ -12706,7 +11713,7 @@ impl IdentityRuntime {
         )
     }
 
-    /// The ONE delivery preparation both member doors run (task #54): the
+    /// The ONE delivery preparation both member doors run: the
     /// send door always had it; the dispatch door previously delivered raw,
     /// so internal dispatches (schedules foremost) skipped defanging, taint
     /// session attribution, and ambient memory injection for the member's
@@ -12714,14 +11721,14 @@ impl IdentityRuntime {
     ///
     /// Steer is latency-sensitive live operator input: it bypasses both
     /// memory injection and inbound defanging by design. Every other
-    /// delivery is defanged first (§9.1 anti-spoofing - even with injection
+    /// delivery is defanged first (section 9.1 anti-spoofing - even with injection
     /// off, forged memory envelopes are an inbound threat) and only then
     /// considered for ambient injection. Ask 1: the user content and the
     /// ambient recall travel as SEPARATE bodies - the (defanged) message and
     /// the recall as its own typed injected-context body, never fused.
-    /// §10.1 taint hook: `note_current_session` keeps session attribution
+    /// section 10.1 taint hook: `note_current_session` keeps session attribution
     /// authoritative ahead of the async observe stream; the generation bind
-    /// feeds the Distiller's EvidenceRefs (§8.4).
+    /// feeds the Distiller's EvidenceRefs (section 8.4).
     async fn prepare_member_delivery(
         &self,
         identity: &AgentIdentity,
@@ -12824,22 +11831,14 @@ impl IdentityRuntime {
         input: &DispatchInput,
         track_turn: bool,
     ) -> Result<DispatchOutcome, IdentityRuntimeError> {
-        let should_materialize = {
-            let entries = self.entries.read().await;
-            let entry = entries
-                .get(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            // A retired identity (`Retiring`, the terminal form) is
-            // re-materialized onto its recorded session exactly like a Dormant
-            // one; this is the operator's "retire then send" recovery path.
-            matches!(
-                entry.state,
-                IdentityLifecycleState::Dormant
-                    | IdentityLifecycleState::Uninitialized
-                    | IdentityLifecycleState::Retiring
-            )
-        };
-        if should_materialize && expected.is_none() {
+        if !self.entries.read().await.contains_key(identity) {
+            return Err(IdentityRuntimeError::UnknownIdentity(identity.clone()));
+        }
+        // Core holds no live member (dormant, or retired: the operator's
+        // "retire then send" recovery path): wake it onto its committed
+        // session through the one wake door. A maintenance dispatch bound to
+        // a captured incarnation never wakes anything.
+        if expected.is_none() && self.core_live_member(identity).await?.is_none() {
             self.materialize_for_admission(identity, expected_alias, None)
                 .await?;
         }
@@ -12858,18 +11857,9 @@ impl IdentityRuntime {
             self.ensure_expected_member_alias_current(identity, expected_alias)
                 .await?;
         }
-        {
-            let entries = self.entries.read().await;
-            let entry = entries
-                .get(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            if entry.state != IdentityLifecycleState::Active {
-                return Err(self.refuse_inactive_delivery(identity, entry.state, "dispatch"));
-            }
-        }
-
-        let mut token = self.ensure_active_lease(identity).await?;
-        // Same pre-delivery baseline contract as the send path — see
+        let (live, scope) = self.live_delivery_target(identity, "dispatch").await?;
+        let mut token = Self::scope_fence(scope.as_ref());
+        // Same pre-delivery baseline contract as the send path - see
         // `send_with_mode_and_interaction_with_expected_member_alias`.
         let completion_baseline = self.credited_completion_cursor(identity, token).await;
         let (
@@ -12885,26 +11875,21 @@ impl IdentityRuntime {
             let entry = entries
                 .get(identity)
                 .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            // REQ-04: durability depends on runtime_store
-            let is_durable = entry.has_runtime_store;
-
-            let runtime_id = entry
-                .continuity
-                .as_ref()
-                .map(|c| c.agent_runtime_id.clone());
+            // REQ-04: durability depends on the runtime store composition.
+            let is_durable = self.has_runtime_store;
 
             (
                 is_durable,
-                runtime_id,
-                entry.continuity.as_ref().map(|c| c.session_id.clone()),
-                entry.continuity.as_ref().map(|c| c.session_id.to_string()),
-                entry.continuity.as_ref().map(|c| c.generation.get()),
+                Some(live.agent_runtime_id.clone()),
+                live.session_id.clone(),
+                live.session_id.as_ref().map(ToString::to_string),
+                scope.as_ref().map(|scope| scope.generation().get()),
                 self.effective_runtime_mode(&entry.spec),
                 durable_spec_uses_external_binding(&entry.spec),
             )
         };
 
-        // Task #54: the dispatch door runs the SAME delivery preparation as
+        // The dispatch door runs the SAME delivery preparation as
         // the send door (defang, taint session attribution, ambient memory
         // injection). Dispatch has no Steer mode; `DispatchOrigin` rides the
         // input untouched.
@@ -12918,7 +11903,7 @@ impl IdentityRuntime {
                 DeliveryPreparation::Work(memory_runtime_mode),
             )
             .await?;
-        // Task #50 fail-closed matrix, validated BEFORE bridge admission:
+        // The fail-closed matrix, validated BEFORE bridge admission:
         // (None, None) is an ordinary delivery; a full pair validates
         // upstream (canonical non-nil UUID correlation) and carries; EVERY
         // other combination - half-pair, invalid UUID - is a typed refusal
@@ -12937,7 +11922,7 @@ impl IdentityRuntime {
                 // the RPC surface's System default). Code-owned lanes -
                 // Scheduler, Policy, Flow - mint their own canonical UUIDs,
                 // so a non-canonical value there is a defect to refuse
-                // typed (the task #50 matrix), never to mask.
+                // typed (the fail-closed matrix), never to mask.
                 let app_lane = matches!(
                     input.origin,
                     super::types::DispatchOrigin::Connector | super::types::DispatchOrigin::System
@@ -13149,7 +12134,11 @@ impl IdentityRuntime {
             }
             dispatched_session_id = Some(delivered_session_id.clone());
             if let Some(rebound_token) = self
-                .reconcile_delivered_session_locked(identity, delivered_session_id)
+                .reconcile_delivered_session_locked(
+                    identity,
+                    live.session_id.as_ref(),
+                    delivered_session_id,
+                )
                 .await?
             {
                 token = rebound_token;
@@ -13277,7 +12266,7 @@ impl IdentityRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // Status: status() — REQ-07
+    // Status: status() - REQ-07
     // -----------------------------------------------------------------------
 
     /// Return the full identity status for the given identity.
@@ -13294,61 +12283,137 @@ impl IdentityRuntime {
         let _ = release.await;
     }
 
+    /// Whether a roster compile registered `identity` and no later compile
+    /// dropped it (extension documents' principal rule reads it).
+    #[cfg(feature = "extension-state")]
+    pub(crate) async fn is_registered(&self, identity: &AgentIdentity) -> bool {
+        self.entries.read().await.contains_key(identity)
+    }
+
+    /// The identity's status, read from Core on every call: Active
+    /// while Core holds its member, Broken after a FINAL refused wake, Dormant
+    /// otherwise. The Core facts come from one read of Core's member history
+    /// that is, a store read that never waits on the mob actor; a read fault is
+    /// typed history unavailable, never a guess.
     pub async fn status(
         &self,
         identity: &AgentIdentity,
     ) -> Result<IdentityStatus, IdentityRuntimeError> {
-        let entries = self.entries.read().await;
-        let entry = entries
-            .get(identity)
-            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
+        if !self.entries.read().await.contains_key(identity) {
+            return Err(IdentityRuntimeError::UnknownIdentity(identity.clone()));
+        }
+        let history = self.core_view_history().await.map_err(|error| {
+            IdentityRuntimeError::IdentityHistoryUnavailable {
+                identity: identity.clone(),
+                detail: format!("reading Core's member history: {error}"),
+            }
+        })?;
+        self.status_from(identity, history.as_ref()).await
+    }
 
-        let lease_info = entry.lease.as_ref().map(|l| LeaseInfo {
-            fencing_token: l.fencing_token,
-            ttl_remaining: l.ttl_remaining(),
-            healthy: l.is_healthy(),
-        });
-
-        let continuity_health = Some(ContinuityHealth {
-            store_reachable: true, // tracked per-store in production
-            durability_policy: self.durability_policy.clone(),
-            last_checkpoint_version: if entry.checkpoint_version.get() > 0 {
-                Some(entry.checkpoint_version)
-            } else {
-                None
-            },
-        });
-
+    /// [`Self::status`] over a history already read.
+    async fn status_from(
+        &self,
+        identity: &AgentIdentity,
+        history: Option<&meerkat_mob::MemberBindingHistory>,
+    ) -> Result<IdentityStatus, IdentityRuntimeError> {
+        let (spec, wake_refusal, replaced_session) = {
+            let entries = self.entries.read().await;
+            let entry = entries
+                .get(identity)
+                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
+            (
+                entry.spec.clone(),
+                entry.wake_refusal.clone(),
+                entry.replaced_session.clone(),
+            )
+        };
+        let facts = CoreViewFacts::of(history, identity);
+        let convergence = if facts.intent_managed {
+            self.core_convergence(identity).await
+        } else {
+            None
+        };
+        let session_repair_required = self.session_repair_hold(wake_refusal.as_ref());
         Ok(IdentityStatus {
             identity: identity.clone(),
-            state: entry.state,
-            agent_runtime_id: entry
-                .continuity
-                .as_ref()
-                .map(|c| c.agent_runtime_id.clone()),
-            session_id: entry.continuity.as_ref().map(|c| c.session_id.clone()),
-            profile: Some(entry.spec.profile.clone()),
-            runtime_mode: entry.spec.runtime_mode_override,
-            addressability: entry.spec.addressability,
-            display_name: entry.spec.display_name.clone(),
-            labels: entry.spec.labels.clone(),
-            generation: entry.continuity.as_ref().map(|c| c.generation),
-            checkpoint_version: if entry.checkpoint_version.get() > 0 {
-                Some(entry.checkpoint_version)
-            } else {
-                None
-            },
-            lease: lease_info,
-            continuity_health,
-            continuity_unrecoverable: entry.continuity_unrecoverable.clone(),
-            session_repair_required: entry.session_repair_required.clone(),
+            state: Self::view_state(self.runs_live_member(facts.live), wake_refusal.as_ref()),
+            agent_runtime_id: facts.runtime_id,
+            session_id: facts.session_id,
+            member_id: facts.member_id,
+            profile: Some(spec.profile.clone()),
+            runtime_mode: spec.runtime_mode_override,
+            addressability: spec.addressability,
+            display_name: spec.display_name.clone(),
+            labels: spec.labels.clone(),
+            generation: facts.generation,
+            intent_managed: facts.intent_managed,
+            convergence,
+            wake_refusal,
+            replaced_session,
+            session_repair_required,
             customizer_tools_pending: self.customizer_tools_pending_for(identity),
         })
     }
 
-    /// Return statuses for every registered identity without materializing
-    /// dormant members.
-    pub async fn statuses(&self) -> Vec<IdentityStatus> {
+    /// The typed repair hold of a wake Core held for audited-endpoint
+    /// repair (the `repair_session` remedy): the exact repair commands for
+    /// the held session, scoped to this runtime's store. `None` for every
+    /// other refusal.
+    fn session_repair_hold(
+        &self,
+        wake_refusal: Option<&super::types::WakeRefusal>,
+    ) -> Option<SessionRepairRequired> {
+        let refusal = wake_refusal?;
+        (refusal.remedy == super::types::WakeRefusalRemedy::RepairSession).then(|| {
+            SessionRepairRequired::audited_endpoint_divergence(
+                refusal.session_id.clone(),
+                self.session_repair_scope().as_ref(),
+                "Core held the session's resume: its committed document fails the \
+                 audited-endpoint guard",
+            )
+        })
+    }
+
+    /// Core's member history: one fold of its journal and identity
+    /// intent rows. `None` without a bridge (no Core mob, nothing live).
+    async fn core_view_history(
+        &self,
+    ) -> Result<Option<meerkat_mob::MemberBindingHistory>, BridgeError> {
+        match self.bridge.as_ref() {
+            Some(bridge) => bridge.member_binding_history().await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Core's convergence status of an intent-managed identity, in wire
+    /// form naming the Meta identity. `None` while Core holds no readable
+    /// status row: an unreadable row is diagnostic noise here, never a
+    /// guessed condition.
+    async fn core_convergence(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Option<meerkat_contracts::wire::WireIdentityConvergenceStatus> {
+        let bridge = self.bridge.as_ref()?;
+        match bridge.identity_convergence_status(identity).await {
+            Ok(meerkat_mob::identity::IdentityStoredObservation::Valid(status)) => {
+                let mut wire = status.to_wire();
+                wire.agent_identity = identity.as_str().to_string();
+                Some(wire)
+            }
+            Ok(_) => None,
+            Err(error) => {
+                tracing::debug!(%identity, %error, "Core's convergence status could not be read");
+                None
+            }
+        }
+    }
+
+    /// Return statuses for every registered identity without waking any.
+    /// One read of Core's member history serves every identity; when that
+    /// read fails the call fails typed (`MemberHistoryUnavailable`): no
+    /// status is guessed and no empty list stands in for "none".
+    pub async fn statuses(&self) -> Result<Vec<IdentityStatus>, IdentityRuntimeError> {
         let identities = self
             .entries
             .read()
@@ -13356,24 +12421,28 @@ impl IdentityRuntime {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        let history = self.core_view_history().await.map_err(|error| {
+            IdentityRuntimeError::MemberHistoryUnavailable {
+                detail: format!("reading Core's member history: {error}"),
+            }
+        })?;
         let mut statuses = Vec::with_capacity(identities.len());
         for identity in identities {
-            if let Ok(status) = self.status(&identity).await {
+            // An identity unregistered between the two reads has no status.
+            if let Ok(status) = self.status_from(&identity, history.as_ref()).await {
                 statuses.push(status);
             }
         }
-        statuses
+        Ok(statuses)
     }
 
     // -----------------------------------------------------------------------
-    // Lifecycle: retire() — REQ-08
+    // Lifecycle: retire() - REQ-08
     // -----------------------------------------------------------------------
 
-    /// Retire an identity. Validates lease ownership and retires the mob member.
-    pub async fn retire(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Result<FencingToken, IdentityRuntimeError> {
+    /// Retire an identity: Core retires its member and keeps the member's
+    /// history, so the next wake resumes the same session.
+    pub async fn retire(&self, identity: &AgentIdentity) -> Result<(), IdentityRuntimeError> {
         self.retire_with_expected_member_alias(identity, None).await
     }
 
@@ -13381,7 +12450,7 @@ impl IdentityRuntime {
         &self,
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
-    ) -> Result<FencingToken, IdentityRuntimeError> {
+    ) -> Result<(), IdentityRuntimeError> {
         let lifecycle_lock = self.lifecycle_lock_for(identity).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
         if let Some(expected_alias) = expected_alias {
@@ -13391,10 +12460,7 @@ impl IdentityRuntime {
         self.retire_locked(identity).await
     }
 
-    async fn retire_locked(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Result<FencingToken, IdentityRuntimeError> {
+    async fn retire_locked(&self, identity: &AgentIdentity) -> Result<(), IdentityRuntimeError> {
         self.retire_locked_with_intent(identity, LifecycleRetireIntent::Retire)
             .await
     }
@@ -13407,7 +12473,7 @@ impl IdentityRuntime {
         expected: &CapturedIncarnation,
         expected_alias: Option<&str>,
         change: super::bridge::CompactionFloorChange<'_>,
-    ) -> Result<(ContinuityRecord, CapturedIncarnation), IdentityRuntimeError> {
+    ) -> Result<(SessionId, CapturedIncarnation), IdentityRuntimeError> {
         let lock = self.lifecycle_lock_for(identity).await;
         let _guard = lock.lock().await;
         if self.capture_incarnation(identity).await? != *expected {
@@ -13420,14 +12486,9 @@ impl IdentityRuntime {
             self.ensure_expected_member_alias_current(identity, alias)
                 .await?;
         }
-        let before = self.status(identity).await?;
-        if before.state != IdentityLifecycleState::Active {
-            return Err(IdentityRuntimeError::InvalidState {
-                identity: identity.clone(),
-                state: before.state,
-                operation: "compact_member",
-            });
-        }
+        let (before, _) = self
+            .live_delivery_target(identity, "compact_member")
+            .await?;
         self.retire_locked(identity).await?;
         match change.floor {
             Some(floor) => {
@@ -13450,7 +12511,7 @@ impl IdentityRuntime {
                 EmbodimentOverrides::default(),
             )
             .await
-            .map(|outcome| outcome.record);
+            .map(|outcome| outcome.binding);
         self.mark_bootstrap_materialization_finished(identity, &result, generation);
         change
             .registry
@@ -13458,8 +12519,11 @@ impl IdentityRuntime {
         if result.is_err() && change.floor.is_some() {
             change.registry.clear_owned(identity, change.operation_id);
         }
-        let record = result?;
-        if before.session_id.as_ref() != Some(&record.session_id) {
+        let binding = result?;
+        let Some(session_id) = binding
+            .session_id
+            .filter(|session_id| before.session_id.as_ref() == Some(session_id))
+        else {
             if change.floor.is_some() {
                 change.registry.clear_owned(identity, change.operation_id);
             }
@@ -13468,8 +12532,8 @@ impl IdentityRuntime {
                 detail: "maintenance rebuild did not retain the captured durable session"
                     .to_string(),
             });
-        }
-        Ok((record, self.capture_incarnation(identity).await?))
+        };
+        Ok((session_id, self.capture_incarnation(identity).await?))
     }
 
     pub(crate) async fn invalidate_superseded_compaction_floor(
@@ -13487,152 +12551,90 @@ impl IdentityRuntime {
         }
     }
 
-    /// Retire the identity's mob member while the caller holds the lifecycle
-    /// lock. `Retire` is the ordinary path; `Reload` is the first half of a
-    /// non-destructive reload and skips the memory harvest hooks because the
-    /// same session is re-materialized right after (nothing rotates, no exit).
+    /// Section 8.4 trigger (b): distill the outgoing session's tail BEFORE
+    /// the member retires, then queue the retired identity's store for the
+    /// next dream's harvest (section 8.5 exit interview). Best-effort and
+    /// bounded: retirement proceeds at the distiller's pre-rotation timeout.
+    async fn distill_before_retire(
+        &self,
+        identity: &AgentIdentity,
+        session_id: Option<&SessionId>,
+    ) {
+        let Some(injector) = self.agent_memory.read().await.clone() else {
+            return;
+        };
+        if let Some(session_id) = session_id {
+            injector
+                .distill_before_rotation(
+                    identity,
+                    &session_id.to_string(),
+                    crate::memory::distiller::DistillCause::Retire,
+                )
+                .await;
+        }
+        // Section 8.5 exit interview: queue the retired identity's store for
+        // the next dream's harvest sub-phase.
+        injector
+            .note_identity_retired(
+                identity,
+                session_id.map(std::string::ToString::to_string).as_deref(),
+                "retire",
+            )
+            .await;
+    }
+
+    /// Retire the identity's Core member while the caller holds the lifecycle
+    /// lock. Core keeps the member's history, so a later wake resumes
+    /// the same session at a new generation. `Retire` is the ordinary path;
+    /// `Reload` is the first half of a non-destructive reload and skips the
+    /// memory harvest hooks because the same session is woken right after
+    /// (nothing rotates, no exit).
     async fn retire_locked_with_intent(
         &self,
         identity: &AgentIdentity,
         intent: LifecycleRetireIntent,
-    ) -> Result<FencingToken, IdentityRuntimeError> {
-        self.ensure_active_lease(identity).await?;
-        let registered_entry = self
-            .mark_lifecycle_in_progress(identity, IdentityLifecycleState::Retiring)
-            .await?;
-        let _previous_token = match Self::check_lease(&registered_entry) {
-            Ok(token) => token,
-            Err(err) => {
-                self.restore_entry(identity, registered_entry).await;
-                return Err(err);
-            }
-        };
-        let runtime_id = registered_entry
-            .continuity
-            .as_ref()
-            .map(|c| c.agent_runtime_id.clone());
-        let session_id = registered_entry
-            .continuity
-            .as_ref()
-            .map(|c| c.session_id.clone());
-
-        let acquire_result = match self
-            .lease_provider
-            .acquire_leases(std::slice::from_ref(identity), &self.runtime_instance_id)
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                self.restore_entry(identity, registered_entry).await;
-                return Err(IdentityRuntimeError::Lease(err));
-            }
-        };
-
-        let grant = match acquire_result.get(identity) {
-            Some(super::types::LeaseAcquireResult::Acquired(g)) => g.clone(),
-            _ => {
-                self.restore_entry(identity, registered_entry).await;
-                return Err(IdentityRuntimeError::NoActiveLease(identity.clone()));
-            }
-        };
-        if let Err(err) = self
-            .advance_existing_continuity_fence(identity, &registered_entry, &grant)
-            .await
-        {
-            self.restore_broken_entry_and_release_grant(identity, registered_entry, &grant)
-                .await;
-            return Err(err);
-        }
-        // The durable fence now belongs to the retire transaction. Refresh
-        // the bridge adapter before retirement so Meerkat's terminal archive
-        // projection carries that same token. Leaving the live session on the
-        // prior token makes ArchiveSession fail closed with a stale fence and
-        // strands the member in Retiring.
-        if let Some(record) = registered_entry.continuity.as_ref()
-            && let Err(error) = self
-                .refresh_existing_session_runtime_state(identity, record, &grant)
+    ) -> Result<(), IdentityRuntimeError> {
+        // A host-adopted identity is read-only to Meta.
+        self.refuse_host_adopted(identity).await?;
+        let Some(live) = self.core_live_member(identity).await? else {
+            let wake_refusal = self
+                .entries
+                .read()
                 .await
-        {
-            self.restore_broken_entry_with_fenced_store(identity, registered_entry, &grant)
-                .await;
-            return Err(IdentityRuntimeError::Internal(format!(
-                "bridge refresh session authority before retire: {error}"
-            )));
-        }
-
-        // §8.4 trigger (b): distill the outgoing session's tail BEFORE the
-        // member retires. Best-effort and bounded — retirement proceeds at
-        // the distiller's pre-rotation timeout. A reload keeps the session,
-        // so neither the distillation nor the exit interview applies.
-        if intent == LifecycleRetireIntent::Retire
-            && let Some(injector) = self.agent_memory.read().await.clone()
-        {
-            if let Some(session_id) = session_id.as_ref() {
-                injector
-                    .distill_before_rotation(
-                        identity,
-                        &session_id.to_string(),
-                        crate::memory::distiller::DistillCause::Retire,
-                    )
-                    .await;
-            }
-            // §8.5 exit interview: queue the retired identity's store for
-            // the next dream's harvest sub-phase.
-            injector
-                .note_identity_retired(
-                    identity,
-                    session_id
-                        .as_ref()
-                        .map(std::string::ToString::to_string)
-                        .as_deref(),
-                    "retire",
-                )
-                .await;
-        }
-
-        // Retire the mob member through the session bridge when available.
-        if let (Some(bridge), Some(rid)) = (&self.bridge, &runtime_id)
-            && let Err(err) = bridge.retire_member(rid).await
-        {
-            self.restore_entry_with_grant(identity, registered_entry, &grant)
-                .await;
-            return Err(IdentityRuntimeError::Internal(format!(
-                "bridge retire: {err}"
-            )));
-        }
-        if let (Some(bridge), Some(session_id)) = (&self.bridge, &session_id)
-            && let Err(err) = bridge.unregister_session_runtime_state(session_id).await
-        {
-            self.restore_broken_entry_and_release_grant(identity, registered_entry, &grant)
-                .await;
-            return Err(IdentityRuntimeError::Internal(format!(
-                "bridge unregister retired session: {err}"
-            )));
-        }
-
-        let release_result = self
-            .lease_provider
-            .release_leases(std::slice::from_ref(&grant))
-            .await;
-        let (state, bootstrap_error) = match &release_result {
-            Ok(()) => (IdentityLifecycleState::Retiring, None),
-            Err(error) => (
-                IdentityLifecycleState::Broken,
-                Some(format!("lease release after retire: {error}")),
-            ),
+                .get(identity)
+                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?
+                .wake_refusal
+                .clone();
+            return Err(IdentityRuntimeError::InvalidState {
+                identity: identity.clone(),
+                state: Self::view_state(false, wake_refusal.as_ref()),
+                operation: "retire",
+            });
         };
-        {
-            let mut entries = self.entries.write().await;
-            let entry = entries
-                .get_mut(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            entry.state = state;
-            entry.lease = None;
-            entry.pending_lease_release = release_result.as_ref().err().map(|_| grant.clone());
+        self.clear_wake_notes_of_live_member(identity).await;
+
+        // Section 8.4 trigger (b), and the exit interview. A reload keeps
+        // the session, so neither applies.
+        if intent == LifecycleRetireIntent::Retire {
+            self.distill_before_retire(identity, live.session_id.as_ref())
+                .await;
         }
-        self.mark_bootstrap_from_lifecycle(identity, state, bootstrap_error);
-        release_result.map_err(IdentityRuntimeError::Lease)?;
-        Ok(grant.fencing_token)
+
+        self.core_bridge(identity)?
+            .retire_member(&live.agent_runtime_id)
+            .await
+            .map_err(|err| IdentityRuntimeError::Internal(format!("bridge retire: {err}")))?;
+        self.entries.notify_binding_changed();
+        self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Dormant, None);
+        self.emit_event(
+            identity,
+            IdentityEvent::StateChanged {
+                identity: identity.clone(),
+                new_state: IdentityLifecycleState::Dormant,
+            },
+        )
+        .await;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -13652,77 +12654,55 @@ impl IdentityRuntime {
         result
     }
 
-    /// Non-destructive cold reload of the identity's live member.
+    /// Non-destructive cold reload of the identity's live member: same
+    /// session, same Core incarnation.
     ///
-    /// Same identity alias, same durable session id, same continuity
-    /// generation. Implemented on the meerkat 0.8.33 API as retire-then-
-    /// re-materialize under the identity's lifecycle lock:
+    /// Core's member registration reload (`reload_member_registration`)
+    /// quiesces, discards and re-registers the executor for the SAME session
+    /// and can tell a healthy registration apart (`not_degraded`). A bridge
+    /// without that primitive falls back to retire then wake under the
+    /// identity's lifecycle lock: the same session is resumed and Core's
+    /// generation advances.
     ///
-    /// 1. the mob member is retired (`bridge.retire_member`, which runs
-    ///    meerkat-mob's retire path and its reload-required discard) and the
-    ///    session runtime state is unregistered; the continuity record is NOT
-    ///    touched (retire only re-upserts it under the new fence token);
-    /// 2. the entry stays in the retired terminal form (`Retiring`), which the
-    ///    embodiment door accepts exactly like `Dormant` (#404);
-    /// 3. the same continuity record is embodied again: `resume_session` on
-    ///    the recorded `session_id`, whose executor registration is where
-    ///    meerkat mints the cold reload from durable truth.
-    ///
-    /// Contrast `respawn_member` (identity reset): fence owner, ADVANCE the
-    /// generation, fresh continuity. That is a destructive continuity reset
-    /// and this verb never calls it.
-    ///
-    /// Prefer the upstream registration primitive. Only a bridge that does
-    /// not expose it uses the legacy retire/embody path. Dormant,
-    /// uninitialized and retired identities return `not_current`; reload
-    /// does not revive them. Broken/Suspended are refused typed.
+    /// Contrast reset and `delete_identity`: a fresh session. This verb never
+    /// starts one. An identity Core holds no member for returns `not_current`
+    /// (the next send wakes it), except one whose last wake Core held for an
+    /// audited-endpoint repair: reload is the operator's path after that
+    /// repair, and wakes it onto the same session. A host-adopted identity
+    /// refuses typed.
     async fn reload_locked_inner(
         &self,
         identity: &AgentIdentity,
     ) -> Result<MemberReloadOutcome, IdentityRuntimeError> {
-        let (state, before, repair_held) = {
-            let entries = self.entries.read().await;
-            let entry = entries
-                .get(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            (
-                entry.state,
-                entry.continuity.clone(),
-                entry.session_repair_required.is_some(),
-            )
+        let wake_refusal = self
+            .entries
+            .read()
+            .await
+            .get(identity)
+            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?
+            .wake_refusal
+            .clone();
+        self.refuse_host_adopted(identity).await?;
+        let Some(live) = self.core_live_member(identity).await? else {
+            if wake_refusal.as_ref().is_some_and(|refusal| {
+                refusal.remedy == super::types::WakeRefusalRemedy::RepairSession
+            }) {
+                return self.reload_repaired_session_locked(identity).await;
+            }
+            let last = self.core_last_binding(identity).await?;
+            return Ok(MemberReloadOutcome {
+                reloaded: false,
+                disposition: MemberReloadDisposition::NotCurrent,
+                session_id: last
+                    .as_ref()
+                    .and_then(|binding| binding.session_id().cloned()),
+                generation: last
+                    .as_ref()
+                    .map(|binding| ContinuityGeneration::new(binding.generation().get())),
+            });
         };
-        match state {
-            IdentityLifecycleState::Active => {}
-            // The one Broken shape the reload verb IS the repair path for:
-            // the operator has (presumably) run the sanctioned WholeBlob
-            // repair and asks for the same durable session back. No flag, no
-            // reset: re-embody the recorded continuity through the ordinary
-            // resume door, which re-records the hold if the document is
-            // still refused.
-            IdentityLifecycleState::Broken if repair_held => {
-                return self.reload_repaired_session_locked(identity, before).await;
-            }
-            // Dormant, uninitialized, or retired: no live registration to
-            // reload; the next send materializes lazily.
-            IdentityLifecycleState::Dormant
-            | IdentityLifecycleState::Uninitialized
-            | IdentityLifecycleState::Retiring => {
-                return Ok(MemberReloadOutcome {
-                    reloaded: false,
-                    disposition: MemberReloadDisposition::NotCurrent,
-                    session_id: before.as_ref().map(|record| record.session_id.clone()),
-                    generation: before.as_ref().map(|record| record.generation),
-                });
-            }
-            IdentityLifecycleState::Broken | IdentityLifecycleState::Suspended => {
-                return Err(IdentityRuntimeError::InvalidState {
-                    identity: identity.clone(),
-                    state,
-                    operation: "reload_member",
-                });
-            }
-        }
-        let Some(before) = before else {
+        let Some(session_id) = live.session_id.clone() else {
+            // A peer-only member has no session registration to reload.
             return Ok(MemberReloadOutcome {
                 reloaded: false,
                 disposition: MemberReloadDisposition::NotCurrent,
@@ -13730,53 +12710,44 @@ impl IdentityRuntime {
                 generation: None,
             });
         };
+        let generation = self
+            .core_live_scope(identity)
+            .await?
+            .map(|scope| ContinuityGeneration::new(scope.generation().get()));
 
-        self.ensure_active_lease(identity).await?;
-
-        // meerkat 0.8.34: the mob primitive quiesces, discards, and re-registers
-        // the executor for the SAME session off the actor loop, and can tell a
-        // healthy registration apart (`not_degraded`). Preferred when the
-        // bridge exposes it. A `not_current` verdict is a no-op, not authority
-        // to retire or replace the member.
-        let registration_reload = match self.bridge.as_ref() {
-            Some(bridge) => {
-                match bridge
-                    .reload_member_registration(&before.agent_runtime_id)
-                    .await
-                {
-                    Ok(reload) => reload,
-                    // Typed audited-endpoint divergence: the registration is
-                    // retained, but no reload can read the document. Park
-                    // the member with the exact repair commands instead of
-                    // reporting a store-not-healthy refusal that invites the
-                    // retry storm.
-                    Err(BridgeError::SessionRepairRequired {
-                        session_id, detail, ..
-                    }) => {
-                        return Err(self
-                            .park_session_repair_required(identity, session_id, detail)
-                            .await);
-                    }
-                    Err(error) => return Err(reload_phase_error(identity, error)),
-                }
+        let bridge = Arc::clone(self.core_bridge(identity)?);
+        // A `not_current` verdict is a no-op, not authority to retire or
+        // replace the member.
+        let registration_reload = match bridge
+            .reload_member_registration(&live.agent_runtime_id)
+            .await
+        {
+            Ok(reload) => reload,
+            // Typed audited-endpoint divergence: the registration is retained,
+            // but no reload can read the document. Refuse with the exact
+            // repair commands instead of a store-not-healthy refusal that
+            // invites the retry storm.
+            Err(error @ BridgeError::SessionRepairRequired { .. }) => {
+                let refusal = classify_wake_failure(identity, Some(&session_id), error);
+                self.record_wake_refusal(identity, &refusal).await;
+                return Err(refusal);
             }
-            None => None,
+            Err(error) => return Err(reload_phase_error(identity, error)),
         };
         if let Some(reload) = registration_reload {
-            if reload.session_id != before.session_id {
+            if reload.session_id != session_id {
                 return Err(IdentityRuntimeError::Internal(format!(
-                    "reload_member registration session {} differs from continuity session {}",
-                    reload.session_id, before.session_id,
+                    "reload_member registration session {} differs from Core's live session {}",
+                    reload.session_id, session_id,
                 )));
             }
             tracing::info!(
                 %identity,
-                session_id = %before.session_id,
-                generation = before.generation.get(),
+                %session_id,
                 disposition = ?reload.disposition,
                 registration_generation = reload.registration_generation,
                 "reload_member: meerkat member registration reload completed \
-                 (non-destructive; continuity generation does not advance)"
+                 (non-destructive; the incarnation does not change)"
             );
             return Ok(MemberReloadOutcome {
                 reloaded: matches!(
@@ -13784,102 +12755,49 @@ impl IdentityRuntime {
                     MemberReloadDisposition::Discarded | MemberReloadDisposition::Reattached
                 ),
                 disposition: reload.disposition,
-                session_id: Some(before.session_id),
-                generation: Some(before.generation),
+                session_id: Some(session_id),
+                generation,
             });
         }
 
         tracing::info!(
             %identity,
-            session_id = %before.session_id,
-            generation = before.generation.get(),
-            "reload_member: discarding the live member registration and re-materializing the \
-             same durable session (non-destructive; generation does not advance)"
+            %session_id,
+            "reload_member: retiring the live member and waking it onto the same session \
+             (non-destructive; Core's generation advances)"
         );
-        // Leaves the entry in the retired terminal form (`Retiring`, lease
-        // released, continuity intact), which `embody_identity_locked` accepts
-        // exactly like Dormant: the same door the plain retire-then-send
-        // recovery takes (#404).
         self.retire_locked_with_intent(identity, LifecycleRetireIntent::Reload)
             .await?;
-
-        let mut bound_generation = None;
-        let result = self
-            .embody_identity_locked(
-                identity,
-                None,
-                None,
-                None,
-                &mut bound_generation,
-                EmbodimentOverrides::default(),
-            )
-            .await
-            .map(|outcome| outcome.record);
-        self.mark_bootstrap_materialization_finished(identity, &result, bound_generation);
-        let record = result?;
-        if record.session_id != before.session_id {
-            tracing::warn!(
-                %identity,
-                before = %before.session_id,
-                after = %record.session_id,
-                "reload_member: the resume fell back to a fresh session (meerkat reported the \
-                 durable snapshot typed-absent); the identity is bound to the new session"
-            );
-        }
-        Ok(MemberReloadOutcome {
-            reloaded: true,
-            disposition: MemberReloadDisposition::Discarded,
-            session_id: Some(record.session_id),
-            generation: Some(record.generation),
-        })
+        let outcome = self.wake_onto_last_session_locked(identity).await?;
+        Ok(outcome)
     }
 
-    /// `reload_member` for a Broken identity parked with a
-    /// [`SessionRepairRequired`] hold: release the Broken entry's lower-plane
-    /// remnants and lease exactly as the repair pass would, re-project it
-    /// Dormant with its continuity record intact, and resume the SAME durable
-    /// session through the shared embodiment door. A successful resume clears
-    /// the hold (non-Broken projection); a document still refused re-parks
-    /// the identity through the resume door with a fresh hold, and the typed
-    /// `EmbodimentRejected(RepairRequired)` failure is what the operator sees.
+    /// `reload_member` for an identity whose last wake Core held for the
+    /// sanctioned audited-endpoint repair (`WakeHeld`, remedy
+    /// `repair_session`): the operator has (presumably) run the repair and
+    /// asks for the same durable session back. The wake door resumes it; a
+    /// document still refused records the hold again, and that typed
+    /// refusal is what the operator sees.
     async fn reload_repaired_session_locked(
         &self,
         identity: &AgentIdentity,
-        before: Option<ContinuityRecord>,
     ) -> Result<MemberReloadOutcome, IdentityRuntimeError> {
-        let Some(before) = before else {
-            return Err(IdentityRuntimeError::InvalidState {
-                identity: identity.clone(),
-                state: IdentityLifecycleState::Broken,
-                operation: "reload_member",
-            });
-        };
         tracing::info!(
             %identity,
-            session_id = %before.session_id,
-            generation = before.generation.get(),
-            "reload_member: re-attempting the resume of a session parked for the sanctioned \
-             audited-endpoint repair (same session, same generation)"
+            "reload_member: re-attempting the resume of a session held for the sanctioned \
+             audited-endpoint repair"
         );
-        self.prepare_broken_identity_for_registration(identity)
-            .await?;
-        {
-            let mut entries = self.entries.write().await;
-            if let Some(entry) = entries.get_mut(identity) {
-                entry.state = IdentityLifecycleState::Dormant;
-                entry.lease = None;
-            }
-        }
-        self.emit_event(
-            identity,
-            IdentityEvent::StateChanged {
-                identity: identity.clone(),
-                new_state: IdentityLifecycleState::Dormant,
-            },
-        )
-        .await;
         self.clear_materialization_backoff(identity).await;
+        self.wake_onto_last_session_locked(identity).await
+    }
 
+    /// Wake `identity` through the one wake door under the caller's
+    /// lifecycle lock and report it as a completed reload.
+    async fn wake_onto_last_session_locked(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<MemberReloadOutcome, IdentityRuntimeError> {
+        let before = self.core_last_binding(identity).await?;
         let mut bound_generation = None;
         let result = self
             .embody_identity_locked(
@@ -13890,32 +12808,29 @@ impl IdentityRuntime {
                 &mut bound_generation,
                 EmbodimentOverrides::default(),
             )
-            .await
-            .map(|outcome| outcome.record);
+            .await;
         self.mark_bootstrap_materialization_finished(identity, &result, bound_generation);
-        let record = result?;
+        let outcome = result?;
+        let scope = self.core_live_scope(identity).await?;
+        let session_id = outcome.binding.session_id.clone();
+        if let (Some(before), Some(after)) = (
+            before.as_ref().and_then(|binding| binding.session_id()),
+            session_id.as_ref(),
+        ) && before != after
         {
-            let mut entries = self.entries.write().await;
-            if let Some(entry) = entries.get_mut(identity)
-                && entry.state != IdentityLifecycleState::Broken
-            {
-                entry.session_repair_required = None;
-            }
-        }
-        if record.session_id != before.session_id {
             tracing::warn!(
                 %identity,
-                before = %before.session_id,
-                after = %record.session_id,
-                "reload_member: the repaired-session resume fell back to a fresh session; the \
-                 identity is bound to the new session"
+                before = %before,
+                after = %after,
+                "reload_member: Core holds no durable session for the last session, so the wake \
+                 spawned a fresh one; the identity runs on the new session"
             );
         }
         Ok(MemberReloadOutcome {
             reloaded: true,
             disposition: MemberReloadDisposition::Discarded,
-            session_id: Some(record.session_id),
-            generation: Some(record.generation),
+            session_id,
+            generation: scope.map(|scope| ContinuityGeneration::new(scope.generation().get())),
         })
     }
 
@@ -13954,11 +12869,14 @@ impl IdentityRuntime {
             IdentityRuntimeError::ActorAdmissionTimeout { .. } => {
                 (ReloadAttemptOutcome::TimedOut, error.to_string())
             }
-            IdentityRuntimeError::EmbodimentRejected(failure)
-                if failure.kind == ContinuityFailureKind::RepairRequired =>
-            {
-                (ReloadAttemptOutcome::RepairRequired, failure.detail.clone())
-            }
+            IdentityRuntimeError::WakeHeld {
+                hold:
+                    WakeHold::DurableResume(
+                        meerkat_core::service::DurableResumeHold::AuditedEndpointDivergence,
+                    ),
+                detail,
+                ..
+            } => (ReloadAttemptOutcome::RepairRequired, detail.clone()),
             other => (ReloadAttemptOutcome::Failed, other.to_string()),
         };
         let record = ReloadAttemptRecord {
@@ -14086,17 +13004,32 @@ impl IdentityRuntime {
             .clone()
     }
 
-    /// The identity's lifecycle and delivery health. Every field is an
-    /// in-process read: this never touches the mob actor, so it answers while
-    /// the loop is stalled, which is exactly when an operator needs it.
+    /// The identity's lifecycle and delivery health. Its Core facts come from
+    /// Core's member history (a store read) and the rest is in-process: this
+    /// never touches the mob actor, so it answers while the loop is stalled,
+    /// which is exactly when an operator needs it.
     pub async fn member_health(
         &self,
         identity: &AgentIdentity,
     ) -> Result<MemberHealthReport, IdentityRuntimeError> {
-        let entries = self.entries.read().await;
-        let entry = entries
-            .get(identity)
-            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
+        let (last_delivery_error, last_reload, wake_refusal) = {
+            let entries = self.entries.read().await;
+            let entry = entries
+                .get(identity)
+                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
+            (
+                entry.last_delivery_error.clone(),
+                entry.last_reload.clone(),
+                entry.wake_refusal.clone(),
+            )
+        };
+        let history = self.core_view_history().await.map_err(|error| {
+            IdentityRuntimeError::IdentityHistoryUnavailable {
+                identity: identity.clone(),
+                detail: format!("reading Core's member history: {error}"),
+            }
+        })?;
+        let facts = CoreViewFacts::of(history.as_ref(), identity);
         let bootstrap_state = self
             .identity_bootstrap_status()
             .identities
@@ -14111,30 +13044,24 @@ impl IdentityRuntime {
             .flatten();
         let mut report = MemberHealthReport {
             identity: identity.clone(),
-            member_id: entry
-                .continuity
-                .as_ref()
-                .map(|record| record.agent_runtime_id.clone()),
-            state: entry.state,
+            state: Self::view_state(self.runs_live_member(facts.live), wake_refusal.as_ref()),
+            member_id: facts.runtime_id,
             bootstrap_state,
             materialization_in_flight: bootstrap_state == Some(IdentityBootstrapState::Warming),
-            session_id: entry
-                .continuity
-                .as_ref()
-                .map(|record| record.session_id.clone()),
-            generation: entry.continuity.as_ref().map(|record| record.generation),
-            last_delivery_error: entry.last_delivery_error.clone(),
-            last_reload: entry.last_reload.clone(),
+            session_id: facts.session_id,
+            generation: facts.generation,
+            last_delivery_error,
+            last_reload,
             actor_loop,
             open_stall_id,
             durability: None,
-            continuity_unrecoverable: entry.continuity_unrecoverable.clone(),
-            session_repair_required: entry.session_repair_required.clone(),
+            session_repair_required: self.session_repair_hold(wake_refusal.as_ref()),
+            wake_refusal,
         };
-        // Custom bridges may await I/O. Never hold the fleet entries lock
-        // across that extension point.
-        drop(entries);
-        if let (Some(bridge), Some(session_id)) = (self.bridge.as_ref(), report.session_id.as_ref())
+        // Custom bridges may await I/O; no lock is held across it.
+        if facts.live
+            && let (Some(bridge), Some(session_id)) =
+                (self.bridge.as_ref(), report.session_id.as_ref())
         {
             report.durability = bridge.member_durability(session_id).await;
         }
@@ -14175,6 +13102,9 @@ impl IdentityRuntime {
         };
         if let Some(entry) = self.entries.write().await.get_mut(identity) {
             entry.last_delivery_error = Some(record);
+            if let IdentityRuntimeError::IdentitySessionAbsent { session_id, .. } = err {
+                entry.absent_delivery_session = Some(session_id.clone());
+            }
         }
     }
 
@@ -14187,19 +13117,15 @@ impl IdentityRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // Lifecycle: respawn() — REQ-09
+    // Lifecycle: respawn() - REQ-09
     // -----------------------------------------------------------------------
 
-    /// Respawn: non-destructive recovery.
-    ///
-    /// 1. Fence the current owner
-    /// 2. Attempt final checkpoint
-    /// 3. Reactivate from authoritative continuity with same record + runtime ID
-    /// 4. ContinuityGeneration does NOT advance
+    /// Respawn: non-destructive recovery onto the same session at a new Core
+    /// generation (see [`Self::respawn_locked`]).
     pub async fn respawn(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         self.respawn_with_expected_member_alias(identity, None)
             .await
     }
@@ -14208,7 +13134,7 @@ impl IdentityRuntime {
         &self,
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         let lifecycle_lock = self.lifecycle_lock_for(identity).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
         if let Some(expected_alias) = expected_alias {
@@ -14218,449 +13144,169 @@ impl IdentityRuntime {
         self.respawn_locked(identity).await
     }
 
-    /// Perform the identity-side half of respawn while the caller holds the
-    /// per-identity lifecycle lock.
+    /// Respawn: retire the identity's Core member, then wake it
+    /// onto the same session (Core's `Resume` from the member history) in one
+    /// verb under the lifecycle lock. The transcript is kept and Core's
+    /// generation ADVANCES, so a delivery scope captured before the respawn
+    /// refuses as stale. A crash between the two halves leaves the identity
+    /// retired with its history; the next wake resumes it. An identity Core
+    /// holds no member for is simply woken.
     async fn respawn_locked(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
-        let registered_entry = self
-            .mark_lifecycle_in_progress(identity, IdentityLifecycleState::Suspended)
-            .await?;
-
-        // Fence the old owner by re-acquiring the lease
-        let acquire_result = match self
-            .lease_provider
-            .acquire_leases(std::slice::from_ref(identity), &self.runtime_instance_id)
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                self.restore_entry(identity, registered_entry).await;
-                return Err(IdentityRuntimeError::Lease(err));
-            }
-        };
-
-        let grant = match acquire_result.get(identity) {
-            Some(super::types::LeaseAcquireResult::Acquired(g)) => g.clone(),
-            _ => {
-                self.restore_entry(identity, registered_entry).await;
-                return Err(IdentityRuntimeError::NoActiveLease(identity.clone()));
-            }
-        };
-
-        if let Err(err) = self
-            .advance_existing_continuity_fence(identity, &registered_entry, &grant)
-            .await
-        {
-            self.restore_broken_entry_and_release_grant(identity, registered_entry, &grant)
-                .await;
-            return Err(err);
-        }
-
-        // Resolve current continuity state
-        let resolved = match self
-            .continuity_store
-            .resolve_many(std::slice::from_ref(identity))
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                self.restore_entry_with_grant(identity, registered_entry.clone(), &grant)
-                    .await;
-                return Err(IdentityRuntimeError::Store(err));
-            }
-        };
-
-        let record = match resolved.get(identity) {
-            Some(super::types::ContinuityResolveState::Ready { record }) => record.clone(),
-            Some(super::types::ContinuityResolveState::Broken { failure }) => {
-                self.restore_entry_with_grant(identity, registered_entry, &grant)
-                    .await;
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "broken continuity for {identity}: {}",
-                    failure.detail
-                )));
-            }
-            Some(super::types::ContinuityResolveState::Uninitialized) => {
-                self.restore_entry_with_grant(identity, registered_entry, &grant)
-                    .await;
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "cannot respawn uninitialized identity {identity}"
-                )));
-            }
-            None => {
-                self.restore_entry_with_grant(identity, registered_entry, &grant)
-                    .await;
-                return Err(IdentityRuntimeError::Store(
-                    ContinuityStoreError::NotFound {
-                        identity: identity.clone(),
-                    },
-                ));
-            }
-        };
-
-        // §8.4 trigger (b): respawn is a recovery boundary — harvest the
-        // session's window before the runtime refreshes (the SessionId does
-        // not rotate here; the cursor stays valid). Bounded; respawn
-        // proceeds at the pre-rotation timeout.
-        if let Some(injector) = self.agent_memory.read().await.clone() {
-            let session_key = record.session_id.to_string();
-            injector.note_session_generation(identity, &session_key, record.generation.get());
-            injector
-                .distill_before_rotation(
-                    identity,
-                    &session_key,
-                    crate::memory::distiller::DistillCause::Respawn,
-                )
-                .await;
-        }
-
-        let effective_checkpoint_version = match self
-            .refresh_existing_session_runtime_state(identity, &record, &grant)
-            .await
-        {
-            Ok(version) => version,
-            Err(err) => {
-                self.restore_entry_with_grant(identity, registered_entry, &grant)
-                    .await;
-                return Err(err);
-            }
-        };
-        let mut record = record;
-        record.checkpoint_version = effective_checkpoint_version;
-
-        // Update runtime state: same record, new lease, back to Active
-        let mut entries = self.entries.write().await;
-        let Some(entry) = entries.get_mut(identity) else {
-            drop(entries);
-            if let Err(err) = self
-                .release_or_park_untracked_leases(std::slice::from_ref(&grant))
-                .await
-            {
-                tracing::warn!(
-                    %identity,
-                    error = %err,
-                    "failed to release lease after respawn entry disappeared; exact grant parked for retry"
-                );
-            }
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
+        // An identity this runtime does not hold is refused before Core's
+        // member is touched: the wake below would refuse it only after the
+        // retire had already happened.
+        if !self.entries.read().await.contains_key(identity) {
             return Err(IdentityRuntimeError::UnknownIdentity(identity.clone()));
-        };
-        entry.continuity = Some(record.clone());
-        entry.lease = Some(LeaseEntry {
-            fencing_token: grant.fencing_token,
-            ttl: grant.ttl,
-            acquired_at: Instant::now(),
-        });
-        entry.state = IdentityLifecycleState::Active;
-        entry.checkpoint_version = record.checkpoint_version;
-        entry.role_migration_refusal = None;
-        drop(entries);
-        self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Active, None);
-
-        Ok(record)
-    }
-
-    /// Rebind continuity to the concrete session created by a lower-level
-    /// member respawn. This keeps identity-first status aligned when a control
-    /// surface refreshes the mob member outside the identity runtime bridge.
-    pub async fn rebind_session_after_live_respawn(
-        &self,
-        identity: &AgentIdentity,
-        session_id: SessionId,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
-        self.rebind_session_after_live_respawn_with_expected_member_alias(
-            identity, None, session_id,
-        )
-        .await
-    }
-
-    async fn rebind_session_after_live_respawn_with_expected_member_alias(
-        &self,
-        identity: &AgentIdentity,
-        expected_alias: Option<&str>,
-        session_id: SessionId,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
-        let lifecycle_lock = self.lifecycle_lock_for(identity).await;
-        let _lifecycle_guard = lifecycle_lock.lock().await;
-        if let Some(expected_alias) = expected_alias {
-            self.ensure_expected_member_alias_current(identity, expected_alias)
-                .await?;
         }
-        self.rebind_session_after_live_respawn_locked(identity, session_id)
-            .await
-    }
-
-    async fn reconcile_delivered_session_locked(
-        &self,
-        identity: &AgentIdentity,
-        delivered_session_id: SessionId,
-    ) -> Result<Option<FencingToken>, IdentityRuntimeError> {
-        let current_session_id = {
-            let entries = self.entries.read().await;
-            let entry = entries
-                .get(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            entry
-                .continuity
-                .as_ref()
-                .map(|record| record.session_id.clone())
-        };
-
-        let Some(current_session_id) = current_session_id else {
-            return Ok(None);
-        };
-        if current_session_id == delivered_session_id {
-            return Ok(None);
-        }
-
-        tracing::warn!(
-            %identity,
-            old_session_id = %current_session_id,
-            new_session_id = %delivered_session_id,
-            "identity bridge delivery returned a rotated session; rebinding continuity"
-        );
-        self.rebind_session_after_live_respawn_locked(identity, delivered_session_id)
-            .await?;
-
-        let entries = self.entries.read().await;
-        let entry = entries
-            .get(identity)
-            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-        Ok(entry.lease.as_ref().map(|lease| lease.fencing_token))
-    }
-
-    async fn rebind_session_after_live_respawn_locked(
-        &self,
-        identity: &AgentIdentity,
-        session_id: SessionId,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
-        let registered_entry = self
-            .mark_lifecycle_in_progress(identity, IdentityLifecycleState::Suspended)
-            .await?;
-
-        let acquire_result = match self
-            .lease_provider
-            .acquire_leases(std::slice::from_ref(identity), &self.runtime_instance_id)
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                self.restore_entry(identity, registered_entry).await;
-                return Err(IdentityRuntimeError::Lease(err));
+        self.refuse_host_adopted(identity).await?;
+        if let Some(live) = self.core_live_member(identity).await? {
+            // The retire below ends the member, and the wake after it resumes
+            // the session from what Core keeps of it. When Core keeps nothing
+            // beyond the member (sessions in memory only), nothing could
+            // resume it again: refuse before anything is retired, as the
+            // bridge's own delivery repair does.
+            if let Some(session_id) = live.session_id.as_ref() {
+                self.refuse_respawn_without_durable_copy(identity, session_id)
+                    .await?;
             }
-        };
-
-        let grant = match acquire_result.get(identity) {
-            Some(super::types::LeaseAcquireResult::Acquired(g)) => g.clone(),
-            _ => {
-                self.restore_entry(identity, registered_entry).await;
-                return Err(IdentityRuntimeError::NoActiveLease(identity.clone()));
-            }
-        };
-
-        let mut record = match registered_entry.continuity.as_ref() {
-            Some(record) => record.clone(),
-            None => {
-                self.restore_entry_with_grant(identity, registered_entry, &grant)
-                    .await;
-                return Err(IdentityRuntimeError::UnknownIdentity(identity.clone()));
-            }
-        };
-        if let Err(err) = self
-            .advance_existing_continuity_fence(identity, &registered_entry, &grant)
-            .await
-        {
-            if let Some(bridge) = self.bridge.as_ref()
-                && let Err(unregister_err) =
-                    bridge.unregister_session_runtime_state(&session_id).await
+            self.clear_wake_notes_of_live_member(identity).await;
+            // Section 8.4 trigger (b): respawn is a recovery boundary; harvest the
+            // session's window before the member is replaced (the session
+            // does not rotate, so the cursor stays valid). Bounded.
+            let injector = self.agent_memory.read().await.clone();
+            if let Some(injector) = injector
+                && let Some(scope) = self.core_live_scope(identity).await?
             {
-                tracing::warn!(
-                    %identity,
-                    session_id = %session_id,
-                    error = %unregister_err,
-                    "failed to unregister rebound session after continuity fence failure"
-                );
-            }
-            self.restore_broken_entry_and_release_grant(identity, registered_entry, &grant)
-                .await;
-            return Err(err);
-        }
-        let previous_session_id = record.session_id.clone();
-        record.session_id = session_id;
-
-        if let Err(err) = self
-            .continuity_store
-            .upsert_continuity_record(&record, grant.fencing_token)
-            .await
-        {
-            if let Some(bridge) = self.bridge.as_ref()
-                && let Err(unregister_err) = bridge
-                    .unregister_session_runtime_state(&record.session_id)
-                    .await
-            {
-                tracing::warn!(
-                    %identity,
-                    session_id = %record.session_id,
-                    error = %unregister_err,
-                    "failed to unregister rebound session after continuity upsert failure"
-                );
-            }
-            self.mark_rebind_failure_broken(identity, registered_entry, &grant, &record)
-                .await;
-            return Err(IdentityRuntimeError::Store(err));
-        }
-
-        // A lower session-store save can advance the durable checkpoint head
-        // while a respawn is rebinding to a different session id. The local
-        // store preserves that same-generation maximum; read the effective
-        // row back before seeding bridge runtime state so neither the in-memory
-        // entry nor the new session counter rewinds to the stale captured
-        // version.
-        let effective = match self
-            .continuity_store
-            .resolve_many(std::slice::from_ref(identity))
-            .await
-        {
-            Ok(effective) => effective,
-            Err(error) => {
-                self.mark_rebind_failure_broken(identity, registered_entry, &grant, &record)
-                    .await;
-                return Err(IdentityRuntimeError::Store(error));
-            }
-        };
-        match effective.get(identity) {
-            Some(super::types::ContinuityResolveState::Ready {
-                record: effective_record,
-            }) if effective_record.session_id == record.session_id
-                && effective_record.generation == record.generation =>
-            {
-                record = effective_record.clone();
-            }
-            other => {
-                self.mark_rebind_failure_broken(identity, registered_entry, &grant, &record)
-                    .await;
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "rebind continuity read-back did not return the committed session/generation: {other:?}"
-                )));
-            }
-        }
-
-        if let Some(bridge) = self.bridge.as_ref() {
-            match bridge
-                .register_session_runtime_state(
-                    &record.session_id,
-                    identity,
-                    record.generation,
-                    record.checkpoint_version,
-                    grant.fencing_token,
-                )
-                .await
-            {
-                Ok(version) => {
-                    record.checkpoint_version =
-                        CheckpointVersion::new(record.checkpoint_version.get().max(version.get()));
-                }
-                Err(err) => {
-                    if let Err(unregister_err) = bridge
-                        .unregister_session_runtime_state(&record.session_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            %identity,
-                            session_id = %record.session_id,
-                            error = %unregister_err,
-                            "failed to unregister rebound session after bridge register failure"
-                        );
-                    }
-                    self.mark_rebind_failure_broken(identity, registered_entry, &grant, &record)
-                        .await;
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "bridge rebind respawned session runtime state: {err}"
-                    )));
-                }
-            }
-            if previous_session_id != record.session_id
-                && let Err(err) = bridge
-                    .unregister_session_runtime_state(&previous_session_id)
-                    .await
-            {
-                tracing::warn!(
-                    %identity,
-                    session_id = %previous_session_id,
-                    error = %err,
-                    "failed to unregister previous session after live respawn rebind"
-                );
-            }
-        }
-
-        if let Err(err) = self
-            .continuity_store
-            .upsert_continuity_record(&record, grant.fencing_token)
-            .await
-        {
-            if let Some(bridge) = self.bridge.as_ref()
-                && let Err(unregister_err) = bridge
-                    .unregister_session_runtime_state(&record.session_id)
-                    .await
-            {
-                tracing::warn!(
-                    %identity,
-                    session_id = %record.session_id,
-                    error = %unregister_err,
-                    "failed to unregister rebound session after final continuity upsert failure"
-                );
-            }
-            self.mark_rebind_failure_broken(identity, registered_entry, &grant, &record)
-                .await;
-            return Err(IdentityRuntimeError::Store(err));
-        }
-
-        self.register_locked(
-            registered_entry.spec,
-            IdentityLifecycleState::Active,
-            Some(record.clone()),
-            Some(grant),
-        )
-        .await;
-        if previous_session_id != record.session_id {
-            let observer = self
-                .session_rotation_observer
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(observer) = observer {
-                // The observer keys the member by its roster row, the encoded
-                // DURABLE identity; the runtime alias names only this
-                // incarnation and no roster row.
-                observer
-                    .member_session_rotated(
-                        &crate::member_comms_id::roster_member_id_for_identity(
-                            record.identity.as_str(),
-                        ),
-                        &previous_session_id,
-                        &record.session_id,
+                let session_key = scope.session_id().to_string();
+                injector.note_session_generation(identity, &session_key, scope.generation().get());
+                injector
+                    .distill_before_rotation(
+                        identity,
+                        &session_key,
+                        crate::memory::distiller::DistillCause::Respawn,
                     )
                     .await;
             }
+            self.core_bridge(identity)?
+                .retire_member(&live.agent_runtime_id)
+                .await
+                .map_err(|err| {
+                    IdentityRuntimeError::Internal(format!("bridge retire before respawn: {err}"))
+                })?;
+            self.entries.notify_binding_changed();
         }
-        Ok(record)
+        let mut generation = None;
+        let result = self
+            .embody_identity_locked(
+                identity,
+                None,
+                None,
+                None,
+                &mut generation,
+                EmbodimentOverrides::default(),
+            )
+            .await;
+        self.mark_bootstrap_materialization_finished(identity, &result, generation);
+        result?;
+        self.core_live_scope(identity).await
+    }
+
+    /// Refuse a respawn whose retire would end the only copy of the live
+    /// member's session: Core keeps it nowhere beyond the member (sessions
+    /// in memory only). A bridge that cannot say keeps the retire-then-wake
+    /// path; one that fails to answer refuses retryable. Nothing is retired
+    /// either way.
+    async fn refuse_respawn_without_durable_copy(
+        &self,
+        identity: &AgentIdentity,
+        session_id: &SessionId,
+    ) -> Result<(), IdentityRuntimeError> {
+        match self
+            .core_bridge(identity)?
+            .session_outlives_member(session_id)
+            .await
+        {
+            Ok(true) | Err(BridgeError::Unsupported { .. }) => Ok(()),
+            Ok(false) => Err(IdentityRuntimeError::InvalidState {
+                identity: identity.clone(),
+                state: IdentityLifecycleState::Active,
+                operation: "respawn a member whose session lives only in memory",
+            }),
+            Err(error) => Err(IdentityRuntimeError::IdentityWakeRetryable {
+                identity: identity.clone(),
+                session_id: Some(session_id.clone()),
+                detail: format!(
+                    "the respawn could not tell whether session {session_id} outlives its \
+                     member ({error}); nothing was retired"
+                ),
+            }),
+        }
+    }
+
+    /// A delivery landed on `delivered_session_id`. When that is not the
+    /// session the delivery was admitted under (`admitted_session_id`, from
+    /// the Core scope read before admission), Core rotated the member's
+    /// session (a delivery repair): tell the session rotation observer and
+    /// return Core's fence for the rotated binding. No Meta record is
+    /// rebound: every view reads Core.
+    async fn reconcile_delivered_session_locked(
+        &self,
+        identity: &AgentIdentity,
+        admitted_session_id: Option<&SessionId>,
+        delivered_session_id: SessionId,
+    ) -> Result<Option<FencingToken>, IdentityRuntimeError> {
+        let Some(previous_session_id) = admitted_session_id else {
+            return Ok(None);
+        };
+        if *previous_session_id == delivered_session_id {
+            return Ok(None);
+        }
+        tracing::warn!(
+            %identity,
+            old_session_id = %previous_session_id,
+            new_session_id = %delivered_session_id,
+            "identity bridge delivery returned a rotated session"
+        );
+        let observer = self
+            .session_rotation_observer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(observer) = observer {
+            // The observer keys the member by its roster row, the encoded
+            // DURABLE identity; the runtime alias names only one incarnation.
+            observer
+                .member_session_rotated(
+                    &crate::member_comms_id::roster_member_id_for_identity(identity.as_str()),
+                    previous_session_id,
+                    &delivered_session_id,
+                )
+                .await;
+        }
+        self.entries.notify_binding_changed();
+        Ok(self
+            .core_live_scope(identity)
+            .await?
+            .map(|scope| FencingToken::new(scope.fence_token().get())))
     }
 
     // -----------------------------------------------------------------------
-    // Lifecycle: reset() — REQ-10
+    // Lifecycle: reset() - REQ-10
     // -----------------------------------------------------------------------
 
-    /// Reset: destructive continuity reset.
-    ///
-    /// 1. Fence old owner
-    /// 2. Advance ContinuityGeneration
-    /// 3. Create fresh continuity under the same AgentIdentity
-    /// 4. Old-owner late writes rejected by stale fencing token
+    /// Reset: a destructive fresh start. Core mints a fresh session at
+    /// a higher generation under the CURRENT roster spec; the old session
+    /// stays in Core as history and the identity never resumes it again.
+    /// Liveness is kept: a live identity gets its successor, a dormant one
+    /// gets a fresh spawn that is retired at once. Returns Core's binding of
+    /// the fresh life. A host-adopted identity refuses typed.
     pub async fn reset(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<meerkat_mob::MemberBinding, IdentityRuntimeError> {
         self.reset_with_expected_member_alias(identity, None).await
     }
 
@@ -14668,7 +13314,7 @@ impl IdentityRuntime {
         &self,
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<meerkat_mob::MemberBinding, IdentityRuntimeError> {
         let mut foreground_shutdown = self.foreground_cancel.subscribe();
         let lifecycle_lock = self.lifecycle_lock_for(identity).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
@@ -14676,630 +13322,316 @@ impl IdentityRuntime {
             self.ensure_expected_member_alias_current(identity, expected_alias)
                 .await?;
         }
-        // Re-profile before snapshotting the lifecycle entry so the rebuilt
-        // session uses the current roster spec, not the old checkpoint spec.
+        // Before anything acts: a host-adopted identity is read-only.
+        self.refuse_host_adopted(identity).await?;
+        self.refuse_pending_first_boot_row(identity, "reset")
+            .await?;
+        // Re-profile first so the fresh session uses the current roster spec.
         self.adopt_current_roster_spec_for_reset(identity).await?;
-        let registered_entry = self
-            .mark_lifecycle_in_progress(identity, IdentityLifecycleState::Suspended)
+        let previous = self.core_last_binding(identity).await?;
+        let live = self
+            .start_fresh_life_locked(identity, &mut foreground_shutdown, "reset", None)
             .await?;
 
-        // INV-05: fence the old owner first
-        let acquire_result = match self
-            .lease_provider
-            .acquire_leases(std::slice::from_ref(identity), &self.runtime_instance_id)
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                self.restore_entry(identity, registered_entry).await;
-                return Err(IdentityRuntimeError::Lease(err));
-            }
-        };
-
-        let grant = match acquire_result.get(identity) {
-            Some(super::types::LeaseAcquireResult::Acquired(g)) => g.clone(),
-            _ => {
-                self.restore_entry(identity, registered_entry).await;
-                return Err(IdentityRuntimeError::NoActiveLease(identity.clone()));
-            }
-        };
-        if let Err(err) = self
-            .advance_existing_continuity_fence(identity, &registered_entry, &grant)
-            .await
-        {
-            self.restore_broken_entry_and_release_grant(identity, registered_entry, &grant)
-                .await;
-            return Err(err);
-        }
-
-        // Resolve to get current generation
-        let resolved = match self
-            .continuity_store
-            .resolve_many(std::slice::from_ref(identity))
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                self.restore_entry_with_grant(identity, registered_entry.clone(), &grant)
-                    .await;
-                return Err(IdentityRuntimeError::Store(err));
-            }
-        };
-
-        let current_gen = match resolved.get(identity) {
-            Some(super::types::ContinuityResolveState::Ready { record }) => record.generation,
-            Some(super::types::ContinuityResolveState::Uninitialized) => {
-                ContinuityGeneration::new(0)
-            }
-            _ => ContinuityGeneration::new(0),
-        };
-
-        // Advance generation
-        let new_gen = ContinuityGeneration::new(current_gen.get() + 1);
-        let new_session_id = meerkat_core::types::SessionId::new();
-        let new_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:{}", new_gen.get()))
-            .map_err(|e| {
-                IdentityRuntimeError::Internal(format!("failed to mint runtime id: {e}"))
-            })?;
-
-        let new_record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: new_runtime_id,
-            session_id: new_session_id,
-            generation: new_gen,
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        let spec = registered_entry.spec.clone();
-        let mut draft = super::types::AgentBuildDraft {
-            model: None,
-            system_prompt: None,
-            additional_instructions: spec.additional_instructions.clone(),
-            labels: spec.labels.clone(),
-            app_context: spec.context.clone(),
-            external_tools: Vec::new(),
-            local_external_tools: Default::default(),
-            provider_params: None,
-            compaction_curator: Default::default(),
-        };
-        if self.bridge.is_some() {
-            let active_peers = self.entries.read().await.keys().cloned().collect();
-            let managed_edges = self.desired_peer_edges.read().await.clone();
-            let build_context = AgentBuildContext {
-                identity: identity.clone(),
-                active_peers,
-                managed_edges,
-                runtime_services: self.runtime_services(),
-            };
-            let mut customized = false;
-            if let Some(customizer) = self.customizer.read().await.clone() {
-                let customize = customizer.customize_build(&build_context, &spec, &mut draft);
-                tokio::pin!(customize);
-                let customize_result = if *foreground_shutdown.borrow() {
-                    None
-                } else {
-                    tokio::select! {
-                        result = &mut customize => Some(result),
-                        changed = foreground_shutdown.changed() => {
-                            if changed.is_ok() && *foreground_shutdown.borrow() {
-                                None
-                            } else {
-                                Some(customize.await)
-                            }
-                        }
-                    }
-                };
-                let Some(customize_result) = customize_result else {
-                    self.restore_entry_with_grant(identity, registered_entry, &grant)
-                        .await;
-                    return Err(IdentityRuntimeError::Internal(
-                        "identity reset cancelled during shutdown before session installation"
-                            .to_string(),
-                    ));
-                };
-                if let Err(err) = customize_result {
-                    self.restore_entry_with_grant(identity, registered_entry, &grant)
-                        .await;
-                    if let super::types::CustomizerError::ToolArtifactRefused(refusal) = err {
-                        return Err(IdentityRuntimeError::ToolArtifactRefused(refusal));
-                    }
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "customizer after reset: {err}"
-                    )));
-                }
-                customized = true;
-            }
-            if customized {
-                self.publish_customizer_tools(identity, &mut draft).await;
-            }
-        }
-
-        #[cfg(feature = "extension-state")]
-        let extension_publication = match self
-            .bridge
-            .as_ref()
-            .map(|bridge| bridge.begin_extension_identity_publication(identity))
-            .transpose()
-        {
-            Ok(publication) => publication.flatten(),
-            Err(error) => {
-                self.restore_entry_with_grant(identity, registered_entry, &grant)
-                    .await;
-                return Err(IdentityRuntimeError::Internal(format!(
-                    "identity publication preparation: {error}"
-                )));
-            }
-        };
-
-        // Bridge: ONE authoritative successor transition. This used to retire the
-        // old mob member and then create a fresh one, which the durable-roster
-        // contract makes impossible - the successor occupies the same roster row,
-        // so the create collided with its own predecessor. Respawn is the single
-        // primitive that retires terminally and spawns the exact successor, and
-        // splitting it back into retire + create would reopen the compensation
-        // races it exists to close.
-        if let Some(bridge) = &self.bridge {
-            if let Err(err) = self
-                .continuity_store
-                .upsert_continuity_record(&new_record, grant.fencing_token)
-                .await
+        // The fresh life is committed in Core from here. The bookkeeping that
+        // needs only the old binding runs first, so a failed read of the
+        // fresh binding below never leaves it undone or invites a caller to
+        // rotate a second time.
+        //
+        // Section 10.1: reset is the deliberate clean-slate boundary. Clear session
+        // taint explicitly (rotation clears implicitly; this also drops
+        // pending pre-attribution taint) and mark the outgoing boundary
+        // synchronously; a runtime-owned task distills the outgoing session,
+        // which Core keeps, so the reset stays latency-neutral. The fresh
+        // life always runs on a fresh session, so the old one is outgoing.
+        let injector = self.agent_memory.read().await.clone();
+        if let Some(injector) = injector.as_ref() {
+            injector.clear_taint_for_identity(identity);
+            if let Some(previous) = previous.as_ref()
+                && let Some(old_session_id) = previous.session_id()
             {
-                self.restore_entry_with_grant(identity, registered_entry, &grant)
-                    .await;
-                return Err(IdentityRuntimeError::Store(err));
+                let capture = PendingResetMemoryCapture {
+                    injector: injector.clone(),
+                    identity: identity.clone(),
+                    session_key: old_session_id.to_string(),
+                    generation: previous.generation().get(),
+                };
+                injector.note_reset_boundary(&capture.session_key);
+                injector.note_session_generation(
+                    identity,
+                    &capture.session_key,
+                    capture.generation,
+                );
+                self.spawn_reset_memory_capture(capture).await;
             }
-            let provisional_record = new_record.clone();
+        }
+        self.settle_fresh_life(identity, live, None).await;
+        let fresh = self.committed_fresh_binding(identity, "reset").await?;
+        if let (Some(injector), Some(session_id)) = (injector.as_ref(), fresh.session_id()) {
+            injector.note_session_generation(
+                identity,
+                &session_id.to_string(),
+                fresh.generation().get(),
+            );
+        }
+        tracing::debug!(
+            %identity,
+            generation = fresh.generation().get(),
+            session_id = ?fresh.session_id(),
+            live,
+            "reset completed",
+        );
+        Ok(fresh)
+    }
 
-            let old_runtime_id = registered_entry
-                .continuity
-                .as_ref()
-                .map(|c| c.agent_runtime_id.clone());
-            let old_session_id = registered_entry
-                .continuity
-                .as_ref()
-                .map(|c| c.session_id.clone());
+    /// Core's binding of the fresh life `operation` just committed, read
+    /// once more on a failed read. If Core still cannot be read, the answer
+    /// says the fresh life IS committed and is not retryable: repeating the
+    /// verb would start another fresh life.
+    async fn committed_fresh_binding(
+        &self,
+        identity: &AgentIdentity,
+        operation: &'static str,
+    ) -> Result<meerkat_mob::MemberBinding, IdentityRuntimeError> {
+        let mut failure = String::new();
+        for _ in 0..2 {
+            match self.core_last_binding(identity).await {
+                Ok(Some(binding)) => return Ok(binding),
+                Ok(None) => {
+                    failure = "Core holds no binding of it".to_string();
+                    break;
+                }
+                Err(error) => failure = error.to_string(),
+            }
+        }
+        Err(IdentityRuntimeError::Internal(format!(
+            "identity {identity}: the {operation}'s fresh life is committed in Core, but its \
+             binding could not be read ({failure}); read the identity's status, do not repeat \
+             the {operation}"
+        )))
+    }
 
+    /// Start `identity`'s fresh life on Core while the caller holds the
+    /// lifecycle lock (reset, `delete_identity`): Core mints a fresh session
+    /// at a higher generation, and the old one stays in Core's store as
+    /// history. Liveness is kept. A live member is replaced by its
+    /// successor in ONE Core transition (`reset_member_to_successor`, never
+    /// composed from retire plus create); an identity Core holds no member
+    /// for gets a fresh spawn that is retired in the same verb, so it never
+    /// becomes live as a side effect. `queued` is the old member's captured
+    /// queue, admitted to the successor as soon as Core commits it. Returns
+    /// whether the identity is live afterwards.
+    async fn start_fresh_life_locked(
+        &self,
+        identity: &AgentIdentity,
+        foreground_shutdown: &mut watch::Receiver<bool>,
+        operation: &'static str,
+        queued: Option<super::bridge::QueuedMemberInputs>,
+    ) -> Result<bool, IdentityRuntimeError> {
+        // An identity a held pass did not publish owes its host a fresh held
+        // completion. A fresh life outside a held pass that covers it would
+        // have Core bind a member that completion never saw, and after a
+        // restart that binding would read as the pass's publication and drop
+        // the mark; so it is refused typed before Core is asked anything.
+        self.load_held_completion_marks().await?;
+        if self.held_completion_owed(identity)
+            && self
+                .held_create_pass()
+                .is_none_or(|pass| !pass.covers(identity))
+        {
+            return Err(IdentityRuntimeError::HeldCompletionOwed {
+                identity: identity.clone(),
+            });
+        }
+        let bridge = Arc::clone(self.core_bridge(identity)?);
+        let spec = self
+            .entries
+            .read()
+            .await
+            .get(identity)
+            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?
+            .spec
+            .clone();
+        let live = self.core_live_member(identity).await?.is_some();
+        if live {
+            self.clear_wake_notes_of_live_member(identity).await;
+        }
+        let draft = self
+            .fresh_life_draft(identity, &spec, foreground_shutdown, operation)
+            .await?;
+
+        if live {
             let successor = bridge
                 .reset_member_to_successor(identity, &spec, &draft)
                 .await
-                .map_err(|e| {
-                    IdentityRuntimeError::Internal(format!("bridge reset successor: {e}"))
-                });
-            let successor = match successor {
-                Ok(successor) => successor,
-                Err(err) => {
-                    // No cleanup retire here. The provisional runtime id was
-                    // never created as a roster row - respawn either committed
-                    // its own successor or did not - so retiring it would report
-                    // a spurious cleanup failure on top of the real error.
-                    let cleanup_error: Option<BridgeError> = None;
-                    let delete_error = self
-                        .restore_entry_after_reset_bridge_failure(
-                            identity,
-                            &provisional_record,
-                            registered_entry.clone(),
-                            &grant,
-                            cleanup_error.is_some(),
-                        )
-                        .await;
-                    if cleanup_error.is_some() || delete_error.is_some() {
-                        return Err(IdentityRuntimeError::Internal(format!(
-                            "{err}{}{}",
-                            cleanup_error
-                                .as_ref()
-                                .map(|e| format!("; cleanup retire failed: {e}"))
-                                .unwrap_or_default(),
-                            delete_error
-                                .as_ref()
-                                .map(|e| format!("; tentative continuity cleanup failed: {e}"))
-                                .unwrap_or_default()
-                        )));
+                .map_err(|error| {
+                    if let Some(queued) = queued.as_ref().filter(|queued| queued.carryable() > 0) {
+                        tracing::error!(
+                            %identity,
+                            lost = queued.carryable(),
+                            %error,
+                            "Core's successor respawn failed; the queued inputs captured before \
+                             it are lost if Core retired the member"
+                        );
                     }
-                    return Err(err);
-                }
-            };
-            // Commit continuity from what the machine actually committed. Both
-            // atoms come from the successor binding: the generation is
-            // MobMachine's to mint, so a pre-computed runtime id would be a
-            // guess that happened to be right until it was not.
-            let mut new_record = new_record;
-            new_record.agent_runtime_id = successor.agent_runtime_id.clone();
-            let session_id = successor.session_id;
-            new_record.session_id = session_id;
-            tracing::debug!(
-                identity = %identity,
-                runtime_id = %new_record.agent_runtime_id,
-                session_id = %new_record.session_id,
-                "reset bridge create_session completed",
-            );
-
-            if let Err(err) = self
-                .continuity_store
-                .upsert_continuity_record(&new_record, grant.fencing_token)
-                .await
-            {
-                let unregister_error = Self::unregister_bridge_session_runtime_states(
-                    bridge.as_ref(),
-                    std::slice::from_ref(&new_record.session_id),
-                )
-                .await;
-                let cleanup_error = bridge
-                    .retire_member(&new_record.agent_runtime_id)
-                    .await
-                    .err();
-                let delete_error = self
-                    .restore_entry_after_reset_bridge_failure(
-                        identity,
-                        &provisional_record,
-                        registered_entry.clone(),
-                        &grant,
-                        unregister_error.is_some() || cleanup_error.is_some(),
-                    )
-                    .await;
-                if unregister_error.is_some() || cleanup_error.is_some() || delete_error.is_some() {
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "continuity upsert actual session after reset: {err}{}{}{}",
-                        unregister_error
-                            .as_ref()
-                            .map(|e| format!("; unregister session failed: {e}"))
-                            .unwrap_or_default(),
-                        cleanup_error
-                            .as_ref()
-                            .map(|e| format!("; cleanup retire failed: {e}"))
-                            .unwrap_or_default(),
-                        delete_error
-                            .as_ref()
-                            .map(|e| format!("; tentative continuity cleanup failed: {e}"))
-                            .unwrap_or_default(),
-                    )));
-                }
-                return Err(IdentityRuntimeError::Store(err));
-            }
-
-            let register_result = bridge
-                .register_session_runtime_state(
-                    &new_record.session_id,
-                    identity,
-                    new_record.generation,
-                    new_record.checkpoint_version,
-                    grant.fencing_token,
-                )
-                .await;
-            let effective_checkpoint_version = match register_result {
-                Ok(version) => version,
-                Err(err) => {
-                    let unregister_error = Self::unregister_bridge_session_runtime_states(
-                        bridge.as_ref(),
-                        std::slice::from_ref(&new_record.session_id),
-                    )
-                    .await;
-                    let cleanup_error = bridge
-                        .retire_member(&new_record.agent_runtime_id)
-                        .await
-                        .err();
-                    let mut detail =
-                        format!("bridge register actual session runtime state after reset: {err}");
-                    if let Some(unregister_error) = unregister_error.as_ref() {
-                        detail
-                            .push_str(&format!("; unregister session failed: {unregister_error}"));
+                    IdentityRuntimeError::Internal(format!(
+                        "{operation} of identity {identity}: Core's successor respawn failed: \
+                         {error}"
+                    ))
+                })?;
+            // The captured queue goes to the fresh member before anything
+            // reads the binding back.
+            if let Some(queued) = queued {
+                match successor.session_id.as_ref() {
+                    Some(session_id) => {
+                        bridge
+                            .readmit_queued_member_inputs(identity, session_id, queued)
+                            .await;
                     }
-                    if let Some(cleanup_error) = cleanup_error.as_ref() {
-                        detail.push_str(&format!("; cleanup retire failed: {cleanup_error}"));
-                    }
-                    let delete_error = self
-                        .restore_entry_after_reset_bridge_failure(
-                            identity,
-                            &new_record,
-                            registered_entry.clone(),
-                            &grant,
-                            unregister_error.is_some() || cleanup_error.is_some(),
-                        )
-                        .await;
-                    if let Some(delete_error) = delete_error {
-                        return Err(IdentityRuntimeError::Internal(format!(
-                            "{detail}; tentative continuity cleanup failed: {delete_error}"
-                        )));
-                    }
-                    return Err(IdentityRuntimeError::Internal(detail));
-                }
-            };
-            new_record.checkpoint_version = effective_checkpoint_version;
-            tracing::debug!(
-                identity = %identity,
-                runtime_id = %new_record.agent_runtime_id,
-                session_id = %new_record.session_id,
-                checkpoint_version = new_record.checkpoint_version.get(),
-                "reset bridge session runtime state registered",
-            );
-
-            if let Err(err) = self
-                .continuity_store
-                .upsert_continuity_record(&new_record, grant.fencing_token)
-                .await
-            {
-                tracing::warn!(
-                    identity = %identity,
-                    runtime_id = %new_record.agent_runtime_id,
-                    session_id = %new_record.session_id,
-                    error = %err,
-                    "reset final continuity upsert failed after bridge materialization; rolling back new generation",
-                );
-                let unregister_error = bridge
-                    .unregister_session_runtime_state(&new_record.session_id)
-                    .await
-                    .err();
-                let cleanup_error = bridge
-                    .retire_member(&new_record.agent_runtime_id)
-                    .await
-                    .err();
-                let rollback_error = self
-                    .continuity_store
-                    .rollback_continuity_record(
-                        &new_record,
-                        registered_entry.continuity.as_ref(),
-                        grant.fencing_token,
-                    )
-                    .await
-                    .err();
-                if rollback_error.is_some() {
-                    self.restore_broken_entry_from_authoritative_continuity(
-                        identity,
-                        registered_entry,
-                        &grant,
-                    )
-                    .await;
-                } else {
-                    self.restore_broken_entry_and_release_grant(identity, registered_entry, &grant)
-                        .await;
-                }
-                if unregister_error.is_some() || cleanup_error.is_some() || rollback_error.is_some()
-                {
-                    return Err(IdentityRuntimeError::Internal(format!(
-                        "continuity upsert after reset: {err}{}{}{}",
-                        unregister_error
-                            .as_ref()
-                            .map(|e| format!("; unregister session failed: {e}"))
-                            .unwrap_or_default(),
-                        cleanup_error
-                            .as_ref()
-                            .map(|e| format!("; cleanup retire failed: {e}"))
-                            .unwrap_or_default(),
-                        rollback_error
-                            .as_ref()
-                            .map(|e| format!("; continuity rollback failed: {e}"))
-                            .unwrap_or_default()
-                    )));
-                }
-                return Err(IdentityRuntimeError::Store(err));
-            }
-
-            // Update runtime state
-            let mut entries = self.entries.write().await;
-            let Some(entry) = entries.get_mut(identity) else {
-                drop(entries);
-                tracing::warn!(
-                    identity = %identity,
-                    runtime_id = %new_record.agent_runtime_id,
-                    session_id = %new_record.session_id,
-                    "reset entry disappeared after bridge materialization; rolling back new generation",
-                );
-                let _ = bridge
-                    .unregister_session_runtime_state(&new_record.session_id)
-                    .await;
-                let _ = bridge.retire_member(&new_record.agent_runtime_id).await;
-                if let Err(err) = self
-                    .continuity_store
-                    .rollback_continuity_record(
-                        &new_record,
-                        registered_entry.continuity.as_ref(),
-                        grant.fencing_token,
-                    )
-                    .await
-                {
-                    tracing::warn!(
+                    None if queued.carryable() > 0 => tracing::error!(
                         %identity,
-                        error = %err,
-                        "failed to roll back continuity after reset entry disappeared"
-                    );
+                        lost = queued.carryable(),
+                        "the fresh member has no session to admit the captured queued inputs \
+                         to; they are lost"
+                    ),
+                    None => {}
                 }
-                if let Err(err) = self
-                    .release_or_park_untracked_leases(std::slice::from_ref(&grant))
-                    .await
-                {
-                    tracing::warn!(
-                        %identity,
-                        error = %err,
-                        "failed to release lease after reset entry disappeared; exact grant parked for retry"
-                    );
-                }
-                return Err(IdentityRuntimeError::UnknownIdentity(identity.clone()));
-            };
-            entry.continuity = Some(new_record.clone());
-            entry.lease = Some(Self::lease_entry_from_grant(&grant));
-            entry.state = IdentityLifecycleState::Active;
-            entry.checkpoint_version = new_record.checkpoint_version;
-            // The reset installed a new embodiment: a refusal of the old one
-            // no longer describes this identity. Rollbacks restore the
-            // snapshot, park included.
-            entry.role_migration_refusal = None;
-            tracing::debug!(
-                identity = %identity,
-                runtime_id = %new_record.agent_runtime_id,
-                session_id = %new_record.session_id,
-                "reset completed",
-            );
-            drop(entries);
-
-            // The prior bridge projection remains rollback authority until
-            // the final continuity row and in-memory entry both commit. In
-            // particular, blocking continuity stores introduce scheduler
-            // yield points here, so scheduling cleanup before the final
-            // upsert can unregister the old session while rollback is still
-            // possible.
-            // NO old-member retire debt. The authoritative successor transition
-            // (respawn) terminally retired the predecessor row inside the same
-            // operation, so scheduling a retire here would manufacture debt for
-            // work another authority already committed - and because respawn
-            // always advances the generation, the old/new filter below would
-            // never skip it. Reset would return success while the runtime
-            // accumulated retryable cleanup it could never discharge.
-            //
-            // `retire_reset_superseded_member` is deliberately NOT made tolerant
-            // of an absent member: that would hide wrong ownership here and mask
-            // genuinely missing members everywhere else it is used.
-            let cleanup_old_runtime_id: Option<AgentRuntimeId> = None;
-            let _ = &old_runtime_id;
-            // The old SESSION is still Meta's to unregister: it is a
-            // continuity concern rather than a roster row, so respawn does not
-            // touch it. If that unregistration fails it stays exact and
-            // retryable, unchanged.
-            let cleanup_old_session_id = old_session_id
-                .as_ref()
-                .filter(|old_session_id| *old_session_id != &new_record.session_id)
-                .cloned();
-            let reset_memory_injector = self.agent_memory.read().await.clone();
-            let reset_memory_capture = reset_memory_injector.as_ref().and_then(|injector| {
-                registered_entry.continuity.as_ref().map(|old_continuity| {
-                    PendingResetMemoryCapture {
-                        injector: injector.clone(),
+            }
+        } else {
+            if let Some(queued) = queued.as_ref().filter(|queued| queued.carryable() > 0) {
+                tracing::error!(
+                    %identity,
+                    lost = queued.carryable(),
+                    "the member left Core before its fresh life; the queued inputs captured from \
+                     it have no member to go to and are lost"
+                );
+            }
+            let created = bridge
+                .create_session(identity, &spec, &draft)
+                .await
+                .map_err(|error| match deterministic_build_rejection_reason(&error) {
+                    Some(reason) => IdentityRuntimeError::HostRejectedBuild {
                         identity: identity.clone(),
-                        session_key: old_continuity.session_id.to_string(),
-                        generation: old_continuity.generation.get(),
+                        reason,
+                    },
+                    None => IdentityRuntimeError::Internal(format!(
+                        "{operation} of identity {identity}: Core's fresh spawn failed: {error}"
+                    )),
+                })?;
+            if let Err(error) = bridge.retire_member(&created.agent_runtime_id).await {
+                self.entries.notify_binding_changed();
+                return Err(IdentityRuntimeError::Internal(format!(
+                    "{operation} of identity {identity}: Core committed the fresh session, but \
+                     retiring it to keep the identity dormant failed ({error}); the identity is \
+                     live until it is retired"
+                )));
+            }
+        }
+        self.entries.notify_binding_changed();
+        Ok(live)
+    }
+
+    /// The build draft of a fresh life (reset, `delete_identity`): the base
+    /// draft plus the installed customizer. A foreground shutdown cancels it
+    /// before Core is asked for anything.
+    async fn fresh_life_draft(
+        &self,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
+        foreground_shutdown: &mut watch::Receiver<bool>,
+        operation: &'static str,
+    ) -> Result<AgentBuildDraft, IdentityRuntimeError> {
+        let mut draft = Self::base_build_draft(spec);
+        let Some(customizer) = self.customizer.read().await.clone() else {
+            return Ok(draft);
+        };
+        let cancelled = || {
+            IdentityRuntimeError::Internal(format!(
+                "identity {operation} cancelled during shutdown before Core was asked for a \
+                 fresh session"
+            ))
+        };
+        if *foreground_shutdown.borrow() {
+            return Err(cancelled());
+        }
+        let active_peers = self.entries.read().await.keys().cloned().collect();
+        let managed_edges = self.desired_peer_edges.read().await.clone();
+        let build_context = AgentBuildContext {
+            identity: identity.clone(),
+            active_peers,
+            managed_edges,
+            runtime_services: self.runtime_services(),
+        };
+        let customize_result = {
+            let customize = customizer.customize_build(&build_context, spec, &mut draft);
+            tokio::pin!(customize);
+            tokio::select! {
+                result = &mut customize => result,
+                changed = foreground_shutdown.changed() => {
+                    if changed.is_ok() && *foreground_shutdown.borrow() {
+                        return Err(cancelled());
                     }
-                })
-            });
-            // Record exact cleanup debt immediately after the durable and
-            // in-memory replacement commit. The owned debt carries its memory
-            // capture prerequisite, so reset remains latency-neutral while
-            // graceful shutdown still joins/retries the complete sequence.
-            let reset_bridge_cleanup = self
-                .record_old_bridge_cleanup_after_reset(
-                    cleanup_old_runtime_id,
-                    cleanup_old_session_id,
-                    reset_memory_capture.clone(),
-                )
-                .await;
-            // §10.1: reset is the deliberate clean-slate boundary — clear
-            // session taint explicitly (rotation clears implicitly; this
-            // also drops pending pre-attribution taint). Mark the outgoing
-            // boundary synchronously; the runtime-owned cleanup task performs
-            // bounded distillation before it may CAS-delete the superseded
-            // session projection. This preserves detached reset latency
-            // without racing the evidence source.
-            if let Some(injector) = reset_memory_injector.as_ref() {
-                injector.clear_taint_for_identity(identity);
-                injector.note_session_generation(
-                    identity,
-                    &new_record.session_id.to_string(),
-                    new_record.generation.get(),
-                );
-                if let Some(old_continuity) = registered_entry.continuity.as_ref() {
-                    let old_session_key = old_continuity.session_id.to_string();
-                    injector.note_reset_boundary(&old_session_key);
-                    injector.note_session_generation(
-                        identity,
-                        &old_session_key,
-                        old_continuity.generation.get(),
-                    );
+                    customize.await
                 }
             }
-
-            if let Some(cleanup) = reset_bridge_cleanup {
-                self.spawn_old_bridge_cleanup_after_reset(bridge.clone(), cleanup)
-                    .await;
-            }
-            tracing::debug!(
-                identity = %identity,
-                runtime_id = %new_record.agent_runtime_id,
-                session_id = %new_record.session_id,
-                "reset old bridge cleanup debt recorded after continuity commit",
-            );
-            self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Active, None);
-            #[cfg(feature = "extension-state")]
-            if let Some(publication) = extension_publication {
-                publication.publish();
-            }
-            return Ok(new_record);
-        }
-
-        // Persist the new record (fencing token from new lease protects against old writes)
-        if let Err(err) = self
-            .continuity_store
-            .upsert_continuity_record(&new_record, grant.fencing_token)
-            .await
-        {
-            self.restore_entry_with_grant(identity, registered_entry, &grant)
-                .await;
-            return Err(IdentityRuntimeError::Store(err));
-        }
-
-        // No bridge — update runtime state only (validation mode)
-        let mut entries = self.entries.write().await;
-        let Some(entry) = entries.get_mut(identity) else {
-            drop(entries);
-            if let Err(err) = self
-                .continuity_store
-                .rollback_continuity_record(
-                    &new_record,
-                    registered_entry.continuity.as_ref(),
-                    grant.fencing_token,
-                )
-                .await
-            {
-                tracing::warn!(
-                    %identity,
-                    error = %err,
-                    "failed to roll back continuity after reset validation entry disappeared"
-                );
-            }
-            if let Err(err) = self
-                .release_or_park_untracked_leases(std::slice::from_ref(&grant))
-                .await
-            {
-                tracing::warn!(
-                    %identity,
-                    error = %err,
-                    "failed to release lease after reset validation entry disappeared; exact grant parked for retry"
-                );
-            }
-            return Err(IdentityRuntimeError::UnknownIdentity(identity.clone()));
         };
-        entry.continuity = Some(new_record.clone());
-        entry.lease = Some(Self::lease_entry_from_grant(&grant));
-        entry.state = IdentityLifecycleState::Active;
-        entry.checkpoint_version = CheckpointVersion::new(0);
-        entry.role_migration_refusal = None;
-        drop(entries);
-        if let Some(injector) = self.agent_memory.read().await.as_ref() {
-            injector.clear_taint_for_identity(identity);
-            // No-bridge (validation) reset: same §8.4 boundary semantics.
-            if let Some(old_continuity) = registered_entry.continuity.as_ref() {
-                let old_session_key = old_continuity.session_id.to_string();
-                injector.note_reset_boundary(&old_session_key);
-                injector.spawn_rotation_distillation(
-                    identity,
-                    &old_session_key,
-                    crate::memory::distiller::DistillCause::Reset,
-                );
+        if let Err(err) = customize_result {
+            if let super::types::CustomizerError::ToolArtifactRefused(refusal) = err {
+                return Err(IdentityRuntimeError::ToolArtifactRefused(refusal));
             }
+            return Err(IdentityRuntimeError::Internal(format!(
+                "customizer for {operation}: {err}"
+            )));
         }
+        self.publish_customizer_tools(identity, &mut draft).await;
+        Ok(draft)
+    }
 
-        self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Active, None);
-        Ok(new_record)
+    /// Settle the views after a fresh life (reset, `delete_identity`): a
+    /// recorded refusal of the old session no longer describes the identity.
+    async fn settle_fresh_life(
+        &self,
+        identity: &AgentIdentity,
+        live: bool,
+        replaced_session: Option<super::types::ReplacedSession>,
+    ) {
+        if live {
+            self.settle_successful_wake(identity, replaced_session)
+                .await;
+            self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Active, None);
+            return;
+        }
+        if let Some(entry) = self.entries.write().await.get_mut(identity) {
+            entry.wake_refusal = None;
+            entry.replaced_session = replaced_session;
+            entry.absent_delivery_session = None;
+        }
+        self.clear_materialization_backoff(identity).await;
+        self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Dormant, None);
+        self.emit_event(
+            identity,
+            IdentityEvent::StateChanged {
+                identity: identity.clone(),
+                new_state: IdentityLifecycleState::Dormant,
+            },
+        )
+        .await;
     }
 
     // -----------------------------------------------------------------------
-    // Lifecycle: delete_identity() — REQ-11
+    // Lifecycle: delete_identity() - REQ-11
     // -----------------------------------------------------------------------
 
-    /// Delete an identity: removes continuity record.
-    ///
-    /// 1. Fence old owner
-    /// 2. Remove ContinuityRecord
-    /// 3. Future bootstrap treats identity as Uninitialized
+    /// Delete an identity's continuity: its next life starts fresh
+    /// at once, and no "deleted" mark is stored (Core's last binding is the
+    /// fresh session). Liveness is kept, as for [`Self::reset`]. The old
+    /// session stays in Core's store as history; the identity never resumes
+    /// it again. `None` when Core never spawned the identity: there is
+    /// nothing to delete. A host-adopted identity refuses typed.
     pub async fn delete_identity(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<(), IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberBinding>, IdentityRuntimeError> {
         self.delete_identity_with_expected_member_alias(identity, None)
             .await
     }
@@ -15308,7 +13640,7 @@ impl IdentityRuntime {
         &self,
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
-    ) -> Result<(), IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberBinding>, IdentityRuntimeError> {
         let lifecycle_lock = self.lifecycle_lock_for(identity).await;
         let _lifecycle_guard = lifecycle_lock.lock().await;
         if let Some(expected_alias) = expected_alias {
@@ -15321,389 +13653,109 @@ impl IdentityRuntime {
     async fn delete_identity_locked(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<(), IdentityRuntimeError> {
-        let registered_entry = self
-            .mark_lifecycle_in_progress(identity, IdentityLifecycleState::Retiring)
+    ) -> Result<Option<meerkat_mob::MemberBinding>, IdentityRuntimeError> {
+        // Before anything acts: a host-adopted identity is read-only.
+        self.refuse_host_adopted(identity).await?;
+        if !self.entries.read().await.contains_key(identity) {
+            return Err(IdentityRuntimeError::UnknownIdentity(identity.clone()));
+        }
+        self.refuse_pending_first_boot_row(identity, "delete_identity")
             .await?;
-        let runtime_id = registered_entry
-            .continuity
-            .as_ref()
-            .map(|c| c.agent_runtime_id.clone());
-        let session_id = registered_entry
-            .continuity
-            .as_ref()
-            .map(|c| c.session_id.clone());
-
-        // INV-05: fence the old owner first
-        let acquire_result = match self
-            .lease_provider
-            .acquire_leases(std::slice::from_ref(identity), &self.runtime_instance_id)
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                self.restore_entry(identity, registered_entry).await;
-                return Err(IdentityRuntimeError::Lease(err));
-            }
+        let Some(previous) = self.core_last_binding(identity).await? else {
+            return Ok(None);
         };
+        let previous_session_key = previous.session_id().map(ToString::to_string);
 
-        let grant = match acquire_result.get(identity) {
-            Some(super::types::LeaseAcquireResult::Acquired(g)) => g.clone(),
-            _ => {
-                self.restore_entry(identity, registered_entry).await;
-                return Err(IdentityRuntimeError::NoActiveLease(identity.clone()));
-            }
-        };
-        if let Err(err) = self
-            .advance_existing_continuity_fence(identity, &registered_entry, &grant)
-            .await
+        // Section 8.4 trigger (b): delete is the identity's LAST boundary - harvest
+        // the outgoing session before its fresh life starts. Bounded; the
+        // delete proceeds at the pre-rotation timeout.
+        let injector = self.agent_memory.read().await.clone();
+        if let (Some(injector), Some(session_key)) =
+            (injector.as_ref(), previous_session_key.as_ref())
         {
-            self.restore_broken_entry_and_release_grant(identity, registered_entry, &grant)
-                .await;
-            return Err(err);
-        }
-        // The durable fence now belongs to the delete transaction. Refresh
-        // the bridge adapter before retirement so Meerkat's terminal archive
-        // projection carries that same token. Leaving the live session on the
-        // prior token makes ArchiveSession fail closed, retains a Retiring Mob
-        // anchor, and later prevents strict shutdown attestation.
-        if let Some(record) = registered_entry.continuity.as_ref()
-            && let Err(error) = self
-                .refresh_existing_session_runtime_state(identity, record, &grant)
-                .await
-        {
-            self.restore_broken_entry_with_fenced_store(identity, registered_entry, &grant)
-                .await;
-            return Err(IdentityRuntimeError::Internal(format!(
-                "bridge refresh session authority before delete: {error}"
-            )));
-        }
-
-        // §8.4 trigger (b): delete is the identity's LAST boundary — harvest
-        // the outgoing session before teardown (its exit-interview analog,
-        // §8.5, is the steward's; the distillate is what it will read).
-        // Bounded; deletion proceeds at the pre-rotation timeout.
-        if let Some(injector) = self.agent_memory.read().await.clone() {
-            if let Some(session_id) = session_id.as_ref() {
-                let session_key = session_id.to_string();
-                injector
-                    .distill_before_rotation(
-                        identity,
-                        &session_key,
-                        crate::memory::distiller::DistillCause::Delete,
-                    )
-                    .await;
-                // Ask 2 GC: delete permanently abandons this session id, and
-                // its knowledge has just been distilled into the identity-keyed
-                // Meta store (which the exit-interview harvest below reads —
-                // a DIFFERENT store from the meerkat session-memory scope). So
-                // reclaiming the orphaned meerkat scope here frees dead
-                // re-embed weight without starving any downstream read.
-                injector
-                    .drop_orphaned_session_scope(
-                        &session_key,
-                        crate::memory::distiller::DistillCause::Delete,
-                    )
-                    .await;
-            }
-            // §8.5 exit interview (delete is the identity's LAST boundary).
             injector
-                .note_identity_retired(
+                .distill_before_rotation(
                     identity,
-                    session_id
-                        .as_ref()
-                        .map(std::string::ToString::to_string)
-                        .as_deref(),
-                    "delete",
+                    session_key,
+                    crate::memory::distiller::DistillCause::Delete,
                 )
                 .await;
         }
 
-        // Retire the mob member through the session bridge before removing
-        // the continuity record. This ensures the mob actor is cleaned up.
-        if let (Some(bridge), Some(rid)) = (&self.bridge, &runtime_id)
-            && let Err(err) = bridge.retire_member(rid).await
-        {
-            self.restore_entry_with_grant(identity, registered_entry, &grant)
-                .await;
-            return Err(IdentityRuntimeError::Internal(format!(
-                "bridge retire before delete: {err}"
-            )));
-        }
-
-        if let (Some(bridge), Some(session_id)) = (&self.bridge, &session_id)
-            && let Some(err) = Self::unregister_bridge_session_runtime_states(
-                bridge.as_ref(),
-                std::slice::from_ref(session_id),
-            )
-            .await
-        {
-            self.restore_broken_entry_with_fenced_store(identity, registered_entry, &grant)
-                .await;
-            return Err(IdentityRuntimeError::Internal(format!(
-                "bridge unregister session before delete: {err}"
-            )));
-        }
-
-        // Destroy-deprojection (2026-07-31 verdict): the durable session row
-        // must not outlive the identity - a leftover external body is
-        // exactly what the ephemeral-runtime-store activation mint would
-        // faithfully resurrect on the next cold pod. Projection writes are
-        // already quiesced (member retired, session unregistered) and this
-        // delete transaction owns the ADVANCED identity fence, so the
-        // revision-CAS delete cannot race a live writer. `delete_continuity_record` below removes any
-        // remainder atomically for conforming stores; a store that cannot
-        // support session-scoped deletion (`Ok(false)` default) or a row the
-        // current decoder cannot token (an unimported released envelope)
-        // keeps the record-scoped contract and is surfaced loudly instead of
-        // silently retained.
-        if let Some(session_id) = session_id.as_ref() {
-            match self
-                .continuity_store
-                .load_session_snapshot(session_id)
-                .await
-            {
-                Ok(Some(snapshot)) => {
-                    let cas_token = serde_json::from_slice::<meerkat_core::Session>(&snapshot.data)
-                        .ok()
-                        .and_then(|current| {
-                            meerkat_core::session_store::session_projection_cas_token(&current).ok()
-                        });
-                    match cas_token {
-                        Some(token) => match self
-                            .continuity_store
-                            .delete_session_snapshot_if_current_revision(session_id, &token)
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                tracing::warn!(
-                                    identity = %identity,
-                                    session_id = %session_id,
-                                    "session-scoped snapshot delete unsupported or superseded; \
-                                     relying on delete_continuity_record's record-scoped \
-                                     deletion - a non-conforming external store may retain a \
-                                     resurrectable session body"
-                                );
-                            }
-                            Err(err) => {
-                                self.restore_broken_entry_and_release_grant(
-                                    identity,
-                                    registered_entry,
-                                    &grant,
-                                )
-                                .await;
-                                return Err(IdentityRuntimeError::Store(err));
-                            }
-                        },
-                        None => {
-                            tracing::warn!(
-                                identity = %identity,
-                                session_id = %session_id,
-                                "durable session row cannot be revision-tokened for CAS \
-                                 delete; relying on delete_continuity_record's record-scoped \
-                                 deletion"
-                            );
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    self.restore_broken_entry_and_release_grant(identity, registered_entry, &grant)
-                        .await;
-                    return Err(IdentityRuntimeError::Store(err));
-                }
-            }
-        }
-
-        // Remove authoritative continuity record from the store
-        if let Err(err) = self
-            .continuity_store
-            .delete_continuity_record(identity, grant.fencing_token)
-            .await
-        {
-            self.restore_broken_entry_and_release_grant(identity, registered_entry, &grant)
-                .await;
-            return Err(IdentityRuntimeError::Store(err));
-        }
-
-        // Authoritative deletion is committed before ownership is released,
-        // so another holder can never race the continuity delete. Surface a
-        // provider release failure explicitly; the still-held external grant
-        // then remains the fail-closed ownership fence.
-        let release_result = self
-            .lease_provider
-            .release_leases(std::slice::from_ref(&grant))
-            .await;
-
-        match release_result {
-            Ok(()) => {
-                self.event_channels.write().await.remove(identity);
-                self.entries.write().await.remove(identity);
-                // The identity remains part of the desired bootstrap roster
-                // until a roster reconcile removes it. Successful deletion
-                // therefore makes readiness Dormant.
-                self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Dormant, None);
-                Ok(())
-            }
-            Err(error) => {
-                // The physical member and continuity row are already gone,
-                // but the provider still owns this exact fencing grant. Keep
-                // an explicit Broken tombstone so reconcile and shutdown can
-                // retry it; removing the entry here would make non-expiring
-                // provider authority permanently unreachable.
-                let mut entries = self.entries.write().await;
-                let entry = entries
-                    .get_mut(identity)
-                    .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-                entry.state = IdentityLifecycleState::Broken;
-                entry.continuity = None;
-                entry.lease = None;
-                entry.pending_lease_release = Some(grant);
-                drop(entries);
-                self.mark_bootstrap_from_lifecycle(
-                    identity,
-                    IdentityLifecycleState::Broken,
-                    Some(format!("lease release after delete: {error}")),
-                );
-                Err(IdentityRuntimeError::Lease(error))
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Checkpoint — REQ-14, REQ-15, REQ-16, REQ-17
-    // -----------------------------------------------------------------------
-
-    /// Save a checkpoint snapshot. Enforces version ordering and fencing.
-    pub async fn checkpoint(
-        &self,
-        identity: &AgentIdentity,
-        snapshot: &SessionSnapshot,
-    ) -> Result<CheckpointVersion, IdentityRuntimeError> {
-        let lifecycle_lock = self.lifecycle_lock_for(identity).await;
-        let _lifecycle_guard = lifecycle_lock.lock().await;
-        {
-            let entries = self.entries.read().await;
-            let entry = entries
-                .get(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            if entry.state != IdentityLifecycleState::Active {
-                return Err(IdentityRuntimeError::InvalidState {
-                    identity: identity.clone(),
-                    state: entry.state,
-                    operation: "checkpoint",
-                });
-            }
-        }
-
-        let token = self.ensure_active_lease(identity).await?;
-        let (record, new_version) = {
-            let entries = self.entries.read().await;
-            let entry = entries
-                .get(identity)
-                .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-            let record = entry
-                .continuity
-                .as_ref()
-                .ok_or_else(|| {
-                    IdentityRuntimeError::Internal(format!("no continuity record for {identity}"))
-                })?
-                .clone();
-
-            let new_version = CheckpointVersion::new(entry.checkpoint_version.get() + 1);
-            (record, new_version)
-        };
-
-        // REQ-15 + REQ-16: store enforces version ordering and fencing
-        self.continuity_store
-            .save_session_snapshot(
-                identity,
-                &record.session_id,
-                record.generation,
-                new_version,
-                token,
-                snapshot,
-            )
+        let mut foreground_shutdown = self.foreground_cancel.subscribe();
+        let live = self
+            .start_fresh_life_locked(identity, &mut foreground_shutdown, "delete", None)
             .await?;
 
-        // Update local checkpoint version
-        {
-            let mut entries = self.entries.write().await;
-            if let Some(entry) = entries.get_mut(identity) {
-                entry.checkpoint_version = new_version;
+        // The fresh life is committed in Core from here: the bookkeeping runs
+        // before the fresh binding is read, so a failed read never leaves it
+        // undone or invites a second rotation.
+        if let Some(injector) = injector {
+            if let Some(session_key) = previous_session_key.as_ref() {
+                // Ask 2 GC: the identity never resumes the old session again,
+                // and its knowledge was just distilled into the identity-keyed
+                // Meta store (which the exit-interview harvest below reads, a
+                // different store from the meerkat session-memory scope), so
+                // reclaiming that scope frees dead re-embed weight without
+                // starving any downstream read.
+                injector
+                    .drop_orphaned_session_scope(
+                        session_key,
+                        crate::memory::distiller::DistillCause::Delete,
+                    )
+                    .await;
             }
+            // Section 8.5 exit interview (delete is the identity's LAST boundary).
+            injector
+                .note_identity_retired(identity, previous_session_key.as_deref(), "delete")
+                .await;
         }
 
-        self.emit_event(
-            identity,
-            IdentityEvent::CheckpointCompleted {
-                identity: identity.clone(),
-                version: new_version,
-            },
-        )
-        .await;
-
-        Ok(new_version)
+        // Subscriptions belong to the old life and end with it.
+        self.event_channels.write().await.remove(identity);
+        self.settle_fresh_life(identity, live, None).await;
+        let fresh = self.committed_fresh_binding(identity, "delete").await?;
+        Ok(Some(fresh))
     }
 
     // -----------------------------------------------------------------------
-    // Roster inspection — REQ-32
+    // Checkpoint - REQ-14, REQ-15, REQ-16, REQ-17
     // -----------------------------------------------------------------------
 
-    /// Return all active identities with their specs and status.
+    // -----------------------------------------------------------------------
+    // Roster inspection - REQ-32
+    // -----------------------------------------------------------------------
+
+    /// Return every registered identity with its spec and status (one read
+    /// of Core's member history serves them all; a failed read fails typed,
+    /// as [`Self::statuses`]).
     pub async fn roster_inspect(
         &self,
-    ) -> BTreeMap<AgentIdentity, (DurableAgentSpec, IdentityStatus)> {
-        let entries = self.entries.read().await;
+    ) -> Result<BTreeMap<AgentIdentity, (DurableAgentSpec, IdentityStatus)>, IdentityRuntimeError>
+    {
+        let specs = self
+            .entries
+            .read()
+            .await
+            .iter()
+            .map(|(identity, entry)| (identity.clone(), entry.spec.clone()))
+            .collect::<Vec<_>>();
+        let history = self.core_view_history().await.map_err(|error| {
+            IdentityRuntimeError::MemberHistoryUnavailable {
+                detail: format!("reading Core's member history: {error}"),
+            }
+        })?;
         let mut result = BTreeMap::new();
-        for (identity, entry) in entries.iter() {
-            let lease_info = entry.lease.as_ref().map(|l| LeaseInfo {
-                fencing_token: l.fencing_token,
-                ttl_remaining: l.ttl_remaining(),
-                healthy: l.is_healthy(),
-            });
-            let continuity_health = Some(ContinuityHealth {
-                store_reachable: true,
-                durability_policy: self.durability_policy.clone(),
-                last_checkpoint_version: if entry.checkpoint_version.get() > 0 {
-                    Some(entry.checkpoint_version)
-                } else {
-                    None
-                },
-            });
-            let status = IdentityStatus {
-                identity: identity.clone(),
-                state: entry.state,
-                agent_runtime_id: entry
-                    .continuity
-                    .as_ref()
-                    .map(|c| c.agent_runtime_id.clone()),
-                session_id: entry.continuity.as_ref().map(|c| c.session_id.clone()),
-                profile: Some(entry.spec.profile.clone()),
-                runtime_mode: entry.spec.runtime_mode_override,
-                addressability: entry.spec.addressability,
-                display_name: entry.spec.display_name.clone(),
-                labels: entry.spec.labels.clone(),
-                generation: entry.continuity.as_ref().map(|c| c.generation),
-                checkpoint_version: if entry.checkpoint_version.get() > 0 {
-                    Some(entry.checkpoint_version)
-                } else {
-                    None
-                },
-                lease: lease_info,
-                continuity_health,
-                continuity_unrecoverable: entry.continuity_unrecoverable.clone(),
-                session_repair_required: entry.session_repair_required.clone(),
-                customizer_tools_pending: self.customizer_tools_pending_for(identity),
-            };
-            result.insert(identity.clone(), (entry.spec.clone(), status));
+        for (identity, spec) in specs {
+            if let Ok(status) = self.status_from(&identity, history.as_ref()).await {
+                result.insert(identity, (spec, status));
+            }
         }
-        result
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
-    // Roster uniqueness validation — INV-06
+    // Roster uniqueness validation - INV-06
     // -----------------------------------------------------------------------
 
     /// Validate that a roster contains no duplicate identities.
@@ -15736,13 +13788,19 @@ impl IdentityRuntime {
         self.entries.read().await.contains_key(identity)
     }
 
-    /// Check if an identity is registered AND in Active state.
+    /// Whether an identity is registered AND Core holds its member (read from
+    /// Core's member history; a failed read answers `false`).
     pub async fn is_active(&self, identity: &AgentIdentity) -> bool {
-        self.entries
-            .read()
-            .await
-            .get(identity)
-            .is_some_and(|e| e.state == IdentityLifecycleState::Active)
+        if !self.entries.read().await.contains_key(identity) {
+            return false;
+        }
+        match self.core_view_history().await {
+            Ok(history) => CoreViewFacts::of(history.as_ref(), identity).live,
+            Err(error) => {
+                tracing::debug!(%identity, %error, "is_active: Core's member history read failed");
+                false
+            }
+        }
     }
 
     fn identity_from_member_alias(alias: &str) -> Option<(AgentIdentity, bool)> {
@@ -15800,15 +13858,16 @@ impl IdentityRuntime {
         if alias_identity != *identity {
             return Err(IdentityRuntimeError::UnknownIdentity(alias_identity));
         }
-        let entries = self.entries.read().await;
-        let entry = entries
-            .get(identity)
-            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
+        if !self.entries.read().await.contains_key(identity) {
+            return Err(IdentityRuntimeError::UnknownIdentity(identity.clone()));
+        }
         if generated_runtime_alias {
-            let current = entry
-                .continuity
-                .as_ref()
-                .map(|record| record.agent_runtime_id.clone());
+            // A generated alias names one incarnation: it must be the live
+            // member Core holds now.
+            let current = self
+                .core_live_member(identity)
+                .await?
+                .map(|live| live.agent_runtime_id);
             if current.as_ref().map(AgentRuntimeId::as_str) != Some(canonical_alias.as_ref()) {
                 return Err(IdentityRuntimeError::StaleRuntimeAlias {
                     identity: identity.clone(),
@@ -15826,7 +13885,7 @@ impl IdentityRuntime {
     /// and a plain identity string; returns the identity only when it is
     /// actually registered in this runtime. Member-scoped RPCs use this to
     /// route lifecycle mutations of identity-owned members through the
-    /// identity authority — a classic `handle.retire()`/`respawn()` on such
+    /// identity authority - a classic `handle.retire()`/`respawn()` on such
     /// a member would mutate it behind the IdentityRuntime's back (stale
     /// continuity binding, generation drift), which is the doctrine's
     /// "mob plane must not mangle durables" rule.
@@ -15835,344 +13894,9 @@ impl IdentityRuntime {
         self.contains(&identity).await.then_some(identity)
     }
 
-    /// Identities currently in the Broken lifecycle state.
-    pub async fn broken_identities(&self) -> Vec<AgentIdentity> {
-        self.entries
-            .read()
-            .await
-            .iter()
-            .filter(|(_, entry)| entry.state == IdentityLifecycleState::Broken)
-            .map(|(identity, _)| identity.clone())
-            .collect()
-    }
-
-    /// Broken identities that do NOT carry a terminal heal verdict — the set
-    /// the continuity repair supervisor is allowed to keep retrying.
-    pub async fn repairable_broken_identities(&self) -> Vec<AgentIdentity> {
-        self.entries
-            .read()
-            .await
-            .iter()
-            .filter(|(identity, entry)| {
-                entry.state == IdentityLifecycleState::Broken
-                    && entry.continuity_unrecoverable.is_none()
-                    && entry.session_repair_required.is_none()
-                    && entry
-                        .host_rejected_build_park
-                        .as_ref()
-                        .is_none_or(|park| park.spec_digest != durable_spec_digest(&entry.spec))
-                    && role_migration_refusal_for(entry, &entry.spec).is_none()
-                    && !self.held_completion_owed(identity)
-            })
-            .map(|(identity, _)| identity.clone())
-            .collect()
-    }
-
-    /// The terminal heal verdict recorded for an identity, if any.
-    pub async fn continuity_unrecoverable(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Option<ContinuityUnrecoverable> {
-        self.entries
-            .read()
-            .await
-            .get(identity)
-            .and_then(|entry| entry.continuity_unrecoverable.clone())
-    }
-
-    /// The typed "session needs repair" hold recorded for an identity, if any.
-    pub async fn session_repair_required(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Option<SessionRepairRequired> {
-        self.entries
-            .read()
-            .await
-            .get(identity)
-            .and_then(|entry| entry.session_repair_required.clone())
-    }
-
-    /// Record meerkat's typed audited-endpoint divergence against a Broken
-    /// identity as a [`SessionRepairRequired`] hold carrying the exact repair
-    /// commands.
-    ///
-    /// Returns `false` (without writing) when the identity is unknown or not
-    /// Broken: the hold only ever parks an already-Broken entry. While
-    /// recorded, the repair supervisor skips the identity and reconcile keeps
-    /// its Broken projection; `reload_member` re-attempts the resume once the
-    /// operator has repaired the document.
-    pub async fn mark_session_repair_required(
-        &self,
-        identity: &AgentIdentity,
-        session_id: meerkat_core::types::SessionId,
-        detail: impl Into<String>,
-    ) -> bool {
-        let hold = SessionRepairRequired::audited_endpoint_divergence(
-            session_id,
-            self.session_repair_scope().as_ref(),
-            detail,
-        );
-        let reason = hold.operator_reason();
-        let marked = {
-            let mut entries = self.entries.write().await;
-            match entries.get_mut(identity) {
-                Some(entry) if entry.state == IdentityLifecycleState::Broken => {
-                    entry.session_repair_required = Some(hold);
-                    true
-                }
-                _ => false,
-            }
-        };
-        if marked {
-            tracing::error!(
-                %identity,
-                reason = %reason,
-                "identity parked: durable session needs the sanctioned audited-endpoint repair"
-            );
-            self.mark_bootstrap_from_lifecycle(
-                identity,
-                IdentityLifecycleState::Broken,
-                Some(reason),
-            );
-        }
-        marked
-    }
-
-    /// Project a live or Dormant identity Broken with the typed repair hold
-    /// and hand back the typed failure the caller returns. Used by the doors
-    /// that learn about the divergence outside the resume path (the
-    /// registration reload of an Active member).
-    async fn park_session_repair_required(
-        &self,
-        identity: &AgentIdentity,
-        session_id: meerkat_core::types::SessionId,
-        detail: String,
-    ) -> IdentityRuntimeError {
-        let (record, transitioned) = {
-            let mut entries = self.entries.write().await;
-            let record = entries
-                .get(identity)
-                .and_then(|entry| entry.continuity.clone());
-            let mut transitioned = false;
-            if let Some(entry) = entries.get_mut(identity) {
-                transitioned = entry.state != IdentityLifecycleState::Broken;
-                entry.state = IdentityLifecycleState::Broken;
-            }
-            (record, transitioned)
-        };
-        if transitioned {
-            self.emit_event(
-                identity,
-                IdentityEvent::StateChanged {
-                    identity: identity.clone(),
-                    new_state: IdentityLifecycleState::Broken,
-                },
-            )
-            .await;
-        }
-        if !self
-            .mark_session_repair_required(identity, session_id, detail.clone())
-            .await
-        {
-            tracing::debug!(
-                %identity,
-                "identity left Broken before the session repair hold could be recorded"
-            );
-        }
-        IdentityRuntimeError::EmbodimentRejected(Box::new(ContinuityFailure {
-            identity: identity.clone(),
-            kind: ContinuityFailureKind::RepairRequired,
-            record,
-            detail,
-        }))
-    }
-
-    /// Record a terminal heal verdict against a Broken identity.
-    ///
-    /// Returns `false` (without writing) when the identity is unknown or no
-    /// longer Broken — the verdict only ever parks an already-Broken entry;
-    /// it never degrades a live one. While recorded, the repair supervisor
-    /// skips the identity and reconcile keeps its Broken projection instead
-    /// of cosmetically resetting it (2026-07-29 heal/re-Break incident).
-    pub async fn mark_continuity_unrecoverable(
-        &self,
-        identity: &AgentIdentity,
-        reason: String,
-    ) -> bool {
-        let marked = {
-            let mut entries = self.entries.write().await;
-            match entries.get_mut(identity) {
-                Some(entry) if entry.state == IdentityLifecycleState::Broken => {
-                    entry.continuity_unrecoverable = Some(ContinuityUnrecoverable {
-                        reason: reason.clone(),
-                    });
-                    true
-                }
-                _ => false,
-            }
-        };
-        if marked {
-            // Keep the bootstrap status surface honest about WHY the
-            // identity stays broken (operators read this, not the log).
-            self.mark_bootstrap_from_lifecycle(
-                identity,
-                IdentityLifecycleState::Broken,
-                Some(reason),
-            );
-        }
-        marked
-    }
-
-    /// Clear a previously recorded terminal heal verdict (operator retry).
-    pub async fn clear_continuity_unrecoverable(&self, identity: &AgentIdentity) -> bool {
-        let mut entries = self.entries.write().await;
-        match entries.get_mut(identity) {
-            Some(entry) => entry.continuity_unrecoverable.take().is_some(),
-            None => false,
-        }
-    }
-
-    /// The ACTIVE host-rejected-build park for an identity: `Some` only
-    /// while the identity's current spec still digests to the parked value.
-    /// A mismatch (the roster/policy changed) clears the park in place and
-    /// returns `None` — the retry is permitted.
-    pub async fn host_rejected_build_park(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Option<HostRejectedBuildPark> {
-        let mut entries = self.entries.write().await;
-        let entry = entries.get_mut(identity)?;
-        let park = entry.host_rejected_build_park.clone()?;
-        if park.spec_digest == durable_spec_digest(&entry.spec) {
-            Some(park)
-        } else {
-            entry.host_rejected_build_park = None;
-            None
-        }
-    }
-
-    /// The refusal detail when the bridge refused a declared role migration
-    /// that still holds for an action on `spec` (see
-    /// [`role_migration_refusal_for`]). `None` acts on the entry's current
-    /// spec.
-    pub(crate) async fn role_migration_refusal(
-        &self,
-        identity: &AgentIdentity,
-        spec: Option<&DurableAgentSpec>,
-    ) -> Option<String> {
-        let entries = self.entries.read().await;
-        let entry = entries.get(identity)?;
-        role_migration_refusal_for(entry, spec.unwrap_or(&entry.spec))
-            .map(|refusal| refusal.reason.clone())
-    }
-
-    /// Record a refused declared role migration against a Broken identity,
-    /// scoped to its current spec and to `record`, the embodiment whose
-    /// resume was refused. Returns `false` (without writing) when the
-    /// identity is unknown or no longer Broken.
-    pub(crate) async fn mark_role_migration_refusal(
-        &self,
-        identity: &AgentIdentity,
-        reason: String,
-        record: &ContinuityRecord,
-    ) -> bool {
-        let mut entries = self.entries.write().await;
-        match entries.get_mut(identity) {
-            Some(entry) if entry.state == IdentityLifecycleState::Broken => {
-                let spec_digest = durable_spec_digest(&entry.spec);
-                entry.role_migration_refusal = Some(RoleMigrationRefusal {
-                    reason,
-                    spec_digest,
-                    session_id: record.session_id.clone(),
-                    generation: record.generation,
-                });
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Park an identity whose build was deterministically rejected (the host
-    /// gate or a deterministic provider-auth kind, see
-    /// [`deterministic_build_rejection_reason`]), scoped to the identity's
-    /// CURRENT spec. Operator-visible through the
-    /// bootstrap status surface and the warn line; no automatic retry until
-    /// the spec changes.
-    pub(crate) async fn mark_host_rejected_build_park(
-        &self,
-        identity: &AgentIdentity,
-        reason: String,
-    ) -> bool {
-        let marked_state = {
-            let mut entries = self.entries.write().await;
-            match entries.get_mut(identity) {
-                Some(entry) => {
-                    entry.host_rejected_build_park = Some(HostRejectedBuildPark {
-                        reason: reason.clone(),
-                        spec_digest: durable_spec_digest(&entry.spec),
-                    });
-                    Some(entry.state)
-                }
-                None => None,
-            }
-        };
-        let Some(state) = marked_state else {
-            return false;
-        };
-        tracing::warn!(
-            identity = %identity,
-            reason = %reason,
-            "this identity's build was deterministically rejected; parking (no automatic \
-             retry) until the roster spec changes"
-        );
-        // Keep the bootstrap status surface honest about WHY the identity is
-        // stuck (operators read this, not the log). The detail renders on
-        // Broken projections; for a Dormant park the typed materialize error
-        // carries the reason to every send instead.
-        self.mark_bootstrap_from_lifecycle(identity, state, Some(reason));
-        true
-    }
-
-    /// Clear a host-rejected-build park (operator retry with an unchanged
-    /// spec — e.g. after fixing the app-side gate's policy out of band).
-    pub async fn clear_host_rejected_build_park(&self, identity: &AgentIdentity) -> bool {
-        let mut entries = self.entries.write().await;
-        match entries.get_mut(identity) {
-            Some(entry) => entry.host_rejected_build_park.take().is_some(),
-            None => false,
-        }
-    }
-
-    /// The durable session currently bound to an identity, if any.
-    pub(crate) async fn continuity_session_id(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Option<SessionId> {
-        self.entries
-            .read()
-            .await
-            .get(identity)
-            .and_then(|entry| entry.continuity.as_ref().map(|c| c.session_id.clone()))
-    }
-
-    /// Get the continuity store reference.
-    pub fn continuity_store(&self) -> &Arc<dyn ContinuityStore> {
-        &self.continuity_store
-    }
-
-    /// Get the lease provider reference.
-    pub fn lease_provider(&self) -> &Arc<dyn LeaseProvider> {
-        &self.lease_provider
-    }
-
     /// Get the runtime instance ID.
     pub fn runtime_instance_id(&self) -> &str {
         &self.runtime_instance_id
-    }
-
-    /// Get the durability policy.
-    pub fn durability_policy(&self) -> &DurabilityPolicy {
-        &self.durability_policy
     }
 
     /// Get whether a runtime store is configured.
@@ -16221,7 +13945,7 @@ impl IdentityRuntime {
         super::orchestrator::restore_flow(self, roster, topology_provider, customizer).await
     }
 
-    /// Resolve the AgentRuntimeId for a registered identity.
+    /// Resolve the AgentRuntimeId of a registered identity's live Core member.
     /// # NOT a roster key
     ///
     /// This returns the identity's CURRENT INCARNATION - `rt:{identity}:{gen}` -
@@ -16241,16 +13965,16 @@ impl IdentityRuntime {
         &self,
         identity: &AgentIdentity,
     ) -> Result<AgentRuntimeId, IdentityRuntimeError> {
-        let entries = self.entries.read().await;
-        let entry = entries
-            .get(identity)
-            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
-        entry
-            .continuity
-            .as_ref()
-            .map(|c| c.agent_runtime_id.clone())
+        if !self.entries.read().await.contains_key(identity) {
+            return Err(IdentityRuntimeError::UnknownIdentity(identity.clone()));
+        }
+        self.core_live_member(identity)
+            .await?
+            .map(|live| live.agent_runtime_id)
             .ok_or_else(|| {
-                IdentityRuntimeError::Internal(format!("no continuity record for {identity}"))
+                IdentityRuntimeError::Internal(format!(
+                    "Core holds no live member for identity {identity}"
+                ))
             })
     }
 
@@ -16308,26 +14032,14 @@ impl IdentityRuntime {
     // Continuity repair triggers
     // -----------------------------------------------------------------------
 
-    /// Wake the continuity repair supervisor with a typed cause.
-    pub(crate) fn trigger_continuity_repair(&self, trigger: ContinuityRepairTrigger) {
-        self.continuity_repair_triggers.send_modify(|wake| {
-            wake.epoch = wake.epoch.wrapping_add(1);
-            wake.last = Some(trigger);
-        });
-    }
-
-    /// The refusal of a delivery to an identity that is not Active. A Broken
-    /// identity's refused delivery is a caller's demand for it, and fires the
-    /// typed repair trigger.
+    /// The refusal of a delivery to an identity Core holds no live member
+    /// for. Nothing is triggered: the next wake asks Core again.
     fn refuse_inactive_delivery(
         &self,
         identity: &AgentIdentity,
         state: IdentityLifecycleState,
         operation: &'static str,
     ) -> IdentityRuntimeError {
-        if state == IdentityLifecycleState::Broken {
-            self.trigger_continuity_repair(ContinuityRepairTrigger::DemandOnBroken);
-        }
         IdentityRuntimeError::InvalidState {
             identity: identity.clone(),
             state,
@@ -16335,66 +14047,235 @@ impl IdentityRuntime {
         }
     }
 
-    fn subscribe_continuity_repair_triggers(&self) -> watch::Receiver<ContinuityRepairWake> {
-        self.continuity_repair_triggers.subscribe()
-    }
-
-    /// Hold one embodiment burst in flight (a restore pass, a background
-    /// warm). Between two members of a burst no single embodiment may be in
-    /// flight; the burst keeps the count above zero until it settled.
-    pub(super) fn enter_embodiment_burst(&self) -> EmbodimentInFlight<'_> {
-        EmbodimentInFlight::enter(&self.embodiments_in_flight)
-    }
-
-    /// Wait until no embodiment is in flight; `false` when the supervisor
-    /// was cancelled first.
-    async fn embodiments_settled_or_cancelled(
+    /// [`Self::refuse_inactive_delivery`] with the identity's view state.
+    async fn inactive_delivery_refusal(
         &self,
-        cancellation: &mut Option<watch::Receiver<bool>>,
-    ) -> bool {
-        let mut in_flight = self.embodiments_in_flight.subscribe();
-        loop {
-            if *in_flight.borrow_and_update() == 0 {
-                return true;
-            }
-            tokio::select! {
-                changed = in_flight.changed() => {
-                    if changed.is_err() {
-                        return true;
-                    }
-                }
-                () = repair_cancelled(cancellation) => return false,
-            }
-        }
+        identity: &AgentIdentity,
+        operation: &'static str,
+    ) -> IdentityRuntimeError {
+        let wake_refusal = match self.entries.read().await.get(identity) {
+            Some(entry) => entry.wake_refusal.clone(),
+            None => return IdentityRuntimeError::UnknownIdentity(identity.clone()),
+        };
+        self.refuse_inactive_delivery(
+            identity,
+            Self::view_state(false, wake_refusal.as_ref()),
+            operation,
+        )
     }
 
-    /// What a repair request reaches right now: the repairable Broken
-    /// identities, and whether a supervisor runs to act on them.
-    pub(crate) async fn continuity_repair_request_outcome(&self) -> ContinuityRepairRequestOutcome {
-        if self.repairable_broken_identities().await.is_empty() {
-            ContinuityRepairRequestOutcome::NothingToRepair
-        } else if self.continuity_repair_supervisors.load(Ordering::Acquire) == 0 {
-            ContinuityRepairRequestOutcome::NoSupervisor
-        } else {
-            ContinuityRepairRequestOutcome::Scheduled
+    /// A member session a delivery found Core holds no durable copy of is
+    /// never delivered to again: the identity's fresh life starts here, under
+    /// the caller's lifecycle lock, with that session as its replaced session
+    /// (the wake's own `Absent` rule), and the delivery goes to the fresh
+    /// member. Core never persisted the absent session, so nothing durable is
+    /// lost.
+    async fn start_fresh_life_after_absent_session(
+        &self,
+        identity: &AgentIdentity,
+        absent: SessionId,
+    ) -> Result<super::bridge::MemberRuntimeBinding, IdentityRuntimeError> {
+        tracing::warn!(
+            %identity,
+            session_id = %absent,
+            "a delivery found the member's session absent from Core's durable store; the \
+             identity starts its fresh life before delivering"
+        );
+        // The wedged member still holds the inputs other senders queued
+        // behind it: capture them before the fresh life replaces it, for the
+        // fresh member, as the bridge's delivery repair carries its member's
+        // queue. A queue that cannot be observed defers the fresh life:
+        // replacing the member would destroy inputs nobody has seen.
+        let queued = self
+            .core_bridge(identity)?
+            .capture_queued_member_inputs(identity, &absent)
+            .await
+            .map_err(|error| IdentityRuntimeError::IdentityWakeRetryable {
+                identity: identity.clone(),
+                session_id: Some(absent.clone()),
+                detail: format!(
+                    "the fresh life after the absent session is deferred: the member's queued \
+                     inputs could not be captured ({error})"
+                ),
+            })?;
+        let mut foreground_shutdown = self.foreground_cancel.subscribe();
+        let live = self
+            .start_fresh_life_locked(
+                identity,
+                &mut foreground_shutdown,
+                "fresh life after an absent session",
+                Some(queued),
+            )
+            .await?;
+        self.settle_fresh_life(
+            identity,
+            live,
+            Some(super::types::ReplacedSession {
+                session_id: absent,
+                reason: super::types::ReplacedSessionReason::Absent,
+            }),
+        )
+        .await;
+        self.core_live_member(identity).await?.ok_or_else(|| {
+            IdentityRuntimeError::IdentityHistoryUnavailable {
+                identity: identity.clone(),
+                detail: "Core holds no live member after the fresh life an absent session \
+                         started; nothing was delivered"
+                    .to_string(),
+            }
+        })
+    }
+
+    /// Core answers a live member with no session both for a peer-only
+    /// member and for a session-backed member whose session binding it does
+    /// not project at that moment (a retiring member, or the projection
+    /// behind the actor). Whether an identity is peer-only is read from its
+    /// spec, never from that answer: a session-backed identity whose member
+    /// reads without a session refuses typed (history unavailable, so the
+    /// next call reads Core again), and nothing skips a revive or delivers
+    /// without Core's fence.
+    async fn refuse_unprojected_session(
+        &self,
+        identity: &AgentIdentity,
+        binding: &super::bridge::MemberRuntimeBinding,
+    ) -> Result<(), IdentityRuntimeError> {
+        if binding.session_id.is_some() {
+            return Ok(());
         }
+        let session_backed = self
+            .entries
+            .read()
+            .await
+            .get(identity)
+            .is_some_and(|entry| !durable_spec_uses_external_binding(&entry.spec));
+        if session_backed {
+            return Err(IdentityRuntimeError::IdentityHistoryUnavailable {
+                identity: identity.clone(),
+                detail: format!(
+                    "Core holds member {} for the identity but projects no session binding \
+                     for it; a session-backed identity is never treated as peer-only, so \
+                     nothing was done",
+                    binding.agent_runtime_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Core's live member of `identity` for a delivery, read under the
+    /// caller's lifecycle lock: its binding and, for a session-backed
+    /// member, its delivery scope. An identity Core holds no member for
+    /// refuses typed with its view state (the caller woke it first, so Core
+    /// let it go meanwhile).
+    async fn live_delivery_target(
+        &self,
+        identity: &AgentIdentity,
+        operation: &'static str,
+    ) -> Result<
+        (
+            super::bridge::MemberRuntimeBinding,
+            Option<meerkat_mob::MemberDeliveryScope>,
+        ),
+        IdentityRuntimeError,
+    > {
+        let Some(live) = self.core_live_member(identity).await? else {
+            return Err(self.inactive_delivery_refusal(identity, operation).await);
+        };
+        // A pending first-boot `Fresh` row carried out here replaced the
+        // member by its successor: the delivery goes to the member Core
+        // holds now.
+        let live = if self
+            .first_boot_guard_live_locked(identity, operation)
+            .await?
+        {
+            match self.core_live_member(identity).await? {
+                Some(live) => live,
+                None => return Err(self.inactive_delivery_refusal(identity, operation).await),
+            }
+        } else {
+            live
+        };
+        self.refuse_unprojected_session(identity, &live).await?;
+        self.publish_pending_customizer_tools(identity, live.session_id.as_ref(), operation)
+            .await?;
+        let absent_session = self
+            .entries
+            .read()
+            .await
+            .get(identity)
+            .and_then(|entry| entry.absent_delivery_session.clone());
+        let live = match absent_session {
+            Some(absent) if live.session_id.as_ref() == Some(&absent) => {
+                self.start_fresh_life_after_absent_session(identity, absent)
+                    .await?
+            }
+            _ => live,
+        };
+        let scope = if live.session_id.is_some() {
+            self.core_live_scope(identity).await?
+        } else {
+            None
+        };
+        Ok((live, scope))
+    }
+
+    /// The fencing token a delivery carries and its completion cursor's
+    /// epoch: Core's fence of the scope. A peer-only member has no
+    /// Core scope and carries `0`.
+    fn scope_fence(scope: Option<&meerkat_mob::MemberDeliveryScope>) -> FencingToken {
+        scope.map_or_else(
+            || FencingToken::new(0),
+            |scope| FencingToken::new(scope.fence_token().get()),
+        )
+    }
+
+    /// After the delivery path's one automatic reload: Core's member must
+    /// still be the one the delivery is addressed to (Core's reload
+    /// primitive keeps it). Returns its fence. A reload that re-spawned the
+    /// member refuses typed: the refused attempt delivered nothing, and the
+    /// caller delivers again to the new member.
+    async fn fence_after_delivery_reload(
+        &self,
+        identity: &AgentIdentity,
+        addressed: &AgentRuntimeId,
+        operation: &'static str,
+    ) -> Result<FencingToken, IdentityRuntimeError> {
+        let (live, scope) = self.live_delivery_target(identity, operation).await?;
+        if live.agent_runtime_id != *addressed {
+            return Err(IdentityRuntimeError::ReloadRequired {
+                identity: identity.clone(),
+                reason: format!(
+                    "the automatic reload re-spawned the member as {}; nothing was delivered, \
+                     deliver again",
+                    live.agent_runtime_id
+                ),
+            });
+        }
+        Ok(Self::scope_fence(scope.as_ref()))
     }
 
     // -----------------------------------------------------------------------
     // Turn-completion cursor
     // -----------------------------------------------------------------------
 
-    /// Completion epoch of a REGISTERED identity: its live lease token, or
-    /// token 0 when it holds no grant (dormant, or lease lost). `None` when
-    /// the identity is not registered at all.
+    /// Completion epoch of a REGISTERED identity: Core's fence of its live
+    /// session-backed member, or 0 while Core holds none (dormant,
+    /// peer-only) or the read fails (a 0 rebase never rewinds the cursor).
+    /// `None` when the identity is not registered at all.
     async fn registered_completion_epoch(&self, identity: &AgentIdentity) -> Option<FencingToken> {
-        let entries = self.entries.read().await;
-        entries.get(identity).map(|entry| {
-            entry
-                .lease
-                .as_ref()
-                .map_or_else(|| FencingToken::new(0), |lease| lease.fencing_token)
-        })
+        if !self.entries.read().await.contains_key(identity) {
+            return None;
+        }
+        Some(
+            self.core_live_scope(identity)
+                .await
+                .ok()
+                .flatten()
+                .map_or_else(
+                    || FencingToken::new(0),
+                    |scope| Self::scope_fence(Some(&scope)),
+                ),
+        )
     }
 
     /// Move the stored cursor onto `epoch` if the lease incarnation advanced,
@@ -16433,7 +14314,7 @@ impl IdentityRuntime {
     /// incarnation first, so a poller observes an incarnation change
     /// immediately rather than comparing against a turn count that no longer
     /// means anything. An identity that is gone (retired, deleted, or never
-    /// registered) reports its last published cursor — retained precisely so
+    /// registered) reports its last published cursor - retained precisely so
     /// this read cannot rewind.
     ///
     /// Credit before read: completions that already happened but are still
@@ -16453,11 +14334,11 @@ impl IdentityRuntime {
         }
     }
 
-    /// Credit the run completions of `identity`'s member that happened but
-    /// are not counted yet ([`PendingCompletionDrain`]). Only under a live
-    /// lease: a completion credited before any lease would be discarded by
-    /// the rebase onto the lease, while one credited under the lease is part
-    /// of every baseline taken from then on.
+    /// Credit the run completions of `identity`'s live member that happened
+    /// but are not counted yet ([`PendingCompletionDrain`]). Only under a
+    /// live Core fence: a completion credited before it would be discarded
+    /// by the rebase onto the fence, while one credited under it is part of
+    /// every baseline taken from then on.
     async fn credit_pending_completions(&self, identity: &AgentIdentity) {
         let drain = self
             .pending_completion_drain
@@ -16467,13 +14348,13 @@ impl IdentityRuntime {
         let Some(drain) = drain else {
             return;
         };
-        let session_id = self.entries.read().await.get(identity).and_then(|entry| {
-            entry
-                .continuity
-                .as_ref()
-                .map(|record| record.session_id.clone())
-        });
-        let Some(session_id) = session_id else {
+        let Some(session_id) = self
+            .core_live_member(identity)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|live| live.session_id)
+        else {
             return;
         };
         let terminals = drain.drain(&session_id).await;
@@ -16537,12 +14418,6 @@ impl IdentityRuntime {
         }
     }
 
-    /// Whether a completion drain was installed before the lease observer.
-    #[cfg(test)]
-    pub(crate) fn lease_observer_installed_after_drain(&self) -> bool {
-        self.lease_observer_saw_drain.load(Ordering::Acquire)
-    }
-
     /// Whether a completion-cursor drain is installed
     /// ([`Self::install_pending_completion_drain`]).
     pub(crate) fn has_pending_completion_drain(&self) -> bool {
@@ -16571,7 +14446,7 @@ impl IdentityRuntime {
     /// turn, identical text" from "no new turn", which is the entire defect
     /// this cursor exists to close.
     ///
-    /// Not idempotent by design — one observed completion advances the cursor
+    /// Not idempotent by design - one observed completion advances the cursor
     /// once, which is exactly what a poller comparing against a pre-delivery
     /// baseline needs.
     pub async fn record_turn_completed(&self, identity: &AgentIdentity) -> CompletionCursor {
@@ -16641,12 +14516,14 @@ impl IdentityRuntime {
     /// startup readiness barrier).
     ///
     /// Event-driven: the wait sleeps until a completion or a failed run is
-    /// recorded, the identity table changes (a lease incarnation change,
-    /// Broken, retire and delete are table writes), or the runtime starts
-    /// shutting down, and re-derives the outcome then. Every wake re-reads
-    /// the identity's entry, so a wait never runs to its deadline on an
-    /// identity that went Broken, retired or was deleted. `timeout` is only
-    /// the caller's overall deadline; reaching it is
+    /// recorded, the identity table changes, a verb of this runtime moves the
+    /// identity's Core member (wake, retire, respawn, reset, delete), or the
+    /// runtime starts shutting down, and re-derives the outcome then. Every
+    /// wake re-reads the entry and Core's fence, so a wait never runs to its
+    /// deadline on an identity whose last wake was refused for good, that
+    /// Core no longer holds (retired, unless a verb of this runtime is still
+    /// replacing the member) or that was unregistered. `timeout` is only the
+    /// caller's overall deadline; reaching it is
     /// [`CompletionWait::TimedOut`], a typed outcome rather than an error.
     ///
     /// An identity that is not registered yet reads its retained cursor, so a
@@ -16675,6 +14552,9 @@ impl IdentityRuntime {
         let _ = self.completion_cursor(identity).await;
         let failures_at_start = self.run_failure_count(identity);
         let registered_at_start = self.entries.read().await.contains_key(identity);
+        // A readiness wait on a dormant identity waits for its first wake;
+        // only a member Core held when the wait began can retire under it.
+        let live_at_start = matches!(self.core_live_member(identity).await, Ok(Some(_)));
         loop {
             let cursor = self.completion_cursor(identity).await;
             match after {
@@ -16691,19 +14571,41 @@ impl IdentityRuntime {
             if self.run_failure_count(identity) > failures_at_start {
                 return CompletionWait::RunFailed(cursor);
             }
-            let state = self
+            let wake_refusal = self
                 .entries
                 .read()
                 .await
                 .get(identity)
-                .map(|entry| entry.state);
-            match state {
+                .map(|entry| entry.wake_refusal.clone());
+            match wake_refusal {
                 None if registered_at_start => return CompletionWait::IdentityGone(cursor),
-                Some(IdentityLifecycleState::Broken) => return CompletionWait::Broken(cursor),
-                Some(IdentityLifecycleState::Retiring) => {
-                    return CompletionWait::Retiring(cursor);
+                Some(Some(refusal)) if refusal.is_final() => {
+                    return CompletionWait::Broken(cursor);
                 }
                 _ => {}
+            }
+            // Core let the member go and no verb of this runtime is replacing
+            // it (a respawn retires, then wakes, under the lifecycle lock).
+            if live_at_start && matches!(self.core_live_member(identity).await, Ok(None)) {
+                if !self.lifecycle_verb_in_flight(identity).await {
+                    return CompletionWait::Retiring(cursor);
+                }
+                // The verb signalled its move while it still held the lock,
+                // and nothing signals when it lets go: read again once it
+                // has, so a retire never leaves this wait to its deadline.
+                let lifecycle_lock = self.lifecycle_lock_for(identity).await;
+                tokio::select! {
+                    _released = lifecycle_lock.lock() => continue,
+                    changed = shutdown.changed() => {
+                        if changed.is_err() {
+                            return CompletionWait::ShuttingDown(cursor);
+                        }
+                        continue;
+                    }
+                    () = tokio::time::sleep_until(deadline) => {
+                        return CompletionWait::TimedOut(cursor);
+                    }
+                }
             }
             if *shutdown.borrow_and_update() {
                 return CompletionWait::ShuttingDown(cursor);
@@ -16753,173 +14655,56 @@ impl IdentityRuntime {
         self.default_timeout
     }
 
-    async fn execute_reset_bridge_cleanup(
-        bridge: &Arc<dyn SessionBridge>,
-        cleanup: &PendingResetBridgeCleanup,
-    ) -> Result<(), BridgeError> {
-        match (&cleanup.runtime_id, &cleanup.session_id) {
-            (Some(runtime_id), Some(session_id)) => {
-                bridge
-                    .retire_reset_superseded_member(runtime_id, session_id)
-                    .await
-            }
-            (Some(runtime_id), None) => bridge.retire_member(runtime_id).await,
-            (None, Some(session_id)) => bridge.unregister_session_runtime_state(session_id).await,
-            (None, None) => Ok(()),
-        }
-    }
-
-    async fn clear_reset_bridge_cleanup_if_current(
-        pending: &RwLock<BTreeMap<String, PendingResetBridgeCleanup>>,
-        key: &str,
-        cleanup: &PendingResetBridgeCleanup,
-    ) {
-        let mut pending = pending.write().await;
-        if pending.get(key) == Some(cleanup) {
-            pending.remove(key);
-        }
-    }
-
-    async fn run_reset_memory_capture_if_pending(
-        pending: &RwLock<BTreeMap<String, PendingResetBridgeCleanup>>,
-        key: &str,
-        cleanup: &mut PendingResetBridgeCleanup,
-    ) {
-        let Some(capture) = cleanup.memory_capture.take() else {
-            return;
-        };
-        capture.run().await;
-
-        // Publish the state-machine advance only after the bounded capture
-        // returns. Cancellation before this write leaves the capture on the
-        // authoritative debt and a shutdown retry runs it again.
-        let mut pending = pending.write().await;
-        if let Some(current) = pending.get_mut(key)
-            && current == cleanup
-        {
-            current.memory_capture = None;
-        }
-    }
-
-    async fn record_old_bridge_cleanup_after_reset(
-        &self,
-        old_runtime_id: Option<AgentRuntimeId>,
-        old_session_id: Option<SessionId>,
-        memory_capture: Option<PendingResetMemoryCapture>,
-    ) -> Option<PendingResetBridgeCleanup> {
-        if old_runtime_id.is_none() && old_session_id.is_none() {
-            return None;
-        }
-        let cleanup = PendingResetBridgeCleanup {
-            runtime_id: old_runtime_id,
-            session_id: old_session_id,
-            memory_capture,
-        };
-        let key = cleanup.key();
-        self.pending_reset_bridge_cleanups
+    /// Run a reset's memory capture of the outgoing session in a
+    /// runtime-owned task, so the reset stays latency-neutral. The capture
+    /// stays in the ledger until it ran: a graceful shutdown joins the task,
+    /// then reruns whatever a cancelled task left behind.
+    async fn spawn_reset_memory_capture(&self, capture: PendingResetMemoryCapture) {
+        let key = capture.session_key.clone();
+        self.pending_reset_memory_captures
             .write()
             .await
-            .insert(key, cleanup.clone());
-        Some(cleanup)
-    }
-
-    async fn spawn_old_bridge_cleanup_after_reset(
-        &self,
-        bridge: Arc<dyn SessionBridge>,
-        mut cleanup: PendingResetBridgeCleanup,
-    ) {
-        let key = cleanup.key();
-        let runtime_instance_id = self.runtime_instance_id.clone();
-        let pending = self.pending_reset_bridge_cleanups.clone();
-        let mut tasks = self.reset_bridge_cleanup_tasks.lock().await;
+            .insert(key.clone(), capture.clone());
+        let pending = Arc::clone(&self.pending_reset_memory_captures);
+        let mut tasks = self.reset_memory_capture_tasks.lock().await;
         while let Some(result) = tasks.try_join_next() {
             if let Err(error) = result {
                 tracing::error!(
                     runtime_instance_id = %self.runtime_instance_id,
                     %error,
-                    "reset bridge cleanup task panicked"
+                    "reset memory capture task panicked"
                 );
             }
         }
         tasks.spawn(async move {
-            Self::run_reset_memory_capture_if_pending(&pending, &key, &mut cleanup).await;
-            match Self::execute_reset_bridge_cleanup(&bridge, &cleanup).await {
-                Ok(()) => {
-                    Self::clear_reset_bridge_cleanup_if_current(&pending, &key, &cleanup).await;
-                }
-                Err(error) => tracing::warn!(
-                    runtime_instance_id = %runtime_instance_id,
-                    cleanup_key = %key,
-                    %error,
-                    "reset-superseded bridge cleanup failed; retaining exact shutdown debt",
-                ),
-            }
+            capture.run().await;
+            pending.write().await.remove(&key);
         });
     }
 
-    /// Join every post-commit reset cleanup task after foreground lifecycle
-    /// admission is closed. The exact debt remains in the ledger on failure
-    /// and is retried synchronously before physical mob shutdown.
-    pub(crate) async fn join_reset_bridge_cleanup_tasks(&self) {
-        let mut tasks = self.reset_bridge_cleanup_tasks.lock().await;
+    /// Join every reset memory capture task after foreground lifecycle
+    /// admission is closed.
+    pub(crate) async fn join_reset_memory_captures(&self) {
+        let mut tasks = self.reset_memory_capture_tasks.lock().await;
         while let Some(result) = tasks.join_next().await {
             if let Err(error) = result {
                 tracing::error!(
                     runtime_instance_id = %self.runtime_instance_id,
                     %error,
-                    "reset bridge cleanup task panicked"
+                    "reset memory capture task panicked"
                 );
             }
         }
     }
 
-    /// Retry all exact reset cleanup debt. Success is the only path that
-    /// removes an obligation; callers must retain identity grants when this
-    /// returns an error.
-    pub(crate) async fn drain_pending_reset_bridge_cleanups(
-        &self,
-    ) -> Result<usize, IdentityRuntimeError> {
-        let Some(bridge) = self.bridge.as_ref() else {
-            return Ok(0);
-        };
-        let pending = self
-            .pending_reset_bridge_cleanups
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut completed = 0_usize;
-        let mut errors = Vec::new();
-        for mut cleanup in pending {
-            let key = cleanup.key();
-            Self::run_reset_memory_capture_if_pending(
-                &self.pending_reset_bridge_cleanups,
-                &key,
-                &mut cleanup,
-            )
-            .await;
-            match Self::execute_reset_bridge_cleanup(bridge, &cleanup).await {
-                Ok(()) => {
-                    Self::clear_reset_bridge_cleanup_if_current(
-                        &self.pending_reset_bridge_cleanups,
-                        &key,
-                        &cleanup,
-                    )
-                    .await;
-                    completed += 1;
-                }
-                Err(error) => errors.push(format!("{key}: {error}")),
-            }
+    /// Run every reset memory capture a cancelled task left in the ledger.
+    /// Returns how many ran.
+    pub(crate) async fn drain_pending_reset_memory_captures(&self) -> usize {
+        let pending = std::mem::take(&mut *self.pending_reset_memory_captures.write().await);
+        for capture in pending.values() {
+            capture.run().await;
         }
-        if errors.is_empty() {
-            Ok(completed)
-        } else {
-            Err(IdentityRuntimeError::Internal(format!(
-                "reset bridge cleanup debt remains: {}",
-                errors.join("; ")
-            )))
-        }
+        pending.len()
     }
 
     /// Wait until the identity produces an output_preview, or timeout.
@@ -17058,6 +14843,11 @@ pub async fn wire_cross_mob_by_identity(
         .map_err(|e| IdentityRuntimeError::Internal(format!("wire_cross_mob: {e}")))
 }
 
+/// Core's member facts for this file's `SessionBridge` test doubles. A double
+/// records each member it creates, replaces or retires here and answers the
+/// runtime's Core reads (live member, delivery scope, member history,
+/// identity management) from it, so a unit test drives the identity runtime
+/// against the facts Core would hold without standing up a mob.
 #[cfg(test)]
 mod reset_reprofile_tests {
     use super::*;
@@ -17066,291 +14856,16 @@ mod reset_reprofile_tests {
     use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
     use super::super::bridge::{
-        BridgeDelivery, BridgeError, MemberInspection, ResumeSessionOutcome,
+        BridgeDelivery, BridgeError, MemberInspection, MemberRuntimeBinding, ResumeSessionOutcome,
     };
     use super::super::contracts::RosterProvider;
     use super::super::local_lease::LocalLeaseProvider;
     use super::super::local_store::LocalContinuityStore;
-    use super::super::types::{
-        AgentBuildDraft, ContinuityResolveState, CustomizerError, LeaseAcquireResult, LeaseError,
-        LeaseRenewResult, RosterError, SessionSnapshot,
-    };
+    use super::super::types::{AgentBuildDraft, CheckpointVersion, RosterError, SessionSnapshot};
+    use tokio::sync::Notify;
 
     struct MutableRoster {
         specs: AsyncRwLock<Vec<DurableAgentSpec>>,
-    }
-
-    struct LostRenewLeaseProvider {
-        inner: LocalLeaseProvider,
-        lose_renewals: AtomicBool,
-    }
-
-    impl Default for LostRenewLeaseProvider {
-        fn default() -> Self {
-            Self {
-                inner: LocalLeaseProvider::new(),
-                lose_renewals: AtomicBool::new(false),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl LeaseProvider for LostRenewLeaseProvider {
-        async fn acquire_leases(
-            &self,
-            identities: &[AgentIdentity],
-            runtime_instance: &str,
-        ) -> Result<BTreeMap<AgentIdentity, LeaseAcquireResult>, LeaseError> {
-            self.inner
-                .acquire_leases(identities, runtime_instance)
-                .await
-        }
-
-        async fn renew_leases(
-            &self,
-            grants: &[LeaseGrant],
-        ) -> Result<BTreeMap<AgentIdentity, LeaseRenewResult>, LeaseError> {
-            if self.lose_renewals.load(Ordering::SeqCst) {
-                return Ok(grants
-                    .iter()
-                    .map(|grant| {
-                        (
-                            grant.identity.clone(),
-                            LeaseRenewResult::Lost {
-                                identity: grant.identity.clone(),
-                            },
-                        )
-                    })
-                    .collect());
-            }
-            self.inner.renew_leases(grants).await
-        }
-
-        async fn release_leases(&self, grants: &[LeaseGrant]) -> Result<(), LeaseError> {
-            self.inner.release_leases(grants).await
-        }
-    }
-
-    struct RecordingReleaseLeaseProvider {
-        inner: LocalLeaseProvider,
-        fail_next_release: AtomicBool,
-        release_attempts: AsyncMutex<Vec<LeaseGrant>>,
-    }
-
-    impl Default for RecordingReleaseLeaseProvider {
-        fn default() -> Self {
-            Self {
-                inner: LocalLeaseProvider::new(),
-                fail_next_release: AtomicBool::new(false),
-                release_attempts: AsyncMutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl RecordingReleaseLeaseProvider {
-        fn fail_next_release(&self) {
-            self.fail_next_release.store(true, Ordering::SeqCst);
-        }
-
-        async fn release_attempts(&self) -> Vec<LeaseGrant> {
-            self.release_attempts.lock().await.clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl LeaseProvider for RecordingReleaseLeaseProvider {
-        async fn acquire_leases(
-            &self,
-            identities: &[AgentIdentity],
-            runtime_instance: &str,
-        ) -> Result<BTreeMap<AgentIdentity, LeaseAcquireResult>, LeaseError> {
-            self.inner
-                .acquire_leases(identities, runtime_instance)
-                .await
-        }
-
-        async fn renew_leases(
-            &self,
-            grants: &[LeaseGrant],
-        ) -> Result<BTreeMap<AgentIdentity, LeaseRenewResult>, LeaseError> {
-            self.inner.renew_leases(grants).await
-        }
-
-        async fn release_leases(&self, grants: &[LeaseGrant]) -> Result<(), LeaseError> {
-            self.release_attempts.lock().await.extend_from_slice(grants);
-            if self.fail_next_release.swap(false, Ordering::SeqCst) {
-                return Err(LeaseError::ProviderUnavailable(
-                    "synthetic retained Broken lease release failure".to_string(),
-                ));
-            }
-            self.inner.release_leases(grants).await
-        }
-    }
-
-    struct GatedResetContinuityStore {
-        inner: Arc<LocalContinuityStore>,
-        upsert_calls: AtomicUsize,
-        fail_on_call: AtomicUsize,
-        failure_started: Notify,
-        release_failure: Notify,
-    }
-
-    #[derive(Default)]
-    struct GatedResetCustomizer {
-        entered: Notify,
-    }
-
-    impl GatedResetCustomizer {
-        async fn wait_for_entry(&self) {
-            self.entered.notified().await;
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl AgentCustomizer for GatedResetCustomizer {
-        async fn customize_build(
-            &self,
-            _context: &AgentBuildContext,
-            _spec: &DurableAgentSpec,
-            _draft: &mut AgentBuildDraft,
-        ) -> Result<(), CustomizerError> {
-            self.entered.notify_one();
-            futures::future::pending::<()>().await;
-            Ok(())
-        }
-    }
-
-    impl GatedResetContinuityStore {
-        fn new() -> Result<Self, ContinuityStoreError> {
-            Ok(Self {
-                inner: Arc::new(LocalContinuityStore::in_memory()?),
-                upsert_calls: AtomicUsize::new(0),
-                fail_on_call: AtomicUsize::new(usize::MAX),
-                failure_started: Notify::new(),
-                release_failure: Notify::new(),
-            })
-        }
-
-        fn fail_after_successful_upserts(&self, successful_upserts: usize) {
-            let current = self.upsert_calls.load(Ordering::SeqCst);
-            self.fail_on_call
-                .store(current + successful_upserts + 1, Ordering::SeqCst);
-        }
-
-        async fn wait_for_failure(&self) {
-            self.failure_started.notified().await;
-        }
-
-        fn release_failure(&self) {
-            self.release_failure.notify_one();
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ContinuityStore for GatedResetContinuityStore {
-        // The trait requires an explicit answer: a double that stayed
-        // silent used to assert an authoritative "no record" while
-        // meaning "I was never taught to answer", which is how a fix
-        // goes inert with every test still green.
-        async fn resolve_record_by_session(
-            &self,
-            _session_id: &meerkat_core::types::SessionId,
-        ) -> Result<
-            Option<(
-                crate::identity_first::ContinuityRecord,
-                crate::identity_first::FencingToken,
-                crate::identity_first::CheckpointVersion,
-            )>,
-            crate::identity_first::ContinuityStoreError,
-        > {
-            Ok(None)
-        }
-
-        async fn resolve_many(
-            &self,
-            identities: &[AgentIdentity],
-        ) -> Result<BTreeMap<AgentIdentity, ContinuityResolveState>, ContinuityStoreError> {
-            self.inner.resolve_many(identities).await
-        }
-
-        async fn load_session_snapshot(
-            &self,
-            session_id: &SessionId,
-        ) -> Result<Option<SessionSnapshot>, ContinuityStoreError> {
-            self.inner.load_session_snapshot(session_id).await
-        }
-
-        async fn save_session_snapshot(
-            &self,
-            identity: &AgentIdentity,
-            session_id: &SessionId,
-            generation: ContinuityGeneration,
-            version: CheckpointVersion,
-            fencing_token: FencingToken,
-            snapshot: &SessionSnapshot,
-        ) -> Result<(), ContinuityStoreError> {
-            self.inner
-                .save_session_snapshot(
-                    identity,
-                    session_id,
-                    generation,
-                    version,
-                    fencing_token,
-                    snapshot,
-                )
-                .await
-        }
-
-        async fn upsert_continuity_record(
-            &self,
-            record: &ContinuityRecord,
-            fencing_token: FencingToken,
-        ) -> Result<(), ContinuityStoreError> {
-            let call = self.upsert_calls.fetch_add(1, Ordering::SeqCst) + 1;
-            if self
-                .fail_on_call
-                .compare_exchange(call, usize::MAX, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                self.failure_started.notify_one();
-                self.release_failure.notified().await;
-                return Err(ContinuityStoreError::Io(
-                    "gated final reset upsert failure".to_string(),
-                ));
-            }
-            self.inner
-                .upsert_continuity_record(record, fencing_token)
-                .await
-        }
-
-        async fn rollback_continuity_record(
-            &self,
-            expected_attempt: &ContinuityRecord,
-            previous: Option<&ContinuityRecord>,
-            fencing_token: FencingToken,
-        ) -> Result<(), ContinuityStoreError> {
-            self.inner
-                .rollback_continuity_record(expected_attempt, previous, fencing_token)
-                .await
-        }
-
-        async fn delete_continuity_record(
-            &self,
-            identity: &AgentIdentity,
-            fencing_token: FencingToken,
-        ) -> Result<(), ContinuityStoreError> {
-            self.inner
-                .delete_continuity_record(identity, fencing_token)
-                .await
-        }
-        /// Test double: deliberately whole-snapshot only.
-        fn as_incremental_sessions(
-            &self,
-        ) -> Option<
-            std::sync::Arc<dyn crate::identity_first::contracts::ContinuityIncrementalSessions>,
-        > {
-            None
-        }
     }
 
     impl MutableRoster {
@@ -17382,24 +14897,19 @@ mod reset_reprofile_tests {
         creates_in_flight: AtomicUsize,
         max_creates_in_flight: AtomicUsize,
         retired_runtime_ids: AsyncMutex<Vec<String>>,
-        hanging_retire_runtime_ids: AsyncMutex<BTreeSet<String>>,
-        failing_register_session_ids: AsyncMutex<BTreeSet<String>>,
-        failing_unregister_session_ids: AsyncMutex<BTreeSet<String>>,
-        registered_fencing_tokens: AsyncMutex<Vec<FencingToken>>,
-        authority_transitions: AsyncMutex<Vec<String>>,
-        /// Successor generations minted by `reset_member_to_successor`, so a
-        /// test can observe that the transition happened and under which
-        /// incarnation.
+        /// Successor aliases minted by `reset_member_to_successor`; their
+        /// count numbers the next successor.
         successor_generations: AsyncMutex<Vec<String>>,
+        /// Identities created through the held arm (`create_session_held`).
+        held_creates: AsyncMutex<Vec<String>>,
+        /// The members Core holds, as this double's creates and retires
+        /// leave them.
+        core: crate::identity_first::core_test_members::CoreTestMembers,
     }
 
     impl RecordingBridge {
         async fn create_profiles(&self) -> Vec<String> {
             self.create_profiles.lock().await.clone()
-        }
-
-        async fn successor_generations(&self) -> Vec<String> {
-            self.successor_generations.lock().await.clone()
         }
 
         fn max_creates_in_flight(&self) -> usize {
@@ -17408,42 +14918,6 @@ mod reset_reprofile_tests {
 
         async fn retired_runtime_ids(&self) -> Vec<String> {
             self.retired_runtime_ids.lock().await.clone()
-        }
-
-        async fn hang_retire_for(&self, runtime_id: &AgentRuntimeId) {
-            self.hanging_retire_runtime_ids
-                .lock()
-                .await
-                .insert(runtime_id.to_string());
-        }
-
-        async fn fail_unregister_for(&self, session_id: &SessionId) {
-            self.failing_unregister_session_ids
-                .lock()
-                .await
-                .insert(session_id.to_string());
-        }
-
-        async fn allow_unregister_for(&self, session_id: &SessionId) {
-            self.failing_unregister_session_ids
-                .lock()
-                .await
-                .remove(&session_id.to_string());
-        }
-
-        async fn fail_register_for(&self, session_id: &SessionId) {
-            self.failing_register_session_ids
-                .lock()
-                .await
-                .insert(session_id.to_string());
-        }
-
-        async fn registered_fencing_tokens(&self) -> Vec<FencingToken> {
-            self.registered_fencing_tokens.lock().await.clone()
-        }
-
-        async fn authority_transitions(&self) -> Vec<String> {
-            self.authority_transitions.lock().await.clone()
         }
     }
 
@@ -17469,7 +14943,7 @@ mod reset_reprofile_tests {
             identity: &AgentIdentity,
             spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
-        ) -> Result<crate::identity_first::bridge::ResetSuccessorBinding, BridgeError> {
+        ) -> Result<crate::identity_first::bridge::MemberRuntimeBinding, BridgeError> {
             // The successor IS built on the requested spec now, so the double
             // publishes the profile the same way create does.
             self.create_profiles
@@ -17482,20 +14956,23 @@ mod reset_reprofile_tests {
             let agent_runtime_id = AgentRuntimeId::parse(&alias).map_err(|error| {
                 BridgeError::Mob(format!("test double minted an unusable successor: {error}"))
             })?;
-            Ok(crate::identity_first::bridge::ResetSuccessorBinding {
+            let binding = crate::identity_first::bridge::MemberRuntimeBinding {
                 agent_runtime_id,
-                session_id: SessionId::new(),
-            })
+                session_id: Some(SessionId::new()),
+            };
+            self.core.bind(identity, &binding, &spec.profile);
+            Ok(binding)
         }
 
         async fn create_session(
             &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
+            identity: &AgentIdentity,
             spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
-            session_id: &SessionId,
-        ) -> Result<SessionId, BridgeError> {
+        ) -> Result<crate::identity_first::MemberRuntimeBinding, BridgeError> {
+            let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
+            let session_id = &meerkat_core::types::SessionId::new();
             let in_flight = self.creates_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_creates_in_flight
                 .fetch_max(in_flight, Ordering::SeqCst);
@@ -17505,17 +14982,41 @@ mod reset_reprofile_tests {
                 .lock()
                 .await
                 .push(spec.profile.to_string());
-            Ok(session_id.clone())
+            let binding = crate::identity_first::MemberRuntimeBinding {
+                agent_runtime_id,
+                session_id: Some(session_id.clone()),
+            };
+            self.core.bind(identity, &binding, &spec.profile);
+            Ok(binding)
+        }
+
+        /// Core mints a held member's incarnation too. Generation 7 is one
+        /// the runtime never mints, so a status that names it was adopted.
+        async fn create_session_held(
+            &self,
+            identity: &AgentIdentity,
+            spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+            _pass: &super::super::held_bootstrap::HeldCreatePass,
+        ) -> Result<crate::identity_first::MemberRuntimeBinding, BridgeError> {
+            self.held_creates.lock().await.push(identity.to_string());
+            let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:7"))
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
+            let binding = crate::identity_first::MemberRuntimeBinding {
+                agent_runtime_id,
+                session_id: Some(SessionId::new()),
+            };
+            self.core.bind(identity, &binding, &spec.profile);
+            Ok(binding)
         }
 
         async fn resume_session(
             &self,
             _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
             _spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
             _session_id: &SessionId,
-            _snapshot: &SessionSnapshot,
+            _resume_from_role: Option<&meerkat_mob::ProfileName>,
         ) -> Result<ResumeSessionOutcome, BridgeError> {
             Err(BridgeError::Mob(
                 "resume not used in reset test".to_string(),
@@ -17543,18 +15044,11 @@ mod reset_reprofile_tests {
         }
 
         async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+            self.core.retire(runtime_id);
             self.retired_runtime_ids
                 .lock()
                 .await
                 .push(runtime_id.to_string());
-            if self
-                .hanging_retire_runtime_ids
-                .lock()
-                .await
-                .contains(runtime_id.as_str())
-            {
-                futures::future::pending::<()>().await;
-            }
             Ok(())
         }
 
@@ -17567,58 +15061,75 @@ mod reset_reprofile_tests {
             ))
         }
 
+        async fn live_member(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn live_member_scope(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+            self.core.live_member_scope(identity)
+        }
+
+        async fn ensure_member_live(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn last_member_binding(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+            self.core.last_member_binding(identity)
+        }
+
+        async fn member_binding_history(
+            &self,
+        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+            self.core.history()
+        }
+
+        async fn durable_identity_members(
+            &self,
+        ) -> Result<Vec<meerkat_mob::MemberBinding>, BridgeError> {
+            self.core.durable_identity_members()
+        }
+
+        async fn identity_management(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+            Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
+        }
+
         async fn register_session_runtime_state(
             &self,
-            session_id: &SessionId,
+            _session_id: &SessionId,
             _identity: &AgentIdentity,
             _generation: ContinuityGeneration,
             checkpoint_version: CheckpointVersion,
-            fencing_token: FencingToken,
+            _fencing_token: FencingToken,
         ) -> Result<CheckpointVersion, BridgeError> {
-            self.registered_fencing_tokens
-                .lock()
-                .await
-                .push(fencing_token);
-            self.authority_transitions
-                .lock()
-                .await
-                .push(format!("register:{}", fencing_token.get()));
-            if self
-                .failing_register_session_ids
-                .lock()
-                .await
-                .contains(&session_id.to_string())
-            {
-                return Err(BridgeError::Mob(
-                    "synthetic live-session rebind failure".to_string(),
-                ));
-            }
             Ok(checkpoint_version)
         }
 
         async fn suspend_session_runtime_state(
             &self,
-            session_id: &SessionId,
+            _session_id: &SessionId,
         ) -> Result<(), BridgeError> {
-            self.authority_transitions
-                .lock()
-                .await
-                .push(format!("suspend:{session_id}"));
             Ok(())
         }
 
         async fn unregister_session_runtime_state(
             &self,
-            session_id: &SessionId,
+            _session_id: &SessionId,
         ) -> Result<(), BridgeError> {
-            if self
-                .failing_unregister_session_ids
-                .lock()
-                .await
-                .contains(&session_id.to_string())
-            {
-                return Err(BridgeError::Mob("old session still draining".to_string()));
-            }
             Ok(())
         }
     }
@@ -17632,33 +15143,40 @@ mod reset_reprofile_tests {
         sessions: AsyncMutex<BTreeMap<String, SessionId>>,
         retire_calls: AtomicUsize,
         resume_calls: AtomicUsize,
+        core: crate::identity_first::core_test_members::CoreTestMembers,
     }
 
     #[async_trait::async_trait]
     impl SessionBridge for HotReloadBridge {
         async fn create_session(
             &self,
-            _identity: &AgentIdentity,
-            runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
+            identity: &AgentIdentity,
+            spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
-            session_id: &SessionId,
-        ) -> Result<SessionId, BridgeError> {
+        ) -> Result<crate::identity_first::MemberRuntimeBinding, BridgeError> {
+            let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
+            let runtime_id = &agent_runtime_id;
+            let session_id = &meerkat_core::types::SessionId::new();
             self.sessions
                 .lock()
                 .await
                 .insert(runtime_id.to_string(), session_id.clone());
-            Ok(session_id.clone())
+            let binding = crate::identity_first::MemberRuntimeBinding {
+                agent_runtime_id,
+                session_id: Some(session_id.clone()),
+            };
+            self.core.bind(identity, &binding, &spec.profile);
+            Ok(binding)
         }
 
         async fn resume_session(
             &self,
             _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
             _spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
             _session_id: &SessionId,
-            _snapshot: &SessionSnapshot,
+            _resume_from_role: Option<&meerkat_mob::ProfileName>,
         ) -> Result<ResumeSessionOutcome, BridgeError> {
             self.resume_calls.fetch_add(1, Ordering::SeqCst);
             Err(BridgeError::Mob(
@@ -17692,6 +15210,7 @@ mod reset_reprofile_tests {
         async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
             self.retire_calls.fetch_add(1, Ordering::SeqCst);
             self.sessions.lock().await.remove(runtime_id.as_str());
+            self.core.retire(runtime_id);
             Ok(())
         }
 
@@ -17703,157 +15222,52 @@ mod reset_reprofile_tests {
                 "inspect not used in hot-reload test".to_string(),
             ))
         }
-    }
 
-    /// Lower-plane model for lease-loss reconciliation. Resume rejects a
-    /// duplicate concrete alias, so the tests prove Broken cleanup happens
-    /// before profile replacement rather than merely observing call counts.
-    #[derive(Default)]
-    struct LostCleanupBridge {
-        members: AsyncMutex<BTreeSet<String>>,
-        session_runtime_states: AsyncMutex<BTreeSet<String>>,
-        retire_calls: AtomicUsize,
-        unregister_calls: AtomicUsize,
-        unregistered_sessions: AsyncMutex<Vec<String>>,
-        resume_collisions: AtomicUsize,
-    }
-
-    impl LostCleanupBridge {
-        async fn member_count(&self) -> usize {
-            self.members.lock().await.len()
+        async fn live_member(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
         }
 
-        async fn session_runtime_state_count(&self) -> usize {
-            self.session_runtime_states.lock().await.len()
+        async fn live_member_scope(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+            self.core.live_member_scope(identity)
         }
-    }
 
-    async fn force_renewal_lost(
-        runtime: &IdentityRuntime,
-        lease_provider: &LostRenewLeaseProvider,
-        identity: &AgentIdentity,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        lease_provider.lose_renewals.store(true, Ordering::SeqCst);
-        {
-            let mut entries = runtime.entries.write().await;
-            let entry = entries
-                .get_mut(identity)
-                .ok_or("identity disappeared before forced renewal")?;
-            let lease = entry
-                .lease
-                .as_mut()
-                .ok_or("active identity has no lease before forced renewal")?;
-            lease.ttl = Duration::ZERO;
+        async fn ensure_member_live(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
         }
-        assert!(matches!(
-            runtime.renew_due_leases_once().await,
-            Err(IdentityRuntimeError::LeaseLost(lost)) if lost == *identity
-        ));
-        Ok(())
-    }
 
-    #[async_trait::async_trait]
-    impl SessionBridge for LostCleanupBridge {
-        async fn create_session(
+        async fn last_member_binding(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+            self.core.last_member_binding(identity)
+        }
+
+        async fn member_binding_history(
+            &self,
+        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+            self.core.history()
+        }
+
+        async fn durable_identity_members(
+            &self,
+        ) -> Result<Vec<meerkat_mob::MemberBinding>, BridgeError> {
+            self.core.durable_identity_members()
+        }
+
+        async fn identity_management(
             &self,
             _identity: &AgentIdentity,
-            runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
-            _draft: &AgentBuildDraft,
-            session_id: &SessionId,
-        ) -> Result<SessionId, BridgeError> {
-            if !self.members.lock().await.insert(runtime_id.to_string()) {
-                return Err(BridgeError::Mob(format!(
-                    "member collision for {runtime_id}"
-                )));
-            }
-            Ok(session_id.clone())
-        }
-
-        async fn resume_session(
-            &self,
-            _identity: &AgentIdentity,
-            runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
-            _draft: &AgentBuildDraft,
-            session_id: &SessionId,
-            _snapshot: &SessionSnapshot,
-        ) -> Result<ResumeSessionOutcome, BridgeError> {
-            if !self.members.lock().await.insert(runtime_id.to_string()) {
-                self.resume_collisions.fetch_add(1, Ordering::SeqCst);
-                return Err(BridgeError::Mob(format!(
-                    "member collision for {runtime_id}"
-                )));
-            }
-            Ok(ResumeSessionOutcome::Resumed {
-                session_id: session_id.clone(),
-            })
-        }
-
-        async fn deliver_admitted(
-            &self,
-            _runtime_id: &AgentRuntimeId,
-            _delivery: BridgeDelivery,
-        ) -> Result<SessionId, BridgeError> {
-            Err(BridgeError::Mob(
-                "deliver not used in lost cleanup test".to_string(),
-            ))
-        }
-
-        async fn checkpoint_session(
-            &self,
-            _runtime_id: &AgentRuntimeId,
-            _session_id: &SessionId,
-        ) -> Result<SessionSnapshot, BridgeError> {
-            Err(BridgeError::Mob(
-                "checkpoint not used in lost cleanup test".to_string(),
-            ))
-        }
-
-        async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
-            self.retire_calls.fetch_add(1, Ordering::SeqCst);
-            self.members.lock().await.remove(runtime_id.as_str());
-            Ok(())
-        }
-
-        async fn inspect_member(
-            &self,
-            _runtime_id: &AgentRuntimeId,
-        ) -> Result<MemberInspection, BridgeError> {
-            Err(BridgeError::Mob(
-                "inspect not used in lost cleanup test".to_string(),
-            ))
-        }
-
-        async fn register_session_runtime_state(
-            &self,
-            session_id: &SessionId,
-            _identity: &AgentIdentity,
-            _generation: ContinuityGeneration,
-            checkpoint_version: CheckpointVersion,
-            _fencing_token: FencingToken,
-        ) -> Result<CheckpointVersion, BridgeError> {
-            self.session_runtime_states
-                .lock()
-                .await
-                .insert(session_id.to_string());
-            Ok(checkpoint_version)
-        }
-
-        async fn unregister_session_runtime_state(
-            &self,
-            session_id: &SessionId,
-        ) -> Result<(), BridgeError> {
-            self.unregister_calls.fetch_add(1, Ordering::SeqCst);
-            self.unregistered_sessions
-                .lock()
-                .await
-                .push(session_id.to_string());
-            self.session_runtime_states
-                .lock()
-                .await
-                .remove(&session_id.to_string());
-            Ok(())
+        ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+            Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
         }
     }
 
@@ -17871,79 +15285,6 @@ mod reset_reprofile_tests {
             backend: None,
             binding: None,
             placement: None,
-        }
-    }
-
-    /// Always answers create with the host's deterministic rejection — the
-    /// exact string shape rpc_gateway mints when the app-side
-    /// `callback/build_agent` round trip COMPLETES with an error.
-    #[derive(Default)]
-    struct HostRejectingBridge {
-        create_attempts: std::sync::atomic::AtomicUsize,
-    }
-
-    impl HostRejectingBridge {
-        fn attempts(&self) -> usize {
-            self.create_attempts
-                .load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl SessionBridge for HostRejectingBridge {
-        async fn create_session(
-            &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
-            _draft: &AgentBuildDraft,
-            _session_id: &SessionId,
-        ) -> Result<SessionId, BridgeError> {
-            self.create_attempts
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(BridgeError::Mob(
-                "spawn_member: callback/build_agent failed: callback error: candidate-mode \
-                 effect gate refused this build"
-                    .to_string(),
-            ))
-        }
-
-        async fn resume_session(
-            &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
-            _draft: &AgentBuildDraft,
-            _session_id: &SessionId,
-            _snapshot: &SessionSnapshot,
-        ) -> Result<ResumeSessionOutcome, BridgeError> {
-            Err(BridgeError::Mob(
-                "resume not used in host-reject test".to_string(),
-            ))
-        }
-
-        async fn deliver_admitted(
-            &self,
-            _runtime_id: &AgentRuntimeId,
-            _delivery: BridgeDelivery,
-        ) -> Result<SessionId, BridgeError> {
-            Err(BridgeError::Mob(
-                "deliver not used in host-reject test".to_string(),
-            ))
-        }
-
-        async fn checkpoint_session(
-            &self,
-            _runtime_id: &AgentRuntimeId,
-            _session_id: &SessionId,
-        ) -> Result<SessionSnapshot, BridgeError> {
-            Err(BridgeError::Mob(
-                "checkpoint not used in host-reject test".to_string(),
-            ))
-        }
-
-        async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
-            Ok(())
         }
     }
 
@@ -17969,11 +15310,9 @@ mod reset_reprofile_tests {
         async fn create_session(
             &self,
             _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
             _spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
-            _session_id: &SessionId,
-        ) -> Result<SessionId, BridgeError> {
+        ) -> Result<crate::identity_first::MemberRuntimeBinding, BridgeError> {
             Err(BridgeError::Mob(
                 "create not used in release test".to_string(),
             ))
@@ -17982,11 +15321,10 @@ mod reset_reprofile_tests {
         async fn resume_session(
             &self,
             _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
             _spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
             _session_id: &SessionId,
-            _snapshot: &SessionSnapshot,
+            _resume_from_role: Option<&meerkat_mob::ProfileName>,
         ) -> Result<ResumeSessionOutcome, BridgeError> {
             Err(BridgeError::Mob(
                 "resume not used in release test".to_string(),
@@ -18032,7 +15370,7 @@ mod reset_reprofile_tests {
         }
     }
 
-    /// #563 follow-up: a restored member whose early `customize_build` failed
+    /// A restored member whose early `customize_build` failed
     /// is held by the mob build (`ToolsNotPublished`). The publication that
     /// clears its pending record releases that hold exactly once; publishing
     /// for an identity that was not pending releases nothing; a failed
@@ -18105,758 +15443,6 @@ mod reset_reprofile_tests {
         Ok(())
     }
 
-    /// Always answers create with meerkat's typed provider-auth refusal for
-    /// the configured `AuthErrorKind`: the shape the mob bridge produces when
-    /// the factory fails credential resolution at build time.
-    struct ProviderAuthRejectingBridge {
-        kind: meerkat_core::AuthErrorKind,
-        create_attempts: std::sync::atomic::AtomicUsize,
-    }
-
-    impl ProviderAuthRejectingBridge {
-        fn new(kind: meerkat_core::AuthErrorKind) -> Self {
-            Self {
-                kind,
-                create_attempts: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-
-        fn attempts(&self) -> usize {
-            self.create_attempts
-                .load(std::sync::atomic::Ordering::SeqCst)
-        }
-
-        fn failure(&self) -> meerkat_core::service::SessionProviderAuthFailure {
-            meerkat_core::service::SessionProviderAuthFailure {
-                kind: self.kind,
-                provider: meerkat_core::Provider::Anthropic,
-                realm_id: None,
-                binding_id: None,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl SessionBridge for ProviderAuthRejectingBridge {
-        async fn create_session(
-            &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
-            _draft: &AgentBuildDraft,
-            _session_id: &SessionId,
-        ) -> Result<SessionId, BridgeError> {
-            self.create_attempts
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let failure = self.failure();
-            Err(BridgeError::ProviderAuthRejected {
-                detail: format!("create_session: {}", failure.public_message()),
-                failure,
-            })
-        }
-
-        async fn resume_session(
-            &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
-            _draft: &AgentBuildDraft,
-            _session_id: &SessionId,
-            _snapshot: &SessionSnapshot,
-        ) -> Result<ResumeSessionOutcome, BridgeError> {
-            Err(BridgeError::Mob(
-                "resume not used in provider-auth test".to_string(),
-            ))
-        }
-
-        async fn deliver_admitted(
-            &self,
-            _runtime_id: &AgentRuntimeId,
-            _delivery: BridgeDelivery,
-        ) -> Result<SessionId, BridgeError> {
-            Err(BridgeError::Mob(
-                "deliver not used in provider-auth test".to_string(),
-            ))
-        }
-
-        async fn checkpoint_session(
-            &self,
-            _runtime_id: &AgentRuntimeId,
-            _session_id: &SessionId,
-        ) -> Result<SessionSnapshot, BridgeError> {
-            Err(BridgeError::Mob(
-                "checkpoint not used in provider-auth test".to_string(),
-            ))
-        }
-
-        async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
-            Ok(())
-        }
-    }
-
-    /// A head-canonical store that answers Ready and then fails the exact
-    /// session lookup must make pre-prepare resolution TERMINAL, not skip.
-    ///
-    /// Skipping is the defect: publish nothing, let prepare run, let inner
-    /// recovery commit, and let the projection hit the unregistered-owner
-    /// backstop - a boot that is NOT byte-neutral, because the inner commit has
-    /// already landed when the refusal fires. Failing here lets the caller retry
-    /// a boot that has changed nothing.
-    #[tokio::test]
-    async fn strict_preflight_refuses_rather_than_skipping_on_a_head_canonical_store()
-    -> Result<(), Box<dyn std::error::Error>> {
-        use crate::identity_first::types::{
-            CheckpointVersion, ContinuityGeneration, ContinuityRecord,
-        };
-
-        #[derive(Clone, Copy, PartialEq, Eq)]
-        enum FenceAnswer {
-            Error,
-            Absent,
-            Matching,
-        }
-
-        struct ScriptedFenceStore {
-            inner: Arc<crate::identity_first::local_store::LocalContinuityStore>,
-            record: ContinuityRecord,
-            answer: FenceAnswer,
-        }
-
-        #[async_trait::async_trait]
-        impl crate::identity_first::ContinuityStore for ScriptedFenceStore {
-            async fn resolve_many(
-                &self,
-                identities: &[AgentIdentity],
-            ) -> Result<
-                std::collections::BTreeMap<
-                    AgentIdentity,
-                    crate::identity_first::types::ContinuityResolveState,
-                >,
-                crate::identity_first::types::ContinuityStoreError,
-            > {
-                let mut out = std::collections::BTreeMap::new();
-                for identity in identities {
-                    out.insert(
-                        identity.clone(),
-                        crate::identity_first::types::ContinuityResolveState::Ready {
-                            record: self.record.clone(),
-                        },
-                    );
-                }
-                Ok(out)
-            }
-
-            async fn resolve_record_by_session(
-                &self,
-                _session_id: &meerkat_core::types::SessionId,
-            ) -> Result<
-                Option<(
-                    ContinuityRecord,
-                    crate::identity_first::types::FencingToken,
-                    CheckpointVersion,
-                )>,
-                crate::identity_first::types::ContinuityStoreError,
-            > {
-                match self.answer {
-                    FenceAnswer::Error => Err(
-                        crate::identity_first::types::ContinuityStoreError::Transient(
-                            "scripted fence failure".to_string(),
-                        ),
-                    ),
-                    FenceAnswer::Absent => Ok(None),
-                    FenceAnswer::Matching => Ok(Some((
-                        self.record.clone(),
-                        crate::identity_first::types::FencingToken::new(1),
-                        CheckpointVersion::new(7),
-                    ))),
-                }
-            }
-
-            async fn load_session_snapshot(
-                &self,
-                session_id: &meerkat_core::types::SessionId,
-            ) -> Result<
-                Option<crate::identity_first::types::SessionSnapshot>,
-                crate::identity_first::types::ContinuityStoreError,
-            > {
-                self.inner.load_session_snapshot(session_id).await
-            }
-
-            async fn save_session_snapshot(
-                &self,
-                identity: &AgentIdentity,
-                session_id: &meerkat_core::types::SessionId,
-                generation: crate::identity_first::types::ContinuityGeneration,
-                version: CheckpointVersion,
-                fencing_token: crate::identity_first::types::FencingToken,
-                snapshot: &crate::identity_first::types::SessionSnapshot,
-            ) -> Result<(), crate::identity_first::types::ContinuityStoreError> {
-                self.inner
-                    .save_session_snapshot(
-                        identity,
-                        session_id,
-                        generation,
-                        version,
-                        fencing_token,
-                        snapshot,
-                    )
-                    .await
-            }
-
-            async fn upsert_continuity_record(
-                &self,
-                record: &ContinuityRecord,
-                fencing_token: crate::identity_first::types::FencingToken,
-            ) -> Result<(), crate::identity_first::types::ContinuityStoreError> {
-                self.inner
-                    .upsert_continuity_record(record, fencing_token)
-                    .await
-            }
-
-            async fn delete_continuity_record(
-                &self,
-                identity: &AgentIdentity,
-                fencing_token: crate::identity_first::types::FencingToken,
-            ) -> Result<(), crate::identity_first::types::ContinuityStoreError> {
-                self.inner
-                    .delete_continuity_record(identity, fencing_token)
-                    .await
-            }
-
-            // Delegated so this double IS head-canonical, which is the whole
-            // point: the strict branch is selected by as_incremental_sessions()
-            // being Some, so a double that returned None would silently test the
-            // blob-only path and pass while proving nothing.
-            fn as_incremental_sessions(
-                &self,
-            ) -> Option<Arc<dyn crate::identity_first::contracts::ContinuityIncrementalSessions>>
-            {
-                self.inner.as_incremental_sessions()
-            }
-        }
-
-        let identity = AgentIdentity::parse("domain:calendar")?;
-        let record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse("rt:domain:calendar:0")?,
-            session_id: meerkat_core::types::SessionId::new(),
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        let roster = vec![durable_spec(identity.clone(), "calendar")];
-
-        for answer in [FenceAnswer::Error, FenceAnswer::Absent] {
-            let store: Arc<dyn crate::identity_first::ContinuityStore> =
-                Arc::new(ScriptedFenceStore {
-                    inner: Arc::new(
-                        crate::identity_first::local_store::LocalContinuityStore::in_memory()?,
-                    ),
-                    record: record.clone(),
-                    answer,
-                });
-            let outcome = IdentityRuntime::resolve_persisted_owner_states(&store, &roster).await;
-            assert!(
-                outcome.is_err(),
-                "a Ready record followed by an unreadable fence must be TERMINAL on a \
-                 head-canonical store, not a skip that lets prepare proceed"
-            );
-        }
-
-        // Control: the same double with a matching fence resolves one state, so
-        // the refusals above are about the unreadable fence and not about the
-        // double being unusable.
-        let store: Arc<dyn crate::identity_first::ContinuityStore> = Arc::new(ScriptedFenceStore {
-            inner: Arc::new(crate::identity_first::local_store::LocalContinuityStore::in_memory()?),
-            record: record.clone(),
-            answer: FenceAnswer::Matching,
-        });
-        let states = IdentityRuntime::resolve_persisted_owner_states(&store, &roster).await?;
-        assert_eq!(
-            states.len(),
-            1,
-            "a matching fence must resolve exactly one owner state"
-        );
-        assert_eq!(states[0].1.identity, identity);
-        assert_eq!(states[0].1.checkpoint_version, CheckpointVersion::new(7));
-
-        // The three resolve-state outcomes, which must NOT collapse into one
-        // skip. Only Uninitialized is the creation path.
-        struct ScriptedResolveStore {
-            inner: Arc<crate::identity_first::local_store::LocalContinuityStore>,
-            state: Option<crate::identity_first::types::ContinuityResolveState>,
-            // false => as_incremental_sessions returns None, i.e. BLOB-ONLY.
-            // Without this the "terminal on ANY store" claim was only ever
-            // exercised head-canonical, because delegating to a real store makes
-            // the double head-canonical by construction - the assertion passed
-            // while testing the opposite branch of the one it named.
-            head_canonical: bool,
-            // Counts store reads so INV-06 can be shown to reject BEFORE any
-            // read rather than merely returning some error eventually.
-            reads: Arc<std::sync::atomic::AtomicUsize>,
-        }
-
-        #[async_trait::async_trait]
-        impl crate::identity_first::ContinuityStore for ScriptedResolveStore {
-            async fn resolve_many(
-                &self,
-                identities: &[AgentIdentity],
-            ) -> Result<
-                std::collections::BTreeMap<
-                    AgentIdentity,
-                    crate::identity_first::types::ContinuityResolveState,
-                >,
-                crate::identity_first::types::ContinuityStoreError,
-            > {
-                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut out = std::collections::BTreeMap::new();
-                if let Some(state) = self.state.clone() {
-                    for identity in identities {
-                        out.insert(identity.clone(), state.clone());
-                    }
-                }
-                // state == None means we deliberately answer with NO entry,
-                // which the trait contract forbids.
-                Ok(out)
-            }
-
-            async fn resolve_record_by_session(
-                &self,
-                session_id: &meerkat_core::types::SessionId,
-            ) -> Result<
-                Option<(
-                    ContinuityRecord,
-                    crate::identity_first::types::FencingToken,
-                    CheckpointVersion,
-                )>,
-                crate::identity_first::types::ContinuityStoreError,
-            > {
-                self.inner.resolve_record_by_session(session_id).await
-            }
-
-            async fn load_session_snapshot(
-                &self,
-                session_id: &meerkat_core::types::SessionId,
-            ) -> Result<
-                Option<crate::identity_first::types::SessionSnapshot>,
-                crate::identity_first::types::ContinuityStoreError,
-            > {
-                self.inner.load_session_snapshot(session_id).await
-            }
-
-            async fn save_session_snapshot(
-                &self,
-                identity: &AgentIdentity,
-                session_id: &meerkat_core::types::SessionId,
-                generation: crate::identity_first::types::ContinuityGeneration,
-                version: CheckpointVersion,
-                fencing_token: crate::identity_first::types::FencingToken,
-                snapshot: &crate::identity_first::types::SessionSnapshot,
-            ) -> Result<(), crate::identity_first::types::ContinuityStoreError> {
-                self.inner
-                    .save_session_snapshot(
-                        identity,
-                        session_id,
-                        generation,
-                        version,
-                        fencing_token,
-                        snapshot,
-                    )
-                    .await
-            }
-
-            async fn upsert_continuity_record(
-                &self,
-                record: &ContinuityRecord,
-                fencing_token: crate::identity_first::types::FencingToken,
-            ) -> Result<(), crate::identity_first::types::ContinuityStoreError> {
-                self.inner
-                    .upsert_continuity_record(record, fencing_token)
-                    .await
-            }
-
-            async fn delete_continuity_record(
-                &self,
-                identity: &AgentIdentity,
-                fencing_token: crate::identity_first::types::FencingToken,
-            ) -> Result<(), crate::identity_first::types::ContinuityStoreError> {
-                self.inner
-                    .delete_continuity_record(identity, fencing_token)
-                    .await
-            }
-
-            fn as_incremental_sessions(
-                &self,
-            ) -> Option<Arc<dyn crate::identity_first::contracts::ContinuityIncrementalSessions>>
-            {
-                if self.head_canonical {
-                    self.inner.as_incremental_sessions()
-                } else {
-                    None
-                }
-            }
-        }
-
-        // Built once with `?` rather than `.expect()` inside the closure: this
-        // crate denies clippy::expect_used, and --lib alone does not compile the
-        // test targets, so only --all-targets surfaces it.
-        let scripted_inner =
-            Arc::new(crate::identity_first::local_store::LocalContinuityStore::in_memory()?);
-        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let scripted = |state: Option<crate::identity_first::types::ContinuityResolveState>,
-                        head_canonical: bool| {
-            let store: Arc<dyn crate::identity_first::ContinuityStore> =
-                Arc::new(ScriptedResolveStore {
-                    inner: Arc::clone(&scripted_inner),
-                    state,
-                    head_canonical,
-                    reads: Arc::clone(&reads),
-                });
-            store
-        };
-
-        // Uninitialized: the ONLY creation path. Zero states, no error, on BOTH
-        // store shapes.
-        for head_canonical in [true, false] {
-            let uninit = scripted(
-                Some(crate::identity_first::types::ContinuityResolveState::Uninitialized),
-                head_canonical,
-            );
-            let states = IdentityRuntime::resolve_persisted_owner_states(&uninit, &roster).await?;
-            assert!(
-                states.is_empty(),
-                "Uninitialized is the creation path on either store shape: no owner state, and \
-                 NOT an error (head_canonical={head_canonical})"
-            );
-        }
-
-        // Missing entry: a provider-contract violation, terminal on ANY store -
-        // and now actually EXERCISED on a blob-only double. Previously this claim
-        // was only ever run head-canonical, because delegating
-        // as_incremental_sessions to a real store makes the double
-        // head-canonical, so the assertion named one branch and tested another.
-        for head_canonical in [true, false] {
-            let missing = scripted(None, head_canonical);
-            assert!(
-                IdentityRuntime::resolve_persisted_owner_states(&missing, &roster)
-                    .await
-                    .is_err(),
-                "resolve_many must answer for every requested identity; a missing entry is a \
-                 provider error on EITHER store shape, not an implicit Uninitialized \
-                 (head_canonical={head_canonical})"
-            );
-        }
-
-        // Broken: the identity HAS durable state and the store says it is
-        // unusable. Terminal on a head-canonical store - publishing nothing and
-        // letting prepare proceed means recovery meets an empty owner map for a
-        // session that exists, which is the defect, not a creation.
-        let broken = scripted(
-            Some(
-                crate::identity_first::types::ContinuityResolveState::Broken {
-                    failure: crate::identity_first::types::ContinuityFailure {
-                        identity: identity.clone(),
-                        kind:
-                            crate::identity_first::types::ContinuityFailureKind::SnapshotCorrupted,
-                        record: None,
-                        detail: "scripted broken head".to_string(),
-                    },
-                },
-            ),
-            true,
-        );
-        assert!(
-            IdentityRuntime::resolve_persisted_owner_states(&broken, &roster)
-                .await
-                .is_err(),
-            "Broken is not the creation path: an identity with unusable durable state must be \
-             terminal on a head-canonical store rather than silently recreated"
-        );
-
-        // BLOB-ONLY Broken control, proving the accepted legacy disposition
-        // rather than assuming it: no head-canonical projection needs the cursor
-        // there, so Broken degrades to best-effort - ZERO states, and NOT an
-        // error. Without this the head-canonical assertion above would be
-        // consistent with Broken being terminal everywhere, which is not what
-        // was accepted.
-        let broken_blob = scripted(
-            Some(
-                crate::identity_first::types::ContinuityResolveState::Broken {
-                    failure: crate::identity_first::types::ContinuityFailure {
-                        identity: identity.clone(),
-                        kind:
-                            crate::identity_first::types::ContinuityFailureKind::SnapshotCorrupted,
-                        record: None,
-                        detail: "scripted broken head, blob-only".to_string(),
-                    },
-                },
-            ),
-            false,
-        );
-        let blob_states =
-            IdentityRuntime::resolve_persisted_owner_states(&broken_blob, &roster).await?;
-        assert!(
-            blob_states.is_empty(),
-            "on a blob-only store Broken keeps the legacy best-effort disposition: zero states, \
-             not an error"
-        );
-
-        // INV-06 before any store read: a duplicated roster identity must be
-        // rejected as a malformed roster, NOT surface later as an ownership
-        // conflict from register_session being called twice.
-        let duplicated = vec![
-            durable_spec(identity.clone(), "calendar"),
-            durable_spec(identity.clone(), "calendar"),
-        ];
-        let ok_store = scripted(
-            Some(crate::identity_first::types::ContinuityResolveState::Uninitialized),
-            true,
-        );
-        let reads_before = reads.load(std::sync::atomic::Ordering::SeqCst);
-        let inv06 = IdentityRuntime::resolve_persisted_owner_states(&ok_store, &duplicated).await;
-        // The TYPED variant, not merely is_err(): an is_err() assertion passes on
-        // any failure at all, including one from a later store read, which is
-        // exactly the outcome this test exists to rule out.
-        assert!(
-            matches!(inv06, Err(IdentityRuntimeError::DuplicateIdentity(_))),
-            "a duplicated roster identity must fail as DuplicateIdentity, not as some later \
-             ownership conflict: {inv06:?}"
-        );
-        // And ZERO store reads: INV-06 runs before the first read, so the counter
-        // must not have moved.
-        assert_eq!(
-            reads.load(std::sync::atomic::Ordering::SeqCst),
-            reads_before,
-            "INV-06 must reject a malformed roster BEFORE any store read"
-        );
-        Ok(())
-    }
-
-    /// Herd-investigation park: a build the HOST deterministically rejects
-    /// (the candidate-mode effect gate) parks the identity typed on the
-    /// FIRST attempt — no repair-loop churn — and a roster spec change
-    /// re-admits exactly one new attempt.
-    #[tokio::test]
-    async fn host_rejected_build_parks_identity_until_spec_changes()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:gated")?;
-        let bridge = Arc::new(HostRejectingBridge::default());
-        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
-            lease_provider: Arc::new(LocalLeaseProvider::new()),
-            runtime_instance_id: "host-reject-park-test".to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: Some(bridge.clone()),
-            default_timeout: None,
-        }));
-        runtime
-            .register(
-                durable_spec(identity.clone(), "domain"),
-                IdentityLifecycleState::Dormant,
-                None,
-                None,
-            )
-            .await;
-
-        // The first attempt reaches the host exactly once; the deterministic
-        // rejection parks the identity typed.
-        assert!(
-            runtime.materialize(&identity).await.is_err(),
-            "gated build must fail"
-        );
-        assert_eq!(bridge.attempts(), 1);
-        let park = runtime
-            .host_rejected_build_park(&identity)
-            .await
-            .ok_or("the first host rejection must park the identity")?;
-        assert!(park.reason.contains("callback error"));
-
-        // Parked: the next attempt fails fast typed WITHOUT reaching the
-        // host, and the repair supervisor's Broken selection excludes the
-        // identity even when a reconcile re-registers it Broken with the
-        // same spec.
-        match runtime.materialize(&identity).await {
-            Err(IdentityRuntimeError::HostRejectedBuild { reason, .. }) => {
-                assert!(reason.contains("callback error"));
-            }
-            other => return Err(format!("expected the typed park, got {other:?}").into()),
-        }
-        assert_eq!(
-            bridge.attempts(),
-            1,
-            "a parked identity must not re-ask the host"
-        );
-        runtime
-            .register(
-                durable_spec(identity.clone(), "domain"),
-                IdentityLifecycleState::Broken,
-                None,
-                None,
-            )
-            .await;
-        assert!(
-            runtime.repairable_broken_identities().await.is_empty(),
-            "the repair supervisor must skip a parked identity"
-        );
-
-        // A spec change clears the park: the retry is permitted and reaches
-        // the host exactly once more.
-        let mut changed = durable_spec(identity.clone(), "domain");
-        changed
-            .labels
-            .insert("policy_epoch".to_string(), "2".to_string());
-        runtime
-            .register(changed, IdentityLifecycleState::Dormant, None, None)
-            .await;
-        assert!(
-            runtime.host_rejected_build_park(&identity).await.is_none(),
-            "a spec change must clear the park"
-        );
-        assert!(runtime.materialize(&identity).await.is_err());
-        assert_eq!(
-            bridge.attempts(),
-            2,
-            "a changed spec re-admits exactly one new build attempt"
-        );
-        Ok(())
-    }
-
-    /// A missing provider secret is a deterministic wall: the first typed
-    /// refusal parks the identity with an operator-readable reason, the next
-    /// attempt fails fast without a bridge call, and the repair supervisor
-    /// skips it. Before this the refusal was flattened to text, matched
-    /// nothing, and the identity heal-looped with the cause visible nowhere.
-    #[tokio::test]
-    async fn missing_secret_build_refusal_parks_identity_typed_on_first_attempt()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:keyless")?;
-        let bridge = Arc::new(ProviderAuthRejectingBridge::new(
-            meerkat_core::AuthErrorKind::MissingSecret,
-        ));
-        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
-            lease_provider: Arc::new(LocalLeaseProvider::new()),
-            runtime_instance_id: "provider-auth-park-test".to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: Some(bridge.clone()),
-            default_timeout: None,
-        }));
-        runtime
-            .register(
-                durable_spec(identity.clone(), "domain"),
-                IdentityLifecycleState::Dormant,
-                None,
-                None,
-            )
-            .await;
-
-        // The FIRST attempt is already the typed park, not `Internal` prose:
-        // a console send that materializes a Dormant keyless identity in-band
-        // surfaces the reason on this very call.
-        match runtime.materialize(&identity).await {
-            Err(IdentityRuntimeError::HostRejectedBuild { reason, .. }) => {
-                assert!(reason.contains("kind=missing_secret"), "{reason}");
-            }
-            other => {
-                return Err(format!(
-                    "the first keyless build must fail with the typed park, got {other:?}"
-                )
-                .into());
-            }
-        }
-        assert_eq!(bridge.attempts(), 1);
-        let park = runtime
-            .host_rejected_build_park(&identity)
-            .await
-            .ok_or("the first typed provider-auth refusal must park the identity")?;
-        assert!(
-            park.reason.contains("kind=missing_secret"),
-            "{}",
-            park.reason
-        );
-        assert!(
-            park.reason.contains("provider=anthropic"),
-            "{}",
-            park.reason
-        );
-
-        // Parked: the next attempt fails fast typed WITHOUT re-running the
-        // build, and the repair supervisor's Broken selection excludes it.
-        match runtime.materialize(&identity).await {
-            Err(IdentityRuntimeError::HostRejectedBuild { reason, .. }) => {
-                assert!(reason.contains("kind=missing_secret"), "{reason}");
-            }
-            other => return Err(format!("expected the typed park, got {other:?}").into()),
-        }
-        assert_eq!(
-            bridge.attempts(),
-            1,
-            "a parked identity must not re-run the build"
-        );
-        runtime
-            .register(
-                durable_spec(identity.clone(), "domain"),
-                IdentityLifecycleState::Broken,
-                None,
-                None,
-            )
-            .await;
-        assert!(
-            runtime.repairable_broken_identities().await.is_empty(),
-            "the repair supervisor must skip a parked identity"
-        );
-        Ok(())
-    }
-
-    /// Credential STATE that can change out of band (an expired lease, or a
-    /// credential-store refusal the shared credential owner clears) is not a
-    /// wall: no park, and the next attempt reaches the bridge again.
-    #[tokio::test]
-    async fn transient_provider_auth_failure_stays_on_the_repair_lanes()
-    -> Result<(), Box<dyn std::error::Error>> {
-        for kind in [
-            meerkat_core::AuthErrorKind::Expired,
-            meerkat_core::AuthErrorKind::CredentialAccessDenied,
-            meerkat_core::AuthErrorKind::CredentialInteractionRequired,
-            meerkat_core::AuthErrorKind::CredentialAccessPending,
-            meerkat_core::AuthErrorKind::CredentialStoreUnavailable,
-        ] {
-            let identity = AgentIdentity::parse("domain:transient-auth")?;
-            let bridge = Arc::new(ProviderAuthRejectingBridge::new(kind));
-            let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-                continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
-                lease_provider: Arc::new(LocalLeaseProvider::new()),
-                runtime_instance_id: "provider-auth-transient-test".to_string(),
-                has_runtime_store: true,
-                durability_policy: DurabilityPolicy::SyncWriteThrough,
-                bridge: Some(bridge.clone()),
-                default_timeout: None,
-            }));
-            runtime
-                .register(
-                    durable_spec(identity.clone(), "domain"),
-                    IdentityLifecycleState::Dormant,
-                    None,
-                    None,
-                )
-                .await;
-
-            assert!(runtime.materialize(&identity).await.is_err());
-            assert!(
-                runtime.host_rejected_build_park(&identity).await.is_none(),
-                "{kind:?} must not park"
-            );
-            assert!(runtime.materialize(&identity).await.is_err());
-            assert_eq!(
-                bridge.attempts(),
-                2,
-                "{kind:?}: an unparked identity re-attempts the build"
-            );
-        }
-        Ok(())
-    }
-
     /// The classifier reads the typed refusal (its kind) and the host gate's
     /// minted text; everything else is not a deterministic wall.
     #[test]
@@ -18898,6 +15484,21 @@ mod reset_reprofile_tests {
                 "{transient:?} can change out of band and must not park"
             );
         }
+        let realm = deterministic_build_rejection_reason(&BridgeError::RealmBackendUnavailable {
+            detail: "create_session: durable sessions required".to_string(),
+        })
+        .ok_or("a host without a persistent realm backend is a deterministic wall")?;
+        assert!(
+            realm.starts_with("create_session: durable sessions required; "),
+            "{realm}"
+        );
+        assert!(
+            realm.contains(
+                "run that host with a persistent realm backend, or remove the identity's \
+                 placement"
+            ),
+            "the reason names the remedy: {realm}"
+        );
         let host_gate = BridgeError::Mob(
             "spawn_member: callback/build_agent failed: callback error: gate refused".to_string(),
         );
@@ -18926,107 +15527,33 @@ mod reset_reprofile_tests {
         Ok(())
     }
 
-    async fn lazy_context_with_broken_retained_lease(
-        identity: AgentIdentity,
-        spec: DurableAgentSpec,
-        roster: Arc<MutableRoster>,
-        lease_provider: Arc<RecordingReleaseLeaseProvider>,
-        runtime_instance_id: &str,
-    ) -> Result<
-        (
-            Arc<IdentityRuntime>,
-            IdentityFirstRuntimeContext,
-            LeaseGrant,
-        ),
-        Box<dyn std::error::Error>,
-    > {
-        let continuity_store = Arc::new(LocalContinuityStore::in_memory()?);
-        let acquired = lease_provider
-            .acquire_leases(std::slice::from_ref(&identity), runtime_instance_id)
-            .await?;
-        let grant = match acquired.get(&identity) {
-            Some(LeaseAcquireResult::Acquired(grant)) => grant.clone(),
-            other => return Err(format!("expected retained lease grant, got {other:?}").into()),
-        };
-        let record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{identity}:0"))?,
-            session_id: SessionId::new(),
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        continuity_store
-            .upsert_continuity_record(&record, grant.fencing_token)
-            .await?;
-        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store,
-            lease_provider,
-            runtime_instance_id: runtime_instance_id.to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
-            default_timeout: None,
-        }));
-        runtime
-            .register(
-                spec,
-                IdentityLifecycleState::Active,
-                Some(record),
-                Some(grant.clone()),
-            )
-            .await;
-        // Model the public rollback state exercised by
-        // `identity_first_runtime_reset_register_failure_cleans_new_member_and_preserves_old_continuity`:
-        // the identity is fail-closed Broken while its exact current grant is
-        // retained in `entry.lease` for repair.
-        runtime
-            .entries
-            .write()
-            .await
-            .get_mut(&identity)
-            .ok_or("seeded identity disappeared")?
-            .state = IdentityLifecycleState::Broken;
-        let context = IdentityFirstRuntimeContext::new_with_bootstrap_mode(
-            runtime.clone(),
-            roster,
-            None,
-            None,
-            None,
-            IdentityBootstrapMode::LazyMaterialize,
-        );
-        Ok((runtime, context, grant))
-    }
-
     async fn active_alias_runtime(
         runtime_instance_id: &str,
         identity: &str,
     ) -> Result<(Arc<IdentityRuntime>, String), Box<dyn std::error::Error>> {
         let identity = AgentIdentity::parse(identity)?;
         let alias = format!("rt:{identity}:0");
-        let record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse(&alias)?,
-            session_id: SessionId::new(),
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
+        // Core holds the identity's live member at generation 0, so the
+        // generated alias names its current incarnation.
+        let bridge = Arc::new(RecordingBridge::default());
+        bridge.core.bind(
+            &identity,
+            &MemberRuntimeBinding {
+                agent_runtime_id: AgentRuntimeId::parse(&alias)?,
+                session_id: Some(SessionId::new()),
+            },
+            &meerkat_mob::ProfileName::from("domain"),
+        );
         let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: runtime_instance_id.to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(bridge),
             default_timeout: None,
         }));
-        runtime
-            .register(
-                durable_spec(identity, "domain"),
-                IdentityLifecycleState::Active,
-                Some(record),
-                None,
-            )
-            .await;
+        runtime.register(durable_spec(identity, "domain")).await;
         Ok((runtime, alias))
     }
 
@@ -19040,97 +15567,6 @@ mod reset_reprofile_tests {
             .ok_or_else(|| {
                 format!("generated alias did not resolve to lifecycle target: {alias}").into()
             })
-    }
-
-    #[tokio::test]
-    async fn permanent_stream_loss_breaks_only_the_current_active_embodiment()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:stream-loss")?;
-        let (runtime, alias) =
-            active_alias_runtime("stream-loss-runtime", identity.as_str()).await?;
-        runtime
-            .update_lease(
-                &identity,
-                LeaseGrant {
-                    identity: identity.clone(),
-                    fencing_token: FencingToken::new(7),
-                    ttl: Duration::from_mins(1),
-                },
-            )
-            .await?;
-
-        assert!(
-            runtime
-                .mark_active_runtime_broken(&identity, &alias, 7, "event stream closed")
-                .await?
-        );
-        assert_eq!(
-            runtime.status(&identity).await?.state,
-            IdentityLifecycleState::Broken
-        );
-        assert!(
-            runtime
-                .entries
-                .read()
-                .await
-                .get(&identity)
-                .and_then(|entry| entry.lease.as_ref())
-                .is_some(),
-            "repair must retain the exact live lease for fenced cleanup"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stale_stream_loss_does_not_break_replacement_embodiment()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:replacement")?;
-        let (runtime, _) = active_alias_runtime("replacement-runtime", identity.as_str()).await?;
-
-        assert!(
-            !runtime
-                .mark_active_runtime_broken(
-                    &identity,
-                    "rt:domain:replacement:stale",
-                    0,
-                    "stale event stream closed",
-                )
-                .await?
-        );
-        assert_eq!(
-            runtime.status(&identity).await?.state,
-            IdentityLifecycleState::Active
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stale_fence_stream_loss_does_not_break_same_alias_replacement()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:replacement-fence")?;
-        let (runtime, alias) =
-            active_alias_runtime("replacement-fence-runtime", identity.as_str()).await?;
-        runtime
-            .update_lease(
-                &identity,
-                LeaseGrant {
-                    identity: identity.clone(),
-                    fencing_token: FencingToken::new(8),
-                    ttl: Duration::from_mins(1),
-                },
-            )
-            .await?;
-
-        assert!(
-            !runtime
-                .mark_active_runtime_broken(&identity, &alias, 7, "old-fence event stream closed",)
-                .await?
-        );
-        assert_eq!(
-            runtime.status(&identity).await?.state,
-            IdentityLifecycleState::Active
-        );
-        Ok(())
     }
 
     #[tokio::test]
@@ -19452,9 +15888,9 @@ mod reset_reprofile_tests {
             .set(vec![durable_spec(identity.clone(), "security")])
             .await;
 
-        let record = runtime.reset(&identity).await?;
+        let binding = runtime.reset(&identity).await?;
 
-        assert_eq!(record.generation.get(), 1);
+        assert_eq!(binding.generation().get(), 1);
         assert_eq!(
             bridge.create_profiles().await,
             vec!["domain".to_string(), "security".to_string()]
@@ -19463,6 +15899,69 @@ mod reset_reprofile_tests {
         assert_eq!(
             status.profile.map(|profile| profile.to_string()).as_deref(),
             Some("security")
+        );
+        Ok(())
+    }
+
+    /// The held create arm adopts the incarnation Core committed, like the
+    /// plain arm: the materialized scope and the status name the runtime id
+    /// Core minted for the held member.
+    #[tokio::test]
+    async fn a_held_create_adopts_the_runtime_id_core_committed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let identity = AgentIdentity::parse("domain:held")?;
+        let bridge = Arc::new(RecordingBridge::default());
+        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "held-create-adoption-test".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(bridge.clone()),
+            default_timeout: None,
+        }));
+        super::super::orchestrator::lazy_register_flow(
+            &runtime,
+            &[durable_spec(identity.clone(), "domain")],
+            None,
+        )
+        .await?;
+        *runtime
+            .held_create_pass
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::new(super::super::held_bootstrap::HeldCreatePass::new(
+                Arc::new(super::super::held_bootstrap::HeldTerminal::new(
+                    meerkat_mob::HeldSpawnDeadline::now() + Duration::from_mins(1),
+                )),
+                [identity.clone()],
+                1,
+            )));
+
+        let scope = runtime
+            .materialize(&identity)
+            .await?
+            .ok_or("the held create left no live member")?;
+
+        assert_eq!(
+            bridge.held_creates.lock().await.clone(),
+            vec![identity.to_string()],
+            "the held arm created the member"
+        );
+        assert!(
+            bridge.create_profiles().await.is_empty(),
+            "the plain create arm never ran"
+        );
+        let committed = AgentRuntimeId::parse("rt:domain:held:7")?;
+        assert_eq!(
+            crate::member_comms_id::public_runtime_alias(scope.runtime_id()),
+            committed.as_str()
+        );
+        let status = runtime.status(&identity).await?;
+        assert_eq!(
+            status.agent_runtime_id.as_ref(),
+            Some(&committed),
+            "the status must name the incarnation Core committed on the held create"
         );
         Ok(())
     }
@@ -19546,374 +16045,31 @@ mod reset_reprofile_tests {
     }
 
     #[tokio::test]
-    async fn shutdown_joins_reset_after_outer_abort_at_final_upsert()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:security")?;
-        let roster = Arc::new(MutableRoster::new(vec![durable_spec(
-            identity.clone(),
-            "domain",
-        )]));
-        let bridge = Arc::new(RecordingBridge::default());
-        let store = Arc::new(GatedResetContinuityStore::new()?);
-        let runtime = Arc::new(
-            IdentityRuntime::new(IdentityRuntimeConfig {
-                continuity_store: store.clone(),
-                lease_provider: Arc::new(LocalLeaseProvider::new()),
-                runtime_instance_id: "tracked-reset-shutdown-test".to_string(),
-                has_runtime_store: true,
-                durability_policy: DurabilityPolicy::SyncWriteThrough,
-                bridge: Some(bridge.clone()),
-                default_timeout: None,
-            })
-            .with_reset_roster_provider(roster.clone()),
-        );
-
-        super::super::orchestrator::restore_flow(
-            &runtime,
-            &roster
-                .roster(&RosterContext {
-                    mob_definition: None,
-                    previous_identities: Vec::new(),
-                })
-                .await?,
-            None,
-            None,
-        )
-        .await?;
-        let old_record = match store
-            .resolve_many(std::slice::from_ref(&identity))
-            .await?
-            .remove(&identity)
-        {
-            Some(ContinuityResolveState::Ready { record }) => record,
-            other => return Err(format!("expected initial continuity, got {other:?}").into()),
-        };
-        store.fail_after_successful_upserts(3);
-
-        let outer = tokio::spawn({
-            let runtime = Arc::clone(&runtime);
-            let identity = identity.clone();
-            async move { runtime.reset_tracked(&identity).await }
-        });
-        // Bounded. This waits for an injected failure at the FINAL continuity
-        // upsert, which is unreachable whenever reset refuses earlier - for
-        // example the reprofile guard refusing a drifted spec before the
-        // destructive step. Unbounded, that turns into a suite-blocking hang
-        // that reports nothing; bounded, it names itself.
-        tokio::time::timeout(Duration::from_secs(10), store.wait_for_failure())
-            .await
-            .map_err(|_| {
-                "reset never reached the final continuity upsert, so the injected failure could \
-                 not fire; reset refused earlier in the flow"
-            })?;
-        outer.abort();
-        match outer.await {
-            Err(error) => assert!(error.is_cancelled()),
-            Ok(result) => {
-                return Err(
-                    format!("outer reset waiter unexpectedly completed: {result:?}").into(),
-                );
-            }
-        }
-
-        runtime.close_foreground_operations();
-        let mut join = tokio::spawn({
-            let runtime = Arc::clone(&runtime);
-            async move { runtime.join_foreground_operations().await }
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut join)
-                .await
-                .is_err(),
-            "shutdown must wait for the runtime-owned reset transaction"
-        );
-        assert!(
-            bridge.retired_runtime_ids().await.is_empty(),
-            "rollback cleanup cannot run before the final upsert resolves"
-        );
-
-        store.release_failure();
-        tokio::time::timeout(Duration::from_secs(2), &mut join)
-            .await
-            .map_err(|_| "shutdown did not join reset rollback")??;
-
-        let resolved = store.resolve_many(std::slice::from_ref(&identity)).await?;
-        assert_eq!(
-            resolved.get(&identity),
-            Some(&ContinuityResolveState::Ready {
-                record: old_record.clone(),
-            }),
-            "abandoned reset must roll durable continuity back before shutdown completes"
-        );
-        let status = runtime.status(&identity).await?;
-        assert_eq!(
-            status.agent_runtime_id.as_ref(),
-            Some(&old_record.agent_runtime_id)
-        );
-        assert_eq!(status.state, IdentityLifecycleState::Broken);
-        assert_eq!(
-            bridge.retired_runtime_ids().await,
-            vec!["rt:domain:security:1".to_string()],
-            "rollback must retire only the tentative reset generation"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn shutdown_cancels_reset_customizer_and_restores_old_generation()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:security")?;
-        let spec = durable_spec(identity.clone(), "domain");
-        let bridge = Arc::new(RecordingBridge::default());
-        let store = Arc::new(LocalContinuityStore::in_memory()?);
-        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: store.clone(),
-            lease_provider: Arc::new(LocalLeaseProvider::new()),
-            runtime_instance_id: "reset-customizer-shutdown-test".to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: Some(bridge.clone()),
-            default_timeout: None,
-        }));
-
-        super::super::orchestrator::restore_flow(&runtime, std::slice::from_ref(&spec), None, None)
-            .await?;
-        let old_record = match store
-            .resolve_many(std::slice::from_ref(&identity))
-            .await?
-            .remove(&identity)
-        {
-            Some(ContinuityResolveState::Ready { record }) => record,
-            other => return Err(format!("expected initial continuity, got {other:?}").into()),
-        };
-
-        let customizer = Arc::new(GatedResetCustomizer::default());
-        runtime.set_agent_customizer(Some(customizer.clone())).await;
-        let outer = tokio::spawn({
-            let runtime = Arc::clone(&runtime);
-            let identity = identity.clone();
-            async move { runtime.reset_tracked(&identity).await }
-        });
-        tokio::time::timeout(Duration::from_secs(2), customizer.wait_for_entry())
-            .await
-            .map_err(|_| "reset did not enter the gated customizer")?;
-        outer.abort();
-        match outer.await {
-            Err(error) => assert!(error.is_cancelled()),
-            Ok(result) => {
-                return Err(
-                    format!("outer reset waiter unexpectedly completed: {result:?}").into(),
-                );
-            }
-        }
-
-        runtime.close_foreground_operations();
-        tokio::time::timeout(Duration::from_secs(2), runtime.join_foreground_operations())
-            .await
-            .map_err(|_| "shutdown hung on the reset customizer")?;
-
-        let resolved = store.resolve_many(std::slice::from_ref(&identity)).await?;
-        assert_eq!(
-            resolved.get(&identity),
-            Some(&ContinuityResolveState::Ready {
-                record: old_record.clone(),
-            }),
-            "shutdown cancellation must roll durable continuity back to the old generation"
-        );
-        let status = runtime.status(&identity).await?;
-        assert_eq!(status.state, IdentityLifecycleState::Active);
-        assert_eq!(
-            status.agent_runtime_id.as_ref(),
-            Some(&old_record.agent_runtime_id)
-        );
-        assert_eq!(status.session_id.as_ref(), Some(&old_record.session_id));
-        assert_eq!(bridge.create_profiles().await, vec!["domain".to_string()]);
-        assert!(
-            bridge.retired_runtime_ids().await.is_empty(),
-            "cancellation before session installation must not touch either bridge generation"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn shutdown_cancelled_dormant_reset_releases_temporary_lease()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:dormant")?;
-        let bridge = Arc::new(RecordingBridge::default());
-        let store = Arc::new(LocalContinuityStore::in_memory()?);
-        let lease_provider = Arc::new(LocalLeaseProvider::new());
-        let runtime_instance_id = "dormant-reset-customizer-shutdown-test";
-        let acquired = lease_provider
-            .acquire_leases(std::slice::from_ref(&identity), runtime_instance_id)
-            .await?;
-        let initial_grant = match acquired.get(&identity) {
-            Some(super::super::types::LeaseAcquireResult::Acquired(grant)) => grant.clone(),
-            other => return Err(format!("expected initial lease, got {other:?}").into()),
-        };
-        let old_record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse("rt:domain:dormant:0")?,
-            session_id: SessionId::new(),
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        store
-            .upsert_continuity_record(&old_record, initial_grant.fencing_token)
-            .await?;
-        lease_provider
-            .release_leases(std::slice::from_ref(&initial_grant))
-            .await?;
-        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: store.clone(),
-            lease_provider: lease_provider.clone(),
-            runtime_instance_id: runtime_instance_id.to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: Some(bridge.clone()),
-            default_timeout: None,
-        }));
-        runtime
-            .register(
-                durable_spec(identity.clone(), "domain"),
-                IdentityLifecycleState::Dormant,
-                Some(old_record.clone()),
-                None,
-            )
-            .await;
-
-        let customizer = Arc::new(GatedResetCustomizer::default());
-        runtime.set_agent_customizer(Some(customizer.clone())).await;
-        let outer = tokio::spawn({
-            let runtime = Arc::clone(&runtime);
-            let identity = identity.clone();
-            async move { runtime.reset_tracked(&identity).await }
-        });
-        tokio::time::timeout(Duration::from_secs(2), customizer.wait_for_entry())
-            .await
-            .map_err(|_| "dormant reset did not enter the gated customizer")?;
-        outer.abort();
-        match outer.await {
-            Err(error) => assert!(error.is_cancelled()),
-            Ok(result) => {
-                return Err(
-                    format!("outer dormant reset unexpectedly completed: {result:?}").into(),
-                );
-            }
-        }
-        runtime.close_foreground_operations();
-        tokio::time::timeout(Duration::from_secs(2), runtime.join_foreground_operations())
-            .await
-            .map_err(|_| "shutdown hung on the dormant reset customizer")?;
-
-        let status = runtime.status(&identity).await?;
-        assert_eq!(status.state, IdentityLifecycleState::Dormant);
-        assert!(status.lease.is_none());
-        let resolved = store.resolve_many(std::slice::from_ref(&identity)).await?;
-        assert_eq!(
-            resolved.get(&identity),
-            Some(&ContinuityResolveState::Ready {
-                record: old_record.clone(),
-            })
-        );
-        let failover = lease_provider
-            .acquire_leases(std::slice::from_ref(&identity), "dormant-reset-failover")
-            .await?;
-        assert!(
-            matches!(
-                failover.get(&identity),
-                Some(super::super::types::LeaseAcquireResult::Acquired(_))
-            ),
-            "shutdown rollback must release the dormant reset lease: {failover:?}"
-        );
-        assert!(bridge.create_profiles().await.is_empty());
-        assert!(bridge.retired_runtime_ids().await.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn tracked_identity_respawn_preserves_authoritative_continuity()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:durable-respawn")?;
-        let spec = durable_spec(identity.clone(), "domain");
-        let bridge = Arc::new(RecordingBridge::default());
-        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
-            lease_provider: Arc::new(LocalLeaseProvider::new()),
-            runtime_instance_id: "durable-respawn".to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: Some(bridge.clone()),
-            default_timeout: None,
-        }));
-        super::super::orchestrator::restore_flow(&runtime, std::slice::from_ref(&spec), None, None)
-            .await?;
-
-        let before = runtime.status(&identity).await?;
-        let runtime_alias = before
-            .agent_runtime_id
-            .clone()
-            .ok_or("missing durable runtime id")?;
-        let respawned = runtime
-            .respawn_identity_in_place_tracked(&identity, Some(runtime_alias.as_str()))
-            .await?;
-
-        assert_eq!(Some(respawned.session_id), before.session_id);
-        assert_eq!(Some(respawned.agent_runtime_id), before.agent_runtime_id);
-        assert_eq!(Some(respawned.generation), before.generation);
-        assert_eq!(
-            runtime.status(&identity).await?.state,
-            IdentityLifecycleState::Active
-        );
-        assert!(
-            bridge.retired_runtime_ids().await.is_empty(),
-            "identity respawn must not retire and recreate the authoritative session"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn stale_alias_materialization_preserves_active_and_dormant_bootstrap_status()
     -> Result<(), Box<dyn std::error::Error>> {
         let identity = AgentIdentity::parse("domain:bootstrap-alias")?;
         let spec = durable_spec(identity.clone(), "domain");
-        let current_alias = AgentRuntimeId::parse("rt:domain:bootstrap-alias:1")?;
         let stale_alias = "rt:domain:bootstrap-alias:0";
-        let store = Arc::new(LocalContinuityStore::in_memory()?);
-        let lease_provider = Arc::new(LocalLeaseProvider::new());
-        let grants = lease_provider
-            .acquire_leases(std::slice::from_ref(&identity), "bootstrap-alias-status")
-            .await?;
-        let grant = match grants.get(&identity) {
-            Some(super::super::types::LeaseAcquireResult::Acquired(grant)) => grant.clone(),
-            other => return Err(format!("expected acquired lease, got {other:?}").into()),
-        };
-        let record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: current_alias,
-            session_id: SessionId::new(),
-            generation: ContinuityGeneration::new(1),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        store
-            .upsert_continuity_record(&record, grant.fencing_token)
-            .await?;
+        // Core holds the identity's live member at generation 1.
+        let bridge = Arc::new(RecordingBridge::default());
+        bridge.core.bind(
+            &identity,
+            &MemberRuntimeBinding {
+                agent_runtime_id: AgentRuntimeId::parse("rt:domain:bootstrap-alias:1")?,
+                session_id: Some(SessionId::new()),
+            },
+            &spec.profile,
+        );
         let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: store,
-            lease_provider,
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "bootstrap-alias-status".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(bridge),
             default_timeout: None,
         }));
-        runtime
-            .register(
-                spec.clone(),
-                IdentityLifecycleState::Active,
-                Some(record),
-                Some(grant),
-            )
-            .await;
+        runtime.register(spec.clone()).await;
 
         let active_generation =
             runtime.begin_identity_bootstrap_pending(IdentityBootstrapMode::LazyMaterialize);
@@ -20012,11 +16168,12 @@ mod reset_reprofile_tests {
         let before_session = before.session_id.clone();
         let before_runtime_id = before.agent_runtime_id.clone();
         let before_generation = before.generation;
-        let before_token = before
-            .lease
-            .as_ref()
-            .ok_or("initial active identity must have a lease")?
-            .fencing_token;
+        let before_fence = bridge
+            .core
+            .live_member_scope(&identity)?
+            .ok_or("the eager bootstrap left no live member")?
+            .fence_token()
+            .get();
 
         let mut updated_spec = initial_spec;
         updated_spec.addressability = AgentAddressability::InternalOnly;
@@ -20043,15 +16200,6 @@ mod reset_reprofile_tests {
         assert_eq!(after.session_id, before_session);
         assert_eq!(after.agent_runtime_id, before_runtime_id);
         assert_eq!(after.generation, before_generation);
-        assert_eq!(
-            after
-                .lease
-                .as_ref()
-                .ok_or("hot-reloaded identity must retain its lease")?
-                .fencing_token,
-            before_token,
-            "same-profile reconcile must preserve exact live authority"
-        );
         assert_eq!(bridge.retire_calls.load(Ordering::SeqCst), 0);
         assert_eq!(bridge.resume_calls.load(Ordering::SeqCst), 0);
 
@@ -20067,302 +16215,12 @@ mod reset_reprofile_tests {
         let (dispatch_token, durable) = runtime
             .dispatch(&identity, &DispatchInput::system("system notice"))
             .await?;
-        assert_eq!(dispatch_token, before_token);
+        assert_eq!(
+            dispatch_token.get(),
+            before_fence,
+            "same-profile reconcile must keep Core's live incarnation"
+        );
         assert!(durable);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn lazy_unchanged_reconcile_retained_broken_lease_failure_stays_shutdown_visible()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("identity:broken-retained-unchanged")?;
-        let spec = durable_spec(identity.clone(), "personal");
-        let roster = Arc::new(MutableRoster::new(vec![spec.clone()]));
-        let lease_provider = Arc::new(RecordingReleaseLeaseProvider::default());
-        let (runtime, context, retained_grant) = lazy_context_with_broken_retained_lease(
-            identity.clone(),
-            spec,
-            roster,
-            lease_provider.clone(),
-            "broken-retained-unchanged",
-        )
-        .await?;
-
-        lease_provider.fail_next_release();
-        let error = match context.refresh_desired_topology().await {
-            Err(error) => error,
-            Ok(_) => return Err("failed exact release allowed lazy registration".into()),
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("synthetic retained Broken lease release failure")
-        );
-        let status = runtime.status(&identity).await?;
-        assert_eq!(status.state, IdentityLifecycleState::Broken);
-        assert!(
-            status.lease.is_none(),
-            "failed release authority must be pending, never advertised as active"
-        );
-        assert_eq!(
-            runtime
-                .entries
-                .read()
-                .await
-                .get(&identity)
-                .and_then(|entry| entry.pending_lease_release.as_ref())
-                .map(|grant| grant.fencing_token),
-            Some(retained_grant.fencing_token),
-            "the exact retained token must survive provider failure"
-        );
-        assert_eq!(
-            lease_provider
-                .release_attempts()
-                .await
-                .iter()
-                .map(|grant| grant.fencing_token)
-                .collect::<Vec<_>>(),
-            vec![retained_grant.fencing_token]
-        );
-
-        assert_eq!(
-            runtime.release_all_leases_for_shutdown().await?,
-            1,
-            "shutdown must retain visibility of the staged exact grant"
-        );
-        assert_eq!(
-            lease_provider
-                .release_attempts()
-                .await
-                .iter()
-                .map(|grant| grant.fencing_token)
-                .collect::<Vec<_>>(),
-            vec![retained_grant.fencing_token, retained_grant.fencing_token],
-            "shutdown must retry the same exact fencing token"
-        );
-        assert!(
-            runtime
-                .entries
-                .read()
-                .await
-                .get(&identity)
-                .is_some_and(|entry| {
-                    entry.lease.is_none() && entry.pending_lease_release.is_none()
-                })
-        );
-
-        context.refresh_desired_topology().await?;
-        let recovered = runtime.status(&identity).await?;
-        assert_eq!(recovered.state, IdentityLifecycleState::Dormant);
-        assert!(recovered.lease.is_none());
-        let failover = lease_provider
-            .acquire_leases(std::slice::from_ref(&identity), "other-runtime")
-            .await?;
-        assert!(matches!(
-            failover.get(&identity),
-            Some(LeaseAcquireResult::Acquired(_))
-        ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn lazy_profile_replace_releases_retained_broken_lease_before_overwrite()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("identity:broken-retained-replace")?;
-        let original = durable_spec(identity.clone(), "personal-v1");
-        let roster = Arc::new(MutableRoster::new(vec![original.clone()]));
-        let lease_provider = Arc::new(RecordingReleaseLeaseProvider::default());
-        let (runtime, context, retained_grant) = lazy_context_with_broken_retained_lease(
-            identity.clone(),
-            original,
-            roster.clone(),
-            lease_provider.clone(),
-            "broken-retained-replace",
-        )
-        .await?;
-
-        roster
-            .set(vec![durable_spec(identity.clone(), "personal-v2")])
-            .await;
-        context.refresh_desired_topology().await?;
-
-        let status = runtime.status(&identity).await?;
-        assert_eq!(status.state, IdentityLifecycleState::Dormant);
-        assert_eq!(
-            status.profile.as_ref().map(ToString::to_string).as_deref(),
-            Some("personal-v2")
-        );
-        assert!(status.lease.is_none());
-        assert_eq!(
-            lease_provider
-                .release_attempts()
-                .await
-                .iter()
-                .map(|grant| grant.fencing_token)
-                .collect::<Vec<_>>(),
-            vec![retained_grant.fencing_token],
-            "profile replacement must release the retained exact token before lazy registration"
-        );
-        assert!(
-            runtime
-                .entries
-                .read()
-                .await
-                .get(&identity)
-                .is_some_and(|entry| entry.pending_lease_release.is_none())
-        );
-        let failover = lease_provider
-            .acquire_leases(std::slice::from_ref(&identity), "replacement-failover")
-            .await?;
-        assert!(matches!(
-            failover.get(&identity),
-            Some(LeaseAcquireResult::Acquired(_))
-        ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn lease_lost_then_roster_remove_cleans_lower_plane_before_dropping_entry()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("identity:lost-remove")?;
-        let spec = durable_spec(identity.clone(), "personal");
-        let roster = Arc::new(MutableRoster::new(vec![spec.clone()]));
-        let bridge = Arc::new(LostCleanupBridge::default());
-        let lease_provider = Arc::new(LostRenewLeaseProvider::default());
-        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
-            lease_provider: lease_provider.clone(),
-            runtime_instance_id: "lost-remove-cleanup".to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: Some(bridge.clone()),
-            default_timeout: None,
-        }));
-        let context = IdentityFirstRuntimeContext::new_with_bootstrap_mode(
-            runtime.clone(),
-            roster.clone(),
-            None,
-            None,
-            None,
-            IdentityBootstrapMode::EagerMaterialize,
-        );
-        context
-            .bootstrap_roster(std::slice::from_ref(&spec))
-            .await?;
-        assert_eq!(bridge.member_count().await, 1);
-        assert_eq!(bridge.session_runtime_state_count().await, 1);
-
-        force_renewal_lost(&runtime, &lease_provider, &identity).await?;
-        assert_eq!(
-            runtime.status(&identity).await?.state,
-            IdentityLifecycleState::Broken
-        );
-        assert_eq!(bridge.member_count().await, 1);
-        let unregisters_after_lost = bridge.unregister_calls.load(Ordering::SeqCst);
-
-        roster.set(Vec::new()).await;
-        context.refresh_desired_topology().await?;
-        assert!(!runtime.contains(&identity).await);
-        assert_eq!(
-            bridge.member_count().await,
-            0,
-            "stale member survived removal"
-        );
-        assert_eq!(
-            bridge.session_runtime_state_count().await,
-            0,
-            "stale session authority survived removal"
-        );
-        assert_eq!(bridge.retire_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            bridge.unregister_calls.load(Ordering::SeqCst),
-            unregisters_after_lost + 1,
-            "roster removal must idempotently unregister after Lost"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn lease_lost_then_profile_replace_cleans_old_member_before_resume()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("identity:lost-replace")?;
-        let original = durable_spec(identity.clone(), "personal-v1");
-        let roster = Arc::new(MutableRoster::new(vec![original.clone()]));
-        let bridge = Arc::new(LostCleanupBridge::default());
-        let lease_provider = Arc::new(LostRenewLeaseProvider::default());
-        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
-            lease_provider: lease_provider.clone(),
-            runtime_instance_id: "lost-replace-cleanup".to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: Some(bridge.clone()),
-            default_timeout: None,
-        }));
-        let context = IdentityFirstRuntimeContext::new_with_bootstrap_mode(
-            runtime.clone(),
-            roster.clone(),
-            None,
-            None,
-            None,
-            IdentityBootstrapMode::EagerMaterialize,
-        );
-        context
-            .bootstrap_roster(std::slice::from_ref(&original))
-            .await?;
-        let registered_after_bootstrap: BTreeSet<String> =
-            bridge.session_runtime_states.lock().await.clone();
-        force_renewal_lost(&runtime, &lease_provider, &identity).await?;
-        let unregisters_after_lost = bridge.unregister_calls.load(Ordering::SeqCst);
-
-        let replacement = durable_spec(identity.clone(), "personal-v2");
-        roster.set(vec![replacement]).await;
-        context.refresh_desired_topology().await?;
-
-        let status = runtime.status(&identity).await?;
-        assert_eq!(status.state, IdentityLifecycleState::Active);
-        assert_eq!(
-            status.profile.as_ref().map(ToString::to_string).as_deref(),
-            Some("personal-v2")
-        );
-        // Measured at the meerkat 0.8.22 / mobkit 0.8.16 pair (release-lead
-        // fallback ruling 2026-08-13, dual-driver-unattributed): the
-        // retire+unregister cleanup sequence runs TWICE inside the single
-        // refresh window on the same runtime/session (the old binding ran it
-        // once). Phase-bracketed diagnostics attribute the first pair to
-        // reconcile_roster_members; the second pair's frames were inlined
-        // beyond attribution and the driver pair is an OPEN follow-up on the
-        // release record (candidate lead: retire_reset_superseded_member's
-        // single caller). The redundancy is idempotent and the final state is
-        // fully correct, so the counts are pinned at the measured values -
-        // if either count changes again, RE-DERIVE the driver set; do not
-        // pattern-match the number. Collapse of the double-drive is a tracked
-        // next-release item per the fast-track ruling.
-        assert_eq!(
-            bridge.retire_calls.load(Ordering::SeqCst),
-            2,
-            "measured at the pair: reconcile cleanup plus one unattributed idempotent repeat"
-        );
-        assert_eq!(
-            bridge.unregister_calls.load(Ordering::SeqCst),
-            unregisters_after_lost + 2,
-            "measured at the pair: one unregister per retire inside the refresh window"
-        );
-        let unregistered_sessions_log: Vec<String> =
-            bridge.unregistered_sessions.lock().await.clone();
-        assert!(
-            unregistered_sessions_log
-                .iter()
-                .all(|session| registered_after_bootstrap.contains(session)),
-            "every unregister must target the pre-loss session, never the replacement: {unregistered_sessions_log:?}"
-        );
-        assert_eq!(
-            bridge.resume_collisions.load(Ordering::SeqCst),
-            0,
-            "replacement encountered the stale lower-plane alias"
-        );
-        assert_eq!(bridge.member_count().await, 1);
-        assert_eq!(bridge.session_runtime_state_count().await, 1);
         Ok(())
     }
 
@@ -20484,7 +16342,9 @@ mod reset_reprofile_tests {
             runtime_instance_id: "foreground-reconcile-first".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            // Identity lifecycle runs on Core's mob: the materialization
+            // wakes the identity through a session bridge.
+            bridge: Some(Arc::new(RecordingBridge::default())),
             default_timeout: None,
         }));
         let context = IdentityFirstRuntimeContext::new_with_bootstrap_mode(
@@ -20577,166 +16437,6 @@ mod reset_reprofile_tests {
     }
 
     #[tokio::test]
-    async fn stale_runtime_alias_preflight_cannot_mutate_new_generation()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:alias-race")?;
-        let old_alias = "rt:domain:alias-race:0";
-        let store = Arc::new(LocalContinuityStore::in_memory()?);
-        let lease_provider = Arc::new(LocalLeaseProvider::new());
-        let acquired = lease_provider
-            .acquire_leases(std::slice::from_ref(&identity), "alias-race-test")
-            .await?;
-        let grant = match acquired.get(&identity) {
-            Some(super::super::types::LeaseAcquireResult::Acquired(grant)) => grant.clone(),
-            other => return Err(format!("expected initial lease, got {other:?}").into()),
-        };
-        let old_record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse(old_alias)?,
-            session_id: SessionId::new(),
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        store
-            .upsert_continuity_record(&old_record, grant.fencing_token)
-            .await?;
-        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: store,
-            lease_provider,
-            runtime_instance_id: "alias-race-test".to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
-            default_timeout: None,
-        }));
-        runtime
-            .register(
-                durable_spec(identity.clone(), "domain"),
-                IdentityLifecycleState::Active,
-                Some(old_record),
-                Some(grant),
-            )
-            .await;
-
-        let preflight_identity = runtime
-            .owned_identity_for_member_alias(old_alias)
-            .await
-            .ok_or("old alias did not pass ownership preflight")?;
-        let new_record = runtime.reset_tracked(&identity).await?;
-        assert_eq!(new_record.generation, ContinuityGeneration::new(1));
-
-        let respawn_error = match runtime
-            .respawn_member_alias_tracked(&preflight_identity, old_alias)
-            .await
-        {
-            Ok(_) => return Err("old alias respawned the replacement generation".into()),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            respawn_error,
-            IdentityRuntimeError::StaleRuntimeAlias { ref requested, .. }
-                if requested == old_alias
-        ));
-        let content = meerkat_core::ContentInput::Text("stale alias delivery".to_string());
-        let send_error = match runtime
-            .send_with_mode_and_interaction_member_alias_tracked(
-                &preflight_identity,
-                old_alias,
-                &content,
-                HandlingMode::Queue,
-                None,
-            )
-            .await
-        {
-            Ok(_) => return Err("old alias delivered to the replacement generation".into()),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            send_error,
-            IdentityRuntimeError::StaleRuntimeAlias { ref requested, .. }
-                if requested == old_alias
-        ));
-        let dispatch = DispatchInput {
-            content,
-            origin: super::super::types::DispatchOrigin::System,
-            correlation_id: None,
-            idempotency_key: None,
-        };
-        let dispatch_error = match runtime
-            .dispatch_member_alias_tracked(&preflight_identity, old_alias, &dispatch)
-            .await
-        {
-            Ok(_) => return Err("old alias dispatched to the replacement generation".into()),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            dispatch_error,
-            IdentityRuntimeError::StaleRuntimeAlias { ref requested, .. }
-                if requested == old_alias
-        ));
-        let rebind_error = match runtime
-            .rebind_session_after_live_respawn_member_alias_tracked(
-                &preflight_identity,
-                old_alias,
-                SessionId::new(),
-            )
-            .await
-        {
-            Ok(_) => return Err("old alias rebound the replacement generation".into()),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            rebind_error,
-            IdentityRuntimeError::StaleRuntimeAlias { ref requested, .. }
-                if requested == old_alias
-        ));
-        let retire_error = match runtime
-            .retire_member_alias_tracked(&preflight_identity, old_alias)
-            .await
-        {
-            Ok(_) => return Err("old alias retired the replacement generation".into()),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            retire_error,
-            IdentityRuntimeError::StaleRuntimeAlias { ref requested, .. }
-                if requested == old_alias
-        ));
-        let reset_error = match runtime
-            .reset_member_alias_tracked(&preflight_identity, old_alias)
-            .await
-        {
-            Ok(_) => return Err("old alias reset the replacement generation".into()),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            reset_error,
-            IdentityRuntimeError::StaleRuntimeAlias { ref requested, .. }
-                if requested == old_alias
-        ));
-        let delete_error = match runtime
-            .delete_identity_member_alias_tracked(&preflight_identity, old_alias)
-            .await
-        {
-            Ok(()) => return Err("old alias deleted the replacement generation".into()),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            delete_error,
-            IdentityRuntimeError::StaleRuntimeAlias { ref requested, .. }
-                if requested == old_alias
-        ));
-        let status = runtime.status(&identity).await?;
-        assert_eq!(status.state, IdentityLifecycleState::Active);
-        assert_eq!(status.generation, Some(ContinuityGeneration::new(1)));
-        assert_eq!(
-            status.agent_runtime_id.as_ref(),
-            Some(&new_record.agent_runtime_id)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn reset_reprofiles_session_from_identity_first_context_roster_provider()
     -> Result<(), Box<dyn std::error::Error>> {
         let identity = AgentIdentity::parse("domain:security")?;
@@ -20762,9 +16462,9 @@ mod reset_reprofile_tests {
             .set(vec![durable_spec(identity.clone(), "security")])
             .await;
 
-        let record = runtime.reset(&identity).await?;
+        let binding = runtime.reset(&identity).await?;
 
-        assert_eq!(record.generation.get(), 1);
+        assert_eq!(binding.generation().get(), 1);
         assert_eq!(
             bridge.create_profiles().await,
             vec!["domain".to_string(), "security".to_string()]
@@ -20774,406 +16474,6 @@ mod reset_reprofile_tests {
             status.profile.map(|profile| profile.to_string()).as_deref(),
             Some("security")
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reset_records_exact_cleanup_debt_without_waiting_for_hung_old_retire()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:security")?;
-        let roster = Arc::new(MutableRoster::new(vec![durable_spec(
-            identity.clone(),
-            "domain",
-        )]));
-        let bridge = Arc::new(RecordingBridge::default());
-        let runtime = Arc::new(
-            IdentityRuntime::new(IdentityRuntimeConfig {
-                continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
-                lease_provider: Arc::new(LocalLeaseProvider::new()),
-                runtime_instance_id: "reset-skips-old-retire-test".to_string(),
-                has_runtime_store: true,
-                durability_policy: DurabilityPolicy::SyncWriteThrough,
-                bridge: Some(bridge.clone()),
-                default_timeout: Some(Duration::from_millis(50)),
-            })
-            .with_reset_roster_provider(roster.clone()),
-        );
-
-        super::super::orchestrator::restore_flow(
-            &runtime,
-            &roster
-                .roster(&RosterContext {
-                    mob_definition: None,
-                    previous_identities: Vec::new(),
-                })
-                .await?,
-            None,
-            None,
-        )
-        .await?;
-
-        // The old incarnation's retire is rigged to HANG. Nothing should ever
-        // attempt it: the authoritative successor transition retires the
-        // predecessor itself, so Meta must not schedule that work again. If it
-        // did, this reset would either block on the hung retire or leave debt
-        // behind, and both are observable below.
-        let old_runtime_id = AgentRuntimeId::parse("rt:domain:security:0")?;
-        bridge.hang_retire_for(&old_runtime_id).await;
-        // Spec deliberately NOT drifted. Reprofile capability is covered by its
-        // own tests, which are red until the upstream successor-spec operation
-        // lands; this one is about phantom cleanup debt.
-        roster
-            .set(vec![durable_spec(identity.clone(), "domain")])
-            .await;
-
-        let record = tokio::time::timeout(Duration::from_secs(1), runtime.reset(&identity))
-            .await
-            .map_err(|_| "reset blocked, which means it attempted the hung old-member retire")??;
-
-        assert_eq!(record.generation.get(), 1);
-        // Positive: the successor transition happened.
-        assert!(
-            !bridge.successor_generations().await.is_empty(),
-            "reset must go through the authoritative successor transition"
-        );
-        // And it manufactured NO member-retire debt. Respawn already retired the
-        // predecessor inside the same transition, so any runtime_id debt here is
-        // work scheduled against a row another authority destroyed - debt that
-        // can never discharge, on every reset, while reset reports success.
-        let member_retire_debt: Vec<String> = runtime
-            .pending_reset_bridge_cleanups
-            .read()
-            .await
-            .values()
-            .filter_map(|cleanup| cleanup.runtime_id.as_ref().map(ToString::to_string))
-            .collect();
-        assert!(
-            member_retire_debt.is_empty(),
-            "reset must not record old-member retire debt for work the successor transition \
-             already committed: {member_retire_debt:?}"
-        );
-        assert!(
-            !bridge
-                .retired_runtime_ids()
-                .await
-                .contains(&old_runtime_id.to_string()),
-            "the predecessor must not be retired through the bridge a second time"
-        );
-        // The successor keeps the predecessor's profile, which is what respawn
-        // promises. The reprofile case is deliberately not exercised here.
-        let status = runtime.status(&identity).await?;
-        assert_eq!(
-            status.profile.map(|profile| profile.to_string()).as_deref(),
-            Some("domain")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reset_cleanup_failure_stays_retryable_after_new_generation()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:security")?;
-        let roster = Arc::new(MutableRoster::new(vec![durable_spec(
-            identity.clone(),
-            "domain",
-        )]));
-        let bridge = Arc::new(RecordingBridge::default());
-        let runtime = Arc::new(
-            IdentityRuntime::new(IdentityRuntimeConfig {
-                continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
-                lease_provider: Arc::new(LocalLeaseProvider::new()),
-                runtime_instance_id: "reset-unregister-failure-test".to_string(),
-                has_runtime_store: true,
-                durability_policy: DurabilityPolicy::SyncWriteThrough,
-                bridge: Some(bridge.clone()),
-                default_timeout: Some(Duration::from_millis(50)),
-            })
-            .with_reset_roster_provider(roster.clone()),
-        );
-
-        super::super::orchestrator::restore_flow(
-            &runtime,
-            &roster
-                .roster(&RosterContext {
-                    mob_definition: None,
-                    previous_identities: Vec::new(),
-                })
-                .await?,
-            None,
-            None,
-        )
-        .await?;
-
-        let old_status = runtime.status(&identity).await?;
-        let Some(old_session_id) = old_status.session_id else {
-            return Err("initial session id missing".into());
-        };
-        bridge.fail_unregister_for(&old_session_id).await;
-        // Spec deliberately NOT drifted: this test is about the old SESSION
-        // unregistration staying exact and retryable after the successor
-        // generation commits. Session cleanup remains Meta's concern - the
-        // successor transition does not touch it - so it is unaffected by the
-        // reprofile capability gap that keeps its sibling tests red.
-        roster
-            .set(vec![durable_spec(identity.clone(), "domain")])
-            .await;
-
-        let record = tokio::time::timeout(Duration::from_secs(1), runtime.reset(&identity))
-            .await
-            .map_err(|_| "reset timed out waiting for old session unregister cleanup")??;
-
-        assert_eq!(record.generation.get(), 1);
-        assert!(
-            !bridge.successor_generations().await.is_empty(),
-            "the successor generation must have committed before cleanup is judged"
-        );
-        runtime.join_reset_bridge_cleanup_tasks().await;
-        assert_eq!(
-            runtime.pending_reset_bridge_cleanups.read().await.len(),
-            1,
-            "failed unregister must retain exact cleanup debt"
-        );
-        bridge.allow_unregister_for(&old_session_id).await;
-        assert_eq!(runtime.drain_pending_reset_bridge_cleanups().await?, 1);
-        assert!(
-            runtime
-                .pending_reset_bridge_cleanups
-                .read()
-                .await
-                .is_empty()
-        );
-        let status = runtime.status(&identity).await?;
-        assert_eq!(
-            status.profile.map(|profile| profile.to_string()).as_deref(),
-            Some("domain")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn active_renewal_suspends_bridge_before_publishing_replacement_authority()
-    -> Result<(), Box<dyn std::error::Error>> {
-        struct RotatingLeaseProvider;
-
-        #[async_trait::async_trait]
-        impl LeaseProvider for RotatingLeaseProvider {
-            async fn acquire_leases(
-                &self,
-                _identities: &[AgentIdentity],
-                _runtime_instance: &str,
-            ) -> Result<BTreeMap<AgentIdentity, LeaseAcquireResult>, LeaseError> {
-                Ok(BTreeMap::new())
-            }
-
-            async fn renew_leases(
-                &self,
-                grants: &[LeaseGrant],
-            ) -> Result<BTreeMap<AgentIdentity, LeaseRenewResult>, LeaseError> {
-                Ok(grants
-                    .iter()
-                    .map(|grant| {
-                        let renewed = LeaseGrant {
-                            identity: grant.identity.clone(),
-                            fencing_token: FencingToken::new(grant.fencing_token.get() + 1),
-                            ttl: Duration::from_mins(5),
-                        };
-                        (grant.identity.clone(), LeaseRenewResult::Renewed(renewed))
-                    })
-                    .collect())
-            }
-
-            async fn release_leases(&self, _grants: &[LeaseGrant]) -> Result<(), LeaseError> {
-                Ok(())
-            }
-        }
-
-        let identity = AgentIdentity::parse("domain:renewal-barrier")?;
-        let runtime_instance = "active-renewal-barrier-test";
-        let store = Arc::new(LocalContinuityStore::in_memory()?);
-        let lease = Arc::new(RotatingLeaseProvider);
-        let bridge = Arc::new(RecordingBridge::default());
-        let first = LeaseGrant {
-            identity: identity.clone(),
-            fencing_token: FencingToken::new(1),
-            ttl: Duration::ZERO,
-        };
-        let record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse("rt:domain:renewal-barrier:0")?,
-            session_id: SessionId::new(),
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        store
-            .upsert_continuity_record(&record, first.fencing_token)
-            .await?;
-        bridge
-            .register_session_runtime_state(
-                &record.session_id,
-                &identity,
-                record.generation,
-                record.checkpoint_version,
-                first.fencing_token,
-            )
-            .await?;
-        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: store,
-            lease_provider: lease,
-            runtime_instance_id: runtime_instance.to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: Some(bridge.clone()),
-            default_timeout: None,
-        });
-        runtime
-            .register(
-                durable_spec(identity.clone(), "domain"),
-                IdentityLifecycleState::Active,
-                Some(record.clone()),
-                Some(first.clone()),
-            )
-            .await;
-
-        let renewed_token = runtime.ensure_active_lease(&identity).await?;
-        assert!(renewed_token > first.fencing_token);
-        assert_eq!(
-            bridge.authority_transitions().await,
-            vec![
-                format!("register:{}", first.fencing_token.get()),
-                format!("suspend:{}", record.session_id),
-                format!("suspend:{}", record.session_id),
-                format!("register:{}", renewed_token.get()),
-            ],
-            "the old bridge authority must be quiesced before replacement publication"
-        );
-        assert_eq!(
-            runtime
-                .status(&identity)
-                .await?
-                .lease
-                .map(|lease| lease.fencing_token),
-            Some(renewed_token)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn active_grant_bridge_failure_parks_rotated_token_for_exact_shutdown_release()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:bridge-fence")?;
-        let runtime_instance = "active-grant-bridge-failure-test";
-        let store = Arc::new(LocalContinuityStore::in_memory()?);
-        let lease = Arc::new(LocalLeaseProvider::new());
-        let bridge = Arc::new(RecordingBridge::default());
-        let first = match lease
-            .acquire_leases(std::slice::from_ref(&identity), runtime_instance)
-            .await?
-            .remove(&identity)
-        {
-            Some(LeaseAcquireResult::Acquired(grant)) => grant,
-            other => return Err(format!("initial lease was not acquired: {other:?}").into()),
-        };
-        let record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse("rt:domain:bridge-fence:0")?,
-            session_id: SessionId::new(),
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        store
-            .upsert_continuity_record(&record, first.fencing_token)
-            .await?;
-        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: store,
-            lease_provider: lease.clone(),
-            runtime_instance_id: runtime_instance.to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: Some(bridge.clone()),
-            default_timeout: None,
-        });
-        runtime
-            .register(
-                durable_spec(identity.clone(), "domain"),
-                IdentityLifecycleState::Active,
-                Some(record.clone()),
-                Some(first.clone()),
-            )
-            .await;
-
-        let rotated = match lease
-            .renew_leases(std::slice::from_ref(&first))
-            .await?
-            .remove(&identity)
-        {
-            Some(LeaseRenewResult::Renewed(grant)) => grant,
-            other => return Err(format!("lease did not rotate: {other:?}").into()),
-        };
-        runtime
-            .publish_active_grant(&identity, None, &rotated)
-            .await?;
-        {
-            let entries = runtime.entries.read().await;
-            let entry = entries
-                .get(&identity)
-                .ok_or("identity entry disappeared after active grant refresh")?;
-            assert_eq!(entry.state, IdentityLifecycleState::Active);
-            assert_eq!(
-                entry.lease.as_ref().map(|lease| lease.fencing_token),
-                Some(rotated.fencing_token)
-            );
-        }
-
-        let failed_grant = match lease
-            .renew_leases(std::slice::from_ref(&rotated))
-            .await?
-            .remove(&identity)
-        {
-            Some(LeaseRenewResult::Renewed(grant)) => grant,
-            other => return Err(format!("second lease did not rotate: {other:?}").into()),
-        };
-        bridge.fail_register_for(&record.session_id).await;
-        let error = match runtime
-            .publish_active_grant(&identity, None, &failed_grant)
-            .await
-        {
-            Ok(_) => return Err("bridge publication failure unexpectedly succeeded".into()),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("synthetic live-session rebind failure")
-        );
-        assert_eq!(
-            bridge.registered_fencing_tokens().await,
-            vec![rotated.fencing_token, failed_grant.fencing_token],
-            "every active refresh must project the provider-committed token into the bridge"
-        );
-        {
-            let entries = runtime.entries.read().await;
-            let entry = entries
-                .get(&identity)
-                .ok_or("identity entry disappeared after bridge failure")?;
-            assert_eq!(entry.state, IdentityLifecycleState::Broken);
-            assert!(entry.lease.is_none());
-            assert_eq!(
-                entry
-                    .pending_lease_release
-                    .as_ref()
-                    .map(|grant| grant.fencing_token),
-                Some(failed_grant.fencing_token)
-            );
-        }
-
-        assert_eq!(runtime.release_all_leases_for_shutdown().await?, 1);
-        let failover = lease
-            .acquire_leases(std::slice::from_ref(&identity), "bridge-failure-failover")
-            .await?;
-        assert!(matches!(
-            failover.get(&identity),
-            Some(LeaseAcquireResult::Acquired(_))
-        ));
         Ok(())
     }
 }
@@ -21379,281 +16679,9 @@ mod turn_ticket_tests {
 }
 
 #[cfg(test)]
-mod lease_renewal_backoff_tests {
-    use super::*;
-
-    /// Regression: a lease provider that errors persistently must not spin the
-    /// renewal task at the TTL-derived floor (down to 10ms). The failure
-    /// backoff grows from a 1s base and caps at the max poll interval.
-    #[test]
-    fn lease_renewal_failure_backoff_grows_and_caps() {
-        let max = Duration::from_mins(1);
-        assert_eq!(
-            lease_renewal_failure_backoff(0, max),
-            LEASE_RENEWAL_FAILURE_BACKOFF_BASE
-        );
-        assert_eq!(
-            lease_renewal_failure_backoff(1, max),
-            LEASE_RENEWAL_FAILURE_BACKOFF_BASE * 2
-        );
-        assert_eq!(lease_renewal_failure_backoff(6, max), max);
-        // Saturates at the cap for arbitrarily many failures (no shift overflow).
-        assert_eq!(lease_renewal_failure_backoff(99, max), max);
-        assert!(lease_renewal_failure_backoff(2, max) > lease_renewal_failure_backoff(1, max));
-    }
-}
-
-#[cfg(test)]
-mod continuity_repair_supervisor_tests {
-    use super::*;
-    use crate::identity_first::bridge::{
-        BridgeDelivery, BridgeError, ResumeSessionOutcome, SessionBridge,
-    };
-    use crate::identity_first::types::{AgentBuildDraft, SessionSnapshot};
-    use crate::identity_first::{LocalContinuityStore, LocalLeaseProvider, MutableRosterProvider};
-
-    /// A resume path that is deterministically wedged: every attempt fails
-    /// with the SAME error bytes, and every attempt is counted. This is the
-    /// shape whose blind re-execution the bounded-identical-retry park
-    /// exists to stop (each real repair attempt re-runs destructive dispose
-    /// steps against the same blocking precondition).
-    struct IdenticallyWedgedResumeBridge {
-        resume_attempts: std::sync::atomic::AtomicUsize,
-    }
-
-    impl IdenticallyWedgedResumeBridge {
-        fn attempts(&self) -> usize {
-            self.resume_attempts
-                .load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl SessionBridge for IdenticallyWedgedResumeBridge {
-        async fn create_session(
-            &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
-            _draft: &AgentBuildDraft,
-            _session_id: &SessionId,
-        ) -> Result<SessionId, BridgeError> {
-            Err(BridgeError::Mob(
-                "create not expected: the identity resolves Ready".to_string(),
-            ))
-        }
-
-        async fn resume_session(
-            &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
-            _draft: &AgentBuildDraft,
-            _session_id: &SessionId,
-            _snapshot: &SessionSnapshot,
-        ) -> Result<ResumeSessionOutcome, BridgeError> {
-            self.resume_attempts
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(BridgeError::Mob(
-                "collision retire blocked: disposal precondition holds (wedged for park test)"
-                    .to_string(),
-            ))
-        }
-
-        async fn deliver_admitted(
-            &self,
-            _runtime_id: &AgentRuntimeId,
-            _delivery: BridgeDelivery,
-        ) -> Result<SessionId, BridgeError> {
-            Err(BridgeError::Mob("deliver not used".to_string()))
-        }
-
-        async fn checkpoint_session(
-            &self,
-            _runtime_id: &AgentRuntimeId,
-            _session_id: &SessionId,
-        ) -> Result<SessionSnapshot, BridgeError> {
-            Err(BridgeError::Mob("checkpoint not used".to_string()))
-        }
-
-        async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
-            Ok(())
-        }
-    }
-
-    fn park_test_spec(identity: AgentIdentity) -> DurableAgentSpec {
-        DurableAgentSpec {
-            identity,
-            profile: meerkat_mob::ProfileName::from("domain"),
-            addressability: crate::identity_first::AgentAddressability::Addressable,
-            display_name: None,
-            labels: BTreeMap::new(),
-            context: None,
-            additional_instructions: Vec::new(),
-            initial_message: None,
-            runtime_mode_override: None,
-            backend: None,
-            binding: None,
-            placement: None,
-        }
-    }
-
-    /// Task #48 (c) — bounded non-identical retries: a Broken identity whose
-    /// repair fails byte-identically on three consecutive passes is parked
-    /// TYPED (`continuity_unrecoverable`, reason naming the blocking
-    /// failure), and the supervisor never re-executes the repair afterwards.
-    #[tokio::test]
-    async fn repair_loop_parks_typed_after_three_byte_identical_failures()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let identity = AgentIdentity::parse("domain:wedged")?;
-        let spec = park_test_spec(identity.clone());
-        let session_id = SessionId::new();
-        let record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{identity}:0"))?,
-            session_id: session_id.clone(),
-            generation: ContinuityGeneration::new(1),
-            checkpoint_version: CheckpointVersion::new(1),
-        };
-        let continuity_store = Arc::new(LocalContinuityStore::in_memory()?);
-        continuity_store
-            .upsert_continuity_record(&record, FencingToken::new(1))
-            .await?;
-        let bridge = Arc::new(IdenticallyWedgedResumeBridge {
-            resume_attempts: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store,
-            lease_provider: Arc::new(LocalLeaseProvider::new()),
-            runtime_instance_id: "identical-failure-park-test".to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: Some(bridge.clone()),
-            default_timeout: None,
-        }));
-        runtime
-            .register(
-                spec.clone(),
-                IdentityLifecycleState::Broken,
-                Some(record),
-                None,
-            )
-            .await;
-        let context = Arc::new(IdentityFirstRuntimeContext::new(
-            Arc::clone(&runtime),
-            Arc::new(MutableRosterProvider::new(vec![spec])),
-            None,
-            None,
-            None,
-        ));
-        let task = Arc::clone(&context)
-            .spawn_tracked_broken_identity_repair_task(ContinuityRepairPolicy::default());
-
-        // The park must arrive after EXACTLY the bounded attempt count. The
-        // supervisor has no timer: its first pass runs at start, and each
-        // later pass follows a typed trigger. Here each is a caller's demand
-        // (a materialization refused because the identity is Broken), issued
-        // once the previous attempt was observed.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let park = loop {
-            if let Some(park) = runtime.continuity_unrecoverable(&identity).await {
-                break park;
-            }
-            if Instant::now() > deadline {
-                task.cancel_and_join().await;
-                return Err("repair loop never parked the identically-failing identity".into());
-            }
-            let seen = bridge.attempts();
-            if seen > 0 && runtime.continuity_unrecoverable(&identity).await.is_none() {
-                assert!(runtime.materialize(&identity).await.is_err());
-                while bridge.attempts() == seen
-                    && runtime.continuity_unrecoverable(&identity).await.is_none()
-                {
-                    if Instant::now() > deadline {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            } else {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        };
-        assert!(
-            park.reason.contains("byte-identical"),
-            "park reason must name the bounded-identical-retry cause: {}",
-            park.reason
-        );
-        assert!(
-            park.reason
-                .contains("disposal precondition holds (wedged for park test)"),
-            "park reason must carry the blocking failure verbatim: {}",
-            park.reason
-        );
-        let attempts_at_park = bridge.attempts();
-        assert_eq!(
-            attempts_at_park, 3,
-            "the destructive repair must run exactly the bounded attempt count"
-        );
-
-        // Parked = no further destructive re-execution, whatever triggers it.
-        for _ in 0..5 {
-            let _ = runtime.materialize(&identity).await;
-            context.request_continuity_repair().await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(
-            bridge.attempts(),
-            attempts_at_park,
-            "a parked identity must not be re-repaired on the timer"
-        );
-        assert!(
-            runtime
-                .repairable_broken_identities()
-                .await
-                .iter()
-                .all(|id| id != &identity),
-            "a parked identity must leave the repairable set"
-        );
-        task.cancel_and_join().await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn repair_loop_exits_when_supervisor_sender_is_dropped()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
-            lease_provider: Arc::new(LocalLeaseProvider::new()),
-            runtime_instance_id: "dropped-repair-supervisor-test".to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
-            default_timeout: None,
-        }));
-        let context = Arc::new(IdentityFirstRuntimeContext::new(
-            runtime,
-            Arc::new(MutableRosterProvider::new(Vec::new())),
-            None,
-            None,
-            None,
-        ));
-        let TrackedContinuityRepairTask { cancel, join } =
-            context.spawn_tracked_broken_identity_repair_task(ContinuityRepairPolicy::default());
-
-        // This is what happens if the owning runtime is dropped without an
-        // explicit shutdown: JoinHandle detaches, while the sender disappears.
-        drop(cancel);
-        tokio::time::timeout(Duration::from_millis(100), join)
-            .await
-            .map_err(|_| "repair loop spun after its cancellation channel closed")??;
-        Ok(())
-    }
-}
-
-#[cfg(test)]
 mod completion_wait_tests {
     use super::*;
-    use crate::identity_first::{LocalContinuityStore, LocalLeaseProvider};
+    use crate::identity_first::{ContinuityStoreError, LocalContinuityStore, LocalLeaseProvider};
 
     fn runtime() -> Result<Arc<IdentityRuntime>, ContinuityStoreError> {
         Ok(Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
@@ -21691,9 +16719,7 @@ mod completion_wait_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let runtime = runtime()?;
         let identity = AgentIdentity::parse("agent:gone")?;
-        runtime
-            .register(spec(&identity), IdentityLifecycleState::Dormant, None, None)
-            .await;
+        runtime.register(spec(&identity)).await;
         let baseline = runtime.completion_cursor(&identity).await;
         let wait = runtime.await_completion(&identity, Some(baseline), Duration::from_mins(10));
         let remove = async {
@@ -21728,9 +16754,7 @@ mod completion_wait_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let runtime = runtime()?;
         let identity = AgentIdentity::parse("agent:closing")?;
-        runtime
-            .register(spec(&identity), IdentityLifecycleState::Dormant, None, None)
-            .await;
+        runtime.register(spec(&identity)).await;
         let baseline = runtime.completion_cursor(&identity).await;
         let completion =
             runtime.await_completion(&identity, Some(baseline), Duration::from_mins(10));
@@ -21746,96 +16770,69 @@ mod completion_wait_tests {
         assert!(matches!(turn, TurnWait::Settled(TurnOutcome::Unknown)));
         Ok(())
     }
-}
 
-#[cfg(test)]
-mod lease_observer_tests {
-    use super::*;
-    use crate::identity_first::{LocalContinuityStore, LocalLeaseProvider};
-
-    /// The identity health monitor's typed wake: the installed observer is
-    /// told when a lease lands or moves, and not for writes that leave every
-    /// lease where it was.
+    /// A retire signals the waiters while its verb still holds the
+    /// identity's lifecycle lock, and nothing signals when the verb lets go.
+    /// A wait that reads in that window waits for the release, then answers
+    /// Retiring, well inside its deadline.
     #[tokio::test]
-    async fn the_lease_observer_is_told_when_a_lease_lands_and_only_then()
+    async fn a_wait_that_reads_inside_a_retire_answers_retiring_once_the_verb_lets_go()
     -> Result<(), Box<dyn std::error::Error>> {
-        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
+        let bridge = Arc::new(super::super::core_test_bridge::CoreReadsBridge::default());
+        let session_bridge: Arc<dyn SessionBridge> = bridge.clone();
+        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
-            runtime_instance_id: "lease-observer-test".to_string(),
+            runtime_instance_id: "completion-wait-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(session_bridge),
             default_timeout: None,
+        }));
+        let identity = AgentIdentity::parse("agent:retired-under-a-verb")?;
+        let runtime_id = super::super::core_test_bridge::register_live(
+            &runtime,
+            &bridge.core,
+            spec(&identity),
+            1,
+            SessionId::new(),
+        )
+        .await?;
+        let baseline = runtime.completion_cursor(&identity).await;
+
+        // A lifecycle verb holds the identity, as a retire does.
+        let lifecycle_lock = runtime.lifecycle_lock_for(&identity).await;
+        let held = lifecycle_lock.lock().await;
+        let wait = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            let identity = identity.clone();
+            async move {
+                runtime
+                    .await_completion(&identity, Some(baseline), Duration::from_mins(10))
+                    .await
+            }
         });
-        let (observer, mut wake) = watch::channel(0_u64);
-        runtime.install_lease_observer(observer);
-        assert!(wake.has_changed()?, "installation wakes once");
-        wake.borrow_and_update();
-
-        let identity = AgentIdentity::parse("agent:leased")?;
-        let spec = DurableAgentSpec {
-            identity: identity.clone(),
-            profile: meerkat_mob::ProfileName::from("worker"),
-            addressability: AgentAddressability::Addressable,
-            display_name: None,
-            labels: BTreeMap::new(),
-            context: None,
-            additional_instructions: Vec::new(),
-            initial_message: None,
-            runtime_mode_override: None,
-            backend: None,
-            binding: None,
-            placement: None,
-        };
-        runtime
-            .register(spec.clone(), IdentityLifecycleState::Dormant, None, None)
-            .await;
-        assert!(!wake.has_changed()?, "no lease, no wake");
-
-        runtime
-            .register(
-                spec.clone(),
-                IdentityLifecycleState::Active,
-                None,
-                Some(LeaseGrant {
-                    identity: identity.clone(),
-                    fencing_token: FencingToken::new(3),
-                    ttl: Duration::from_mins(5),
-                }),
-            )
-            .await;
-        assert!(wake.has_changed()?, "the lease landing wakes the observer");
-        wake.borrow_and_update();
-
-        runtime.record_turn_completed(&identity).await;
-        runtime.entries.notify();
-        // A table write that leaves every lease where it was.
-        runtime
-            .entries
-            .write()
+        // The waiter reads the member live and parks.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // The retire: Core lets the member go, and the waiters are signalled
+        // while the verb still holds the lock.
+        bridge.core.retire(&runtime_id);
+        runtime.entries.notify_binding_changed();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!wait.is_finished(), "the wait holds while the verb runs");
+        // The verb lets go and signals nothing.
+        drop(held);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), wait)
             .await
-            .get_mut(&identity)
-            .ok_or("registered")?
-            .checkpoint_version = CheckpointVersion::new(7);
+            .map_err(|_| "the wait must answer once the verb lets go, not at its deadline")??;
         assert!(
-            !wake.has_changed()?,
-            "a write that moves no lease does not wake"
+            matches!(outcome, CompletionWait::Retiring(_)),
+            "{outcome:?}"
         );
-
-        runtime
-            .register(
-                spec,
-                IdentityLifecycleState::Active,
-                None,
-                Some(LeaseGrant {
-                    identity: identity.clone(),
-                    fencing_token: FencingToken::new(4),
-                    ttl: Duration::from_mins(5),
-                }),
-            )
-            .await;
-        assert!(wake.has_changed()?, "a rotated lease wakes the observer");
         Ok(())
     }
 }
@@ -21843,7 +16840,7 @@ mod lease_observer_tests {
 #[cfg(test)]
 mod foreground_shutdown_tests {
     use super::*;
-    use crate::identity_first::{LocalContinuityStore, LocalLeaseProvider};
+    use crate::identity_first::{ContinuityStoreError, LocalContinuityStore, LocalLeaseProvider};
 
     #[test]
     fn foreground_shutdown_value_is_retained_for_late_subscribers()
@@ -21872,7 +16869,7 @@ mod foreground_shutdown_tests {
 #[cfg(test)]
 mod bootstrap_failure_attribution_tests {
     use super::*;
-    use crate::identity_first::{LocalContinuityStore, LocalLeaseProvider};
+    use crate::identity_first::{ContinuityStoreError, LocalContinuityStore, LocalLeaseProvider};
 
     fn make_runtime() -> Result<IdentityRuntime, ContinuityStoreError> {
         Ok(IdentityRuntime::new(IdentityRuntimeConfig {
@@ -22211,6 +17208,7 @@ model = "gpt-5.5"
 mod admission_first_topology_tests {
     use super::*;
     use std::sync::Mutex as StdTestMutex;
+    use tokio::sync::Notify;
 
     use super::super::bridge::{BridgeDelivery, BridgeError, ResumeSessionOutcome};
     use super::super::local_lease::LocalLeaseProvider;
@@ -22244,6 +17242,8 @@ mod admission_first_topology_tests {
         wire_entered: Notify,
         wire_release: Notify,
         build_entered: Notify,
+        /// The members Core holds.
+        core: crate::identity_first::core_test_members::CoreTestMembers,
     }
 
     impl WedgeableTopologyBridge {
@@ -22264,6 +17264,7 @@ mod admission_first_topology_tests {
                 wire_entered: Notify::new(),
                 wire_release: Notify::new(),
                 build_entered: Notify::new(),
+                core: crate::identity_first::core_test_members::CoreTestMembers::default(),
             }
         }
 
@@ -22332,36 +17333,54 @@ mod admission_first_topology_tests {
     impl SessionBridge for WedgeableTopologyBridge {
         async fn create_session(
             &self,
-            _identity: &AgentIdentity,
-            runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
+            identity: &AgentIdentity,
+            spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
-            session_id: &SessionId,
-        ) -> Result<SessionId, BridgeError> {
+        ) -> Result<crate::identity_first::MemberRuntimeBinding, BridgeError> {
+            let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
+            let runtime_id = &agent_runtime_id;
+            let session_id = &meerkat_core::types::SessionId::new();
             self.build_entered.notify_one();
             if self.wedge_builds {
                 // A member build parked in the host's build callback.
                 self.park_until_open().await;
             }
             self.bind_session(runtime_id, session_id);
-            Ok(session_id.clone())
+            let binding = crate::identity_first::MemberRuntimeBinding {
+                agent_runtime_id,
+                session_id: Some(session_id.clone()),
+            };
+            self.core.bind(identity, &binding, &spec.profile);
+            Ok(binding)
         }
 
         async fn resume_session(
             &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
+            identity: &AgentIdentity,
+            spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
             session_id: &SessionId,
-            _snapshot: &SessionSnapshot,
+            _resume_from_role: Option<&meerkat_mob::ProfileName>,
         ) -> Result<ResumeSessionOutcome, BridgeError> {
+            let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
             self.build_entered.notify_one();
             if self.wedge_builds {
                 self.park_until_open().await;
             }
+            self.bind_session(&agent_runtime_id, session_id);
+            self.core.bind(
+                identity,
+                &crate::identity_first::MemberRuntimeBinding {
+                    agent_runtime_id: agent_runtime_id.clone(),
+                    session_id: Some(session_id.clone()),
+                },
+                &spec.profile,
+            );
             Ok(ResumeSessionOutcome::Resumed {
                 session_id: session_id.clone(),
+                agent_runtime_id,
             })
         }
 
@@ -22447,8 +17466,50 @@ mod admission_first_topology_tests {
             ))
         }
 
-        async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+        async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+            self.core.retire(runtime_id);
             Ok(())
+        }
+
+        async fn live_member(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn live_member_scope(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+            self.core.live_member_scope(identity)
+        }
+
+        async fn ensure_member_live(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn last_member_binding(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+            self.core.last_member_binding(identity)
+        }
+
+        async fn member_binding_history(
+            &self,
+        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+            self.core.history()
+        }
+
+        async fn identity_management(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+            Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
         }
     }
 
@@ -22495,7 +17556,8 @@ mod admission_first_topology_tests {
         register_active_as(runtime, bridge, spec(identity), generation).await
     }
 
-    /// [`register_active`] with an explicit spec (for example a profile).
+    /// [`register_active`] with an explicit spec (for example a profile):
+    /// Core holds the identity's live member at `generation`.
     async fn register_active_as(
         runtime: &IdentityRuntime,
         bridge: &WedgeableTopologyBridge,
@@ -22503,28 +17565,18 @@ mod admission_first_topology_tests {
         generation: u64,
     ) -> Result<AgentRuntimeId, Box<dyn std::error::Error + Send + Sync>> {
         let identity = spec.identity.clone();
-        let identity = &identity;
         let runtime_id = AgentRuntimeId::parse(&format!("rt:{}:{generation}", identity.as_str()))?;
         let session_id = SessionId::new();
         bridge.bind_session(&runtime_id, &session_id);
-        runtime
-            .register(
-                spec,
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: runtime_id.clone(),
-                    session_id,
-                    generation: ContinuityGeneration::new(generation),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                Some(LeaseGrant {
-                    identity: identity.clone(),
-                    fencing_token: FencingToken::new(7 + generation),
-                    ttl: Duration::from_mins(1),
-                }),
-            )
-            .await;
+        bridge.core.bind(
+            &identity,
+            &crate::identity_first::MemberRuntimeBinding {
+                agent_runtime_id: runtime_id.clone(),
+                session_id: Some(session_id),
+            },
+            &spec.profile,
+        );
+        runtime.register(spec).await;
         Ok(runtime_id)
     }
 
@@ -22636,9 +17688,7 @@ mod admission_first_topology_tests {
         let bridge = Arc::new(bridge);
         let runtime = runtime_with(bridge.clone(), "admission-first-wedged-build")?;
         let target_rt = register_active(&runtime, &bridge, &target, 0).await?;
-        runtime
-            .register(spec(&peer), IdentityLifecycleState::Dormant, None, None)
-            .await;
+        runtime.register(spec(&peer)).await;
         runtime
             .set_desired_peer_edges(vec![ManagedPeerEdge::new(target.clone(), peer.clone())?])
             .await;
@@ -22756,9 +17806,7 @@ mod admission_first_topology_tests {
         let bridge = Arc::new(WedgeableTopologyBridge::new(gate));
         let runtime = runtime_with(bridge.clone(), "wake-wires-before-admission")?;
         let peer_rt = register_active(&runtime, &bridge, &peer, 0).await?;
-        runtime
-            .register(spec(&sleeper), IdentityLifecycleState::Dormant, None, None)
-            .await;
+        runtime.register(spec(&sleeper)).await;
         runtime
             .set_desired_peer_edges(vec![ManagedPeerEdge::new(sleeper.clone(), peer.clone())?])
             .await;
@@ -23176,6 +18224,8 @@ model = "gpt-5.5"
         events: Arc<StdTestMutex<Vec<String>>>,
         wire_entered: Notify,
         unwire_entered: Notify,
+        /// The members Core holds.
+        core: crate::identity_first::core_test_members::CoreTestMembers,
     }
 
     impl OrderedActorBridge {
@@ -23188,6 +18238,7 @@ model = "gpt-5.5"
                 events: Arc::new(StdTestMutex::new(Vec::new())),
                 wire_entered: Notify::new(),
                 unwire_entered: Notify::new(),
+                core: crate::identity_first::core_test_members::CoreTestMembers::default(),
             }
         }
 
@@ -23210,26 +18261,33 @@ model = "gpt-5.5"
     impl SessionBridge for OrderedActorBridge {
         async fn create_session(
             &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
-            _spec: &DurableAgentSpec,
+            identity: &AgentIdentity,
+            spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
-            session_id: &SessionId,
-        ) -> Result<SessionId, BridgeError> {
-            Ok(session_id.clone())
+        ) -> Result<crate::identity_first::MemberRuntimeBinding, BridgeError> {
+            let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
+            let binding = crate::identity_first::MemberRuntimeBinding {
+                agent_runtime_id,
+                session_id: Some(meerkat_core::types::SessionId::new()),
+            };
+            self.core.bind(identity, &binding, &spec.profile);
+            Ok(binding)
         }
 
         async fn resume_session(
             &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
+            identity: &AgentIdentity,
             _spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
             session_id: &SessionId,
-            _snapshot: &SessionSnapshot,
+            _resume_from_role: Option<&meerkat_mob::ProfileName>,
         ) -> Result<ResumeSessionOutcome, BridgeError> {
+            let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
             Ok(ResumeSessionOutcome::Resumed {
                 session_id: session_id.clone(),
+                agent_runtime_id,
             })
         }
 
@@ -23323,8 +18381,50 @@ model = "gpt-5.5"
             ))
         }
 
-        async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+        async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+            self.core.retire(runtime_id);
             Ok(())
+        }
+
+        async fn live_member(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn live_member_scope(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+            self.core.live_member_scope(identity)
+        }
+
+        async fn ensure_member_live(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn last_member_binding(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+            self.core.last_member_binding(identity)
+        }
+
+        async fn member_binding_history(
+            &self,
+        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+            self.core.history()
+        }
+
+        async fn identity_management(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+            Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
         }
     }
 
@@ -23353,25 +18453,18 @@ model = "gpt-5.5"
         }));
         let mut runtime_ids = Vec::new();
         for identity in [&alpha, &beta] {
+            // Core holds both members live.
             let runtime_id = AgentRuntimeId::parse(&format!("rt:{}:0", identity.as_str()))?;
-            runtime
-                .register(
-                    spec(identity),
-                    IdentityLifecycleState::Active,
-                    Some(ContinuityRecord {
-                        identity: identity.clone(),
-                        agent_runtime_id: runtime_id.clone(),
-                        session_id: SessionId::new(),
-                        generation: ContinuityGeneration::new(0),
-                        checkpoint_version: CheckpointVersion::new(0),
-                    }),
-                    Some(LeaseGrant {
-                        identity: identity.clone(),
-                        fencing_token: FencingToken::new(7),
-                        ttl: Duration::from_mins(1),
-                    }),
-                )
-                .await;
+            let spec = spec(identity);
+            bridge.core.bind(
+                identity,
+                &crate::identity_first::MemberRuntimeBinding {
+                    agent_runtime_id: runtime_id.clone(),
+                    session_id: Some(SessionId::new()),
+                },
+                &spec.profile,
+            );
+            runtime.register(spec).await;
             runtime_ids.push(runtime_id);
         }
         let edge = ManagedPeerEdge::new(alpha.clone(), beta.clone())?;
@@ -23487,9 +18580,7 @@ model = "gpt-5.5"
         let bridge = Arc::new(WedgeableTopologyBridge::new(gate));
         let runtime = runtime_with(bridge.clone(), "wake-lock-timeout")?;
         register_active(&runtime, &bridge, &peer, 0).await?;
-        runtime
-            .register(spec(&sleeper), IdentityLifecycleState::Dormant, None, None)
-            .await;
+        runtime.register(spec(&sleeper)).await;
         runtime
             .set_desired_peer_edges(vec![ManagedPeerEdge::new(sleeper.clone(), peer.clone())?])
             .await;
@@ -23543,9 +18634,7 @@ model = "gpt-5.5"
         let bridge = Arc::new(bridge);
         let runtime = runtime_with(bridge.clone(), "merged-hydrations")?;
         register_active(&runtime, &bridge, &target, 0).await?;
-        runtime
-            .register(spec(&peer), IdentityLifecycleState::Dormant, None, None)
-            .await;
+        runtime.register(spec(&peer)).await;
         runtime
             .set_desired_peer_edges(vec![ManagedPeerEdge::new(target.clone(), peer.clone())?])
             .await;
@@ -23658,6 +18747,1944 @@ model = "gpt-5.5"
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod wake_refusal_classifier_tests {
+    //! Per reason: each of Core's answers to
+    //! a failed resume maps to one typed outcome, one JSON-RPC code, one wire
+    //! kind and one recorded remedy, matched by kind and never by text.
+    use super::*;
+    use meerkat_core::service::{DurableResumeHold, SessionError};
+    use meerkat_mob::error::SessionResumeUnavailableReason as Unavailable;
+
+    use super::super::types::{WakeRefusal, WakeRefusalRemedy};
+
+    fn keeper() -> Result<AgentIdentity, Box<dyn std::error::Error>> {
+        Ok(AgentIdentity::parse("keeper")?)
+    }
+
+    fn rejected(kind: ResumeRejectionKind) -> BridgeError {
+        BridgeError::ResumeRejected {
+            kind,
+            session_id: SessionId::new(),
+            detail: "resume refused".to_string(),
+        }
+    }
+
+    /// A classified wake failure with what each surface shows of it.
+    struct Classified {
+        error: IdentityRuntimeError,
+        code: i64,
+        data: Option<serde_json::Value>,
+        recorded: Option<WakeRefusal>,
+    }
+
+    fn classify(
+        session_id: Option<&SessionId>,
+        error: BridgeError,
+    ) -> Result<Classified, Box<dyn std::error::Error>> {
+        let error = classify_wake_failure(&keeper()?, session_id, error);
+        Ok(Classified {
+            code: crate::rpc::identity_error_code(&error),
+            data: error.structured_data(),
+            recorded: wake_refusal_of(&error),
+            error,
+        })
+    }
+
+    /// Archived beyond revival and contradictory durable authority are
+    /// Core's final answers: `IdentityUnresumable` (-32051) naming the
+    /// session, remedy `delete_identity`, recorded as final.
+    #[test]
+    fn archived_and_contradictory_sessions_are_final_unresumable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session_id = SessionId::new();
+        for (reason, expected, token) in [
+            (
+                Unavailable::ArchivedNotRevivable,
+                UnresumableReason::ArchivedNotRevivable,
+                "archived_not_revivable",
+            ),
+            (
+                Unavailable::ContradictoryDurableAuthority,
+                UnresumableReason::ContradictoryDurableAuthority,
+                "contradictory_durable_authority",
+            ),
+        ] {
+            let classified = classify(
+                Some(&session_id),
+                rejected(ResumeRejectionKind::Unavailable { reason }),
+            )?;
+            assert!(
+                matches!(
+                    &classified.error,
+                    IdentityRuntimeError::IdentityUnresumable {
+                        session_id: refused,
+                        reason: got,
+                        ..
+                    } if *refused == session_id && *got == expected
+                ),
+                "{reason:?}: {:?}",
+                classified.error
+            );
+            assert_eq!(
+                classified.code,
+                crate::rpc::IDENTITY_UNRESUMABLE_CODE,
+                "{reason:?}"
+            );
+            let data = classified
+                .data
+                .ok_or("an unresumable refusal carries data")?;
+            assert_eq!(data["kind"], "identity_unresumable", "{reason:?}");
+            assert_eq!(data["reason"], token, "{reason:?}");
+            assert_eq!(data["session_id"], session_id.to_string(), "{reason:?}");
+            assert_eq!(data["remedy"], "delete_identity", "{reason:?}");
+            assert_eq!(data["retryable"], false, "{reason:?}");
+            let recorded = classified
+                .recorded
+                .ok_or("a final refusal is recorded for the views")?;
+            assert_eq!(recorded.code, crate::rpc::IDENTITY_UNRESUMABLE_CODE);
+            assert_eq!(recorded.session_id, session_id);
+            assert_eq!(recorded.remedy, WakeRefusalRemedy::DeleteIdentity);
+            assert!(recorded.is_final(), "{reason:?}");
+        }
+        Ok(())
+    }
+
+    /// An unprovable committed boundary is held, not final: the durable
+    /// copies stay for reconciliation, the wake answers -32603 with Core's
+    /// reason in its data, and the operator reviews it.
+    #[test]
+    fn an_unprovable_committed_boundary_is_held_for_operator_review()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session_id = SessionId::new();
+        let classified = classify(
+            Some(&session_id),
+            rejected(ResumeRejectionKind::Unavailable {
+                reason: Unavailable::CommittedBoundaryUnprovable,
+            }),
+        )?;
+        assert!(
+            matches!(
+                &classified.error,
+                IdentityRuntimeError::WakeHeld {
+                    session_id: held,
+                    hold: WakeHold::CommittedBoundaryUnprovable,
+                    ..
+                } if *held == session_id
+            ),
+            "{:?}",
+            classified.error
+        );
+        assert_eq!(classified.code, -32603);
+        let data = classified.data.ok_or("a held refusal carries data")?;
+        assert_eq!(data["kind"], "mob_member_session_resume_held");
+        assert_eq!(
+            data["resume_unavailable_reason"],
+            "committed_boundary_unprovable"
+        );
+        assert_eq!(data["session_id"], session_id.to_string());
+        assert_eq!(data["content_retained"], true);
+        assert_eq!(data["retryable"], false);
+        assert!(
+            data.get("remedy").is_none(),
+            "held error data carries no remedy key: {data}"
+        );
+        let recorded = classified.recorded.ok_or("a hold is recorded")?;
+        assert_eq!(recorded.code, -32603);
+        assert_eq!(recorded.remedy, WakeRefusalRemedy::OperatorReview);
+        assert!(!recorded.is_final());
+        Ok(())
+    }
+
+    /// Authority that moved while the body loaded is transient: the wake
+    /// answers -32052 retryable and records nothing; the next wake reads
+    /// the session again.
+    #[test]
+    fn authority_changed_during_materialization_is_retryable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session_id = SessionId::new();
+        let classified = classify(
+            Some(&session_id),
+            rejected(ResumeRejectionKind::Unavailable {
+                reason: Unavailable::AuthorityChangedDuringMaterialization,
+            }),
+        )?;
+        assert!(
+            matches!(
+                &classified.error,
+                IdentityRuntimeError::IdentityWakeRetryable {
+                    session_id: Some(retried),
+                    ..
+                } if *retried == session_id
+            ),
+            "{:?}",
+            classified.error
+        );
+        assert_eq!(
+            classified.code,
+            crate::rpc::IDENTITY_HISTORY_UNAVAILABLE_CODE
+        );
+        let data = classified.data.ok_or("a retryable refusal carries data")?;
+        assert_eq!(data["kind"], "identity_wake_retryable");
+        assert_eq!(data["session_id"], session_id.to_string());
+        assert_eq!(data["retryable"], true);
+        assert!(
+            classified.recorded.is_none(),
+            "a transient refusal is never recorded"
+        );
+        Ok(())
+    }
+
+    /// Core's `Absent` is the one answer the wake replaces with a fresh
+    /// spawn: the predicate matches it and nothing else, never by
+    /// text. Were it to reach the classifier anyway, it stays transient.
+    #[test]
+    fn only_an_absent_session_is_replaced_by_a_fresh_spawn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for reason in [
+            Unavailable::ArchivedNotRevivable,
+            Unavailable::CommittedBoundaryUnprovable,
+            Unavailable::AuthorityChangedDuringMaterialization,
+            Unavailable::ContradictoryDurableAuthority,
+            Unavailable::Absent,
+        ] {
+            assert_eq!(
+                resume_refused_absent(&rejected(ResumeRejectionKind::Unavailable { reason })),
+                reason == Unavailable::Absent,
+                "{reason:?}"
+            );
+        }
+        for hold in [
+            DurableResumeHold::TailHeldForRecovery,
+            DurableResumeHold::RecoveryRefused,
+            DurableResumeHold::EvidenceQuarantined,
+            DurableResumeHold::AuditedEndpointDivergence,
+        ] {
+            assert!(
+                !resume_refused_absent(&rejected(ResumeRejectionKind::Held { hold })),
+                "{hold:?}"
+            );
+        }
+        assert!(!resume_refused_absent(&rejected(
+            ResumeRejectionKind::RoleMigrationNotApplied
+        )));
+        assert!(
+            !resume_refused_absent(&BridgeError::Mob(Unavailable::Absent.to_string())),
+            "Core's Absent prose is never read as Absent"
+        );
+        let session_id = SessionId::new();
+        let classified = classify(
+            Some(&session_id),
+            rejected(ResumeRejectionKind::Unavailable {
+                reason: Unavailable::Absent,
+            }),
+        )?;
+        assert!(
+            matches!(
+                classified.error,
+                IdentityRuntimeError::IdentityWakeRetryable { .. }
+            ),
+            "{:?}",
+            classified.error
+        );
+        assert!(classified.recorded.is_none());
+        Ok(())
+    }
+
+    /// Core's durable holds keep the session: the audited-endpoint
+    /// divergence is repaired (`repair_session`), the tail and evidence
+    /// holds wait for operator review, and a refused tail recovery is
+    /// retried (Core's own advice), unrecorded.
+    #[test]
+    fn each_durable_resume_hold_maps_to_its_remedy() -> Result<(), Box<dyn std::error::Error>> {
+        let session_id = SessionId::new();
+        let audited = classify(
+            Some(&session_id),
+            rejected(ResumeRejectionKind::Held {
+                hold: DurableResumeHold::AuditedEndpointDivergence,
+            }),
+        )?;
+        assert!(
+            matches!(
+                &audited.error,
+                IdentityRuntimeError::WakeHeld {
+                    hold: WakeHold::DurableResume(DurableResumeHold::AuditedEndpointDivergence),
+                    ..
+                }
+            ),
+            "{:?}",
+            audited.error
+        );
+        assert_eq!(audited.code, -32603);
+        let data = audited.data.ok_or("a held refusal carries data")?;
+        assert_eq!(data["kind"], "mob_member_session_repair_required");
+        assert_eq!(
+            data[SessionError::DURABLE_RESUME_HOLD_KEY],
+            "audited_endpoint_divergence"
+        );
+        assert_eq!(data["session_id"], session_id.to_string());
+        assert!(data.get("remedy").is_none(), "{data}");
+        assert_eq!(
+            audited.recorded.ok_or("a hold is recorded")?.remedy,
+            WakeRefusalRemedy::RepairSession
+        );
+
+        for hold in [
+            DurableResumeHold::TailHeldForRecovery,
+            DurableResumeHold::EvidenceQuarantined,
+        ] {
+            let held = classify(
+                Some(&session_id),
+                rejected(ResumeRejectionKind::Held { hold }),
+            )?;
+            assert!(
+                matches!(
+                    &held.error,
+                    IdentityRuntimeError::WakeHeld {
+                        hold: WakeHold::DurableResume(got),
+                        ..
+                    } if *got == hold
+                ),
+                "{hold:?}: {:?}",
+                held.error
+            );
+            assert_eq!(held.code, -32603, "{hold:?}");
+            let data = held.data.ok_or("a held refusal carries data")?;
+            assert_eq!(data["kind"], "mob_member_session_resume_held", "{hold:?}");
+            assert_eq!(
+                data[SessionError::DURABLE_RESUME_HOLD_KEY],
+                hold.as_str(),
+                "{hold:?}"
+            );
+            assert_eq!(data["session_id"], session_id.to_string(), "{hold:?}");
+            assert_eq!(data["content_retained"], true, "{hold:?}");
+            assert_eq!(data["retryable"], false, "{hold:?}");
+            assert!(data.get("remedy").is_none(), "{hold:?}: {data}");
+            let recorded = held.recorded.ok_or("a hold is recorded")?;
+            assert_eq!(
+                recorded.remedy,
+                WakeRefusalRemedy::OperatorReview,
+                "{hold:?}"
+            );
+            assert!(!recorded.is_final(), "{hold:?}");
+        }
+
+        let refused = classify(
+            Some(&session_id),
+            rejected(ResumeRejectionKind::Held {
+                hold: DurableResumeHold::RecoveryRefused,
+            }),
+        )?;
+        assert!(
+            matches!(
+                refused.error,
+                IdentityRuntimeError::IdentityWakeRetryable { .. }
+            ),
+            "{:?}",
+            refused.error
+        );
+        assert_eq!(refused.code, crate::rpc::IDENTITY_HISTORY_UNAVAILABLE_CODE);
+        assert!(refused.recorded.is_none());
+        Ok(())
+    }
+
+    /// The registration reload path raises the audited-endpoint hold as its
+    /// own bridge error; it classifies like the resume path's, keyed on the
+    /// session that error names.
+    #[test]
+    fn a_session_repair_requirement_is_the_audited_endpoint_hold()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session_id = SessionId::new();
+        let classified = classify(
+            None,
+            BridgeError::SessionRepairRequired {
+                identity: crate::member_comms_id::roster_member_id_for_identity("keeper"),
+                session_id: session_id.clone(),
+                detail: "the audited endpoint diverged".to_string(),
+            },
+        )?;
+        assert!(
+            matches!(
+                &classified.error,
+                IdentityRuntimeError::WakeHeld {
+                    session_id: held,
+                    hold: WakeHold::DurableResume(DurableResumeHold::AuditedEndpointDivergence),
+                    ..
+                } if *held == session_id
+            ),
+            "{:?}",
+            classified.error
+        );
+        assert_eq!(
+            classified.recorded.ok_or("a hold is recorded")?.remedy,
+            WakeRefusalRemedy::RepairSession
+        );
+        Ok(())
+    }
+
+    /// A role migration Core did not apply is held until the host declares
+    /// it or the profile is restored.
+    #[test]
+    fn a_role_migration_core_did_not_apply_is_held_for_resolution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session_id = SessionId::new();
+        let classified = classify(
+            Some(&session_id),
+            rejected(ResumeRejectionKind::RoleMigrationNotApplied),
+        )?;
+        assert!(
+            matches!(
+                &classified.error,
+                IdentityRuntimeError::WakeHeld {
+                    hold: WakeHold::RoleMigrationNotApplied,
+                    ..
+                }
+            ),
+            "{:?}",
+            classified.error
+        );
+        assert_eq!(classified.code, -32603);
+        let data = classified.data.ok_or("a held refusal carries data")?;
+        assert_eq!(data["kind"], "identity_role_migration_refused");
+        assert!(data.get("remedy").is_none(), "{data}");
+        assert_eq!(
+            classified.recorded.ok_or("a hold is recorded")?.remedy,
+            WakeRefusalRemedy::ResolveRoleMigration
+        );
+        Ok(())
+    }
+
+    /// Text never classifies: Core's prose for every final and held reason,
+    /// a rejection kind with no durable meaning, and a typed refusal with no
+    /// session to name are all transient, and none is recorded.
+    #[test]
+    fn text_and_untyped_rejections_never_classify_as_final_or_held()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session_id = SessionId::new();
+        let prose = BridgeError::Mob(format!(
+            "resume failed: {} / {} / {} / {}",
+            Unavailable::ArchivedNotRevivable,
+            Unavailable::ContradictoryDurableAuthority,
+            Unavailable::CommittedBoundaryUnprovable,
+            DurableResumeHold::AuditedEndpointDivergence,
+        ));
+        for (label, session, error) in [
+            ("prose", Some(&session_id), prose),
+            (
+                "untyped kind",
+                Some(&session_id),
+                rejected(ResumeRejectionKind::Other),
+            ),
+            (
+                "no session",
+                None,
+                rejected(ResumeRejectionKind::Unavailable {
+                    reason: Unavailable::ArchivedNotRevivable,
+                }),
+            ),
+        ] {
+            let classified = classify(session, error)?;
+            assert!(
+                matches!(
+                    classified.error,
+                    IdentityRuntimeError::IdentityWakeRetryable { .. }
+                ),
+                "{label}: {:?}",
+                classified.error
+            );
+            assert_eq!(
+                classified.code,
+                crate::rpc::IDENTITY_HISTORY_UNAVAILABLE_CODE,
+                "{label}"
+            );
+            assert!(classified.recorded.is_none(), "{label}");
+        }
+        Ok(())
+    }
+
+    /// The host's deterministic build refusal on a resume is the typed
+    /// build refusal on every attempt, and it is never recorded.
+    #[test]
+    fn a_deterministic_build_refusal_on_resume_is_host_rejected_build()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let classified = classify(
+            Some(&SessionId::new()),
+            BridgeError::Mob(
+                "spawn_member: callback/build_agent failed: callback error: gate refused"
+                    .to_string(),
+            ),
+        )?;
+        assert!(
+            matches!(
+                classified.error,
+                IdentityRuntimeError::HostRejectedBuild { .. }
+            ),
+            "{:?}",
+            classified.error
+        );
+        assert!(classified.recorded.is_none());
+        Ok(())
+    }
+
+    /// A host adoption and an unreadable history answer their own codes, and neither is
+    /// a recorded wake refusal.
+    #[test]
+    fn host_adopted_and_unreadable_history_answer_their_own_codes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adopted = IdentityRuntimeError::IdentityHostAdopted {
+            identity: keeper()?,
+        };
+        assert_eq!(
+            crate::rpc::identity_error_code(&adopted),
+            crate::rpc::IDENTITY_HOST_ADOPTED_CODE
+        );
+        let data = adopted
+            .structured_data()
+            .ok_or("the host-adoption refusal carries data")?;
+        assert_eq!(data["kind"], "identity_host_adopted");
+        assert_eq!(data["identity"], "keeper");
+        assert!(wake_refusal_of(&adopted).is_none());
+
+        let unreadable = IdentityRuntimeError::IdentityHistoryUnavailable {
+            identity: keeper()?,
+            detail: "the store is busy".to_string(),
+        };
+        assert_eq!(
+            crate::rpc::identity_error_code(&unreadable),
+            crate::rpc::IDENTITY_HISTORY_UNAVAILABLE_CODE
+        );
+        let data = unreadable
+            .structured_data()
+            .ok_or("an unreadable history carries data")?;
+        assert_eq!(data["kind"], "identity_history_unavailable");
+        assert_eq!(data["retryable"], true);
+        assert!(wake_refusal_of(&unreadable).is_none());
+        Ok(())
+    }
+
+    /// The view reads the recorded refusal: only a final one shows
+    /// `broken`; a hold leaves the identity `dormant`, and a live member is
+    /// `active` whatever was recorded.
+    #[test]
+    fn only_a_final_refusal_shows_broken() {
+        let refusal = |remedy| WakeRefusal {
+            code: -32603,
+            session_id: SessionId::new(),
+            remedy,
+        };
+        assert_eq!(
+            IdentityRuntime::view_state(false, None),
+            IdentityLifecycleState::Dormant
+        );
+        assert_eq!(
+            IdentityRuntime::view_state(false, Some(&refusal(WakeRefusalRemedy::DeleteIdentity))),
+            IdentityLifecycleState::Broken
+        );
+        assert_eq!(
+            IdentityRuntime::view_state(true, Some(&refusal(WakeRefusalRemedy::DeleteIdentity))),
+            IdentityLifecycleState::Active
+        );
+        for remedy in [
+            WakeRefusalRemedy::RepairSession,
+            WakeRefusalRemedy::ResolveRoleMigration,
+            WakeRefusalRemedy::OperatorReview,
+        ] {
+            assert_eq!(
+                IdentityRuntime::view_state(false, Some(&refusal(remedy))),
+                IdentityLifecycleState::Dormant,
+                "{remedy:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod wake_per_reason_tests {
+    //! A placement host that refuses the spawn itself (its realm backend is
+    //! not persistent) answers the typed build refusal with its remedy, on
+    //! every attempt and unrecorded.
+    //!
+    //! On the wake door: each answer Core gives for not resuming an
+    //! identity's last session reaches `materialize` as its own typed
+    //! outcome after exactly one resume attempt, and only `Absent` spawns. A
+    //! refused wake creates nothing in Core, and the views record only the
+    //! final and held refusals.
+    use super::*;
+    use meerkat_core::service::DurableResumeHold;
+    use meerkat_mob::error::SessionResumeUnavailableReason as Unavailable;
+    use std::sync::atomic::AtomicUsize;
+
+    use super::super::bridge::{MemberRuntimeBinding, ResumeSessionOutcome};
+    use super::super::local_lease::LocalLeaseProvider;
+    use super::super::local_store::LocalContinuityStore;
+    use super::super::types::{ReplacedSession, ReplacedSessionReason, WakeRefusalRemedy};
+
+    const PROFILE: &str = "worker";
+
+    fn spec(identity: &AgentIdentity) -> DurableAgentSpec {
+        DurableAgentSpec {
+            identity: identity.clone(),
+            profile: meerkat_mob::ProfileName::from(PROFILE),
+            addressability: AgentAddressability::Addressable,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: None,
+            backend: None,
+            binding: None,
+            placement: None,
+        }
+    }
+
+    /// Core's member history for one retired identity: its last binding is
+    /// `session` at generation 3, under the roster profile.
+    fn retired_binding(
+        identity: &AgentIdentity,
+        session: &SessionId,
+    ) -> meerkat_mob::MemberBinding {
+        meerkat_mob::MemberBinding::for_test(
+            crate::member_comms_id::roster_member_id_for_identity(identity.as_str()),
+            meerkat_mob::Generation::new(3),
+            Some(session.clone()),
+            meerkat_mob::MemberBindingState::Retired,
+            meerkat_mob::ProfileName::from(PROFILE),
+            meerkat_mob::SpawnContinuityIntent::DurableIdentity {
+                continuity_key: identity.as_str().to_string(),
+            },
+            meerkat_mob::MemberIdentityManagement::CommandDriven,
+        )
+    }
+
+    /// A bridge over a Core that holds no live member for the identity and
+    /// answers its resume with one fixed refusal, which names the session
+    /// the wake asked for, as Core names the session it refused. It counts
+    /// resume and create calls; a create commits a fresh binding.
+    struct RefusingResumeBridge {
+        last: meerkat_mob::MemberBinding,
+        refusal: Box<dyn Fn(&SessionId) -> BridgeError + Send + Sync>,
+        resumes: AtomicUsize,
+        creates: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBridge for RefusingResumeBridge {
+        async fn deliver_admitted(
+            &self,
+            _runtime_id: &AgentRuntimeId,
+            _delivery: super::super::bridge::BridgeDelivery,
+        ) -> Result<SessionId, BridgeError> {
+            Err(BridgeError::Mob(
+                "deliver is not used in this test".to_string(),
+            ))
+        }
+
+        async fn checkpoint_session(
+            &self,
+            _runtime_id: &AgentRuntimeId,
+            _session_id: &SessionId,
+        ) -> Result<super::super::types::SessionSnapshot, BridgeError> {
+            Err(BridgeError::Mob(
+                "checkpoint is not used in this test".to_string(),
+            ))
+        }
+
+        async fn create_session(
+            &self,
+            identity: &AgentIdentity,
+            _spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+        ) -> Result<MemberRuntimeBinding, BridgeError> {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            Ok(MemberRuntimeBinding {
+                agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{}:4", identity.as_str()))
+                    .map_err(|error| BridgeError::InvalidInput(error.to_string()))?,
+                session_id: Some(SessionId::new()),
+            })
+        }
+
+        async fn resume_session(
+            &self,
+            _identity: &AgentIdentity,
+            _spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+            session_id: &SessionId,
+            _resume_from_role: Option<&meerkat_mob::ProfileName>,
+        ) -> Result<ResumeSessionOutcome, BridgeError> {
+            self.resumes.fetch_add(1, Ordering::SeqCst);
+            Err((self.refusal)(session_id))
+        }
+
+        async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn live_member(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
+            Ok(None)
+        }
+
+        async fn live_member_scope(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+            Ok(None)
+        }
+
+        async fn last_member_binding(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+            Ok(Some(self.last.clone()))
+        }
+
+        async fn identity_management(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+            Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
+        }
+
+        async fn member_binding_history(
+            &self,
+        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+            Ok(meerkat_mob::MemberBindingHistory::for_test(
+                [self.last.clone()],
+                [self.last.clone()],
+                [],
+                1,
+            ))
+        }
+    }
+
+    async fn runtime_refusing_with(
+        identity: &AgentIdentity,
+        session: &SessionId,
+        refusal: impl Fn(&SessionId) -> BridgeError + Send + Sync + 'static,
+    ) -> Result<(Arc<RefusingResumeBridge>, IdentityRuntime), Box<dyn std::error::Error>> {
+        let bridge = Arc::new(RefusingResumeBridge {
+            last: retired_binding(identity, session),
+            refusal: Box::new(refusal),
+            resumes: AtomicUsize::new(0),
+            creates: AtomicUsize::new(0),
+        });
+        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "wake-per-reason".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(bridge.clone() as Arc<dyn SessionBridge>),
+            default_timeout: None,
+        });
+        runtime.register(spec(identity)).await;
+        Ok((bridge, runtime))
+    }
+
+    /// What one refused wake must look like on every surface.
+    struct Expected {
+        code: i64,
+        recorded: Option<WakeRefusalRemedy>,
+        state: IdentityLifecycleState,
+    }
+
+    fn unavailable(
+        reason: Unavailable,
+    ) -> impl Fn(&SessionId) -> BridgeError + Send + Sync + 'static {
+        move |session_id: &SessionId| BridgeError::ResumeRejected {
+            kind: ResumeRejectionKind::Unavailable { reason },
+            session_id: session_id.clone(),
+            detail: format!("Core refused the resume: {reason:?}"),
+        }
+    }
+
+    fn held(hold: DurableResumeHold) -> impl Fn(&SessionId) -> BridgeError + Send + Sync + 'static {
+        move |session_id: &SessionId| BridgeError::ResumeRejected {
+            kind: ResumeRejectionKind::Held { hold },
+            session_id: session_id.clone(),
+            detail: format!("Core held the resume: {hold:?}"),
+        }
+    }
+
+    async fn assert_refused_without_spawning(
+        case: &str,
+        refusal: impl Fn(&SessionId) -> BridgeError + Send + Sync + 'static,
+        expected: Expected,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let identity = AgentIdentity::parse("keeper")?;
+        let session = SessionId::new();
+        let (bridge, runtime) = runtime_refusing_with(&identity, &session, refusal).await?;
+
+        let error = match runtime.materialize(&identity).await {
+            Err(error) => error,
+            Ok(scope) => panic!("{case}: the wake must refuse, got {scope:?}"),
+        };
+        assert_eq!(
+            crate::rpc::identity_error_code(&error),
+            expected.code,
+            "{case}: {error:?}"
+        );
+        assert_eq!(
+            bridge.resumes.load(Ordering::SeqCst),
+            1,
+            "{case}: one resume attempt, no retry loop"
+        );
+        assert_eq!(
+            bridge.creates.load(Ordering::SeqCst),
+            0,
+            "{case}: a refused wake must spawn nothing in Core"
+        );
+
+        let status = runtime.status(&identity).await?;
+        assert_eq!(
+            status.wake_refusal.as_ref().map(|refusal| refusal.remedy),
+            expected.recorded,
+            "{case}: the recorded refusal"
+        );
+        if let Some(recorded) = status.wake_refusal.as_ref() {
+            assert_eq!(recorded.session_id, session, "{case}: it names the session");
+            assert_eq!(
+                recorded.code, expected.code,
+                "{case}: it keeps the wake's code"
+            );
+        }
+        assert_eq!(status.state, expected.state, "{case}: the view state");
+        assert_eq!(
+            status.replaced_session, None,
+            "{case}: nothing was replaced"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_refused_resume_reason_spawns_nothing_and_answers_its_own_code()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let final_refusal = || Expected {
+            code: crate::rpc::IDENTITY_UNRESUMABLE_CODE,
+            recorded: Some(WakeRefusalRemedy::DeleteIdentity),
+            state: IdentityLifecycleState::Broken,
+        };
+        let held_refusal = |remedy| Expected {
+            code: -32603,
+            recorded: Some(remedy),
+            state: IdentityLifecycleState::Dormant,
+        };
+        let retryable = || Expected {
+            code: crate::rpc::IDENTITY_HISTORY_UNAVAILABLE_CODE,
+            recorded: None,
+            state: IdentityLifecycleState::Dormant,
+        };
+
+        assert_refused_without_spawning(
+            "archived not revivable",
+            unavailable(Unavailable::ArchivedNotRevivable),
+            final_refusal(),
+        )
+        .await?;
+        assert_refused_without_spawning(
+            "contradictory durable authority",
+            unavailable(Unavailable::ContradictoryDurableAuthority),
+            final_refusal(),
+        )
+        .await?;
+        assert_refused_without_spawning(
+            "committed boundary unprovable",
+            unavailable(Unavailable::CommittedBoundaryUnprovable),
+            held_refusal(WakeRefusalRemedy::OperatorReview),
+        )
+        .await?;
+        assert_refused_without_spawning(
+            "authority changed during materialization",
+            unavailable(Unavailable::AuthorityChangedDuringMaterialization),
+            retryable(),
+        )
+        .await?;
+        assert_refused_without_spawning(
+            "tail held for recovery",
+            held(DurableResumeHold::TailHeldForRecovery),
+            held_refusal(WakeRefusalRemedy::OperatorReview),
+        )
+        .await?;
+        assert_refused_without_spawning(
+            "recovery refused",
+            held(DurableResumeHold::RecoveryRefused),
+            retryable(),
+        )
+        .await?;
+        assert_refused_without_spawning(
+            "evidence quarantined",
+            held(DurableResumeHold::EvidenceQuarantined),
+            held_refusal(WakeRefusalRemedy::OperatorReview),
+        )
+        .await?;
+        assert_refused_without_spawning(
+            "audited endpoint divergence",
+            held(DurableResumeHold::AuditedEndpointDivergence),
+            held_refusal(WakeRefusalRemedy::RepairSession),
+        )
+        .await?;
+        assert_refused_without_spawning(
+            "role migration not applied",
+            |session_id: &SessionId| BridgeError::ResumeRejected {
+                kind: ResumeRejectionKind::RoleMigrationNotApplied,
+                session_id: session_id.clone(),
+                detail: "Core did not apply the role migration".to_string(),
+            },
+            held_refusal(WakeRefusalRemedy::ResolveRoleMigration),
+        )
+        .await?;
+        assert_refused_without_spawning(
+            "session repair required",
+            |session_id: &SessionId| BridgeError::SessionRepairRequired {
+                identity: crate::member_comms_id::roster_member_id_for_identity("keeper"),
+                session_id: session_id.clone(),
+                detail: "the audited endpoint diverged".to_string(),
+            },
+            held_refusal(WakeRefusalRemedy::RepairSession),
+        )
+        .await
+    }
+
+    /// The one reason that spawns: Core holds nothing durable for the last
+    /// session, so the wake creates a fresh one, once, and says so (A3).
+    #[tokio::test]
+    async fn only_an_absent_last_session_spawns_fresh_with_its_marker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let identity = AgentIdentity::parse("keeper")?;
+        let session = SessionId::new();
+        let (bridge, runtime) =
+            runtime_refusing_with(&identity, &session, unavailable(Unavailable::Absent)).await?;
+
+        runtime.materialize(&identity).await?;
+        assert_eq!(bridge.resumes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            bridge.creates.load(Ordering::SeqCst),
+            1,
+            "an Absent last session is replaced by exactly one fresh spawn"
+        );
+        let status = runtime.status(&identity).await?;
+        assert_eq!(
+            status.replaced_session,
+            Some(ReplacedSession {
+                session_id: session,
+                reason: ReplacedSessionReason::Absent,
+            }),
+            "the fresh spawn names the session it replaced"
+        );
+        assert_eq!(
+            status.wake_refusal, None,
+            "a fresh spawn records no refusal"
+        );
+        Ok(())
+    }
+
+    /// A bridge over a Core that holds nothing for the identity, whose
+    /// placement host refuses every spawn because its realm backend is not
+    /// persistent. It counts create calls.
+    #[derive(Default)]
+    struct NonPersistentHostBridge {
+        creates: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBridge for NonPersistentHostBridge {
+        async fn deliver_admitted(
+            &self,
+            _runtime_id: &AgentRuntimeId,
+            _delivery: super::super::bridge::BridgeDelivery,
+        ) -> Result<SessionId, BridgeError> {
+            Err(BridgeError::Mob(
+                "deliver is not used in this test".to_string(),
+            ))
+        }
+
+        async fn checkpoint_session(
+            &self,
+            _runtime_id: &AgentRuntimeId,
+            _session_id: &SessionId,
+        ) -> Result<super::super::types::SessionSnapshot, BridgeError> {
+            Err(BridgeError::Mob(
+                "checkpoint is not used in this test".to_string(),
+            ))
+        }
+
+        async fn create_session(
+            &self,
+            _identity: &AgentIdentity,
+            _spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+        ) -> Result<MemberRuntimeBinding, BridgeError> {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            Err(BridgeError::RealmBackendUnavailable {
+                detail: "create_session: materialize rejected: durable sessions required but \
+                         the realm backend is not persistent"
+                    .to_string(),
+            })
+        }
+
+        async fn resume_session(
+            &self,
+            _identity: &AgentIdentity,
+            _spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+            _session_id: &SessionId,
+            _resume_from_role: Option<&meerkat_mob::ProfileName>,
+        ) -> Result<ResumeSessionOutcome, BridgeError> {
+            Err(BridgeError::Mob(
+                "resume is not used in this test".to_string(),
+            ))
+        }
+
+        async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn live_member(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
+            Ok(None)
+        }
+
+        async fn live_member_scope(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+            Ok(None)
+        }
+
+        async fn last_member_binding(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+            Ok(None)
+        }
+
+        async fn identity_management(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+            Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
+        }
+
+        async fn member_binding_history(
+            &self,
+        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+            Ok(meerkat_mob::MemberBindingHistory::for_test([], [], [], 0))
+        }
+    }
+
+    /// A bridge over a Core that holds the identity's member live, whose
+    /// delivery repair finds the member's first session absent from every
+    /// durable authority: deliveries to that incarnation refuse `Absent`,
+    /// deliveries to any later one land. A reset successor is bound at the
+    /// next generation on a fresh session. `queue_events` records the
+    /// deliveries, the successor and the queue capture and readmission in
+    /// order; `capture_fails` makes the member's queue unobservable.
+    #[derive(Default)]
+    struct AbsentSessionBridge {
+        core: super::super::core_test_members::CoreTestMembers,
+        absent_runtime_id: std::sync::Mutex<Option<AgentRuntimeId>>,
+        delivered_to: std::sync::Mutex<Vec<AgentRuntimeId>>,
+        successors: AtomicUsize,
+        queue_events: std::sync::Mutex<Vec<String>>,
+        capture_fails: std::sync::atomic::AtomicBool,
+    }
+
+    impl AbsentSessionBridge {
+        fn record(&self, event: String) {
+            self.queue_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBridge for AbsentSessionBridge {
+        async fn deliver_admitted(
+            &self,
+            runtime_id: &AgentRuntimeId,
+            _delivery: super::super::bridge::BridgeDelivery,
+        ) -> Result<SessionId, BridgeError> {
+            self.delivered_to
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(runtime_id.clone());
+            self.record("deliver".to_string());
+            let absent = self
+                .absent_runtime_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let identity = AgentIdentity::parse("absent")
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
+            let session_id = self
+                .core
+                .live_member(&identity)?
+                .and_then(|binding| binding.session_id)
+                .ok_or_else(|| BridgeError::Mob("no live session".to_string()))?;
+            if absent.as_ref() == Some(runtime_id) {
+                return Err(BridgeError::ResumeRejected {
+                    kind: ResumeRejectionKind::Unavailable {
+                        reason: Unavailable::Absent,
+                    },
+                    session_id,
+                    detail: "no durable authority knows the session".to_string(),
+                });
+            }
+            Ok(session_id)
+        }
+
+        async fn checkpoint_session(
+            &self,
+            _runtime_id: &AgentRuntimeId,
+            _session_id: &SessionId,
+        ) -> Result<super::super::types::SessionSnapshot, BridgeError> {
+            Err(BridgeError::Mob(
+                "checkpoint is not used in this test".to_string(),
+            ))
+        }
+
+        async fn create_session(
+            &self,
+            _identity: &AgentIdentity,
+            _spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+        ) -> Result<MemberRuntimeBinding, BridgeError> {
+            Err(BridgeError::Mob(
+                "create is not used in this test".to_string(),
+            ))
+        }
+
+        async fn resume_session(
+            &self,
+            _identity: &AgentIdentity,
+            _spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+            _session_id: &SessionId,
+            _resume_from_role: Option<&meerkat_mob::ProfileName>,
+        ) -> Result<ResumeSessionOutcome, BridgeError> {
+            Err(BridgeError::Mob(
+                "resume is not used in this test".to_string(),
+            ))
+        }
+
+        async fn reset_member_to_successor(
+            &self,
+            identity: &AgentIdentity,
+            spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+        ) -> Result<MemberRuntimeBinding, BridgeError> {
+            let generation = self.successors.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            let agent_runtime_id = super::super::core_test_bridge::bind_live(
+                &self.core,
+                identity,
+                &spec.profile,
+                generation,
+                Some(SessionId::new()),
+            )?;
+            self.record("successor".to_string());
+            Ok(MemberRuntimeBinding {
+                session_id: self
+                    .core
+                    .live_member(identity)?
+                    .and_then(|binding| binding.session_id),
+                agent_runtime_id,
+            })
+        }
+
+        async fn capture_queued_member_inputs(
+            &self,
+            _identity: &AgentIdentity,
+            session_id: &SessionId,
+        ) -> Result<super::super::bridge::QueuedMemberInputs, BridgeError> {
+            if self.capture_fails.load(Ordering::SeqCst) {
+                return Err(BridgeError::Mob(
+                    "the runtime owner refused to serve".to_string(),
+                ));
+            }
+            self.record(format!("capture {session_id}"));
+            Ok(super::super::bridge::QueuedMemberInputs::default())
+        }
+
+        async fn readmit_queued_member_inputs(
+            &self,
+            _identity: &AgentIdentity,
+            session_id: &SessionId,
+            _inputs: super::super::bridge::QueuedMemberInputs,
+        ) {
+            self.record(format!("readmit {session_id}"));
+        }
+
+        async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+            self.core.retire(runtime_id);
+            Ok(())
+        }
+
+        async fn live_member(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn ensure_member_live(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn live_member_scope(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+            self.core.live_member_scope(identity)
+        }
+
+        async fn last_member_binding(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+            self.core.last_member_binding(identity)
+        }
+
+        async fn identity_management(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+            Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
+        }
+
+        async fn member_binding_history(
+            &self,
+        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+            self.core.history()
+        }
+    }
+
+    /// A delivery whose member's session Core holds no durable copy of is
+    /// refused typed (`IdentitySessionAbsent`, retryable), never an internal
+    /// error, and never a loop: the next delivery starts the identity's fresh
+    /// life first (one successor), names the absent session as the replaced
+    /// session, and lands on the fresh member.
+    #[tokio::test]
+    async fn a_delivery_to_an_absent_session_refuses_once_then_starts_the_fresh_life()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let identity = AgentIdentity::parse("absent")?;
+        let bridge = Arc::new(AbsentSessionBridge::default());
+        let first_session = SessionId::new();
+        let first = super::super::core_test_bridge::bind_live(
+            &bridge.core,
+            &identity,
+            &spec(&identity).profile,
+            0,
+            Some(first_session.clone()),
+        )?;
+        *bridge
+            .absent_runtime_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(first.clone());
+        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "absent-session".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(bridge.clone() as Arc<dyn SessionBridge>),
+            default_timeout: None,
+        });
+        runtime.register(spec(&identity)).await;
+
+        let refused = match runtime
+            .dispatch(&identity, &DispatchInput::system("first"))
+            .await
+        {
+            Err(error) => error,
+            Ok(admission) => panic!("the absent session must refuse, got {admission:?}"),
+        };
+        let IdentityRuntimeError::IdentitySessionAbsent { session_id, .. } = &refused else {
+            panic!("the typed absent-session refusal, got {refused:?}");
+        };
+        assert_eq!(session_id, &first_session);
+        assert_eq!(
+            crate::rpc::identity_error_code(&refused),
+            crate::rpc::IDENTITY_HISTORY_UNAVAILABLE_CODE
+        );
+        assert_eq!(bridge.successors.load(Ordering::SeqCst), 0);
+
+        runtime
+            .dispatch(&identity, &DispatchInput::system("second"))
+            .await?;
+        assert_eq!(
+            bridge.successors.load(Ordering::SeqCst),
+            1,
+            "the second delivery starts exactly one fresh life"
+        );
+        let delivered_to = bridge
+            .delivered_to
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(delivered_to.len(), 2, "{delivered_to:?}");
+        assert_eq!(delivered_to[0], first);
+        assert_ne!(
+            delivered_to[1], first,
+            "the second delivery lands on the fresh member"
+        );
+        let status = runtime.status(&identity).await?;
+        assert_eq!(
+            status.replaced_session,
+            Some(ReplacedSession {
+                session_id: first_session,
+                reason: ReplacedSessionReason::Absent,
+            })
+        );
+        assert_eq!(
+            status.member_id.as_deref(),
+            Some(crate::member_comms_id::roster_member_id_for_identity(identity.as_str()).as_str()),
+            "the status names Core's member of the binding"
+        );
+        Ok(())
+    }
+
+    /// The absent-session fixture: `bridge`'s Core holds the identity's
+    /// member live on a first session it has no durable copy of. Returns
+    /// the registered runtime, the identity and that session.
+    async fn absent_session_runtime(
+        bridge: &Arc<AbsentSessionBridge>,
+    ) -> Result<(IdentityRuntime, AgentIdentity, SessionId), Box<dyn std::error::Error>> {
+        let identity = AgentIdentity::parse("absent")?;
+        let first_session = SessionId::new();
+        let first = super::super::core_test_bridge::bind_live(
+            &bridge.core,
+            &identity,
+            &spec(&identity).profile,
+            0,
+            Some(first_session.clone()),
+        )?;
+        *bridge
+            .absent_runtime_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(first);
+        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "absent-session-queue".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(bridge.clone() as Arc<dyn SessionBridge>),
+            default_timeout: None,
+        });
+        runtime.register(spec(&identity)).await;
+        Ok((runtime, identity, first_session))
+    }
+
+    /// The wedged member an absent session leaves live may hold inputs
+    /// other senders queued behind it. The fresh life captures that queue
+    /// from the absent session before Core's successor respawn and admits it
+    /// to the fresh member's session as soon as the successor is committed,
+    /// before the delivery that started the fresh life.
+    #[tokio::test]
+    async fn the_fresh_life_after_an_absent_session_carries_the_wedged_members_queue()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bridge = Arc::new(AbsentSessionBridge::default());
+        let (runtime, identity, first_session) = absent_session_runtime(&bridge).await?;
+
+        assert!(
+            runtime
+                .dispatch(&identity, &DispatchInput::system("first"))
+                .await
+                .is_err(),
+            "the first delivery refuses the absent session"
+        );
+        runtime
+            .dispatch(&identity, &DispatchInput::system("second"))
+            .await?;
+
+        let fresh_session = bridge
+            .core
+            .live_member(&identity)?
+            .and_then(|binding| binding.session_id)
+            .ok_or("the fresh member has a session")?;
+        assert_ne!(fresh_session, first_session);
+        let events = bridge
+            .queue_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            events,
+            vec![
+                "deliver".to_string(),
+                format!("capture {first_session}"),
+                "successor".to_string(),
+                format!("readmit {fresh_session}"),
+                "deliver".to_string(),
+            ],
+            "the queue is captured before the successor and admitted to it first"
+        );
+        Ok(())
+    }
+
+    /// A wedged member whose queue cannot be observed is not replaced: the
+    /// fresh life is deferred and the delivery refused retryable, so no input
+    /// another sender queued is destroyed unseen. Nothing is delivered.
+    #[tokio::test]
+    async fn an_unobservable_queue_defers_the_fresh_life_after_an_absent_session()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bridge = Arc::new(AbsentSessionBridge::default());
+        bridge.capture_fails.store(true, Ordering::SeqCst);
+        let (runtime, identity, first_session) = absent_session_runtime(&bridge).await?;
+
+        assert!(
+            runtime
+                .dispatch(&identity, &DispatchInput::system("first"))
+                .await
+                .is_err(),
+            "the first delivery refuses the absent session"
+        );
+        let deferred = match runtime
+            .dispatch(&identity, &DispatchInput::system("second"))
+            .await
+        {
+            Err(error) => error,
+            Ok(admission) => panic!("the fresh life must be deferred, got {admission:?}"),
+        };
+        assert!(
+            matches!(
+                &deferred,
+                IdentityRuntimeError::IdentityWakeRetryable { session_id, .. }
+                    if session_id.as_ref() == Some(&first_session)
+            ),
+            "{deferred:?}"
+        );
+        assert_eq!(
+            crate::rpc::identity_error_code(&deferred),
+            crate::rpc::IDENTITY_HISTORY_UNAVAILABLE_CODE
+        );
+        assert_eq!(
+            bridge.successors.load(Ordering::SeqCst),
+            0,
+            "the member is not replaced"
+        );
+        assert_eq!(
+            bridge
+                .core
+                .live_member(&identity)?
+                .and_then(|binding| binding.session_id),
+            Some(first_session),
+            "the wedged member stays with its queue"
+        );
+        assert_eq!(
+            bridge
+                .delivered_to
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "only the first, refused delivery reached Core"
+        );
+        Ok(())
+    }
+
+    /// The typed remedy for a durable identity placed on a host whose
+    /// realm backend is not persistent: the wake answers `HostRejectedBuild`
+    /// naming the remedy, on every attempt (one spawn each, no retry loop),
+    /// and records nothing.
+    #[tokio::test]
+    async fn a_host_without_a_persistent_realm_refuses_the_wake_typed_with_its_remedy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let identity = AgentIdentity::parse("placed")?;
+        let bridge = Arc::new(NonPersistentHostBridge::default());
+        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "non-persistent-host".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(bridge.clone() as Arc<dyn SessionBridge>),
+            default_timeout: None,
+        });
+        runtime.register(spec(&identity)).await;
+
+        for attempt in 1..=2 {
+            let error = match runtime.materialize(&identity).await {
+                Err(error) => error,
+                Ok(scope) => panic!("attempt {attempt}: the wake must refuse, got {scope:?}"),
+            };
+            let IdentityRuntimeError::HostRejectedBuild {
+                identity: refused,
+                reason,
+            } = &error
+            else {
+                panic!("attempt {attempt}: the typed build refusal, got {error:?}");
+            };
+            assert_eq!(refused, &identity, "attempt {attempt}");
+            assert!(
+                reason.contains("the realm backend is not persistent"),
+                "attempt {attempt}: Core's refusal is kept: {reason}"
+            );
+            assert!(
+                error.to_string().contains(
+                    "run that host with a persistent realm backend, or remove the identity's \
+                     placement"
+                ),
+                "attempt {attempt}: the answer names the remedy: {error}"
+            );
+            assert_eq!(
+                bridge.creates.load(Ordering::SeqCst),
+                attempt,
+                "attempt {attempt}: one spawn per wake, no retry loop"
+            );
+        }
+        let status = runtime.status(&identity).await?;
+        assert_eq!(
+            status.wake_refusal, None,
+            "the build refusal is answered on every attempt, never recorded"
+        );
+
+        // No supervisor retries the identity: none runs any more. The only
+        // automatic re-attempt is best-effort hydration, which records the
+        // refusal and backs off for MATERIALIZATION_FAILURE_BACKOFF.
+        assert!(runtime.materialize_all().await?.is_empty());
+        assert_eq!(
+            bridge.creates.load(Ordering::SeqCst),
+            3,
+            "the first hydration pass attempts the spawn once"
+        );
+        assert!(runtime.materialize_all().await?.is_empty());
+        assert_eq!(
+            bridge.creates.load(Ordering::SeqCst),
+            3,
+            "the backoff holds the next pass inside its window"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod respawn_window_tests {
+    //! The respawn window: Core retires the member and then wakes it
+    //! onto the same session in a second step, and a status read between the
+    //! two reads the retired binding. It may show Dormant; it never shows
+    //! Broken or a replaced session, even when an earlier wake left either
+    //! note on the member.
+    use super::*;
+
+    use super::super::bridge::{MemberRuntimeBinding, ResumeSessionOutcome};
+    use super::super::local_lease::LocalLeaseProvider;
+    use super::super::local_store::LocalContinuityStore;
+    use super::super::types::{
+        ReplacedSession, ReplacedSessionReason, WakeRefusal, WakeRefusalRemedy,
+    };
+
+    const PROFILE: &str = "worker";
+
+    fn spec(identity: &AgentIdentity) -> DurableAgentSpec {
+        DurableAgentSpec {
+            identity: identity.clone(),
+            profile: meerkat_mob::ProfileName::from(PROFILE),
+            addressability: AgentAddressability::Addressable,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: None,
+            backend: None,
+            binding: None,
+            placement: None,
+        }
+    }
+
+    /// A Core that holds the member live on one session, retires it on
+    /// request, and holds the resume that follows until the test opens the
+    /// gate.
+    struct GatedRespawnBridge {
+        identity: AgentIdentity,
+        session: SessionId,
+        live: AtomicBool,
+        generation: AtomicU64,
+        resume_entered: tokio::sync::Notify,
+        resume_gate: tokio::sync::Notify,
+    }
+
+    impl GatedRespawnBridge {
+        fn new(identity: AgentIdentity, session: SessionId) -> Self {
+            Self {
+                identity,
+                session,
+                live: AtomicBool::new(true),
+                generation: AtomicU64::new(3),
+                resume_entered: tokio::sync::Notify::new(),
+                resume_gate: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn binding(&self) -> meerkat_mob::MemberBinding {
+            let state = if self.live.load(Ordering::SeqCst) {
+                meerkat_mob::MemberBindingState::Live
+            } else {
+                meerkat_mob::MemberBindingState::Retired
+            };
+            meerkat_mob::MemberBinding::for_test(
+                crate::member_comms_id::roster_member_id_for_identity(self.identity.as_str()),
+                meerkat_mob::Generation::new(self.generation.load(Ordering::SeqCst)),
+                Some(self.session.clone()),
+                state,
+                meerkat_mob::ProfileName::from(PROFILE),
+                meerkat_mob::SpawnContinuityIntent::DurableIdentity {
+                    continuity_key: self.identity.as_str().to_string(),
+                },
+                meerkat_mob::MemberIdentityManagement::CommandDriven,
+            )
+        }
+
+        fn runtime_binding(&self) -> Result<MemberRuntimeBinding, BridgeError> {
+            Ok(MemberRuntimeBinding {
+                agent_runtime_id: AgentRuntimeId::parse(&format!(
+                    "rt:{}:{}",
+                    self.identity.as_str(),
+                    self.generation.load(Ordering::SeqCst)
+                ))
+                .map_err(|error| BridgeError::InvalidInput(error.to_string()))?,
+                session_id: Some(self.session.clone()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBridge for GatedRespawnBridge {
+        async fn deliver_admitted(
+            &self,
+            _runtime_id: &AgentRuntimeId,
+            _delivery: super::super::bridge::BridgeDelivery,
+        ) -> Result<SessionId, BridgeError> {
+            Err(BridgeError::Mob(
+                "deliver is not used in this test".to_string(),
+            ))
+        }
+
+        async fn checkpoint_session(
+            &self,
+            _runtime_id: &AgentRuntimeId,
+            _session_id: &SessionId,
+        ) -> Result<super::super::types::SessionSnapshot, BridgeError> {
+            Err(BridgeError::Mob(
+                "checkpoint is not used in this test".to_string(),
+            ))
+        }
+
+        async fn create_session(
+            &self,
+            _identity: &AgentIdentity,
+            _spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+        ) -> Result<MemberRuntimeBinding, BridgeError> {
+            Err(BridgeError::InvalidInput(
+                "a respawn resumes the member's session; it never creates one".to_string(),
+            ))
+        }
+
+        async fn resume_session(
+            &self,
+            _identity: &AgentIdentity,
+            _spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+            _session_id: &SessionId,
+            _resume_from_role: Option<&meerkat_mob::ProfileName>,
+        ) -> Result<ResumeSessionOutcome, BridgeError> {
+            self.resume_entered.notify_one();
+            self.resume_gate.notified().await;
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.live.store(true, Ordering::SeqCst);
+            Ok(ResumeSessionOutcome::Resumed {
+                session_id: self.session.clone(),
+                agent_runtime_id: self.runtime_binding()?.agent_runtime_id,
+            })
+        }
+
+        async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+            self.live.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn live_member(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
+            if self.live.load(Ordering::SeqCst) {
+                self.runtime_binding().map(Some)
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn live_member_scope(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+            Ok(None)
+        }
+
+        async fn last_member_binding(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+            Ok(Some(self.binding()))
+        }
+
+        async fn identity_management(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+            Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
+        }
+
+        async fn member_binding_history(
+            &self,
+        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+            let binding = self.binding();
+            Ok(meerkat_mob::MemberBindingHistory::for_test(
+                [binding.clone()],
+                [binding],
+                [],
+                1,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_status_read_between_the_respawn_steps_is_dormant_never_broken()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let identity = AgentIdentity::parse("keeper")?;
+        let session = SessionId::new();
+        let bridge = Arc::new(GatedRespawnBridge::new(identity.clone(), session.clone()));
+        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "respawn-window".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(bridge.clone() as Arc<dyn SessionBridge>),
+            default_timeout: None,
+        }));
+        runtime.register(spec(&identity)).await;
+        // Notes an earlier wake left on a member Core now holds live: a final
+        // refusal and a replaced session. Neither describes the live member.
+        {
+            let mut entries = runtime.entries.write().await;
+            let entry = entries
+                .get_mut(&identity)
+                .ok_or("the identity is registered")?;
+            entry.wake_refusal = Some(WakeRefusal {
+                code: crate::rpc::IDENTITY_UNRESUMABLE_CODE,
+                session_id: session.clone(),
+                remedy: WakeRefusalRemedy::DeleteIdentity,
+            });
+            entry.replaced_session = Some(ReplacedSession {
+                session_id: SessionId::new(),
+                reason: ReplacedSessionReason::Absent,
+            });
+        }
+        assert_eq!(
+            runtime.status(&identity).await?.state,
+            IdentityLifecycleState::Active
+        );
+
+        let respawn = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            let identity = identity.clone();
+            async move { runtime.respawn(&identity).await }
+        });
+        bridge.resume_entered.notified().await;
+
+        let between = runtime.status(&identity).await?;
+        assert_eq!(
+            between.state,
+            IdentityLifecycleState::Dormant,
+            "between Core's retire and the wake the member reads Dormant, never Broken"
+        );
+        assert_eq!(
+            between.wake_refusal, None,
+            "no refusal describes the member"
+        );
+        assert_eq!(
+            between.replaced_session, None,
+            "the respawn replaced no session"
+        );
+        assert_eq!(
+            between.session_id,
+            Some(session.clone()),
+            "the read names the session the respawn wakes"
+        );
+
+        bridge.resume_gate.notify_one();
+        respawn.await??;
+        let after = runtime.status(&identity).await?;
+        assert_eq!(after.state, IdentityLifecycleState::Active);
+        assert_eq!(after.session_id, Some(session));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod history_read_fault_tests {
+    //! No default-healthy status: a view of an identity reads Core's
+    //! member history at request time or fails typed. A failed read never
+    //! yields an empty list, a guessed status or a healthy default.
+    use super::*;
+
+    use super::super::bridge::{MemberRuntimeBinding, ResumeSessionOutcome};
+    use super::super::local_lease::LocalLeaseProvider;
+    use super::super::local_store::LocalContinuityStore;
+
+    /// A bridge over a Core whose member history cannot be read.
+    struct UnreadableHistoryBridge;
+
+    #[async_trait::async_trait]
+    impl SessionBridge for UnreadableHistoryBridge {
+        async fn deliver_admitted(
+            &self,
+            _runtime_id: &AgentRuntimeId,
+            _delivery: super::super::bridge::BridgeDelivery,
+        ) -> Result<SessionId, BridgeError> {
+            Err(BridgeError::Mob(
+                "deliver is not used in this test".to_string(),
+            ))
+        }
+
+        async fn checkpoint_session(
+            &self,
+            _runtime_id: &AgentRuntimeId,
+            _session_id: &SessionId,
+        ) -> Result<super::super::types::SessionSnapshot, BridgeError> {
+            Err(BridgeError::Mob(
+                "checkpoint is not used in this test".to_string(),
+            ))
+        }
+
+        async fn create_session(
+            &self,
+            _identity: &AgentIdentity,
+            _spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+        ) -> Result<MemberRuntimeBinding, BridgeError> {
+            Err(BridgeError::Mob(
+                "no member is created in this test".to_string(),
+            ))
+        }
+
+        async fn resume_session(
+            &self,
+            _identity: &AgentIdentity,
+            _spec: &DurableAgentSpec,
+            _draft: &AgentBuildDraft,
+            _session_id: &SessionId,
+            _resume_from_role: Option<&meerkat_mob::ProfileName>,
+        ) -> Result<ResumeSessionOutcome, BridgeError> {
+            Err(BridgeError::Mob(
+                "no member is resumed in this test".to_string(),
+            ))
+        }
+
+        async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn member_binding_history(
+            &self,
+        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+            Err(BridgeError::Mob(
+                "the mob journal could not be read".to_string(),
+            ))
+        }
+    }
+
+    fn spec(identity: &AgentIdentity) -> DurableAgentSpec {
+        DurableAgentSpec {
+            identity: identity.clone(),
+            profile: meerkat_mob::ProfileName::from("worker"),
+            addressability: AgentAddressability::Addressable,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: None,
+            backend: None,
+            binding: None,
+            placement: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_member_history_fails_every_view_typed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "unreadable-history".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(Arc::new(UnreadableHistoryBridge) as Arc<dyn SessionBridge>),
+            default_timeout: None,
+        });
+        let keeper = AgentIdentity::parse("keeper")?;
+        runtime.register(spec(&keeper)).await;
+
+        let error = match runtime.statuses().await {
+            Err(error) => error,
+            Ok(statuses) => panic!("a failed history read must not list statuses: {statuses:?}"),
+        };
+        assert!(
+            matches!(error, IdentityRuntimeError::MemberHistoryUnavailable { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            crate::rpc::identity_error_code(&error),
+            crate::rpc::IDENTITY_HISTORY_UNAVAILABLE_CODE
+        );
+        assert_eq!(
+            error.structured_data(),
+            Some(serde_json::json!({
+                "kind": "identity_history_unavailable", "retryable": true,
+            }))
+        );
+        assert!(
+            matches!(
+                runtime.roster_inspect().await,
+                Err(IdentityRuntimeError::MemberHistoryUnavailable { .. })
+            ),
+            "roster_inspect must fail typed, not answer an empty roster"
+        );
+        assert!(
+            matches!(
+                runtime.status(&keeper).await,
+                Err(IdentityRuntimeError::IdentityHistoryUnavailable { .. })
+            ),
+            "status must fail typed, not report a default state"
+        );
+        assert!(
+            matches!(
+                runtime.member_health(&keeper).await,
+                Err(IdentityRuntimeError::IdentityHistoryUnavailable { .. })
+            ),
+            "member_health must fail typed, not report a healthy member"
+        );
+        Ok(())
+    }
+}
+
 /// The tracked (owned) operations of an exported identity runtime. Each one
 /// takes its own public owner for the operation's whole life (see
 /// `IdentityRuntime::run_tracked_foreground`); the view keeps the mob owned
@@ -23687,14 +20714,14 @@ impl super::PublicIdentityRuntime {
     pub async fn materialize_tracked(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         self.runtime.materialize_tracked(identity).await
     }
 
     pub async fn retire_tracked(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<FencingToken, IdentityRuntimeError> {
+    ) -> Result<(), IdentityRuntimeError> {
         self.runtime.retire_tracked(identity).await
     }
 
@@ -23702,16 +20729,25 @@ impl super::PublicIdentityRuntime {
         &self,
         identity: &AgentIdentity,
         expected_alias: &str,
-    ) -> Result<FencingToken, IdentityRuntimeError> {
+    ) -> Result<(), IdentityRuntimeError> {
         self.runtime
             .retire_member_alias_tracked(identity, expected_alias)
             .await
     }
 
+    /// See [`IdentityRuntime::retire_at_scope_tracked`].
+    pub async fn retire_at_scope_tracked(
+        &self,
+        identity: &AgentIdentity,
+        scope: &super::DeliveryScope,
+    ) -> Result<FencingToken, super::ScopedRetireError> {
+        self.runtime.retire_at_scope_tracked(identity, scope).await
+    }
+
     pub async fn respawn_tracked(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         self.runtime.respawn_tracked(identity).await
     }
 
@@ -23719,41 +20755,16 @@ impl super::PublicIdentityRuntime {
         &self,
         identity: &AgentIdentity,
         expected_alias: &str,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         self.runtime
             .respawn_member_alias_tracked(identity, expected_alias)
-            .await
-    }
-
-    pub async fn rebind_session_after_live_respawn_tracked(
-        &self,
-        identity: &AgentIdentity,
-        session_id: SessionId,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
-        self.runtime
-            .rebind_session_after_live_respawn_tracked(identity, session_id)
-            .await
-    }
-
-    pub async fn rebind_session_after_live_respawn_member_alias_tracked(
-        &self,
-        identity: &AgentIdentity,
-        expected_alias: &str,
-        session_id: SessionId,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
-        self.runtime
-            .rebind_session_after_live_respawn_member_alias_tracked(
-                identity,
-                expected_alias,
-                session_id,
-            )
             .await
     }
 
     pub async fn reset_tracked(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<meerkat_mob::MemberBinding, IdentityRuntimeError> {
         self.runtime.reset_tracked(identity).await
     }
 
@@ -23761,7 +20772,7 @@ impl super::PublicIdentityRuntime {
         &self,
         identity: &AgentIdentity,
         expected_alias: &str,
-    ) -> Result<ContinuityRecord, IdentityRuntimeError> {
+    ) -> Result<meerkat_mob::MemberBinding, IdentityRuntimeError> {
         self.runtime
             .reset_member_alias_tracked(identity, expected_alias)
             .await
@@ -23770,7 +20781,7 @@ impl super::PublicIdentityRuntime {
     pub async fn delete_identity_tracked(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<(), IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberBinding>, IdentityRuntimeError> {
         self.runtime.delete_identity_tracked(identity).await
     }
 
@@ -23778,7 +20789,7 @@ impl super::PublicIdentityRuntime {
         &self,
         identity: &AgentIdentity,
         expected_alias: &str,
-    ) -> Result<(), IdentityRuntimeError> {
+    ) -> Result<Option<meerkat_mob::MemberBinding>, IdentityRuntimeError> {
         self.runtime
             .delete_identity_member_alias_tracked(identity, expected_alias)
             .await
@@ -23786,7 +20797,7 @@ impl super::PublicIdentityRuntime {
 
     pub async fn materialize_all_required_tracked(
         &self,
-    ) -> Result<Vec<ContinuityRecord>, IdentityRuntimeError> {
+    ) -> Result<Vec<meerkat_mob::MemberDeliveryScope>, IdentityRuntimeError> {
         self.runtime.materialize_all_required_tracked().await
     }
 
@@ -23973,6 +20984,25 @@ impl super::PublicIdentityFirstContext {
         &self,
     ) -> Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError> {
         self.context.refresh_desired_topology_tracked().await
+    }
+
+    /// See [`IdentityFirstRuntimeContext::add_member_held`].
+    pub async fn add_member_held<F, Fut>(
+        &self,
+        spec: DurableAgentSpec,
+        deadline: meerkat_mob::HeldSpawnDeadline,
+        complete: F,
+    ) -> Result<super::held_bootstrap::HeldBootstrapStart, IdentityRuntimeError>
+    where
+        F: FnOnce(
+                Vec<super::held_bootstrap::HeldIdentityMember>,
+                super::held_bootstrap::HeldCompletion,
+            ) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        self.context.add_member_held(spec, deadline, complete).await
     }
 }
 

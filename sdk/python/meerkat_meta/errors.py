@@ -11,10 +11,6 @@ if TYPE_CHECKING:
 # is past the current ledger frontier.
 MOB_EVENTS_STALE_CURSOR_CODE: int = -32010
 CAPABILITY_UNAVAILABLE_CODE: int = -32004
-# Transient/recoverable identity-plane lease loss on a send/dispatch. Distinct
-# from CAPABILITY_UNAVAILABLE_CODE (-32004) so a lease that merely needs
-# re-acquisition is not mis-typed as a permanent capability gap.
-LEASE_LOST_CODE: int = -32005
 # A send named the registered row its input was authored from
 # (``expected_spec_digest``) and the identity's registered row is no longer
 # that row. Checked before delivery: nothing was submitted.
@@ -50,6 +46,27 @@ MEMBER_RELOAD_REQUIRED_KIND: str = "mob_member_reload_required"
 WORKGRAPH_UNAVAILABLE_CODE: int = -32041
 # WorkGraph CAS/revision conflict on a mutation (stale `expected_revision`).
 WORKGRAPH_CONFLICT_CODE: int = -32042
+# Identity lifecycle refusals. Core's mob machine and journal hold an
+# identity's session and generation; these codes carry Core's typed answers.
+# The identity's durable session cannot be resumed: Core reports it archived
+# and not revivable, or its durable authority contradictory. Final; nothing
+# was spawned.
+IDENTITY_UNRESUMABLE_CODE: int = -32051
+# Core's member history, or the session resume, could not be read right now.
+# Retryable; nothing was spawned.
+IDENTITY_HISTORY_UNAVAILABLE_CODE: int = -32052
+# The identity is managed by a host intent declaration in Core, so Meta's
+# lifecycle verbs refuse it.
+IDENTITY_HOST_ADOPTED_CODE: int = -32053
+# A wake Core holds until an operator acts rides JSON-RPC's internal-error
+# code with structured data; the data ``kind`` names the hold.
+IDENTITY_WAKE_HELD_KINDS: frozenset[str] = frozenset(
+    {
+        "mob_member_session_repair_required",
+        "mob_member_session_resume_held",
+        "identity_role_migration_refused",
+    }
+)
 
 
 class MetaError(Exception):
@@ -164,11 +181,11 @@ class InitOutcomeUnknownError(MetaError):
     Raised when the init request was written but no settlement arrived: the
     acceptance was lost, the reader failed, the gateway exited, or the
     caller's init deadline ran out. The gateway may have changed native state
-    (owner publication, identities, leases, continuity, schedules) before it
-    stopped, so this is never reported as a refusal and never retried
-    automatically. ``init_id`` correlates with the gateway's progress
-    notifications; ``last_phase`` is the last ``meta/init_progress`` phase
-    seen (``None`` when none arrived); ``reason`` names what ended the wait.
+    (owner publication, identities, schedules) before it stopped, so this
+    is never reported as a refusal and never retried automatically.
+    ``init_id`` correlates with the gateway's progress notifications;
+    ``last_phase`` is the last ``meta/init_progress`` phase seen (``None``
+    when none arrived); ``reason`` names what ended the wait.
     """
 
     def __init__(self, init_id: str, last_phase: str | None, reason: str):
@@ -266,32 +283,6 @@ class CapabilityUnavailableError(RpcError):
         )
 
 
-class LeaseLostError(RpcError):
-    """Raised when an identity's lease was lost mid send/dispatch.
-
-    This is transient and recoverable: the identity simply needs to
-    re-acquire its lease. Distinct from :class:`CapabilityUnavailableError`
-    so callers do not treat a recoverable lease loss as a permanent
-    capability gap.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        request_id: str = "",
-        method: str = "",
-        data: Any | None = None,
-    ):
-        super().__init__(
-            LEASE_LOST_CODE,
-            message,
-            request_id=request_id,
-            method=method,
-            data=data,
-        )
-
-
 class RegisteredSpecChangedError(RpcError):
     """Raised when a send's ``expected_spec_digest`` no longer names the
     identity's registered row.
@@ -325,9 +316,9 @@ class StaleScopeError(RpcError):
     Nothing was submitted and the delivery was not retargeted to the
     identity's current binding. ``mismatch`` names the atom that moved:
     ``runtime_id``, ``generation``, ``lease_fencing_token``, ``member`` or
-    ``member_binding`` (the member's session, incarnation or fence). An
-    earlier attempt under the same scope is recovered with
-    ``recover_delivery``, never by redispatching to a fresh scope.
+    ``member_binding`` (the member's session, incarnation or fence, or the
+    mob's incarnation). An earlier attempt under the same scope is recovered
+    with ``recover_delivery``, never by redispatching to a fresh scope.
     """
 
     def __init__(
@@ -390,16 +381,36 @@ class ConsoleTimelineReplayUnavailableError(RpcError):
 
 
 class StorageResolutionError(RpcError):
-    """Raised when the gateway refuses to start over a storage resolution gap.
+    """The gateway's storage cannot serve this call.
 
-    The refusals are deliberate (storage-unification fail-closed posture):
-    file-name twins (e.g. ``sessions.sqlite3`` beside ``sessions.db``) the
-    layout will not pick between, a session/runtime/blob/metadata/console
-    store that failed to open where older gateways silently fell back to
-    in-memory, or an uncreatable state root. The message names the
-    remediation — run the storage doctor (``meta/storage/doctor``) for
-    twins, fix the database file, or declare the ephemeral choice
-    explicitly (e.g. ``runtime_store.memory()``).
+    At start the refusals are deliberate (storage-unification fail-closed
+    posture): file-name twins (e.g. ``sessions.sqlite3`` beside
+    ``sessions.db``) the layout will not pick between, a
+    session/runtime/blob/metadata/console store that failed to open where
+    older gateways silently fell back to in-memory, or an uncreatable state
+    root. The message names the remediation: run the storage doctor
+    (``meta/storage/doctor``) for twins, fix the database file, or declare
+    the ephemeral choice explicitly (e.g. ``runtime_store.memory()``).
+
+    After ``storage-migrate-native``, the gateway's first boot carries out
+    the migration's first-boot manifest, and ``kind`` names its refusals:
+
+    - ``"first_boot_manifest_unreadable"``: the manifest at ``path`` cannot
+      be read, so no identity wakes;
+    - ``"first_boot_row_refused"``: Core contradicts the manifest row for
+      ``identity`` (``row_kind``, ``manifest_session`` and
+      ``core_session`` say how), so that identity's wakes and sends are
+      refused;
+    - ``"first_boot_row_pending"``: ``operation`` (``"reset"``,
+      ``"delete_identity"`` or a delivery verb) waits until the row for
+      ``identity`` is carried out. ``waiting_for`` says what it waits for,
+      and ``remedy`` what to do: ``"add_to_roster"`` (no roster lists the
+      identity) or ``"wake_identity"`` (the roster lists it and its row waits
+      to be carried out). Retryable.
+
+    ``retryable`` is ``True`` only when the gateway says so. The other
+    fields are ``None`` when the gateway did not send them; the full
+    refusal stays available as ``data``.
     """
 
     def __init__(
@@ -417,6 +428,16 @@ class StorageResolutionError(RpcError):
             method=method,
             data=data,
         )
+        self.kind = _data_str(data, "kind")
+        self.identity = _data_str(data, "identity")
+        self.row_kind = _data_str(data, "row_kind")
+        self.manifest_session = _data_str(data, "manifest_session")
+        self.core_session = _data_str(data, "core_session")
+        self.operation = _data_str(data, "operation")
+        self.path = _data_str(data, "path")
+        self.waiting_for = _data_str(data, "waiting_for")
+        self.remedy = _data_str(data, "remedy")
+        self.retryable = isinstance(data, dict) and data.get("retryable") is True
 
 
 class InitInProgressError(RpcError):
@@ -424,8 +445,8 @@ class InitInProgressError(RpcError):
 
     The gateway serves ordinary requests only after init settles and refuses
     earlier ones at once. A startup provider callback (roster, topology,
-    continuity, lease, session builder, customizer) must not issue ordinary
-    runtime RPCs on the runtime that is starting.
+    session builder, customizer) must not issue ordinary runtime RPCs on the
+    runtime that is starting.
     """
 
     def __init__(
@@ -600,6 +621,163 @@ class WorkGraphConflictError(RpcError):
             request_id=err.request_id,
             method=err.method,
             data=err.data,
+        )
+
+
+def _data_str(data: Any | None, key: str) -> str | None:
+    value = data.get(key) if isinstance(data, dict) else None
+    return value if isinstance(value, str) else None
+
+
+class IdentityUnresumableError(RpcError):
+    """The identity's durable session cannot be resumed. The refusal is final.
+
+    Core still holds the identity's history, but cannot resume the session
+    it names (``reason`` is ``"archived_not_revivable"`` or
+    ``"contradictory_durable_authority"``; a newer reason is kept as sent).
+    Nothing was spawned, and a retry ends the same way. The remedy
+    (``remedy``, ``"delete_identity"``) starts the identity on a fresh
+    session. ``identity``, ``session_id``, ``reason`` and ``remedy`` are
+    ``None`` when the gateway sent no refusal data; the full refusal stays
+    available as ``data``.
+    """
+
+    retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str = "",
+        method: str = "",
+        data: Any | None = None,
+    ):
+        super().__init__(
+            IDENTITY_UNRESUMABLE_CODE,
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+        self.identity = _data_str(data, "identity")
+        self.session_id = _data_str(data, "session_id")
+        self.reason = _data_str(data, "reason")
+        self.remedy = _data_str(data, "remedy")
+
+
+class IdentityHistoryUnavailableError(RpcError):
+    """Core's member history or the session resume could not be read right now.
+
+    Retryable: nothing was spawned and the identity's history is untouched,
+    so the same call can be retried. ``kind`` is
+    ``"identity_history_unavailable"`` when Core's history read failed,
+    ``"identity_wake_retryable"`` when the wake failed transiently (resuming
+    ``session_id``, or starting fresh when ``session_id`` is ``None``), or
+    ``"identity_session_absent"`` when a delivery reached a member whose
+    session ``session_id`` Core holds no durable copy of: nothing was
+    delivered, and the next delivery starts the identity's fresh session. A
+    failed read of the whole roster's history names no ``identity``.
+    ``kind``, ``identity`` and ``session_id`` are ``None`` when the gateway
+    did not send them.
+    """
+
+    retryable = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str = "",
+        method: str = "",
+        data: Any | None = None,
+    ):
+        super().__init__(
+            IDENTITY_HISTORY_UNAVAILABLE_CODE,
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+        self.kind = _data_str(data, "kind")
+        self.identity = _data_str(data, "identity")
+        self.session_id = _data_str(data, "session_id")
+
+
+class IdentityHostAdoptedError(RpcError):
+    """The identity is managed by a host intent declaration in Core.
+
+    Core holds intent for the identity (the host adopted it), so Meta's
+    lifecycle verbs refuse to act on it; the host's reconciler owns it.
+    ``identity`` is ``None`` when the gateway did not send it.
+    """
+
+    retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str = "",
+        method: str = "",
+        data: Any | None = None,
+    ):
+        super().__init__(
+            IDENTITY_HOST_ADOPTED_CODE,
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+        self.identity = _data_str(data, "identity")
+
+
+class IdentityWakeHeldError(RpcError):
+    """The identity's wake is held until an operator acts.
+
+    Core kept the identity's session and its content but will not resume it
+    on its own, and a retry ends the same way. The identity reads
+    ``dormant`` and its status carries the refusal. ``kind`` names the hold:
+
+    - ``"mob_member_session_repair_required"``: the session's committed
+      document fails Core's audited-endpoint check; ``operator_path`` lists
+      the repair, then ``meta/reload_member``;
+    - ``"mob_member_session_resume_held"``: Core holds the session's resume;
+      ``durable_resume_hold`` or ``resume_unavailable_reason`` names why;
+    - ``"identity_role_migration_refused"``: the roster changed the
+      identity's profile without a declared role migration.
+
+    ``kind``, ``identity``, ``session_id``, ``durable_resume_hold`` and
+    ``resume_unavailable_reason`` are ``None`` when the gateway did not send
+    them; the full refusal stays available as ``data``.
+    """
+
+    retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str = "",
+        method: str = "",
+        data: Any | None = None,
+    ):
+        super().__init__(
+            -32603,
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+        self.kind = _data_str(data, "kind")
+        self.identity = _data_str(data, "identity")
+        self.session_id = _data_str(data, "session_id")
+        self.durable_resume_hold = _data_str(data, "durable_resume_hold")
+        self.resume_unavailable_reason = _data_str(data, "resume_unavailable_reason")
+        operator_path = data.get("operator_path") if isinstance(data, dict) else None
+        self.operator_path: list[str] = (
+            [step for step in operator_path if isinstance(step, str)]
+            if isinstance(operator_path, list)
+            else []
         )
 
 

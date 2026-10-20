@@ -213,6 +213,33 @@ fn definition(mob_id: &str, model_lines: &str) -> MobDefinition {
     MobDefinition::from_toml(&toml).expect("parse pair-coherence mob definition")
 }
 
+/// Declare `definition` as the stored definition's successor at
+/// `expected_revision` through the spec-update ceremony, the sanctioned path
+/// for an edited definition: a persistent mob pins its definition, so a boot
+/// carrying an undeclared edit is refused as divergent.
+async fn declare_definition(
+    state_path: &std::path::Path,
+    definition: MobDefinition,
+    expected_revision: u64,
+) {
+    let storage = meerkat_mob::MobStorage::persistent(state_path.join("event_log.sqlite3"))
+        .expect("open the mob store");
+    let mob_id = definition.id.as_str().to_string();
+    let receipt = meerkat_meta::spec_update_ceremony::declare_spec_update(
+        &storage,
+        &mob_id,
+        &definition,
+        expected_revision,
+    )
+    .await
+    .expect("declare the edited definition");
+    assert_eq!(
+        receipt.committed_revision,
+        expected_revision + 1,
+        "{receipt:?}"
+    );
+}
+
 /// Build a fresh runtime + identity runtime against `state_path` with the
 /// given definition — one process (re)start against a durable store.
 async fn boot(
@@ -285,8 +312,11 @@ async fn explicit_model_override_resumes_with_catalog_derived_pair() {
         .await
         .expect("restore_flow (boot 1)");
         match result.outcomes.get(&alice).expect("alice outcome") {
-            RestoreOutcome::Created { record, .. } => {
-                original_session_id = record.session_id.clone();
+            RestoreOutcome::Created { binding, .. } => {
+                original_session_id = binding
+                    .session_id
+                    .clone()
+                    .expect("Core binds the member to a session");
             }
             other => panic!("expected Created on first boot, got {other:?}"),
         }
@@ -308,6 +338,15 @@ async fn explicit_model_override_resumes_with_catalog_derived_pair() {
     // --- Boot 2: SAME store, definition edited to a model owned by another
     // provider, with no provider key but explicit operator resume authority.
     // The pair must move together. ---
+    declare_definition(
+        &state_path,
+        definition(
+            "pair-coherence",
+            "model = \"claude-opus-4-8\"\nresume_overrides = [\"model\", \"provider\"]",
+        ),
+        1,
+    )
+    .await;
     {
         let capture = CaptureClient::default();
         let (unified, identity_rt) = boot(
@@ -330,9 +369,10 @@ async fn explicit_model_override_resumes_with_catalog_derived_pair() {
         .await
         .expect("restore_flow (boot 2)");
         match result.outcomes.get(&alice).expect("alice outcome") {
-            RestoreOutcome::Resumed { record, .. } => {
+            RestoreOutcome::Resumed { binding, .. } => {
                 assert_eq!(
-                    record.session_id, original_session_id,
+                    binding.session_id.as_ref(),
+                    Some(&original_session_id),
                     "the cross-provider model edit must resume the SAME durable session"
                 );
             }
@@ -371,13 +411,8 @@ async fn explicit_model_override_resumes_with_catalog_derived_pair() {
     // both persisted, coherent with the catalog. ---
     {
         use meerkat::SessionStore as _;
-        // Canonical spelling first, legacy spellings beside it (the storage
-        // layout's own probe order).
-        let db_path = ["sessions.sqlite3", "sessions.db", "sessions.sqlite"]
-            .iter()
-            .map(|name| state_path.join(name))
-            .find(|path| path.exists())
-            .expect("a session store file exists in the state dir");
+        // Core's session store shares runtime.sqlite with its runtime store.
+        let db_path = state_path.join("runtime.sqlite");
         let store = meerkat_store::SqliteSessionStore::open(db_path)
             .expect("open the session store for the pair audit");
         let session = store
@@ -491,8 +526,11 @@ async fn unresolvable_model_edit_refuses_boot_and_durable_truth_survives() {
         .await
         .expect("restore_flow (boot 1)");
         match result.outcomes.get(&bob).expect("bob outcome") {
-            RestoreOutcome::Created { record, .. } => {
-                original_session_id = record.session_id.clone();
+            RestoreOutcome::Created { binding, .. } => {
+                original_session_id = binding
+                    .session_id
+                    .clone()
+                    .expect("Core binds the member to a session");
             }
             other => panic!("expected Created on first boot, got {other:?}"),
         }
@@ -511,31 +549,47 @@ async fn unresolvable_model_edit_refuses_boot_and_durable_truth_survives() {
     }
 
     // --- Boot 2: the profile now declares a model NOBODY can resolve a
-    // provider for. No coherent pair exists, so the runtime must refuse to
-    // boot, typed, naming the unresolvable declaration — never half-apply
-    // it over the durable identity. ---
+    // provider for. A persistent mob pins its definition: a boot carrying the
+    // undeclared edit is refused as divergent before anything is applied, and
+    // declaring the edit is refused typed, naming the unresolvable
+    // declaration. Neither half-applies it over the durable identity. ---
+    let unresolvable = || definition("pair-divergence", "model = \"model-nobody-knows\"");
     {
         let capture = CaptureClient::default();
         let error = UnifiedRuntimeBuilder::default()
-            .definition(definition(
-                "pair-divergence",
-                "model = \"model-nobody-knows\"",
-            ))
+            .definition(unresolvable())
             .persistent_state(&state_path)
             .comms(true)
             .default_llm_client(Arc::new(capture))
             .build()
             .await
             .err()
-            .expect(
-                "a declared model with no resolvable provider must refuse the boot typed, \
-                 not half-apply over durable truth",
+            .expect("a boot carrying an undeclared definition edit must be refused");
+        let rendered = format!("{error:?}");
+        for needle in ["Divergent", "profiles.personal.model"] {
+            assert!(
+                rendered.contains(needle),
+                "the boot refusal must name the divergent declaration \
+                 (missing `{needle}`): {rendered}"
             );
+        }
+    }
+    {
+        let storage = meerkat_mob::MobStorage::persistent(state_path.join("event_log.sqlite3"))
+            .expect("open the mob store");
+        let error = meerkat_meta::spec_update_ceremony::declare_spec_update(
+            &storage,
+            "pair-divergence",
+            &unresolvable(),
+            1,
+        )
+        .await
+        .expect_err("declaring a model no provider resolves must be refused");
         let rendered = format!("{error:?}");
         for needle in ["UnknownModel", "model-nobody-knows", "profiles.personal"] {
             assert!(
                 rendered.contains(needle),
-                "the boot refusal must name the unresolvable declaration \
+                "the declaration refusal must name the unresolvable declaration \
                  (missing `{needle}`): {rendered}"
             );
         }
@@ -563,9 +617,10 @@ async fn unresolvable_model_edit_refuses_boot_and_durable_truth_survives() {
         .await
         .expect("restore_flow (boot 3)");
         match result.outcomes.get(&bob).expect("bob outcome") {
-            RestoreOutcome::Resumed { record, .. } => {
+            RestoreOutcome::Resumed { binding, .. } => {
                 assert_eq!(
-                    record.session_id, original_session_id,
+                    binding.session_id.as_ref(),
+                    Some(&original_session_id),
                     "the refused boot must not have touched the durable session binding"
                 );
             }
@@ -614,11 +669,8 @@ async fn persisted_prompt_probe(
     session_id: &meerkat_core::types::SessionId,
 ) -> (Vec<String>, Vec<String>) {
     use meerkat::SessionStore as _;
-    let db_path = ["sessions.sqlite3", "sessions.db", "sessions.sqlite"]
-        .iter()
-        .map(|name| state_path.join(name))
-        .find(|path| path.exists())
-        .expect("a session store file exists in the state dir");
+    // Core's session store shares runtime.sqlite with its runtime store.
+    let db_path = state_path.join("runtime.sqlite");
     let store = meerkat_store::SqliteSessionStore::open(db_path)
         .expect("open the session store for the prompt probe");
     let session = store
@@ -722,8 +774,11 @@ async fn resume_never_authors_prompts_and_definition_edits_are_inert_by_design()
         .await
         .expect("restore_flow (boot 1)");
         match result.outcomes.get(&alice).expect("alice outcome") {
-            RestoreOutcome::Created { record, .. } => {
-                original_session_id = record.session_id.clone();
+            RestoreOutcome::Created { binding, .. } => {
+                original_session_id = binding
+                    .session_id
+                    .clone()
+                    .expect("Core binds the member to a session");
             }
             other => panic!("expected Created on first boot, got {other:?}"),
         }
@@ -749,7 +804,13 @@ async fn resume_never_authors_prompts_and_definition_edits_are_inert_by_design()
         "the created member must carry the assembled base prompt: {systems_after_create:?}"
     );
 
-    // --- Boot 2: definition prompt edit — must be INERT for the member. ---
+    // --- Boot 2: definition prompt edit - must be INERT for the member. ---
+    declare_definition(
+        &state_path,
+        definition_with(&format!("{ROLE_BASE} {PARAGRAPH_A}")),
+        1,
+    )
+    .await;
     {
         let capture = CaptureClient::default();
         let (unified, identity_rt) = boot(
@@ -768,9 +829,10 @@ async fn resume_never_authors_prompts_and_definition_edits_are_inert_by_design()
         .await
         .expect("restore_flow (boot 2, edited definition)");
         match result.outcomes.get(&alice).expect("alice outcome") {
-            RestoreOutcome::Resumed { record, .. } => {
+            RestoreOutcome::Resumed { binding, .. } => {
                 assert_eq!(
-                    record.session_id, original_session_id,
+                    binding.session_id.as_ref(),
+                    Some(&original_session_id),
                     "an edited definition must still resume the SAME durable session"
                 );
             }
@@ -873,11 +935,8 @@ async fn persisted_ordered_rows(
     session_id: &meerkat_core::types::SessionId,
 ) -> Vec<String> {
     use meerkat::SessionStore as _;
-    let db_path = ["sessions.sqlite3", "sessions.db", "sessions.sqlite"]
-        .iter()
-        .map(|name| state_path.join(name))
-        .find(|path| path.exists())
-        .expect("a session store file exists in the state dir");
+    // Core's session store shares runtime.sqlite with its runtime store.
+    let db_path = state_path.join("runtime.sqlite");
     let store = meerkat_store::SqliteSessionStore::open(db_path)
         .expect("open the session store for the ordinal probe");
     let session = store
@@ -987,8 +1046,11 @@ async fn authored_system_turn_appends_exactly_once_and_replays() {
         .await
         .expect("restore_flow (boot 1)");
         match result.outcomes.get(&carol).expect("carol outcome") {
-            RestoreOutcome::Created { record, .. } => {
-                original_session_id = record.session_id.clone();
+            RestoreOutcome::Created { binding, .. } => {
+                original_session_id = binding
+                    .session_id
+                    .clone()
+                    .expect("Core binds the member to a session");
             }
             other => panic!("expected Created on first boot, got {other:?}"),
         }
@@ -1040,9 +1102,10 @@ async fn authored_system_turn_appends_exactly_once_and_replays() {
         .await
         .expect("restore_flow (boot 2)");
         match result.outcomes.get(&carol).expect("carol outcome") {
-            RestoreOutcome::Resumed { record, .. } => {
+            RestoreOutcome::Resumed { binding, .. } => {
                 assert_eq!(
-                    record.session_id, original_session_id,
+                    binding.session_id.as_ref(),
+                    Some(&original_session_id),
                     "boot 2 must resume the SAME durable session"
                 );
             }
@@ -1163,9 +1226,10 @@ async fn authored_system_turn_appends_exactly_once_and_replays() {
         .await
         .expect("restore_flow (boot 3)");
         match result.outcomes.get(&carol).expect("carol outcome") {
-            RestoreOutcome::Resumed { record, .. } => {
+            RestoreOutcome::Resumed { binding, .. } => {
                 assert_eq!(
-                    record.session_id, original_session_id,
+                    binding.session_id.as_ref(),
+                    Some(&original_session_id),
                     "boot 3 must resume the SAME durable session"
                 );
             }

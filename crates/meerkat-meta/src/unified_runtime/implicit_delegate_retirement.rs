@@ -192,7 +192,6 @@ async fn run_implicit_delegate_retirement(
                             identity_runtime
                                 .retire_member_alias_tracked(&durable_identity, &public_alias)
                                 .await
-                                .map(|_| ())
                                 .map_err(|error| error.to_string())
                         } else if crate::member_comms_id::is_reserved_generated_alias(&public_alias)
                         {
@@ -631,11 +630,9 @@ mod tests {
     #[tokio::test]
     async fn running_sweeper_observes_identity_authority_attached_after_runtime_bootstrap() {
         use crate::identity_first::{
-            AgentAddressability, AgentIdentity as DurableIdentity, AgentRuntimeId,
-            CheckpointVersion, ContinuityGeneration, ContinuityRecord, ContinuityStore,
-            DurabilityPolicy, DurableAgentSpec, IdentityFirstRuntimeContext,
-            IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig, LeaseAcquireResult,
-            LeaseProvider, LocalContinuityStore, LocalLeaseProvider, MobSessionBridge,
+            AgentAddressability, AgentIdentity as DurableIdentity, DurabilityPolicy,
+            DurableAgentSpec, IdentityFirstRuntimeContext, IdentityLifecycleState, IdentityRuntime,
+            IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider, MobSessionBridge,
             RosterContext, RosterError, RosterProvider,
         };
         use crate::{
@@ -714,8 +711,10 @@ comms = true
         );
 
         let identity = DurableIdentity::parse("domain:late-bound").expect("identity");
-        let alias = "rt:domain:late-bound:0";
-        let roster_member = crate::member_comms_id::mob_member_id(alias);
+        // Seated at the roster row of its durable identity, as identity-first
+        // materialization seats it: Core's journal binds the member there.
+        let roster_member =
+            crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
         let handle = runtime.mob_handle();
         handle
             .ensure_member(
@@ -729,34 +728,11 @@ comms = true
                 )])),
             )
             .await
-            .expect("spawn pre-attached generated member");
-        let session_id = handle
-            .resolve_bridge_session_id_observation(&roster_member)
-            .await
-            .expect("member session id");
+            .expect("spawn pre-attached identity member");
 
         let continuity_store =
             Arc::new(LocalContinuityStore::in_memory().expect("late-bound continuity store"));
         let lease_provider = Arc::new(LocalLeaseProvider::new());
-        let leases = lease_provider
-            .acquire_leases(std::slice::from_ref(&identity), "late-bound-retirement")
-            .await
-            .expect("identity lease");
-        let lease = match leases.get(&identity) {
-            Some(LeaseAcquireResult::Acquired(lease)) => lease.clone(),
-            other => panic!("expected acquired lease, got {other:?}"),
-        };
-        let record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse(alias).expect("runtime alias"),
-            session_id,
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        continuity_store
-            .upsert_continuity_record(&record, lease.fencing_token)
-            .await
-            .expect("persist continuity");
         let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store,
             lease_provider,
@@ -780,14 +756,16 @@ comms = true
             binding: None,
             placement: None,
         };
-        identity_runtime
-            .register(
-                spec.clone(),
-                IdentityLifecycleState::Active,
-                Some(record),
-                Some(lease),
-            )
-            .await;
+        identity_runtime.register(spec.clone()).await;
+        assert_eq!(
+            identity_runtime
+                .status(&identity)
+                .await
+                .expect("status")
+                .state,
+            IdentityLifecycleState::Active,
+            "Core holds the seated member before the sweeper runs"
+        );
         runtime.attach_identity_first_context(Arc::new(IdentityFirstRuntimeContext::new(
             Arc::clone(&identity_runtime),
             Arc::new(FixedRoster(vec![spec])),
@@ -796,12 +774,14 @@ comms = true
             Some(runtime.mob_handle().definition().clone()),
         )));
 
+        // Retired through the identity authority: Core no longer holds the
+        // member, so the identity reads Dormant.
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if identity_runtime
                     .status(&identity)
                     .await
-                    .is_ok_and(|status| status.state == IdentityLifecycleState::Retiring)
+                    .is_ok_and(|status| status.state == IdentityLifecycleState::Dormant)
                 {
                     break;
                 }
@@ -1045,17 +1025,8 @@ comms = true
     /// Boot a primary-mob runtime whose idle sweep runs every
     /// `sweep_interval_ms` with no runtime default (only a recorded opt-in
     /// makes a primary-mob member a candidate), on the given metadata file.
-    async fn boot_sweeping_runtime(
-        mob_id: &str,
-        state_root: &std::path::Path,
-        metadata_path: &std::path::Path,
-        sweep_interval_ms: u64,
-    ) -> UnifiedRuntime {
-        use crate::{
-            DiscoverySpec, MetaConfig, MobBootstrapOptions, MobBootstrapSpec, SqliteMetadataStore,
-        };
-
-        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+    fn sweeping_definition(mob_id: &str) -> meerkat_mob::MobDefinition {
+        meerkat_mob::MobDefinition::from_toml(&format!(
             r#"
 [mob]
 id = "{mob_id}"
@@ -1067,20 +1038,107 @@ model = "gpt-5.5"
 comms = true
 "#
         ))
-        .expect("mob definition");
-        let mob_spec = MobBootstrapSpec::ephemeral(
-            definition,
+        .expect("mob definition")
+    }
+
+    fn sweeping_options() -> crate::MobBootstrapOptions {
+        crate::MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        }
+    }
+
+    /// The idle-retirement runtime, its sessions in memory only.
+    async fn boot_sweeping_runtime(
+        mob_id: &str,
+        state_root: &std::path::Path,
+        metadata_path: &std::path::Path,
+        sweep_interval_ms: u64,
+    ) -> UnifiedRuntime {
+        let mob_spec = crate::MobBootstrapSpec::ephemeral(
+            sweeping_definition(mob_id),
             meerkat_mob::MobStorage::in_memory(),
             state_root.to_path_buf(),
             4,
             None,
         )
         .expect("build the idle retirement fixture ephemeral spec")
-        .with_options(MobBootstrapOptions {
-            allow_ephemeral_sessions: true,
-            notify_orchestrator_on_resume: true,
-            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
-        });
+        .with_options(sweeping_options());
+        bootstrap_sweeping(mob_spec, mob_id, metadata_path, sweep_interval_ms).await
+    }
+
+    /// The idle-retirement runtime over Core's persistent session service,
+    /// whose sessions outlive their members.
+    async fn boot_persistent_sweeping_runtime(
+        mob_id: &str,
+        state_root: &std::path::Path,
+        metadata_path: &std::path::Path,
+        sweep_interval_ms: u64,
+    ) -> UnifiedRuntime {
+        std::fs::create_dir_all(state_root).expect("state dir");
+        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
+            meerkat_store::SqliteSessionStore::open(state_root.join("sessions.db"))
+                .expect("session store"),
+        );
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new(state_root.join("runtime.sqlite"))
+                .expect("runtime store"),
+        );
+        let blob_store: Arc<dyn meerkat_core::BlobStore> =
+            Arc::new(meerkat_store::MemoryBlobStore::new());
+        let factory = meerkat::AgentFactory::new(state_root).comms(true);
+        let mut inner_builder =
+            meerkat::FactoryAgentBuilder::new(factory, meerkat::Config::default());
+        inner_builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
+            session_store.clone(),
+        )));
+        inner_builder.default_blob_store = Some(blob_store.clone());
+        let jobs: Arc<dyn meerkat::DetachedJobStore> =
+            Arc::new(meerkat::MemoryDetachedJobStore::new());
+        inner_builder.default_detached_job_store = Some(Arc::clone(&jobs));
+        let mob_tools_slot = Arc::clone(&inner_builder.default_mob_tools);
+        let delivery = crate::MobRuntimeDelivery::new(Arc::clone(&runtime_store), jobs);
+        let adapter = Arc::new(
+            meerkat_runtime::MeerkatMachine::persistent(
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            )
+            .expect("runtime owner"),
+        );
+        let concrete = Arc::new(
+            meerkat_session::PersistentSessionService::new(
+                inner_builder,
+                16,
+                session_store,
+                runtime_store,
+                blob_store,
+            )
+            .with_canonical_runtime_adapter(adapter.clone()),
+        );
+        let mut mob_spec = crate::MobBootstrapSpec::new(
+            sweeping_definition(mob_id),
+            meerkat_mob::MobStorage::in_memory(),
+            concrete.clone(),
+        )
+        .with_session_runtime_adapter(adapter)
+        .expect("acquire the fixture session runtime owner")
+        .with_options(sweeping_options())
+        .with_runtime_delivery(delivery)
+        .with_agent_mob_tools(mob_tools_slot)
+        .expect("install the agent mob tools");
+        mob_spec.committed_boundary_recoverer = Some(concrete);
+        bootstrap_sweeping(mob_spec, mob_id, metadata_path, sweep_interval_ms).await
+    }
+
+    async fn bootstrap_sweeping(
+        mob_spec: crate::MobBootstrapSpec,
+        mob_id: &str,
+        metadata_path: &std::path::Path,
+        sweep_interval_ms: u64,
+    ) -> UnifiedRuntime {
+        use crate::{DiscoverySpec, MetaConfig, SqliteMetadataStore};
+
         UnifiedRuntime::bootstrap_with_options(
             mob_spec,
             MetaConfig {
@@ -1320,6 +1378,257 @@ comms = true
         runtime.shutdown().await;
     }
 
+    /// A registered identity over `runtime`'s mob, its member seated: the
+    /// identity runtime, the identity, its roster member and the member's
+    /// session. The bridge is wired as the gateways wire it, over the
+    /// runtime's session service.
+    async fn seated_identity(
+        runtime: &mut UnifiedRuntime,
+        mob_id: &str,
+    ) -> (
+        Arc<crate::identity_first::IdentityRuntime>,
+        crate::identity_first::AgentIdentity,
+        AgentIdentity,
+        meerkat_core::types::SessionId,
+    ) {
+        use crate::identity_first::{
+            AgentAddressability, AgentIdentity as DurableIdentity, DurabilityPolicy,
+            DurableAgentSpec, IdentityFirstRuntimeContext, IdentityRuntime, IdentityRuntimeConfig,
+            LocalContinuityStore, LocalLeaseProvider, MobSessionBridge, RosterContext, RosterError,
+            RosterProvider,
+        };
+
+        struct FixedRoster(Vec<DurableAgentSpec>);
+
+        #[async_trait::async_trait]
+        impl RosterProvider for FixedRoster {
+            async fn roster(
+                &self,
+                _context: &RosterContext,
+            ) -> Result<Vec<DurableAgentSpec>, RosterError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let handle = runtime.mob_handle();
+        let identity = DurableIdentity::parse("domain:respawning").expect("identity");
+        let roster_member =
+            crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
+        handle
+            .ensure_member(meerkat_mob::SpawnMemberSpec::new(
+                meerkat_mob::ProfileName::from("worker"),
+                roster_member.clone(),
+            ))
+            .await
+            .expect("seat identity member");
+        let session = handle
+            .resolve_bridge_session_id(&roster_member)
+            .await
+            .expect("member session");
+        let service = runtime
+            .mob_runtime
+            .session_service()
+            .cloned()
+            .expect("the runtime's session service");
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(
+                LocalContinuityStore::in_memory().expect("continuity store"),
+            ),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: mob_id.to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(Arc::new(MobSessionBridge::with_session_service(
+                handle.clone(),
+                service,
+            ))),
+            default_timeout: None,
+        }));
+        let spec = DurableAgentSpec {
+            identity: identity.clone(),
+            profile: meerkat_mob::ProfileName::from("worker"),
+            addressability: AgentAddressability::Addressable,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: None,
+            backend: None,
+            binding: None,
+            placement: None,
+        };
+        identity_runtime.register(spec.clone()).await;
+        runtime.attach_identity_first_context(Arc::new(IdentityFirstRuntimeContext::new(
+            Arc::clone(&identity_runtime),
+            Arc::new(FixedRoster(vec![spec])),
+            None,
+            None,
+            Some(runtime.mob_handle().definition().clone()),
+        )));
+        (identity_runtime, identity, roster_member, session)
+    }
+
+    /// An identity-runtime respawn retires the identity's Core member and
+    /// resumes it onto the same session, so the member's idle-retire opt-in,
+    /// which the retire releases, is restored on the resumed session. The
+    /// runtime's sessions outlive their members, as a respawn needs.
+    #[tokio::test]
+    async fn identity_runtime_respawn_keeps_the_opt_in() {
+        const MOB_ID: &str = "identity-respawn-keeps-opt-in";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let metadata_path = temp.path().join("metadata.sqlite3");
+        let mut runtime = boot_persistent_sweeping_runtime(
+            MOB_ID,
+            &temp.path().join("state"),
+            &metadata_path,
+            3_600_000,
+        )
+        .await;
+        let handle = runtime.mob_handle();
+        let (identity_runtime, identity, roster_member, before) =
+            seated_identity(&mut runtime, MOB_ID).await;
+
+        let overrides = runtime
+            .mob_runtime
+            .implicit_delegate_retirement_overrides()
+            .expect("overrides");
+        let policy = DelegateIdleRetireOverride::Seconds(3600);
+        overrides.set(MOB_ID, roster_member.as_str(), policy).await;
+        assert_eq!(
+            view(overrides.get_bound(MOB_ID, roster_member.as_str()).await),
+            Some((policy, Some(before.clone())))
+        );
+
+        identity_runtime
+            .respawn(&identity)
+            .await
+            .expect("identity runtime respawn");
+        let after = handle
+            .resolve_bridge_session_id(&roster_member)
+            .await
+            .expect("respawned session");
+        assert_eq!(
+            after, before,
+            "an identity respawn resumes the same session"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while view(overrides.get_bound(MOB_ID, roster_member.as_str()).await)
+                != Some((policy, Some(before.clone())))
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the identity respawn did not keep the opt-in on the resumed session");
+        runtime.shutdown().await;
+    }
+
+    /// On a runtime whose sessions live in memory only, the retire a respawn
+    /// starts with would end the session's only copy, and nothing could
+    /// resume it. The respawn refuses typed before it retires anything: the
+    /// member stays live on its session, its opt-in untouched.
+    #[tokio::test]
+    async fn identity_runtime_respawn_refuses_before_its_retire_when_sessions_live_in_memory() {
+        const MOB_ID: &str = "identity-respawn-in-memory-refused";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let metadata_path = temp.path().join("metadata.sqlite3");
+        let mut runtime = boot_sweeping_runtime(
+            MOB_ID,
+            &temp.path().join("state"),
+            &metadata_path,
+            3_600_000,
+        )
+        .await;
+        let handle = runtime.mob_handle();
+        let (identity_runtime, identity, roster_member, before) =
+            seated_identity(&mut runtime, MOB_ID).await;
+        let overrides = runtime
+            .mob_runtime
+            .implicit_delegate_retirement_overrides()
+            .expect("overrides");
+        let policy = DelegateIdleRetireOverride::Seconds(3600);
+        overrides.set(MOB_ID, roster_member.as_str(), policy).await;
+
+        let refused = identity_runtime.respawn(&identity).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::identity_first::IdentityRuntimeError::InvalidState {
+                    state: crate::identity_first::IdentityLifecycleState::Active,
+                    operation,
+                    ..
+                }) if operation.contains("lives only in memory")
+            ),
+            "the respawn refuses typed before its retire: {refused:?}"
+        );
+        assert_eq!(
+            handle.resolve_bridge_session_id(&roster_member).await,
+            Some(before.clone()),
+            "the member is still live on its session"
+        );
+        assert_eq!(
+            view(overrides.get_bound(MOB_ID, roster_member.as_str()).await),
+            Some((policy, Some(before))),
+            "nothing released the opt-in"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// On a runtime whose sessions live in memory only, a retired member's
+    /// session is gone with it. The next wake reads that no authority knows
+    /// the session and starts the identity's fresh life (the Absent rule),
+    /// naming the replaced session, instead of retrying a resume that can
+    /// never succeed.
+    #[tokio::test]
+    async fn a_retired_identity_of_an_in_memory_runtime_wakes_on_a_fresh_session() {
+        const MOB_ID: &str = "identity-in-memory-retire-wake";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let metadata_path = temp.path().join("metadata.sqlite3");
+        let mut runtime = boot_sweeping_runtime(
+            MOB_ID,
+            &temp.path().join("state"),
+            &metadata_path,
+            3_600_000,
+        )
+        .await;
+        let (identity_runtime, identity, _roster_member, before) =
+            seated_identity(&mut runtime, MOB_ID).await;
+
+        identity_runtime
+            .retire(&identity)
+            .await
+            .expect("retire the identity");
+        identity_runtime
+            .materialize(&identity)
+            .await
+            .expect("the wake starts a fresh life");
+        let status = identity_runtime
+            .status(&identity)
+            .await
+            .expect("identity status");
+        assert_eq!(
+            status.state,
+            crate::identity_first::IdentityLifecycleState::Active
+        );
+        assert!(
+            status
+                .session_id
+                .as_ref()
+                .is_some_and(|session| *session != before),
+            "the identity runs a fresh session: {status:?}"
+        );
+        assert_eq!(
+            status
+                .replaced_session
+                .as_ref()
+                .map(|replaced| replaced.session_id.clone()),
+            Some(before),
+            "the status names the session the wake replaced"
+        );
+        runtime.shutdown().await;
+    }
+
     /// A respawn's rebind carries the opt-in whichever way it races the
     /// retirement of the old session: a live opt-in moves, a just-released
     /// one is restored, a late release of the old session is a no-op, and a
@@ -1502,158 +1811,6 @@ comms = true
         .expect("the retired sessions' opt-in rows were not cleared");
         assert_eq!(overrides.get(MOB_ID, "reset-me").await, None);
         assert_eq!(overrides.get(MOB_ID, "retire-me").await, None);
-        runtime.shutdown().await;
-    }
-
-    /// An identity member's continuity rebind to a respawned (or delivery
-    /// repaired) session carries its opt-in: the identity runtime tells the
-    /// runtime's opt-ins which session the member moved from and to. The
-    /// member is seated, as identity-first materialization seats it, at the
-    /// roster row of its DURABLE identity: the opt-in is keyed by that row,
-    /// and the runtime alias names only the current incarnation.
-    #[tokio::test]
-    async fn identity_continuity_rebind_carries_the_opt_in() {
-        use crate::identity_first::{
-            AgentAddressability, AgentIdentity as DurableIdentity, AgentRuntimeId,
-            CheckpointVersion, ContinuityGeneration, ContinuityRecord, ContinuityStore,
-            DurabilityPolicy, DurableAgentSpec, IdentityFirstRuntimeContext,
-            IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig, LeaseAcquireResult,
-            LeaseProvider, LocalContinuityStore, LocalLeaseProvider, MobSessionBridge,
-            RosterContext, RosterError, RosterProvider,
-        };
-
-        struct FixedRoster(Vec<DurableAgentSpec>);
-
-        #[async_trait::async_trait]
-        impl RosterProvider for FixedRoster {
-            async fn roster(
-                &self,
-                _context: &RosterContext,
-            ) -> Result<Vec<DurableAgentSpec>, RosterError> {
-                Ok(self.0.clone())
-            }
-        }
-
-        const MOB_ID: &str = "identity-rotation-carries-opt-in";
-        let temp = tempfile::tempdir().expect("tempdir");
-        let metadata_path = temp.path().join("metadata.sqlite3");
-        let mut runtime = boot_sweeping_runtime(
-            MOB_ID,
-            &temp.path().join("state"),
-            &metadata_path,
-            3_600_000,
-        )
-        .await;
-        let handle = runtime.mob_handle();
-
-        let identity = DurableIdentity::parse("domain:rotating").expect("identity");
-        let alias = "rt:domain:rotating:0";
-        let roster_member =
-            crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
-        handle
-            .ensure_member(meerkat_mob::SpawnMemberSpec::new(
-                meerkat_mob::ProfileName::from("worker"),
-                roster_member.clone(),
-            ))
-            .await
-            .expect("seat identity member");
-        let before = handle
-            .resolve_bridge_session_id(&roster_member)
-            .await
-            .expect("member session");
-
-        let continuity_store =
-            Arc::new(LocalContinuityStore::in_memory().expect("continuity store"));
-        let lease_provider = Arc::new(LocalLeaseProvider::new());
-        let leases = lease_provider
-            .acquire_leases(std::slice::from_ref(&identity), MOB_ID)
-            .await
-            .expect("identity lease");
-        let lease = match leases.get(&identity) {
-            Some(LeaseAcquireResult::Acquired(lease)) => lease.clone(),
-            other => panic!("expected acquired lease, got {other:?}"),
-        };
-        let record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse(alias).expect("runtime alias"),
-            session_id: before.clone(),
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        continuity_store
-            .upsert_continuity_record(&record, lease.fencing_token)
-            .await
-            .expect("persist continuity");
-        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store,
-            lease_provider,
-            runtime_instance_id: MOB_ID.to_string(),
-            has_runtime_store: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: Some(Arc::new(MobSessionBridge::new(handle.clone()))),
-            default_timeout: None,
-        }));
-        let spec = DurableAgentSpec {
-            identity: identity.clone(),
-            profile: meerkat_mob::ProfileName::from("worker"),
-            addressability: AgentAddressability::Addressable,
-            display_name: None,
-            labels: BTreeMap::new(),
-            context: None,
-            additional_instructions: Vec::new(),
-            initial_message: None,
-            runtime_mode_override: None,
-            backend: None,
-            binding: None,
-            placement: None,
-        };
-        identity_runtime
-            .register(
-                spec.clone(),
-                IdentityLifecycleState::Active,
-                Some(record),
-                Some(lease),
-            )
-            .await;
-        runtime.attach_identity_first_context(Arc::new(IdentityFirstRuntimeContext::new(
-            Arc::clone(&identity_runtime),
-            Arc::new(FixedRoster(vec![spec])),
-            None,
-            None,
-            Some(runtime.mob_handle().definition().clone()),
-        )));
-
-        let overrides = runtime
-            .mob_runtime
-            .implicit_delegate_retirement_overrides()
-            .expect("overrides");
-        let policy = DelegateIdleRetireOverride::Seconds(3600);
-        overrides.set(MOB_ID, roster_member.as_str(), policy).await;
-        assert_eq!(
-            view(overrides.get_bound(MOB_ID, roster_member.as_str()).await),
-            Some((policy, Some(before.clone())))
-        );
-
-        // A lower-level respawn, then the continuity rebind the control
-        // surfaces and the delivery repair perform.
-        handle
-            .respawn(roster_member.clone(), None)
-            .await
-            .expect("respawn identity member");
-        let after = handle
-            .resolve_bridge_session_id(&roster_member)
-            .await
-            .expect("respawned session");
-        assert_ne!(after, before);
-        identity_runtime
-            .rebind_session_after_live_respawn(&identity, after.clone())
-            .await
-            .expect("continuity rebind");
-
-        assert_eq!(
-            view(overrides.get_bound(MOB_ID, roster_member.as_str()).await),
-            Some((policy, Some(after.clone())))
-        );
         runtime.shutdown().await;
     }
 
@@ -1869,10 +2026,6 @@ comms = true
         let metadata_path = temp.path().join("metadata.sqlite3");
         let state_root = temp.path().join("state");
         std::fs::create_dir_all(&state_root).expect("state root");
-        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
-            meerkat_store::SqliteSessionStore::open(state_root.join("sessions.sqlite3"))
-                .expect("session store"),
-        );
         let definition = meerkat_mob::MobDefinition::from_toml(&format!(
             "[mob]\nid = \"{MOB_ID}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\n\
              [profiles.worker.tools]\ncomms = true\n"
@@ -1881,10 +2034,11 @@ comms = true
         let spec = MobBootstrapSpec::persistent(
             definition,
             meerkat_mob::MobStorage::in_memory(),
+            crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
             state_root,
             4,
-            session_store,
         )
+        .await
         .expect("persistent spec")
         .with_options(MobBootstrapOptions {
             allow_ephemeral_sessions: true,
@@ -2459,10 +2613,6 @@ comms = true
 
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).expect("state root");
-        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
-            meerkat_store::SqliteSessionStore::open(state_root.join("sessions.sqlite3"))
-                .expect("session store"),
-        );
         let definition = meerkat_mob::MobDefinition::from_toml(&format!(
             "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\n\
              [profiles.worker.tools]\ncomms = true\n"
@@ -2471,10 +2621,11 @@ comms = true
         let spec = MobBootstrapSpec::persistent(
             definition,
             meerkat_mob::MobStorage::in_memory(),
+            crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
             state_root,
             4,
-            session_store,
         )
+        .await
         .expect("persistent spec")
         .with_options(MobBootstrapOptions {
             allow_ephemeral_sessions: true,

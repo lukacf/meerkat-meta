@@ -124,7 +124,6 @@ fn assert_shared_sdk_coverage(summary: &ScriptSummary, expected_sdk: &str) {
         "typed client unloaded module exact json-rpc error",
         "console route helper encodes auth token",
         "module-authoring helper normalizes schema",
-        "identity-first lease callback uses rust wire tags",
         "persisted events parse rust internal tags",
         "identity-first agent identity rejects invalid shape",
     ];

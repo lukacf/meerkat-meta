@@ -74,13 +74,13 @@ describe("persistent transport shutdown", () => {
       await providerGate;
       context.signal.throwIfAborted();
       committed = true;
-      return { renewed: true };
+      return [];
     });
 
     (transport as any)._handleCallback({
       jsonrpc: "2.0",
       id: "cb-timeout",
-      method: "callback/lease_provider/renew_leases",
+      method: "callback/roster_provider/roster",
       params: {},
     });
     await new Promise<void>((resolve) => setTimeout(resolve, 25));

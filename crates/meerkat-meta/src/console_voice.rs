@@ -431,6 +431,39 @@ impl RequestSlot {
         }
     }
 
+    /// End this request's voice session once the authentication of the
+    /// caller that opened it lapses: the Console's verifier no longer
+    /// accepts the opening token, on its expiry or on a session fence set
+    /// for its principal. The same rule ends an open stream. A session that
+    /// ends first stops the watch.
+    fn end_when_authentication_lapses(
+        self: &Arc<Self>,
+        mut authentication: crate::http_sse::StreamAuthentication,
+    ) {
+        let slot = Arc::clone(self);
+        tokio::spawn(async move {
+            let ended = async {
+                loop {
+                    let changed = slot.changed.notified();
+                    if slot.state.lock().await.closed {
+                        return;
+                    }
+                    changed.await;
+                }
+            };
+            tokio::select! {
+                () = authentication.lapsed() => {
+                    tracing::info!(
+                        identity = %slot.identity,
+                        "console voice session ended: the sign-in that opened it is no longer accepted"
+                    );
+                    slot.cancel().await;
+                }
+                () = ended => {}
+            }
+        });
+    }
+
     async fn wait_closed(&self) -> Result<(), VoiceError> {
         loop {
             let changed = self.changed.notified();
@@ -961,10 +994,28 @@ impl ConsoleVoiceController {
 }
 
 impl ConsoleVoiceController {
+    /// [`Self::open_while_authenticated`] for a session no authentication
+    /// ends.
+    #[cfg(test)]
     pub(crate) async fn open(
         &self,
         principal: &str,
         request: VoiceRequest,
+    ) -> Result<PendingLiveChannelHandle, VoiceError> {
+        self.open_while_authenticated(principal, request, None)
+            .await
+    }
+
+    /// [`Self::open`] for a caller a token identified: the session it opens
+    /// ends once `authentication` lapses (the Console's verifier no longer
+    /// accepts the token, on its expiry or on a session fence), as an open
+    /// stream does. A retried open of the same request keeps the first
+    /// open's watch.
+    pub(crate) async fn open_while_authenticated(
+        &self,
+        principal: &str,
+        request: VoiceRequest,
+        authentication: Option<crate::http_sse::StreamAuthentication>,
     ) -> Result<PendingLiveChannelHandle, VoiceError> {
         request.validate()?;
         if principal.trim().is_empty() {
@@ -1006,6 +1057,9 @@ impl ConsoleVoiceController {
             ));
             requests.insert(key, Arc::clone(&slot));
             slot.supervise();
+            if let Some(authentication) = authentication {
+                slot.end_when_authentication_lapses(authentication);
+            }
             let host = Arc::clone(host);
             let owner = principal.to_string();
             let pending = Arc::clone(&slot);
@@ -1147,6 +1201,94 @@ impl ConsoleVoiceController {
         tokio::time::timeout(CLOSE_WAIT, slot.wait_closed())
             .await
             .map_err(|_| VoiceError::Busy)?
+    }
+}
+
+/// A host whose sessions open at once and count their closes, for tests of
+/// when a session ends.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) mod closing_test_support {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    pub(crate) struct ClosingVoiceSession {
+        pub close_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ConsoleVoiceSession for ClosingVoiceSession {
+        fn pending(&self) -> PendingLiveChannelHandle {
+            PendingLiveChannelHandle {
+                channel_id: "closing-channel".to_string(),
+                target_identity: "agent-a".to_string(),
+                execution_mode: crate::live_contracts::LiveExecutionMode::ClientContext,
+                pending_receipt: "opaque-pending".to_string(),
+                transport: meerkat_contracts::WireLiveTransportBootstrap::Webrtc {
+                    token: "opaque-token".to_string(),
+                    answer_method: "live/webrtc/answer".to_string(),
+                    http_url: None,
+                },
+                capabilities: meerkat_contracts::WireLiveChannelCapabilities {
+                    audio_in: true,
+                    audio_out: true,
+                    text_in: false,
+                    text_out: false,
+                    image_in: false,
+                    video_in: false,
+                    transcript_supported: true,
+                    barge_in_supported: true,
+                    provider_native_resume: false,
+                },
+                continuity: meerkat_contracts::WireLiveContinuityMode::TranscriptOnly,
+            }
+        }
+
+        async fn close(&self) -> Result<(), VoiceError> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    pub(crate) struct ClosingVoiceHost {
+        pub session: Arc<ClosingVoiceSession>,
+    }
+
+    impl ClosingVoiceHost {
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                session: Arc::new(ClosingVoiceSession {
+                    close_calls: AtomicUsize::new(0),
+                }),
+            })
+        }
+
+        pub(crate) fn controller(self: &Arc<Self>) -> ConsoleVoiceController {
+            ConsoleVoiceController {
+                host: Some(Arc::clone(self) as Arc<dyn ConsoleVoiceHost>),
+                ..ConsoleVoiceController::default()
+            }
+        }
+
+        /// How many times the session was closed.
+        pub(crate) fn closes(&self) -> usize {
+            self.session.close_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ConsoleVoiceHost for ClosingVoiceHost {
+        async fn ready(&self, _principal: &str, _identity: &str) -> Result<bool, VoiceError> {
+            Ok(true)
+        }
+
+        async fn open(
+            &self,
+            _principal: &str,
+            _identity: &str,
+        ) -> Result<Arc<dyn ConsoleVoiceSession>, VoiceError> {
+            Ok(Arc::clone(&self.session) as Arc<dyn ConsoleVoiceSession>)
+        }
     }
 }
 

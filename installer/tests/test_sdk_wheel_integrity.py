@@ -90,7 +90,7 @@ def test_exact_selected_pair_preserves_source_and_license_facts_without_import(p
         assert not hasattr(observed, "admitted") and not hasattr(observed, "gateway")
 
 
-@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1"])
+@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1", "0.9.4"])
 def test_selected_meta_version_is_bound_to_exact_toolkit_native_host_metadata(meta_version):
     pair = (InertWheel("meerkat-meta", version=meta_version),
             InertWheel("meerkat-toolkit", meta_version=meta_version))
@@ -99,7 +99,8 @@ def test_selected_meta_version_is_bound_to_exact_toolkit_native_host_metadata(me
     assert all(observed.sha256 == wheel.selected()[1].sha256 for wheel, observed in zip(pair, facts))
 
 
-@pytest.mark.parametrize(("meta_version", "required_version"), [("0.9.0", "0.9.1"), ("0.9.1", "0.9.0")])
+@pytest.mark.parametrize(("meta_version", "required_version"), [("0.9.0", "0.9.1"), ("0.9.1", "0.9.0"),
+    ("0.9.1", "0.9.4"), ("0.9.4", "0.9.1")])
 def test_selected_meta_cross_pair_mismatch_refuses(meta_version, required_version):
     pair = (InertWheel("meerkat-meta", version=meta_version),
             InertWheel("meerkat-toolkit", meta_version=required_version))
@@ -107,7 +108,7 @@ def test_selected_meta_cross_pair_mismatch_refuses(meta_version, required_versio
         check_pair(pair)
 
 
-@pytest.mark.parametrize("version", ["0.8.48", "0.9.2", "1.0.0"])
+@pytest.mark.parametrize("version", ["0.8.48", "0.9.2", "0.9.3", "1.0.0"])
 def test_other_meta_versions_refuse_even_when_wheel_and_dependency_are_exact(version):
     pair = (InertWheel("meerkat-meta", version=version),
             InertWheel("meerkat-toolkit", meta_version=version))

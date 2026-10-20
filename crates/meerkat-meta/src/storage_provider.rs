@@ -324,6 +324,9 @@ pub(crate) struct ProviderMeerkatStores {
     pub provider_name: String,
     /// The installation's meerkat-level realm the stores were opened under.
     pub realm: meerkat_core::RealmId,
+    /// The realm's session store. It pairs with `runtime_store` exactly as
+    /// the provider composed them; the session service gets this pair.
+    pub session_store: Arc<dyn meerkat::SessionStore>,
     pub runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
     pub runtime_declaration: DurabilityDeclaration,
     pub workgraph_store: Arc<dyn meerkat::WorkGraphStore>,
@@ -488,6 +491,7 @@ pub(crate) async fn open_provider_meerkat_stores(
     Ok(ProviderMeerkatStores {
         provider_name,
         realm,
+        session_store: set.session_store,
         runtime_store: set.runtime_store,
         runtime_declaration,
         workgraph_store: set.workgraph_store,

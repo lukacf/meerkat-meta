@@ -71,7 +71,6 @@ async function makeRuntime(script: {
   const rt = new MetaRuntime({
     mobConfigPath: null,
     sessionBuilder: null,
-    sessionStore: null,
     errorCallback: null,
     eventLog: null,
     consoleConfigPath: null,
@@ -87,9 +86,6 @@ async function makeRuntime(script: {
     gatewayBin: null,
     modules: [],
     persistentState: null,
-    continuityStore: null,
-    leaseProvider: null,
-    scratchDir: null,
     rosterProvider: null,
     agentCustomizer: null,
     topologyProvider: null,
@@ -140,9 +136,6 @@ async function makeRuntime(script: {
         );
       }
       return result;
-    }
-    if (method === "meta/request_continuity_repair") {
-      return { continuity_repair: "scheduled" };
     }
     if (method === "meta/completion_cursor") {
       const entry = walk();
@@ -471,11 +464,6 @@ describe("typed wait outcomes", () => {
     );
   });
 
-  it("requestContinuityRepair reports what the request reached", async () => {
-    const { rt } = await makeRuntime({});
-    assert.equal(await rt.requestContinuityRepair(), "scheduled");
-  });
-
   it("parses typed restore progress on the bootstrap status", async () => {
     const { parseIdentityBootstrapStatus } = await import("../src/types.js");
     const status = parseIdentityBootstrapStatus({
@@ -487,8 +475,8 @@ describe("typed wait outcomes", () => {
         "agent:resuming": { state: "warming", restore: { stage: "resuming" } },
         "agent:broken": {
           state: "broken",
-          error: "resume rejected",
-          restore: { stage: "broken", kind: "resume_rejected" },
+          error: "resume refused",
+          restore: { stage: "refused", code: -32051, kind: "identity_unresumable" },
         },
         "agent:older": { state: "active" },
       },
@@ -496,10 +484,12 @@ describe("typed wait outcomes", () => {
     assert.deepEqual(status.identities["agent:resuming"]?.restore, {
       stage: "resuming",
       kind: null,
+      code: null,
     });
     assert.deepEqual(status.identities["agent:broken"]?.restore, {
-      stage: "broken",
-      kind: "resume_rejected",
+      stage: "refused",
+      kind: "identity_unresumable",
+      code: -32051,
     });
     assert.equal(status.identities["agent:older"]?.restore, null);
     assert.equal(status.complete, false);
@@ -551,6 +541,7 @@ describe("model mirrors carry the cursor in both directions", () => {
       output_preview: "ACK",
       is_final: false,
       peer_reachable_count: 0,
+      intent_managed: false,
       completion_cursor: { epoch: 7, turns: 2 },
     };
 
@@ -571,6 +562,7 @@ describe("model mirrors carry the cursor in both directions", () => {
       identity: "triage:main",
       is_final: false,
       peer_reachable_count: 0,
+      intent_managed: false,
       preview_unavailable: "observation_deadline",
     };
 

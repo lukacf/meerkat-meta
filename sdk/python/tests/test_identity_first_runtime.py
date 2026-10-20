@@ -635,17 +635,8 @@ class TestStatusMethod:
             "display_name": "Triage",
             "labels": {"env": "prod"},
             "generation": 0,
-            "checkpoint_version": 3,
-            "lease": {
-                "fencing_token": 42,
-                "ttl_remaining_ms": 30000,
-                "healthy": True,
-            },
-            "continuity_health": {
-                "store_reachable": True,
-                "durability_policy": {"kind": "sync_write_through"},
-                "last_checkpoint_version": 3,
-            },
+            "intent_managed": False,
+            "wake_refusal": None,
         }
         rt, transport = _make_runtime(result=raw_status)
         from meerkat_meta.identity_first_models import IdentityStatus
@@ -654,10 +645,6 @@ class TestStatusMethod:
         assert result.identity == "triage:main"
         assert result.state == "active"
         assert result.labels == {"env": "prod"}
-        assert result.lease is not None
-        assert result.lease.fencing_token == 42
-        assert result.continuity_health is not None
-        assert result.continuity_health.store_reachable is True
 
 
 class TestIdentityBootstrapMethods:

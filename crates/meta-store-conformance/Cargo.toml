@@ -1,6 +1,6 @@
 [package]
 name = "meta-store-conformance"
-description = "Storage conformance harness for Meta store backends (continuity, console timeline, event log, binary blobs, agent memory)"
+description = "Storage conformance harness for Meta store backends (console timeline, event log, binary blobs, agent memory)"
 # Not published, recorded as a fact rather than a preference: `cargo publish`
 # refuses this crate outright because its `meerkat-meta` dependency is a path
 # with no version. It has also never been published at any version - crates.io
@@ -34,14 +34,14 @@ workspace = true
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
-meerkat-core = { version = "=0.9.3" }
+meerkat-core = { version = "=0.9.4" }
 # The one-remote-bundle reference provider (M4b) implements both levels of
 # the composite seam: meerkat's RealmStorageProvider (facade storage_provider
 # module + in-memory store implementations) next to Meta's realm store set.
-meerkat = { version = "=0.9.3", features = ["session-store", "memory-store"] }
-meerkat-runtime = { version = "=0.9.3" }
-meerkat-store = { version = "=0.9.3", features = ["memory"] }
-meerkat-store-conformance = { version = "=0.9.3" }
+meerkat = { version = "=0.9.4", features = ["session-store", "memory-store"] }
+meerkat-runtime = { version = "=0.9.4" }
+meerkat-store = { version = "=0.9.4", features = ["memory"] }
+meerkat-store-conformance = { version = "=0.9.4" }
 meerkat-meta = { path = "../meerkat-meta" }
 # The extension document chapters run against the store trait directly, so
 # the suite reaches it without turning on meerkat-meta's extension-state

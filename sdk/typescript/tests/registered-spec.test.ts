@@ -18,7 +18,6 @@ async function makeRuntime(answers: Record<string, Record<string, unknown>>) {
   const rt = new MetaRuntime({
     mobConfigPath: null,
     sessionBuilder: null,
-    sessionStore: null,
     errorCallback: null,
     eventLog: null,
     consoleConfigPath: null,
@@ -34,9 +33,6 @@ async function makeRuntime(answers: Record<string, Record<string, unknown>>) {
     gatewayBin: null,
     modules: [],
     persistentState: null,
-    continuityStore: null,
-    leaseProvider: null,
-    scratchDir: null,
     rosterProvider: null,
     agentCustomizer: null,
     topologyProvider: null,

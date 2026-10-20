@@ -3,7 +3,6 @@ import pytest
 
 from meerkat_meta.identity_first_models import (
     ContentBlock,
-    ContinuityHealth,
     DispatchInput,
     DurableAgentSpec,
     IdentityBootstrapCounts,
@@ -13,7 +12,6 @@ from meerkat_meta.identity_first_models import (
     IdentityBootstrapStatus,
     IdentityStatus,
     ImageBlock,
-    LeaseInfo,
     ManagedPeerEdge,
     TextBlock,
 )
@@ -97,8 +95,12 @@ class TestIdentityBootstrapModels:
                 "agent:resuming": {"state": "warming", "restore": {"stage": "resuming"}},
                 "agent:broken": {
                     "state": "broken",
-                    "error": "resume rejected",
-                    "restore": {"stage": "broken", "kind": "resume_rejected"},
+                    "error": "resume refused",
+                    "restore": {
+                        "stage": "refused",
+                        "code": -32051,
+                        "kind": "identity_unresumable",
+                    },
                 },
                 "agent:older": {"state": "active"},
             }
@@ -109,12 +111,13 @@ class TestIdentityBootstrapModels:
             stage="resuming"
         )
         assert status.identities["agent:broken"].restore == IdentityRestoreProgress(
-            stage="broken", kind="resume_rejected"
+            stage="refused", code=-32051, kind="identity_unresumable"
         )
         assert status.identities["agent:older"].restore is None
         assert status.identities["agent:broken"].to_dict()["restore"] == {
-            "stage": "broken",
-            "kind": "resume_rejected",
+            "stage": "refused",
+            "code": -32051,
+            "kind": "identity_unresumable",
         }
 
     def test_status_parser_preserves_unknown_state_as_typed_unknown(self):
@@ -629,17 +632,3 @@ class TestCrossSdkGracefulParsing:
         assert status.identity == ""
         assert status.state == ""
         assert status.addressability == "addressable"
-        assert status.lease is None
-        assert status.continuity_health is None
-
-    def test_lease_info_defaults_missing_keys(self):
-        lease = LeaseInfo.from_dict({})
-        assert lease.fencing_token == 0
-        assert lease.ttl_remaining_ms == 0
-        assert lease.healthy is False
-
-    def test_continuity_health_defaults_missing_keys(self):
-        health = ContinuityHealth.from_dict({})
-        assert health.store_reachable is False
-        assert health.durability_policy.kind == "sync_write_through"
-        assert health.last_checkpoint_version is None

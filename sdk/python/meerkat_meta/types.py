@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from .identity_first_models import WakeRefusal
+
 
 def _coerce_int(value: Any, default: int = 0) -> int:
     """Best-effort int coercion for wire-typed dataclass fields.
@@ -853,7 +855,8 @@ class MemberHealth:
     stall is open. ``last_delivery_error`` is ``{"class", "detail",
     "at_unix_ms"}`` or ``None``. ``durability`` is ``"ready"`` or
     ``{"reload_required": {"operation", "reason"}}`` once the gateway can
-    observe it, and ``None`` before that.
+    observe it, and ``None`` before that. ``generation`` is Core's member
+    generation.
     """
     identity: str
     member_id: str | None
@@ -870,6 +873,9 @@ class MemberHealth:
     #: "timed_out" | "failed", "detail"?, "at_unix_ms"}`` for the most recent
     #: reload attempt; ``refused`` carries meerkat's reason (store not healthy).
     last_reload: dict[str, Any] | None = None
+    #: The identity's last refused wake, as on ``IdentityStatus``; ``None``
+    #: when its last wake was not refused.
+    wake_refusal: WakeRefusal | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MemberHealth:
@@ -877,6 +883,7 @@ class MemberHealth:
         actor_loop = data.get("actor_loop")
         last_error = data.get("last_delivery_error")
         last_reload = data.get("last_reload")
+        wake_refusal = data.get("wake_refusal")
         return cls(
             identity=str(data.get("identity", "")),
             member_id=(str(data["member_id"]) if data.get("member_id") is not None else None),
@@ -894,6 +901,9 @@ class MemberHealth:
                 str(data["bootstrap_state"]) if data.get("bootstrap_state") is not None else None
             ),
             last_reload=(dict(last_reload) if isinstance(last_reload, dict) else None),
+            wake_refusal=(
+                WakeRefusal.from_dict(wake_refusal) if isinstance(wake_refusal, dict) else None
+            ),
         )
 
 

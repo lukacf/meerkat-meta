@@ -23,15 +23,7 @@ use meerkat_core::service::{CreateSessionRequest, SessionError};
 use meerkat_meta::{
     DiscoverySpec, MetaConfig, MobBootstrapOptions, MobBootstrapSpec, SessionHook, UnifiedRuntime,
 };
-use meerkat_mob::{
-    MobDefinition,
-    MobState,
-    MobStorage,
-    ProfileName,
-    SpawnMemberSpec,
-    // meerkat 0.7: the MeerkatId alias was deleted; member ids are AgentIdentity.
-    ids::AgentIdentity as MeerkatId,
-};
+use meerkat_mob::{MobDefinition, MobState, MobStorage};
 
 /// Per-test mob id counter: 0.8.23's fail-closed in-proc registration
 /// means concurrently running tests must not share a supervisor route.
@@ -106,10 +98,15 @@ async fn test_builder_persistent_default() {
     );
 
     // Verify persistent artifacts were created (M2 canonical spellings on a
-    // fresh state dir).
+    // fresh state dir). Sessions live in Core's pair on runtime.sqlite: no
+    // separate sessions database is created.
     assert!(
-        state_path.join("sessions.sqlite3").exists(),
-        "SQLite session store must be created"
+        state_path.join("runtime.sqlite").exists(),
+        "Core's session and runtime store must be created"
+    );
+    assert!(
+        !state_path.join("sessions.sqlite3").exists(),
+        "no separate sessions database may be created"
     );
     assert!(
         state_path.join("meta_console.sqlite3").exists(),
@@ -276,53 +273,6 @@ async fn test_builder_defaults() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Builder persistent with custom session store
-// ---------------------------------------------------------------------------
-#[tokio::test]
-#[ignore]
-async fn test_builder_persistent_custom_store() {
-    let tmp = tempfile::tempdir().expect("temp dir");
-    let state_path = tmp.path().join("state");
-    std::fs::create_dir_all(&state_path).expect("create state dir");
-
-    // Open a custom SQLite store at a non-default path to prove the builder
-    // uses it instead of creating its own.
-    let custom_db_path = state_path.join("custom_sessions.db");
-    let custom_store: std::sync::Arc<dyn meerkat::SessionStore> = std::sync::Arc::new(
-        meerkat_store::SqliteSessionStore::open(&custom_db_path).expect("open custom store"),
-    );
-
-    let runtime = Box::pin(
-        UnifiedRuntime::builder()
-            .definition(test_definition())
-            .persistent_state(&state_path)
-            .session_store(custom_store)
-            .default_llm_client(Arc::new(TestClient::default()))
-            .build(),
-    )
-    .await
-    .expect("persistent build with custom store");
-
-    assert_eq!(
-        runtime.mob_handle().status().await.unwrap(),
-        MobState::Running
-    );
-
-    // The custom store path should exist (we created it).
-    assert!(
-        custom_db_path.exists(),
-        "custom session store db must exist"
-    );
-    // The default sessions.db should NOT have been created by the builder.
-    assert!(
-        !state_path.join("sessions.db").exists(),
-        "builder must use custom store, not create default SQLite"
-    );
-
-    runtime.mob_handle().stop().await.expect("stop");
-}
-
-// ---------------------------------------------------------------------------
 // 8b. Per-slot WorkGraph store injection (0.8.16 item 5)
 // ---------------------------------------------------------------------------
 /// Item 5 is "a durable WorkGraph store injectable INDEPENDENTLY of continuity,
@@ -368,60 +318,6 @@ async fn builder_workgraph_store_injection_suppresses_the_local_sqlite_fallback(
         "an injected workgraph store must suppress the local SQLite fallback; \
          the file's presence means the injected store was dropped and \
          attach_workgraph_tools_reporting ran instead"
-    );
-
-    runtime.mob_handle().stop().await.expect("stop");
-}
-
-#[tokio::test]
-async fn test_builder_ephemeral_custom_store_persists_sessions() {
-    let custom_store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
-    let definition = MobDefinition::from_toml(&format!(
-        r#"
-[mob]
-id = "builder-test-mob-{}"
-
-[profiles.worker]
-model = "gpt-5.5"
-
-[profiles.worker.tools]
-comms = true
-"#,
-        NEXT_TEST_MOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ))
-    .expect("parse test mob definition");
-    let runtime = Box::pin(
-        UnifiedRuntime::builder()
-            .definition(definition)
-            .session_store(custom_store.clone())
-            .default_llm_client(Arc::new(TestClient::default()))
-            .build(),
-    )
-    .await
-    .expect("ephemeral build with custom store");
-
-    // meerkat 0.7: MemberCommsName is fail-closed; raw mob member ids must be
-    // identifier-safe (no ":").
-    let mid = MeerkatId::from("worker-one");
-    Box::pin(runtime.mob_handle().spawn_spec(SpawnMemberSpec::new(
-        ProfileName::from("worker"),
-        mid.clone(),
-    )))
-    .await
-    .expect("spawn worker");
-    let session_id = runtime
-        .mob_handle()
-        .resolve_bridge_session_id(&mid)
-        .await
-        .expect("spawned worker has a bridge session id");
-
-    assert!(
-        custom_store
-            .load(&session_id)
-            .await
-            .expect("custom store load")
-            .is_some(),
-        "ephemeral builder session_store() must wire the custom store into the real session service"
     );
 
     runtime.mob_handle().stop().await.expect("stop");

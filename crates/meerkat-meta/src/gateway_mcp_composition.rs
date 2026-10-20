@@ -45,9 +45,6 @@ pub enum GatewayFactoryKind {
     Persistent,
     /// The process-local launch's factory, behind the SDK callback builder.
     ProcessLocal,
-    /// The process-local launch's identity-first factory, whose sessions
-    /// persist through the continuity store.
-    ContinuityBacked,
 }
 
 /// The actual factory and native runtime a gateway member factory is built
@@ -963,7 +960,6 @@ mod tests {
         for kind in [
             GatewayFactoryKind::Persistent,
             GatewayFactoryKind::ProcessLocal,
-            GatewayFactoryKind::ContinuityBacked,
         ] {
             let dir = tempfile::tempdir().unwrap();
             let machine = runtime_machine();

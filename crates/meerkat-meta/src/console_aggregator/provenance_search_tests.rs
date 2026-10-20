@@ -279,6 +279,7 @@ fn witness(session: &str) -> ConsoleFrameMemberProvenance {
         identity,
         primary_mob_id: "historical-primary".into(),
         source_mob_id: "historical-primary".into(),
+        lineage: Vec::new(),
     }
 }
 
@@ -690,6 +691,24 @@ async fn provenance_failed_page_and_same_cursor_same_tail_reset_cannot_cache_abs
     Ok(())
 }
 
+/// The session `identity` is live under in `entry`'s runtime, as the console
+/// reads its members.
+async fn live_session(entry: &RuntimeEntry, identity: &str) -> Option<String> {
+    for resolved in member_sources_for_entry_including_hidden(entry).await {
+        if let Some(record) = identity_record_for_resolved_member(&resolved).await
+            && record.identity == identity
+        {
+            return record.session_id;
+        }
+    }
+    None
+}
+
+/// A negative history search never masks a member that turns live, nor a
+/// new registration. A lookup names the frame's session: a frame that names
+/// no session records no member, so a session-less lookup is uncaptured
+/// before and after the spawn. The live member is found under its own
+/// session although a negative search is recorded for that session.
 #[tokio::test]
 async fn provenance_negative_search_never_masks_live_members_or_a_new_registration()
 -> ConsoleLogResult<()> {
@@ -699,9 +718,9 @@ async fn provenance_negative_search_never_masks_live_members_or_a_new_registrati
     assert!(
         member_provenance_for_identity(&aggregator.inner, &entry, "live-worker", None, false)
             .await
-            .is_none()
+            .is_none(),
+        "a session-less lookup is uncaptured"
     );
-    let queries = store.count();
     runtime
         .spawn(SpawnMemberSpec::from_wire(
             "worker".into(),
@@ -711,17 +730,60 @@ async fn provenance_negative_search_never_masks_live_members_or_a_new_registrati
             None,
         ))
         .await?;
-    let live =
-        member_provenance_for_identity(&aggregator.inner, &entry, "live-worker", None, false)
-            .await
-            .ok_or("new live member was masked by a negative history search")?;
+    let session = live_session(&entry, "live-worker")
+        .await
+        .ok_or("the spawned member is live with a session")?;
+    // The negative history search that a lookup under this session leaves
+    // when it runs before the member is live.
+    let key = (
+        entry.runtime_key.clone(),
+        "live-worker".to_string(),
+        Some(session.clone()),
+    );
+    assert!(
+        recover_member_provenance(
+            &aggregator.inner,
+            &entry,
+            "live-worker",
+            Some(session.as_str()),
+            key.clone(),
+        )
+        .await
+        .is_none()
+    );
+    assert!(
+        aggregator
+            .inner
+            .member_provenance_searches
+            .lock()
+            .map_err(|_| std::io::Error::other("provenance search cache lock poisoned"))?
+            .entries
+            .contains_key(&key),
+        "the negative search is recorded under the member's session"
+    );
+    let queries = store.count();
+    let live = member_provenance_for_identity(
+        &aggregator.inner,
+        &entry,
+        "live-worker",
+        Some(session.as_str()),
+        false,
+    )
+    .await
+    .ok_or("new live member was masked by a negative history search")?;
     assert_eq!(live.identity.identity, "live-worker");
     assert_eq!(live.identity.runtime_key, RUNTIME);
-    assert!(live.identity.session_id.is_some());
+    assert_eq!(live.identity.session_id.as_deref(), Some(session.as_str()));
     assert_eq!(
         store.count(),
         queries,
         "live resolution precedes the negative history shortcut"
+    );
+    assert!(
+        member_provenance_for_identity(&aggregator.inner, &entry, "live-worker", None, false)
+            .await
+            .is_none(),
+        "a session-less lookup stays uncaptured once the member is live"
     );
     runtime.mob_handle().stop().await?;
 

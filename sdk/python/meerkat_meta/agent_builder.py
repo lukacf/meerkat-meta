@@ -93,8 +93,6 @@ class CallbackDispatcher:
         # gateway has no scope-release signal — newest-wins is the semantics).
         self._customizer_scope_by_identity: dict[str, str] = {}
         # Identity-first providers (REQ-45)
-        self._continuity_store: Any | None = None
-        self._lease_provider: Any | None = None
         self._roster_provider: Any | None = None
         self._topology_provider: Any | None = None
         self._agent_customizer: Any | None = None
@@ -119,12 +117,6 @@ class CallbackDispatcher:
 
     def register_error_callback(self, callback: Callable) -> None:
         self._error_callback = callback
-
-    def register_continuity_store(self, provider: Any) -> None:
-        self._continuity_store = provider
-
-    def register_lease_provider(self, provider: Any) -> None:
-        self._lease_provider = provider
 
     def register_roster_provider(self, provider: Any) -> None:
         self._roster_provider = provider
@@ -313,10 +305,6 @@ class CallbackDispatcher:
             return result
 
         # ----- Identity-first provider routing (REQ-45) -----
-        if method.startswith("callback/continuity_store/"):
-            return await self._handle_continuity_store(method, params)
-        if method.startswith("callback/lease_provider/"):
-            return await self._handle_lease_provider(method, params)
         if method.startswith("callback/roster_provider/"):
             return await self._handle_roster_provider(method, params)
         if method.startswith("callback/topology_provider/"):
@@ -637,128 +625,6 @@ class CallbackDispatcher:
         return {"accepted": True}
 
     # --- Provider dispatch helpers ---
-
-    async def _handle_continuity_store(self, method: str, params: dict[str, Any]) -> Any:
-        from .identity_first_providers import (
-            ContinuityRecord,
-            SessionSnapshot,
-        )
-        store = self._continuity_store
-        if store is None:
-            raise ValueError("no continuity store provider registered")
-
-        op = method.rsplit("/", 1)[-1]
-
-        if op == "resolve_many":
-            result = await store.resolve_many(params["identities"])
-            return {k: v.to_dict() for k, v in result.items()}
-
-        if op == "load_session_snapshot":
-            snap = await store.load_session_snapshot(params["session_id"])
-            return snap.to_dict() if snap is not None else None
-
-        if op == "resolve_record_by_session":
-            handler = getattr(store, "resolve_record_by_session", None)
-            if handler is None:
-                # Loud, not null: a null here would be indistinguishable from an
-                # authoritative "no record" and would silently disable owner
-                # pre-registration.
-                raise ValueError(
-                    "continuity store provider does not implement "
-                    "resolve_record_by_session; owner pre-registration cannot "
-                    "distinguish 'no record' from 'cannot answer' without it"
-                )
-            bound = await handler(params["session_id"])
-            if bound is None:
-                return None
-            record, fencing_token, checkpoint_version = bound
-            return {
-                "record": record.to_dict(),
-                "fencing_token": fencing_token,
-                "checkpoint_version": checkpoint_version,
-            }
-
-        if op == "session_owner":
-            session_id = params["session_id"]
-            handler = getattr(store, "session_owner", None)
-            if handler is not None:
-                owner = await handler(session_id)
-                if owner is not None and not isinstance(owner, str):
-                    raise ValueError("session_owner must return an identity string or None")
-                return owner
-            # Older providers can answer current bindings only. Retained history
-            # requires the explicit session_owner capability described by the API.
-            resolver = getattr(store, "resolve_record_by_session", None)
-            if resolver is None:
-                raise ValueError("continuity store provider cannot resolve session ownership")
-            bound = await resolver(session_id)
-            if bound is None:
-                return None
-            record, _, _ = bound
-            if record.session_id != session_id:
-                raise ValueError("session owner lookup returned a different session")
-            return record.identity
-
-        if op == "delete_session_snapshot_if_current_revision":
-            handler = getattr(
-                store, "delete_session_snapshot_if_current_revision", None
-            )
-            if handler is None:
-                return False
-            return await handler(
-                params["session_id"], params["expected_current_revision"]
-            )
-
-        if op == "save_session_snapshot":
-            snapshot = SessionSnapshot.from_dict(params["snapshot"])
-            await store.save_session_snapshot(
-                params["identity"],
-                params["session_id"],
-                params["generation"],
-                params["version"],
-                params["fencing_token"],
-                snapshot,
-            )
-            return None
-
-        if op == "upsert_continuity_record":
-            record = ContinuityRecord.from_dict(params["record"])
-            await store.upsert_continuity_record(record, params["fencing_token"])
-            return None
-
-        if op == "delete_continuity_record":
-            await store.delete_continuity_record(
-                params["identity"], params["fencing_token"]
-            )
-            return None
-
-        raise ValueError(f"unknown continuity_store operation: {op}")
-
-    async def _handle_lease_provider(self, method: str, params: dict[str, Any]) -> Any:
-        from .identity_first_providers import LeaseGrant
-        provider = self._lease_provider
-        if provider is None:
-            raise ValueError("no lease provider registered")
-
-        op = method.rsplit("/", 1)[-1]
-
-        if op == "acquire_leases":
-            result = await provider.acquire_leases(
-                params["identities"], params["runtime_instance"],
-            )
-            return {k: v.to_dict() for k, v in result.items()}
-
-        if op == "renew_leases":
-            grants = [LeaseGrant.from_dict(g) for g in params["grants"]]
-            result = await provider.renew_leases(grants)
-            return {k: v.to_dict() for k, v in result.items()}
-
-        if op == "release_leases":
-            grants = [LeaseGrant.from_dict(g) for g in params["grants"]]
-            await provider.release_leases(grants)
-            return None
-
-        raise ValueError(f"unknown lease_provider operation: {op}")
 
     async def _handle_roster_provider(self, method: str, params: dict[str, Any]) -> Any:
         from .identity_first_models import RosterContext

@@ -88,25 +88,19 @@ export interface IdentityStatusRow {
   addressability: "addressable" | "internal_only";
   labels: Record<string, string>;
   generation?: number;
-  checkpoint_version?: number;
-  lease_healthy?: boolean;
   progress?: MemberProgress;
   session_repair?: IdentitySessionRepair | null;
   unobserved?: UnobservedFacts;
 }
 
+/// The identity inspect view. `continuity` carries Core's facts for the
+/// identity: its member generation and the session and runtime Core binds.
 export interface IdentityInspectViewState extends IdentityStatusRow {
   continuity: {
     generation?: number;
-    checkpoint_version?: number;
     session_id?: string;
     agent_runtime_id?: string;
   };
-  lease?: {
-    fencing_token: number;
-    ttl_remaining_ms: number;
-    healthy: boolean;
-  } | null;
   output_preview?: string | null;
   is_final?: boolean | null;
   peer_reachable_count?: number | null;
@@ -410,10 +404,6 @@ export function normalizeIdentityStatusRow(value: unknown): IdentityStatusRow | 
     ...(trimString(record.display_name) ? { display_name: trimString(record.display_name) } : {}),
     ...(trimString(record.role) ? { role: trimString(record.role) } : {}),
     ...(typeof record.generation === "number" && Number.isFinite(record.generation) ? { generation: record.generation } : {}),
-    ...(typeof record.checkpoint_version === "number" && Number.isFinite(record.checkpoint_version)
-      ? { checkpoint_version: record.checkpoint_version }
-      : {}),
-    ...(typeof record.lease_healthy === "boolean" ? { lease_healthy: record.lease_healthy } : {}),
     ...((): { progress?: MemberProgress } => {
       const progress = normalizeMemberProgress(record.progress);
       return progress ? { progress } : {};
@@ -482,11 +472,6 @@ export function normalizeIdentityInspectViewState(value: unknown): IdentityInspe
   const continuityRecord = record.continuity && typeof record.continuity === "object"
     ? record.continuity as Record<string, unknown>
     : {};
-  const leaseRecord = record.lease && typeof record.lease === "object"
-    ? record.lease as Record<string, unknown>
-    : record.lease === null
-      ? null
-      : undefined;
 
   return {
     ...statusRow,
@@ -494,26 +479,9 @@ export function normalizeIdentityInspectViewState(value: unknown): IdentityInspe
       ...(normalizeFiniteNumber(continuityRecord.generation) !== undefined
         ? { generation: normalizeFiniteNumber(continuityRecord.generation) }
         : {}),
-      ...(normalizeFiniteNumber(continuityRecord.checkpoint_version) !== undefined
-        ? { checkpoint_version: normalizeFiniteNumber(continuityRecord.checkpoint_version) }
-        : {}),
       ...(trimString(continuityRecord.session_id) ? { session_id: trimString(continuityRecord.session_id) } : {}),
       ...(trimString(continuityRecord.agent_runtime_id) ? { agent_runtime_id: trimString(continuityRecord.agent_runtime_id) } : {}),
     },
-    ...(leaseRecord === null
-      ? { lease: null }
-      : leaseRecord
-        && normalizeFiniteNumber(leaseRecord.fencing_token) !== undefined
-        && normalizeFiniteNumber(leaseRecord.ttl_remaining_ms) !== undefined
-        && typeof leaseRecord.healthy === "boolean"
-          ? {
-              lease: {
-                fencing_token: normalizeFiniteNumber(leaseRecord.fencing_token)!,
-                ttl_remaining_ms: normalizeFiniteNumber(leaseRecord.ttl_remaining_ms)!,
-                healthy: leaseRecord.healthy,
-              },
-            }
-          : {}),
     ...(trimString(record.output_preview) !== undefined ? { output_preview: trimString(record.output_preview) ?? null } : {}),
     ...(typeof record.is_final === "boolean" || record.is_final === null ? { is_final: record.is_final as boolean | null } : {}),
     ...(normalizeFiniteNumber(record.peer_reachable_count) !== undefined

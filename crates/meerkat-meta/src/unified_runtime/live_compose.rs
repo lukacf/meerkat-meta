@@ -97,9 +97,10 @@ impl LiveComposition {
 /// Why the live doors could not be composed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveComposeError {
-    /// The builder registered a live door without a persistent session
-    /// store. Live channels need the durable session owner; call
-    /// `session_store(...)` (or `continuity_from_state_dir`) on the builder.
+    /// The builder registered a live door without persistent sessions.
+    /// Live channels need the durable session owner; call
+    /// `persistent_state(...)` (or compose a `storage_provider` realm) on the
+    /// builder.
     LiveRequiresPersistentSessions,
     /// The console voice controller refused the registration.
     ConsoleVoice(String),
@@ -119,8 +120,8 @@ impl std::fmt::Display for LiveComposeError {
         match self {
             Self::LiveRequiresPersistentSessions => write!(
                 f,
-                "console_voice and live require a persistent session store: configure \
-                 UnifiedRuntimeBuilder::session_store (or continuity_from_state_dir) \
+                "console_voice and live require persistent sessions: configure \
+                 UnifiedRuntimeBuilder::persistent_state (or a storage_provider realm) \
                  before registering a live door"
             ),
             Self::ConsoleVoice(error) => write!(f, "console_voice composition failed: {error}"),
@@ -357,9 +358,9 @@ comms = true
         realtime: Arc<meerkat::test_fixtures::realtime::ScriptedRealtimeSessionFactory>,
     }
 
-    /// The production shape: a library embedder builds through the builder with a
-    /// caller-owned SQLite session store, registers console voice and the
-    /// external live channel, and serves the router on its own listener.
+    /// The production shape: a library embedder builds through the builder with
+    /// persistent state, registers console voice and the external live
+    /// channel, and serves the router on its own listener.
     async fn build_embedder_runtime(id: &str, with_live: bool) -> Built {
         let provider = ProviderFixture::start().await;
         std::fs::create_dir_all(".rct").expect("test state parent");
@@ -367,20 +368,14 @@ comms = true
             .prefix("builder-voice-")
             .tempdir_in(".rct")
             .expect("test state");
-        let store: Arc<dyn meerkat::SessionStore> = Arc::new(
-            meerkat_store::SqliteSessionStore::open(directory.path().join("sessions.sqlite"))
-                .expect("session store"),
-        );
         let client = Arc::new(meerkat_client::TestClient::for_provider(
             meerkat_core::Provider::OpenAI,
         ));
         let mut builder = UnifiedRuntime::builder()
             .definition(definition(id))
-            // No scratch_dir: that option selects the identity-first path, which
-            // needs continuity, lease and roster providers. The default
-            // ephemeral-with-store shape is what a library embedder with a
-            // caller-owned session store uses.
-            .session_store(store)
+            // Sessions persist in Core's pair on runtime.sqlite under the
+            // state directory, which is what a live door needs.
+            .persistent_state(directory.path())
             .default_llm_client(client)
             .meerkat_config(config())
             .console_voice(registration());
@@ -442,7 +437,7 @@ comms = true
                 LiveComposeError::LiveRequiresPersistentSessions
             )
         ));
-        assert!(error.to_string().contains("session_store"));
+        assert!(error.to_string().contains("persistent_state"));
     }
 
     #[tokio::test]
@@ -583,14 +578,10 @@ comms = true
             .prefix("builder-live-url-")
             .tempdir_in(".rct")
             .expect("test state");
-        let store: Arc<dyn meerkat::SessionStore> = Arc::new(
-            meerkat_store::SqliteSessionStore::open(directory.path().join("sessions.sqlite"))
-                .expect("session store"),
-        );
         let Err(error) = Box::pin(
             UnifiedRuntime::builder()
                 .definition(definition("builder-live-url"))
-                .session_store(store)
+                .persistent_state(directory.path())
                 .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
                 .live(LiveOptions::new("   "))
                 .build(),

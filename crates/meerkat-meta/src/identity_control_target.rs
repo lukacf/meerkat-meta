@@ -61,6 +61,13 @@ pub(crate) enum IdentityControlResolutionError {
         projected_identity: String,
         detail: String,
     },
+    /// Core's member history could not be read, so no registered binding can
+    /// be told apart from a live-only member: the control refuses rather
+    /// than resolve against the live roster alone.
+    HistoryUnavailable {
+        requested_identity: String,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for IdentityControlResolutionError {
@@ -95,6 +102,13 @@ impl std::fmt::Display for IdentityControlResolutionError {
                 formatter,
                 "invalid projected identity {projected_identity}: {detail}"
             ),
+            Self::HistoryUnavailable {
+                requested_identity,
+                detail,
+            } => write!(
+                formatter,
+                "identity {requested_identity} was not resolved: {detail}; nothing was changed"
+            ),
         }
     }
 }
@@ -121,7 +135,12 @@ where
     let generated_runtime_alias =
         crate::member_comms_id::is_reserved_generated_alias(&requested_identity);
     let statuses = match identity_runtime {
-        Some(identity_runtime) => identity_runtime.statuses().await,
+        Some(identity_runtime) => identity_runtime.statuses().await.map_err(|error| {
+            IdentityControlResolutionError::HistoryUnavailable {
+                requested_identity: requested_identity.clone(),
+                detail: error.to_string(),
+            }
+        })?,
         None => Vec::new(),
     };
     let members = handle.list_members_including_retiring().await;

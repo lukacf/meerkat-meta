@@ -69,33 +69,6 @@ async fn identity_first_boundary_session_store_roundtrip() {
 // session and the session pipeline restores it.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-#[ignore]
-async fn identity_first_boundary_session_restore_path() {
-    // Create and serialize a session (simulating snapshot save)
-    let original = meerkat_core::Session::new();
-    let original_id = original.id().clone();
-
-    let snapshot_bytes = serde_json::to_vec(&original).expect("serialize");
-    let restored: meerkat_core::Session =
-        serde_json::from_slice(&snapshot_bytes).expect("deserialize");
-
-    // Verify the restored session preserves the ID
-    assert_eq!(restored.id(), &original_id);
-
-    // Prove SessionBuildOptions can accept a resume_session
-    let build_opts = meerkat_core::service::SessionBuildOptions {
-        resume_session: Some(restored),
-        ..Default::default()
-    };
-
-    // The fact that this compiles and the resume_session field is populated
-    // proves the interface assumption
-    assert!(build_opts.resume_session.is_some());
-    let resume = build_opts.resume_session.as_ref().expect("resume present");
-    assert_eq!(resume.id(), &original_id);
-}
-
 // ---------------------------------------------------------------------------
 // Task 0.25 — External boundary: MobDefinition compatibility
 //

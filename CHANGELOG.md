@@ -23,6 +23,416 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   incident command center example parses its scenario with four of these
   rules: YAML 1.2 booleans, `<<` as an ordinary key, and refusal of
   duplicate keys and unknown tags.
+- `rpc_gateway` refuses the `meta/init` params `has_continuity_store`,
+  `has_lease_provider` and `scratch_dir` with invalid params (`-32602`),
+  whatever their value, and names each one it received. SDK-hosted
+  continuity (a host continuity store, a host lease provider and their
+  scratch directory) is removed: Meta keeps sessions and identities in the
+  `persistent_state` directory. Remove the keys and set `persistent_state`
+  for durable sessions. To move an SDK-hosted 0.9.3 installation, export
+  its continuity while 0.9.3 is still installed, then run
+  `meta_gateway storage-migrate-native`; the refusal names the upgrade
+  guide section.
+- One Meta runtime per state directory. `rpc_gateway` (with
+  `persistent_state`), `meta_gateway` (with persistent sessions or the
+  identity substrate), `UnifiedRuntimeBuilder::persistent_state` and
+  `MobBootstrapSpec::persistent` take an exclusive lock on
+  `<state dir>/meta-runtime.lock` before they open any store. A runtime
+  holds it until a shutdown that stood its mob down cleanly has run to its
+  end, or until it drops (a `MobRuntime` without a `UnifiedRuntime` gives it
+  up after a clean child-mob stand-down); the kernel releases it when the
+  process exits. A second runtime on the same directory, in another process
+  or in the same one, is refused with STORAGE_RESOLUTION (`-32014`): "state
+  directory <dir> is in use by another Meta runtime"
+  (`StorageLayoutError::StateDirInUse`, or `StateDirUnavailable` when the
+  lock file cannot be created or locked). A configuration the builder
+  refuses leaves the directory untouched. The storage doctor lists the lock
+  file as inventory, never as a leftover.
+- Persistent compositions keep sessions in Core's own session and runtime
+  stores, both on `<state dir>/runtime.sqlite` (the head-canonical profile,
+  composed as Core's realm composes them): `rpc_gateway` with
+  `persistent_state`, `meta_gateway` with persistent sessions,
+  `UnifiedRuntimeBuilder::persistent_state` and `MobBootstrapSpec::persistent`.
+  A composite storage provider's realm supplies its session store together
+  with its runtime store. Meta no longer keeps a session copy of its own: it
+  opens no `sessions.sqlite3` and no continuity session tables, and its
+  runtime-store facade, its per-session write epochs and the startup
+  authority prewarm are gone. A state directory that still holds 0.9.3
+  storage is refused before any store opens with STORAGE_RESOLUTION
+  (`-32014`, `StorageLayoutError::NativeStorageMigrationRequired`), naming
+  `meta_gateway storage-migrate-native --state-dir <dir>` (a dry run) and its
+  `--apply` run.
+- Before any store opens, a persistent composition also refuses
+  (`-32014`): a state directory on which another process still hosts
+  runtimes (`StorageLayoutError::RuntimeInUse`: Core's execution-custody lock
+  beside `runtime.sqlite` is held, as by a running 0.9.3 gateway); identity
+  bindings that name sessions (continuity records, or Core's durable member
+  bindings in the mob store) while `runtime.sqlite` is missing or holds no
+  session (`RuntimeStoreMissing`: restore `runtime.sqlite` together with its
+  `-wal` file from the same backup; a composition whose runtime store is a
+  non-disk `storage_provider()` backend keeps no `runtime.sqlite` there and
+  skips this check); and a check that cannot read a store,
+  the mob store included (`RuntimeLockUnreadable`,
+  `StartupProbeUnreadable`). `meta_gateway` refuses
+  a `store_path` with a file extension that is not an existing directory
+  (`SessionDatabaseOverrideRetired`), whether or not the file exists:
+  sessions live in `runtime.sqlite` under the state directory, so pass the
+  directory. An existing directory is the state directory whatever its name
+  (`/srv/meta.d`). A file that holds sessions moves into the layout with
+  `meta_gateway storage-migrate --state-dir <dir> --session-db <file>
+  --apply`, followed by `storage-migrate-native`.
+- `StorageLayoutError` gains the variants above (`StateDirInUse`,
+  `StateDirUnavailable`, `NativeStorageMigrationRequired`, `RuntimeInUse`,
+  `RuntimeLockUnreadable`, `RuntimeStoreMissing`, `StartupProbeUnreadable`,
+  `SessionDatabaseOverrideRetired`, `MobStorageUndeclared`) and is now
+  `#[non_exhaustive]`, so variants added later are not breaking.
+- A persistent composition refuses in-memory stores that its state directory
+  would outlive: a declared in-memory runtime store (`rpc_gateway`
+  `runtime_options.runtime_store` with `persistent_state`, `-32014`;
+  `UnifiedRuntimeBuilder::ephemeral_runtime_store(true)` with
+  `persistent_state`, `ConflictingConfiguration`), and in-memory mob storage
+  while a roster provider is registered (`rpc_gateway`
+  `runtime_options.mob_storage`, `-32014`; `UnifiedRuntimeBuilder::mob_storage`
+  without a persistent path, `ConflictingConfiguration`). Without
+  `mob_storage`, `UnifiedRuntimeBuilder::persistent_state` now keeps mob
+  storage durable in `<state dir>/event_log.sqlite3`, as the gateways do; a
+  persistent `mob_storage` is honoured at its own path. A definition edit
+  between restarts (for example a profile's model or a skill) now refuses
+  with `-32019` `divergent` (`MobRuntimeError::CompositionProvenance` from
+  Rust), as on the gateways. Declare the change with
+  `runtime_options.declare_spec_update` (`{expected_revision}`; the SDK
+  builders' `declare_spec_update(expected_revision)` and
+  `declareSpecUpdate(expectedRevision)`, `spec_update_ceremony::declare_spec_update`
+  from Rust), or launch the candidate with
+  `runtime_options.mob_composition.candidate_definition = "stored"`
+  (`MobBootstrapSpec::with_candidate_definition(CandidateDefinition::Stored)`).
+  A roster gateway that kept mob storage in memory
+  (`runtime_options.mob_storage = {"storage": "memory"}`) to edit
+  `mob_config` freely is now refused at start (`-32014`); drop that
+  declaration and declare each definition edit with `declare_spec_update`.
+- `MobBootstrapSpec::persistent` and `persistent_with_hook` are `async`,
+  take the mob storage's `MobStorageProvenance` right after the storage, and
+  no longer take a session store. Pass the pair that
+  `persistent_mob_storage(path)` returns for durable mob storage, or
+  `MobStorageProvenance::declared_ephemeral()` for in-memory mob storage; an
+  unspecified provenance is refused
+  (`StorageLayoutError::MobStorageUndeclared`).
+- Removed: `UnifiedRuntimeBuilder::session_store`;
+  `MobBootstrapSpec::with_session_write_epochs` and
+  `with_runtime_authority_prewarm` (use `with_durable_runtime_store`);
+  `SessionWriteEpochsHandle`, `epoch_tracking_runtime_store` and
+  `epoch_tracking_runtime_store_with_durable_projection`;
+  `GatewayFactoryKind::ContinuityBacked`; and
+  `UnifiedRuntimeBootstrapPhase::PrewarmPersistedAuthority`.
+  `UnifiedRuntimeBuilder::continuity_from_state_dir` installs the identity
+  substrate only, and the builder's agent memory engines read the
+  composition's durable session store (refused without one). The live doors
+  (`console_voice`, `live`) take their session store from `persistent_state`
+  or a storage provider realm; without one the build is refused with
+  `LiveComposeError::LiveRequiresPersistentSessions`, which used to name
+  `session_store` and `continuity_from_state_dir`.
+- `meta/init_progress` no longer reports the `prewarm` phase;
+  `owner_publication` now covers only the early roster callback, whose
+  refusal still refuses the activation with invalid params (`-32602`).
+
+- `session_service` takes only the session agent builder: the session store
+  it also accepted was never read, because Core's own session store holds
+  every session. Any second argument now raises `TypeError` in both SDKs
+  (Python `session_service(builder, store)`, TypeScript
+  `sessionService(builder, store)`, which also no longer type-checks), and
+  the builder config field that held it is gone (Python `session_store`,
+  TypeScript `MetaBuilderConfig.sessionStore`). So are the config helpers
+  that built such a store: Python `meerkat_meta.config.session_store` (also
+  exported as `meerkat_meta.session_store`) with `json()`, `bigquery()`,
+  `JsonSessionStoreConfig` and `BigQuerySessionStoreConfig`, and TypeScript
+  `sessionStore` with `json()`, `bigquery()`,
+  `jsonSessionStoreConfigToDict()`, `bigquerySessionStoreConfigToDict()`,
+  `JsonSessionStoreConfig` and `BigQuerySessionStoreConfig`. Drop the
+  argument and the helper calls; they had no effect.
+  `session_store_bigquery()` (TypeScript `sessionStoreBigQuery()`, the
+  `meta/session_store/bigquery` call) is unchanged.
+- `IdentityStatus` drops `checkpoint_version` (TypeScript
+  `checkpointVersion`) in both SDKs. In TypeScript, `agentRuntimeId`,
+  `sessionId` and `generation` are now `null` when the gateway sends none
+  (they read as `""` and `0` before): `agentRuntimeId` while the identity is
+  not live, `sessionId` and `generation` while Core holds no binding for it.
+- SDK-hosted continuity is removed from both SDKs: Meta keeps sessions and
+  identities in Core's stores under the `persistent_state` directory, and
+  nothing replaces a host continuity store or lease provider. Removed: the
+  builder options `continuity_store()`, `lease_provider()` and
+  `scratch_dir()` (TypeScript `continuityStore()`, `leaseProvider()` and
+  `scratchDir()`); `CallbackDispatcher.register_continuity_store()` and
+  `register_lease_provider()` (TypeScript `registerContinuityStore()` and
+  `registerLeaseProvider()`); the provider protocols (Python
+  `ContinuityStoreProvider`, `SessionOwnershipProvider` and
+  `LeaseProviderProtocol`, TypeScript `ContinuityStore` and
+  `LeaseProvider`); their record, snapshot and lease types
+  (`ContinuityRecord`, `ContinuityFailure`, `ContinuityResolveState`,
+  `SessionSnapshot`, `LeaseGrant`, `LeaseAcquireResult`,
+  `LeaseRenewResult`, `LeaseInfo` and `DurabilityPolicy`, with the
+  TypeScript parse and to-dict helpers of each); the gateway callbacks that
+  served them (`callback/continuity_store/*` and
+  `callback/lease_provider/*`); and the lease-lost error (`LEASE_LOST_CODE`
+  and `LeaseLostError`). `IdentityStatus` drops `lease` and
+  `continuity_health` (TypeScript `continuityHealth`), and
+  `ContinuityHealth` is removed. To move a 0.9.3 deployment that passed a
+  continuity provider, export its continuity with 0.9.3 still installed
+  and import the file with `meta_gateway storage-migrate-native
+  --continuity-export`; `docs/guides/upgrading-to-0-9-4.mdx` has the
+  steps.
+- `request_continuity_repair()` (TypeScript `requestContinuityRepair()`)
+  and the `meta/request_continuity_repair` method are removed: Core's mob
+  machine and journal hold an identity's session and generation, and Meta
+  runs no continuity repair of its own. The method answers method not
+  found (`-32601`), and `meta/capabilities` no longer lists it.
+- The identity methods of the SDK gateway report Core's facts and drop
+  Meta's continuity and lease atoms:
+  - `meta/status_identity` and `meta/inspect_identity` no longer send
+    `checkpoint_version`, `continuity_health`, `lease_healthy` or `lease`,
+    and `meta/inspect_identity` drops its `continuity` object: its
+    `agent_runtime_id`, `session_id` and `generation` are top-level keys.
+    A registered identity's `state` is `active`, `dormant` or `broken`;
+    `retiring`, `suspended` and `uninitialized` are gone.
+  - `meta/reconcile_identity` drops `continuity_repair`, and its outcomes
+    drop `generation`. The `broken` outcome is replaced by `refused`, which
+    carries the refusal as an `error` object (`code`, `message`, `data`),
+    the same error the refusal answers on its own. A `created` outcome
+    carries `replaced_session_id` when the identity woke on a fresh
+    session because Core held no copy of its last one.
+  - `meta/respawn` and `meta/reset` results drop `checkpoint_version`. A
+    respawn result's `agent_runtime_id`, `session_id` and `generation` are
+    `null` for a peer-only member. A reset of a dormant identity gives it a
+    fresh session that it wakes onto later, so the result's
+    `agent_runtime_id` is `null`.
+  - `meta/retire` results drop `fencing_token`.
+  - Bootstrap restore progress reports a refused identity as stage
+    `refused` with the error `code` and `kind`; stage `broken` is gone.
+  - Identity refusals that 0.9.3 answered as internal errors (`-32603`)
+    carry their own codes: `-32051` (Core cannot resume the identity;
+    final), `-32052` (Core's history is unreadable for now, or a delivery
+    reached a member whose session Core holds no durable copy of;
+    retryable) and `-32053` (a host adopted the identity, so Meta's verbs
+    leave it alone; its data carries `retryable: false`). A send or
+    dispatch to an adopted identity whose intent declares a live member
+    that Core has not brought live yet answers `-32052` instead
+    (`identity_wake_retryable`): Meta never wakes it and queues nothing,
+    and the same request, sent again, is delivered once Core holds the
+    member. A delivery whose
+    resume Core refuses answers the same classes as a wake. A reset or
+    `delete_identity` whose fresh session Core committed but whose binding
+    cannot be read back answers an internal error that says so: read the
+    identity's status instead of repeating it.
+    A wake Core holds until an operator acts stays `-32603`, with a
+    structured `kind`. `-32003` (no active lease) and `-32005` (lease lost)
+    are no longer answered, and `-32005` is never reused.
+  - A respawn advances the identity's generation. A delivery scope's
+    `generation` and `lease_fencing_token` are Core's member generation and
+    fence token, so a scope captured before a respawn, or saved by 0.9.3,
+    is refused as stale (`-32007`) and nothing is submitted, as is a scope
+    captured at another incarnation of the mob (one destroyed and created
+    again under its id).
+- `delete_identity` starts the identity over and keeps its old session in
+  Core instead of deleting Meta's copy. A live identity moves to a fresh
+  session at once and stays live; a dormant one stays dormant and starts
+  fresh at its next wake; an identity Core never spawned is a no-op. Core
+  keeps the old session archived with its transcript: session listings
+  hide it, and a history read by its session id still serves it, also
+  after a restart. 0.9.3 deleted Meta's session snapshot and the
+  identity's continuity record and left the identity dormant until the
+  next reconcile. The result is still `{identity, cleanup_warning}` and
+  does not name the old session: read the identity's status before
+  deleting to keep a handle on the old transcript. An identity a host
+  adopted is refused with `-32053`.
+- Console identity rows no longer carry `checkpoint_version`,
+  `continuity_health`, `lease_healthy` or `lease`. This covers the identity
+  rows of `GET /console/experience`, the console JSON-RPC
+  `meta/status_identity` and `meta/inspect_identity` replies, and the
+  identity row in the live-member reply of `meta/respawn` and `meta/reset`.
+  The `continuity` object of `meta/inspect_identity` drops
+  `checkpoint_version` and keeps `generation`, `session_id` and
+  `agent_runtime_id`.
+- The console's `meta/respawn` and `meta/reset` results for an identity, and
+  the `identity_respawned` and `identity_reset` events, drop
+  `checkpoint_version`; their `agent_runtime_id`, `session_id` and
+  `generation` can be `null` (a peer-only member has none, and a dormant
+  identity has no runtime until it wakes). `reset_all` no longer fails a
+  dormant or broken identity with `identity_not_resettable_in_state`: the
+  reset gives it a fresh session. The identity receipt of the console
+  `meta/ensure_member` reports a refused identity as `refused` instead of
+  `broken`.
+- Identity-first members placed on a host whose realm backend is not
+  persistent (for example a `rkat mob host` realm on the memory or jsonl
+  backend) are now refused when they are created, with a typed
+  `HostRejectedBuild` error that names the remedy. Previously they were
+  created but could never be resumed, so they lost their session at the
+  first retire, wake or host restart. Run the placement host with a
+  persistent (SQLite) realm backend, or remove the identity's placement.
+- `meerkat_meta::identity_first::HostRejectedBuildPark` is removed. Nothing
+  parks a refused build any more: `HostRejectedBuild` is answered on every
+  attempt. The wire is unchanged: the error is still `-32603`, and its
+  reason ends with the remedy.
+- `IdentityRuntime` reads each identity's state from Core's member history,
+  and its Rust API follows:
+  - `register(spec)` takes only the spec; its lifecycle state argument is
+    gone.
+  - `IdentityLifecycleState` has `Dormant`, `Active` and `Broken`;
+    `Retiring`, `Suspended` and `Uninitialized` are removed.
+  - `IdentityStatus` drops `checkpoint_version`, `lease`,
+    `continuity_health` and `continuity_unrecoverable`, and its `generation`
+    is `Option<meerkat_mob::Generation>` (it was
+    `Option<ContinuityGeneration>`). It gains `member_id: Option<String>`,
+    and so does `ConsoleIdentityRecord`. `LeaseInfo` and `ContinuityHealth`
+    are removed.
+  - `reset` and `reset_tracked` return the `meerkat_mob::MemberBinding` Core
+    committed instead of a `ContinuityRecord`.
+  - `statuses()` and `roster_inspect()` return a `Result`: when Core's member
+    history cannot be read they refuse with
+    `IdentityRuntimeError::MemberHistoryUnavailable` instead of reporting an
+    empty or guessed list.
+  - `RestoreOutcome` carries Core's binding instead of a continuity record:
+    `Dormant { draft }`, `Created { binding, draft, replaced_session }`,
+    `Resumed { binding, draft }`, and `Refused(Arc<IdentityRuntimeError>)`
+    in place of `Broken(ContinuityFailure)`. `binding` is the
+    `MemberRuntimeBinding` Core committed, and `replaced_session` names the
+    session a fresh wake replaced.
+  - `IdentityRuntimeError` loses `AlreadyEmbodied`, `EmbodimentRejected`,
+    `Lease`, `LeaseLost`, `NoActiveLease`, `StaleCheckpointVersion`,
+    `StaleContinuityGeneration`, `StaleFencingToken` and `Store`, and gains
+    `IdentityUnresumable`, `IdentityHistoryUnavailable`,
+    `MemberHistoryUnavailable`, `IdentityWakeRetryable`,
+    `IdentityHostAdopted`, `IdentitySessionAbsent`, `WakeHeld`,
+    `FirstBootManifestUnreadable`, `FirstBootRowRefused` and
+    `FirstBootRowPending`. A match on it, on
+    `IdentityLifecycleState` or on `RestoreOutcome` without a wildcard arm
+    must change.
+- `meta_repair` keeps only its composition-manifest repair,
+  `meta_repair --composition-manifests <manifest or state directory>
+  [--apply] [--report <file>]`. The session transcript repair modes are
+  removed with the 0.9.3 continuity projection they rewrote: `--db`,
+  `--session`, `--all-sessions`, `--keep-newest`, `--truncate-tool-results`
+  and `--drop-tool-results-older-than` now exit 2 with an error that points
+  at `meta_gateway storage-migrate-native`. The binary and its
+  `meta-repair` release archive stay. Run any 0.9.3 transcript repair you
+  still need before you migrate.
+- `SessionBridge::create_session(identity, spec, draft)` takes no runtime id
+  and no session id, and returns the `MemberRuntimeBinding` Core committed
+  (`agent_runtime_id`, and `session_id`, which is `None` for a member Core
+  binds to no session, such as a peer-only member). It returned the session
+  id. MobMachine mints the generation, so a caller never supplies one.
+- `SessionBridge::create_session_held(identity, spec, draft, pass)` takes no
+  runtime id and no session id, and returns `MemberRuntimeBinding` like
+  `create_session`.
+- `SessionBridge::resume_session(identity, spec, draft, session_id,
+  resume_from_role)` resumes the durable Core session by id. It takes no
+  runtime id and no `SessionSnapshot`; `resume_from_role` is the role the
+  caller decided the member migrates from (`None` for no migration).
+  `MobSessionBridge` no longer falls back to the activation's declared
+  migration when the caller passes `None`.
+- `SessionBridge::requires_resume_snapshot` is removed. Behaviour: a bridge is
+  never handed the continuity payload, and with a bridge installed the
+  runtime no longer loads the session snapshot before a resume.
+- `SessionBridge::reset_member_to_successor` returns `MemberRuntimeBinding`.
+  `ResetSuccessorBinding` is removed.
+- Every `ResumeSessionOutcome` variant (`Resumed`,
+  `AttachedPendingRegistration`, `FreshSpawned`) carries the
+  `agent_runtime_id` Core committed for the member, read back from the
+  roster, and `ResumeSessionOutcome::agent_runtime_id()` returns it.
+  Patterns and constructors that list the fields must add it.
+- `BridgeError` gains `Unsupported { operation }`. It is the answer of a
+  `SessionBridge` read a bridge does not implement.
+- `BridgeError` and `ResumeRejectionKind` are `#[non_exhaustive]`: a match
+  outside the crate needs a wildcard arm.
+- `ResumeRejectionKind` carries Core's typed answer: `Unavailable { reason }`
+  (Core's `SessionResumeUnavailableReason`), `Held { hold }` (Core's
+  `DurableResumeHold`), `RoleMigrationNotApplied`, `MemberRestoreFailed`
+  (a restore failure without a hold) and `Other`. `ArchivedNotRevivable`,
+  `AuditedEndpointDivergence` and `TranscriptContinuity` are removed; their
+  cases are `Unavailable { reason: ArchivedNotRevivable }`,
+  `Held { hold: AuditedEndpointDivergence }` and `Other` (no error text is
+  classified).
+- `BridgeError::ResumeRejected` and `BridgeAdmissionError::ResumeRejected`
+  gain `session_id`, the session the resume asked for. Their display text
+  names it and no longer ends with "durable session preserved, identity
+  degraded pending retry".
+- Behaviour: `MobSessionBridge::resume_session` no longer spawns a fresh
+  member when Core holds no durable copy of the session. It refuses with
+  `ResumeRejected { kind: Unavailable { reason: Absent }, session_id, .. }`,
+  and the identity runtime wakes the identity on a fresh session in its
+  place (the `ResumeFallback` event still reports `NeverPersisted`, now
+  naming the replaced session).
+- `BridgeError` gains `HostAdopted { identity }`. Behaviour:
+  `MobSessionBridge::ensure_member_live` and the resume collision path read
+  Core's identity intent row first and refuse with `HostAdopted` when one
+  exists (Present or Absent; Meta writes none, so the row is the host's, for
+  example from `mob/adopt_member_identity_declaration`). Nothing is attached,
+  ensured or retired. Before, a Present intent naming the resumed session
+  waited for convergence and attached the member, and an Absent intent let
+  the bridge retire the occupant. A row that cannot be read is refused as
+  retryable.
+- Behaviour: when a member's event stream closes for good, or stays
+  unavailable after bounded retries, the identity is no longer marked
+  `Broken` for repair. The stream loss is logged as a warning and the stream
+  is re-attached; Core owns the member's materialization.
+- Behaviour: the delivery repair no longer spawns a fresh member
+  when Core holds no durable copy of the member's session. The delivery fails
+  with `ResumeRejected { kind: Unavailable { reason: Absent }, .. }`, as the
+  resume does. When no durable authority knows the session, the repair
+  refuses before it retires the member, so the member and its queued inputs
+  are kept.
+- `ResumeRejectionKind` gains `SourceUnanswered { authority }`. Behaviour:
+  before the collision repair or the delivery repair retires a member, it
+  asks the archive authority whether the member's session exists. When that
+  read fails, the repair now refuses with
+  `ResumeRejected { kind: SourceUnanswered { .. } }` before the retire, and
+  nothing is disposed or retired. Before, the repair went ahead with its
+  retire. The refusal is retryable.
+- `MobSessionBridge::with_continuity_session_store` is removed. A bridge no
+  longer writes member sessions through Meta's continuity projection: Core
+  owns every member's session. Build the bridge with `new`,
+  `with_session_service` or `with_session_store_and_service` instead.
+  `LocalContinuityStore` keeps the identity records at runtime, and both it
+  and `ContinuitySessionStoreAdapter` stay for the native migration, which
+  reads a 0.9.3 directory's continuity data.
+- `BridgeError` gains `LiveMemberMoved { identity }`. `live_member` and
+  `ensure_member_live` return it when a respawn lands between their
+  incarnation and session reads twice in a row; nothing is recorded and a
+  later call can succeed.
+- Behaviour-only: the identity runtime adopts the runtime id Core committed
+  on create, held create and resume, so `IdentityStatus.agent_runtime_id`
+  names Core's current incarnation (a resume after a retirement reports the
+  new generation).
+- Behaviour: a held identity bootstrap decides whether a roster member is
+  fresh from Core alone. A member is fresh when Core's member history holds
+  no binding for it since the latest mob reset and no first-boot row is
+  still to carry out for it; any other member still refuses the whole pass
+  with `HeldBootstrapRefusal::ExistingContinuity` (the name is kept) before
+  any member is held. Meta takes no lease and writes no continuity record
+  for a held member: Core never publishes an aborted or expired held member,
+  so the identity gains no binding and a later held pass holds it again. The
+  refusal's message now reads `<identity> is not fresh (Core already spawned
+  it, or a first-boot row is still to carry out for it); only fresh members
+  can be held`.
+- Behaviour: a member a held pass did not publish keeps owing its host a
+  held completion across a restart: the pass marks every roster identity in
+  `<state_dir>/held-completion-owed/` (one file per identity) before it
+  creates any member and removes a member's mark when it publishes it.
+  After a restart an ordinary bootstrap or wake refuses a marked member with
+  `HeldCompletionOwed` instead of publishing it without the host's
+  completion; a held pass that covers it publishes it. A runtime without a
+  state directory keeps the marks in memory only.
+- `meerkat_meta::extension_state::IdentityPublication`,
+  `UnifiedRuntimeBuilderError::ExtensionAuthorityUnavailable` and the
+  `SessionBridge::begin_extension_identity_publication` default method are
+  removed. Extension documents resolve a member session's principal from
+  Core's member binding history, so the identity publication fence, the
+  history coverage anchor and the history enable at build are gone.
+- `ConsoleFrameMemberProvenance` has a new public field, `lineage`
+  (`Vec<ConsoleFrameLineageLink>`): the member and its spawn ancestors as
+  recorded with a timeline frame. Code that builds the struct with a literal
+  adds `lineage: Vec::new()`; frames stored without it read as empty.
+- `ValidatedJwt` has a new public field, `issued_at_epoch_seconds`
+  (`Option<u64>`): the token's `iat` claim. Code that builds the struct with
+  a literal adds `issued_at_epoch_seconds: None`.
 - Behaviour-only: the console's identity routes (`meta/status_identity`,
   `meta/inspect_identity`, `meta/retire`, `meta/respawn`, `meta/reset` and
   `meta/delete_identity` on `/console/rpc`) refuse a generated runtime id
@@ -125,6 +535,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   own YAML parsing already used serde-saphyr, and the Meerkat Core 0.9.4
   crates parse SKILL.md frontmatter with serde-saphyr as well, so `deny.toml`
   no longer ignores that advisory.
+- Open event streams decide each frame right before they send it, under the
+  access configuration committed at that point: the console timeline and
+  identity streams, `/agents/{agent_id}/events`, `/mob/events`,
+  `/meta/mob_events/stream` and the WorkGraph facts stream. A stream whose
+  own grant is withdrawn (`agent.view` on its agent, `mob.observe`, or
+  `workgraph.view`) ends when the change is committed, and its client
+  reconnects under the current configuration. The timeline streams judge a
+  member that joined while they were open by its own labels and role.
+- Open event streams end once the token that opened them is no longer
+  accepted: 30 seconds after its `exp`, when a request with the same token is
+  refused. This covers the console timeline, identity and gating streams,
+  `/agents/{agent_id}/events`, `/mob/events`, `/meta/mob_events/stream` and
+  the WorkGraph facts stream, with or without access control, and a token a
+  caller volunteers on a console that does not require sign-in. The stream
+  ends without a final frame, and nothing it decides after that point is
+  sent.
+- No member may take `_system` or `__console__`, the identities the console
+  reserves for its own events (identity-less memory events and source-gap
+  markers). Every Meta path that creates a member refuses them: the RPC and
+  console spawn, ensure and fork methods, the Rust spawn API, the members a
+  runtime's bootstrap discovery declares, roster reconcile, identity-first
+  materialization, agent mob tools in the host mob and in child mobs,
+  helpers, forks, respawns, and spawns that a host spawn customizer renames
+  or labels. A member that already holds one of these names still comes up,
+  but the console attributes none of its events, sends or history to them;
+  the runtime logs each such member when it starts, and `meta/status` lists
+  it under `reserved_identity_members`. The console also refuses them as the
+  member of a mob announcement subscription
+  (`meta/mob_announcements/subscriptions/put` on `/console/rpc`).
+- Console timeline frames are decided by the member as the console recorded
+  it with each frame: its identity, role and labels, and the spawn ancestors
+  its lineage names, taken only from the member that performed each spawn.
+  This covers the REST window, `meta/console/query_timeline` and the
+  timeline and identity streams. A frame is visible only when both the
+  recorded and the current attributes allow it; a member no longer on the
+  roster is decided by the recorded attributes alone. A frame recorded
+  without member attributes (among them a frame that names no session of
+  the member that wrote it), and an ancestor that could not be confirmed,
+  are refused under any deny rule the identity alone cannot decide (a role
+  or label selector, or one naming another agent). Each frame is decided
+  before it is shaped for the caller, so a page counts only frames the caller
+  may see, and a recent-mode query whose scan reaches its budget with nothing
+  visible returns an empty page with a cursor to continue from.
+- A principal's Console sessions can be revoked:
+  `meta/console/revoke_sessions` sets a fence at the current instant, and
+  from then on the Console refuses with 401, on every route the runtime
+  serves and on the `auth_token` query parameter alike, each token of that
+  principal whose `iat` is earlier than the fence plus 30 seconds, or that
+  has no `iat`. Every event stream, console voice session and gating stream
+  such a token opened ends at once, whether or not access control is
+  configured and whether or not the token has an `exp`. The 30 seconds are
+  the verifier's clock leeway: a token minted just before the revocation by
+  an issuer whose clock runs ahead is refused too, and so is a sign-in
+  within 30 seconds after it. The fences live in their own file in the
+  gateway's state directory (`console-session-fences.json`), apart from the
+  access configuration. A binary without fences neither reads nor rewrites
+  the file: it does not enforce them while it runs, and they apply again
+  after the upgrade. A gateway without a durable state directory refuses the
+  revocation.
+- Console voice sessions end when the token that opened them is no longer
+  accepted: 30 seconds after its `exp`, or when its principal's sessions are
+  revoked.
+- A principal the Console accepted a token without `exp` for is listed, by
+  the principal and a non-expiring flag only, in `meta/status`
+  (`non_expiring_console_principals`) and in the storage doctor
+  (`console-non-expiring-principal`). Such a token is still accepted; only a
+  revocation ends it.
 - The console and the flow editor no longer fetch their fonts from Google
   Fonts. Their stylesheets imported Inter Tight and IBM Plex Mono from
   `fonts.googleapis.com`, so every console or flow editor load sent a
@@ -146,6 +623,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `tools/continuity-export/` holds two standalone scripts for deployments
+  whose 0.9.3 continuity lived behind an SDK continuity provider
+  (`continuity_store` on the builder): `continuity_export.py` (Python 3.10 or
+  later, standard library only) and `continuity-export.mjs` (Node.js 18 or
+  later). Run with every 0.9.3 gateway on the store stopped and the 0.9.3 SDK
+  still installed, either script calls only the provider's 0.9.3 read methods
+  and writes a versioned, SHA-256-checked continuity export file holding each
+  listed identity's continuity record and the exact bytes of its current
+  session snapshot, for `meta_gateway storage-migrate-native` to import. A
+  listed identity it cannot export as it stands (broken continuity, a missing
+  snapshot, a record that disagrees with the session index, an answer outside
+  the 0.9.3 wire shape, a snapshot too large for one entry of the file, about
+  400 MB) refuses the whole export and writes nothing; the output names each
+  such identity, its class and the action that clears it. A 0.9.3 gateway
+  that the Python or TypeScript SDK started with a continuity provider never
+  saved session snapshots to it (a 0.9.3 known issue: every restart started
+  every identity fresh), so each ready identity it left refuses as a missing
+  snapshot; `--missing-snapshot fresh` writes those identities as
+  uninitialized instead, so they start fresh after the upgrade too, with an
+  empty transcript, and lists each with its 0.9.3 record. The file holds one
+  entry per line under a header that counts, measures and hashes them, and
+  both scripts write and read it one entry at a time. `--verify` checks an
+  export file. Both scripts ship in the `v0.9.4` tag:
+  download them from there and check their SHA-256 digests before running
+  either (`sha256sum --check`, or `shasum -a 256 --check` on macOS, reads the
+  two digest lines below). `docs/guides/continuity-export.mdx` has the steps.
+
+  ```text
+  https://raw.githubusercontent.com/lukacf/meerkat-meta/v0.9.4/tools/continuity-export/continuity_export.py
+  https://raw.githubusercontent.com/lukacf/meerkat-meta/v0.9.4/tools/continuity-export/continuity-export.mjs
+  36ffe2f8da8e0e68a85b31b7045197a37cec9ba19fe9f9223872cf266457ae80  continuity_export.py
+  228771596cf78882d112bb574befc5a7c79913b755317dda00a7342235c7831e  continuity-export.mjs
+  ```
 - `GatewayHostComposition::operation_refusal_observer` lets a gateway host
   install Core's operation refusal observer on each gateway member factory.
   The gateway asks it with the same construction as `compose_member_factory`,
@@ -173,6 +683,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Publication releases those exact bytes as a prerelease that never becomes the
   latest release. `forge.yml` can now be dispatched, and records each job's
   toolchain. `installer/RELEASING.md` has the steps.
+- `AccessController::subscribe_revision` watches the revision of the
+  committed access configuration. The value changes after each committed
+  change, once the new configuration is visible to every reader; a refused
+  edit signals nothing, and changes in quick succession may be observed as
+  one.
+- `ConsoleFrameLineageLink`, one recorded link of a member's spawn lineage
+  (identity, runtime member id, role and labels; no labels for an ancestor
+  that could not be confirmed). Agent-tool spawns also register a
+  `spawned_by_session` console label next to `spawned_by`: the session of the
+  member that performed the spawn. Like `spawned_by`, only the spawn registry
+  may set it.
+- `meta/console/revoke_sessions` (`{"principal": ...}`) on the runtime's RPC
+  surface and the console's `/console/rpc` (an access admin when an access
+  controller is installed, enforced or not; any caller a token identified on
+  a console without one), answering the principal, the fence (`not_before`)
+  and the earliest `iat` accepted from then on (`accepts_tokens_issued_from`);
+  `-32004` when the runtime has no durable session fence record.
+  `ConsoleSessionFences` is that record:
+  `UnifiedRuntime::set_console_session_fences` installs it (the bundled
+  gateways open it in their state directory), and
+  `validate_console_token_under_session_fences` checks a token against it.
+  The standalone router constructors, `handle_console_rest_json_route*` and
+  `validate_console_token` apply no session fence; use the runtime's
+  routers, or the `_under_session_fences` variant.
+- `RuntimePlaneIdentityGuard::customizer()`, a spawn customizer that refuses a
+  member the console would attribute to one of its reserved identities. Every
+  mob a `MobBootstrapSpec` builds already composes it last; a host that adopts
+  a handle with `RealMobRuntime::from_handle` appends it last to the handle
+  builder's own spawn customizers.
 - `meerkat_meta::unobserved`: `UnobservedFacts` (built with
   `UnobservedFacts::new`) and `UnobservedReason` (`RefreshPending`,
   `NotObserved`), both `#[non_exhaustive]`. They are the shape of the
@@ -202,6 +741,176 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   code and the kind, with `member_id`/`memberId`, `reason` and
   `required_action`/`requiredAction`. Any other `-32029` stays a plain
   `RpcError`.
+- `meta_gateway storage-migrate --session-db <file>` brings in the session
+  database a 0.9.3 `meta_gateway` kept under the name its `store_path` gave
+  it. The file becomes `sessions.sqlite3` in the state directory (next to
+  another sessions copy it is a file-name twin, resolved with `--apply
+  --adopt <file>`), and its old path gets a retired stamp that a 0.9.3 gateway
+  refuses, so a 0.9.3 gateway started again with that `store_path` cannot
+  start empty there. It refuses typed and moves nothing when the file is
+  missing, not in the state directory or not a session database, when a 0.9.4
+  runtime has already started on the directory, and while another process
+  holds the directory's runtime locks. A rerun after a run that moved the
+  file and stopped before the stamp writes the stamp with `--apply`. Run it
+  before `storage-migrate-native`.
+- `meta_gateway storage-migrate-native --state-dir <dir> [--apply]
+  [--scratch-dir <dir>] [--mob-store <path>] [--continuity-export <file>]
+  [--discard-bodyless <session id>]... [--json]` migrates a 0.9.3
+  state directory, once and offline, onto Meerkat Core's native session and
+  identity stores. Without `--apply` it runs a census on scratch copies of
+  the databases and changes no database or state in the directory; it may
+  leave Meerkat Core's empty `.mfence` and `.mpresence` lock files there.
+  `--apply` refuses while
+  the census refuses any row; otherwise it journals every step, so a run
+  that stopped part way finishes when it runs again (a rerun after a stop
+  before Core wrote its claim to `runtime.sqlite` begins again with a new
+  census), keeps a pre-apply backup of each database it changes
+  (`<name>.pre-0.9.4-<timestamp>.native-migration`, which the storage doctor
+  lists and `meta_gateway storage-prune` deletes), converts `runtime.sqlite`
+  in place to Core's head-canonical profile, imports the sessions only the
+  projection holds, writes the first-boot manifest the identity runtime
+  carries out and keeps a copy of it beside the backups (`storage-prune`
+  keeps that copy while the manifest exists), and retires the old
+  session projection (`sessions.sqlite3`
+  takes a retired stamp; `continuity.sqlite3` keeps its identity records and
+  loses its session rows).
+  A session whose authority in `runtime.sqlite` has lost its body, which no
+  release can load, refuses the census; `--discard-bodyless <session id>`
+  (repeatable) lets `--apply` discard it after the backup, import the
+  projection's copy of the session when it holds one, and report the rows
+  Core keeps for the discarded runtime.
+  `docs/guides/upgrading-to-0-9-4.mdx` lists the census refusals and the
+  way back to 0.9.3.
+- `meta_gateway identity-census --state-dir <dir> [--scratch-dir <dir>]
+  [--json]` is an offline, read-only census of the identities a native
+  (0.9.4) state directory names (Core's durable bindings, the continuity
+  records, the first-boot manifest rows and the held-completion marks), for
+  deploy-time readers that work on a copy of the directory while no
+  gateway runs on it. It writes nothing in the directory: it reads copies
+  of the directory's top-level files (not the backups, the quarantined
+  files or `-shm` files), taken into a temporary directory or under
+  `--scratch-dir`, and reads the held-completion marks in place. A
+  directory a runtime holds is refused (`runtime_in_use`), and so is one
+  that is not migrated (`needs_migration` or `migration_incomplete`, whose
+  `remedy` names `storage-migrate-native`). `--json` prints the report with
+  format `meerkat-meta.identity-census`, version 1; the exit codes are 0
+  read, 1 refused, 2 usage error. With in-memory mob storage, `mob_store`
+  is null and `mob_store_note` says why the binding facts are null. Per
+  identity the report gives:
+  - `session_id`, `generation` and `member_id` of Core's last binding since
+    the latest mob reset, live or retired;
+  - `live`, and `agent_runtime_id` while the member is live (the value
+    `meta/status_identity` reports);
+  - `runtime_id`, the runtime id under which `runtime.sqlite` holds the
+    session's authority, and `retired`, when Core's session catalog marks
+    that session lifecycle-terminal;
+  - `held_completion_owed`, when the identity owes its host a held
+    completion (its mark is present and Core holds no binding of it since
+    the latest mob reset), and `pending_first_boot_row`, the identity's
+    first-boot manifest row as the manifest spells it.
+- `meta_gateway identity-reset --state-dir <dir> --identity <identity>
+  [--mob-store <path>] [--apply] [--json]` gives one identity of a stopped
+  state directory a fresh life at its next start. It writes a `Fresh` row to
+  the directory's first-boot manifest, and the next start replaces a live
+  member by its successor on a fresh session (a retired identity gets a
+  fresh session and stays dormant). The old session stays in Core's store,
+  bound to nothing. Unlike the online reset, nothing of the old session is
+  distilled into agent memory. A dry run is the default; `--apply` writes the
+  row.
+- Typed SDK errors for the identity refusal codes, in both SDKs:
+  `IdentityUnresumableError` (-32051, final),
+  `IdentityHistoryUnavailableError` (-32052, retryable),
+  `IdentityHostAdoptedError` (-32053) and `IdentityWakeHeldError` for a wake
+  held until an operator acts (-32603 with a structured data `kind`).
+- `IdentityStatus` and `IdentityInspection` carry `intent_managed`, Core's
+  `convergence` status, the last `wake_refusal` and the `replaced_session`
+  (TypeScript `intentManaged`, `convergence`, `wakeRefusal` and
+  `replacedSession`). `IdentityStatus` also carries `runtime_mode` and
+  `customizer_tools_pending`, and `IdentityInspection` the
+  `agent_runtime_id` and `session_id`. `MemberHealth` carries
+  `wake_refusal`, and bootstrap restore progress the refusal's error `code`.
+- The bootstrap status (`identity_bootstrap_status()` and
+  `wait_identity_bootstrap()`; TypeScript `identityBootstrapStatus()` and
+  `waitIdentityBootstrap()`) lists `first_boot_pending` (TypeScript
+  `firstBootPending`): the rows of the `storage-migrate-native` first-boot
+  manifest the gateway has not carried out yet, each with its `identity`,
+  `kind` (`resume` or `fresh`) and `waiting_for` (`roster` or `carry_out`).
+  `StorageResolutionError` (-32014) exposes the refusal's `kind`,
+  `identity`, `row_kind`, `manifest_session`, `core_session`, `operation`,
+  `path`, `waiting_for`, `remedy` and `retryable` (TypeScript camelCase),
+  which name the first-boot refusals `first_boot_manifest_unreadable` (its
+  `path`), `first_boot_row_refused` and `first_boot_row_pending` (what it
+  waits for, and the remedy `add_to_roster` or `wake_identity`).
+- `SessionBridge::live_member`, `live_member_scope`, `ensure_member_live` and
+  `identity_convergence_status` answer by identity from Core's roster (the
+  committed runtime id and bound session, the delivery scope, a live
+  ensure, the stored convergence observation). Their defaults return
+  `BridgeError::Unsupported`. `SessionBridge::declared_role_migration`
+  returns the migration the host declared for the identity (default
+  `None`). `PublicSessionBridge` forwards all of them.
+- `MemberRuntimeBinding { agent_runtime_id, session_id }`.
+- `SessionBridge::identity_labelled_members` (default `Unsupported`, read as
+  none).
+- `SessionBridge::capture_queued_member_inputs` and
+  `readmit_queued_member_inputs` (their defaults capture and admit nothing;
+  `PublicSessionBridge` forwards both). The identity runtime uses them to
+  carry the inputs other senders had queued on a member whose session Core
+  no longer holds into the identity's fresh life.
+- `meta/status_identity` and `meta/inspect_identity` answer `member_id`,
+  Core's mob member id of the identity's last binding, live or retired (the
+  roster member id: the identity itself when it is already a valid comms
+  name, its `mk--...` encoding otherwise), from the same binding as
+  `session_id`, and absent when Core holds no binding; identity records of
+  `meta/console/list_identities` carry it too. Both SDKs read it
+  (`IdentityStatus.member_id` and `IdentityInspection.member_id`, TypeScript
+  `memberId`; Python `ConsoleIdentityRecord.member_id`). Read-only and
+  additive on the wire.
+- `IdentityRuntime::set_held_completion_state_dir`, for embedders that build
+  their own identity runtime, points the held-completion marks at their
+  state directory; `identity_first::HELD_COMPLETION_OWED_DIR` names the
+  marks' directory.
+- `identity_first::live_binding_runtime_id(&MemberBinding)` returns Meta's
+  public runtime id (`rt:{identity}:{generation}`) of a binding Core holds
+  live, and `None` once the binding is retired.
+- `IdentityRuntime::retire_at_scope_tracked` (also on
+  `PublicIdentityRuntime`) retires an identity only at a `DeliveryScope` the
+  host captured with `capture_delivery_scope`, and Core decides: meerkat's
+  `MobHandle::retire_at_scope` retires exactly the member incarnation the
+  scope names, with `retire`'s process-tree semantics, and re-checks the
+  scope in each step's own actor command, so a successor minted by a
+  respawn, reset or wake after the capture is never retired through the old
+  scope. When the scope names Core's live member, the ordinary retire's
+  memory hooks run first. Meta holds no lease and writes no continuity record
+  for it; it returns the Core fence of the incarnation the scope names, and
+  `Ok` is meerkat's terminal barrier, so a retry at a retired scope converges
+  to `Ok`. A refusal does not retire the scope's member: `Unsupported`,
+  `Rejected`, `Refused` (a host-adopted identity, or Core's intent row
+  unreadable), or `StaleScope`, final for the scope (`RuntimeId`,
+  `LeaseFencingToken` or `MemberBinding`, which also answers a scope
+  captured at another incarnation of the mob). Descendants retired before a
+  `StaleScope` or `Rejected` answer stay retired.
+  `retire_member_alias_tracked` checks the generated alias only, so a
+  session move under the same generation still passes it.
+- `IdentityFirstRuntimeContext::add_member_held` (also on
+  `PublicIdentityFirstContext`) adds one fresh member to a running roster,
+  held at its producer hold point until the host has completed its
+  application from the member's finished surface, while every other member
+  keeps running. It is the one-member counterpart of `bootstrap_roster_held`:
+  the same bootstrap controller (a roster pass waits for it), the same one
+  terminal decision (deadline first, then the caller's loss, then the host's
+  completion) and settlement, and the same `HeldBootstrapStart`. It never
+  reconciles the roster or changes the managed peer edges. A host lists the
+  member's spec in its roster provider from inside its completion, where the
+  add still holds the controller, so no pass of the attached context
+  embodies the member unheld, and unlists it when the add ends unsettled.
+  Freshness is Core's member history, as for a held roster bootstrap: an
+  identity Core spawned since the latest mob reset, or one a first-boot row
+  names, is refused (`ExistingContinuity`), and a host-adopted identity is
+  refused (`IdentityHostAdopted`). The add marks the owed held completion
+  durably before the member exists and clears the mark on publish, so an
+  aborted add stays owed across a restart: every pass other than a held one
+  refuses the member (`HeldCompletionOwed`) until a held pass, such as
+  adding it again, publishes it.
 
 - Mob announcements. The host announces a development to a mob hosted on
   this gateway; member subscriptions, keyed by `{mob_id, identity}`, take the
@@ -379,9 +1088,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   stays for wire compatibility, as `meta/respawn` keeps its retired
   warnings; `meta/reset_all` dropped the same warning for the same reason.
   Identity control calls still reject a stale runtime id.
+- The console no longer shows a member's checkpoint version or lease health
+  (the roster's Chk and Lease columns, and the Checkpoint, Lease and Lease
+  Healthy rows of the member and identity details), because Meta keeps no
+  continuity copy and holds no leases. The sidebar marks a member degraded
+  when its identity's view state is `broken`; it read the lease health
+  before.
+- Extension documents resolve a member's principal from Core's member
+  history: a member of the identity mob acts as its identity when Core's
+  durable-identity marker for that identity is on its session's binding or
+  its current-life binding. Meta 0.9.3 never set the marker. Every roster
+  pass respawns a live member that lacks it onto the same session, keeping
+  the transcript, and a member that is not live gets the marker at its next
+  wake. Until then such a member resolves no principal
+  (`AuthorityUnavailable`), never a worker. A live member the pass leaves
+  as it is because its role differs from the roster profile needs
+  `meta/respawn` with a declared role migration; one whose session Core
+  holds no durable copy of is left running, and a later pass respawns it
+  once Core holds its session.
+- A per-agent event stream of an identity follows its session: a retire no
+  longer ends it; a reset, a delete, a respawn that mints a session, a
+  roster removal, or a mob reset or destroy does.
+- A maintenance verb such as `meta/compact_member` whose member a retire
+  ended before the verb's input was admitted answers that the member's
+  incarnation changed (`PostAdmissionSuperseded`, JSON-RPC `-32603` with no
+  `data`), no longer that the identity's member history could not be read
+  (`IdentityHistoryUnavailable`, JSON-RPC `-32052` with `data.kind`
+  `identity_history_unavailable` and `retryable: true`).
+- The storage doctor reports a `*.mpresence` presence-lock file as a
+  `maintenance-fence-lock` finding, as it reports `*.mfence`. Meerkat Core
+  0.9.4 creates one next to a SQLite database whose connection is kept open
+  between operations, and maintenance creates one at every database it
+  fences.
+- Forks of a member with activated host instructions follow Meerkat 0.9.4's
+  fork instruction policy, set by the new `runtime_options.fork_instruction_policy`
+  (Python `.fork_instruction_policy(...)`, TypeScript `.forkInstructionPolicy(...)`;
+  Rust: `UnifiedRuntimeBuilder::fork_instruction_policy`, or
+  `MobBootstrapSpec::with_fork_instruction_policy` on a spec the host builds;
+  `meta_gateway` runs Meerkat's default). The default,
+  `require_explicit_activation`, refuses a `fork_off`, delegation fork or council
+  participant of such a member with a typed `fork_instruction_refused` before
+  anything is committed, where 0.9.3 committed a child whose first turn failed; a
+  console fork still leaves the activation to the host. `reactivate_inherited`
+  re-activates the source's effective instructions in the child, and `refuse`
+  refuses every fork that would inherit one. The council card shows the
+  refusal's cause.
 
 ### Fixed
 
+- A roster pass retires a live member that carries the identity-first
+  `agent_identity` label when the roster no longer lists its identity,
+  including a member Meta 0.9.3 spawned without the durable-identity marker.
+  Before, such a member stayed live after its identity left the roster.
+- A gateway start no longer leaves the mob stopped when the previous process
+  stopped uncleanly part way through its shutdown Stop. The mob's log then
+  ends in that Stop, unfinished, and Core finishes it in the background after
+  the resume. The boot now waits (up to 60 s) for that Stop to land, then
+  resumes the mob to Running as it does for any stopped mob. Before, the boot
+  usually read the mob as running, never resumed it, and every send was
+  refused with "invalid state transition: Stopped -> Running".
+- If that Stop does not land within 60 s, the start is refused instead of
+  running a mob that accepts no work.
+- Shutdown counts a Stop on a mob that is already stopped as a stopped mob.
+  Before, it was reported as a failed mob stop, skipped the child stand-down
+  and exited with status 1, which left the next start in the same state.
+- On a runtime whose sessions live in memory only (no persistent state), an
+  identity respawn refuses before it retires anything, since retiring the
+  member would end its session's only copy. The refusal is typed
+  (`InvalidState`), and the member stays live on its session. A wake after a
+  retire on such a runtime starts the identity's fresh life on a new session
+  and names the replaced one; the old session's transcript is gone with its
+  member. Before, the respawn retired the member and then failed every wake
+  as retryable, so the identity never came back.
+- A completion wait (`meta/wait_for_completion`) on an identity that a retire
+  moves no longer runs to its deadline. The retire signalled the waiters while
+  it still held the identity, and nothing signalled when it let go.
+- An identity's status and member health no longer report a live member once
+  the runtime has begun shutting down.
+- After a restart, a restored member whose customizer tools the mob build
+  could not publish (an early `customize_build` failure) runs again once
+  they are published. Before, a publication by the bootstrap left meerkat's
+  run-start hold in place, and a member Core restored live never published
+  them at all, so the member started no run and every send to it waited.
+  While its tools still cannot be published, a wake or a send of the member
+  is refused instead of queueing behind the hold: as retryable
+  (`IdentityWakeRetryable`), or as `ToolArtifactRefused` when the host's tool
+  artifact is refused.
+- A resume that collides with a spawn of the same member still in Core's
+  custody (a client retry) adopts that spawn once Core has committed the
+  member. Before, it could read the member's session binding before the
+  roster commit and fail with "no committed roster entry".
+- A spawn customizer composed with another one through
+  `identity_first::ComposedSpawnMemberCustomizer` is asked its own
+  `customize_resume` when a member is rebuilt on its durable session.
+- A spawn customizer set on a `MobBootstrapSpec`
+  (`with_spawn_member_customizer`) runs when classic agent memory is on: both
+  run, the host's customizer first.
 - Meta Forge's packager accepts the frontend it has just built. esbuild
   carries the file names that installed packages' own source maps give
   (inline-style-parser's `index.js`, the MCP SDK's TypeScript sources) into
@@ -441,9 +1243,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and names the refusal in its new `skill_refusal` field (see Added).
 - The `complete_held_identity_members` documentation no longer says that
   resumed members are skipped. A held identity bootstrap holds fresh members
-  only: a roster member that already has continuity refuses the whole pass
+  only: a roster member that is not fresh refuses the whole pass
   (`HeldBootstrapRefusal::ExistingContinuity`) before any member is held, as
-  it did before.
+  it did before. The held identity bootstrap line under Breaking says how a
+  member counts as fresh.
 - The durable-behind repair's INFO log names the durable and parent row
   counts (`durable_messages`, `parent_messages`), the first committed rewrite
   it replays (`first_rewrite_generation`) and how many it replays
@@ -543,14 +1346,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   whose transcript history had retired its oldest compaction (it keeps 4 by
   default), so every later turn failed and asked for a runtime reload that
   failed the same way. Meerkat Core 0.9.4 derives that head.
+- A mob member respawned through Meta keeps the restrictions it was spawned
+  under, with meerkat's respawn fix: Meta's session wrappers (the pre-build
+  wrapper and the after-create wrapper) forward meerkat's read of the
+  predecessor's spawn-time restrictions to the inner session service.
+  Unforwarded, meerkat's default refuses that read, and every member respawn
+  through Meta would be refused.
 
 ### Known limitations
 
+- After a gateway restart, an identity a host adopted runs again only once
+  the previous process's identity lease expires, at most 30 s after that
+  process last renewed it; until then its status's `convergence.decision`
+  reads `await_lease`, and a send or dispatch to it answers `-32052`
+  (retryable). A scoped dispatch to it is refused with `-32603`
+  (`scoped_delivery_rejected`) while Core holds no live member. No Core
+  runtime path releases the lease at shutdown; a Core fix is planned for a
+  later release.
+- With a non-disk `storage_provider()` backend holding the runtime store,
+  startup does not check that store against the mob's identity bindings: the
+  `RuntimeStoreMissing` check reads only a local `runtime.sqlite`. If the
+  backend has lost sessions the mob still binds, those identities start
+  fresh, with no history: startup does not refuse, and only each identity's
+  status reports it (`replaced_session`). A check that covers provider
+  backends is planned for a later release.
 - A member that leaves a mob ends nothing for mob announcements. No 0.9.4
   gateway answers `member_departed`, and none records a final fact that a
   member retired or was deleted, so the member's subscriptions wait, typed,
   as for a member that is not registered. Its owed batches expire after the
   retention window, and `subscriptions/cancel` ends its subscriptions.
+- On macOS and Windows, and on Linux where the kernel's lock table cannot
+  name the custody lock's holders (as on btrfs subvolumes, or on overlayfs
+  such as a container root without a volume), while this process's previous
+  runtime on a state directory is alive (shut down, with its handles still in
+  scope), a new runtime in the same process does not detect a holder that
+  does not run 0.9.4's startup check (for example an older release or a
+  Core-only tool on the same directory). Elsewhere on Linux it is detected:
+  there the new runtime starts only when the kernel's lock table shows this
+  process as the custody lock's only holder.
+- `meta_gateway identity-reset` keeps no copy of the first-boot manifest it
+  rewrites. If that file becomes unreadable, the copy
+  `storage-migrate-native --apply` kept lacks the reset rows: run
+  identity-reset again for each reset made since.
+- If a storage write or the host fails after an identity's member
+  retirement has durably started (in its adoption, retire, reset or
+  respawn), the identity stays in `Backoff` in its convergence status, and
+  sends to it are refused, until the gateway restarts: the restart drives
+  the retirement again and recovers it. An embedder can also stop and
+  resume the mob (`MobHandle::stop`, then `resume`). A Core fix is planned
+  for a later release.
 
 ## [0.9.3] - 2026-10-18
 

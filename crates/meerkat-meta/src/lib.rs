@@ -66,6 +66,7 @@ pub mod mob_composition_manifest;
 pub mod mob_handle_runtime;
 pub mod mobpack;
 pub mod mocks;
+pub mod native_startup;
 pub mod process;
 pub mod protocol;
 pub mod public_live_config;
@@ -73,16 +74,18 @@ pub mod rpc;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod rpc_gateway;
 pub mod runtime;
-#[cfg(test)]
+#[cfg(all(test, feature = "openai-live"))]
 #[allow(clippy::expect_used)]
 mod runtime_store_forwarding_probe;
 pub mod schedule_wiring;
 pub mod shutdown_signal;
 pub mod spec_update_ceremony;
+pub mod state_dir_claim;
 pub mod storage_doctor;
 pub mod storage_health;
 pub mod storage_layout;
 pub mod storage_migrate;
+pub mod storage_migrate_native;
 pub mod storage_predecessor;
 pub mod storage_provider;
 #[cfg(test)]
@@ -111,6 +114,10 @@ pub use access::{
 pub use actor_loop_health::{
     ActorLoopHealth, ActorLoopHealthKind, ActorLoopHealthReport, ActorLoopHealthState,
 };
+pub use auth::session_fence::{
+    CONSOLE_SESSION_FENCES_FILE, ConsoleSessionFence, ConsoleSessionFences,
+    ConsoleSessionFencesError, ConsoleSessionRecordSummary, read_console_session_record,
+};
 pub use auth::{
     GATEWAY_PEER_KEY_FILE, GatewayPeerKeyError, GatewayPeerKeys, Jwk, JwksCache, JwksCacheConfig,
     JwksCacheError, JwksDocument, JwtHeaderView, JwtValidationConfig, JwtValidationError,
@@ -137,14 +144,14 @@ pub use compaction_policy::{
 pub use config_convention::ConventionalPaths;
 pub use console_aggregator::{
     AllowAllConsoleVisibilityPolicy, AppendDisposition, AppendOutcome, ConsoleAggregatorOptions,
-    ConsoleCursor, ConsoleFrame, ConsoleFrameMemberProvenance, ConsoleFrameSource,
-    ConsoleFrameSourceKind, ConsoleFrameStatus, ConsoleIdentityInspection, ConsoleIdentityRecord,
-    ConsoleInteractionAccepted as ConsoleTimelineInteractionAccepted, ConsoleLogError,
-    ConsoleLogResult, ConsoleLogStore, ConsoleReplayUnavailable, ConsoleRuntimeRegistration,
-    ConsoleSendDedupeDurability, ConsoleSendRequest, ConsoleTimelineEvent, ConsoleTimelineMode,
-    ConsoleTimelinePage, ConsoleTimelineQuery, ConsoleTimelineQueryError,
-    ConsoleTimelineQueryResult, ConsoleTimelineWindowPage, ConsoleTimelineWindowQuery,
-    ConsoleTurnOrigin, ConsoleVisibility, ConsoleVisibilityPolicy,
+    ConsoleCursor, ConsoleFrame, ConsoleFrameLineageLink, ConsoleFrameMemberProvenance,
+    ConsoleFrameSource, ConsoleFrameSourceKind, ConsoleFrameStatus, ConsoleIdentityInspection,
+    ConsoleIdentityRecord, ConsoleInteractionAccepted as ConsoleTimelineInteractionAccepted,
+    ConsoleLogError, ConsoleLogResult, ConsoleLogStore, ConsoleReplayUnavailable,
+    ConsoleRuntimeRegistration, ConsoleSendDedupeDurability, ConsoleSendRequest,
+    ConsoleTimelineEvent, ConsoleTimelineMode, ConsoleTimelinePage, ConsoleTimelineQuery,
+    ConsoleTimelineQueryError, ConsoleTimelineQueryResult, ConsoleTimelineWindowPage,
+    ConsoleTimelineWindowQuery, ConsoleTurnOrigin, ConsoleVisibility, ConsoleVisibilityPolicy,
     HideImplicitDelegateMembersConsoleVisibilityPolicy, InMemoryConsoleLogStore,
     MetaConsoleAggregator, NewConsoleFrame, ReplaySubscriptionEffect, ReplaySubscriptionState,
     ReplaySubscriptionTransition, SendEffect, SendState, SendTransition, SourceIngestionEffect,
@@ -211,6 +218,7 @@ pub use live_contracts::{
 };
 pub use meerkat_mob::{MemberTurnEventSender, MemberTurnHandle, MemberTurnOptions};
 pub use meerkat_mob_mcp::ChildToolBundleAvailability;
+pub use member_comms_id::RuntimePlaneIdentityGuard;
 #[cfg(not(target_arch = "wasm32"))]
 pub use member_mcp_custody::{MEMBER_MCP_SETTLEMENT_BUDGET, MemberMcpCustody};
 pub use memory::{
@@ -301,10 +309,11 @@ pub use storage_layout::{
 pub use storage_migrate::{
     DivergenceStatus, FileRenameEntry, LedgerBaselineAction, LedgerBaselineEntry,
     MetaMaintenanceFence, MetaMigrateReport, MetaPruneArtifact, MetaPruneReport, MigrateMode,
-    PruneAction, PruneArtifactKind, RenameAction, RowDivergenceEntry, SiblingRename, TwinReport,
-    TwinResolution, enumerate_state_dir_artifacts, enumerate_state_dir_databases,
+    PruneAction, PruneArtifactKind, RenameAction, RowDivergenceEntry, SessionDbOutcome,
+    SessionDbRefusal, SessionDbReport, SiblingRename, TwinReport, TwinResolution,
+    enumerate_state_dir_artifacts, enumerate_state_dir_databases,
     is_registered_backup_artifact_name, is_registered_quarantine_artifact_name, migrate_state_dir,
-    migrate_state_dir_acknowledging_skipped, prune_state_dir,
+    migrate_state_dir_acknowledging_skipped, migrate_state_dir_with_session_db, prune_state_dir,
 };
 pub use storage_provider::{
     DiskMetaStorageProvider, MeerkatLevelRealmDeclaration, MetaLeaseAuthority,

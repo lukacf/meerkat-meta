@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use meerkat_core::SessionStoreError;
 use meerkat_core::session_store::{
     SessionHead, SessionHeadCas, StrandLayout, TranscriptStrandId, reconstruct_rewrite_record,
-    session_head_cas_token, strand_layout_for_history, validate_commit_rewrite_transition,
-    validate_save_head_transition,
+    session_head_cas_token, strand_layout_for_history, strand_layout_for_retained_history,
+    validate_commit_rewrite_transition, validate_save_head_transition,
 };
 use meerkat_core::types::Message;
 use meerkat_core::{Session, TranscriptRewriteCommit, TranscriptRewriteRecord};
@@ -1853,6 +1853,14 @@ impl MaterializedBlobLayout {
     }
 }
 
+/// The whole-graph blob layout a head-canonical write persists, and its head.
+///
+/// The continuity schema keeps every rewrite row of a head-canonical session
+/// and has no row for a retired base. A graph that retired its oldest
+/// rewrite occurrences after compaction (a re-anchored graph) therefore has
+/// no faithful conversion here and refuses typed, through Meerkat's
+/// whole-graph layout. Reads lay such a blob out with
+/// [`retained_layout_for_blob_session`].
 fn layout_for_blob_session(
     session: &Session,
 ) -> Result<(MaterializedBlobLayout, SessionHead), SessionStoreError> {
@@ -1869,6 +1877,33 @@ fn layout_for_blob_session(
         materialized.head_strand.clone(),
         materialized.rewrites.len() as u64,
     )?;
+    Ok((materialized, head))
+}
+
+/// The blob layout reads use, and the head they synthesize, through
+/// Meerkat's retained layout: a re-anchored graph lays out from its
+/// re-anchored anchor through its retained occurrences, as Meerkat's own
+/// SQLite session store lays out the same blob. The head counts every
+/// rewrite generation, the retired ones included, as the session's rewrite
+/// prefix does. A whole graph lays out exactly as
+/// [`layout_for_blob_session`] lays it out.
+fn retained_layout_for_blob_session(
+    session: &Session,
+) -> Result<(MaterializedBlobLayout, SessionHead), SessionStoreError> {
+    let history = session
+        .validated_transcript_history_state()
+        .map_err(|err| SessionStoreError::InvalidTranscriptRewrite {
+            id: session.id().clone(),
+            reason: format!("stored transcript history state is malformed: {err}"),
+        })?;
+    let retained = strand_layout_for_retained_history(session, history.as_ref())?;
+    let materialized = MaterializedBlobLayout::from_layout(session.id(), &retained.layout)?;
+    let rewrite_count = retained
+        .retired_count()
+        .checked_add(materialized.rewrites.len())
+        .and_then(|count| u64::try_from(count).ok())
+        .ok_or_else(|| SessionStoreError::Corrupted(session.id().clone()))?;
+    let head = SessionHead::from_session(session, materialized.head_strand.clone(), rewrite_count)?;
     Ok((materialized, head))
 }
 
@@ -3323,11 +3358,11 @@ impl ContinuityStore for LocalContinuityStore {
 impl LocalContinuityStore {
     /// Read-only enumeration of every durable identity → session binding.
     ///
-    /// Operator-maintenance surface (task #63): the repair binary's
-    /// `--all-sessions` pass needs the fleet's bindings without knowing
-    /// identities up front; each binding then goes through the ordinary
-    /// per-session [`ContinuityStore::resolve_record_by_session`] path, so
-    /// this adds no new write or trust surface.
+    /// Operator-maintenance surface: an offline reader walks the fleet's
+    /// bindings without knowing identities up front; each binding then goes
+    /// through the ordinary per-session
+    /// [`ContinuityStore::resolve_record_by_session`] path, so this adds no
+    /// new write or trust surface.
     pub async fn list_session_bindings(
         &self,
     ) -> Result<Vec<(AgentIdentity, meerkat_core::types::SessionId)>, ContinuityStoreError> {
@@ -3826,7 +3861,7 @@ impl ContinuityIncrementalSessions for LocalContinuityStore {
             let Some(session) = blob_session_in_txn(tx, &id)? else {
                 return Ok(None);
             };
-            let (_layout, head) = layout_for_blob_session(&session)?;
+            let (_layout, head) = retained_layout_for_blob_session(&session)?;
             Ok(Some(head))
         })
         .await
@@ -3915,7 +3950,7 @@ impl ContinuityIncrementalSessions for LocalContinuityStore {
             let Some(session) = blob_session_in_txn(tx, &id)? else {
                 return Err(SessionStoreError::NotFound(id));
             };
-            let (layout, _head) = layout_for_blob_session(&session)?;
+            let (layout, _head) = retained_layout_for_blob_session(&session)?;
             let rows = layout
                 .strands
                 .iter()
@@ -3946,7 +3981,7 @@ impl ContinuityIncrementalSessions for LocalContinuityStore {
             let Some(session) = blob_session_in_txn(tx, &id)? else {
                 return Ok(Vec::new());
             };
-            let (layout, _head) = layout_for_blob_session(&session)?;
+            let (layout, _head) = retained_layout_for_blob_session(&session)?;
             layout
                 .rewrites
                 .iter()
@@ -6575,6 +6610,208 @@ mod tests {
             .expect("head-canonical sessions serve a synthesized snapshot");
         let loaded: Session = serde_json::from_slice(&snapshot.data).expect("decode");
         assert_eq!(loaded.messages(), document.messages());
+    }
+
+    /// A document compacted `cycles` times the way a long-lived member is:
+    /// two turns, a compaction of everything but the newest message, the
+    /// default transcript retention, then a live tail.
+    fn compacted_session(cycles: usize) -> Session {
+        let user =
+            |text: String| meerkat_core::Message::User(meerkat_core::UserMessage::text(text));
+        let mut document = session_with(&["seed"]);
+        for cycle in 0..cycles {
+            for turn in 0..2 {
+                document.push(user(format!("cycle {cycle} turn {turn}")));
+            }
+            let end = document.messages().len() - 1;
+            document
+                .commit_transcript_rewrite(
+                    meerkat_core::TranscriptRewriteSelection::MessageRange { start: 0, end },
+                    vec![user(format!("summary {cycle}"))],
+                    meerkat_core::TranscriptRewriteReason::new("compaction"),
+                    Some("unit-test".to_string()),
+                    None,
+                )
+                .expect("commit the compaction rewrite");
+            document
+                .retire_transcript_history(meerkat_core::TranscriptHistoryRetention::default())
+                .expect("retire past the default retention");
+            document.push(user(format!("cycle {cycle} live tail")));
+        }
+        document
+    }
+
+    /// A graph that retired nothing lays out for reads exactly as the
+    /// head-canonical conversion lays it out.
+    #[test]
+    fn whole_graph_blob_reads_through_the_conversion_layout() {
+        let document = compacted_session(4);
+        let history = document
+            .validated_transcript_history_state()
+            .expect("history decodes")
+            .expect("compacted history");
+        assert_eq!(
+            history.state().retired_count(),
+            0,
+            "four rewrites retire none"
+        );
+        let (read_layout, read_head) =
+            retained_layout_for_blob_session(&document).expect("read layout");
+        let (write_layout, write_head) = layout_for_blob_session(&document).expect("write layout");
+        assert_eq!(
+            serde_json::to_value(&read_head).unwrap(),
+            serde_json::to_value(&write_head).unwrap()
+        );
+        assert_eq!(read_layout.strands, write_layout.strands);
+        assert_eq!(read_layout.head_strand, write_layout.head_strand);
+        assert_eq!(read_layout.rewrites.len(), 4);
+        assert_eq!(write_layout.rewrites.len(), 4);
+    }
+
+    /// A member compacted more often than the transcript retention keeps (4
+    /// rewrites by default) has a re-anchored graph in its blob: the oldest
+    /// rewrite occurrences are retired and their bodies are gone. Reads lay
+    /// the retained part out as Meerkat's own SQLite session store does for
+    /// the same blob: the same transcript head, head rows and retained
+    /// rewrites. The head-canonical conversion still refuses the blob typed,
+    /// because the continuity schema keeps every rewrite row and has none for
+    /// a retired base, and it writes nothing.
+    #[tokio::test]
+    async fn re_anchored_blob_reads_as_meerkats_store_lays_it_out_and_does_not_convert() {
+        let document = compacted_session(7);
+        let history = document
+            .validated_transcript_history_state()
+            .expect("history decodes")
+            .expect("compacted history");
+        assert_eq!(
+            (
+                history.state().commit_count(),
+                history.state().retired_count()
+            ),
+            (7, 3),
+            "seven compactions under the default retention retire three"
+        );
+        match layout_for_blob_session(&document) {
+            Ok(_) => panic!("the conversion layout laid out a re-anchored graph"),
+            Err(error) => assert!(
+                error.to_string().contains("needs the whole graph"),
+                "{error}"
+            ),
+        }
+        let session_id = document.id().clone();
+
+        // Meerkat's own store, holding the same document as a whole blob. A
+        // plain first save may not seed rewrite history, so the blob enters
+        // through the offline create path a storage migration uses.
+        let core_dir = tempfile::tempdir().expect("tempdir");
+        let core: Arc<dyn meerkat::SessionStore> = Arc::new(
+            meerkat_store::SqliteSessionStore::open(core_dir.path().join("sessions.sqlite3"))
+                .expect("open Meerkat's session store"),
+        );
+        core.save_authoritative_projection_if_current_revision(&document, None)
+            .await
+            .expect("whole-blob seed");
+        let core_rows = Arc::clone(&core)
+            .as_incremental()
+            .expect("Meerkat's SQLite store has an incremental channel");
+        let core_head = core_rows
+            .load_head(&session_id)
+            .await
+            .expect("Meerkat lays the re-anchored blob out")
+            .expect("synthesized head");
+
+        let store = LocalContinuityStore::in_memory().unwrap();
+        let identity = AgentIdentity::parse("triage:main").unwrap();
+        seed_record(&store, &identity, &session_id, 1).await;
+        store
+            .save_session_snapshot(
+                &identity,
+                &session_id,
+                ContinuityGeneration::new(0),
+                CheckpointVersion::new(1),
+                FencingToken::new(1),
+                &SessionSnapshot {
+                    data: serde_json::to_vec(&document).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let head = store
+            .load_head(&session_id)
+            .await
+            .expect("reads lay the retained graph out")
+            .expect("synthesized head");
+
+        // The continuity store derives its row prefix from full per-strand
+        // rows; every other transcript fact of the head is Meerkat's.
+        let transcript_facts = |head: &SessionHead| {
+            let value = serde_json::to_value(head).unwrap();
+            serde_json::json!({
+                "strand": value["strand"],
+                "head_revision": value["head_revision"],
+                "message_count": value["message_count"],
+                "rewrite_count": value["rewrite_count"],
+                "rewrite_prefix": value["rewrite_prefix"],
+                "graph_prefix": value["graph_prefix"],
+            })
+        };
+        assert_eq!(transcript_facts(&head), transcript_facts(&core_head));
+        assert_eq!(
+            head.rewrite_count, 7,
+            "the head counts the retired generations"
+        );
+        assert_eq!(
+            store
+                .load_messages(&session_id, &head.strand, 0..head.message_count)
+                .await
+                .expect("head rows"),
+            document.messages()
+        );
+        let retained: Vec<TranscriptRewriteCommit> = store
+            .load_rewrites(&session_id)
+            .await
+            .expect("retained rewrites")
+            .into_iter()
+            .map(|record| record.commit)
+            .collect();
+        assert_eq!(retained.len(), 4, "only the retained occurrences have rows");
+        assert_eq!(
+            serde_json::to_value(&retained).unwrap(),
+            serde_json::to_value(
+                core_rows
+                    .load_rewrite_commits(&session_id)
+                    .await
+                    .expect("Meerkat's retained commits")
+            )
+            .unwrap()
+        );
+
+        // The conversion has no row for the retired base: the first delta
+        // write refuses typed and leaves no head row.
+        let refused = store
+            .append_messages(
+                &cursor(&identity, 0, 2, 1),
+                &session_id,
+                &head.strand,
+                head.message_count,
+                &[meerkat_core::Message::User(
+                    meerkat_core::UserMessage::text("after the cut".to_string()),
+                )],
+            )
+            .await
+            .expect_err("a re-anchored blob does not convert");
+        assert!(
+            refused.to_string().contains("needs the whole graph"),
+            "{refused}"
+        );
+        assert!(
+            store
+                .load_canonical_head(&session_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the refused conversion writes no head row"
+        );
     }
 
     /// Lazy per-session migration: the first delta write on a blob-only

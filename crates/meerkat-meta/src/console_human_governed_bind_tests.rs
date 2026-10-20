@@ -23,11 +23,10 @@ use crate::console_aggregator::{
 };
 use crate::console_governed_ingress::{ConsoleGovernedIngress, ConsoleSendContext};
 use crate::identity_first::{
-    AgentAddressability, AgentIdentity, AgentRuntimeId, BoundGovernedInput, CheckpointVersion,
-    ContinuityGeneration, ContinuityRecord, DurabilityPolicy, DurableAgentSpec, FencingToken,
+    AgentAddressability, AgentIdentity, BoundGovernedInput, DurabilityPolicy, DurableAgentSpec,
     GovernedAdmission, GovernedBindContext, GovernedInputBinder, GovernedSettlement,
-    IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig, LeaseGrant,
-    LocalContinuityStore, LocalLeaseProvider, MobSessionBridge, SessionBridge,
+    IdentityRuntime, IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider,
+    MobSessionBridge, SessionBridge,
 };
 use crate::runtime::AuthenticatedConsoleHuman;
 
@@ -59,37 +58,24 @@ async fn governed_identity_runtime_as(
         bridge: Some(bridge),
         default_timeout: None,
     }));
+    // Core's journal binds the fixture's governed member (spawned under the
+    // identity's own roster id): the runtime reads it from there.
     let identity = AgentIdentity::parse(MEMBER).unwrap();
     runtime
-        .register(
-            DurableAgentSpec {
-                identity: identity.clone(),
-                profile: meerkat_mob::ProfileName::from("worker"),
-                addressability,
-                display_name: None,
-                labels: BTreeMap::new(),
-                context: None,
-                additional_instructions: Vec::new(),
-                initial_message: None,
-                runtime_mode_override: Some(meerkat_mob::MobRuntimeMode::TurnDriven),
-                backend: None,
-                binding: None,
-                placement: None,
-            },
-            IdentityLifecycleState::Active,
-            Some(ContinuityRecord {
-                identity: identity.clone(),
-                agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{identity}:0")).unwrap(),
-                session_id: fixture.session_id.clone(),
-                generation: ContinuityGeneration::new(0),
-                checkpoint_version: CheckpointVersion::new(0),
-            }),
-            Some(LeaseGrant {
-                identity: identity.clone(),
-                fencing_token: FencingToken::new(1),
-                ttl: Duration::from_mins(5),
-            }),
-        )
+        .register(DurableAgentSpec {
+            identity: identity.clone(),
+            profile: meerkat_mob::ProfileName::from("worker"),
+            addressability,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: Some(meerkat_mob::MobRuntimeMode::TurnDriven),
+            backend: None,
+            binding: None,
+            placement: None,
+        })
         .await;
     (runtime, identity)
 }

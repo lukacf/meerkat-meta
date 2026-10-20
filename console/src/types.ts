@@ -76,8 +76,6 @@ export interface ConsoleAgent extends SidebarWatchFields {
   state?: string;
   addressability?: IdentityStatusRow["addressability"];
   generation?: number;
-  checkpoint_version?: number;
-  lease_healthy?: boolean;
   progress?: IdentityStatusRow["progress"];
   response_phase?: ResponsePhase;
   wired_to?: string[];

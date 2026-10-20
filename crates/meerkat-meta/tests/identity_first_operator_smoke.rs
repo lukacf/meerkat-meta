@@ -22,23 +22,21 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 
 use meerkat_mob::definition::WiringRules;
-// meerkat 0.7: the MeerkatId alias was deleted; member ids are AgentIdentity.
-use meerkat_mob::ids::AgentIdentity as MeerkatId;
 use meerkat_mob::{
     MobDefinition, MobId, MobRuntimeMode, Profile, ProfileBinding, ProfileName, ToolConfig,
 };
 
 use meerkat_meta::UnifiedRuntimeBuilder;
-use meerkat_meta::identity_first::contracts::{AgentCustomizer, LeaseProvider, TopologyProvider};
+use meerkat_meta::identity_first::contracts::{AgentCustomizer, TopologyProvider};
 use meerkat_meta::identity_first::orchestrator::{RestoreOutcome, restore_flow};
 use meerkat_meta::identity_first::{
-    AgentAddressability, AgentBuildContext, AgentBuildDraft, AgentIdentity, CheckpointVersion,
-    ContinuityGeneration, ContinuityStore, CorrelationId, CustomizerError, DispatchInput,
-    DispatchOrigin, DurabilityPolicy, DurableAgentSpec, IdentityLifecycleState, IdentityRuntime,
-    IdentityRuntimeConfig, IdentityRuntimeError, LeaseAcquireResult, LeaseError, LeaseGrant,
-    LeaseRenewResult, LocalContinuityStore, LocalLeaseProvider, ManagedPeerEdge, SessionBridge,
+    AgentAddressability, AgentBuildContext, AgentBuildDraft, AgentIdentity, ContinuityStore,
+    CorrelationId, CustomizerError, DispatchInput, DispatchOrigin, DurabilityPolicy,
+    DurableAgentSpec, IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig,
+    IdentityRuntimeError, LocalContinuityStore, LocalLeaseProvider, ManagedPeerEdge, SessionBridge,
     TopologyContext, TopologyError,
 };
+use meerkat_meta::member_comms_id::roster_member_id_for_identity;
 use meerkat_meta::mob_handle_runtime::SessionCreatedContext;
 
 // ---------------------------------------------------------------------------
@@ -268,13 +266,13 @@ async fn e2e_smoke_01_identity_first_send_real_llm() {
     .await
     .expect("restore_flow");
 
-    let alice_record = match result.outcomes.get(&id("personal:alice")).unwrap() {
-        RestoreOutcome::Created { record, .. } => record.clone(),
+    let alice_binding = match result.outcomes.get(&id("personal:alice")).unwrap() {
+        RestoreOutcome::Created { binding, .. } => binding.clone(),
         other => panic!("expected Created, got {other:?}"),
     };
     eprintln!(
-        "[SMOKE-01] alice created: session={}, runtime_id={}",
-        alice_record.session_id, alice_record.agent_runtime_id
+        "[SMOKE-01] alice created: session={:?}, runtime_id={}",
+        alice_binding.session_id, alice_binding.agent_runtime_id
     );
 
     // --- Send via identity-first API ---
@@ -292,7 +290,7 @@ async fn e2e_smoke_01_identity_first_send_real_llm() {
     // --- Wait for ASSISTANT response by polling member status ---
     // MobMemberSnapshot.output_preview is Some when the LLM has produced output.
     let mob_handle = unified.mob_handle();
-    let alice_mid = MeerkatId::from(alice_record.agent_runtime_id.as_str());
+    let alice_mid = roster_member_id_for_identity("personal:alice");
     let deadline = Instant::now() + Duration::from_secs(90);
     let output;
     loop {
@@ -331,12 +329,11 @@ async fn e2e_smoke_01_identity_first_send_real_llm() {
     // --- Verify NotAddressable for InternalOnly ---
     // Register a review agent as InternalOnly and verify send() is rejected
     identity_rt
-        .register(
-            spec("review:main", AgentAddressability::InternalOnly, "review"),
-            meerkat_meta::identity_first::IdentityLifecycleState::Active,
-            None,
-            None,
-        )
+        .register(spec(
+            "review:main",
+            AgentAddressability::InternalOnly,
+            "review",
+        ))
         .await;
 
     let reject = identity_rt
@@ -421,14 +418,14 @@ async fn e2e_smoke_02_dynamic_roster_add_subscriber() {
     .await
     .expect("restore_flow v1");
 
-    let alice_record = match result.outcomes.get(&id("personal:alice")).unwrap() {
-        RestoreOutcome::Created { record, .. } => record.clone(),
+    let alice_binding = match result.outcomes.get(&id("personal:alice")).unwrap() {
+        RestoreOutcome::Created { binding, .. } => binding.clone(),
         other => panic!("expected Created for alice, got {other:?}"),
     };
-    let alice_session_v1 = alice_record.session_id.clone();
+    let alice_session_v1 = alice_binding.session_id.clone();
     eprintln!(
-        "[SMOKE-02] alice created: session={}",
-        alice_record.session_id
+        "[SMOKE-02] alice created: session={:?}",
+        alice_binding.session_id
     );
 
     // Send to alice to prove she works
@@ -442,7 +439,7 @@ async fn e2e_smoke_02_dynamic_roster_add_subscriber() {
 
     // Wait for alice's response
     let mob_handle = unified.mob_handle();
-    let alice_mid = MeerkatId::from(alice_record.agent_runtime_id.as_str());
+    let alice_mid = roster_member_id_for_identity("personal:alice");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let member = mob_handle.member(&alice_mid).await.expect("member");
@@ -483,20 +480,20 @@ async fn e2e_smoke_02_dynamic_roster_add_subscriber() {
     .expect("restore_flow v2");
 
     // carol should be Created (Uninitialized → fresh)
-    let carol_record = match result2.outcomes.get(&id("personal:carol")).unwrap() {
-        RestoreOutcome::Created { record, .. } => record.clone(),
+    let carol_binding = match result2.outcomes.get(&id("personal:carol")).unwrap() {
+        RestoreOutcome::Created { binding, .. } => binding.clone(),
         other => panic!("expected Created for carol, got {other:?}"),
     };
     eprintln!(
-        "[SMOKE-02] carol created: session={}",
-        carol_record.session_id
+        "[SMOKE-02] carol created: session={:?}",
+        carol_binding.session_id
     );
 
-    // alice should be Resumed or Created-with-existing-record
+    // alice should be Resumed (or Created) onto her existing session
     let alice_v2 = result2.outcomes.get(&id("personal:alice")).unwrap();
     let alice_session_v2 = match alice_v2 {
-        RestoreOutcome::Created { record, .. } | RestoreOutcome::Resumed { record, .. } => {
-            record.session_id.clone()
+        RestoreOutcome::Created { binding, .. } | RestoreOutcome::Resumed { binding, .. } => {
+            binding.session_id.clone()
         }
         other => panic!("expected Created/Resumed for alice v2, got {other:?}"),
     };
@@ -507,9 +504,9 @@ async fn e2e_smoke_02_dynamic_roster_add_subscriber() {
         "alice session should be stable across roster reconciliation"
     );
 
-    // carol's ContinuityRecord should have a minted AgentRuntimeId
+    // carol's Core binding should name a minted AgentRuntimeId
     assert!(
-        !carol_record.agent_runtime_id.as_str().is_empty(),
+        !carol_binding.agent_runtime_id.as_str().is_empty(),
         "carol should have a minted AgentRuntimeId"
     );
 
@@ -522,7 +519,7 @@ async fn e2e_smoke_02_dynamic_roster_add_subscriber() {
         .await
         .expect("send to carol");
 
-    let carol_mid = MeerkatId::from(carol_record.agent_runtime_id.as_str());
+    let carol_mid = roster_member_id_for_identity("personal:carol");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let member = mob_handle.member(&carol_mid).await.expect("member");
@@ -548,9 +545,9 @@ async fn e2e_smoke_02_dynamic_roster_add_subscriber() {
 // ===========================================================================
 // SMOKE-03: Respawn stuck agent without losing history
 //
-// Send a message, then respawn the agent. Verify same AgentRuntimeId,
-// same generation, and that the agent can respond to new messages after
-// respawn.
+// Send a message, then respawn the agent. Since 0.9.4 Core wakes it onto the
+// same session at a new generation: verify the session is kept, the
+// generation advances, and the agent remembers the earlier turn.
 // ===========================================================================
 
 #[tokio::test]
@@ -612,12 +609,18 @@ async fn e2e_smoke_03_respawn_preserves_history() {
     .await
     .expect("restore_flow");
 
-    let alice_record = match result.outcomes.get(&id("personal:alice")).unwrap() {
-        RestoreOutcome::Created { record, .. } => record.clone(),
+    let alice_binding = match result.outcomes.get(&id("personal:alice")).unwrap() {
+        RestoreOutcome::Created { binding, .. } => binding.clone(),
         other => panic!("expected Created, got {other:?}"),
     };
-    let original_runtime_id = alice_record.agent_runtime_id.clone();
-    let original_generation = alice_record.generation;
+    let original_runtime_id = alice_binding.agent_runtime_id.clone();
+    let original_session = alice_binding.session_id.clone();
+    let original_generation = identity_rt
+        .status(&id("personal:alice"))
+        .await
+        .expect("status before respawn")
+        .generation
+        .expect("alice has a Core binding");
     eprintln!(
         "[SMOKE-03] alice created: runtime_id={original_runtime_id}, gen={original_generation}"
     );
@@ -633,7 +636,7 @@ async fn e2e_smoke_03_respawn_preserves_history() {
 
     // Wait for response
     let mob_handle = unified.mob_handle();
-    let alice_mid = MeerkatId::from(alice_record.agent_runtime_id.as_str());
+    let alice_mid = roster_member_id_for_identity("personal:alice");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let member = mob_handle.member(&alice_mid).await.expect("member");
@@ -646,32 +649,40 @@ async fn e2e_smoke_03_respawn_preserves_history() {
     }
     eprintln!("[SMOKE-03] Got first response, now respawning...");
 
-    // Respawn
-    let respawn_record = identity_rt
+    // Respawn: Core retires the member and wakes it onto the same session at
+    // a new generation, so the transcript is kept and the incarnation moves.
+    let respawned = identity_rt
         .respawn(&id("personal:alice"))
         .await
-        .expect("respawn");
-
-    // Verify same runtime ID and generation
+        .expect("respawn")
+        .expect("respawn should hand back the new incarnation's scope");
     assert_eq!(
-        respawn_record.agent_runtime_id, original_runtime_id,
-        "respawn should preserve AgentRuntimeId"
+        Some(respawned.session_id()),
+        original_session.as_ref(),
+        "respawn should keep the session"
     );
-    assert_eq!(
-        respawn_record.generation, original_generation,
-        "respawn should NOT advance ContinuityGeneration"
+    assert!(
+        respawned.generation() > original_generation,
+        "respawn should advance Core's generation: old={original_generation}, new={}",
+        respawned.generation()
     );
     eprintln!(
-        "[SMOKE-03] Respawn preserved: runtime_id={}, gen={}",
-        respawn_record.agent_runtime_id, respawn_record.generation
+        "[SMOKE-03] Respawn kept session={}, gen={}",
+        respawned.session_id(),
+        respawned.generation()
     );
 
-    // Verify agent status is Active after respawn
+    // Verify agent status is Active after respawn, at a new incarnation
     let status = identity_rt
         .status(&id("personal:alice"))
         .await
         .expect("status after respawn");
     assert_eq!(status.state, IdentityLifecycleState::Active);
+    assert_ne!(
+        status.agent_runtime_id.as_ref(),
+        Some(&original_runtime_id),
+        "respawn should run alice at a new AgentRuntimeId"
+    );
 
     // Send post-respawn message that tests whether the agent remembers
     // the prior conversation. If session resume works, the agent should
@@ -718,7 +729,7 @@ async fn e2e_smoke_03_respawn_preserves_history() {
 
     let elapsed = start.elapsed();
     eprintln!(
-        "[SMOKE-03] PASSED in {:.1}s - respawn preserves identity + agent works ✓",
+        "[SMOKE-03] PASSED in {:.1}s - respawn keeps the session + agent works",
         elapsed.as_secs_f64()
     );
     assert!(elapsed.as_secs() >= 1, "too fast for real LLM calls");
@@ -727,8 +738,8 @@ async fn e2e_smoke_03_respawn_preserves_history() {
 // ===========================================================================
 // SMOKE-04: Reset agent - intentional clean slate
 //
-// Send a message, then reset the agent. Verify generation advances,
-// new SessionId minted, checkpoint version resets to 0.
+// Send a message, then reset the agent. Verify Core's generation advances and
+// a new SessionId is minted.
 // ===========================================================================
 
 #[tokio::test]
@@ -790,12 +801,20 @@ async fn e2e_smoke_04_reset_clean_slate() {
     .await
     .expect("restore_flow");
 
-    let alice_record = match result.outcomes.get(&id("personal:alice")).unwrap() {
-        RestoreOutcome::Created { record, .. } => record.clone(),
+    let alice_binding = match result.outcomes.get(&id("personal:alice")).unwrap() {
+        RestoreOutcome::Created { binding, .. } => binding.clone(),
         other => panic!("expected Created, got {other:?}"),
     };
-    let old_session = alice_record.session_id.clone();
-    let old_generation = alice_record.generation;
+    let old_session = alice_binding
+        .session_id
+        .clone()
+        .expect("alice is bound to a session");
+    let old_generation = identity_rt
+        .status(&id("personal:alice"))
+        .await
+        .expect("status before reset")
+        .generation
+        .expect("alice has a Core binding");
     eprintln!("[SMOKE-04] alice created: session={old_session}, gen={old_generation}");
 
     // Send initial message to build history
@@ -808,7 +827,7 @@ async fn e2e_smoke_04_reset_clean_slate() {
 
     // Wait for response
     let mob_handle = unified.mob_handle();
-    let alice_mid = MeerkatId::from(alice_record.agent_runtime_id.as_str());
+    let alice_mid = roster_member_id_for_identity("personal:alice");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let member = mob_handle.member(&alice_mid).await.expect("member");
@@ -821,30 +840,24 @@ async fn e2e_smoke_04_reset_clean_slate() {
     }
     eprintln!("[SMOKE-04] Got response, now resetting...");
 
-    // Reset the agent
-    let reset_record = identity_rt
+    // Reset the agent: Core mints a fresh session at a higher generation
+    let reset_binding = identity_rt
         .reset(&id("personal:alice"))
         .await
         .expect("reset");
 
     // Verify generation advanced
-    assert_eq!(
-        reset_record.generation,
-        ContinuityGeneration::new(old_generation.get() + 1),
-        "reset should advance ContinuityGeneration"
+    assert!(
+        reset_binding.generation() > old_generation,
+        "reset should advance Core's generation: old={old_generation}, new={}",
+        reset_binding.generation()
     );
 
     // Verify new session ID
     assert_ne!(
-        reset_record.session_id, old_session,
+        reset_binding.session_id(),
+        Some(&old_session),
         "reset should mint new SessionId"
-    );
-
-    // Verify checkpoint version reset to 0
-    assert_eq!(
-        reset_record.checkpoint_version,
-        CheckpointVersion::new(0),
-        "reset should reset CheckpointVersion to 0"
     );
 
     // Verify status reflects the reset
@@ -853,29 +866,25 @@ async fn e2e_smoke_04_reset_clean_slate() {
         .await
         .expect("status after reset");
     assert_eq!(status.state, IdentityLifecycleState::Active);
-    assert_eq!(
-        status.generation,
-        Some(ContinuityGeneration::new(old_generation.get() + 1))
-    );
-    assert_eq!(status.session_id, Some(reset_record.session_id.clone()));
+    assert_eq!(status.generation, Some(reset_binding.generation()));
+    assert_eq!(status.session_id.as_ref(), reset_binding.session_id());
 
     let elapsed = start.elapsed();
     eprintln!(
-        "[SMOKE-04] PASSED in {:.1}s - reset: new gen={}, new session={}, cpv=0 ✓",
+        "[SMOKE-04] PASSED in {:.1}s - reset: new gen={}, new session={:?}",
         elapsed.as_secs_f64(),
-        reset_record.generation,
-        reset_record.session_id,
+        reset_binding.generation(),
+        reset_binding.session_id(),
     );
     assert!(elapsed.as_secs() >= 1, "too fast for real LLM calls");
 }
 
 // ===========================================================================
-// SMOKE-05: Scheduled review with async checkpoint durability
+// SMOKE-05: Scheduled review dispatch
 //
-// Tests checkpoint semantics: dispatch with correlation_id, verify checkpoint
-// version advances, verify checkpoint not stalled. Does NOT need LLM calls
-// for the checkpoint mechanics — uses real mob members but focuses on
-// continuity store operations.
+// Dispatch with a correlation id to an InternalOnly review agent and verify
+// the admission is durable (the composition has a runtime store), send()
+// refuses the InternalOnly agent, and both agents run with a Core runtime id.
 // ===========================================================================
 
 #[tokio::test]
@@ -941,14 +950,12 @@ async fn e2e_smoke_05_async_checkpoint_durability() {
     .await
     .expect("restore_flow");
 
-    let review_record = match result.outcomes.get(&id("review:main")).unwrap() {
-        RestoreOutcome::Created { record, .. } => record.clone(),
-        other => panic!("expected Created for review, got {other:?}"),
-    };
-    let alice_record = match result.outcomes.get(&id("personal:alice")).unwrap() {
-        RestoreOutcome::Created { record, .. } => record.clone(),
-        other => panic!("expected Created for alice, got {other:?}"),
-    };
+    for identity in ["review:main", "personal:alice"] {
+        match result.outcomes.get(&id(identity)).unwrap() {
+            RestoreOutcome::Created { .. } => {}
+            other => panic!("expected Created for {identity}, got {other:?}"),
+        }
+    }
 
     // Dispatch to review agent (InternalOnly) with correlation_id
     eprintln!("[SMOKE-05] Dispatching to review:main with correlation_id...");
@@ -973,7 +980,7 @@ async fn e2e_smoke_05_async_checkpoint_durability() {
 
     // Wait for review to process
     let mob_handle = unified.mob_handle();
-    let review_mid = MeerkatId::from(review_record.agent_runtime_id.as_str());
+    let review_mid = roster_member_id_for_identity("review:main");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let member = mob_handle.member(&review_mid).await.expect("member");
@@ -1011,7 +1018,7 @@ async fn e2e_smoke_05_async_checkpoint_durability() {
         .await
         .expect("send to alice");
 
-    let alice_mid = MeerkatId::from(alice_record.agent_runtime_id.as_str());
+    let alice_mid = roster_member_id_for_identity("personal:alice");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let member = mob_handle.member(&alice_mid).await.expect("member");
@@ -1043,222 +1050,19 @@ async fn e2e_smoke_05_async_checkpoint_durability() {
 
     let elapsed = start.elapsed();
     eprintln!(
-        "[SMOKE-05] PASSED in {:.1}s - dispatch with correlation_id + checkpoint semantics ✓",
+        "[SMOKE-05] PASSED in {:.1}s - dispatch with correlation_id + durable admission",
         elapsed.as_secs_f64(),
     );
     assert!(elapsed.as_secs() >= 1, "too fast for real LLM calls");
 }
 
 // ===========================================================================
-// SMOKE-06: Lease contention - rolling deploy
+// SMOKE-07: Delete a subscriber's continuity
 //
-// Tests lease semantics: Runtime A acquires leases, Runtime B tries to
-// acquire (gets AlreadyHeld), A releases, B acquires successfully.
-// Does NOT need LLM calls — purely about lease provider behavior.
-// ===========================================================================
-
-/// A test lease provider that wraps LocalLeaseProvider but exposes
-/// the inner state for runtime-switch simulation.
-struct ContendedLeaseProvider {
-    inner: LocalLeaseProvider,
-}
-
-impl ContendedLeaseProvider {
-    fn new() -> Self {
-        Self {
-            inner: LocalLeaseProvider::new(),
-        }
-    }
-}
-
-#[async_trait]
-impl LeaseProvider for ContendedLeaseProvider {
-    async fn acquire_leases(
-        &self,
-        identities: &[AgentIdentity],
-        runtime_instance: &str,
-    ) -> Result<BTreeMap<AgentIdentity, LeaseAcquireResult>, LeaseError> {
-        self.inner
-            .acquire_leases(identities, runtime_instance)
-            .await
-    }
-
-    async fn renew_leases(
-        &self,
-        grants: &[LeaseGrant],
-    ) -> Result<BTreeMap<AgentIdentity, LeaseRenewResult>, LeaseError> {
-        self.inner.renew_leases(grants).await
-    }
-
-    async fn release_leases(&self, grants: &[LeaseGrant]) -> Result<(), LeaseError> {
-        self.inner.release_leases(grants).await
-    }
-}
-
-#[tokio::test]
-#[ignore = "integration-real: live API"]
-async fn e2e_smoke_06_lease_contention_rolling_deploy() {
-    if !has_api_key() {
-        eprintln!("Skipping SMOKE-06: no ANTHROPIC_API_KEY");
-        return;
-    }
-
-    let model = smoke_model();
-    let temp = tempfile::TempDir::new().expect("temp dir");
-    let state_path = temp.path().join("state");
-    let start = Instant::now();
-
-    eprintln!("[SMOKE-06] Building UnifiedRuntime with model={model}...");
-
-    let unified = UnifiedRuntimeBuilder::default()
-        .definition(operator_definition(&model))
-        .persistent_state(&state_path)
-        .comms(true)
-        .build()
-        .await
-        .expect("build UnifiedRuntime");
-
-    let bridge: Arc<dyn SessionBridge> = unified
-        .session_bridge()
-        .map(|bridge| Arc::new(bridge) as Arc<dyn SessionBridge>)
-        .expect("session_bridge should exist");
-
-    let store = Arc::new(
-        LocalContinuityStore::open(state_path.join("continuity.db"))
-            .expect("open continuity store"),
-    );
-    // Shared lease provider for both runtimes
-    let shared_leases = Arc::new(ContendedLeaseProvider::new());
-
-    // --- Runtime A boots and acquires leases ---
-    eprintln!("[SMOKE-06] Runtime A booting...");
-    let rt_a = IdentityRuntime::new(IdentityRuntimeConfig {
-        continuity_store: store.clone() as Arc<dyn ContinuityStore>,
-        lease_provider: shared_leases.clone() as Arc<dyn LeaseProvider>,
-        runtime_instance_id: "pod-A".to_string(),
-        has_runtime_store: true,
-        durability_policy: DurabilityPolicy::SyncWriteThrough,
-        bridge: Some(bridge.clone()),
-        default_timeout: None,
-    });
-
-    let roster = vec![spec(
-        "personal:alice",
-        AgentAddressability::Addressable,
-        "personal",
-    )];
-
-    let result_a = restore_flow(
-        &rt_a,
-        &roster,
-        Some(&EmptyTopology as &dyn TopologyProvider),
-        Some(&NoopCustomizer as &dyn AgentCustomizer),
-    )
-    .await
-    .expect("restore_flow A");
-
-    let alice_record = match result_a.outcomes.get(&id("personal:alice")).unwrap() {
-        RestoreOutcome::Created { record, .. } => record.clone(),
-        other => panic!("expected Created, got {other:?}"),
-    };
-    eprintln!("[SMOKE-06] Runtime A holds lease for alice");
-
-    // --- Runtime B tries to acquire — should get AlreadyHeld ---
-    eprintln!("[SMOKE-06] Runtime B attempting lease acquisition...");
-    let identities = vec![id("personal:alice")];
-    let b_results = shared_leases
-        .acquire_leases(&identities, "pod-B")
-        .await
-        .expect("acquire for B");
-
-    let alice_result = b_results.get(&id("personal:alice")).unwrap();
-    match alice_result {
-        LeaseAcquireResult::AlreadyHeld { holder, .. } => {
-            assert_eq!(holder, "pod-A", "should be held by pod-A");
-            eprintln!("[SMOKE-06] Runtime B correctly got AlreadyHeld (holder=pod-A)");
-        }
-        other => panic!("expected AlreadyHeld, got {other:?}"),
-    }
-
-    // --- Runtime A releases leases (simulates graceful shutdown) ---
-    eprintln!("[SMOKE-06] Runtime A releasing leases...");
-    // We need the grant from A's lease to release it
-    let a_status = rt_a.status(&id("personal:alice")).await.expect("status");
-    let a_token = a_status
-        .lease
-        .as_ref()
-        .expect("should have lease")
-        .fencing_token;
-    let release_grants = vec![LeaseGrant {
-        identity: id("personal:alice"),
-        fencing_token: a_token,
-        ttl: Duration::from_mins(5),
-    }];
-    shared_leases
-        .release_leases(&release_grants)
-        .await
-        .expect("release");
-    eprintln!("[SMOKE-06] Runtime A released leases");
-
-    // --- Runtime B retries — should succeed now ---
-    eprintln!("[SMOKE-06] Runtime B retrying lease acquisition...");
-    let b_results2 = shared_leases
-        .acquire_leases(&identities, "pod-B")
-        .await
-        .expect("acquire for B retry");
-
-    match b_results2.get(&id("personal:alice")).unwrap() {
-        LeaseAcquireResult::Acquired(grant) => {
-            eprintln!(
-                "[SMOKE-06] Runtime B acquired lease: fencing_token={}",
-                grant.fencing_token
-            );
-            // The new fencing token should be higher than A's
-            assert!(
-                grant.fencing_token > a_token,
-                "B's fencing token should be higher than A's: B={}, A={}",
-                grant.fencing_token,
-                a_token,
-            );
-        }
-        other => panic!("expected Acquired, got {other:?}"),
-    }
-
-    // Runtime B can now resolve continuity to verify A's records are visible.
-    // In a real rolling deploy, B would call restore_flow with its own mob;
-    // here we verify the store state that B would see.
-    let resolved = store
-        .resolve_many(&[id("personal:alice")])
-        .await
-        .expect("resolve after B acquires lease");
-
-    match resolved.get(&id("personal:alice")).unwrap() {
-        meerkat_meta::identity_first::ContinuityResolveState::Ready { record } => {
-            assert_eq!(
-                record.session_id, alice_record.session_id,
-                "B should see A's session in continuity store"
-            );
-            eprintln!(
-                "[SMOKE-06] Runtime B sees alice continuity: session={}",
-                record.session_id
-            );
-        }
-        other => panic!("expected Ready state from A's records, got {other:?}"),
-    }
-
-    let elapsed = start.elapsed();
-    eprintln!(
-        "[SMOKE-06] PASSED in {:.1}s - lease contention + rolling deploy ✓",
-        elapsed.as_secs_f64(),
-    );
-}
-
-// ===========================================================================
-// SMOKE-07: Delete subscriber - full identity removal
-//
-// Create 2 personal agents, delete one, verify continuity record gone.
-// Re-run restore_flow — deleted identity should be Uninitialized → fresh-create
-// with a new AgentRuntimeId.
+// Create 2 personal agents and delete one. Since 0.9.4 a delete starts the
+// identity's next life at once on a fresh session (Core's last binding) and
+// keeps it registered and live; the old session is never resumed. Re-run
+// restore_flow: bob runs on the fresh session, alice keeps hers.
 // ===========================================================================
 
 #[tokio::test]
@@ -1323,17 +1127,17 @@ async fn e2e_smoke_07_delete_and_recreate() {
     .await
     .expect("restore_flow");
 
-    let alice_record = match result.outcomes.get(&id("personal:alice")).unwrap() {
-        RestoreOutcome::Created { record, .. } => record.clone(),
+    let alice_binding = match result.outcomes.get(&id("personal:alice")).unwrap() {
+        RestoreOutcome::Created { binding, .. } => binding.clone(),
         other => panic!("expected Created for alice, got {other:?}"),
     };
-    let bob_record = match result.outcomes.get(&id("personal:bob")).unwrap() {
-        RestoreOutcome::Created { record, .. } => record.clone(),
+    let bob_binding = match result.outcomes.get(&id("personal:bob")).unwrap() {
+        RestoreOutcome::Created { binding, .. } => binding.clone(),
         other => panic!("expected Created for bob, got {other:?}"),
     };
     eprintln!(
         "[SMOKE-07] alice={}, bob={}",
-        alice_record.agent_runtime_id, bob_record.agent_runtime_id
+        alice_binding.agent_runtime_id, bob_binding.agent_runtime_id
     );
 
     // Send to both to build some history
@@ -1355,7 +1159,7 @@ async fn e2e_smoke_07_delete_and_recreate() {
 
     // Wait for alice to respond
     let mob_handle = unified.mob_handle();
-    let alice_mid = MeerkatId::from(alice_record.agent_runtime_id.as_str());
+    let alice_mid = roster_member_id_for_identity("personal:alice");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let member = mob_handle.member(&alice_mid).await.expect("member");
@@ -1368,17 +1172,23 @@ async fn e2e_smoke_07_delete_and_recreate() {
     }
     eprintln!("[SMOKE-07] alice responded");
 
-    // Delete bob — delete_identity retires the mob member and removes continuity
+    // Delete bob: his next life starts at once on a fresh session
     eprintln!("[SMOKE-07] Deleting bob...");
-    identity_rt
+    let fresh = identity_rt
         .delete_identity(&id("personal:bob"))
         .await
-        .expect("delete bob");
+        .expect("delete bob")
+        .expect("Core spawned bob, so his continuity is deleted");
+    assert_ne!(
+        fresh.session_id(),
+        bob_binding.session_id.as_ref(),
+        "delete should start bob on a fresh session"
+    );
 
-    // Verify bob is removed from runtime
+    // A delete keeps liveness, as a reset does: bob stays registered
     assert!(
-        !identity_rt.contains(&id("personal:bob")).await,
-        "bob should be removed after delete"
+        identity_rt.contains(&id("personal:bob")).await,
+        "bob should stay registered after delete"
     );
 
     // alice should be unaffected
@@ -1388,20 +1198,8 @@ async fn e2e_smoke_07_delete_and_recreate() {
         .expect("alice status");
     assert_eq!(alice_status.state, IdentityLifecycleState::Active);
 
-    // Verify bob resolves as Uninitialized in the continuity store
-    let resolved = store
-        .resolve_many(&[id("personal:bob")])
-        .await
-        .expect("resolve bob after delete");
-    match resolved.get(&id("personal:bob")).unwrap() {
-        meerkat_meta::identity_first::ContinuityResolveState::Uninitialized => {
-            eprintln!("[SMOKE-07] bob correctly resolves as Uninitialized after delete");
-        }
-        other => panic!("expected Uninitialized for deleted bob, got {other:?}"),
-    }
-
-    // Re-bootstrap with full roster — bob reappears as Uninitialized → fresh-create,
-    // alice is already active so restore_flow skips her bridge calls.
+    // Re-bootstrap with the full roster: bob runs on the session his delete
+    // started, and alice keeps hers.
     eprintln!("[SMOKE-07] Re-bootstrapping with full roster...");
     let result2 = restore_flow(
         &identity_rt,
@@ -1413,41 +1211,41 @@ async fn e2e_smoke_07_delete_and_recreate() {
     .expect("restore_flow 2");
 
     let bob_new = match result2.outcomes.get(&id("personal:bob")).unwrap() {
-        RestoreOutcome::Created { record, .. } => record.clone(),
-        other => panic!("expected Created for bob reappearance, got {other:?}"),
+        RestoreOutcome::Created { binding, .. } | RestoreOutcome::Resumed { binding, .. } => {
+            binding.clone()
+        }
+        other => panic!("expected bob to run after his delete, got {other:?}"),
     };
-
-    // After delete + Uninitialized fresh-create: new session, generation 0
-    assert_ne!(
-        bob_new.session_id, bob_record.session_id,
-        "reappearing bob should get new SessionId"
-    );
     assert_eq!(
-        bob_new.generation,
-        ContinuityGeneration::new(0),
-        "reappearing bob should start at generation 0"
+        bob_new.session_id.as_ref(),
+        fresh.session_id(),
+        "bob should run on the session his delete started"
+    );
+    assert_ne!(
+        bob_new.session_id, bob_binding.session_id,
+        "bob should never resume his deleted session"
     );
     eprintln!(
-        "[SMOKE-07] bob recreated: old_session={}, new_session={}, rt={}",
-        bob_record.session_id, bob_new.session_id, bob_new.agent_runtime_id,
+        "[SMOKE-07] bob after delete: old_session={:?}, new_session={:?}, rt={}",
+        bob_binding.session_id, bob_new.session_id, bob_new.agent_runtime_id,
     );
 
     // alice should still be stable
     let alice_v2 = result2.outcomes.get(&id("personal:alice")).unwrap();
     let alice_v2_session = match alice_v2 {
-        RestoreOutcome::Created { record, .. } | RestoreOutcome::Resumed { record, .. } => {
-            record.session_id.clone()
+        RestoreOutcome::Created { binding, .. } | RestoreOutcome::Resumed { binding, .. } => {
+            binding.session_id.clone()
         }
         other => panic!("unexpected alice outcome: {other:?}"),
     };
     assert_eq!(
-        alice_v2_session, alice_record.session_id,
+        alice_v2_session, alice_binding.session_id,
         "alice session should survive bob deletion"
     );
 
     let elapsed = start.elapsed();
     eprintln!(
-        "[SMOKE-07] PASSED in {:.1}s - delete + recreate with new runtime ID ✓",
+        "[SMOKE-07] PASSED in {:.1}s - delete starts a fresh session, alice unaffected",
         elapsed.as_secs_f64(),
     );
     assert!(elapsed.as_secs() >= 1, "too fast for real LLM calls");

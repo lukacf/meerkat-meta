@@ -503,7 +503,7 @@ fn identity_first_types_not_addressable_error() {
     assert!(err.to_string().contains("not addressable"));
 }
 
-// ---- Task 0.17: IdentityStatus + LeaseInfo + ContinuityHealth + DurabilityPolicy ----
+// ---- Task 0.17: IdentityStatus + DurabilityPolicy ----
 
 #[test]
 fn identity_first_types_identity_status_full_roundtrip() {
@@ -512,6 +512,7 @@ fn identity_first_types_identity_status_full_roundtrip() {
         state: IdentityLifecycleState::Active,
         agent_runtime_id: Some(AgentRuntimeId::parse("rt:001").expect("parse")),
         session_id: Some(meerkat_core::types::SessionId::new()),
+        member_id: Some("mk--triage-main".to_string()),
         profile: Some(meerkat_mob::ProfileName::from("lead")),
         runtime_mode: None,
         addressability: AgentAddressability::Addressable,
@@ -521,21 +522,15 @@ fn identity_first_types_identity_status_full_roundtrip() {
             m.insert("team".to_string(), "core".to_string());
             m
         },
-        generation: Some(ContinuityGeneration::new(2)),
-        checkpoint_version: Some(CheckpointVersion::new(15)),
-        lease: Some(LeaseInfo {
-            fencing_token: FencingToken::new(42),
-            ttl_remaining: std::time::Duration::from_secs(25),
-            healthy: true,
+        generation: Some(meerkat_mob::Generation::new(2)),
+        intent_managed: false,
+        convergence: None,
+        wake_refusal: Some(WakeRefusal {
+            code: -32005,
+            session_id: meerkat_core::types::SessionId::new(),
+            remedy: WakeRefusalRemedy::OperatorReview,
         }),
-        continuity_health: Some(ContinuityHealth {
-            store_reachable: true,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            last_checkpoint_version: Some(CheckpointVersion::new(14)),
-        }),
-        continuity_unrecoverable: Some(meerkat_meta::identity_first::ContinuityUnrecoverable {
-            reason: "the only durable checkpoint is an intra-turn projection".to_string(),
-        }),
+        replaced_session: None,
         customizer_tools_pending: None,
         session_repair_required: Some(
             meerkat_meta::identity_first::SessionRepairRequired::audited_endpoint_divergence(
@@ -577,19 +572,19 @@ fn identity_first_types_identity_status_full_roundtrip() {
         "{val}"
     );
     let _ = session;
-
-    // Check ttl_remaining serialized as ms
-    let val: serde_json::Value = serde_json::from_str(&json).expect("parse json");
-    assert_eq!(val["lease"]["ttl_remaining"], 25_000);
+    // Core's mob member id of the binding rides as an optional string.
+    assert_eq!(val["member_id"], "mk--triage-main");
+    // The generation is Core's; the refused wake rides with its remedy.
+    assert_eq!(val["generation"], 2);
+    assert_eq!(val["wake_refusal"]["remedy"], "operator_review");
 }
 
 #[test]
 fn identity_first_types_lifecycle_state_all_variants() {
     let states = [
+        IdentityLifecycleState::Dormant,
         IdentityLifecycleState::Active,
-        IdentityLifecycleState::Retiring,
-        IdentityLifecycleState::Suspended,
-        IdentityLifecycleState::Uninitialized,
+        IdentityLifecycleState::Broken,
     ];
     for state in &states {
         let json = serde_json::to_string(state).expect("serialize");

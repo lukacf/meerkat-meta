@@ -6,14 +6,22 @@
 //! makes, and the observer receives exactly that refusal as the call's tool
 //! result.
 //!
+//! A member runs more than one turn: its spawn kickoff, then the test's own
+//! input. Each turn is its own run, and Core reports the refused call of
+//! each run, so the test model calls the refused tool only on the first
+//! request it gets and answers every later request with text. Each launch
+//! then makes exactly one refused call, whichever turn makes it.
+//!
 //! Each test reads the observations once the model is asked again with
 //! the refused call's result, a typed watch the test client sets, bounded
 //! only by a named failure timeout. Core reports a call's refusal before
-//! that result returns to the model, so the read sees every observation of
-//! the call, and a duplicate fails the exact comparison.
+//! that result returns to the model, and no later request calls the tool,
+//! so the read sees every observation there will be, and a duplicate fails
+//! the exact comparison.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -79,16 +87,25 @@ impl AgentToolDispatcher for RefusingBundle {
     }
 }
 
-/// Calls the refused tool, then ends the turn once the call has a result.
-/// It marks `answered` when the model is asked again with that result.
+/// Calls the refused tool on its first request and answers every later
+/// request with text, so the member's turns together make one refused call.
+/// It marks `answered` when the model is asked again with that call's
+/// result.
 struct RefusedCallClient {
+    called: AtomicBool,
     answered: tokio::sync::watch::Sender<bool>,
 }
 
 impl RefusedCallClient {
     fn new() -> (Arc<Self>, tokio::sync::watch::Receiver<bool>) {
         let (answered, seen) = tokio::sync::watch::channel(false);
-        (Arc::new(Self { answered }), seen)
+        (
+            Arc::new(Self {
+                called: AtomicBool::new(false),
+                answered,
+            }),
+            seen,
+        )
     }
 }
 
@@ -103,15 +120,8 @@ impl LlmClient for RefusedCallClient {
         if after_tool {
             self.answered.send_replace(true);
         }
-        let (event, stop_reason) = if after_tool {
-            (
-                LlmEvent::TextDelta {
-                    delta: "done".to_string(),
-                    meta: None,
-                },
-                StopReason::EndTurn,
-            )
-        } else {
+        let first_request = !self.called.swap(true, Ordering::SeqCst);
+        let (event, stop_reason) = if first_request {
             (
                 LlmEvent::ToolCallComplete {
                     id: REFUSED_CALL.to_string(),
@@ -120,6 +130,14 @@ impl LlmClient for RefusedCallClient {
                     meta: None,
                 },
                 StopReason::ToolUse,
+            )
+        } else {
+            (
+                LlmEvent::TextDelta {
+                    delta: "done".to_string(),
+                    meta: None,
+                },
+                StopReason::EndTurn,
             )
         };
         Box::pin(futures::stream::iter(vec![
@@ -208,8 +226,8 @@ fn refused_call() -> Vec<(
     )]
 }
 
-/// Spawns the member and sends it one message; its turn calls the refused
-/// tool.
+/// Spawns the member and sends it one message. The member's first turn (its
+/// spawn kickoff) makes the refused call, and every later turn gets text.
 async fn spawn_and_send(runtime: &UnifiedRuntime) {
     runtime
         .spawn(SpawnMemberSpec::from_wire(
@@ -271,7 +289,9 @@ async fn a_temp_dir_member_reports_its_refused_call_to_the_host_observer() {
 
 /// The scratch launch: a scratch directory selects the identity-first
 /// composition over the runtime-backed ephemeral spec. The roster member's
-/// turn runs through the mob's host input.
+/// spawn kickoff makes the refused call. The test then runs one turn
+/// through the mob's host input, which gets text, and reads once that turn
+/// has ended.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_scratch_member_reports_its_refused_call_to_the_host_observer() {
     let scratch = tempfile::tempdir().unwrap();

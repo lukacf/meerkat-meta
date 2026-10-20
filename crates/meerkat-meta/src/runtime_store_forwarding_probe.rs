@@ -10,14 +10,18 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use meerkat_runtime::store::{
     ContinuationAdmission, ContinuationAdmissionOutcome, ContinuationAdmissionTransition,
-    ContinuationKeyBinding, KeyedRuntimeDeliveryCasOutcome, RuntimeDeliveryAuthorityRecord,
-    RuntimeDeliveryStoreRecord, RuntimeStoreControllerCustody, RuntimeStoreError,
-    RuntimeStoreExecutionClaim, RuntimeStoreExecutionCustody,
+    ContinuationKeyBinding, DeliveryGenerationReader, KeyedRuntimeDeliveryCasOutcome,
+    RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord, RuntimeStoreControllerCustody,
+    RuntimeStoreError, RuntimeStoreExecutionClaim, RuntimeStoreExecutionCustody,
 };
 use meerkat_runtime::{HostingCapability, LogicalRuntimeId, RuntimeStore};
 
 const REFUSAL: &str = "forwarding probe: controller mutation custody";
 const DELIVERY_GENERATION: u64 = 41;
+/// The probe's commit outcome deadline: neither the trait default
+/// (`DEFAULT_COMMIT_OUTCOME_DEADLINE`) nor the in-memory store's `None`.
+pub(crate) const COMMIT_OUTCOME_DEADLINE: std::time::Duration =
+    std::time::Duration::from_millis(41_017);
 
 pub(crate) struct ForwardingRuntimeStoreProbe {
     inner: meerkat_runtime::InMemoryRuntimeStore,
@@ -139,6 +143,18 @@ pub(crate) async fn assert_forwards_to(
             .expect("the inner store's generation"),
         DELIVERY_GENERATION
     );
+    let mut reader = store
+        .delivery_generation_reader()
+        .expect("the inner store's generation reader");
+    assert_eq!(
+        reader.read().await.expect("the inner reader's generation"),
+        DELIVERY_GENERATION
+    );
+    assert_eq!(
+        store.commit_outcome_deadline(),
+        Some(COMMIT_OUTCOME_DEADLINE),
+        "the inner store's commit outcome deadline"
+    );
     assert_eq!(
         probe.calls(),
         vec![
@@ -150,6 +166,8 @@ pub(crate) async fn assert_forwards_to(
             "load_continuation_admission",
             "transition_continuation_admission",
             "load_delivery_generation",
+            "delivery_generation_reader",
+            "commit_outcome_deadline",
         ],
         "each method reaches the inner store exactly once"
     );
@@ -161,6 +179,23 @@ pub(crate) async fn assert_forwards_to(
 #[cfg(test)]
 mod store_impl {
     use super::*;
+
+    /// The probe's own generation reader: the trait default answers none, so
+    /// a decorator that keeps the default fails the forwarding check.
+    struct ProbeGenerationReader;
+
+    #[async_trait]
+    impl DeliveryGenerationReader for ProbeGenerationReader {
+        async fn read(&mut self) -> Result<u64, RuntimeStoreError> {
+            Ok(DELIVERY_GENERATION)
+        }
+
+        fn keeps_connection(&self) -> bool {
+            false
+        }
+
+        fn release(&mut self) {}
+    }
 
     #[async_trait]
     impl RuntimeStore for ForwardingRuntimeStoreProbe {
@@ -231,6 +266,16 @@ mod store_impl {
         async fn load_delivery_generation(&self) -> Result<u64, RuntimeStoreError> {
             self.record("load_delivery_generation");
             Ok(DELIVERY_GENERATION)
+        }
+
+        fn delivery_generation_reader(&self) -> Option<Box<dyn DeliveryGenerationReader>> {
+            self.record("delivery_generation_reader");
+            Some(Box::new(ProbeGenerationReader))
+        }
+
+        fn commit_outcome_deadline(&self) -> Option<std::time::Duration> {
+            self.record("commit_outcome_deadline");
+            Some(COMMIT_OUTCOME_DEADLINE)
         }
 
         async fn commit_session_snapshot(

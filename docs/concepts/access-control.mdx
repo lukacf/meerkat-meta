@@ -344,6 +344,8 @@ the composed Console bundle; discovery alone is not an E2E result.
   runtimes; the authority-local JSON-RPC surface fails it closed.
 - `/agents/{id}/events` — requires `agent.view` on that agent. `/mob/events` and `/meta/mob_events/stream` require `mob.observe` to open and additionally filter each event by `agent.view` on its source (see below).
 
+A committed configuration change reaches open streams before their next frame. The timeline streams, `/agents/{id}/events`, `/mob/events`, `/meta/mob_events/stream` and the WorkGraph facts stream decide each frame right before they send it, under the configuration committed at that point, not the one they opened with. A stream whose own grant is withdrawn (`agent.view` on its agent, `mob.observe`, or `workgraph.view`) ends when the change is committed, even while it has nothing to send, and the client's reconnect is decided under the new configuration. A member that joins while a timeline stream is open is judged by its own labels and role.
+
 Label- and role-based rules resolve against an attribute cache the runtime refreshes from every roster projection, so selectors keep working on surfaces that only carry an identity string.
 
 <Note>
@@ -361,6 +363,20 @@ Label- and role-based rules resolve against an attribute cache the runtime refre
 ## Relationship to authentication
 
 Access control layers on top of console authentication (`require_app_auth` + the email allowlist): authentication decides who may reach the console at all, ABAC decides what each of them sees and does once inside. Identity comes from the validated bearer token (`email` or `sub` claim). With authentication optional, a valid voluntarily supplied token can still establish a named principal when trusted-token validation and access control are configured. Callers without one are anonymous and match only rules without subject constraints. For per-user deployments, require authentication rather than relying on optional identification.
+
+## Timeline frames of members that changed or left
+
+When the console records a member's timeline frame, it also records the member's attributes at that moment: its identity, role and labels, and the spawn ancestors its lineage names. Each timeline surface (the REST window, `meta/console/query_timeline`, and the snapshot and live frames of the timeline streams) decides `agent.view` on every frame with those recorded attributes, before the frame is shaped for the caller, so a page limit counts only frames the caller may see. The recorded attributes never leave the server.
+
+The most restrictive rule applies:
+
+- A frame is visible only when both the recorded attributes and the member's current attributes allow it. After a member is relabelled into a denied class, its earlier frames are denied too; after it is relabelled out of one, frames its recorded attributes deny stay denied.
+- A member that has left, or that nothing has read from the roster since a restart, is decided by its recorded attributes only. A label or role deny keeps applying to its frames.
+- A spawn ancestor is recorded only from the member that actually performed the spawn (the spawning session), not from a later member under the same identity. An ancestor that could not be confirmed counts as unknown, and the current attributes of a member under an ancestor's identity can only add a deny.
+- A frame recorded without member attributes (written by an earlier release, or when the console could not tell which member wrote it) and an unknown ancestor are refused under any deny rule the identity alone cannot decide: a rule with a role or label selector, or one naming another agent (it could be an ancestor). Allow rules and identity-only denies decide such a frame by its identity, as before.
+- The console's own frames (the `_system` and `__console__` identities) are decided by those identities. No member can run under them.
+
+Every timeline surface applies this decision, frame by frame. When a recent-mode query scans its whole budget without a frame the caller may see, it returns an empty page with a cursor to continue from, the same shape as any page with nothing visible.
 
 ## Cross-mob control grants
 

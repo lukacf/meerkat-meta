@@ -12,14 +12,12 @@ try:
     from meerkat_meta._client import MetaTypedClient
     from meerkat_meta.helpers import build_console_modules_route, define_module_spec
     from meerkat_meta.identity_first_models import DurableAgentSpec
-    from meerkat_meta.identity_first_providers import LeaseAcquireResult, LeaseGrant
     from meerkat_meta.types import PersistedEvent, UnifiedAgentEvent
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from meerkat_meta._client import MetaTypedClient  # type: ignore[no-redef]
     from meerkat_meta.helpers import build_console_modules_route, define_module_spec  # type: ignore[no-redef]
     from meerkat_meta.identity_first_models import DurableAgentSpec  # type: ignore[no-redef]
-    from meerkat_meta.identity_first_providers import LeaseAcquireResult, LeaseGrant  # type: ignore[no-redef]
     from meerkat_meta.types import PersistedEvent, UnifiedAgentEvent  # type: ignore[no-redef]
 
 
@@ -111,20 +109,6 @@ def main() -> int:
             "boundary": "mcp",
         },
         "unexpected module spec",
-    ))
-
-    check("identity-first lease callback uses rust wire tags", lambda: _assert_eq(
-        LeaseAcquireResult(
-            status="acquired",
-            grant=LeaseGrant(identity="lead:main", fencing_token=7, ttl_ms=5000),
-        ).to_dict(),
-        {
-            "result": "acquired",
-            "identity": "lead:main",
-            "fencing_token": 7,
-            "ttl": 5000,
-        },
-        "unexpected lease callback shape",
     ))
 
     def _event_check() -> None:

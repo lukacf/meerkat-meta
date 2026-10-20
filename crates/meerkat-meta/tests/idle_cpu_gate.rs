@@ -29,18 +29,19 @@
 //! growing-session freshness TTL (2s) was shorter than the loop period —
 //! plus the 4Hz stream reconcilers deep-cloning the machine state. With the
 //! large fixture those size-proportional reads alone exceed this gate's
-//! budget on pre-fix code; the write-epoch gate and event-driven reconcile
-//! cadence make them ~zero.
+//! budget on pre-fix code; the committed-boundary gate and event-driven
+//! reconcile cadence make them ~zero.
 //!
 //! COMPOSITION-PARITY class: this test composes its runtime the way the
 //! production gateway binaries do (own stores + own session service +
 //! `MobBootstrapSpec::new`), NOT through `UnifiedRuntimeBuilder`. The
 //! third idle-burn generation survived the builder-composed version of
-//! this gate: the builder path threads the write-epoch witness internally,
-//! but the gateways' external composition left it absent, silently
-//! disabling the console epoch gate in every gateway-composed runtime while
-//! the test stayed green. Diverge from the gateways' composition here only
-//! with a reason written down.
+//! this gate: the builder path wired the console's durable-read gate
+//! internally (then a write-epoch witness, now the composition's durable
+//! runtime store), but the gateways' external composition left it absent,
+//! silently disabling that gate in every gateway-composed runtime while the
+//! test stayed green. Diverge from the gateways' composition here only with
+//! a reason written down.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::BTreeMap;
@@ -57,14 +58,14 @@ use meerkat_meta::identity_first::{
     IdentityRuntime, IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider,
     SessionBridge,
 };
-use meerkat_meta::mob_handle_runtime::epoch_tracking_runtime_store;
+use meerkat_meta::mob_handle_runtime::open_native_session_pair;
+use meerkat_meta::storage_provider::default_meerkat_level_realm;
 use meerkat_meta::{
     AllowAllConsoleVisibilityPolicy, Base64BlobStoreAdapter, BinaryBlobStore,
     ConsoleRuntimeRegistration, DiscoverySpec, MetaConfig, MetaConsoleAggregator,
     MobBootstrapOptions, MobBootstrapSpec, ObjectStoreBlobStore, UnifiedRuntime,
 };
 use meerkat_mob::{MobDefinition, MobStorage, ProfileName};
-use meerkat_store::SqliteSessionStore;
 use tokio::time::sleep;
 
 const MOB_TOML: &str = r#"
@@ -177,30 +178,24 @@ async fn converged_idle_gateway_consumes_near_zero_cpu() {
     let state_path = temp.path().join("state");
     let capture = CaptureClient::default();
 
-    // GATEWAY-PARITY COMPOSITION — keep in lockstep with the persistent
-    // branches of src/bin/rpc_gateway.rs / src/bin/meta_gateway.rs. Both
-    // production gateways roll their own stores and session service and
-    // enter through `MobBootstrapSpec::new`, NOT through
-    // `UnifiedRuntimeBuilder`. The 0.8.4 idle driver survived this gate's
-    // first version precisely because of that split: the library builder
-    // threads the session write-epoch witness internally, while the
-    // external composition must wrap its runtime store with
-    // `epoch_tracking_runtime_store` and call `with_session_write_epochs`
-    // by hand — omit either and the console discovery loop re-reads whole
-    // session documents every 5s forever.
+    // GATEWAY-PARITY COMPOSITION - keep in lockstep with the persistent
+    // branches of src/rpc_gateway.rs / src/bin/meta_gateway.rs. Both
+    // production gateways open Core's native session pair on runtime.sqlite,
+    // roll their own session service and enter through
+    // `MobBootstrapSpec::new`, NOT through `UnifiedRuntimeBuilder`. The 0.8.4
+    // idle driver survived this gate's first version precisely because of
+    // that split: the library builder declares its durable runtime store
+    // internally, while the external composition must call
+    // `with_durable_runtime_store` by hand. Omit it and the console
+    // discovery loop re-reads whole session documents every 5s forever.
     std::fs::create_dir_all(&state_path).expect("create state dir");
     let definition = MobDefinition::from_toml(MOB_TOML).expect("parse idle-cpu mob definition");
-    let session_store = Arc::new(
-        SqliteSessionStore::open(state_path.join("sessions.sqlite")).expect("session store"),
-    );
+    let (session_store, runtime_store) =
+        open_native_session_pair(&state_path, &default_meerkat_level_realm())
+            .expect("native session pair");
     let binary_blob_store: Arc<dyn BinaryBlobStore> = Arc::new(ObjectStoreBlobStore::memory());
     let blob_store: Arc<dyn meerkat_core::BlobStore> =
         Arc::new(Base64BlobStoreAdapter::new(binary_blob_store));
-    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
-        meerkat_runtime::store::SqliteRuntimeStore::new(state_path.join("runtime.sqlite"))
-            .expect("runtime store"),
-    );
-    let (runtime_store, session_write_epochs) = epoch_tracking_runtime_store(runtime_store);
     let adapter = Arc::new(
         meerkat_runtime::MeerkatMachine::persistent(
             Arc::clone(&runtime_store),
@@ -225,7 +220,7 @@ async fn converged_idle_gateway_consumes_near_zero_cpu() {
         .with_canonical_runtime_adapter(adapter.clone()),
     );
     let mob_spec = MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
-        .with_session_write_epochs(&session_write_epochs)
+        .with_durable_runtime_store(&runtime_store)
         .with_session_runtime_adapter(adapter)
         .expect("acquire the fixture session runtime owner")
         .with_options(MobBootstrapOptions {
@@ -356,10 +351,11 @@ async fn converged_idle_gateway_consumes_near_zero_cpu() {
     // durable commits (multi-second, size-proportional, debug-build) and the
     // console's catch-up backfill must finish first. Wait on the console's
     // typed convergence signal: every session-history pass it owes has run,
-    // including a re-read of a session whose durable write epoch moved while
-    // the registration pass read it, and the refresh that waits for a queued
-    // burst to drain. A timed CPU probe could not see a pass scheduled after
-    // it. A gateway that never converges (an idle-CPU hot loop) fails here.
+    // including a re-read of a session whose committed boundary moved while
+    // the registration pass read it, and the refresh re-driven after a
+    // queued burst drains. A timed CPU probe could not see a pass scheduled
+    // after it. A gateway that never converges (an idle-CPU hot loop) fails
+    // here.
     tokio::time::timeout(
         Duration::from_mins(4),
         aggregator.history_backfill_converged(),

@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::access::{AccessController, AccessResource, AccessView, AgentResourceAttributes};
+use crate::auth::session_fence::ConsoleSessionFences;
 use crate::rpc::META_CONTRACT_VERSION;
 use crate::unobserved::{UnobservedFacts, UnobservedReason};
 
@@ -165,6 +166,9 @@ impl ConsoleLiveSnapshot {
     }
 }
 
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 pub fn handle_console_rest_json_route(
     decisions: &RuntimeDecisionState,
     request: &ConsoleRestJsonRequest,
@@ -172,6 +176,9 @@ pub fn handle_console_rest_json_route(
     handle_console_rest_json_route_with_snapshot(decisions, request, None)
 }
 
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 pub fn handle_console_rest_json_route_with_snapshot(
     decisions: &RuntimeDecisionState,
     request: &ConsoleRestJsonRequest,
@@ -187,6 +194,10 @@ pub fn handle_console_rest_json_route_with_snapshot(
 /// may not view disappear from every section, per-agent affordances are
 /// intersected with the caller's grants, and an `access` section describing
 /// the caller's standing is appended for the console UI.
+///
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 pub fn handle_console_rest_json_route_with_snapshot_and_access(
     decisions: &RuntimeDecisionState,
     request: &ConsoleRestJsonRequest,
@@ -226,6 +237,10 @@ pub fn handle_console_rest_json_route_with_snapshot_access_and_memory(
 /// wired a WorkGraph service, so the experience can project the `workgraph`
 /// affordance section the console consumes (`available` + ABAC-intersected
 /// `can_view`/`can_manage`).
+///
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 pub fn handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph(
     decisions: &RuntimeDecisionState,
     request: &ConsoleRestJsonRequest,
@@ -236,6 +251,7 @@ pub fn handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph(
 ) -> ConsoleRestJsonResponse {
     handle_console_rest_json_route_with_pending_rows(
         decisions,
+        &ConsoleSessionFences::detached(),
         request,
         live_snapshot,
         access,
@@ -246,12 +262,16 @@ pub fn handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph(
 }
 
 /// [`handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph`]
-/// for a snapshot whose `pending` identities were walked under an identity
-/// binding that has since moved. Access and visibility decide on the
-/// walked facts; the experience then renders every record of a pending
-/// identity, in every panel, in its withheld shape.
+/// under the Console's session fence record (a token issued before its
+/// principal's fence is refused like an invalid one), for a snapshot whose
+/// `pending` identities were walked under an identity binding that has since
+/// moved. Access and visibility decide on the walked facts; the experience
+/// then renders every record of a pending identity, in every panel, in its
+/// withheld shape.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_console_rest_json_route_with_pending_rows(
     decisions: &RuntimeDecisionState,
+    fences: &ConsoleSessionFences,
     request: &ConsoleRestJsonRequest,
     live_snapshot: Option<&ConsoleLiveSnapshot>,
     access: Option<&AccessController>,
@@ -270,7 +290,10 @@ pub(crate) fn handle_console_rest_json_route_with_pending_rows(
     }
 
     let resolved_auth = match resolve_console_auth(decisions, request.auth.as_ref(), &query_params)
-    {
+        .and_then(|auth| {
+            check_query_token_session_fence(decisions, fences, request.auth.as_ref(), &query_params)
+                .map(|()| auth)
+        }) {
         Ok(auth) => auth,
         Err(error) => {
             return ConsoleRestJsonResponse {
@@ -319,8 +342,8 @@ pub(crate) fn handle_console_rest_json_route_with_pending_rows(
         && !decisions.console.require_app_auth
         && let Some(token) = query_params.get("auth_token")
     {
-        access_subject =
-            resolve_authorized_console_auth_from_token(decisions, token).map(|auth| auth.email);
+        access_subject = resolve_authorized_console_auth_from_token(decisions, fences, token)
+            .map(|auth| auth.email);
     }
     let access_view =
         access.map(|controller| controller.view_for_subject(access_subject.as_deref()));
@@ -1279,14 +1302,6 @@ fn build_identity_status_rows(sidebar_agents: &[Value], pending: &BTreeSet<Strin
             if let Some(generation) = agent.get("generation").and_then(Value::as_u64) {
                 row["generation"] = Value::from(generation);
             }
-            if let Some(checkpoint_version) =
-                agent.get("checkpoint_version").and_then(Value::as_u64)
-            {
-                row["checkpoint_version"] = Value::from(checkpoint_version);
-            }
-            if let Some(lease_healthy) = agent.get("lease_healthy").and_then(Value::as_bool) {
-                row["lease_healthy"] = Value::from(lease_healthy);
-            }
             // Machine-owned liveness projection (meerkat 0.7.29+, ask 14).
             if let Some(progress) = agent.get("progress").filter(|value| !value.is_null()) {
                 row["progress"] = progress.clone();
@@ -1356,25 +1371,31 @@ pub fn extract_bearer_token_from_header(header_value: &str) -> Option<&str> {
 /// Validate a bearer token against the console's trusted OIDC config AND
 /// the email allowlist / provider policy (via `enforce_console_route_access`).
 /// Returns `true` only if the token is valid AND the caller is authorized.
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 pub fn validate_console_token(decisions: &RuntimeDecisionState, token: &str) -> bool {
-    resolve_authorized_console_auth_from_token(decisions, token).is_some()
+    validate_console_token_under_session_fences(decisions, &ConsoleSessionFences::detached(), token)
+}
+
+/// [`validate_console_token`] under the Console's session fence record: a
+/// token issued before its principal's fence (or carrying no `iat` once the
+/// principal has one) is not valid.
+pub fn validate_console_token_under_session_fences(
+    decisions: &RuntimeDecisionState,
+    fences: &ConsoleSessionFences,
+    token: &str,
+) -> bool {
+    resolve_authorized_console_auth_from_token(decisions, fences, token).is_some()
 }
 
 pub(crate) fn resolve_authorized_console_auth_from_token(
     decisions: &RuntimeDecisionState,
+    fences: &ConsoleSessionFences,
     token: &str,
 ) -> Option<ConsoleAccessRequest> {
-    resolve_authorized_console_human_from_token(decisions, token).map(|(auth, _)| auth)
-}
-
-/// [`resolve_authorized_console_auth_from_token`] that also returns the
-/// verified human behind the token, when there is one.
-pub(crate) fn resolve_authorized_console_human_from_token(
-    decisions: &RuntimeDecisionState,
-    token: &str,
-) -> Option<(ConsoleAccessRequest, Option<AuthenticatedConsoleHuman>)> {
-    resolve_authorized_console_caller_from_token(decisions, token)
-        .map(|caller| (caller.auth, caller.human))
+    accept_console_token_at(decisions, fences, token, SystemTime::now())
+        .map(|verified| verified.access_request())
 }
 
 /// A caller the Console resolved from a token it verified and authorized.
@@ -1387,22 +1408,163 @@ pub(crate) struct ResolvedConsoleCaller {
     pub(crate) issuer: String,
     /// The verified human behind the token, when there is one.
     pub(crate) human: Option<AuthenticatedConsoleHuman>,
+    /// The verification the token passed, kept so the caller can be
+    /// verified again while it acts.
+    pub(crate) verification: ConsoleCallerVerification,
 }
 
-/// [`resolve_authorized_console_human_from_token`] that also carries the
-/// issuer the token verified against out of that verification.
+/// Resolve the caller of a token the Console verifies and authorizes now,
+/// under the Console's session fence record.
 pub(crate) fn resolve_authorized_console_caller_from_token(
     decisions: &RuntimeDecisionState,
+    fences: &ConsoleSessionFences,
     token: &str,
 ) -> Option<ResolvedConsoleCaller> {
-    let caller = resolve_console_caller_from_token(decisions, token).ok()?;
-    crate::decisions::enforce_console_route_access(
-        &decisions.auth,
-        &decisions.console,
-        &caller.auth,
-    )
-    .ok()?;
-    Some(caller)
+    resolve_authorized_console_caller_from_token_at(decisions, fences, token, SystemTime::now())
+}
+
+/// [`resolve_authorized_console_caller_from_token`] with the verifier's
+/// clock read as `now`.
+pub(crate) fn resolve_authorized_console_caller_from_token_at(
+    decisions: &RuntimeDecisionState,
+    fences: &ConsoleSessionFences,
+    token: &str,
+    now: SystemTime,
+) -> Option<ResolvedConsoleCaller> {
+    // Taken before the acceptance reads the fence, so a fence the
+    // acceptance did not see has moved the record past it.
+    let fence_revision = fences.revision();
+    let VerifiedConsoleToken {
+        caller,
+        expires_at_epoch_seconds,
+        issued_at_epoch_seconds: _,
+        refused_from,
+    } = accept_console_token_at(decisions, fences, token, now)?;
+    let verification = ConsoleCallerVerification {
+        retained: Arc::new(RetainedConsoleVerification {
+            decisions: decisions.clone(),
+            fences: fences.clone(),
+            fence_revision,
+            token: token.to_string(),
+            caller: caller.clone(),
+            refused_from,
+        }),
+    };
+    let ConsoleTokenCaller {
+        principal,
+        provider,
+        issuer,
+        human,
+    } = caller;
+    let human = human.map(|human| AuthenticatedConsoleHuman {
+        provider: provider.clone(),
+        issuer: issuer.clone(),
+        subject: human.subject,
+        expires_at_epoch_seconds,
+        token_digest: {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(token.as_bytes()).into()
+        },
+        login_scope: human.login_scope,
+        verification: Some(verification.clone()),
+    });
+    Some(ResolvedConsoleCaller {
+        auth: ConsoleAccessRequest {
+            provider,
+            email: principal,
+        },
+        issuer,
+        human,
+        verification,
+    })
+}
+
+/// The verification a Console caller's token passed, kept so the caller
+/// can be verified again later by the same verifier: by a governed send
+/// after its awaits, and by a stream for as long as it stays open. Only the
+/// verifier builds one. It holds the accepted token, which none of its
+/// formatting shows.
+#[derive(Clone)]
+pub(crate) struct ConsoleCallerVerification {
+    retained: Arc<RetainedConsoleVerification>,
+}
+
+/// The accepted token, the Console decisions that verified it, the
+/// Console's live session fence record, and what that verification found.
+struct RetainedConsoleVerification {
+    decisions: RuntimeDecisionState,
+    /// The record itself, shared with every route: a fence set after the
+    /// token was accepted is read at the next verification.
+    fences: ConsoleSessionFences,
+    /// The record's revision when the acceptance began.
+    fence_revision: u64,
+    token: String,
+    caller: ConsoleTokenCaller,
+    refused_from: Option<SystemTime>,
+}
+
+/// What a fresh verification of a still-current caller found.
+pub(crate) struct CurrentConsoleCaller {
+    /// The access principal the Console's access policy keys.
+    pub(crate) principal: String,
+    /// The first instant the verifier refuses the token; `None` when the
+    /// token has no `exp`.
+    pub(crate) refused_from: Option<SystemTime>,
+}
+
+impl ConsoleCallerVerification {
+    /// The first instant the verifier refuses the token on its expiry, as
+    /// the verification that accepted it computed it; `None` when the token
+    /// has no `exp` and so never lapses.
+    pub(crate) fn refused_from(&self) -> Option<SystemTime> {
+        self.retained.refused_from
+    }
+
+    /// A receiver that changes after each change to the Console's session
+    /// fence record, so a holder asks [`Self::current_at`] again whatever
+    /// the token's expiry. It starts out changed when the record moved since
+    /// the acceptance began: a fence set between the acceptance and the
+    /// holder's start is never missed.
+    pub(crate) fn session_fence_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        let mut changes = self.retained.fences.subscribe();
+        let moved = *changes.borrow() != self.retained.fence_revision;
+        if moved {
+            changes.mark_changed();
+        }
+        changes
+    }
+
+    /// Verify the caller again, with the verifier's clock read as `now`.
+    /// This is the one rule every retained Console caller is held to: the
+    /// retained token must still pass the acceptance a request goes
+    /// through (signature, issuer, audience, time, the allowlist and
+    /// provider policy of the decisions it was accepted with, and its
+    /// principal's session fence as the record holds it now) and name the
+    /// same principal, provider classification and issuer, and for a
+    /// Console human also the same subject and login association. It does
+    /// not observe a replaced login, nor verifier, JWKS, allowlist or
+    /// provider decisions made after the token was accepted; a session fence
+    /// set after it is observed.
+    pub(crate) fn current_at(&self, now: SystemTime) -> Option<CurrentConsoleCaller> {
+        let retained = &*self.retained;
+        let verified =
+            accept_console_token_at(&retained.decisions, &retained.fences, &retained.token, now)?;
+        if verified.caller != retained.caller {
+            return None;
+        }
+        Some(CurrentConsoleCaller {
+            principal: verified.caller.principal,
+            refused_from: verified.refused_from,
+        })
+    }
+}
+
+impl std::fmt::Debug for ConsoleCallerVerification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsoleCallerVerification")
+            .field("refused_from", &self.retained.refused_from)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The trust-domain prefix of a Console human's qualified principal: the
@@ -1427,15 +1589,9 @@ pub struct AuthenticatedConsoleHuman {
     /// The token's signed `sid`, exactly as signed: the issuer's opaque login
     /// association, when it asserts one.
     login_scope: Option<String>,
-    /// The verifier that accepted the token, retained so the human can be
-    /// re-verified after an await ([`Self::current`]); never serialized.
-    verification: Option<Arc<ConsoleHumanVerification>>,
-}
-
-/// The accepted token and the Console decisions that verified it.
-struct ConsoleHumanVerification {
-    decisions: RuntimeDecisionState,
-    token: String,
+    /// The verification that accepted the token, retained so the human can
+    /// be re-verified after an await ([`Self::current`]); never serialized.
+    verification: Option<ConsoleCallerVerification>,
 }
 
 /// The verified Console human is no longer current: its retained token no
@@ -1526,33 +1682,23 @@ impl AuthenticatedConsoleHuman {
         )
     }
 
-    /// Re-verify this human now, after any await: the retained token must
-    /// still verify under the verifier decisions it was accepted with
-    /// (signature, issuer, audience, expiry, and that snapshot's allowlist
-    /// and provider policy) and still name the same issuer and subject.
-    /// Returns the access principal (the email the Console's access policy
-    /// keys) for a separate check against the live access policy. It does
-    /// not observe a replaced login, nor replacement verifier, JWKS,
-    /// allowlist or provider decisions made after the token was accepted.
-    /// The digest and expiry alone are attribution, not current
-    /// authorization.
+    /// Re-verify this human now, after any await, by the rule every Console
+    /// caller kept for later is held to: the retained token must still
+    /// verify under the verifier decisions it was accepted with (signature,
+    /// issuer, audience, expiry, and that snapshot's allowlist and provider
+    /// policy) and still name the same principal, provider, issuer, subject
+    /// and login association. Returns the access principal (the email the
+    /// Console's access policy keys) for a separate check against the live
+    /// access policy. It does not observe a replaced login, nor replacement
+    /// verifier, JWKS, allowlist or provider decisions made after the token
+    /// was accepted. The digest and expiry alone are attribution, not
+    /// current authorization.
     pub fn current(&self) -> Result<String, ConsoleHumanNotCurrent> {
-        let verification = self.verification.as_ref().ok_or(ConsoleHumanNotCurrent)?;
-        let (auth, human) = resolve_authorized_console_human_from_token(
-            &verification.decisions,
-            &verification.token,
-        )
-        .ok_or(ConsoleHumanNotCurrent)?;
-        match human {
-            Some(human)
-                if human.issuer == self.issuer
-                    && human.subject == self.subject
-                    && human.login_scope == self.login_scope =>
-            {
-                Ok(auth.email)
-            }
-            _ => Err(ConsoleHumanNotCurrent),
-        }
+        self.verification
+            .as_ref()
+            .and_then(|verification| verification.current_at(SystemTime::now()))
+            .map(|current| current.principal)
+            .ok_or(ConsoleHumanNotCurrent)
     }
 
     #[cfg(test)]
@@ -1583,13 +1729,154 @@ fn resolve_console_auth_from_token(
     decisions: &RuntimeDecisionState,
     token: &str,
 ) -> Result<ConsoleAccessRequest, ConsoleAuthResolutionError> {
-    resolve_console_caller_from_token(decisions, token).map(|caller| caller.auth)
+    verify_console_token_at(decisions, token, SystemTime::now())
+        .map(|verified| verified.access_request())
 }
 
-fn resolve_console_caller_from_token(
+/// The session fence check of the REST routes' query-parameter token: when
+/// the request resolved through a token (no explicit caller, on a console
+/// that requires sign-in), that token must also pass its principal's session
+/// fence, read from the record as it is now.
+fn check_query_token_session_fence(
+    decisions: &RuntimeDecisionState,
+    fences: &ConsoleSessionFences,
+    explicit_auth: Option<&ConsoleAccessRequest>,
+    query_params: &BTreeMap<String, String>,
+) -> Result<(), ConsoleAuthResolutionError> {
+    if explicit_auth.is_some() || !decisions.console.require_app_auth {
+        return Ok(());
+    }
+    let Some(token) = query_params.get("auth_token") else {
+        return Ok(());
+    };
+    let verified = verify_console_token_at(decisions, token, SystemTime::now())?;
+    if session_fence_admits(
+        fences.not_before(&verified.caller.principal),
+        verified.issued_at_epoch_seconds,
+    ) {
+        Ok(())
+    } else {
+        Err(ConsoleAuthResolutionError::SessionRevoked)
+    }
+}
+
+/// The clock skew, in seconds, the Console's verifier allows on a token's
+/// `exp` and `nbf`.
+const CONSOLE_TOKEN_LEEWAY_SECONDS: u64 = 30;
+
+/// The first instant the Console's verifier refuses a token that expires at
+/// `exp` (seconds since the epoch). Validation refuses `exp < now - leeway`
+/// on whole seconds, so it accepts the token through second
+/// `exp + leeway` and refuses it from the next. `None` when that instant is
+/// not representable: the verifier never refuses the token on time.
+fn console_token_refused_from(exp: u64) -> Option<SystemTime> {
+    let refused_from = exp
+        .checked_add(CONSOLE_TOKEN_LEEWAY_SECONDS)?
+        .checked_add(1)?;
+    UNIX_EPOCH.checked_add(Duration::from_secs(refused_from))
+}
+
+/// Whether a token issued at `issued_at` (its `iat`, seconds since the
+/// epoch) passes its principal's session fence `not_before`. With no fence
+/// every token passes. Under a fence a token passes only when it says it was
+/// issued at least the verifier's clock leeway after the fence: an issuer
+/// whose clock runs up to that much ahead cannot mint a token before the
+/// fence that passes it. A token without `iat` never passes a fence.
+fn session_fence_admits(not_before: Option<u64>, issued_at: Option<u64>) -> bool {
+    match not_before {
+        None => true,
+        Some(not_before) => issued_at
+            .is_some_and(|issued_at| issued_at >= session_fence_first_accepted_iat(not_before)),
+    }
+}
+
+/// The earliest `iat` a token passes a session fence set at `not_before`
+/// with: the fence plus the verifier's clock leeway.
+pub(crate) fn session_fence_first_accepted_iat(not_before: u64) -> u64 {
+    not_before.saturating_add(CONSOLE_TOKEN_LEEWAY_SECONDS)
+}
+
+/// Who a Console token verified as. A later verification of the same token
+/// must find the same caller for it to stay current.
+#[derive(Clone, PartialEq)]
+struct ConsoleTokenCaller {
+    /// The access principal: the email, or the `sub` where the issuer may
+    /// leave the email out.
+    principal: String,
+    provider: AuthProvider,
+    /// The issuer the token verified against.
+    issuer: String,
+    /// The Console human, when the token names one.
+    human: Option<ConsoleTokenHuman>,
+}
+
+/// The verified `sub` and signed login association of a Console human.
+#[derive(Clone, PartialEq)]
+struct ConsoleTokenHuman {
+    subject: String,
+    login_scope: Option<String>,
+}
+
+/// What one verification of a Console token found.
+struct VerifiedConsoleToken {
+    caller: ConsoleTokenCaller,
+    expires_at_epoch_seconds: Option<u64>,
+    /// The token's `iat`, which its principal's session fence is compared
+    /// with.
+    issued_at_epoch_seconds: Option<u64>,
+    /// The first instant the verifier refuses the token on its expiry.
+    refused_from: Option<SystemTime>,
+}
+
+impl VerifiedConsoleToken {
+    fn access_request(&self) -> ConsoleAccessRequest {
+        ConsoleAccessRequest {
+            provider: self.caller.provider.clone(),
+            email: self.caller.principal.clone(),
+        }
+    }
+}
+
+/// The Console's acceptance of a token, with its clock read as `now`: the
+/// token verifies, the Console's route policy (allowlist and provider
+/// policy) admits the caller it names, and the token passes that caller's
+/// session fence, read from the record as it is now. A token caller is
+/// accepted here at its request, and every time it is verified again while
+/// it acts. An accepted token without `exp` lists its principal as
+/// non-expiring in the record.
+fn accept_console_token_at(
+    decisions: &RuntimeDecisionState,
+    fences: &ConsoleSessionFences,
+    token: &str,
+    now: SystemTime,
+) -> Option<VerifiedConsoleToken> {
+    let verified = verify_console_token_at(decisions, token, now).ok()?;
+    crate::decisions::enforce_console_route_access(
+        &decisions.auth,
+        &decisions.console,
+        &verified.access_request(),
+    )
+    .ok()?;
+    if !session_fence_admits(
+        fences.not_before(&verified.caller.principal),
+        verified.issued_at_epoch_seconds,
+    ) {
+        return None;
+    }
+    if verified.expires_at_epoch_seconds.is_none() {
+        fences.note_non_expiring(&verified.caller.principal);
+    }
+    Some(verified)
+}
+
+/// Verify a Console token against the trusted OIDC configuration, with the
+/// verifier's clock read as `now`: signature, issuer, audience, and `exp`
+/// and `nbf` within [`CONSOLE_TOKEN_LEEWAY_SECONDS`].
+fn verify_console_token_at(
     decisions: &RuntimeDecisionState,
     token: &str,
-) -> Result<ResolvedConsoleCaller, ConsoleAuthResolutionError> {
+    now: SystemTime,
+) -> Result<VerifiedConsoleToken, ConsoleAuthResolutionError> {
     if decisions.trusted_oidc.audience.trim().is_empty() {
         return Err(ConsoleAuthResolutionError::InvalidTrustedOidcConfig);
     }
@@ -1612,10 +1899,7 @@ fn resolve_console_caller_from_token(
     let verification_key = build_jwt_verification_key(key, &header.alg)
         .map_err(|_| ConsoleAuthResolutionError::InvalidJwksKeyMaterial)?;
 
-    let now_epoch_seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now_epoch_seconds = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let claims = validate_jwt_with_verification_key(
         token,
         &verification_key,
@@ -1623,7 +1907,7 @@ fn resolve_console_caller_from_token(
             issuer: Some(discovery.issuer.clone()),
             audience: Some(decisions.trusted_oidc.audience.clone()),
             now_epoch_seconds,
-            leeway_seconds: 30,
+            leeway_seconds: CONSOLE_TOKEN_LEEWAY_SECONDS,
         },
     )
     .map_err(|_| ConsoleAuthResolutionError::InvalidToken)?;
@@ -1665,31 +1949,25 @@ fn resolve_console_caller_from_token(
         (AuthProvider::ServiceIdentity, _) | (_, None) => None,
         (_, Some(subject)) if subject.trim().is_empty() => None,
         _ if discovery.issuer.trim().is_empty() => None,
-        (_, Some(subject)) => Some(AuthenticatedConsoleHuman {
-            provider: provider.clone(),
-            issuer: discovery.issuer.clone(),
+        (_, Some(subject)) => Some(ConsoleTokenHuman {
             subject,
-            expires_at_epoch_seconds: claims.expires_at_epoch_seconds,
-            token_digest: {
-                use sha2::Digest as _;
-                sha2::Sha256::digest(token.as_bytes()).into()
-            },
             // Exactly as signed; a blank one is no usable association.
             login_scope: claims.session_id.filter(|scope| !scope.trim().is_empty()),
-            verification: Some(Arc::new(ConsoleHumanVerification {
-                decisions: decisions.clone(),
-                token: token.to_string(),
-            })),
         }),
     };
 
-    Ok(ResolvedConsoleCaller {
-        auth: ConsoleAccessRequest {
+    Ok(VerifiedConsoleToken {
+        caller: ConsoleTokenCaller {
+            principal,
             provider,
-            email: principal,
+            issuer: discovery.issuer,
+            human,
         },
-        issuer: discovery.issuer,
-        human,
+        expires_at_epoch_seconds: claims.expires_at_epoch_seconds,
+        issued_at_epoch_seconds: claims.issued_at_epoch_seconds,
+        refused_from: claims
+            .expires_at_epoch_seconds
+            .and_then(console_token_refused_from),
     })
 }
 
@@ -1703,6 +1981,8 @@ enum ConsoleAuthResolutionError {
     MissingTokenIdentity,
     Hs256NotAllowed,
     EmailNotVerified,
+    /// The token was issued before its principal's session fence.
+    SessionRevoked,
 }
 
 fn console_auth_error_reason(error: &ConsoleAuthResolutionError) -> &'static str {
@@ -1715,6 +1995,7 @@ fn console_auth_error_reason(error: &ConsoleAuthResolutionError) -> &'static str
         ConsoleAuthResolutionError::MissingTokenIdentity => "missing_token_identity",
         ConsoleAuthResolutionError::Hs256NotAllowed => "hs256_not_allowed",
         ConsoleAuthResolutionError::EmailNotVerified => "email_not_verified",
+        ConsoleAuthResolutionError::SessionRevoked => "session_revoked",
     }
 }
 

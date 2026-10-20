@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 from pathlib import Path
 import stat
@@ -39,6 +40,17 @@ CANDIDATE_PATHS = frozenset({"runtime-candidate.json", "runtime_candidates.py", 
 _SDK_WHEEL_HELPER = "sdk_wheel_integrity.py"
 _SDK_WHEEL_SUPERVISOR_HELPER = "launchkit/" + _SDK_WHEEL_HELPER
 APPLICATION_TOOL_POLICY_PATH = "application/tool-policy.json"
+# Meta 0.9.4 keeps conversations and agent identities in Meerkat Core's own
+# stores. It refuses native state that an earlier release wrote until a
+# one-time, offline `meta_gateway storage-migrate-native` run has converted it.
+# Forge does not run that migration, so no update moves an installation across.
+NATIVE_STORAGE_META_VERSION = "0.9.4"
+NATIVE_STORAGE_UPDATE_BLOCKER = (
+    "This update moves the application from Meta {0} to Meta {1}. Meta {1} keeps conversations "
+    "and agent identities in a new storage layout and refuses saved state from an earlier release "
+    "until a one-time, offline migration (`meta_gateway storage-migrate-native`) has converted it. "
+    "Forge does not run that migration, so it cannot apply this update. Nothing was changed: the "
+    "installation, its private settings and saved state stay as they are.")
 UPDATE_BINDING_KEYS = ("update_id", "from_build_id", "to_build_id", "guide_version", "blueprint_hash",
     "source_digest", "brief_hash", "package_sha256", "previous_package_sha256", "changes", "blockers",
     "native_definition_update", "host_instruction_update", "runtime_dependency_update", "maintained_host_update")
@@ -682,6 +694,32 @@ def _completed_maintained_host_transition(previous, candidate, receipt, update, 
         return None
 
 
+def meta_release(version):
+    """Return the numeric release of an exact version string, or None."""
+    match = (re.match(r"([0-9]{1,6})\.([0-9]{1,6})\.([0-9]{1,6})(?![0-9])", version)
+             if type(version) is str else None)
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def crosses_native_storage(from_version, to_version):
+    """Whether native state written by one release needs the offline
+    native-storage migration before the other release can open it."""
+    before, after = meta_release(from_version), meta_release(to_version)
+    return (before is not None and after is not None
+            and before < meta_release(NATIVE_STORAGE_META_VERSION) <= after)
+
+
+def native_storage_crossing(previous, candidate):
+    """Return the (from, to) releases of a source change that would move the
+    installed native state across NATIVE_STORAGE_META_VERSION, else None."""
+    try:
+        versions = tuple(_parsed_config(files, "deployment.json").get("mobkitVersion")
+                         for files in (previous, candidate))
+    except (KeyError, ValueError, TypeError, UnicodeError, RecursionError):
+        return None
+    return versions if crosses_native_storage(*versions) else None
+
+
 def _runtime_dependency_authority(previous, candidate, receipt):
     """Compare the fixed release crossing independently of compiler lifetime."""
     if receipt.get("target", "local") != "local" or not _framework_provenance(previous):
@@ -707,8 +745,14 @@ def _runtime_dependency_authority(previous, candidate, receipt):
                 return None
             prior = _candidate_source_selection(previous)
             if prior is not None and type(parse_candidate_selection(prior)) is MetaToolkitRuntimeTarget:
-                return _product_refresh_authority(previous, candidate, receipt, old, new, prior, selected)
-            return _meta_toolkit_dependency_authority(previous, candidate, old, new, selected, versions)
+                authority = _product_refresh_authority(previous, candidate, receipt, old, new, prior, selected)
+            else:
+                authority = _meta_toolkit_dependency_authority(previous, candidate, old, new, selected, versions)
+            # Recovery is forward-only once the new runtime may start, and that
+            # runtime refuses unmigrated state: never authorize this crossing.
+            if authority is not None and crosses_native_storage(authority["from_version"], authority["to_version"]):
+                return None
+            return authority
         if versions not in {("0.8.42", "0.8.46"), ("0.8.42", "0.8.47"), ("0.8.46", "0.8.47"),
                 ("0.8.42", "0.8.48"), ("0.8.46", "0.8.48"), ("0.8.47", "0.8.48")} or (
                 mode == "background" and versions[1] not in {"0.8.47", "0.8.48"}):
@@ -1836,6 +1880,9 @@ def _completed_runtime_dependency_transition(previous, candidate, receipt, updat
 
 def compatibility(previous, candidate, receipt, *, runtime_target=None):
     changes, blockers = [], []
+    crossing = native_storage_crossing(previous, candidate)
+    if crossing is not None:
+        blockers.append(NATIVE_STORAGE_UPDATE_BLOCKER.format(*crossing))
     instruction_update = instruction_configuration_update(previous, candidate)
     current_host = (current_host_framework(candidate, runtime_target=runtime_target)
                     if runtime_target is not None else current_host_framework(candidate))

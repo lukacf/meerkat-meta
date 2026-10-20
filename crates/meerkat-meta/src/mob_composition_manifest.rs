@@ -794,6 +794,12 @@ impl MobStorageProvenance {
         }
     }
 
+    /// Whether the caller said what the storage is: persistent at a path, or
+    /// in-memory by declaration.
+    pub(crate) fn is_declared(&self) -> bool {
+        !matches!(self.0, Provenance::Unspecified)
+    }
+
     /// Whether a non-empty event log may be resumed under this declaration.
     ///
     /// Only the unspecified form is refused: an undeclared storage could be

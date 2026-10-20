@@ -125,9 +125,6 @@ pub enum UnifiedRuntimeBuilderError {
     DefinitionLoad(String),
     /// Conflicting builder configuration (e.g., persistent_state + scratch_dir).
     ConflictingConfiguration(String),
-    /// Extension activation requires authoritative retained identity history.
-    #[cfg(feature = "extension-state")]
-    ExtensionAuthorityUnavailable(crate::identity_first::ContinuityStoreError),
     /// Storage layout refusal (file-name twins in the state directory).
     StorageLayout(crate::storage_layout::StorageLayoutError),
     /// A storage provider failed to open the realm's store set, or the
@@ -175,10 +172,6 @@ impl Display for UnifiedRuntimeBuilderError {
             Self::Io(msg) => write!(f, "{msg}"),
             Self::DefinitionLoad(msg) => write!(f, "{msg}"),
             Self::ConflictingConfiguration(msg) => write!(f, "conflicting configuration: {msg}"),
-            #[cfg(feature = "extension-state")]
-            Self::ExtensionAuthorityUnavailable(error) => {
-                write!(f, "extension identity authority unavailable: {error}")
-            }
             Self::StorageLayout(err) => write!(f, "{err}"),
             Self::StorageProvider(err) => write!(f, "{err}"),
             Self::LiveCompose(err) => write!(f, "{err}"),
@@ -274,6 +267,9 @@ impl MobStopOutcome {
 }
 
 /// Exact disposition of identity-first lease authority during shutdown.
+///
+/// Meta holds no identity lease authority (Core owns every member
+/// binding), so shutdown reports [`Self::NotConfigured`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityAuthorityReleaseOutcome {
     /// The runtime did not have identity-first authority to release.
@@ -651,7 +647,8 @@ impl Display for UnifiedRuntimeReconcileError {
 
 impl std::error::Error for UnifiedRuntimeReconcileError {}
 
-/// Which supervisor a replacement cleanup was joining.
+/// Which supervisor a replacement cleanup was joining. Meta runs
+/// no lease-renewal or continuity-repair supervisor, so none is retired.
 ///
 /// Replacement retires the previous supervisor, and the two are cancelled and
 /// joined through different authority boundaries (a lease fencing-token
@@ -665,6 +662,8 @@ pub enum RetiredSupervisorKind {
 }
 
 /// Outcome of joining the supervisor cleanups that replacement retired.
+/// Nothing is retired and shutdown reports
+/// [`Self::NothingPending`].
 ///
 /// `start_identity_first_supervisors` may displace a running lease-renewal or
 /// continuity-repair supervisor. Both are cancelled cooperatively, so the

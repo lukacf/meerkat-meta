@@ -1,147 +1,23 @@
 //! Legacy-data axis: synthetic fixtures with genuine schema scar tissue.
 //!
 //! Release-day incidents have been legacy-shape issues, not fresh-store
-//! bugs. These chapters fabricate the exact on-disk shapes older Meta
-//! lines persisted and pin the 0.8.11 contract for them: a pre-ledger
+//! bugs. This chapter fabricates the exact on-disk shape older Meta
+//! lines persisted and pins the 0.8.11 contract for it: a pre-ledger
 //! database is BELOW the supported floor (mobkit 0.8.8 stamped a schema
 //! ledger row at every open, so every supported corpus is ledgered), and
-//! today's bundled stores refuse it typed at open — an unledgered file
+//! today's bundled store refuses it typed at open - an unledgered file
 //! whose owned tables already exist is never silently converged the way
-//! every earlier line converged it — while leaving its logical content
-//! untouched for the operator. Both chapters are scoped to the bundled
-//! implementations by construction — they fabricate those stores' schemas.
+//! every earlier line converged it - while leaving its logical content
+//! untouched for the operator. The chapter is scoped to the bundled
+//! implementation by construction: it fabricates that store's schema.
 
 use std::path::Path;
 
-use meerkat_meta::identity_first::{
-    AgentIdentity, AgentMemoryProvider, LocalContinuityStore, NewAgentMemory,
-};
+use meerkat_meta::identity_first::{AgentIdentity, AgentMemoryProvider, NewAgentMemory};
 use meerkat_meta::memory::SqliteAgentMemoryStore;
 use meerkat_store_conformance::ConformanceFailure;
 
-use crate::fixtures;
 use crate::steps::Steps;
-
-/// The pre-ledger continuity schema exactly as `LocalContinuityStore` has
-/// always created it (`identity_first/local_store.rs` DDL): two tables, no
-/// schema ledger, no secondary indexes.
-const LEGACY_CONTINUITY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS continuity_records (
-        identity       TEXT PRIMARY KEY,
-        agent_runtime_id TEXT NOT NULL,
-        session_id     TEXT NOT NULL,
-        generation     INTEGER NOT NULL,
-        checkpoint_version INTEGER NOT NULL,
-        fencing_token  INTEGER NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS session_snapshots (
-        session_id     TEXT PRIMARY KEY,
-        identity       TEXT NOT NULL,
-        generation     INTEGER NOT NULL,
-        checkpoint_version INTEGER NOT NULL,
-        fencing_token  INTEGER NOT NULL,
-        data           BLOB NOT NULL
-    );";
-
-/// A pre-ledger continuity database (the exact file shape a pre-floor fleet
-/// persisted) must be refused typed at open: the file carries the domain's
-/// owned tables but no `meerkat_schema` row, which is below the meta
-/// 0.8.8 floor. The refusal must leave the fabricated rows untouched —
-/// fail-closed means the operator still owns byte-exact evidence.
-///
-/// This chapter pinned silent pre-ledger convergence (plus LegacyUnverified
-/// snapshot service) until the 0.8.11 reset deleted both the embedded
-/// checkpoint vocabulary and pre-floor convergence; it now pins the typed
-/// refusal that replaced them.
-pub async fn legacy_continuity_database(dir: &Path) -> Result<(), ConformanceFailure> {
-    let steps = Steps::chapter("legacy_continuity_database");
-    let db_path = dir.join("continuity.db");
-
-    // --- fabricate the legacy database ---------------------------------------
-    let step = "fabricate_legacy_database";
-    let session = fixtures::session_with_texts(&["legacy turn one", "legacy turn two"])?;
-    let legacy_blob = steps.wrap(step, serde_json::to_vec(&session))?;
-    let session_key = session.id().to_string();
-    {
-        let connection = steps.wrap(step, rusqlite::Connection::open(&db_path))?;
-        steps.wrap(step, connection.execute_batch(LEGACY_CONTINUITY_SCHEMA))?;
-        steps.wrap(
-            step,
-            connection.execute(
-                "INSERT INTO continuity_records \
-                 (identity, agent_runtime_id, session_id, generation, checkpoint_version, \
-                  fencing_token) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params!["legacy:main", "rt-legacy", session_key, 3_u64, 7_u64, 9_u64],
-            ),
-        )?;
-        steps.wrap(
-            step,
-            connection.execute(
-                "INSERT INTO session_snapshots \
-                 (session_id, identity, generation, checkpoint_version, fencing_token, data) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![session_key, "legacy:main", 3_u64, 7_u64, 9_u64, legacy_blob],
-            ),
-        )?;
-    }
-
-    // --- open is refused typed -------------------------------------------------
-    let step = "pre_ledger_open_is_refused";
-    if LocalContinuityStore::open_with_fencing_floor(db_path.clone())
-        .await
-        .is_ok()
-    {
-        return Err(steps.fail(
-            step,
-            "opening a pre-ledger continuity database must refuse typed: unledgered owned \
-             tables are below the mobkit 0.8.8 floor and must never be silently converged",
-        ));
-    }
-
-    // --- refusal left the logical content untouched ----------------------------
-    let step = "refusal_preserves_rows";
-    let connection = steps.wrap(step, rusqlite::Connection::open(&db_path))?;
-    let (identity, generation, version, fence): (String, u64, u64, u64) = steps.wrap(
-        step,
-        connection.query_row(
-            "SELECT identity, generation, checkpoint_version, fencing_token \
-             FROM continuity_records WHERE session_id = ?1",
-            rusqlite::params![session_key],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        ),
-    )?;
-    steps.ensure(
-        step,
-        identity == "legacy:main" && generation == 3 && version == 7 && fence == 9,
-        "the refused open must leave the continuity record intact",
-    )?;
-    let stored_blob: Vec<u8> = steps.wrap(
-        step,
-        connection.query_row(
-            "SELECT data FROM session_snapshots WHERE session_id = ?1",
-            rusqlite::params![session_key],
-            |row| row.get(0),
-        ),
-    )?;
-    steps.ensure(
-        step,
-        stored_blob == steps.wrap(step, serde_json::to_vec(&session))?,
-        "the refused open must leave the snapshot payload bytes intact",
-    )?;
-    let ledgered: bool = steps.wrap(
-        step,
-        connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'meerkat_schema')",
-            [],
-            |row| row.get(0),
-        ),
-    )?;
-    steps.ensure(
-        step,
-        !ledgered,
-        "the refusal must not stamp a schema ledger onto a file it refused to own",
-    )?;
-    Ok(())
-}
 
 /// The pre-`ever_quarantined` / pre-`proposals.taint` agent-memory schema:
 /// `SCHEMA_SQL` as it existed before those columns, and before the schema

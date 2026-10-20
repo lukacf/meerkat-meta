@@ -104,7 +104,7 @@ export function RosterPanel({
       <div className="roster__body">
         <div className="roster__table">
           <div className="roster__row roster__row--head">
-            <span>Name</span><span>Role</span><span>State</span><span>Profile</span><span>Gen</span><span>Chk</span><span>Lease</span>
+            <span>Name</span><span>Role</span><span>State</span><span>Profile</span><span>Gen</span>
           </div>
           {rows.map((r) => {
             const isSel = active && r.member_id === active.member_id;
@@ -128,8 +128,6 @@ export function RosterPanel({
                 <span className="roster__state">{stateLabel(r.state)}</span>
                 <span className="mono dim">{r.role || "—"}</span>
                 <span className="mono">{r.generation ?? "—"}</span>
-                <span className="mono">{r.checkpoint_version ?? "—"}</span>
-                <span className="mono dim">{r.lease_healthy === false ? "unhealthy" : "ok"}</span>
               </div>
             );
           })}
@@ -155,8 +153,6 @@ export function RosterPanel({
                 <dt>Identity</dt><dd className="mono">{active.identity || "—"}</dd>
                 <dt>Session</dt><dd className="mono">{active.session_id || "—"}</dd>
                 <dt>Generation</dt><dd className="mono">{active.generation ?? "—"}</dd>
-                <dt>Checkpoint</dt><dd className="mono">{active.checkpoint_version ?? "—"}</dd>
-                <dt>Lease</dt><dd className="mono">{active.lease_healthy === false ? "unhealthy" : "ok"}</dd>
                 {active.progress && (
                   <>
                     <dt>Health</dt>

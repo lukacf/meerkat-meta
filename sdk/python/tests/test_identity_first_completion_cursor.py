@@ -610,24 +610,6 @@ class TestTypedWaitOutcomes:
             await handle.wait_for_turn("t-1", timeout=5)
         assert raised.value.outcome == "shutting_down"
 
-    @pytest.mark.asyncio
-    async def test_request_continuity_repair_reports_what_it_reached(self):
-        transport = ScriptedTransport()
-        original = transport.send_sync
-
-        def send_sync(request):
-            if request.get("method") == "meta/request_continuity_repair":
-                transport.calls.append(request)
-                return {
-                    "jsonrpc": "2.0",
-                    "id": request.get("id"),
-                    "result": {"continuity_repair": "scheduled"},
-                }
-            return original(request)
-
-        transport.send_sync = send_sync
-        assert await _make_runtime(transport).request_continuity_repair() == "scheduled"
-
 
 # ---------------------------------------------------------------------------
 # Cursor value semantics
@@ -674,6 +656,7 @@ class TestModelMirrors:
             "identity": "triage:main",
             "is_final": False,
             "peer_reachable_count": 0,
+            "intent_managed": False,
             "preview_unavailable": "observation_deadline",
         }
 

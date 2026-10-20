@@ -33,7 +33,7 @@ class TestNewSymbolsExist:
         "TurnStarted", "TextDelta", "TextComplete",
         "ToolCallRequested", "ToolResultReceived", "TurnCompleted",
         "ToolExecutionStarted", "ToolExecutionCompleted", "UnknownEvent",
-        "auth", "memory", "session_store",
+        "auth", "memory",
     ])
     def test_symbol_exists(self, name):
         assert hasattr(meerkat_meta, name), f"{name} should be in public surface"

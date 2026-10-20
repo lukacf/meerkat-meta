@@ -23,15 +23,15 @@ use async_trait::async_trait;
 use meerkat_client::{LlmError, LlmEvent, LlmRequest};
 use meerkat_core::types::StopReason;
 use meerkat_meta::UnifiedRuntimeBuilder;
-use meerkat_meta::identity_first::contracts::{AgentCustomizer, TopologyProvider};
+use meerkat_meta::identity_first::contracts::{AgentCustomizer, LeaseProvider, TopologyProvider};
 use meerkat_meta::identity_first::orchestrator::RestoreOutcome;
 use meerkat_meta::identity_first::{
     AgentAddressability, AgentBuildContext, AgentBuildDraft, AgentIdentity, AgentRuntimeServices,
     ContinuityStore, CustomizerError, DeliveryScope, DispatchInput, DurabilityPolicy,
-    DurableAgentSpec, IdentityFirstRuntimeContext, IdentityRuntime, IdentityRuntimeConfig,
-    LocalContinuityStore, LocalLeaseProvider, ManagedPeerEdge, MobSessionBridge,
-    MutableRosterProvider, ScopedDeliveryError, ScopedRecovery, SessionBridge, TopologyContext,
-    TopologyError, TurnOutput,
+    DurableAgentSpec, IdentityFirstRuntimeContext, IdentityLifecycleState, IdentityRuntime,
+    IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider, ManagedPeerEdge,
+    MobSessionBridge, MutableRosterProvider, ScopeMismatch, ScopedDeliveryError, ScopedRecovery,
+    ScopedRetireError, SessionBridge, TopologyContext, TopologyError, TurnOutput,
 };
 use meerkat_meta::mob_handle_runtime::SessionCreatedContext;
 use meerkat_mob::{MobDefinition, ProfileName};
@@ -190,7 +190,9 @@ impl meerkat_client::LlmClient for BarrierClient {
 struct Boot {
     unified: meerkat_meta::UnifiedRuntime,
     identity_rt: Arc<IdentityRuntime>,
-    ctx: meerkat_meta::rpc::IdentityFirstContext,
+    /// Absent when the identity runtime was composed without the unified
+    /// runtime's installation ([`Boot::start_standalone`]).
+    ctx: Option<meerkat_meta::rpc::IdentityFirstContext>,
 }
 
 impl Boot {
@@ -205,41 +207,13 @@ impl Boot {
         specs: Vec<DurableAgentSpec>,
     ) -> Self {
         let definition = definition(mob_id);
-        let mut unified = UnifiedRuntimeBuilder::default()
-            .definition(definition.clone())
-            .persistent_state(state_path)
-            .comms(true)
-            .default_llm_client(Arc::new(client.clone()))
-            .build()
-            .await
-            .expect("build UnifiedRuntime");
+        let mut unified = Self::unified(state_path, &definition, client).await;
         // 0.9 exports the composition's bridge and identity runtime only as
         // owning views, so the identity runtime under test drives its own
         // native bridge and is installed into the composition, as the
         // gateway installs its own.
-        let bridge: Arc<dyn SessionBridge> = Arc::new(MobSessionBridge::with_session_service(
-            unified.mob_handle(),
-            unified
-                .mob_runtime()
-                .session_service()
-                .cloned()
-                .expect("the persistent runtime has a session service"),
-        ));
-        let store = Arc::new(
-            LocalContinuityStore::open(state_path.join("continuity.db")).expect("continuity store"),
-        );
-        let identity_rt = Arc::new(
-            IdentityRuntime::new(IdentityRuntimeConfig {
-                continuity_store: store as Arc<dyn ContinuityStore>,
-                lease_provider: Arc::new(LocalLeaseProvider::new()),
-                runtime_instance_id: "delivery-scope".to_string(),
-                has_runtime_store: true,
-                durability_policy: DurabilityPolicy::SyncWriteThrough,
-                bridge: Some(bridge),
-                default_timeout: None,
-            })
-            .with_runtime_services(AgentRuntimeServices::new(unified.mob_handle())),
-        );
+        let identity_rt =
+            Self::identity_runtime(&unified, state_path, Arc::new(LocalLeaseProvider::new()));
         let context = Arc::new(IdentityFirstRuntimeContext::new(
             Arc::clone(&identity_rt),
             Arc::new(MutableRosterProvider::new(specs.clone())),
@@ -276,8 +250,55 @@ impl Boot {
         Self {
             unified,
             identity_rt,
-            ctx,
+            ctx: Some(ctx),
         }
+    }
+
+    async fn unified(
+        state_path: &std::path::Path,
+        definition: &MobDefinition,
+        client: &BarrierClient,
+    ) -> meerkat_meta::UnifiedRuntime {
+        UnifiedRuntimeBuilder::default()
+            .definition(definition.clone())
+            .persistent_state(state_path)
+            .comms(true)
+            .default_llm_client(Arc::new(client.clone()))
+            .build()
+            .await
+            .expect("build UnifiedRuntime")
+    }
+
+    /// The identity runtime under test: its own native bridge over
+    /// `unified`'s mob, an on-disk continuity store and `lease_provider`.
+    fn identity_runtime(
+        unified: &meerkat_meta::UnifiedRuntime,
+        state_path: &std::path::Path,
+        lease_provider: Arc<dyn LeaseProvider>,
+    ) -> Arc<IdentityRuntime> {
+        let bridge: Arc<dyn SessionBridge> = Arc::new(MobSessionBridge::with_session_service(
+            unified.mob_handle(),
+            unified
+                .mob_runtime()
+                .session_service()
+                .cloned()
+                .expect("the persistent runtime has a session service"),
+        ));
+        let store = Arc::new(
+            LocalContinuityStore::open(state_path.join("continuity.db")).expect("continuity store"),
+        );
+        Arc::new(
+            IdentityRuntime::new(IdentityRuntimeConfig {
+                continuity_store: store as Arc<dyn ContinuityStore>,
+                lease_provider,
+                runtime_instance_id: "delivery-scope".to_string(),
+                has_runtime_store: true,
+                durability_policy: DurabilityPolicy::SyncWriteThrough,
+                bridge: Some(bridge),
+                default_timeout: None,
+            })
+            .with_runtime_services(AgentRuntimeServices::new(unified.mob_handle())),
+        )
     }
 
     /// One JSON-RPC call; the whole reply.
@@ -288,7 +309,7 @@ impl Boot {
             &request.to_string(),
             WAIT,
             None,
-            Some(&self.ctx),
+            self.ctx.as_ref(),
         )
         .await;
         serde_json::from_str(&reply).expect("json-rpc reply")
@@ -441,7 +462,16 @@ async fn a_persisted_scope_and_receipt_survive_restart_and_recover_the_original_
         .expect("native capture");
     assert_eq!(native.to_json_value(), scope_json);
     assert_eq!(scope_json["version"], 1, "{scope_json}");
-    assert_eq!(scope_json["member"]["version"], 1, "{scope_json}");
+    // Core's member scope names the mob incarnation it was captured at.
+    assert_eq!(
+        scope_json["member"]["version"],
+        meerkat_mob::MEMBER_DELIVERY_SCOPE_VERSION,
+        "{scope_json}"
+    );
+    assert!(
+        scope_json["member"]["mob_incarnation"].is_string(),
+        "{scope_json}"
+    );
     let status = boot
         .rpc("meta/status_identity", json!({"identity": IDENTITY}))
         .await;
@@ -911,6 +941,54 @@ async fn a_scope_captured_by_another_mob_stays_unresolved() {
     home.shutdown().await;
 }
 
+/// A scope saved by Meta 0.9.3 is refused as a stale scope (`-32007`), never
+/// as an invalid one, now that Core writes version-2 member scopes. 0.9.3
+/// saved Core's version-1 member scope, which names no mob incarnation, beside
+/// Meta's own generation and lease fencing token. Whether those atoms happen
+/// to equal the live member's or not, the refusal is the typed stale scope and
+/// nothing is submitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scope_saved_by_meta_0_9_3_is_refused_as_stale() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let (client, mut calls) = BarrierClient::new(true);
+    let boot = Boot::start(&temp.path().join("state"), &unique_mob_id(), &client).await;
+    let current = boot.status_scope().await;
+    // The version-1 member scope 0.9.3 saved: it names no mob incarnation.
+    let mut legacy = current.clone();
+    let member = legacy["member"].as_object_mut().expect("member scope");
+    assert!(member.remove("mob_incarnation").is_some(), "{current}");
+    member.insert("version".to_string(), json!(1));
+    // Meta 0.9.3's own atoms, which are not Core's generation and fence.
+    let mut meta_atoms = legacy.clone();
+    meta_atoms["generation"] = json!(current["generation"].as_u64().expect("generation") + 7);
+    meta_atoms["lease_fencing_token"] = json!(
+        current["lease_fencing_token"]
+            .as_u64()
+            .expect("fence token")
+            + 7
+    );
+    let correlation = uuid::Uuid::new_v4().to_string();
+    for (case, key, saved) in [
+        ("the live member's atoms", "legacy-live-atoms", &legacy),
+        ("Meta 0.9.3 atoms", "legacy-meta-atoms", &meta_atoms),
+    ] {
+        let refused = boot
+            .scoped_dispatch(saved, "saved by 0.9.3", key, &correlation)
+            .await;
+        assert_eq!(refused["error"]["code"], -32007, "{case}: {refused}");
+        assert_eq!(
+            refused["error"]["data"]["kind"], "stale_delivery_scope",
+            "{case}: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["admission_possible"], false,
+            "{case}: {refused}"
+        );
+    }
+    assert_no_model_call(&mut calls, "a scope saved by 0.9.3 submits nothing");
+    boot.shutdown().await;
+}
+
 /// Gate 6, part 1 (D3): one key at one scope is one input. A replay with
 /// changed bytes never creates a second effect or overwrites the original;
 /// rejecting the conflict belongs to part 2's exact-replay witness.
@@ -1004,24 +1082,7 @@ async fn an_externally_bound_identity_is_unsupported_and_never_falls_back() {
     peer_spec.identity = peer.clone();
     peer_spec.backend = Some(meerkat_mob::MobBackendKind::External);
     let runtime_id = meerkat_meta::identity_first::AgentRuntimeId::parse("rt-remote-peer").unwrap();
-    boot.identity_rt
-        .register(
-            peer_spec,
-            meerkat_meta::identity_first::IdentityLifecycleState::Active,
-            Some(meerkat_meta::identity_first::ContinuityRecord {
-                identity: peer.clone(),
-                agent_runtime_id: runtime_id.clone(),
-                session_id: meerkat_core::types::SessionId::new(),
-                generation: meerkat_meta::identity_first::ContinuityGeneration::new(0),
-                checkpoint_version: meerkat_meta::identity_first::CheckpointVersion::new(0),
-            }),
-            Some(meerkat_meta::identity_first::LeaseGrant {
-                identity: peer.clone(),
-                fencing_token: meerkat_meta::identity_first::FencingToken::new(1),
-                ttl: Duration::from_hours(1),
-            }),
-        )
-        .await;
+    boot.identity_rt.register(peer_spec).await;
 
     let unsupported = |error: &ScopedDeliveryError| {
         matches!(error, ScopedDeliveryError::Unsupported { detail }
@@ -1062,4 +1123,455 @@ async fn an_externally_bound_identity_is_unsupported_and_never_falls_back() {
 
     assert_no_model_call(&mut calls, "no scoped path falls back to a submit");
     boot.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Retirement at a captured scope
+// ---------------------------------------------------------------------------
+
+/// Capture `IDENTITY`'s scope natively, with its member present in meerkat's
+/// roster.
+async fn captured_scope(boot: &Boot) -> DeliveryScope {
+    let scope = boot
+        .identity_rt
+        .capture_delivery_scope(&identity())
+        .await
+        .expect("capture the identity's scope");
+    assert!(
+        member_present(boot, &scope).await,
+        "the captured member is in meerkat's roster"
+    );
+    scope
+}
+
+async fn member_present(boot: &Boot, scope: &DeliveryScope) -> bool {
+    boot.unified
+        .mob_handle()
+        .get_member(scope.member().agent_identity())
+        .await
+        .expect("read meerkat's roster")
+        .is_some()
+}
+
+async fn status(boot: &Boot) -> meerkat_meta::identity_first::IdentityStatus {
+    boot.identity_rt
+        .status(&identity())
+        .await
+        .expect("the identity is registered")
+}
+
+/// Nothing was retired: the identity is active and its member is still in
+/// meerkat's roster.
+async fn assert_not_retired(boot: &Boot, scope: &DeliveryScope) {
+    let status = status(boot).await;
+    assert_eq!(status.state, IdentityLifecycleState::Active, "{status:?}");
+    assert!(
+        member_present(boot, scope).await,
+        "the member is still in meerkat's roster"
+    );
+}
+
+/// An unchanged scope retires the identity, and the retirement has settled
+/// when the call returns: the member has left meerkat's roster and the
+/// identity rests dormant on its session in Core's history. Retiring again at
+/// the same scope converges to `Ok`: no incarnation is current and none is
+/// retiring, so a retry after a lost reply is safe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unchanged_scope_retires_the_identity_and_settles() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let (client, mut calls) = BarrierClient::new(true);
+    let boot = Boot::start(&temp.path().join("state"), &unique_mob_id(), &client).await;
+    let scope = captured_scope(&boot).await;
+
+    boot.identity_rt
+        .retire_at_scope_tracked(&identity(), &scope)
+        .await
+        .expect("an unchanged scope retires the identity");
+
+    let status = status(&boot).await;
+    assert_eq!(status.state, IdentityLifecycleState::Dormant, "{status:?}");
+    assert_eq!(
+        status.session_id.as_ref(),
+        Some(scope.session_id()),
+        "the continuity keeps the retired session"
+    );
+    assert!(
+        !member_present(&boot, &scope).await,
+        "the member has left meerkat's roster"
+    );
+    let again = boot
+        .identity_rt
+        .retire_at_scope_tracked(&identity(), &scope)
+        .await
+        .expect("a retry at the retired scope converges");
+    assert_eq!(again.get(), scope.member().fence_token().get());
+    assert!(!member_present(&boot, &scope).await);
+    assert_no_model_call(&mut calls, "retirement submits nothing");
+    boot.shutdown().await;
+}
+
+/// A scope of an identity retired since the capture (by a plain retire, not
+/// at the scope) still reaches Core: with no live member there is no live
+/// scope for Meta to read, and Core answers `Ok` because no incarnation of
+/// the identity is current. The first call converges like a retry, and
+/// nothing wakes the identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scope_of_an_already_retired_identity_converges_to_ok() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let (client, mut calls) = BarrierClient::new(true);
+    let boot = Boot::start(&temp.path().join("state"), &unique_mob_id(), &client).await;
+    let scope = captured_scope(&boot).await;
+    boot.identity_rt
+        .retire_tracked(&identity())
+        .await
+        .expect("a plain retire");
+    assert!(
+        !member_present(&boot, &scope).await,
+        "the member has left meerkat's roster"
+    );
+
+    let fence = boot
+        .identity_rt
+        .retire_at_scope_tracked(&identity(), &scope)
+        .await
+        .expect("a scope of a retired identity converges");
+    assert_eq!(fence.get(), scope.member().fence_token().get());
+    let status = status(&boot).await;
+    assert_eq!(status.state, IdentityLifecycleState::Dormant, "{status:?}");
+    assert_eq!(
+        status.session_id.as_ref(),
+        Some(scope.session_id()),
+        "the identity rests on its retired session"
+    );
+    assert!(
+        !member_present(&boot, &scope).await,
+        "nothing woke the identity"
+    );
+    assert_no_model_call(&mut calls, "retirement submits nothing");
+    boot.shutdown().await;
+}
+
+/// A rebind between capture and retirement moves the identity to another
+/// session under the same runtime id and generation, which a retirement by
+/// generated alias does not see. The scoped retirement refuses it, with
+/// nothing retired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rebind_between_capture_and_retirement_refuses_the_scoped_retirement() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let (client, _calls) = BarrierClient::new(true);
+    let boot = Boot::start(&temp.path().join("state"), &unique_mob_id(), &client).await;
+    let scope = captured_scope(&boot).await;
+
+    // A lower-level rebind moves Core's member to another session under the
+    // same runtime id and generation.
+    let rebound = meerkat_core::types::SessionId::new();
+    boot.unified
+        .mob_handle()
+        .rebind_member_session_for_test(scope.member().agent_identity(), rebound.clone())
+        .await
+        .expect("move the member's session binding");
+    let rebound_status = status(&boot).await;
+    assert_eq!(
+        rebound_status.agent_runtime_id.as_ref(),
+        Some(scope.agent_runtime_id()),
+        "a rebind keeps the runtime id the generated alias names"
+    );
+    assert_eq!(
+        rebound_status.generation.map(meerkat_mob::Generation::get),
+        Some(scope.generation().get())
+    );
+
+    let error = boot
+        .identity_rt
+        .retire_at_scope_tracked(&identity(), &scope)
+        .await
+        .expect_err("a rebound identity is not retired at the old scope");
+    assert!(
+        matches!(
+            &error,
+            ScopedRetireError::StaleScope {
+                mismatch: ScopeMismatch::MemberBinding,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_not_retired(&boot, &scope).await;
+    boot.shutdown().await;
+}
+
+/// A reset replaces the identity's member with a new generation and
+/// session. The old scope is refused, and the replacement keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_refuses_the_scoped_retirement() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let (client, _calls) = BarrierClient::new(true);
+    let boot = Boot::start(&temp.path().join("state"), &unique_mob_id(), &client).await;
+    let scope = captured_scope(&boot).await;
+
+    boot.identity_rt.reset(&identity()).await.expect("reset");
+    let replacement = boot
+        .identity_rt
+        .capture_delivery_scope(&identity())
+        .await
+        .expect("capture the replacement's scope");
+    assert_ne!(replacement.session_id(), scope.session_id());
+
+    let error = boot
+        .identity_rt
+        .retire_at_scope_tracked(&identity(), &scope)
+        .await
+        .expect_err("a replacement is not retired at the old scope");
+    assert!(
+        matches!(
+            &error,
+            ScopedRetireError::StaleScope {
+                mismatch: ScopeMismatch::RuntimeId | ScopeMismatch::Generation,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_not_retired(&boot, &replacement).await;
+    assert_eq!(
+        status(&boot).await.session_id.as_ref(),
+        Some(replacement.session_id())
+    );
+    boot.shutdown().await;
+}
+
+/// A retire and a wake between capture and the scoped retirement resume the
+/// same session at Core's next generation: another incarnation is current.
+/// The old scope is refused on its runtime id, and the woken member keeps
+/// running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retire_and_wake_refuses_the_old_scope() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let (client, _calls) = BarrierClient::new(true);
+    let boot = Boot::start(&temp.path().join("state"), &unique_mob_id(), &client).await;
+    let scope = captured_scope(&boot).await;
+
+    boot.identity_rt
+        .retire_tracked(&identity())
+        .await
+        .expect("retire");
+    boot.identity_rt
+        .materialize_tracked(&identity())
+        .await
+        .expect("wake onto the same session");
+    let woken = status(&boot).await;
+    assert_eq!(woken.session_id.as_ref(), Some(scope.session_id()));
+    assert_ne!(
+        woken.generation.map(meerkat_mob::Generation::get),
+        Some(scope.generation().get()),
+        "the wake is Core's next incarnation"
+    );
+
+    let error = boot
+        .identity_rt
+        .retire_at_scope_tracked(&identity(), &scope)
+        .await
+        .expect_err("the woken incarnation is not retired at the old scope");
+    assert!(
+        matches!(
+            &error,
+            ScopedRetireError::StaleScope {
+                mismatch: ScopeMismatch::RuntimeId,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_not_retired(&boot, &scope).await;
+    boot.shutdown().await;
+}
+
+/// meerkat's member moves to another session under the same incarnation (a
+/// lower-level rebind). meerkat's scoped retire checks the session in the
+/// step that would retire and refuses the retirement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_native_session_move_refuses_the_scoped_retirement() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let (client, _calls) = BarrierClient::new(true);
+    let boot = Boot::start(&temp.path().join("state"), &unique_mob_id(), &client).await;
+    let scope = captured_scope(&boot).await;
+
+    boot.unified
+        .mob_handle()
+        .rebind_member_session_for_test(
+            scope.member().agent_identity(),
+            meerkat_core::types::SessionId::new(),
+        )
+        .await
+        .expect("move the member's session binding");
+
+    let error = boot
+        .identity_rt
+        .retire_at_scope_tracked(&identity(), &scope)
+        .await
+        .expect_err("a moved native binding is not retired at the old scope");
+    assert!(
+        matches!(
+            &error,
+            ScopedRetireError::StaleScope {
+                mismatch: ScopeMismatch::MemberBinding,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_not_retired(&boot, &scope).await;
+    boot.shutdown().await;
+}
+
+/// A scope selects, it does not authenticate: another identity's scope, or
+/// an envelope around another identity's member, is refused before anything
+/// is read or retired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreign_scope_is_refused_before_anything_is_retired() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let (client, _calls) = BarrierClient::new(true);
+    let boot = Boot::start_with(
+        &temp.path().join("state"),
+        &unique_mob_id(),
+        &client,
+        vec![spec(), spec_for(OTHER)],
+    )
+    .await;
+    let alice = captured_scope(&boot).await;
+    let bob_json = boot.status_scope_of(OTHER).await;
+    let bob = DeliveryScope::from_json_value(bob_json.clone()).unwrap();
+
+    let foreign = boot
+        .identity_rt
+        .retire_at_scope_tracked(&identity(), &bob)
+        .await
+        .expect_err("another identity's scope is refused");
+    assert!(
+        matches!(foreign, ScopedRetireError::Rejected { .. }),
+        "{foreign:?}"
+    );
+    let mut swapped = alice.to_json_value();
+    swapped["member"] = bob_json["member"].clone();
+    let swapped = DeliveryScope::from_json_value(swapped).unwrap();
+    let swapped = boot
+        .identity_rt
+        .retire_at_scope_tracked(&identity(), &swapped)
+        .await
+        .expect_err("an envelope around another member is refused");
+    assert!(
+        matches!(swapped, ScopedRetireError::Rejected { .. }),
+        "{swapped:?}"
+    );
+    assert_not_retired(&boot, &alice).await;
+    assert!(member_present(&boot, &bob).await);
+    boot.shutdown().await;
+}
+
+/// An identity Core holds an identity intent row for is the host's: the
+/// scoped retirement refuses it typed (`Refused` with
+/// `IdentityHostAdopted`), and its member keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_adopted_identity_is_refused_by_the_scoped_retirement() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let (client, _calls) = BarrierClient::new(true);
+    let boot = Boot::start(&temp.path().join("state"), &unique_mob_id(), &client).await;
+    let scope = captured_scope(&boot).await;
+
+    let handle = boot.unified.mob_handle();
+    let core_identity = scope.member().agent_identity().clone();
+    let entry = handle
+        .get_member(&core_identity)
+        .await
+        .expect("Core's roster read")
+        .expect("a live member to adopt");
+    let request = meerkat_mob::AdoptMemberIdentityDeclaration {
+        mob_id: handle.definition().id.clone(),
+        agent_identity: core_identity,
+        request_id: meerkat_mob::IdentityAdoptionId::new("scoped-retire-adoption")
+            .expect("valid adoption id"),
+        precondition: meerkat_mob::IdentityAdoptionPrecondition::ExpectedAbsent,
+        declaration_scope: meerkat_mob::IdentityDeclarationScopeId::new("scoped-retire-host")
+            .expect("valid declaration scope"),
+        declaration_revision: 1,
+        session: meerkat_mob::DesiredSessionTarget {
+            session_id: scope.session_id().clone(),
+            lineage_id: meerkat_core::SessionLineageId::for_session(scope.session_id()),
+            lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+            authority_policy: meerkat_mob::DesiredSessionAuthorityPolicy::RequireExisting,
+        },
+        member: meerkat_mob::IdentityProfileMemberDeclaration {
+            profile_name: entry.role.clone(),
+            profile_override: None,
+            model_override: None,
+            external_addressable_override: None,
+            context: None,
+            labels: Some(entry.labels.clone()),
+            additional_instructions: None,
+            system_prompt_override: None,
+            tool_access_policy: None,
+            auth_binding: None,
+            budget_limits: None,
+            runtime_mode: None,
+            required_env_keys: Vec::new(),
+            required_local_callback_tools: Vec::new(),
+            execution: meerkat_mob::DesiredExecution::ControllingSession,
+        },
+        wiring_custody: Default::default(),
+        owned_wiring: Default::default(),
+        convergence: meerkat_mob::IdentityConvergenceMode::Drain { max_wait_ms: 1_000 },
+    };
+    let adopted = handle
+        .adopt_member_identity_declaration(request)
+        .await
+        .expect("Core adopts the live member");
+    assert!(
+        matches!(
+            adopted.adoption,
+            meerkat_mob::IdentityAdoptionOutcome::Adopted { .. }
+        ),
+        "{:?}",
+        adopted.adoption
+    );
+
+    let error = boot
+        .identity_rt
+        .retire_at_scope_tracked(&identity(), &scope)
+        .await
+        .expect_err("a host-adopted identity is not retired at its scope");
+    assert!(
+        matches!(
+            &error,
+            ScopedRetireError::Refused(
+                meerkat_meta::identity_first::IdentityRuntimeError::IdentityHostAdopted { .. }
+            )
+        ),
+        "{error:?}"
+    );
+    assert!(
+        member_present(&boot, &scope).await,
+        "the adopted member keeps running"
+    );
+    boot.shutdown().await;
+}
+
+/// A runtime that no longer admits identity operations refuses the scoped
+/// retirement as `Rejected`, before any of it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runtime_that_admits_no_operation_rejects_the_scoped_retirement() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let (client, _calls) = BarrierClient::new(true);
+    let boot = Boot::start(&temp.path().join("state"), &unique_mob_id(), &client).await;
+    let scope = captured_scope(&boot).await;
+
+    boot.unified.shutdown().await;
+    let error = boot
+        .identity_rt
+        .retire_at_scope_tracked(&identity(), &scope)
+        .await
+        .expect_err("a runtime that is shutting down retires nothing");
+    assert!(
+        matches!(error, ScopedRetireError::Rejected { .. }),
+        "{error:?}"
+    );
 }

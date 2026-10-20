@@ -59,6 +59,23 @@
 //! Any unresolved twin fails the whole run closed (mirroring `rkat storage
 //! migrate`): the divergence report is the entire output and cases 1/2
 //! do not run, because every one of them would have to pick a spelling.
+//!
+//! # `--session-db`: a session database a 0.9.3 `store_path` named
+//!
+//! A 0.9.3 `meta_gateway` whose `store_path` named a file kept its sessions in
+//! that file, under whatever name it had. With `--session-db <file>` the run
+//! takes the file as one more spelling of the Sessions slot: the fence covers
+//! it, a lone copy renames to `sessions.sqlite3` under case 2, and a copy next
+//! to another Sessions spelling is a case-3 twin whose refusal names the
+//! `--adopt` command for it. Once the file has moved, its old path gets the
+//! retired stamp of the session-store domain, so a 0.9.3 gateway started again
+//! with that `store_path` refuses the file instead of starting an empty
+//! projection. Before anything moves, and whether or not `--apply` is set, the
+//! run refuses typed ([`SessionDbRefusal`]): a path that does not exist, is
+//! not a file, or does not sit in the state directory; a file that is not a
+//! session database; a directory a 0.9.4 runtime already started on; and a
+//! directory whose runtime locks another process holds. A file that already
+//! is the stamp, or that is `sessions.sqlite3` itself, is a typed no-op.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -68,6 +85,7 @@ use std::time::Duration;
 use meerkat_core::storage_diagnostics::{DiagnoseScope, FindingSeverity, StorageFinding};
 pub use meerkat_store::migrate::{DivergenceStatus, MigrateMode, PruneAction, PruneArtifactKind};
 use meerkat_store::migrate::{archive_path_read_only, remove_maintenance_artifact};
+use meerkat_store::sqlite_store::SESSION_STORE_DOMAIN;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -246,8 +264,22 @@ impl MetaMaintenanceFence {
         state_dir: &Path,
         deadline: Duration,
     ) -> Result<Self, meerkat_sqlite::SqliteStoreError> {
+        Self::acquire_including(state_dir, &[], deadline)
+    }
+
+    /// [`Self::acquire`], also fencing `extra` databases the layout does not
+    /// name (the session database `--session-db` names), in the same sorted
+    /// all-or-nothing acquisition.
+    pub fn acquire_including(
+        state_dir: &Path,
+        extra: &[PathBuf],
+        deadline: Duration,
+    ) -> Result<Self, meerkat_sqlite::SqliteStoreError> {
         let started = std::time::Instant::now();
-        let databases = enumerate_state_dir_databases(state_dir);
+        let mut databases = enumerate_state_dir_databases(state_dir);
+        databases.extend(extra.iter().cloned());
+        databases.sort();
+        databases.dedup();
         let mut fences = Vec::with_capacity(databases.len());
         for database in &databases {
             let remaining = deadline.saturating_sub(started.elapsed());
@@ -339,6 +371,10 @@ pub struct MetaMigrateReport {
     /// the file at v1 with rollback available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_canonical_backfill: Option<HeadCanonicalBackfillReport>,
+    /// What `--session-db` did, or would do, with the session database a
+    /// 0.9.3 `store_path` named (`None` without `--session-db`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_db: Option<SessionDbReport>,
     /// Deprecated-leftover findings (case 5; report-only), reusing the
     /// doctor finding vocabulary.
     #[serde(default)]
@@ -528,6 +564,130 @@ pub enum TwinResolution {
     },
 }
 
+/// `--session-db`: the session database a 0.9.3 `meta_gateway` kept under
+/// the name its `store_path` gave it.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDbReport {
+    /// The named file.
+    pub path: PathBuf,
+    /// What happened (or would happen).
+    pub outcome: SessionDbOutcome,
+}
+
+/// What `--session-db` did with the named file.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SessionDbOutcome {
+    /// The file joins the Sessions slot: renamed to `sessions.sqlite3` when
+    /// it is the slot's only copy, else reconciled as a twin (see `renames`
+    /// and `twins`). A dry run stops here, and so does an apply run an
+    /// unresolved twin refused.
+    WouldMove,
+    /// The file moved into the layout (renamed, adopted, or archived as a
+    /// byte-identical twin), and its old path now holds the retired stamp of
+    /// the session-store domain, which a 0.9.3 binary refuses.
+    Moved {
+        /// The retired stamp at the file's old path.
+        tripwire: PathBuf,
+    },
+    /// The file already is the retired stamp: an earlier run moved it.
+    AlreadyMoved,
+    /// The file is gone, `sessions.sqlite3` is in place, and an earlier
+    /// run's artifact of the file (its rename marker, or its archive after a
+    /// dedup or an adopt) lies beside it: that run moved the file and stopped
+    /// before it wrote the retired stamp. An apply run writes the stamp.
+    TripwireOwed,
+    /// The file is `sessions.sqlite3` itself: it already is in the layout.
+    AlreadyInLayout,
+    /// Refused before anything moved; nothing was written.
+    Refused {
+        /// Why.
+        refusal: SessionDbRefusal,
+    },
+}
+
+/// Why `--session-db` refused, before anything moved.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "reason")]
+pub enum SessionDbRefusal {
+    /// Nothing exists at the named path.
+    Missing { path: PathBuf },
+    /// The named path is not a regular file.
+    NotAFile { path: PathBuf },
+    /// The named file is not in the state directory. 0.9.3 made the
+    /// directory holding the `store_path` file its state directory, so the
+    /// file belongs to the directory it sits in.
+    OutsideStateDir { path: PathBuf, state_dir: PathBuf },
+    /// The named file is not a 0.9.3 session database: not SQLite, or no
+    /// `meerkat_schema` row of the session-store domain.
+    NotASessionDatabase { path: PathBuf, detail: String },
+    /// A 0.9.4 runtime already started on the directory: `runtime.sqlite`
+    /// carries Core's head-canonical durable claim, so the native migration
+    /// can no longer read it, and the file's sessions stay where they are.
+    NativeRuntimeAlreadyStarted { state_dir: PathBuf },
+    /// A process holds a runtime lock of the directory (a 0.9.3 gateway
+    /// hosting a runtime, or a 0.9.4 Meta runtime). It may still have the
+    /// named file open.
+    RuntimeInUse { file: PathBuf },
+    /// A file the checks must read could not be read.
+    Unreadable { path: PathBuf, detail: String },
+}
+
+impl std::fmt::Display for SessionDbRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing { path } => write!(
+                f,
+                "--session-db {}: no such file; name the file a 0.9.3 meta_gateway's store_path \
+                 named",
+                path.display()
+            ),
+            Self::NotAFile { path } => write!(
+                f,
+                "--session-db {}: not a file; a state directory needs no --session-db, pass it \
+                 as --state-dir",
+                path.display()
+            ),
+            Self::OutsideStateDir { path, state_dir } => write!(
+                f,
+                "--session-db {} is not in the state directory {}; 0.9.3 used the directory \
+                 that holds the store_path file as its state directory, so pass that directory \
+                 as --state-dir",
+                path.display(),
+                state_dir.display()
+            ),
+            Self::NotASessionDatabase { path, detail } => write!(
+                f,
+                "--session-db {} is not a 0.9.3 session database ({detail}); nothing was moved",
+                path.display()
+            ),
+            Self::NativeRuntimeAlreadyStarted { state_dir } => write!(
+                f,
+                "a 0.9.4 runtime has already started on the state directory {}: its \
+                 runtime.sqlite carries the head-canonical profile, so the native migration \
+                 cannot bring the named file's sessions into it. Nothing was moved; the file's \
+                 0.9.3 sessions stay in that file. Move the file out of the state directory",
+                state_dir.display()
+            ),
+            Self::RuntimeInUse { file } => write!(
+                f,
+                "a process still uses the state directory ({} is locked) and may have the \
+                 named file open; stop every process using the directory, 0.9.3 gateways \
+                 started with that store_path included, then run again",
+                file.display()
+            ),
+            Self::Unreadable { path, detail } => write!(
+                f,
+                "--session-db could not read {}: {detail}; nothing was moved",
+                path.display()
+            ),
+        }
+    }
+}
+
 /// The full `storage-prune` report for one state directory. Shape mirrors
 /// `meerkat_store::migrate::PruneReport` (meta re-declares the structs
 /// because meerkat's are `#[non_exhaustive]` and cannot be constructed
@@ -621,6 +781,19 @@ pub fn migrate_state_dir_acknowledging_skipped(
     adopt: Option<&Path>,
     acknowledged_rows: &std::collections::BTreeSet<String>,
 ) -> MetaMigrateReport {
+    migrate_state_dir_with_session_db(state_dir, mode, adopt, acknowledged_rows, None)
+}
+
+/// [`migrate_state_dir_acknowledging_skipped`], taking `session_db`, the
+/// session database a 0.9.3 `store_path` named, as one more spelling of the
+/// Sessions slot (see the module docs).
+pub fn migrate_state_dir_with_session_db(
+    state_dir: &Path,
+    mode: MigrateMode,
+    adopt: Option<&Path>,
+    acknowledged_rows: &std::collections::BTreeSet<String>,
+    session_db: Option<&Path>,
+) -> MetaMigrateReport {
     let mut report = MetaMigrateReport::new(mode, state_dir);
     if !state_dir.is_dir() {
         report.errors.push(format!(
@@ -657,10 +830,60 @@ pub fn migrate_state_dir_acknowledging_skipped(
         return report;
     }
 
+    // `--session-db`: read-only checks before the fence, then the runtime
+    // locks, held to the end of the run so no runtime starts meanwhile.
+    let mut session_db_plan: Option<SessionDbPlan> = None;
+    let mut _runtime_locks = None;
+    if let Some(named) = session_db {
+        let outcome = match plan_session_db(state_dir, named) {
+            Ok(plan) => {
+                match crate::storage_migrate_native::census::exclude_live_runtimes(state_dir) {
+                    Ok(locks) => {
+                        _runtime_locks = Some(locks);
+                        let outcome = if plan.tripwire_owed {
+                            SessionDbOutcome::TripwireOwed
+                        } else {
+                            SessionDbOutcome::WouldMove
+                        };
+                        session_db_plan = Some(plan);
+                        outcome
+                    }
+                    Err(refusal) => SessionDbOutcome::Refused {
+                        refusal: runtime_lock_refusal(state_dir, refusal),
+                    },
+                }
+            }
+            Err(outcome) => outcome,
+        };
+        if let SessionDbOutcome::Refused { refusal } = &outcome {
+            report.errors.push(refusal.to_string());
+            report.session_db = Some(SessionDbReport {
+                path: named.to_path_buf(),
+                outcome,
+            });
+            return report;
+        }
+        report.session_db = Some(SessionDbReport {
+            path: named.to_path_buf(),
+            outcome,
+        });
+    }
+    let session_db_override = session_db_plan
+        .as_ref()
+        .and_then(|plan| plan.override_path());
+
     // Exclusive maintenance fence over every materialized database (apply
     // only; dry-run is read-only and reports what an apply run would fence).
+    let extra_fenced: Vec<PathBuf> = session_db_override
+        .iter()
+        .map(|path| path.to_path_buf())
+        .collect();
     let mut fence = if apply {
-        match MetaMaintenanceFence::acquire(state_dir, FENCE_DRAIN_DEADLINE) {
+        match MetaMaintenanceFence::acquire_including(
+            state_dir,
+            &extra_fenced,
+            FENCE_DRAIN_DEADLINE,
+        ) {
             Ok(fence) => {
                 report.fenced_databases = fence.fenced_databases().to_vec();
                 Some(fence)
@@ -673,7 +896,11 @@ pub fn migrate_state_dir_acknowledging_skipped(
             }
         }
     } else {
-        report.fenced_databases = enumerate_state_dir_databases(state_dir);
+        let mut fenced = enumerate_state_dir_databases(state_dir);
+        fenced.extend(extra_fenced.iter().cloned());
+        fenced.sort();
+        fenced.dedup();
+        report.fenced_databases = fenced;
         None
     };
 
@@ -685,9 +912,22 @@ pub fn migrate_state_dir_acknowledging_skipped(
     // ── Case 3: twin reconciliation (fail-closed). ───────────────────────
     let mut unresolved_twin = false;
     for slot in DatabaseSlot::ALL {
-        let Err(StorageLayoutError::FileNameTwins { paths, .. }) = layout.resolve_database(slot)
-        else {
-            continue;
+        let paths = if slot == DatabaseSlot::Sessions {
+            // The slot's copies, the file `--session-db` names included: a
+            // twin when there are two or more, else the slot's only copy
+            // (case 2 below).
+            let paths = sessions_copies(state_dir, session_db_override);
+            if paths.len() < 2 {
+                continue;
+            }
+            paths
+        } else {
+            let Err(StorageLayoutError::FileNameTwins { paths, .. }) =
+                layout.resolve_database(slot)
+            else {
+                continue;
+            };
+            paths
         };
         let twin = reconcile_twin(
             slot,
@@ -698,6 +938,8 @@ pub fn migrate_state_dir_acknowledging_skipped(
             fence.as_mut(),
             &mut report.errors,
             &mut unfenced,
+            state_dir,
+            session_db_plan.as_ref().map(|plan| plan.named.as_path()),
         );
         if let TwinResolution::Refused { reason } = &twin.resolution {
             unresolved_twin = true;
@@ -715,14 +957,24 @@ pub fn migrate_state_dir_acknowledging_skipped(
 
     // ── Case 2: lone-legacy-spelling renames (auto-safe, rename-only). ───
     for slot in DatabaseSlot::ALL {
-        let Ok(resolved) = layout.resolve_database(slot) else {
-            continue; // twins were resolved (or absent) above
-        };
-        let DatabaseProvenance::LegacySpelling(_) = resolved.provenance else {
-            continue;
-        };
         let to = state_dir.join(slot.canonical_name());
-        let entry = rename_to_canonical(slot, &resolved.path, &to, apply, &mut report.errors);
+        let from = if slot == DatabaseSlot::Sessions {
+            // A lone legacy spelling, or a lone named file, renames to the
+            // canonical name; two or more copies were reconciled above.
+            match sessions_copies(state_dir, session_db_override).as_slice() {
+                [only] if *only != to => only.clone(),
+                _ => continue,
+            }
+        } else {
+            let Ok(resolved) = layout.resolve_database(slot) else {
+                continue; // twins were resolved (or absent) above
+            };
+            let DatabaseProvenance::LegacySpelling(_) = resolved.provenance else {
+                continue;
+            };
+            resolved.path
+        };
+        let entry = rename_to_canonical(slot, &from, &to, apply, &mut report.errors);
         if entry.action == RenameAction::Renamed
             && slot != DatabaseSlot::AgentMemory
             && let Some(fence) = fence.as_mut()
@@ -736,6 +988,13 @@ pub fn migrate_state_dir_acknowledging_skipped(
             unfenced.push(to.clone());
         }
         report.renames.push(entry);
+    }
+
+    // ── `--session-db`: the tripwire at the named file's old path. ──────
+    if let Some(plan) = &session_db_plan
+        && apply
+    {
+        settle_session_db(plan, &mut report);
     }
 
     // ── Case 1: ledger baseline. ─────────────────────────────────────────
@@ -1228,7 +1487,7 @@ pub(crate) fn move_database_file(
 /// Meerkat store version: Meta-owned artifacts (the adoption rename marker)
 /// record the Meta release that wrote them. Same registered shape, so
 /// [`is_registered_backup_artifact_name`] still recognizes it.
-fn meta_backup_artifact_name(original: &str, purpose: &str) -> String {
+pub(crate) fn meta_backup_artifact_name(original: &str, purpose: &str) -> String {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
@@ -1554,6 +1813,18 @@ fn archive_twin_copy(
     Ok(archived)
 }
 
+/// The command that adopts the copy `--session-db` named, with the state
+/// directory as the run was given it. The named file's parent cannot stand
+/// in for it: a bare file name's parent is empty.
+fn session_db_adopt_command(state_dir: &Path, named: &Path) -> String {
+    format!(
+        "meta_gateway storage-migrate --state-dir {state_dir} --session-db {named} --apply \
+         --adopt {named}",
+        state_dir = state_dir.display(),
+        named = named.display(),
+    )
+}
+
 /// Case 3 for one slot: compute the per-domain divergence report, then
 /// refuse, dedup (exact equality), or adopt-and-archive. A canonicalization
 /// rename that cannot be re-fenced at its new path records a pass error in
@@ -1568,7 +1839,24 @@ fn reconcile_twin(
     fence: Option<&mut MetaMaintenanceFence>,
     errors: &mut Vec<String>,
     unfenced: &mut Vec<PathBuf>,
+    state_dir: &Path,
+    session_db: Option<&Path>,
 ) -> TwinReport {
+    // With `--session-db`, a divergent twin's refusal names the copy 0.9.3
+    // served and the exact command that adopts it.
+    let divergent_reason =
+        || match session_db.filter(|named| paths.iter().any(|path| path == named)) {
+            Some(named) => format!(
+                "divergent twin copies; {named} is the copy 0.9.3 read and wrote while its \
+             store_path named that file: rerun with `{command}` to adopt it and archive the \
+             other copies read-only (no synthesis)",
+                named = named.display(),
+                command = session_db_adopt_command(state_dir, named),
+            ),
+            None => "divergent twin copies; rerun with `--apply --adopt <path>` to adopt one copy \
+                 and archive the rest read-only (no synthesis)"
+                .to_string(),
+        };
     let mut twin = TwinReport {
         slot: slot.to_string(),
         paths: paths.to_vec(),
@@ -1668,9 +1956,7 @@ fn reconcile_twin(
                  canonical spelling, archive the redundant copy read-only)"
                     .to_string()
             } else {
-                "divergent twin copies; rerun with `--apply --adopt <path>` to adopt one copy \
-                 and archive the rest read-only (no synthesis)"
-                    .to_string()
+                divergent_reason()
             },
         };
         return twin;
@@ -1707,9 +1993,7 @@ fn reconcile_twin(
                         .join(", ")
                 )
             } else {
-                "divergent twin copies; rerun with `--apply --adopt <path>` to adopt one copy \
-                 and archive the rest read-only (no synthesis)"
-                    .to_string()
+                divergent_reason()
             },
         };
         return twin;
@@ -1778,6 +2062,284 @@ fn reconcile_twin(
         }
     };
     twin
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `--session-db`: the session database a 0.9.3 `store_path` named.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A `--session-db` file the run takes in.
+struct SessionDbPlan {
+    /// The file as the operator named it.
+    named: PathBuf,
+    /// Whether the name is one of the Sessions slot's own spellings (a legacy
+    /// one: the canonical file is a no-op). The ordinary passes move a legacy
+    /// spelling; the run only adds the tripwire.
+    legacy_spelling: bool,
+    /// An earlier run moved the file and did not write its retired stamp
+    /// (see [`SessionDbOutcome::TripwireOwed`]).
+    tripwire_owed: bool,
+}
+
+impl SessionDbPlan {
+    /// The file when it carries a name the layout does not know: the one
+    /// the run adds to the Sessions slot.
+    fn override_path(&self) -> Option<&Path> {
+        (!self.legacy_spelling).then_some(self.named.as_path())
+    }
+}
+
+/// The first bytes of every SQLite database file.
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+/// The read-only checks `--session-db` runs before the fence: what the named
+/// file is, and whether the directory may take it in. A no-op or a refusal is
+/// the outcome to report.
+fn plan_session_db(state_dir: &Path, named: &Path) -> Result<SessionDbPlan, SessionDbOutcome> {
+    let refuse = |refusal: SessionDbRefusal| SessionDbOutcome::Refused { refusal };
+    let unreadable = |path: &Path, detail: String| {
+        refuse(SessionDbRefusal::Unreadable {
+            path: path.to_path_buf(),
+            detail,
+        })
+    };
+    match fs::metadata(named) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(refuse(SessionDbRefusal::NotAFile {
+                path: named.to_path_buf(),
+            }));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if tripwire_owed(state_dir, named) {
+                let legacy_spelling = named
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| DatabaseSlot::Sessions.legacy_names().contains(&name));
+                return Ok(SessionDbPlan {
+                    named: named.to_path_buf(),
+                    legacy_spelling,
+                    tripwire_owed: true,
+                });
+            }
+            return Err(refuse(SessionDbRefusal::Missing {
+                path: named.to_path_buf(),
+            }));
+        }
+        Err(error) => return Err(unreadable(named, error.to_string())),
+    }
+    // Canonicalized on both sides, so a symlinked --state-dir neither
+    // refuses its own file nor accepts a file outside it.
+    let file = fs::canonicalize(named).map_err(|error| unreadable(named, error.to_string()))?;
+    let dir =
+        fs::canonicalize(state_dir).map_err(|error| unreadable(state_dir, error.to_string()))?;
+    if file.parent() != Some(dir.as_path()) {
+        return Err(refuse(SessionDbRefusal::OutsideStateDir {
+            path: named.to_path_buf(),
+            state_dir: state_dir.to_path_buf(),
+        }));
+    }
+    let name = file.file_name().and_then(|name| name.to_str());
+    if name == Some(DatabaseSlot::Sessions.canonical_name()) {
+        return Err(SessionDbOutcome::AlreadyInLayout);
+    }
+    let legacy_spelling =
+        name.is_some_and(|name| DatabaseSlot::Sessions.legacy_names().contains(&name));
+
+    // Header first: a file that is not SQLite is never opened, so the check
+    // leaves nothing beside it.
+    let mut header = [0_u8; 16];
+    let is_sqlite = match fs::File::open(named) {
+        Ok(mut handle) => {
+            use std::io::Read as _;
+            handle.read_exact(&mut header).is_ok() && &header == SQLITE_HEADER
+        }
+        Err(error) => return Err(unreadable(named, error.to_string())),
+    };
+    if !is_sqlite {
+        return Err(refuse(SessionDbRefusal::NotASessionDatabase {
+            path: named.to_path_buf(),
+            detail: "not a SQLite database".to_string(),
+        }));
+    }
+    let conn = meerkat_sqlite::open(named, meerkat_sqlite::ConnectionProfile::ReadOnly)
+        .map_err(|error| unreadable(named, error.to_string()))?;
+    if crate::storage_migrate_native::layout_status::is_retired(&conn, SESSION_STORE_DOMAIN.name)
+        .map_err(|detail| unreadable(named, detail))?
+    {
+        return Err(SessionDbOutcome::AlreadyMoved);
+    }
+    let version = meerkat_sqlite::domain_version(&conn, SESSION_STORE_DOMAIN.name)
+        .map_err(|error| unreadable(named, error.to_string()))?;
+    drop(conn);
+    if version.is_none() {
+        return Err(refuse(SessionDbRefusal::NotASessionDatabase {
+            path: named.to_path_buf(),
+            detail: format!("no `{}` schema row", SESSION_STORE_DOMAIN.name),
+        }));
+    }
+    match crate::storage_migrate_native::runtime_conversion_began(state_dir) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(refuse(SessionDbRefusal::NativeRuntimeAlreadyStarted {
+                state_dir: state_dir.to_path_buf(),
+            }));
+        }
+        Err(detail) => {
+            return Err(unreadable(
+                &state_dir.join(crate::storage_layout::RUNTIME_DB_FILE_NAME),
+                detail,
+            ));
+        }
+    }
+    Ok(SessionDbPlan {
+        named: named.to_path_buf(),
+        legacy_spelling,
+        tripwire_owed: false,
+    })
+}
+
+/// Whether `named`, which is missing, is a file an earlier `--session-db`
+/// run moved before a crash kept it from writing the retired stamp: `named`
+/// names a file directly in the state directory, `sessions.sqlite3` is in
+/// place, and a registered artifact of the file (`<name>.pre-...`: its
+/// rename marker, or its archive after a dedup or an adopt) lies beside it.
+fn tripwire_owed(state_dir: &Path, named: &Path) -> bool {
+    let Some(name) = named.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let parent = match named.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let in_state_dir = matches!(
+        (fs::canonicalize(parent), fs::canonicalize(state_dir)),
+        (Ok(parent), Ok(dir)) if parent == dir
+    );
+    let prefix = format!("{name}.pre-");
+    in_state_dir
+        && state_dir
+            .join(DatabaseSlot::Sessions.canonical_name())
+            .is_file()
+        && fs::read_dir(parent).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry.file_name().to_str().is_some_and(|file| {
+                    file.starts_with(&prefix) && is_registered_backup_artifact_name(file)
+                })
+            })
+        })
+}
+
+/// The census's runtime-lock refusal, as `--session-db` reports it.
+fn runtime_lock_refusal(
+    state_dir: &Path,
+    refusal: crate::storage_migrate_native::NativeMigrateRefusal,
+) -> SessionDbRefusal {
+    match refusal {
+        crate::storage_migrate_native::NativeMigrateRefusal::RuntimeInUse { file } => {
+            SessionDbRefusal::RuntimeInUse {
+                file: PathBuf::from(file),
+            }
+        }
+        crate::storage_migrate_native::NativeMigrateRefusal::RuntimeLockUnreadable {
+            file,
+            detail,
+        } => SessionDbRefusal::Unreadable {
+            path: PathBuf::from(file),
+            detail,
+        },
+        // The lock check returns only the two refusals above. Any other one
+        // is reported against the state directory, in the census's own
+        // serialized form (the refusal has no Display text).
+        other => SessionDbRefusal::Unreadable {
+            path: state_dir.to_path_buf(),
+            detail: serde_json::to_string(&other).unwrap_or_else(|error| error.to_string()),
+        },
+    }
+}
+
+/// The copies of the Sessions slot in `state_dir`, canonical first, then
+/// the legacy spellings, then `named` (the file `--session-db` names) while
+/// it is still in place. A legacy spelling that holds the session-store
+/// retired stamp is the tripwire an earlier `--session-db` run left there,
+/// not a copy: it is never a twin and never renamed.
+fn sessions_copies(state_dir: &Path, named: Option<&Path>) -> Vec<PathBuf> {
+    let slot = DatabaseSlot::Sessions;
+    let canonical = state_dir.join(slot.canonical_name());
+    let mut copies: Vec<PathBuf> = canonical
+        .exists()
+        .then_some(canonical)
+        .into_iter()
+        .collect();
+    copies.extend(
+        slot.legacy_names()
+            .iter()
+            .map(|name| state_dir.join(name))
+            .filter(|path| path.exists() && !is_session_store_tripwire(path)),
+    );
+    if let Some(named) = named
+        && named.exists()
+        && !copies.iter().any(|copy| copy == named)
+    {
+        copies.push(named.to_path_buf());
+    }
+    copies
+}
+
+/// Whether `path` is the session-store retired stamp, by the census's own
+/// reading. Anything that cannot be read as one (not SQLite, unreadable, or
+/// stamped with other content) is not, so it stays a copy and the twin rules
+/// judge it.
+pub(crate) fn is_session_store_tripwire(path: &Path) -> bool {
+    crate::storage_migrate_native::layout_status::is_retired_stamp_file(
+        path,
+        SESSION_STORE_DOMAIN.name,
+    )
+    .unwrap_or(false)
+}
+
+/// After an apply run's twin and rename cases: once the named file has left
+/// its path (renamed, adopted or archived), leave the retired stamp there.
+fn settle_session_db(plan: &SessionDbPlan, report: &mut MetaMigrateReport) {
+    let Some(entry) = report.session_db.as_mut() else {
+        return;
+    };
+    if plan.named.exists() {
+        // An unresolved twin stopped the run, or the rename refused: the
+        // file is where it was, and the run's errors say why.
+        return;
+    }
+    match write_session_db_tripwire(&plan.named) {
+        Ok(()) => {
+            entry.outcome = SessionDbOutcome::Moved {
+                tripwire: plan.named.clone(),
+            };
+        }
+        Err(error) => report.errors.push(format!(
+            "the session database moved, but its tripwire at {} could not be written: {error}; \
+             a 0.9.3 gateway started with that store_path would start empty there",
+            plan.named.display()
+        )),
+    }
+}
+
+/// The retired stamp of the session-store domain at `path`, synced with its
+/// directory: a 0.9.3 gateway started again with the `store_path` that named
+/// it refuses the file as a schema from the future instead of starting empty.
+fn write_session_db_tripwire(path: &Path) -> Result<(), String> {
+    crate::storage_migrate_native::layout_status::write_retired_stamp(
+        path,
+        SESSION_STORE_DOMAIN.name,
+    )?;
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("sync {}: {error}", path.display()))?;
+    if let Some(dir) = path.parent() {
+        fs::File::open(dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| format!("sync {}: {error}", dir.display()))?;
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2012,6 +2574,15 @@ pub fn enumerate_state_dir_artifacts(state_dir: &Path) -> Vec<MetaPruneArtifact>
     artifacts
 }
 
+/// Whether `path` names a byte copy of the first-boot manifest
+/// (`storage-migrate-native.first-boot.json.pre-*`).
+fn is_first_boot_manifest_copy(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(crate::identity_first::FIRST_BOOT_MANIFEST_FILE))
+        .is_some_and(|rest| rest.starts_with(".pre-"))
+}
+
 /// Registered maintenance-artifact lifecycle over one state directory:
 /// enumerate `*.pre-*` / `*.corrupt-*` artifacts; with
 /// [`MigrateMode::Apply`], delete those at least `older_than_days` old
@@ -2025,8 +2596,13 @@ pub fn prune_state_dir(
 ) -> MetaPruneReport {
     let mut report = MetaPruneReport::new(mode, state_dir, older_than_days);
     let mut artifacts = enumerate_state_dir_artifacts(state_dir);
+    // The first-boot manifest's copies are the remedy the manifest reader
+    // names while rows are pending: kept for as long as the manifest is.
+    let manifest_pending = crate::identity_first::FirstBootManifest::path(state_dir).exists();
     for artifact in &mut artifacts {
-        if artifact.age_days < older_than_days {
+        if artifact.age_days < older_than_days
+            || (manifest_pending && is_first_boot_manifest_copy(&artifact.path))
+        {
             artifact.action = PruneAction::Kept;
             continue;
         }
@@ -2881,6 +3457,12 @@ mod tests {
         drop(Connection::open(state.join(WORKGRAPH_ADMISSION_SIDECAR_FILE)).expect("sidecar"));
         fs::write(state.join("continuity.db.pre-0.0.1-1700000000"), b"backup")
             .expect("backup artifact");
+        // The runtime lock stays between runs; it is inventory, not a leftover.
+        fs::write(
+            state.join(crate::storage_layout::STATE_DIR_LOCK_FILE_NAME),
+            b"",
+        )
+        .expect("runtime lock file");
         // A dead pid: a reaped child. A live pid: this process.
         let mut child = std::process::Command::new("true").spawn().expect("spawn");
         let dead_pid = child.id();
@@ -2914,6 +3496,10 @@ mod tests {
         ] {
             assert!(codes.contains(&expected), "missing {expected}: {codes:?}");
         }
+        assert!(
+            !codes.contains(&storage_doctor::FINDING_STATE_DIR_LOCK),
+            "the runtime lock is no leftover: {codes:?}"
+        );
         let dead: Vec<_> = report
             .findings
             .iter()
@@ -2980,6 +3566,35 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    /// The first-boot manifest's byte copy is the remedy the manifest reader
+    /// names while rows are pending: prune keeps it for as long as the
+    /// manifest exists, however old, and deletes it like any other backup
+    /// once the manifest is gone.
+    #[test]
+    fn prune_keeps_the_first_boot_manifest_copy_while_the_manifest_is_pending() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path();
+        let manifest = state.join(crate::identity_first::FIRST_BOOT_MANIFEST_FILE);
+        let copy = state.join(format!(
+            "{}.pre-0.9.4-1700000000.native-migration",
+            crate::identity_first::FIRST_BOOT_MANIFEST_FILE
+        ));
+        let other = state.join("runtime.sqlite.pre-0.9.4-1700000000.native-migration");
+        fs::write(&manifest, b"{}").expect("manifest");
+        fs::write(&copy, b"{}").expect("copy");
+        fs::write(&other, b"backup").expect("other backup");
+
+        let report = prune_state_dir(state, 0, MigrateMode::Apply);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(copy.exists(), "kept while the manifest is pending");
+        assert!(!other.exists(), "every other backup still goes");
+
+        fs::remove_file(&manifest).expect("the last row carried out");
+        let report = prune_state_dir(state, 0, MigrateMode::Apply);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(!copy.exists(), "deleted once the manifest is gone");
     }
 
     #[test]
@@ -3175,5 +3790,529 @@ mod tests {
         let not_a_dir = dir.path().join("file");
         fs::write(&not_a_dir, b"x").unwrap();
         assert_eq!(proc_entry_liveness(&not_a_dir, 42), None);
+    }
+
+    // ── `--session-db` ───────────────────────────────────────────────────
+
+    /// A 0.9.3 session database as a `store_path` override left it: the
+    /// session-store ledger row, and one session row carrying `marker`.
+    fn create_session_db(path: &Path, marker: &str) {
+        let conn = Connection::open(path).expect("create session db");
+        conn.execute_batch(
+            "CREATE TABLE meerkat_schema (domain TEXT PRIMARY KEY, version INTEGER NOT NULL);
+             CREATE TABLE sessions (id TEXT PRIMARY KEY, data BLOB NOT NULL);",
+        )
+        .expect("session db schema");
+        conn.execute(
+            "INSERT INTO meerkat_schema (domain, version) VALUES (?1, 1)",
+            [SESSION_STORE_DOMAIN.name],
+        )
+        .expect("session-store ledger row");
+        conn.execute(
+            "INSERT INTO sessions (id, data) VALUES ('s-1', ?1)",
+            [marker.as_bytes()],
+        )
+        .expect("session row");
+    }
+
+    fn session_marker(path: &Path) -> String {
+        let conn = Connection::open(path).expect("open session db");
+        let data: Vec<u8> = conn
+            .query_row("SELECT data FROM sessions WHERE id = 's-1'", [], |row| {
+                row.get(0)
+            })
+            .expect("session row");
+        String::from_utf8(data).expect("marker text")
+    }
+
+    /// Names and bytes of every file directly in `dir`.
+    fn dir_snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.is_file())
+            .map(|path| {
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    fs::read(&path).expect("read file"),
+                )
+            })
+            .collect()
+    }
+
+    fn session_db_outcome(report: &MetaMigrateReport) -> &SessionDbOutcome {
+        &report
+            .session_db
+            .as_ref()
+            .expect("session-db report")
+            .outcome
+    }
+
+    fn session_db_run(
+        state: &Path,
+        mode: MigrateMode,
+        adopt: Option<&Path>,
+        named: &Path,
+    ) -> MetaMigrateReport {
+        migrate_state_dir_with_session_db(
+            state,
+            mode,
+            adopt,
+            &std::collections::BTreeSet::new(),
+            Some(named),
+        )
+    }
+
+    /// Case 2 plus the tripwire: a lone named file renames to `sessions.sqlite3`
+    /// (the dry run reports it and changes nothing), its old path then holds
+    /// the session-store retired stamp, a rename marker records the move, and
+    /// a rerun naming the same file is the typed "already moved" no-op.
+    #[test]
+    fn a_lone_session_db_moves_into_the_layout_and_leaves_the_tripwire() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path();
+        let named = state.join("my-sessions.db");
+        create_session_db(&named, "override");
+        let before = dir_snapshot(state);
+
+        let dry = session_db_run(state, MigrateMode::DryRun, None, &named);
+        assert!(!dry.has_errors(), "{:?}", dry.errors);
+        assert_eq!(session_db_outcome(&dry), &SessionDbOutcome::WouldMove);
+        assert!(
+            dry.renames
+                .iter()
+                .any(|entry| entry.from == named && entry.action == RenameAction::WouldRename),
+            "{:?}",
+            dry.renames
+        );
+        assert!(dry.fenced_databases.contains(&named));
+        assert_eq!(dir_snapshot(state), before, "a dry run changes nothing");
+
+        let applied = session_db_run(state, MigrateMode::Apply, None, &named);
+        assert!(!applied.has_errors(), "{:?}", applied.errors);
+        assert_eq!(
+            session_db_outcome(&applied),
+            &SessionDbOutcome::Moved {
+                tripwire: named.clone()
+            }
+        );
+        let canonical = state.join("sessions.sqlite3");
+        assert_eq!(session_marker(&canonical), "override");
+        assert!(is_session_store_tripwire(&named), "the tripwire stands");
+        assert!(
+            fs::read_dir(state).unwrap().any(|entry| {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                name.starts_with("my-sessions.db.pre-") && name.ends_with(".renamed")
+            }),
+            "a rename marker records the move"
+        );
+
+        let again = session_db_run(state, MigrateMode::Apply, None, &named);
+        assert!(!again.has_errors(), "{:?}", again.errors);
+        assert_eq!(session_db_outcome(&again), &SessionDbOutcome::AlreadyMoved);
+        assert_eq!(session_marker(&canonical), "override");
+    }
+
+    /// Naming the canonical file itself is the typed "already in the
+    /// layout" no-op, and leaves no tripwire.
+    #[test]
+    fn a_session_db_that_is_the_canonical_file_is_already_in_the_layout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path();
+        let canonical = state.join("sessions.sqlite3");
+        create_session_db(&canonical, "canonical");
+        let report = session_db_run(state, MigrateMode::Apply, None, &canonical);
+        assert!(!report.has_errors(), "{:?}", report.errors);
+        assert_eq!(
+            session_db_outcome(&report),
+            &SessionDbOutcome::AlreadyInLayout
+        );
+        assert_eq!(session_marker(&canonical), "canonical");
+        assert!(!is_session_store_tripwire(&canonical));
+    }
+
+    /// The refusals before the fence: a missing path, a directory, a file
+    /// outside the state directory, a file that is not SQLite, and SQLite
+    /// without the session-store row. Each refuses typed in an apply run and
+    /// leaves the state directory byte-identical; the non-SQLite file is
+    /// never opened, so nothing appears beside it.
+    #[test]
+    fn session_db_refusals_move_nothing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let outside = elsewhere.join("my-sessions.db");
+        create_session_db(&outside, "outside");
+        let directory = state.join("store.d");
+        fs::create_dir(&directory).unwrap();
+        let text = state.join("notes.db");
+        fs::write(&text, b"not a database at all, just text").unwrap();
+        let foreign = state.join("other.db");
+        Connection::open(&foreign)
+            .unwrap()
+            .execute_batch("CREATE TABLE things (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let before = dir_snapshot(&state);
+
+        type RefusalCase = (PathBuf, fn(&SessionDbRefusal) -> bool);
+        let cases: [RefusalCase; 5] = [
+            (state.join("absent.db"), |refusal| {
+                matches!(refusal, SessionDbRefusal::Missing { .. })
+            }),
+            (directory, |refusal| {
+                matches!(refusal, SessionDbRefusal::NotAFile { .. })
+            }),
+            (outside.clone(), |refusal| {
+                matches!(refusal, SessionDbRefusal::OutsideStateDir { .. })
+            }),
+            (text.clone(), |refusal| {
+                matches!(refusal, SessionDbRefusal::NotASessionDatabase { .. })
+            }),
+            (foreign, |refusal| {
+                matches!(refusal, SessionDbRefusal::NotASessionDatabase { .. })
+            }),
+        ];
+        for (named, expected) in cases {
+            let report = session_db_run(&state, MigrateMode::Apply, None, &named);
+            assert!(report.has_errors(), "{} must refuse", named.display());
+            let SessionDbOutcome::Refused { refusal } = session_db_outcome(&report) else {
+                panic!("{}: {:?}", named.display(), report.session_db);
+            };
+            assert!(expected(refusal), "{}: {refusal:?}", named.display());
+            assert!(
+                report.fenced_databases.is_empty(),
+                "refused before the fence"
+            );
+            assert_eq!(dir_snapshot(&state), before, "{}", named.display());
+        }
+        assert!(!path_with_suffix(&text, "-wal").exists());
+        assert!(!path_with_suffix(&text, "-shm").exists());
+        assert_eq!(session_marker(&outside), "outside");
+    }
+
+    /// The parent check compares canonical paths, so a state directory
+    /// named through a symlink takes the file inside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_state_dir_takes_its_own_session_db() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real = temp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        create_session_db(&real.join("my-sessions.db"), "override");
+        let report = session_db_run(
+            &link,
+            MigrateMode::DryRun,
+            None,
+            &link.join("my-sessions.db"),
+        );
+        assert!(!report.has_errors(), "{:?}", report.errors);
+        assert_eq!(session_db_outcome(&report), &SessionDbOutcome::WouldMove);
+    }
+
+    /// Once a 0.9.4 runtime started on the directory (runtime.sqlite
+    /// carries Core's head-canonical profile pin), the run refuses typed and
+    /// the named file is untouched. Control: the same directory without the
+    /// pin moves it.
+    #[test]
+    fn a_native_runtime_already_started_refuses_the_session_db() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path();
+        let named = state.join("my-sessions.db");
+        create_session_db(&named, "override");
+        let runtime = state.join(crate::storage_layout::RUNTIME_DB_FILE_NAME);
+        Connection::open(&runtime)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE runtime_head_canonical_profile_pin (singleton INTEGER PRIMARY KEY);
+                 INSERT INTO runtime_head_canonical_profile_pin (singleton) VALUES (1);",
+            )
+            .unwrap();
+        let before = dir_snapshot(state);
+        let report = session_db_run(state, MigrateMode::Apply, None, &named);
+        assert!(report.has_errors());
+        assert!(matches!(
+            session_db_outcome(&report),
+            SessionDbOutcome::Refused {
+                refusal: SessionDbRefusal::NativeRuntimeAlreadyStarted { .. }
+            }
+        ));
+        assert_eq!(dir_snapshot(state), before);
+
+        fs::remove_file(&runtime).unwrap();
+        let control = session_db_run(state, MigrateMode::Apply, None, &named);
+        assert!(!control.has_errors(), "{:?}", control.errors);
+        assert!(matches!(
+            session_db_outcome(&control),
+            SessionDbOutcome::Moved { .. }
+        ));
+    }
+
+    /// The live-runtime rule: while another process holds a runtime
+    /// lock of the directory (here a shared lock on the execution-custody
+    /// file, as Core takes per hosted runtime), the run refuses typed and
+    /// moves nothing. Control: once the lock is released the file moves.
+    #[test]
+    fn a_live_runtime_lock_refuses_the_session_db() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path();
+        let named = state.join("my-sessions.db");
+        create_session_db(&named, "override");
+        let mut custody = state
+            .join(crate::storage_layout::RUNTIME_DB_FILE_NAME)
+            .into_os_string();
+        custody.push(".execution-custody");
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(PathBuf::from(custody))
+            .unwrap();
+        holder.lock_shared().unwrap();
+        let before = dir_snapshot(state);
+        let report = session_db_run(state, MigrateMode::Apply, None, &named);
+        assert!(report.has_errors());
+        assert!(matches!(
+            session_db_outcome(&report),
+            SessionDbOutcome::Refused {
+                refusal: SessionDbRefusal::RuntimeInUse { .. }
+            }
+        ));
+        assert_eq!(dir_snapshot(state), before);
+
+        drop(holder);
+        let control = session_db_run(state, MigrateMode::Apply, None, &named);
+        assert!(!control.has_errors(), "{:?}", control.errors);
+        assert!(matches!(
+            session_db_outcome(&control),
+            SessionDbOutcome::Moved { .. }
+        ));
+    }
+
+    /// A named file next to a divergent `sessions.sqlite3` is a twin.
+    /// The refusal names the named file and the exact `--adopt` command;
+    /// apply without `--adopt` refuses too; adopting the named file puts its
+    /// rows at the canonical name, archives the stale copy read-only, and
+    /// leaves the tripwire at the old path.
+    #[test]
+    fn a_session_db_beside_a_divergent_canonical_names_its_adopt_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path();
+        let named = state.join("my-sessions.db");
+        let canonical = state.join("sessions.sqlite3");
+        create_session_db(&named, "override");
+        create_session_db(&canonical, "stale");
+
+        let dry = session_db_run(state, MigrateMode::DryRun, None, &named);
+        assert!(dry.has_errors());
+        let twin = dry
+            .twins
+            .iter()
+            .find(|twin| twin.slot == "sessions")
+            .expect("sessions twin");
+        let TwinResolution::Refused { reason } = &twin.resolution else {
+            panic!("{:?}", twin.resolution);
+        };
+        let command = format!(
+            "`meta_gateway storage-migrate --state-dir {} --session-db {} --apply --adopt {}`",
+            state.display(),
+            named.display(),
+            named.display()
+        );
+        assert!(reason.contains(&command), "{reason}");
+        assert!(reason.contains("the copy 0.9.3 read and wrote"), "{reason}");
+        assert_eq!(session_db_outcome(&dry), &SessionDbOutcome::WouldMove);
+        // A bare file name (`--state-dir . --session-db my-sessions.db`, run
+        // from the state directory) has an empty parent: the command still
+        // names the state directory the run was given.
+        assert_eq!(
+            session_db_adopt_command(Path::new("."), Path::new("my-sessions.db")),
+            "meta_gateway storage-migrate --state-dir . --session-db my-sessions.db --apply \
+             --adopt my-sessions.db"
+        );
+
+        let refused = session_db_run(state, MigrateMode::Apply, None, &named);
+        assert!(refused.has_errors());
+        assert_eq!(session_marker(&named), "override");
+        assert_eq!(session_marker(&canonical), "stale");
+
+        let adopted = session_db_run(state, MigrateMode::Apply, Some(&named), &named);
+        assert!(!adopted.has_errors(), "{:?}", adopted.errors);
+        assert_eq!(session_marker(&canonical), "override");
+        assert!(is_session_store_tripwire(&named));
+        let twin = adopted
+            .twins
+            .iter()
+            .find(|twin| twin.slot == "sessions")
+            .expect("sessions twin");
+        let TwinResolution::Adopted { archived, .. } = &twin.resolution else {
+            panic!("{:?}", twin.resolution);
+        };
+        assert_eq!(session_marker(&archived[0]), "stale");
+        assert!(fs::metadata(&archived[0]).unwrap().permissions().readonly());
+        assert!(matches!(
+            session_db_outcome(&adopted),
+            SessionDbOutcome::Moved { .. }
+        ));
+    }
+
+    /// The adopt command names the state directory as the run was given it,
+    /// never the named file's parent: through a symlinked state directory
+    /// the two differ.
+    #[cfg(unix)]
+    #[test]
+    fn a_divergent_session_db_twin_names_the_state_dir_the_run_was_given() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real = temp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let named = real.join("my-sessions.db");
+        create_session_db(&named, "override");
+        create_session_db(&real.join("sessions.sqlite3"), "stale");
+
+        let dry = session_db_run(&link, MigrateMode::DryRun, None, &named);
+        let twin = dry
+            .twins
+            .iter()
+            .find(|twin| twin.slot == "sessions")
+            .expect("sessions twin");
+        let TwinResolution::Refused { reason } = &twin.resolution else {
+            panic!("{:?}", twin.resolution);
+        };
+        assert!(
+            reason.contains(&format!(
+                "--state-dir {} --session-db {}",
+                link.display(),
+                named.display()
+            )),
+            "{reason}"
+        );
+    }
+
+    /// A run that moved the named file and stopped before its stamp (a crash
+    /// between the two) leaves the stamp owed: a rerun naming the missing
+    /// file reports it, and an apply run writes it. Control: a missing file
+    /// with no artifact beside it is still refused as missing.
+    #[test]
+    fn a_rerun_writes_the_tripwire_an_interrupted_run_owes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path();
+        let named = state.join("my-sessions.db");
+        let canonical = state.join("sessions.sqlite3");
+        create_session_db(&named, "override");
+        // The interrupted run: the rename and its marker, then no stamp.
+        fs::rename(&named, &canonical).unwrap();
+        write_rename_marker(&named, &canonical).unwrap();
+
+        let dry = session_db_run(state, MigrateMode::DryRun, None, &named);
+        assert!(!dry.has_errors(), "{:?}", dry.errors);
+        assert_eq!(session_db_outcome(&dry), &SessionDbOutcome::TripwireOwed);
+        assert!(!named.exists());
+
+        let applied = session_db_run(state, MigrateMode::Apply, None, &named);
+        assert!(!applied.has_errors(), "{:?}", applied.errors);
+        assert!(is_session_store_tripwire(&named));
+        assert!(matches!(
+            session_db_outcome(&applied),
+            SessionDbOutcome::Moved { .. }
+        ));
+        assert_eq!(session_marker(&canonical), "override");
+
+        let other = state.join("other-sessions.db");
+        let missing = session_db_run(state, MigrateMode::DryRun, None, &other);
+        assert!(matches!(
+            session_db_outcome(&missing),
+            SessionDbOutcome::Refused {
+                refusal: SessionDbRefusal::Missing { .. }
+            }
+        ));
+        assert!(!other.exists());
+    }
+
+    /// A named file byte-identical to `sessions.sqlite3` dedups under plain
+    /// `--apply`: the canonical copy stays, the named copy is archived, and
+    /// the tripwire takes its path.
+    #[test]
+    fn a_byte_identical_session_db_dedups_and_leaves_the_tripwire() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path();
+        let canonical = state.join("sessions.sqlite3");
+        create_session_db(&canonical, "same");
+        let named = state.join("my-sessions.db");
+        fs::copy(&canonical, &named).unwrap();
+
+        let report = session_db_run(state, MigrateMode::Apply, None, &named);
+        assert!(!report.has_errors(), "{:?}", report.errors);
+        let twin = report
+            .twins
+            .iter()
+            .find(|twin| twin.slot == "sessions")
+            .expect("sessions twin");
+        let TwinResolution::Deduped { kept, archived } = &twin.resolution else {
+            panic!("{:?}", twin.resolution);
+        };
+        assert_eq!(kept, &canonical);
+        assert!(
+            archived[0]
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(
+                    |name| name.starts_with("my-sessions.db.pre-") && name.ends_with(".twin-dedup")
+                ),
+            "{archived:?}"
+        );
+        assert!(is_session_store_tripwire(&named));
+        assert_eq!(session_marker(&canonical), "same");
+    }
+
+    /// A legacy spelling named with `--session-db` takes case 2 plus the
+    /// tripwire. The stamp at the legacy name is a tripwire, not a copy: a
+    /// later run, with or without `--session-db`, sees no twin and leaves it
+    /// in place.
+    #[test]
+    fn a_legacy_spelling_session_db_takes_case_two_and_the_tripwire() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path();
+        let legacy = state.join("sessions.db");
+        create_session_db(&legacy, "legacy");
+
+        let report = session_db_run(state, MigrateMode::Apply, None, &legacy);
+        assert!(!report.has_errors(), "{:?}", report.errors);
+        assert_eq!(
+            session_db_outcome(&report),
+            &SessionDbOutcome::Moved {
+                tripwire: legacy.clone()
+            }
+        );
+        assert_eq!(session_marker(&state.join("sessions.sqlite3")), "legacy");
+        assert!(is_session_store_tripwire(&legacy));
+
+        let plain = migrate_state_dir(state, MigrateMode::Apply, None);
+        assert!(!plain.has_errors(), "{:?}", plain.errors);
+        assert!(
+            plain.twins.iter().all(|twin| twin.slot != "sessions"),
+            "{:?}",
+            plain.twins
+        );
+        assert!(is_session_store_tripwire(&legacy), "the tripwire stays");
+        let diagnosis = storage_doctor::diagnose_state_dir_blocking(
+            &DiagnoseScope::new(vec![state.to_path_buf()]),
+            None,
+        );
+        assert!(
+            diagnosis
+                .findings
+                .iter()
+                .all(|finding| finding.code != storage_doctor::FINDING_FILE_NAME_TWINS),
+            "the doctor sees no twin beside the tripwire: {:?}",
+            diagnosis.findings
+        );
+        let rerun = session_db_run(state, MigrateMode::Apply, None, &legacy);
+        assert_eq!(session_db_outcome(&rerun), &SessionDbOutcome::AlreadyMoved);
     }
 }

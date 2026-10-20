@@ -27,7 +27,6 @@ import {
   MOB_EVENTS_STALE_CURSOR_CODE,
   CAPABILITY_UNAVAILABLE_CODE,
   CONSOLE_TIMELINE_REPLAY_UNAVAILABLE_CODE,
-  LEASE_LOST_CODE,
   STALE_DELIVERY_SCOPE_CODE,
   REGISTERED_SPEC_CHANGED_CODE,
   MEMORY_BACKEND_UNAVAILABLE_CODE,
@@ -38,11 +37,14 @@ import {
   MEMBER_RELOAD_REQUIRED_KIND,
   WORKGRAPH_UNAVAILABLE_CODE,
   WORKGRAPH_CONFLICT_CODE,
+  IDENTITY_UNRESUMABLE_CODE,
+  IDENTITY_HISTORY_UNAVAILABLE_CODE,
+  IDENTITY_HOST_ADOPTED_CODE,
+  IDENTITY_WAKE_HELD_KINDS,
   CapabilityUnavailableError,
   CompositionProvenanceError,
   MemberReloadRequiredError,
   ConsoleTimelineReplayUnavailableError,
-  LeaseLostError,
   RegisteredSpecChangedError,
   StaleScopeError,
   MemoryBackendUnavailableError,
@@ -55,6 +57,10 @@ import {
   TransportReaderFailedError,
   GatewayStartupCleanupError,
   type GatewayCleanup,
+  IdentityHistoryUnavailableError,
+  IdentityHostAdoptedError,
+  IdentityUnresumableError,
+  IdentityWakeHeldError,
   InitOutcomeUnknownError,
   PostAdmissionObservationError,
   TurnFailedError,
@@ -715,9 +721,6 @@ function rpcErrorFromPayload(
   if (code === CAPABILITY_UNAVAILABLE_CODE) {
     return new CapabilityUnavailableError(message, rid, method, err.data);
   }
-  if (code === LEASE_LOST_CODE) {
-    return new LeaseLostError(message, rid, method, err.data);
-  }
   if (code === REGISTERED_SPEC_CHANGED_CODE) {
     return new RegisteredSpecChangedError(message, rid, method, err.data);
   }
@@ -752,6 +755,23 @@ function rpcErrorFromPayload(
   }
   if (code === WORKGRAPH_CONFLICT_CODE) {
     return new WorkGraphConflictError(message, rid, method, err.data);
+  }
+  if (code === IDENTITY_UNRESUMABLE_CODE) {
+    return new IdentityUnresumableError(message, rid, method, err.data);
+  }
+  if (code === IDENTITY_HISTORY_UNAVAILABLE_CODE) {
+    return new IdentityHistoryUnavailableError(message, rid, method, err.data);
+  }
+  if (code === IDENTITY_HOST_ADOPTED_CODE) {
+    return new IdentityHostAdoptedError(message, rid, method, err.data);
+  }
+  if (
+    code === -32603 &&
+    typeof err.data === "object" &&
+    err.data !== null &&
+    IDENTITY_WAKE_HELD_KINDS.has(String((err.data as Record<string, unknown>).kind))
+  ) {
+    return new IdentityWakeHeldError(message, rid, method, err.data);
   }
   const rpcError = new RpcError(code, message, rid, method, err.data);
   if (code === MOB_EVENTS_STALE_CURSOR_CODE) {
@@ -937,12 +957,6 @@ export class MetaRuntime {
       }
       if (this._config.errorCallback !== null) {
         this._dispatcher.registerErrorCallback(this._config.errorCallback);
-      }
-      if (this._config.continuityStore !== null) {
-        this._dispatcher.registerContinuityStore(this._config.continuityStore);
-      }
-      if (this._config.leaseProvider !== null) {
-        this._dispatcher.registerLeaseProvider(this._config.leaseProvider);
       }
       if (this._config.rosterProvider !== null) {
         this._dispatcher.registerRosterProvider(this._config.rosterProvider);
@@ -1149,6 +1163,9 @@ export class MetaRuntime {
     if (this._config.workgraphEnabled !== null) {
       runtimeOptions.workgraph = this._config.workgraphEnabled;
     }
+    if (this._config.forkInstructionPolicy !== null) {
+      runtimeOptions.fork_instruction_policy = this._config.forkInstructionPolicy;
+    }
     if (this._config.memoryConfig) {
       runtimeOptions.memory_config = serializeConfig(this._config.memoryConfig);
     }
@@ -1240,15 +1257,6 @@ export class MetaRuntime {
     }
     if (this._config.rosterProvider !== null) {
       params.has_roster_provider = true;
-    }
-    if (this._config.continuityStore !== null) {
-      params.has_continuity_store = true;
-    }
-    if (this._config.leaseProvider !== null) {
-      params.has_lease_provider = true;
-    }
-    if (this._config.scratchDir !== null) {
-      params.scratch_dir = this._config.scratchDir;
     }
     if (this._config.topologyProvider !== null) {
       params.has_topology_provider = true;
@@ -2108,7 +2116,7 @@ export class MetaRuntime {
     return this._rpc("meta/retire", { identity });
   }
 
-  /** Reset an identity (destructive continuity reset). */
+  /** Reset an identity: destructive, it continues on a fresh session. */
   async reset(identity: string): Promise<unknown> {
     return this._rpc("meta/reset", { identity });
   }
@@ -2170,12 +2178,20 @@ export class MetaRuntime {
     return raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
   }
 
-  /** Delete an identity permanently. */
+  /**
+   * Start the identity over: its earlier session is no longer resumed, and
+   * its next session starts empty. A live identity moves to a fresh session
+   * at once, without a wake; a retired identity stays retired and starts on
+   * a fresh session at its next wake; an identity with no history is left
+   * as it is. An unlisted or retired identity is never made live. An
+   * identity a host intent declaration manages is refused with
+   * `IdentityHostAdoptedError` (-32053).
+   */
   async deleteIdentity(identity: string): Promise<unknown> {
     return this._rpc("meta/delete_identity", { identity });
   }
 
-  /** Inspect identity continuity/runtime state. */
+  /** Inspect an identity's execution state. */
   async inspectIdentity(identity: string): Promise<IdentityInspection> {
     return parseIdentityInspection(
       await this._rpc("meta/inspect_identity", { identity }),
@@ -2185,22 +2201,6 @@ export class MetaRuntime {
   /** Re-run identity-first reconciliation. */
   async reconcileIdentity(): Promise<unknown> {
     return this._rpc("meta/reconcile_identity", {});
-  }
-
-  /**
-   * Ask the continuity repair supervisor for a pass now
-   * (`meta/request_continuity_repair`). The supervisor retries Broken
-   * identities on typed triggers (another member's embodiment settling, a
-   * settled restore or reconcile pass, a refused delivery to the Broken
-   * identity); this is the explicit one. Resolves what the request reached:
-   * `"scheduled"`, `"nothing_to_repair"` or `"no_supervisor"` (tolerate
-   * future values).
-   */
-  async requestContinuityRepair(): Promise<string> {
-    const raw = asWireRecord(
-      await this._rpc("meta/request_continuity_repair", {}),
-    );
-    return String(raw.continuity_repair ?? "");
   }
 
   /** Identity bootstrap snapshot (`meta/status_identity_bootstrap`). */
@@ -2763,35 +2763,7 @@ export class MobHandle {
       throw new TransportError("multipart RPC returned an empty response");
     }
     if ("error" in body) {
-      const err = body.error as Record<string, unknown>;
-      const code = Number(err.code ?? -1);
-      const message = String(err.message ?? String(err));
-      if (code === CAPABILITY_UNAVAILABLE_CODE) {
-        throw new CapabilityUnavailableError(message, id, method, err.data);
-      }
-      if (code === LEASE_LOST_CODE) {
-        throw new LeaseLostError(message, id, method, err.data);
-      }
-      if (code === REGISTERED_SPEC_CHANGED_CODE) {
-        throw new RegisteredSpecChangedError(message, id, method, err.data);
-      }
-      if (code === STALE_DELIVERY_SCOPE_CODE) {
-        throw new StaleScopeError(message, id, method, err.data);
-      }
-      if (code === MEMORY_BACKEND_UNAVAILABLE_CODE) {
-        throw new MemoryBackendUnavailableError(message, id, method, err.data);
-      }
-      if (code === CONSOLE_TIMELINE_REPLAY_UNAVAILABLE_CODE) {
-        throw new ConsoleTimelineReplayUnavailableError(message, id, method, err.data);
-      }
-      if (code === STORAGE_RESOLUTION_CODE) {
-        throw new StorageResolutionError(message, id, method, err.data);
-      }
-      const rpcError = new RpcError(code, message, id, method, err.data);
-      if (code === MOB_EVENTS_STALE_CURSOR_CODE) {
-        throw MobEventsStaleError.fromRpcError(rpcError);
-      }
-      throw rpcError;
+      throw rpcErrorFromPayload(body.error as Record<string, unknown>, id, method);
     }
     if (!response.ok) {
       throw new TransportError(
@@ -2871,8 +2843,8 @@ export class MobHandle {
   }
 
   /**
-   * Respawn a member. On an identity-first gateway this is a DESTRUCTIVE
-   * continuity reset (fresh session, advanced generation); to clear a
+   * Respawn a member. On an identity-first gateway this is DESTRUCTIVE (a
+   * fresh session under an advanced generation); to clear a
    * durability-degraded member without losing its transcript use
    * {@link reloadMember}.
    */
@@ -2884,7 +2856,7 @@ export class MobHandle {
 
   /**
    * Non-destructive cold reload of an identity's live member: same identity,
-   * same durable session id, same continuity generation. The repair for a
+   * same durable session id, same generation. The repair for a
    * member whose sends fail with the reload-required class. Identity-first
    * gateways only.
    */

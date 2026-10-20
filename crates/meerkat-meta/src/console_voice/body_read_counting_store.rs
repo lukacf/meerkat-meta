@@ -355,6 +355,14 @@ impl RuntimeStore for BodyReadCountingRuntimeStore {
         self.inner.load_delivery_generation().await
     }
 
+    fn delivery_generation_reader(&self) -> Option<Box<dyn DeliveryGenerationReader>> {
+        self.inner.delivery_generation_reader()
+    }
+
+    fn commit_outcome_deadline(&self) -> Option<std::time::Duration> {
+        self.inner.commit_outcome_deadline()
+    }
+
     async fn list_runtime_delivery_authorities(
         &self,
     ) -> Result<Vec<(LogicalRuntimeId, RuntimeDeliveryAuthorityRecord)>, RuntimeStoreError> {

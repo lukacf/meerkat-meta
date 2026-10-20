@@ -83,12 +83,13 @@ pub(super) enum AssistantHistoryRefreshGate {
     /// landed: inputs are still queued, staged or awaiting their boundary
     /// commit (a burst draining between runs, or trailing commits). Not
     /// settled, and a read now would only be read again once the queue
-    /// drains, so the backfill skips it and arms a re-drive on that drain.
+    /// drains, so the backfill skips it and arms a re-drive on the member's
+    /// next typed change.
     Draining,
     /// A run is open on this session. Unsettled like `Pending`, so the pass
     /// still restores positive frames (a boot-time turn can run for minutes),
-    /// but the run ends through durable writes, so the backfill also arms the
-    /// drain re-drive for the settled refresh instead of leaving it to a tick.
+    /// and the backfill also arms a re-drive on the member's next typed
+    /// change for the settled refresh instead of leaving it to a tick.
     Running,
     Settled,
 }
@@ -241,80 +242,6 @@ async fn read_member_status(
     })
     .await
     .unwrap_or(MemberStatusRead::NoAnswer)
-}
-
-/// Whether the member is still bound to `session_id` and live (idle or in a
-/// run, in a running mob), so a queue it has not drained yet can still
-/// drain. A member that is no longer bound, whose mob is stopped, completed
-/// or destroyed, whose actor does not answer, or whose run state is unknown
-/// is not: its queue will not drain through writes this process observes.
-pub(super) async fn member_still_progressing(
-    entry: &RuntimeEntry,
-    record: &ConsoleIdentityRecord,
-    session_id: &str,
-) -> bool {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    matches!(
-        Box::pin(read_member_status(entry, record, session_id, deadline, true)).await,
-        MemberStatusRead::Observed(current, MemberRunState::Idle | MemberRunState::RunOpen)
-            if current == session_id
-    )
-}
-
-/// A session's durable work, tracked across one drain re-drive's checks. An
-/// input leaves the active set when its boundary commits, but its terminal
-/// receipt is finalized in a later durable write: a refresh started in
-/// between reads an image the receipt write then moves past. The tracker
-/// keeps every input it has seen active until its receipt is final.
-#[derive(Default)]
-pub(super) struct SessionDrainTracker {
-    watched: std::collections::BTreeSet<uuid::Uuid>,
-}
-
-/// Where a session's durable work stands for a drain re-drive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum DrainState {
-    /// No commit pending, no active input, every input seen active has its
-    /// receipt finalized: refresh now.
-    Drained,
-    /// Durable work is still landing: wait for the session's next write.
-    Draining,
-    /// The runtime no longer holds or can progress the session (stopped,
-    /// retired or destroyed, given a new driver, durability blocked): its
-    /// queue cannot drain through writes this process observes. Refresh now
-    /// and read what is durable.
-    Stalled,
-    /// A read did not answer within its bound: wait for the next change.
-    NoAnswer,
-}
-
-impl SessionDrainTracker {
-    pub(super) async fn state(&mut self, entry: &RuntimeEntry, session_id: &str) -> DrainState {
-        let watched = self.watched.iter().copied().collect::<Vec<_>>();
-        match Box::pin(
-            entry
-                .runtime
-                .session_drain_observation(session_id, &watched),
-        )
-        .await
-        {
-            crate::mob_handle_runtime::SessionDrainRead::Observed(observation) => {
-                self.watched = observation
-                    .active
-                    .iter()
-                    .chain(&observation.unfinalized)
-                    .copied()
-                    .collect();
-                if !observation.commit_pending && self.watched.is_empty() {
-                    DrainState::Drained
-                } else {
-                    DrainState::Draining
-                }
-            }
-            crate::mob_handle_runtime::SessionDrainRead::Stalled => DrainState::Stalled,
-            crate::mob_handle_runtime::SessionDrainRead::NoAnswer => DrainState::NoAnswer,
-        }
-    }
 }
 
 async fn observe_with<

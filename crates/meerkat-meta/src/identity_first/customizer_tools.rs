@@ -607,11 +607,13 @@ impl CustomizerToolsSpawnCustomizer {
     }
 }
 
-/// Runs several spawn customizers in order. meerkat-mob has a single
-/// `SpawnMemberCustomizer` slot; composing keeps a later installer from
-/// silently replacing an earlier one.
+/// Runs several spawn customizers in order: this crate's one composer.
+/// meerkat-mob has a single `SpawnMemberCustomizer` slot; composing keeps a
+/// later installer from silently replacing an earlier one. Both hooks reach
+/// every customizer, so a customizer's own `customize_resume` still runs when
+/// a member is rebuilt on its durable session.
 pub struct ComposedSpawnMemberCustomizer {
-    customizers: Vec<Arc<dyn SpawnMemberCustomizer>>,
+    chain: meerkat_mob::SpawnMemberCustomizerChain,
 }
 
 impl ComposedSpawnMemberCustomizer {
@@ -623,7 +625,9 @@ impl ComposedSpawnMemberCustomizer {
         match existing {
             None => added,
             Some(existing) => Arc::new(Self {
-                customizers: vec![existing, added],
+                chain: meerkat_mob::SpawnMemberCustomizerChain::new()
+                    .then(existing)
+                    .then(added),
             }),
         }
     }
@@ -635,10 +639,16 @@ impl SpawnMemberCustomizer for ComposedSpawnMemberCustomizer {
         ctx: &SpawnCustomizationContext,
         spec: &mut SpawnMemberSpec,
     ) -> Result<(), MobError> {
-        for customizer in &self.customizers {
-            customizer.customize_spawn(ctx, spec)?;
-        }
-        Ok(())
+        self.chain.customize_spawn(ctx, spec)
+    }
+
+    fn customize_resume(
+        &self,
+        ctx: &SpawnCustomizationContext,
+        durable: &meerkat_mob::ResumedMemberView,
+        spec: &mut SpawnMemberSpec,
+    ) -> Result<(), MobError> {
+        self.chain.customize_resume(ctx, durable, spec)
     }
 }
 

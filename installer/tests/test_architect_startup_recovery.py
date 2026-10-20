@@ -391,6 +391,45 @@ async def test_ordinary_restore_keeps_canonical_tuning_but_explicit_upgrade_uses
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("generation", ["lent", "current"])
+async def test_lent_setup_provider_yields_to_the_selected_model_host(startup, monkeypatch, generation):
+    # On Meta 0.9.4 a fresh setup generation borrows the previous one's saved
+    # settings. A lent provider must not bind it against the selected host route.
+    service, controller = startup
+    from launchkit import bootstrap, guide_sdk
+    monkeypatch.setattr(guide_sdk, "SELECTED_VERSION", "0.9.4")
+    routed = bootstrap.SelectedGuideRuntime(bootstrap.selected_guide_runtime().gateway, "0.9.4", "0.9.4",
+        "a" * 40, "b" * 40, {"provider": "openai", "model": "gpt-6.1-sol", "auth_binding": "fixture-host-route"})
+    monkeypatch.setattr(bootstrap, "_selected_guide_runtime", routed)
+    runtime_root = service.root / ("architect-runtime-meta-v1" if generation == "lent" else "architect-runtime-meta-v2")
+    database = runtime_root / ".mobkit/state/event_log.sqlite3"
+    database.parent.mkdir(parents=True)
+    for directory in (service.root, runtime_root, runtime_root / ".mobkit", database.parent):
+        directory.chmod(0o700)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE mob_specs (mob_id TEXT PRIMARY KEY, spec_json BLOB NOT NULL)")
+        spec = {"revision": 1, "definition": {"id": "launch-architect", "profiles": {
+            name: {"provider": "anthropic", "auto_compact_threshold": 65000}
+            for name in ("architect", "connectors", "reviewer", "visualizer")}}}
+        connection.execute("INSERT INTO mob_specs VALUES (?, ?)", ("launch-architect", json.dumps(spec).encode()))
+    before = database.read_bytes()
+    controller.outcomes = [FakeRuntime()]
+    if generation == "current":
+        # The fresh generation's own definition still refuses a conflicting host.
+        with pytest.raises(ArchitectUnavailable, match="differs from this selected model host"):
+            await service.start()
+        assert controller.builds == 0
+    else:
+        assert (await service.start())["status"] == "ready"
+        profiles = tomllib.loads(controller.mob_configs[0])["profiles"]
+        assert {profile["provider"] for profile in profiles.values()} == {"openai"}
+        assert all(profile.get("auto_compact_threshold") != 65000 for profile in profiles.values())
+        assert controller.builds == 1
+        await service.shutdown()
+    assert database.read_bytes() == before
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("configured", ["", "LOW", " medium", "low\n", "none", "private-canary"])
 async def test_invalid_animation_reasoning_refuses_before_any_startup_work(startup, monkeypatch, configured):
     service, controller = startup

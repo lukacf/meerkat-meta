@@ -5,7 +5,6 @@ const {
   MetaTypedClient,
   buildConsoleModulesRoute,
   defineModuleSpec,
-  leaseAcquireResultToDict,
   parseDurableAgentSpec,
   parsePersistedEvent,
 } = require("../dist/index.cjs");
@@ -105,19 +104,6 @@ check("module-authoring helper normalizes schema", () => {
     restart_policy: "on_failure",
     boundary: "mcp",
   }, "unexpected module spec");
-});
-
-check("identity-first lease callback uses rust wire tags", () => {
-  const wire = leaseAcquireResultToDict({
-    status: "acquired",
-    grant: { identity: "lead:main", fencingToken: 7, ttlMs: 5000 },
-  });
-  assertDeepEqual(wire, {
-    result: "acquired",
-    identity: "lead:main",
-    fencing_token: 7,
-    ttl: 5000,
-  }, "unexpected lease callback shape");
 });
 
 check("persisted events parse rust internal tags", () => {
