@@ -3897,6 +3897,17 @@ impl IdentityRuntime {
     }
 
     /// Create a new identity runtime with the given configuration.
+    ///
+    /// The runtime serves its mob fully once it is installed in the mob's
+    /// [`crate::UnifiedRuntime`], as the builder's identity-first composition
+    /// does with the runtime it makes. Install one made here with
+    /// [`crate::UnifiedRuntime::install_identity_first_context`], in an
+    /// [`IdentityFirstRuntimeContext`]. A runtime that is never installed is
+    /// credited no turn completions by the mob, so a turn ending never wakes
+    /// its output and completion waits (its owner drives them with
+    /// [`Self::record_turn_completed`]), and it is no authority for its
+    /// identities' generated aliases in
+    /// [`crate::UnifiedRuntime::wire_cross_mob`].
     pub fn new(config: IdentityRuntimeConfig) -> Self {
         let (bootstrap_status, _) = watch::channel(IdentityBootstrapStatus::empty(
             IdentityBootstrapMode::EagerMaterialize,
@@ -14828,6 +14839,17 @@ impl OutputWaitEnded {
 /// This is a convenience function for same-process cross-mob scenarios where both
 /// IdentityRuntimes are available. It resolves the AgentRuntimeId for each identity
 /// and delegates to `UnifiedRuntime::wire_cross_mob()`.
+///
+/// The wire checks each generated alias (`rt:{identity}:{generation}`) under
+/// the identity runtime that owns it: the one installed in `local_unified`
+/// for the local identity, and the one the peer mob was registered with
+/// ([`crate::UnifiedRuntime::register_peer_runtime`] or
+/// [`crate::UnifiedRuntime::register_peer_mob_with_identity_runtime`]) for the
+/// remote one. Pass those installed runtimes, for example the views
+/// [`crate::UnifiedRuntime::identity_runtime`] returns. A runtime made with
+/// [`IdentityRuntime::new`] and never installed is no such authority, and the
+/// wire refuses its identities ("generated aliases require the owning
+/// IdentityRuntime").
 pub async fn wire_cross_mob_by_identity(
     local_irt: &IdentityRuntime,
     local_identity: &AgentIdentity,

@@ -1406,6 +1406,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the retirement again and recovers it. An embedder can also stop and
   resume the mob (`MobHandle::stop`, then `resume`). A Core fix is planned
   for a later release.
+- An identity runtime a host makes with `IdentityRuntime::new` and never
+  installs in its `UnifiedRuntime` gets no cross-mob alias authority and no
+  turn completions from the mob. `UnifiedRuntime::wire_cross_mob`, and so
+  `identity_first::wire_cross_mob_by_identity`, refuse its identities'
+  generated aliases, and its output and completion waits do not wake when a
+  turn ends. Install it with `UnifiedRuntime::install_identity_first_context`
+  (or let the builder's identity-first composition make the runtime), and
+  register peer mobs with `register_peer_runtime`.
 
 ## [0.9.3] - 2026-10-18
 

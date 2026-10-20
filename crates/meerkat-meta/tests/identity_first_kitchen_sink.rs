@@ -307,7 +307,7 @@ impl AgentCustomizer for JokeCollabCustomizer {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "integration-real: live API, ~120s"]
+#[ignore = "composes standalone IdentityRuntime::new outside its UnifiedRuntime; 0.9 supports installed runtimes; rewrite tracked for 0.9.4.1"]
 async fn e2e_kitchen_sink_two_mob_chaos() {
     if !has_api_key() {
         eprintln!("Skipping kitchen-sink: no ANTHROPIC_API_KEY");

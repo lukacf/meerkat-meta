@@ -115,7 +115,9 @@ pub enum RestoreOutcome {
         replaced_session: Option<meerkat_core::types::SessionId>,
     },
     /// Core resumed the identity onto its committed session (or revived the
-    /// member it already held).
+    /// member it already held). `draft` is what this wake built: for a member
+    /// Core already held live nothing is built, so it is the spec's base
+    /// draft, and the member keeps the system prompt it was built with.
     Resumed {
         binding: MemberRuntimeBinding,
         draft: AgentBuildDraft,
