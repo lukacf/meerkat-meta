@@ -70,9 +70,10 @@ def sdk_files(tmp_path, monkeypatch, request):
     site.mkdir(parents=True)
     python = root / ".venv/bin/python"
     python.parent.mkdir()
-    meta_version = getattr(request, "param", "0.9.0")
+    versions = getattr(request, "param", "0.9.0")
+    meta_version, toolkit_version = versions if isinstance(versions, tuple) else (versions, "0.9.0")
     meta = inert_wheel("meerkat-meta", version=meta_version)
-    toolkit = inert_wheel("meerkat-toolkit", top_level=False, meta_version=meta_version)
+    toolkit = inert_wheel("meerkat-toolkit", top_level=False, version=toolkit_version, meta_version=meta_version)
     facts = integrity.check_meta_toolkit_wheels(meta[0], toolkit[0], meta=meta[1], toolkit=toolkit[1])
     for _, _, values in (meta, toolkit):
         for name, value in values.items():
@@ -99,7 +100,7 @@ def compare(files, *, facts=None, **options):
         sdk_python=options.get("sdk_python", files.python))
 
 
-@pytest.mark.parametrize("sdk_files", ["0.9.0", "0.9.1", "0.9.4"], indirect=True)
+@pytest.mark.parametrize("sdk_files", ["0.9.0", "0.9.1", "0.9.4", ("0.9.4", "0.9.4")], indirect=True)
 def test_exact_installed_pair_returns_original_facts_and_no_receipt_or_process(sdk_files, monkeypatch):
     original = {path: path.read_bytes() for path in sdk_files.site.rglob("*") if path.is_file()}
     import builtins
@@ -117,6 +118,25 @@ def test_exact_installed_pair_returns_original_facts_and_no_receipt_or_process(s
     assert not (sdk_files.root / ".venv/forge-sdk.receipt.json").exists()
     assert {name: module for name, module in sys.modules.items()
             if name.split(".")[0] in {"meerkat_meta", "meerkat_toolkit"}} == modules
+    assert sdk_files.calls == []
+
+
+@pytest.mark.parametrize("sdk_files", [("0.9.4", "0.9.4")], indirect=True)
+@pytest.mark.parametrize("defect", ["selected-version", "installed-metadata", "installed-version", "payload"])
+def test_toolkit_094_readback_refuses_wrong_selected_or_installed_bytes(sdk_files, defect):
+    facts = sdk_files.facts
+    directory = sdk_files.site / "meerkat_toolkit-0.9.4.dist-info"
+    if defect == "selected-version":
+        facts = (facts[0], replace(facts[1], version="0.9.0"))
+    elif defect == "installed-metadata":
+        path = directory / "METADATA"
+        path.write_bytes(path.read_bytes().replace(b"Version: 0.9.4", b"Version: 0.9.0"))
+    elif defect == "installed-version":
+        directory.rename(sdk_files.site / "meerkat_toolkit-0.9.0.dist-info")
+    else:
+        (sdk_files.site / "meerkat_toolkit/host_control.py").write_bytes(b"Changed source.\n")
+    with pytest.raises(runtime_candidates.CandidateArtifactError):
+        compare(sdk_files, facts=facts)
     assert sdk_files.calls == []
 
 

@@ -23,6 +23,7 @@ MAX_WHEEL_FILES = 4096
 HEX = re.compile(r"[a-f0-9]{64}")
 # Supported byte formats, not source selection or native compatibility evidence.
 SUPPORTED_META_VERSIONS = frozenset({"0.9.0", "0.9.1", "0.9.4"})
+SUPPORTED_TOOLKIT_VERSIONS = frozenset({"0.9.0", "0.9.4"})
 
 
 class WheelIntegrityError(ValueError):
@@ -202,11 +203,13 @@ def check_meta_toolkit_wheels(meta_content, toolkit_content, *, meta, toolkit):
             "The SDK pair requires explicit caller-held byte expectations.")
         _require(type(meta.version) is str and meta.version in SUPPORTED_META_VERSIONS,
             "The selected Meta SDK version is not supported by this byte reader.")
+        _require(type(toolkit.version) is str and toolkit.version in SUPPORTED_TOOLKIT_VERSIONS,
+            "The selected Toolkit SDK version is not supported by this byte reader.")
         meta_facts, meta_metadata = _check_selected_wheel(meta_content, meta,
             distribution="meerkat-meta", version=meta.version,
             required={"meerkat_meta/builder.py", "meerkat_meta/runtime.py", "meerkat_meta/_transport.py"})
         toolkit_facts, toolkit_metadata = _check_selected_wheel(toolkit_content, toolkit,
-            distribution="meerkat-toolkit", version="0.9.0",
+            distribution="meerkat-toolkit", version=toolkit.version,
             required={"meerkat_toolkit/application_runtime.py", "meerkat_toolkit/host_control.py"})
         meta_dependencies = []
         for metadata in (meta_metadata, toolkit_metadata):

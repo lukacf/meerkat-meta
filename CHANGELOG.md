@@ -1290,6 +1290,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   compares and records only the checkout's own sources, skips sources under
   `node_modules` (which `package-lock.json` pins), and refuses a missing
   checkout source as a stale frontend.
+- Meta Forge accepts a `meerkat-toolkit` 0.9.4 wheel, whose native host
+  requires `meerkat-meta==0.9.4`, instead of refusing every Toolkit wheel but
+  0.9.0; the exact version, METADATA, RECORD and payload checks are unchanged.
 - Meta Forge's local knowledge service starts and becomes ready for semantic
   ingestion. `knowledge/manage.py up` used to stop before the service started:
   the pinned source commit could not be fetched, and every available revision
