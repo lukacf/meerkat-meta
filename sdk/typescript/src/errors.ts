@@ -213,6 +213,15 @@ export const INIT_IN_PROGRESS_CODE = -32018 as const;
  * them, the diverged `fields`.
  */
 export const COMPOSITION_PROVENANCE_CODE = -32019 as const;
+/**
+ * meerkat's typed refusal for a member whose runtime registration must be
+ * reloaded before it accepts work (`meta/force_cancel_member`). The error data
+ * carries `kind: MEMBER_RELOAD_REQUIRED_KIND` and names the member and the
+ * repair, `required_action: "reload_member_registration"`.
+ */
+export const MEMBER_RELOAD_REQUIRED_CODE = -32029 as const;
+/** The `data.kind` of meerkat's reload-required refusal. */
+export const MEMBER_RELOAD_REQUIRED_KIND = "mob_member_reload_required" as const;
 /** WorkGraph service not configured on this runtime (memory-backend-unavailable pattern). */
 export const WORKGRAPH_UNAVAILABLE_CODE = -32041 as const;
 /**
@@ -477,6 +486,41 @@ export class CompositionProvenanceError extends RpcError {
     this.fields = Array.isArray(refusal.fields)
       ? refusal.fields.filter((field): field is string => typeof field === "string")
       : [];
+  }
+}
+
+/**
+ * Raised when a member needs a runtime reload before it accepts work.
+ *
+ * `meta/force_cancel_member` answers meerkat's typed refusal (code `-32029`,
+ * data `kind` `"mob_member_reload_required"`) for a member whose runtime
+ * registration cannot serve work. Both must match; any other `-32029` answer
+ * stays a plain `RpcError`. `memberId` and
+ * `reason` come from the refusal's data, and `requiredAction` names meerkat's
+ * repair, `"reload_member_registration"`. Each is `null` when the gateway sent
+ * no such field; the full refusal stays available as `data`.
+ */
+export class MemberReloadRequiredError extends RpcError {
+  readonly memberId: string | null;
+  readonly reason: string | null;
+  readonly requiredAction: string | null;
+
+  constructor(
+    message: string,
+    requestId = "",
+    method = "",
+    data?: unknown,
+  ) {
+    super(MEMBER_RELOAD_REQUIRED_CODE, message, requestId, method, data);
+    this.name = "MemberReloadRequiredError";
+    const refusal =
+      typeof data === "object" && data !== null && !Array.isArray(data)
+        ? (data as Record<string, unknown>)
+        : {};
+    this.memberId = typeof refusal.member_id === "string" ? refusal.member_id : null;
+    this.reason = typeof refusal.reason === "string" ? refusal.reason : null;
+    this.requiredAction =
+      typeof refusal.required_action === "string" ? refusal.required_action : null;
   }
 }
 

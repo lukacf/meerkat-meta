@@ -62,18 +62,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   observed whether the mob runs; it is never defaulted. The snapshot gains
   `unobserved: Option<UnobservedFacts>`, which `new` sets when `running` is
   `None` (serde default, skipped when `None`).
-- `BridgeError` and `BridgeAdmissionError` have two new variants, appended
+- `BridgeError` and `BridgeAdmissionError` have three new variants, appended
   last: `MobAdmissionClosed`, for a delivery Meerkat Core refused because the
-  mob's admission is closed (for any close reason), and
-  `MobShutdownInProgress`, for one it refused while a Shutdown of the mob was
-  still draining (retry later; the mob is not gone). Both carry the member
-  identity, the mob id and Core's message, and render as the `Mob` message
-  they replace. A `match` on either enum without a wildcard needs arms for
-  them. The deliver path hands both up typed and never repairs the member
-  for them (the substring repair classifier no longer sees their text); a
-  completion-bearing send still fails with
+  mob's admission is closed (for any close reason), `MobShutdownInProgress`,
+  for one it refused while a Shutdown of the mob was still draining (retry
+  later; the mob is not gone), and `IdentityConvergenceAdmissionClosed`, for
+  one it refused while the member's identity converges onto committed new
+  material (retry once the replacement is active). Each carries the member
+  identity and Core's message (the first two also the mob id), and renders as
+  the `Mob` message it replaces. A `match` on either enum without a wildcard
+  needs arms for them. The deliver path hands all three up typed and never
+  repairs the member for them (the substring repair classifier no longer sees
+  their text); a completion-bearing send still fails with
   `IdentityRuntimeError::AdmissionFailed`, whose detail is now Core's message
   without the `session bridge mob error:` prefix.
+- `ChildMobStandDownOutcome::Retained { unsettled }` holds one typed
+  `RetainedChildMob { mob_id, kind, detail }` per child mob instead of a
+  `"<mob_id>: <detail>"` string. Its `RetainedChildMobKind` says whether a
+  later stand-down in the same process can clear the debt:
+  `PendingUnregister` (member runtime unregisters still running at the
+  deadline) can clear; `Specific` keeps the child root claimed until the
+  process exits. Both types are `#[non_exhaustive]`. A failure to list or
+  look up the child mobs is its own outcome,
+  `ChildMobStandDownOutcome::EnumerationFailed { detail }`, instead of a
+  `Retained` entry; the gateway's shutdown diagnostics still report it as
+  `retained` with one unsettled entry.
+- Behaviour-only: `meta/force_cancel_member` answers a mob refusal with
+  meerkat's typed code and structured data on stdio and on `/console/rpc`,
+  as `meta/stop_member_run` does, instead of `-32000` with the refusal in
+  its message (`force_cancel_member failed: ...`). A member whose runtime
+  registration must be reloaded before it accepts work answers meerkat's
+  `-32029` with `error.data.kind` `mob_member_reload_required`, the
+  `member_id`, the `reason` and `required_action`
+  `reload_member_registration`, the same refusal rkat-rpc sends. An unknown
+  member answers `-32602` `mob member not found: <id>`. A generated alias
+  without identity authority and an identity-runtime failure keep `-32000`.
 
 ### Security
 
@@ -85,6 +108,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `GatewayHostComposition::operation_refusal_observer` lets a gateway host
+  install Core's operation refusal observer on each gateway member factory.
+  The gateway asks it with the same construction as `compose_member_factory`,
+  before either answer is installed; `Ok(None)` (the default) installs
+  nothing, and `Err` refuses init. The observer sees every agent that factory
+  builds, including spawned helpers, forks, and the child mobs and councils
+  agents create.
+- `UnifiedRuntimeBuilder::operation_refusal_observer` installs the observer
+  on every builder-owned agent factory (persistent, scratch and temp-dir
+  launches). A builder given an already-built `mob_spec()` refuses it with
+  `ConflictingConfiguration`, as it refuses an MCP call-context provider.
+  The public `MobBootstrapSpec` constructors take no observer.
+- `meta/skills/catalog`: a filesystem skill entry carries `skill_refusal`
+  when meerkat's skill parser refuses its `SKILL.md`, with `kind`
+  `invalid_skill_slug` (the directory name is not a skill slug) or
+  `skill_document_refused` (the document), and meerkat's `error`. The field
+  is absent for a skill the parser accepts. The editor can show that
+  meerkat's skill sources would not load such a skill.
 - `.github/workflows/forge-release.yml` releases Meta Forge on its own
   `forge-v<version>` tag, beside Meta's releases. A candidate builds each target's
   package from public inputs pinned in `installer/release/forge-release-inputs.json`,
@@ -115,6 +156,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   has no completion until `activate_without_identity_context` returns `Ok`.
   Installing an identity context withdraws a completion not yet taken;
   attaching one leaves it as it is.
+- Python SDK `MemberReloadRequiredError` and TypeScript SDK
+  `MemberReloadRequiredError` (with `MEMBER_RELOAD_REQUIRED_CODE`, `-32029`,
+  and `MEMBER_RELOAD_REQUIRED_KIND`, `mob_member_reload_required`):
+  `force_cancel_member` / `forceCancelMember` raise it for a member whose
+  runtime registration must be reloaded, when the refusal carries both the
+  code and the kind, with `member_id`/`memberId`, `reason` and
+  `required_action`/`requiredAction`. Any other `-32029` stays a plain
+  `RpcError`.
 
 ### Changed
 
@@ -224,6 +273,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   mob's dot is red; the dot was green whatever the status. console-core's
   `consoleMobStatus` derives the status, and `ConsoleHealthSnapshot` carries
   `running: boolean | null` and the `unobserved` marker.
+- The skills catalog (`meta/skills/catalog`) reads each filesystem
+  `SKILL.md` with meerkat's own skill parser, keyed by its directory slug as
+  meerkat's skill sources load it, instead of its own line splitter. A
+  block-scalar description shows its text instead of `|`, and capabilities
+  are meerkat's typed ids. A skill the parser refuses (no frontmatter, a key
+  given twice, a null description, an unknown tag, a `...` line, a name
+  that is not its directory slug, or a directory name that is not a slug)
+  stays listed and deployable, since a mobpack hands a packed skill's text
+  to the member unparsed, with an empty description and no capabilities,
+  and names the refusal in its new `skill_refusal` field (see Added).
 - The `complete_held_identity_members` documentation no longer says that
   resumed members are skipped. A held identity bootstrap holds fresh members
   only: a roster member that already has continuity refuses the whole pass
@@ -305,7 +364,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   text as the summary. That failure names the stop reason, so a refused
   summary reads as refused rather than as a cancel or a truncation, and a
   summary stream that ends without its terminal event is reported apart.
-
+- A durable child mob whose member's runtime unregister was still running at
+  the stand-down deadline no longer keeps the child root claimed for the rest
+  of the process. The stand-down records that member's pending unregister and
+  follows its exact registration through Meerkat's
+  `MemberUnregisterSettlement`. A later stand-down in the same process clears
+  the debt once the unregister settles, without asking the exited child actor
+  again, and releases the root. Other debt (a stuck or interrupted
+  retirement, an effect whose custody is retained, a failed unregister or
+  request, or an actor that exited before its report was read) still keeps
+  the root claimed for the rest of the process. A member registration that a
+  later owner took over after the child's Shutdown returned (Meerkat's
+  `MemberUnregisterState::HandedOver`) settles that pending unregister
+  without unregistering it. Each child incarnation's pending unregisters are
+  followed and cleared on their own: settling them vouches for that
+  incarnation only, never for a later incarnation of the same child, and a
+  stand-down follows them only after it asked every child incarnation
+  hosted now.
+- A persistent Meta gateway without a roster no longer stops accepting work
+  for a member after its fifth compaction. Each turn's commit reads the
+  member session's head, and Meerkat Core refused to derive one for a session
+  whose transcript history had retired its oldest compaction (it keeps 4 by
+  default), so every later turn failed and asked for a runtime reload that
+  failed the same way. Meerkat Core 0.9.4 derives that head.
 
 ## [0.9.3] - 2026-10-18
 

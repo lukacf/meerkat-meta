@@ -125,7 +125,10 @@ pub use blob_store::{
     Base64BlobStoreAdapter, BinaryBlobPayload, BinaryBlobStore, BinaryBlobStoreAdapter,
     ObjectStoreBlobStore,
 };
-pub use child_mob_storage::{ChildMobStandDownOutcome, ChildMobStorage, ChildMobStorageError};
+pub use child_mob_storage::{
+    ChildMobStandDownOutcome, ChildMobStorage, ChildMobStorageError, RetainedChildMob,
+    RetainedChildMobKind,
+};
 pub use compaction_policy::{
     COMPACTION_POLICY_KEYS, apply_compaction_policy, parse_compaction_policy,
     validate_compaction_policy,

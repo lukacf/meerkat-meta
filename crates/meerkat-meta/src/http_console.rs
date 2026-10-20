@@ -10915,45 +10915,54 @@ async fn handle_console_runtime_rpc_with_visibility(
             {
                 return response_value(response_id, None, Some(error));
             }
-            let result = if let Some(identity_runtime_ref) = identity_runtime.as_ref()
-                && let Some(identity) = identity_runtime_ref
-                    .identity_for_member_mutation(&member_id)
-                    .await
-            {
-                let handle = runtime.handle();
-                // Decode before encoding. This branch has ALREADY resolved an
-                // identity from `member_id` and runs under
-                // run_member_alias_operation_tracked, so it knows an alias is
-                // possible - keying the destructive call off the un-decoded form
-                // would cancel a roster row nothing owns while reporting success.
-                let member_id_value =
-                    crate::member_comms_id::roster_member_id_for_supplied_id(&member_id);
-                identity_runtime_ref
-                    .run_member_alias_operation_tracked(&identity, &member_id, move || async move {
-                        handle
-                            .force_cancel_member(member_id_value)
-                            .await
-                            .map_err(|error| error.to_string())
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-            } else if crate::member_comms_id::is_reserved_generated_alias(&member_id) {
-                Err(format!(
-                    "generated member alias requires current identity authority: {member_id}"
-                ))
-            } else {
-                runtime
-                    .handle()
-                    .force_cancel_member(crate::member_comms_id::mob_member_id(&member_id))
-                    .await
-                    .map_err(|error| error.to_string())
-            };
+            // The meerkat verb's typed `MobError` is carried out of the
+            // identity operation intact, as `meta/stop_member_run` carries it:
+            // a member that needs a runtime reload, an unknown member and
+            // every other mob refusal keep meerkat's typed code and data.
+            let result: Result<Result<(), meerkat_mob::MobError>, String> =
+                if let Some(identity_runtime_ref) = identity_runtime.as_ref()
+                    && let Some(identity) = identity_runtime_ref
+                        .identity_for_member_mutation(&member_id)
+                        .await
+                {
+                    let handle = runtime.handle();
+                    // Decode before encoding. This branch has ALREADY resolved an
+                    // identity from `member_id` and runs under
+                    // run_member_alias_operation_tracked, so it knows an alias is
+                    // possible - keying the destructive call off the un-decoded form
+                    // would cancel a roster row nothing owns while reporting success.
+                    let member_id_value =
+                        crate::member_comms_id::roster_member_id_for_supplied_id(&member_id);
+                    identity_runtime_ref
+                        .run_member_alias_operation_tracked(&identity, &member_id, move || async move {
+                            Ok(handle.force_cancel_member(member_id_value).await)
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                } else if crate::member_comms_id::is_reserved_generated_alias(&member_id) {
+                    Err(format!(
+                        "generated member alias requires current identity authority: {member_id}"
+                    ))
+                } else {
+                    Ok(runtime
+                        .handle()
+                        .force_cancel_member(crate::member_comms_id::mob_member_id(&member_id))
+                        .await)
+                };
             match result {
-                Ok(()) => response_value(
+                Ok(Ok(())) => response_value(
                     response_id,
                     Some(serde_json::json!({ "accepted": true })),
                     None,
                 ),
+                // meerkat's typed code and structured data, the same rendering
+                // the unified RPC path uses.
+                Ok(Err(mob_error)) => serde_json::to_value(
+                    crate::rpc::mob_methods::mob_declaration_error(response_id.clone(), &mob_error),
+                )
+                .unwrap_or_else(|err| {
+                    internal_error(response_id, format!("force_cancel_member failed: {err}"))
+                }),
                 Err(err) => {
                     internal_error(response_id, format!("force_cancel_member failed: {err}"))
                 }
@@ -19004,6 +19013,41 @@ comms = true
         // reload; it must be refused, never routed to the destructive respawn.
         let response = call("meta/reload_member", json!({ "member_id": "plain-worker" })).await;
         assert_eq!(response["error"]["code"], json!(-32001), "{response:#?}");
+        Ok(())
+    }
+
+    /// A mob refusal from `meta/force_cancel_member` reaches a console caller
+    /// with meerkat's typed code and data, the rendering
+    /// `meta/stop_member_run` uses, instead of a `-32000` with the refusal
+    /// flattened into text: an unknown member is meerkat's `MemberNotFound`.
+    #[tokio::test]
+    async fn console_force_cancel_member_answers_a_mob_refusal_typed()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-force-cancel-typed").await?;
+        let response = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            rpc_request_with_params(
+                "meta/force_cancel_member",
+                json!({ "member_id": "missing" }),
+            ),
+            true,
+        ))
+        .await;
+        assert_eq!(response["error"]["code"], json!(-32602), "{response:#?}");
+        assert_eq!(
+            response["error"]["message"],
+            json!("mob member not found: missing"),
+            "{response:#?}"
+        );
         Ok(())
     }
 

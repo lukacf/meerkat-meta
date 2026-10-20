@@ -6,6 +6,9 @@
 
 use base64::Engine;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use meerkat_core::skills::{
+    CapabilityId, SkillDocument, SkillError, SkillKey, SkillName, SkillScope, SourceUuid,
+};
 use meerkat_mob::definition::{
     CollectionPolicy, ConditionExpr, DependencyMode, DispatchMode, FlowNodeSpec, FlowSpec,
     FlowStepSpec, FrameSpec, SkillSource, StepOutputFormat,
@@ -1179,6 +1182,11 @@ fn discover_skills_in_dir(dir: &Path) -> Vec<Value> {
     skills
 }
 
+/// One catalog entry per filesystem `SKILL.md`, read with meerkat's own skill
+/// parser. A document the parser refuses stays listed and deployable, since a
+/// mobpack hands a packed skill's text to the member as it is without parsing
+/// it, but carries the typed refusal as `skill_refusal`: meerkat's skill
+/// sources would not load it as a skill.
 fn skill_catalog_entry_from_markdown(path: &Path, content: &str) -> Option<Value> {
     let id = path
         .parent()
@@ -1186,50 +1194,89 @@ fn skill_catalog_entry_from_markdown(path: &Path, content: &str) -> Option<Value
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())?
         .to_string();
-    let metadata = parse_skill_frontmatter(content);
-    let label = metadata.get("name").cloned().unwrap_or_else(|| id.clone());
-    let desc = metadata.get("description").cloned().unwrap_or_default();
-    let capabilities = metadata
-        .get("requires_capabilities")
-        .map(|raw| {
-            raw.trim_matches(['[', ']'])
-                .split(',')
-                .map(|part| part.trim().trim_matches('"').to_string())
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    Some(json!({
-        "id": id,
-        "label": label,
-        "source": "path",
-        "origin": "filesystem",
-        "path": path.to_string_lossy(),
-        "desc": desc,
-        "requires_capabilities": capabilities,
-        "deployability": catalog_deployability(true, "filesystem skill can be packed into the deployable mobpack"),
-        "provenance": catalog_provenance("meta/skills/catalog", "filesystem", &path.to_string_lossy()),
-    }))
+    let path_text = path.to_string_lossy();
+    let provenance = catalog_provenance("meta/skills/catalog", "filesystem", &path_text);
+    Some(match parse_filesystem_skill(&id, content) {
+        Ok(document) => {
+            let descriptor = document.descriptor;
+            let capabilities: Vec<&str> = descriptor
+                .capability_requirements
+                .iter()
+                .map(CapabilityId::as_str)
+                .collect();
+            json!({
+                "id": id,
+                "label": descriptor.name,
+                "source": "path",
+                "origin": "filesystem",
+                "path": path_text,
+                "desc": descriptor.description,
+                "requires_capabilities": capabilities,
+                "deployability": catalog_deployability(true, "filesystem skill can be packed into the deployable mobpack"),
+                "provenance": provenance,
+            })
+        }
+        Err(refusal) => json!({
+            "id": id,
+            "label": id,
+            "source": "path",
+            "origin": "filesystem",
+            "path": path_text,
+            "desc": "",
+            "requires_capabilities": [],
+            "deployability": catalog_deployability(true, "filesystem skill can be packed into the deployable mobpack"),
+            "skill_refusal": refusal.to_value(),
+            "provenance": provenance,
+        }),
+    })
 }
 
-fn parse_skill_frontmatter(content: &str) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let mut lines = content.lines();
-    if lines.next() != Some("---") {
-        return out;
-    }
-    for line in lines {
-        if line.trim() == "---" {
-            break;
+/// Why meerkat's skill parser refuses a filesystem skill, by the step that
+/// refuses it.
+#[derive(Debug)]
+enum SkillCatalogRefusal {
+    /// The directory name is not a skill slug, so meerkat's filesystem skill
+    /// source skips the directory.
+    InvalidSlug(SkillError),
+    /// meerkat's `SKILL.md` parser refuses the document.
+    Document(SkillError),
+}
+
+impl SkillCatalogRefusal {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidSlug(_) => "invalid_skill_slug",
+            Self::Document(_) => "skill_document_refused",
         }
-        if let Some((key, value)) = line.split_once(':') {
-            out.insert(
-                key.trim().to_string(),
-                value.trim().trim_matches('"').to_string(),
-            );
+    }
+
+    fn error(&self) -> &SkillError {
+        match self {
+            Self::InvalidSlug(error) | Self::Document(error) => error,
         }
     }
-    out
+
+    fn to_value(&self) -> Value {
+        json!({
+            "kind": self.kind(),
+            "error": self.error().to_string(),
+        })
+    }
+}
+
+/// Parses a filesystem `SKILL.md` as meerkat's filesystem skill source does:
+/// keyed by its directory slug, which the frontmatter name must match. The key
+/// and scope only label the parsed descriptor; what meerkat accepts depends on
+/// the slug and the content.
+fn parse_filesystem_skill(id: &str, content: &str) -> Result<SkillDocument, SkillCatalogRefusal> {
+    let name = SkillName::parse(id).map_err(SkillCatalogRefusal::InvalidSlug)?;
+    meerkat_skills::parser::parse_skill_md(
+        SkillKey::new(SourceUuid::project_local(), name),
+        SkillScope::Project,
+        content,
+        Some(id),
+    )
+    .map_err(SkillCatalogRefusal::Document)
 }
 
 fn catalog_deployability(deployable: bool, reason: &str) -> Value {
@@ -29551,6 +29598,83 @@ message = "Plan the work"
             "string"
         );
         assert_eq!(input_schema["properties"]["metadata"]["type"], "object");
+    }
+
+    /// The skills catalog reads each filesystem `SKILL.md` with meerkat's own
+    /// parser, keyed by its directory slug. A skill the parser accepts shows
+    /// its parsed description (a block scalar's text, not `|`) and
+    /// capabilities. One the parser refuses stays listed and deployable (a
+    /// mobpack hands its text over unparsed) and names the typed refusal.
+    #[test]
+    fn skill_catalog_reads_each_skill_with_meerkats_parser() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (slug, content) in [
+            (
+                "block-desc",
+                "---\nname: block-desc\ndescription: |\n  Line one\n  Line two\nrequires_capabilities: [builtins]\n---\n\n# Body\n",
+            ),
+            ("no-frontmatter", "Just a body.\n"),
+            (
+                "duplicate-key",
+                "---\nname: duplicate-key\ndescription: one\ndescription: two\n---\n",
+            ),
+            (
+                "end-marker",
+                "---\nname: end-marker\ndescription: d\n...\nnot: parsed\n---\n",
+            ),
+            ("wrong-name", "---\nname: other-name\ndescription: d\n---\n"),
+            ("Bad_Slug", "---\nname: bad-slug\ndescription: d\n---\n"),
+        ] {
+            let skill_dir = dir.path().join(slug);
+            std::fs::create_dir_all(&skill_dir).expect("skill dir");
+            std::fs::write(skill_dir.join("SKILL.md"), content).expect("write skill");
+        }
+
+        let skills = discover_skills_in_dir(dir.path());
+        let listed = |id: &str| {
+            skills
+                .iter()
+                .find(|skill| skill["id"] == id)
+                .unwrap_or_else(|| panic!("{id} is not listed: {skills:#?}"))
+                .clone()
+        };
+
+        let accepted = listed("block-desc");
+        assert_eq!(accepted["label"], "block-desc", "{accepted:#}");
+        assert_eq!(accepted["desc"], "Line one\nLine two\n", "{accepted:#}");
+        assert_eq!(accepted["requires_capabilities"], json!(["builtins"]));
+        assert_eq!(accepted["deployability"]["deployable"], json!(true));
+        assert!(accepted.get("skill_refusal").is_none(), "{accepted:#}");
+
+        for (id, kind) in [
+            ("no-frontmatter", "skill_document_refused"),
+            ("duplicate-key", "skill_document_refused"),
+            ("end-marker", "skill_document_refused"),
+            ("wrong-name", "skill_document_refused"),
+            ("Bad_Slug", "invalid_skill_slug"),
+        ] {
+            let refused = listed(id);
+            assert_eq!(
+                refused["deployability"]["deployable"],
+                json!(true),
+                "{refused:#}"
+            );
+            assert_eq!(refused["skill_refusal"]["kind"], kind, "{refused:#}");
+            assert!(
+                refused["skill_refusal"]["error"]
+                    .as_str()
+                    .is_some_and(|error| error.starts_with("skill parse failed: ")),
+                "{refused:#}"
+            );
+            assert!(
+                refused["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("SKILL.md")),
+                "{refused:#}"
+            );
+            assert_eq!(refused["label"], id, "{refused:#}");
+            assert_eq!(refused["requires_capabilities"], json!([]), "{refused:#}");
+        }
     }
 
     #[test]

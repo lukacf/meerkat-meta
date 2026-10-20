@@ -7725,7 +7725,11 @@ comms = true
             (2, {
                 let mut report = clean_report();
                 report.child_mob_stand_down = crate::ChildMobStandDownOutcome::Retained {
-                    unsettled: vec!["child: unsettled".to_string()],
+                    unsettled: vec![crate::RetainedChildMob {
+                        mob_id: "child".to_string(),
+                        kind: crate::RetainedChildMobKind::Specific,
+                        detail: "unsettled".to_string(),
+                    }],
                 };
                 report
             }),
@@ -11002,6 +11006,11 @@ fn gateway_shutdown_diagnostics(runtime_shutdown: Option<&UnifiedRuntimeShutdown
             }
             crate::ChildMobStandDownOutcome::InProgress => {
                 json!({ "outcome": "in_progress" })
+            }
+            // The wire keeps its 0.9.3 shape: a failed listing was reported
+            // as one retained entry.
+            crate::ChildMobStandDownOutcome::EnumerationFailed { .. } => {
+                json!({ "outcome": "retained", "unsettled_count": 1 })
             }
         },
         // Gates cleanup_completed(): the members' MCP servers, counted by
@@ -14418,6 +14427,24 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         let _ = construction;
         Ok(None)
     }
+    /// The host's operation refusal observer for a gateway member factory.
+    /// Called once per gateway factory, synchronously, with the construction
+    /// [`Self::compose_member_factory`] is offered and before either answer
+    /// is installed, so before the factory is cloned for live or consumed by
+    /// its builder. The returned observer is installed on that factory and
+    /// sees every agent the factory builds: roster members, spawned helpers
+    /// and forks, and the child mobs and councils agents create. `Ok(None)`
+    /// (the default) installs nothing; `Err` refuses init.
+    ///
+    /// Core's contract applies: `observe` is synchronous and must not block,
+    /// and a panic in it propagates on the deciding task (the member's turn).
+    fn operation_refusal_observer(
+        &self,
+        construction: &GatewayFactoryConstruction<'_>,
+    ) -> Result<Option<Arc<dyn meerkat_core::OperationRefusalObserver>>, GatewayHostError> {
+        let _ = construction;
+        Ok(None)
+    }
 }
 
 /// An SDK-carried prepared application, as transport only: opaque bytes and
@@ -16470,8 +16497,9 @@ external_addressable = true
         if let Some(root) = gateway_options.session_identity_config_root.as_ref() {
             factory = factory.user_config_root(root.clone());
         }
-        // The host composes this factory's MCP constructions before it is
-        // cloned for live or consumed by its builder.
+        // The host composes this factory's MCP constructions, and installs its
+        // operation refusal observer, before it is cloned for live or consumed
+        // by its builder.
         let factory = crate::gateway_mcp_composition::compose_gateway_member_factory(
             host,
             crate::gateway_mcp_composition::GatewayFactoryKind::Persistent,
@@ -16926,8 +16954,9 @@ external_addressable = true
         if let Some(root) = gateway_options.session_identity_config_root.as_ref() {
             factory = factory.user_config_root(root.clone());
         }
-        // The host composes this factory's MCP constructions before it is
-        // cloned for live or consumed by its builder.
+        // The host composes this factory's MCP constructions, and installs its
+        // operation refusal observer, before it is cloned for live or consumed
+        // by its builder.
         let factory = crate::gateway_mcp_composition::compose_gateway_member_factory(
             host,
             crate::gateway_mcp_composition::GatewayFactoryKind::ProcessLocal,
@@ -17082,8 +17111,9 @@ external_addressable = true
                 if let Some(root) = gateway_options.session_identity_config_root.as_ref() {
                     factory = factory.user_config_root(root.clone());
                 }
-                // The host composes this factory's MCP constructions before it is
-                // cloned for live or consumed by its builder.
+                // The host composes this factory's MCP constructions, and installs its
+                // operation refusal observer, before it is cloned for live or consumed
+                // by its builder.
                 let factory = crate::gateway_mcp_composition::compose_gateway_member_factory(
                     host,
                     crate::gateway_mcp_composition::GatewayFactoryKind::ContinuityBacked,
