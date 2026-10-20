@@ -4459,12 +4459,16 @@ async fn the_continuity_mirror_file_sink_keeps_one_row_per_session() {
 #[tokio::test]
 async fn a_hung_continuity_mirror_sink_does_not_hold_shutdown() {
     use meerkat_meta::unified_runtime::continuity_mirror::{
-        ContinuityMirrorSink, ContinuityMirrorTimings, ContinuityMirrorUpdate,
+        ContinuityMirrorBlob, ContinuityMirrorSink, ContinuityMirrorTimings, ContinuityMirrorUpdate,
     };
     struct HungSink;
     #[async_trait]
     impl ContinuityMirrorSink for HungSink {
         async fn put(&self, _update: &ContinuityMirrorUpdate) -> Result<(), String> {
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+        async fn put_blob(&self, _blob: &ContinuityMirrorBlob) -> Result<(), String> {
             std::future::pending::<()>().await;
             Ok(())
         }
@@ -4515,7 +4519,8 @@ async fn a_hung_continuity_mirror_sink_does_not_hold_shutdown() {
 #[tokio::test]
 async fn a_slow_first_continuity_mirror_put_is_offered_again() {
     use meerkat_meta::unified_runtime::continuity_mirror::{
-        ContinuityMirrorSink, ContinuityMirrorTimings, ContinuityMirrorUpdate, JsonlFileMirrorSink,
+        ContinuityMirrorBlob, ContinuityMirrorSink, ContinuityMirrorTimings,
+        ContinuityMirrorUpdate, JsonlFileMirrorSink,
     };
     struct SlowFirstPut {
         inner: JsonlFileMirrorSink,
@@ -4528,6 +4533,9 @@ async fn a_slow_first_continuity_mirror_put_is_offered_again() {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
             self.inner.put(update).await
+        }
+        async fn put_blob(&self, blob: &ContinuityMirrorBlob) -> Result<(), String> {
+            self.inner.put_blob(blob).await
         }
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -4739,4 +4747,149 @@ async fn the_continuity_mirror_is_refused_on_a_runtime_that_is_not_identity_firs
         error.contains("continuity_mirror()") && error.contains("not identity-first"),
         "{error}"
     );
+}
+
+/// A blob the sink does not take holds back only the session that references
+/// it: the other identity's rows still go out, and the held session follows,
+/// with its blob, once the sink takes it.
+#[tokio::test]
+async fn a_continuity_mirror_blob_the_sink_refuses_holds_back_only_its_session() {
+    use meerkat_meta::unified_runtime::continuity_mirror::{
+        ContinuityMirrorBlob, ContinuityMirrorSink, ContinuityMirrorUpdate, JsonlFileMirrorSink,
+    };
+
+    struct RefusesBlobs {
+        inner: JsonlFileMirrorSink,
+        refusing: AtomicBool,
+        refused: AtomicUsize,
+    }
+    #[async_trait]
+    impl ContinuityMirrorSink for RefusesBlobs {
+        async fn put(&self, update: &ContinuityMirrorUpdate) -> Result<(), String> {
+            self.inner.put(update).await
+        }
+        async fn put_blob(&self, blob: &ContinuityMirrorBlob) -> Result<(), String> {
+            if self.refusing.load(Ordering::SeqCst) {
+                self.refused.fetch_add(1, Ordering::SeqCst);
+                return Err("blobs are refused for now".to_string());
+            }
+            self.inner.put_blob(blob).await
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let mirror_dir = tmp.path().join("mirror");
+    let mob_id = unique_builder_mob_id();
+    let sink = Arc::new(RefusesBlobs {
+        inner: JsonlFileMirrorSink::new(&mirror_dir),
+        refusing: AtomicBool::new(true),
+        refused: AtomicUsize::new(0),
+    });
+    let runtime = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(
+                meerkat_mob::MobDefinition::from_toml(&slot8_definition_toml(&mob_id))
+                    .expect("mirror harness definition"),
+            )
+            .meerkat_config(
+                toml::from_str::<meerkat::Config>(&slot8_host_config_toml(&mob_id))
+                    .expect("mirror harness host config"),
+            )
+            .persistent_state(&root)
+            .roster_provider(Arc::new(StubRosterProvider::new(vec![
+                durable_spec("agent:alice"),
+                durable_spec("agent:bob"),
+            ])))
+            .identity_runtime_instance_id("continuity-mirror-blob-hold-test")
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .continuity_mirror(sink.clone(), Duration::from_millis(100))
+            .build(),
+    )
+    .await
+    .expect("build over persistent state with a mirror");
+    let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+    let alice = AgentIdentity::parse("agent:alice").unwrap();
+    let bob = AgentIdentity::parse("agent:bob").unwrap();
+    identity_runtime
+        .send(
+            &alice,
+            &meerkat_core::ContentInput::Blocks(vec![
+                meerkat_core::types::ContentBlock::Text {
+                    text: "alice's image".to_string(),
+                },
+                meerkat_core::types::ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: meerkat_core::types::ImageData::Inline {
+                        data: MIRROR_TEST_PNG.to_string(),
+                    },
+                },
+            ]),
+        )
+        .await
+        .expect("image turn");
+    identity_runtime
+        .send(
+            &bob,
+            &meerkat_core::ContentInput::Text("bob's plain turn".to_string()),
+        )
+        .await
+        .expect("plain turn");
+
+    let session_text = |identity: &str| {
+        let records = mirror_lines(&mirror_dir, "records.jsonl");
+        let record = records
+            .iter()
+            .find(|record| record["identity"] == identity)?;
+        let session = mirrored_session(&mirror_dir, record["session_id"].as_str().unwrap())?;
+        Some(serde_json::to_string(session.messages()).unwrap())
+    };
+
+    // While the sink refuses blobs, alice's image turn is held and bob's turn
+    // goes out: alice keeps her last rows, if she has any.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while sink.refused.load(Ordering::SeqCst) == 0
+        || !session_text("agent:bob").is_some_and(|text| text.contains("bob's plain turn"))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "alice's blob was never refused or bob never went out: refused {}, records {:?}",
+            sink.refused.load(Ordering::SeqCst),
+            mirror_lines(&mirror_dir, "records.jsonl"),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        session_text("agent:alice").is_none_or(|text| !text.contains("alice's image")),
+        "alice's image turn went out without its blob"
+    );
+    assert!(mirror_lines(&mirror_dir, "blobs.jsonl").is_empty());
+
+    // Once the sink takes blobs, alice's image turn follows with its blob.
+    sink.refusing.store(false, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !session_text("agent:alice").is_some_and(|text| text.contains("alice's image")) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "alice never went out once the sink took blobs: records {:?}",
+            mirror_lines(&mirror_dir, "records.jsonl"),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let blobs = mirror_lines(&mirror_dir, "blobs.jsonl");
+    assert_eq!(blobs.len(), 1, "{blobs:?}");
+    assert_eq!(blobs[0]["data"], MIRROR_TEST_PNG);
+    assert!(
+        session_text("agent:alice")
+            .unwrap()
+            .contains(blobs[0]["blob_id"].as_str().unwrap()),
+        "alice's session references the mirrored blob"
+    );
+    assert!(
+        session_text("agent:bob").is_some_and(|text| text.contains("bob's plain turn")),
+        "bob keeps his rows"
+    );
+    tokio::time::timeout(Duration::from_secs(60), runtime.shutdown())
+        .await
+        .expect("shutdown ends");
 }

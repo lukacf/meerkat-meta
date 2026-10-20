@@ -21,8 +21,16 @@
 //!   next round retries.
 //! - Shutdown writes a last round within a deadline; dropping the runtime
 //!   aborts the mirror without one.
+//!
+//! A session holds each image as a reference into the state directory's blob
+//! store, so the mirror also copies every blob a changed session references,
+//! once, and before the session's row can go out; a blob it cannot copy holds
+//! back only the sessions that reference it. Restore writes those blobs into
+//! the new state directory's blob store with
+//! `tools/continuity-export/restore_blobs.py`, which checks each id against
+//! its bytes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,10 +39,15 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use futures::FutureExt as _;
+use meerkat_core::{BlobId, BlobStoreError};
 use meerkat_mob::{MobSessionService, ResumeSessionLoad, SessionResumeAuthority};
 use sha2::{Digest as _, Sha256};
 
+use crate::blob_store::BinaryBlobStore;
 use crate::identity_first::bridge::SessionBridge;
+
+/// The blobs file in a [`JsonlFileMirrorSink`]'s directory.
+pub const CONTINUITY_MIRROR_BLOBS_FILE: &str = "blobs.jsonl";
 
 /// How often the mirror runs a round, and how long a put and the last round
 /// at shutdown may take.
@@ -81,6 +94,18 @@ pub struct ContinuityMirrorSession {
     pub data: String,
 }
 
+/// One row in the blobs file: a blob a session references, the media type
+/// the blob store keeps beside it, and its bytes in standard base64. The id
+/// is the store's address for those bytes: `sha256(media_type || 0x00 ||
+/// base64 text)` for an image, or `sha256(media_type || 0x00 || bytes)` for a
+/// blob under Meta's own address. The restore checks each row against both.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContinuityMirrorBlob {
+    pub blob_id: String,
+    pub media_type: String,
+    pub data: String,
+}
+
 /// What one put hands the sink.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContinuityMirrorUpdate {
@@ -106,9 +131,16 @@ pub struct ContinuityMirrorUpdate {
 /// name, its latest row from a complete sequence at or before it. Records of
 /// an identity the mirror no longer copies are not in that latest sequence, so
 /// a restore does not bring them back.
+///
+/// Blobs go through [`Self::put_blob`]: the mirror puts every blob a changed
+/// session references before the first put that carries that session, and
+/// each id once while it runs. Blobs are content addressed: a sink that
+/// already holds the id keeps the copy it has, and it never drops a blob, since
+/// a session row a restore may still take can reference it.
 #[async_trait::async_trait]
 pub trait ContinuityMirrorSink: Send + Sync {
     async fn put(&self, update: &ContinuityMirrorUpdate) -> Result<(), String>;
+    async fn put_blob(&self, blob: &ContinuityMirrorBlob) -> Result<(), String>;
 }
 
 /// Writes `records.jsonl` and `sessions.jsonl` into a directory. Each file is
@@ -117,11 +149,18 @@ pub trait ContinuityMirrorSink: Send + Sync {
 /// changed ones, then the records file is replaced, then the sessions file is
 /// trimmed to the sessions the records name: a reader never finds a record
 /// whose session is missing, even after a crash between the steps.
+///
+/// Each blob is a line appended to `blobs.jsonl` and synced before `put_blob`
+/// returns; an id the file already holds is not appended again.
 pub struct JsonlFileMirrorSink {
     dir: PathBuf,
     /// One writer at a time: a put whose future passed its deadline keeps
     /// writing on its blocking thread, and the next put waits for it.
     writing: Arc<std::sync::Mutex<()>>,
+    /// The ids `blobs.jsonl` holds: read from the file on the first blob put,
+    /// and again after an append fails. Its lock keeps one blob writer at a
+    /// time.
+    blob_ids: Arc<std::sync::Mutex<Option<HashSet<String>>>>,
 }
 
 impl JsonlFileMirrorSink {
@@ -129,6 +168,7 @@ impl JsonlFileMirrorSink {
         Self {
             dir: dir.into(),
             writing: Arc::new(std::sync::Mutex::new(())),
+            blob_ids: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -152,6 +192,7 @@ impl ContinuityMirrorSink for JsonlFileMirrorSink {
         let sink = Self {
             dir: self.dir.clone(),
             writing: Arc::clone(&self.writing),
+            blob_ids: Arc::clone(&self.blob_ids),
         };
         let update = update.clone();
         tokio::task::spawn_blocking(move || {
@@ -163,6 +204,194 @@ impl ContinuityMirrorSink for JsonlFileMirrorSink {
         })
         .await
         .map_err(|error| format!("the file sink's writer ended: {error}"))?
+    }
+
+    async fn put_blob(&self, blob: &ContinuityMirrorBlob) -> Result<(), String> {
+        let dir = self.dir.clone();
+        let blob_ids = Arc::clone(&self.blob_ids);
+        let blob = blob.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut held = blob_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            put_blob_blocking(&dir, &mut held, &blob)
+        })
+        .await
+        .map_err(|error| format!("the file sink's blob writer ended: {error}"))?
+    }
+}
+
+fn put_blob_blocking(
+    dir: &Path,
+    held: &mut Option<HashSet<String>>,
+    blob: &ContinuityMirrorBlob,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    let path = dir.join(CONTINUITY_MIRROR_BLOBS_FILE);
+    let ids = match held.take() {
+        Some(ids) => ids,
+        None => read_blob_ids(&path)?,
+    };
+    let ids = held.insert(ids);
+    if ids.contains(&blob.blob_id) {
+        return Ok(());
+    }
+    let mut line = serde_json::to_string(blob).map_err(|error| error.to_string())?;
+    line.push('\n');
+    if let Err(error) = append_line(&path, &line) {
+        // A failed append can leave part of the line behind; reading the file
+        // again cuts it off before the next append.
+        *held = None;
+        return Err(error);
+    }
+    ids.insert(blob.blob_id.clone());
+    Ok(())
+}
+
+/// The ids the blobs file at `path` holds. A last line without its newline is
+/// an append that never finished: it is cut off, so the file stays whole
+/// lines and the next append starts a line of its own.
+fn read_blob_ids(path: &Path) -> Result<HashSet<String>, String> {
+    use std::io::BufRead as _;
+    #[derive(serde::Deserialize)]
+    struct Row {
+        blob_id: String,
+    }
+    let failed = |error: std::io::Error| format!("{}: {error}", path.display());
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(failed(error)),
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut ids = HashSet::new();
+    let mut line = Vec::new();
+    let mut whole_lines_end: u64 = 0;
+    let mut number = 0_usize;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).map_err(failed)?;
+        if read == 0 {
+            return Ok(ids);
+        }
+        if line.last() != Some(&b'\n') {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(failed)?;
+            file.set_len(whole_lines_end).map_err(failed)?;
+            file.sync_data().map_err(failed)?;
+            return Ok(ids);
+        }
+        number += 1;
+        whole_lines_end += line.len() as u64;
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let row: Row = serde_json::from_slice(&line)
+            .map_err(|error| format!("{}:{number}: {error}", path.display()))?;
+        ids.insert(row.blob_id);
+    }
+}
+
+/// Append `line` to the file at `path` and sync it, and the directory too
+/// when the append created the file.
+fn append_line(path: &Path, line: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    let failed = |error: std::io::Error| format!("{}: {error}", path.display());
+    let created = !path.exists();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(failed)?;
+    file.write_all(line.as_bytes()).map_err(failed)?;
+    file.sync_data().map_err(failed)?;
+    if created && let Some(dir) = path.parent() {
+        std::fs::File::open(dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(failed)?;
+    }
+    Ok(())
+}
+
+/// Add to `ids` every blob id the serialized session `document` references.
+/// Only a document that names a blob is parsed back, with serde_json's own
+/// depth limit, as the restore's import parses it.
+fn collect_document_blob_ids(
+    document: &[u8],
+    ids: &mut BTreeSet<String>,
+) -> Result<(), serde_json::Error> {
+    if mentions_blob_id(document) {
+        let parsed: serde_json::Value = serde_json::from_slice(document)?;
+        collect_blob_ids(&parsed, ids);
+    }
+    Ok(())
+}
+
+/// Whether a serialized document has a `blob_id` key anywhere: serde_json
+/// writes every such key as these exact bytes.
+fn mentions_blob_id(document: &[u8]) -> bool {
+    const KEY: &[u8] = b"\"blob_id\"";
+    document.windows(KEY.len()).any(|window| window == KEY)
+}
+
+/// Add to `ids` every blob id `document` references: the value of each
+/// `blob_id` key, at any depth, that is a canonical `sha256:<64 hex>` id. That
+/// covers images in the transcript and in its history alike, and the realtime
+/// content records in the session's metadata.
+fn collect_blob_ids(document: &serde_json::Value, ids: &mut BTreeSet<String>) {
+    match document {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                match value {
+                    serde_json::Value::String(id)
+                        if key == "blob_id" && crate::blob_store::is_valid_blob_id_value(id) =>
+                    {
+                        ids.insert(id.clone());
+                    }
+                    _ => collect_blob_ids(value, ids),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_blob_ids(item, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Read `blob_id` from `store` as a blobs-file row. `None` when the store
+/// holds no copy, or none whose bytes match the id under either of the
+/// store's addresses: there is nothing to copy, and a restored session finds
+/// that image missing, as the runtime does now.
+pub async fn read_mirror_blob(
+    store: &dyn BinaryBlobStore,
+    blob_id: &str,
+) -> Result<Option<ContinuityMirrorBlob>, String> {
+    let payload = match store.get_bytes(&BlobId::new(blob_id)).await {
+        Ok(payload) => payload,
+        Err(BlobStoreError::NotFound(_)) => return Ok(None),
+        Err(error) => return Err(format!("blob {blob_id}: {error}")),
+    };
+    let blob = ContinuityMirrorBlob {
+        blob_id: blob_id.to_string(),
+        media_type: payload.media_type,
+        data: base64::engine::general_purpose::STANDARD.encode(&payload.data),
+    };
+    let address = |content: &[u8]| {
+        let mut hasher = Sha256::new();
+        hasher.update(blob.media_type.as_bytes());
+        hasher.update([0]);
+        hasher.update(content);
+        format!("sha256:{:x}", hasher.finalize())
+    };
+    if blob_id == address(blob.data.as_bytes()) || blob_id == address(payload.data.as_ref()) {
+        Ok(Some(blob))
+    } else {
+        Ok(None)
     }
 }
 
@@ -205,12 +434,16 @@ fn write_jsonl<'a, T: serde::Serialize + 'a>(
         .map_err(|error| fail(dir, error))
 }
 
-/// What the mirror reads from: the runtime's non-owning session bridge and
-/// its session service. Holding them keeps nothing of the runtime alive.
+/// What the mirror reads from: the runtime's non-owning session bridge, its
+/// session service and its blob store. Holding them keeps nothing of the
+/// runtime alive.
 #[derive(Clone)]
 pub struct ContinuityMirrorSource {
     bridge: Arc<dyn SessionBridge>,
     service: Arc<dyn MobSessionService>,
+    /// Holds the images the sessions reference; `None` when the runtime has
+    /// no blob store.
+    blobs: Option<Arc<dyn BinaryBlobStore>>,
 }
 
 /// One mirrored identity, as the mirror keeps it between rounds.
@@ -225,8 +458,9 @@ struct Mirrored {
 enum IdentityRead {
     /// The session is unchanged since the last round.
     Unchanged,
-    /// A new or changed session, with its row.
-    Changed(Mirrored, ContinuityMirrorSession),
+    /// A new or changed session, with its row and the ids of the blobs its
+    /// document references.
+    Changed(Mirrored, ContinuityMirrorSession, BTreeSet<String>),
     /// No durable session to copy (`Absent`), or an archived one the lifecycle
     /// cannot revive (`ArchivedNotRevivable`): the identity is not mirrored.
     NotMirrored,
@@ -235,8 +469,16 @@ enum IdentityRead {
 }
 
 impl ContinuityMirrorSource {
-    pub(crate) fn new(bridge: Arc<dyn SessionBridge>, service: Arc<dyn MobSessionService>) -> Self {
-        Self { bridge, service }
+    pub(crate) fn new(
+        bridge: Arc<dyn SessionBridge>,
+        service: Arc<dyn MobSessionService>,
+        blobs: Option<Arc<dyn BinaryBlobStore>>,
+    ) -> Self {
+        Self {
+            bridge,
+            service,
+            blobs,
+        }
     }
 
     async fn read_identity(
@@ -310,6 +552,9 @@ impl ContinuityMirrorSource {
             generation,
             checkpoint_version: 0,
         };
+        let mut blob_ids = BTreeSet::new();
+        collect_document_blob_ids(&document, &mut blob_ids)
+            .map_err(|error| format!("session {session_id}: {error}"))?;
         let row = ContinuityMirrorSession {
             session_id: session_id.to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(&document),
@@ -321,7 +566,24 @@ impl ContinuityMirrorSource {
                 document_sha256,
             },
             row,
+            blob_ids,
         ))
+    }
+}
+
+/// Where a round reads a blob from.
+#[async_trait::async_trait]
+trait BlobRead: Send + Sync {
+    async fn read_blob(&self, blob_id: &str) -> Result<Option<ContinuityMirrorBlob>, String>;
+}
+
+#[async_trait::async_trait]
+impl BlobRead for ContinuityMirrorSource {
+    async fn read_blob(&self, blob_id: &str) -> Result<Option<ContinuityMirrorBlob>, String> {
+        match &self.blobs {
+            Some(store) => read_mirror_blob(store.as_ref(), blob_id).await,
+            None => Ok(None),
+        }
     }
 }
 
@@ -340,6 +602,11 @@ pub struct ContinuityMirrorCounts {
     /// read `Absent` or archived-and-not-revivable while its binding was
     /// unchanged: the copy never follows a loss.
     pub kept_after_loss: AtomicU64,
+    /// Blobs the sink accepted.
+    pub blobs: AtomicU64,
+    /// Times a referenced blob had no copy in the runtime's blob store that
+    /// matches its id. The session goes out without it.
+    pub missing_blobs: AtomicU64,
 }
 
 /// The mirror's state between rounds.
@@ -355,6 +622,8 @@ struct MirrorState {
     sequence: u64,
     /// Identities already warned about an unreadable session.
     warned_lost: BTreeSet<String>,
+    /// The blobs the sink accepted while this mirror runs.
+    put_blobs: BTreeSet<String>,
 }
 
 /// Wall-clock milliseconds, kept strictly above `previous`.
@@ -398,9 +667,31 @@ async fn round(
                     identities.insert(identity, previous.clone());
                 }
             }
-            Ok(IdentityRead::Changed(mirrored, row)) => {
-                state.pending.insert(row.session_id.clone(), row);
-                identities.insert(identity, mirrored);
+            Ok(IdentityRead::Changed(mirrored, row, blob_ids)) => {
+                // The session's blobs go out before its row can. A blob that
+                // cannot be copied holds back this identity alone.
+                if put_new_blobs(
+                    source,
+                    sink,
+                    put_deadline,
+                    &blob_ids,
+                    &mut state.put_blobs,
+                    counts,
+                )
+                .await
+                {
+                    state.pending.insert(row.session_id.clone(), row);
+                    identities.insert(identity, mirrored);
+                } else {
+                    tracing::warn!(
+                        identity = %identity,
+                        "continuity mirror: a blob of the session could not be copied; it keeps \
+                         its last rows"
+                    );
+                    if let Some(previous) = previous {
+                        identities.insert(identity, previous.clone());
+                    }
+                }
             }
             Ok(IdentityRead::NotMirrored) => {
                 // The copy never follows a loss: under the same binding the
@@ -497,6 +788,67 @@ async fn round(
             tracing::warn!("continuity mirror: the sink panicked");
         }
     }
+}
+
+/// Put every blob in `blob_ids` that the sink has not accepted yet. A blob
+/// the runtime's store holds no matching copy of is counted and skipped.
+/// Returns false when a read failed or the sink did not accept a blob (it
+/// refused, panicked or passed the put deadline): the session that references
+/// it waits for the next round.
+async fn put_new_blobs(
+    source: &dyn BlobRead,
+    sink: &dyn ContinuityMirrorSink,
+    put_deadline: Duration,
+    blob_ids: &BTreeSet<String>,
+    put_blobs: &mut BTreeSet<String>,
+    counts: &ContinuityMirrorCounts,
+) -> bool {
+    let new_blobs: Vec<String> = blob_ids.difference(put_blobs).cloned().collect();
+    for blob_id in new_blobs {
+        let blob = match source.read_blob(&blob_id).await {
+            Ok(Some(blob)) => blob,
+            Ok(None) => {
+                counts.missing_blobs.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    blob_id = %blob_id,
+                    "continuity mirror: the blob store holds no copy of a referenced blob \
+                     that matches its id"
+                );
+                continue;
+            }
+            Err(error) => {
+                counts.failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(error = %error, "continuity mirror: reading a blob failed");
+                return false;
+            }
+        };
+        let put = AssertUnwindSafe(tokio::time::timeout(put_deadline, sink.put_blob(&blob)))
+            .catch_unwind();
+        match put.await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                counts.failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(error = %error, "continuity mirror: the sink refused a blob");
+                return false;
+            }
+            Ok(Err(_elapsed)) => {
+                counts.failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    blob_id = %blob_id,
+                    "continuity mirror: the sink did not take a blob before the put deadline"
+                );
+                return false;
+            }
+            Err(_panic) => {
+                counts.failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!("continuity mirror: the sink panicked on a blob");
+                return false;
+            }
+        }
+        counts.blobs.fetch_add(1, Ordering::Relaxed);
+        put_blobs.insert(blob_id);
+    }
+    true
 }
 
 /// A running mirror. The runtime that owns it stops it at shutdown; dropping
@@ -608,8 +960,11 @@ impl super::UnifiedRuntime {
             .session_service()
             .cloned()
             .ok_or_else(|| "it needs a session service".to_string())?;
-        let mirror =
-            ContinuityMirror::spawn(ContinuityMirrorSource::new(bridge, service), sink, timings);
+        let mirror = ContinuityMirror::spawn(
+            ContinuityMirrorSource::new(bridge, service, self.binary_blob_store()),
+            sink,
+            timings,
+        );
         *self.continuity_mirror.lock().await = Some(mirror);
         Ok(())
     }
@@ -624,3 +979,7 @@ impl super::UnifiedRuntime {
             .map(ContinuityMirror::counts)
     }
 }
+
+#[cfg(test)]
+#[path = "continuity_mirror_blob_tests.rs"]
+mod blob_tests;

@@ -342,3 +342,16 @@ only to the released corpora.
   the same five identities: it starts with a byte order mark, mixes CRLF and
   LF line ends, pads identities with ASCII and Unicode spaces, has blank
   lines, and ends without a newline.
+
+- continuity_mirror_blobs_v1/ - the blob half of a continuity mirror, both
+  ways. `blobs.jsonl` holds the rows the mirror copies for two synthetic
+  blobs, a PNG-signed image under Meerkat's image address and a blob under
+  Meta's raw address; `restored/blobs/` is the tree
+  `tools/continuity-export/restore_blobs.py` writes for those rows into a
+  state directory. `src/unified_runtime/continuity_mirror_blob_tests.rs`
+  checks that the mirror writes exactly `blobs.jsonl` from a real blob store
+  and that the gateway's blob store reads the restored tree back with the
+  original bytes; `tools/continuity-export/test_restore_blobs.py` checks that
+  the script writes exactly that tree (apart from each blob's write time).
+  To rewrite them after an intended format change, run the script on
+  `blobs.jsonl` into a fresh directory and copy its `blobs/` here.
