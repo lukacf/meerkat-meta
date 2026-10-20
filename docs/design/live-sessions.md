@@ -203,6 +203,14 @@ opens, carrying the close sequence it would use on itself:
 Neither door refuses. `voice_busy` remains reserved for a pending teardown of
 the same console request and is not used for cross-owner arbitration.
 
+Meerkat admits live opens one at a time per gateway process and queues none.
+An open keeps that admission until its provider has acknowledged its seed:
+for a console voice call, through the browser's WebRTC offer and the
+provider's answer. A console voice open made during another call's setup is
+refused before anything opens, as the retryable `voice_open_busy` on the
+console side and `-32054` on `meta/live/open`. Open again, with backoff; the
+open succeeds once the other call's setup has finished.
+
 Library embedders constructing a `MobBootstrapSpec::new` must install the
 builder's shared `default_mob_tools` slot with `with_agent_mob_tools`, after
 session-runtime/workgraph wiring. Console delegation must use that owning Mob

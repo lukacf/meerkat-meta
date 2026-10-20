@@ -812,9 +812,19 @@ fn live_error(rpc_id: Value, code: i64, message: impl Into<String>) -> JsonRpcRe
     }
 }
 
+/// A live open refused because another live open on this gateway is still
+/// being prepared: Meerkat admits one live open projection per process at a
+/// time and queues none. Nothing was opened, and a new open succeeds once
+/// that open is prepared, so callers treat it as busy, not as a host failure.
+#[cfg(feature = "openai-live")]
+pub(crate) const LIVE_OPEN_BUSY_CODE: i64 = -32054;
+
 #[cfg(feature = "openai-live")]
 fn live_open_error_response(rpc_id: Value, error: LiveOpenError) -> JsonRpcResponse {
     let code = match &error {
+        LiveOpenError::OpenConfig(RealtimeSessionOpenProjectionError::Backpressured) => {
+            LIVE_OPEN_BUSY_CODE
+        }
         LiveOpenError::SessionNotFound { .. }
         | LiveOpenError::OpenConfig(RealtimeSessionOpenProjectionError::Session(
             meerkat_core::SessionError::NotFound { .. },

@@ -137,6 +137,10 @@ pub(crate) enum VoiceError {
     Cancelled,
     Closed,
     Busy,
+    /// Another live open on this gateway was still being prepared, so this
+    /// open was refused before anything opened. A new open succeeds once
+    /// that open is prepared.
+    OpenBusy,
     HostFailed,
     ContextReadFailed,
     /// The gateway's single live voice path was taken by another owner
@@ -173,6 +177,11 @@ impl VoiceError {
                 -32000,
                 "voice_busy",
                 "Voice teardown is still pending; retry the same request",
+            ),
+            Self::OpenBusy => (
+                -32000,
+                "voice_open_busy",
+                "Another voice call is starting on this host; open again shortly",
             ),
             Self::HostFailed => (-32000, "voice_host_failed", "Voice host operation failed"),
             Self::ContextReadFailed => (

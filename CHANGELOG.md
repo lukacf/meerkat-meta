@@ -1169,6 +1169,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A console voice open made while another live open on the same gateway was
+  still being set up answered `voice_host_failed` ("Voice host operation
+  failed"), as if the host were broken. Meerkat admits live opens one at a
+  time per process and queues none, and an open keeps that admission through
+  its setup: for a console voice call, through the browser's WebRTC offer and
+  the provider's answer. An open during another call's setup is now refused
+  as the typed, retryable `voice_open_busy` on the console and `-32054` on
+  `meta/live/open`. Open again with backoff; the open succeeds once the other
+  call's setup has finished. Needs Meerkat 0.9.4's typed `Backpressured` open
+  refusal.
 - A roster pass retires a live member that carries the identity-first
   `agent_identity` label when the roster no longer lists its identity,
   including a member Meta 0.9.3 spawned without the durable-identity marker.
