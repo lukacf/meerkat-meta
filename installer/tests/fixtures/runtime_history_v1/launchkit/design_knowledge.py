@@ -184,7 +184,7 @@ this declaration can retain a persisted gate; it does not prove unrestricted acc
 """
 
 PATTERNS = {
-    "personal_domains": """HomeCore: personal agents retain each person's preferences,
+    "personal_domains": """A personal-assistant deployment: personal agents retain each person's preferences,
 priorities and conversation. Domain agents retain calendar/school/finance/network
 expertise and domain state. A personal agent carries relevant person context to
 the expert; the expert performs domain work and returns it to that conversation
@@ -195,7 +195,7 @@ event triage has a separate ongoing responsibility; ingress adapters are code.
 Apply the ownership principle, not the example's roster size or policy choices.
 The person count alone does not determine the useful specialties. Multiple
 channels can reach the same conversation owner, and a console can coexist with chat.""",
-    "entity_review": """OB3: an initiative identity retains that initiative's history,
+    "entity_review": """An initiative-review deployment: an initiative identity retains that initiative's history,
 corrections and ongoing responsibilities. A personal/channel identity knows its
 recipient and delivers the relevant result. Subscriptions create meaningful
 initiative-to-recipient relationships. Quality review and deep investigation own
@@ -267,13 +267,13 @@ CAPABILITIES = {
 }
 
 SOURCES = [
-    {"project": "HomeCore", "path": "src/homecore/discovery.py", "lines": "144-187,239+", "lesson": "Durable conversation ownership, bounded helpers, explicit peer replies and per-person roster context."},
-    {"project": "HomeCore", "path": "skills/identity/SKILL.md", "lines": "101-122", "lesson": "Personal context stays with its owner; domain experts receive context for domain actions and return results."},
-    {"project": "HomeCore", "path": "src/homecore/plugins/registry.py", "lines": "1631+", "lesson": "Role-specific callback tool grants and effect classification."},
-    {"project": "ob3_validator", "path": "src/meerkat/roster.rs", "lines": "32-174", "lesson": "Desired entity/person/channel identities are application data."},
-    {"project": "ob3_validator", "path": "src/meerkat/topology.rs", "lines": "38-116", "lesson": "Subscription-based relationship edges, not universal mesh."},
-    {"project": "ob3_validator", "path": "config/ob3-mob.toml", "lines": "6-28,119-267", "lesson": "Chatter suppression and separate durable versus ephemeral profiles."},
-    {"project": "ob3_validator", "path": "skills/ob3-review/SKILL.md", "lines": "151-187", "lesson": "Initiative owners retain history and deliver to subscribers; bounded review workers apply an explicit evidence rubric."},
+    {"project": "personal-assistant deployment", "path": "src/assistant/discovery.py", "lines": "144-187,239+", "lesson": "Durable conversation ownership, bounded helpers, explicit peer replies and per-person roster context."},
+    {"project": "personal-assistant deployment", "path": "skills/identity/SKILL.md", "lines": "101-122", "lesson": "Personal context stays with its owner; domain experts receive context for domain actions and return results."},
+    {"project": "personal-assistant deployment", "path": "src/assistant/plugins/registry.py", "lines": "1631+", "lesson": "Role-specific callback tool grants and effect classification."},
+    {"project": "initiative-review deployment", "path": "src/meerkat/roster.rs", "lines": "32-174", "lesson": "Desired entity/person/channel identities are application data."},
+    {"project": "initiative-review deployment", "path": "src/meerkat/topology.rs", "lines": "38-116", "lesson": "Subscription-based relationship edges, not universal mesh."},
+    {"project": "initiative-review deployment", "path": "config/review-mob.toml", "lines": "6-28,119-267", "lesson": "Chatter suppression and separate durable versus ephemeral profiles."},
+    {"project": "initiative-review deployment", "path": "skills/initiative-review/SKILL.md", "lines": "151-187", "lesson": "Initiative owners retain history and deliver to subscribers; bounded review workers apply an explicit evidence rubric."},
     {"project": "MobKit", "path": "installer/launchkit/compiler.py", "lesson": "Exact generated profile, roster, topology and flow semantics."},
     {"project": "MobKit", "path": "installer/launchkit/templates_v2/app.py", "lesson": "Shipping host adapters, persistent runtime and lifecycle."},
     {"project": "MobKit v0.8.42", "path": "crates/meerkat-mobkit/src/schedule_wiring.rs", "lines": "573-649,784-807,867-930", "lesson": "Native persistent schedule store, current-session authoring rewritten to stable mob-member delivery, and native occurrence delivery identity."},
