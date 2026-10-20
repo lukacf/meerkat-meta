@@ -4857,6 +4857,10 @@ async fn the_continuity_mirror_keeps_copying_a_dormant_identity() {
         copied(&mirror_dir, "before the retire").as_deref(),
         Some(session_id.as_str())
     );
+    // The restart takes the state directory's ownership locks, which the
+    // first runtime holds until it is dropped.
+    drop(identity_runtime);
+    drop(runtime);
 
     // The next start, with a new mirror directory: the first round has no
     // last rows to keep, so the dormant session is in the copy only if the
