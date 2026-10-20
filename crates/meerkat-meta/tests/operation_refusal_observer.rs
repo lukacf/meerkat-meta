@@ -120,15 +120,7 @@ impl LlmClient for RefusedCallClient {
         }
         // Autonomous startup or an additional host turn is not another probe.
         // One issued call still must produce exactly one observer notification.
-        let (event, stop_reason) = if !self.probe_pending.swap(false, Ordering::AcqRel) {
-            (
-                LlmEvent::TextDelta {
-                    delta: "done".to_string(),
-                    meta: None,
-                },
-                StopReason::EndTurn,
-            )
-        } else {
+        let (event, stop_reason) = if self.probe_pending.swap(false, Ordering::AcqRel) {
             (
                 LlmEvent::ToolCallComplete {
                     id: REFUSED_CALL.to_string(),
@@ -137,6 +129,14 @@ impl LlmClient for RefusedCallClient {
                     meta: None,
                 },
                 StopReason::ToolUse,
+            )
+        } else {
+            (
+                LlmEvent::TextDelta {
+                    delta: "done".to_string(),
+                    meta: None,
+                },
+                StopReason::EndTurn,
             )
         };
         Box::pin(futures::stream::iter(vec![
