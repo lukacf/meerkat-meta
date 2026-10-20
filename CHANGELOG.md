@@ -778,7 +778,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   loses its session rows). The conversion and the import move each image a
   session holds inline, its compacted history included, to the state
   directory's blob store (`blobs/`) and sync it there before they write the
-  row that names it; the census row says how many images move.
+  row that names it; the census row says how many images move. A Rust host
+  whose runtime reads images from its own blob store (one passed to
+  `UnifiedRuntimeBuilder::blob_store()` or `binary_blob_store()`) copies
+  `blobs/` into that store before its first 0.9.4 start; otherwise every
+  turn of a session whose context names a moved image fails ("required
+  image blob is unavailable").
   A session whose authority in `runtime.sqlite` has lost its body, which no
   release can load, refuses the census; `--discard-bodyless <session id>`
   (repeatable) lets `--apply` discard it after the backup, import the
