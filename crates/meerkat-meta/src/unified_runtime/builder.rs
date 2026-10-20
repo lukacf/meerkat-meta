@@ -1847,44 +1847,56 @@ impl UnifiedRuntimeBuilder {
         // attaches - their decorators read the slot per call).
         let dispatch_taint_slot = mob_spec.dispatch_taint_slot();
         let live_plan = self.live_plan(&mut mob_spec)?;
+        // Resolve one roster for this boot before preparing the mob. A dirty
+        // Running log can restore members inside prepare, before the identity
+        // runtime itself is constructed: the mob build's early customizer
+        // publication, the run-start holds it stages for those members and
+        // the identity bootstrap all use this one roster, so a hold never
+        // names an identity the bootstrap's roster lacks.
+        let identity_roster_specs = if wants_identity_first {
+            let provider = self.roster_provider.as_ref().ok_or_else(|| {
+                UnifiedRuntimeBuilderError::Bootstrap(UnifiedRuntimeBootstrapError::IdentityFirst(
+                    "identity-first validation requires roster_provider".to_string(),
+                ))
+            })?;
+            Some(
+                provider
+                    .roster(&RosterContext {
+                        mob_definition: Some(mob_spec.definition.clone()),
+                        previous_identities: Vec::new(),
+                    })
+                    .await
+                    .map_err(|error| {
+                        UnifiedRuntimeBuilderError::Bootstrap(
+                            UnifiedRuntimeBootstrapError::IdentityFirst(format!(
+                                "roster provider failed before mob preparation: {error}"
+                            )),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         // A persistent mob can be restored while `bootstrap` builds it (a log
         // that was left Running revives every member inside meerkat's own
         // resume), before any identity activation step. Publish each roster
         // identity's customizer tools first, so those builds carry them (#563).
         let early_customizer_tools_pending = match (
             customizer_tool_registry.as_ref(),
-            self.roster_provider.as_ref(),
+            identity_roster_specs.as_ref(),
             agent_customizer.as_ref(),
             storage_layout.as_ref(),
         ) {
-            (Some(registry), Some(roster_provider), Some(customizer), Some(_)) => {
-                match roster_provider
-                    .roster(&RosterContext {
-                        mob_definition: Some(mob_spec.definition.clone()),
-                        previous_identities: Vec::new(),
-                    })
-                    .await
-                {
-                    Ok(roster) => {
-                        crate::identity_first::customizer_tools::prepublish(
-                            registry,
-                            &roster,
-                            customizer.as_ref(),
-                            AgentRuntimeServices::empty(),
-                            &[],
-                            &[],
-                        )
-                        .await
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "roster provider failed before the mob build; customizer tools are \
-                             published by each identity's materialization instead"
-                        );
-                        BTreeMap::new()
-                    }
-                }
+            (Some(registry), Some(roster), Some(customizer), Some(_)) => {
+                crate::identity_first::customizer_tools::prepublish(
+                    registry,
+                    roster,
+                    customizer.as_ref(),
+                    AgentRuntimeServices::empty(),
+                    &[],
+                    &[],
+                )
+                .await
             }
             _ => BTreeMap::new(),
         };
@@ -2077,19 +2089,11 @@ impl UnifiedRuntimeBuilder {
                 registry.bind_identity_runtime(&identity_runtime);
             }
 
-            let roster_specs = roster_provider
-                .roster(&RosterContext {
-                    mob_definition: Some(runtime.mob_runtime.handle().definition().clone()),
-                    previous_identities: Vec::new(),
-                })
-                .await
-                .map_err(|err| {
-                    UnifiedRuntimeBuilderError::Bootstrap(
-                        UnifiedRuntimeBootstrapError::IdentityFirst(format!(
-                            "roster provider failed: {err}"
-                        )),
-                    )
-                })?;
+            let roster_specs = identity_roster_specs.ok_or_else(|| {
+                UnifiedRuntimeBuilderError::Bootstrap(UnifiedRuntimeBootstrapError::IdentityFirst(
+                    "identity roster was not resolved before mob preparation".to_string(),
+                ))
+            })?;
 
             let identity_context = Arc::new(IdentityFirstRuntimeContext::new_with_bootstrap_mode(
                 identity_runtime,

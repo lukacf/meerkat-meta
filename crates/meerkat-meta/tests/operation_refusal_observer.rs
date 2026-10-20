@@ -6,11 +6,11 @@
 //! makes, and the observer receives exactly that refusal as the call's tool
 //! result.
 //!
-//! A member runs more than one turn: its spawn kickoff, then the test's own
-//! input. Each turn is its own run, and Core reports the refused call of
-//! each run, so the test model calls the refused tool only on the first
-//! request it gets and answers every later request with text. Each launch
-//! then makes exactly one refused call, whichever turn makes it.
+//! A member can run more than one turn (an autonomous startup or a spawn
+//! kickoff, then the test's own input), and Core reports the refused call of
+//! each run. So the test model calls the refused tool only once the test
+//! arms its probe, right before the input it reads, and answers every other
+//! request with text: each launch makes exactly one refused call.
 //!
 //! Each test reads the observations once the model is asked again with
 //! the refused call's result, a typed watch the test client sets, bounded
@@ -87,13 +87,11 @@ impl AgentToolDispatcher for RefusingBundle {
     }
 }
 
-/// Calls the refused tool on its first request and answers every later
-/// request with text, so the member's turns together make one refused call.
-/// It marks `answered` when the model is asked again with that call's
-/// result.
+/// Calls the refused tool exactly once after the host arms the probe.
+/// It marks `answered` when the model is asked again with that result.
 struct RefusedCallClient {
-    called: AtomicBool,
     answered: tokio::sync::watch::Sender<bool>,
+    probe_pending: AtomicBool,
 }
 
 impl RefusedCallClient {
@@ -101,11 +99,15 @@ impl RefusedCallClient {
         let (answered, seen) = tokio::sync::watch::channel(false);
         (
             Arc::new(Self {
-                called: AtomicBool::new(false),
                 answered,
+                probe_pending: AtomicBool::new(false),
             }),
             seen,
         )
+    }
+
+    fn arm_probe(&self) {
+        self.probe_pending.store(true, Ordering::Release);
     }
 }
 
@@ -116,12 +118,16 @@ impl LlmClient for RefusedCallClient {
     }
 
     fn stream<'a>(&'a self, request: &'a LlmRequest) -> meerkat_client::types::LlmStream<'a> {
-        let after_tool = matches!(request.messages.last(), Some(Message::ToolResults { .. }));
+        let after_tool = request.messages.iter().any(|message| {
+            matches!(message, Message::ToolResults { results, .. }
+                if results.iter().any(|result| result.tool_use_id == REFUSED_CALL))
+        });
         if after_tool {
             self.answered.send_replace(true);
         }
-        let first_request = !self.called.swap(true, Ordering::SeqCst);
-        let (event, stop_reason) = if first_request {
+        // Autonomous startup or an additional host turn is not another probe.
+        // One issued call still must produce exactly one observer notification.
+        let (event, stop_reason) = if self.probe_pending.swap(false, Ordering::AcqRel) {
             (
                 LlmEvent::ToolCallComplete {
                     id: REFUSED_CALL.to_string(),
@@ -226,9 +232,9 @@ fn refused_call() -> Vec<(
     )]
 }
 
-/// Spawns the member and sends it one message. The member's first turn (its
-/// spawn kickoff) makes the refused call, and every later turn gets text.
-async fn spawn_and_send(runtime: &UnifiedRuntime) {
+/// Spawns the member and sends it one message; its turn calls the refused
+/// tool.
+async fn spawn_and_send(runtime: &UnifiedRuntime, client: &RefusedCallClient) {
     runtime
         .spawn(SpawnMemberSpec::from_wire(
             "worker".to_string(),
@@ -239,6 +245,7 @@ async fn spawn_and_send(runtime: &UnifiedRuntime) {
         ))
         .await
         .expect("spawn");
+    client.arm_probe();
     meerkat_meta::send_message_on_mob(&runtime.mob_handle(), MEMBER, "hello".to_string())
         .await
         .expect("send message");
@@ -254,14 +261,14 @@ async fn a_persistent_member_reports_its_refused_call_to_the_host_observer() {
         UnifiedRuntime::builder()
             .definition(definition("refusal-observer-persistent"))
             .persistent_state(state.path().join("state"))
-            .default_llm_client(client)
+            .default_llm_client(client.clone())
             .register_tool_bundle("refusing", Arc::new(RefusingBundle))
             .operation_refusal_observer(observer.clone())
             .build(),
     )
     .await
     .expect("runtime builds");
-    spawn_and_send(&runtime).await;
+    spawn_and_send(&runtime, &client).await;
     assert_eq!(observer.observed(answered).await, refused_call());
     runtime.shutdown().await;
 }
@@ -275,23 +282,21 @@ async fn a_temp_dir_member_reports_its_refused_call_to_the_host_observer() {
     let runtime = Box::pin(
         UnifiedRuntime::builder()
             .definition(definition("refusal-observer-temp-dir"))
-            .default_llm_client(client)
+            .default_llm_client(client.clone())
             .register_tool_bundle("refusing", Arc::new(RefusingBundle))
             .operation_refusal_observer(observer.clone())
             .build(),
     )
     .await
     .expect("runtime builds");
-    spawn_and_send(&runtime).await;
+    spawn_and_send(&runtime, &client).await;
     assert_eq!(observer.observed(answered).await, refused_call());
     runtime.shutdown().await;
 }
 
 /// The scratch launch: a scratch directory selects the identity-first
 /// composition over the runtime-backed ephemeral spec. The roster member's
-/// spawn kickoff makes the refused call. The test then runs one turn
-/// through the mob's host input, which gets text, and reads once that turn
-/// has ended.
+/// armed turn runs through the mob's host input.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_scratch_member_reports_its_refused_call_to_the_host_observer() {
     let scratch = tempfile::tempdir().unwrap();
@@ -321,13 +326,14 @@ async fn a_scratch_member_reports_its_refused_call_to_the_host_observer() {
             .scratch_dir(scratch.path())
             .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("refusal-observer-scratch")
-            .default_llm_client(client)
+            .default_llm_client(client.clone())
             .register_tool_bundle("refusing", Arc::new(RefusingBundle))
             .operation_refusal_observer(observer.clone())
             .build(),
     )
     .await
     .expect("runtime builds");
+    client.arm_probe();
     run_host_turn(&runtime, &identity).await;
     assert_eq!(observer.observed(answered).await, refused_call());
     runtime.mob_handle().stop().await.unwrap();
