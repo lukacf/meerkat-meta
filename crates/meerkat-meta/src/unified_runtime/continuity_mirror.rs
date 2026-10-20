@@ -480,47 +480,85 @@ impl ContinuityMirrorSource {
             blobs,
         }
     }
+}
 
-    async fn read_identity(
+/// One durable identity's latest binding that names a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirrorBinding {
+    identity: String,
+    session_id: meerkat_core::types::SessionId,
+    generation: u64,
+}
+
+/// The reads a round makes. [`ContinuityMirrorSource`] answers them from the
+/// runtime; the unit rows answer them from a fake.
+#[async_trait::async_trait]
+trait MirrorRead: BlobRead {
+    /// Each durable identity whose latest binding names a session.
+    async fn bindings(&self) -> Result<Vec<MirrorBinding>, String>;
+    /// The session's resume authority, without its body.
+    async fn authority(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<SessionResumeAuthority, String>;
+    /// The session's body, read only.
+    async fn load(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<ResumeSessionLoad, String>;
+    /// The identity's binding now: its session and generation.
+    async fn current_binding(
         &self,
         identity: &str,
-        binding: &meerkat_mob::MemberBinding,
+    ) -> Result<Option<(meerkat_core::types::SessionId, u64)>, String>;
+}
+
+#[async_trait::async_trait]
+impl MirrorRead for ContinuityMirrorSource {
+    async fn bindings(&self) -> Result<Vec<MirrorBinding>, String> {
+        let history = self
+            .bridge
+            .member_binding_history()
+            .await
+            .map_err(|error| format!("member binding history: {error}"))?;
+        Ok(history
+            .durable_identity_bindings()
+            .filter_map(|binding| {
+                binding.session_id().map(|session_id| MirrorBinding {
+                    identity: crate::member_comms_id::durable_identity_for_roster_member(
+                        binding.identity().as_ref(),
+                    ),
+                    session_id: session_id.clone(),
+                    generation: binding.generation().get(),
+                })
+            })
+            .collect())
+    }
+
+    async fn authority(
+        &self,
         session_id: &meerkat_core::types::SessionId,
-        previous: Option<&Mirrored>,
-    ) -> Result<IdentityRead, String> {
-        let generation = binding.generation().get();
-        let authority = self
-            .service
+    ) -> Result<SessionResumeAuthority, String> {
+        self.service
             .observe_session_resume_authority(session_id)
             .await
-            .map_err(|error| format!("session {session_id}: {error}"))?;
-        // A service that keeps no store authority (an ephemeral one) answers
-        // the empty bundle: then only the document digest below can tell.
-        let same_binding = previous.is_some_and(|previous| {
-            previous.record.session_id == session_id.to_string()
-                && previous.record.generation == generation
-        });
-        if same_binding
-            && authority != SessionResumeAuthority::default()
-            && previous.is_some_and(|previous| previous.authority == authority)
-        {
-            return Ok(IdentityRead::Unchanged);
-        }
-        let session = match self
-            .service
+            .map_err(|error| format!("session {session_id}: {error}"))
+    }
+
+    async fn load(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<ResumeSessionLoad, String> {
+        self.service
             .load_session_for_resume(session_id)
             .await
-            .map_err(|error| format!("session {session_id}: {error}"))?
-        {
-            ResumeSessionLoad::Active(session) | ResumeSessionLoad::Revivable(session) => session,
-            ResumeSessionLoad::ArchivedNotRevivable { .. } | ResumeSessionLoad::Absent => {
-                return Ok(IdentityRead::NotMirrored);
-            }
-            // A load this build does not know: the identity keeps its last rows.
-            _ => return Err(format!("session {session_id}: an unknown resume load")),
-        };
-        // A consistent pair: if the identity's binding moved while the body was
-        // read, this tick keeps the last rows and the next one reads again.
+            .map_err(|error| format!("session {session_id}: {error}"))
+    }
+
+    async fn current_binding(
+        &self,
+        identity: &str,
+    ) -> Result<Option<(meerkat_core::types::SessionId, u64)>, String> {
         let durable_identity = crate::identity_first::AgentIdentity::parse(identity)
             .map_err(|error| format!("identity {identity}: {error}"))?;
         let current = self
@@ -528,47 +566,79 @@ impl ContinuityMirrorSource {
             .last_member_binding(&durable_identity)
             .await
             .map_err(|error| format!("member binding: {error}"))?;
-        if current
-            .as_ref()
-            .and_then(meerkat_mob::MemberBinding::session_id)
-            != Some(session_id)
-            || current.as_ref().map(|current| current.generation().get()) != Some(generation)
-        {
-            return Ok(IdentityRead::Moved);
-        }
-        let document = session
-            .to_persisted_bytes()
-            .map_err(|error| format!("session {session_id}: {error}"))?;
-        let document_sha256: [u8; 32] = Sha256::digest(&document).into();
-        if same_binding
-            && previous.is_some_and(|previous| previous.document_sha256 == document_sha256)
-        {
-            return Ok(IdentityRead::Unchanged);
-        }
-        let record = ContinuityMirrorRecord {
-            identity: identity.to_owned(),
-            agent_runtime_id: format!("rt:{identity}:{generation}"),
-            session_id: session_id.to_string(),
-            generation,
-            checkpoint_version: 0,
-        };
-        let mut blob_ids = BTreeSet::new();
-        collect_document_blob_ids(&document, &mut blob_ids)
-            .map_err(|error| format!("session {session_id}: {error}"))?;
-        let row = ContinuityMirrorSession {
-            session_id: session_id.to_string(),
-            data: base64::engine::general_purpose::STANDARD.encode(&document),
-        };
-        Ok(IdentityRead::Changed(
-            Mirrored {
-                record,
-                authority,
-                document_sha256,
-            },
-            row,
-            blob_ids,
-        ))
+        Ok(current.and_then(|binding| {
+            binding
+                .session_id()
+                .map(|session_id| (session_id.clone(), binding.generation().get()))
+        }))
     }
+}
+
+async fn read_identity(
+    source: &dyn MirrorRead,
+    binding: &MirrorBinding,
+    previous: Option<&Mirrored>,
+) -> Result<IdentityRead, String> {
+    let identity = binding.identity.as_str();
+    let session_id = &binding.session_id;
+    let generation = binding.generation;
+    let authority = source.authority(session_id).await?;
+    // A service that keeps no store authority (an ephemeral one) answers
+    // the empty bundle: then only the document digest below can tell.
+    let same_binding = previous.is_some_and(|previous| {
+        previous.record.session_id == session_id.to_string()
+            && previous.record.generation == generation
+    });
+    if same_binding
+        && authority != SessionResumeAuthority::default()
+        && previous.is_some_and(|previous| previous.authority == authority)
+    {
+        return Ok(IdentityRead::Unchanged);
+    }
+    let session = match source.load(session_id).await? {
+        ResumeSessionLoad::Active(session) | ResumeSessionLoad::Revivable(session) => session,
+        ResumeSessionLoad::ArchivedNotRevivable { .. } | ResumeSessionLoad::Absent => {
+            return Ok(IdentityRead::NotMirrored);
+        }
+        // A load this build does not know: the identity keeps its last rows.
+        _ => return Err(format!("session {session_id}: an unknown resume load")),
+    };
+    // A consistent pair: if the identity's binding moved while the body was
+    // read, this tick keeps the last rows and the next one reads again.
+    if source.current_binding(identity).await? != Some((session_id.clone(), generation)) {
+        return Ok(IdentityRead::Moved);
+    }
+    let document = session
+        .to_persisted_bytes()
+        .map_err(|error| format!("session {session_id}: {error}"))?;
+    let document_sha256: [u8; 32] = Sha256::digest(&document).into();
+    if same_binding && previous.is_some_and(|previous| previous.document_sha256 == document_sha256)
+    {
+        return Ok(IdentityRead::Unchanged);
+    }
+    let record = ContinuityMirrorRecord {
+        identity: identity.to_owned(),
+        agent_runtime_id: format!("rt:{identity}:{generation}"),
+        session_id: session_id.to_string(),
+        generation,
+        checkpoint_version: 0,
+    };
+    let mut blob_ids = BTreeSet::new();
+    collect_document_blob_ids(&document, &mut blob_ids)
+        .map_err(|error| format!("session {session_id}: {error}"))?;
+    let row = ContinuityMirrorSession {
+        session_id: session_id.to_string(),
+        data: base64::engine::general_purpose::STANDARD.encode(&document),
+    };
+    Ok(IdentityRead::Changed(
+        Mirrored {
+            record,
+            authority,
+            document_sha256,
+        },
+        row,
+        blob_ids,
+    ))
 }
 
 /// Where a round reads a blob from.
@@ -636,14 +706,14 @@ fn next_sequence(previous: u64) -> u64 {
 }
 
 async fn round(
-    source: &ContinuityMirrorSource,
+    source: &dyn MirrorRead,
     sink: &dyn ContinuityMirrorSink,
     put_deadline: Duration,
     state: &mut MirrorState,
     counts: &ContinuityMirrorCounts,
 ) {
-    let history = match source.bridge.member_binding_history().await {
-        Ok(history) => history,
+    let bindings = match source.bindings().await {
+        Ok(bindings) => bindings,
         Err(error) => {
             counts.failures.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(error = %error, "continuity mirror: reading the member bindings failed");
@@ -651,17 +721,11 @@ async fn round(
         }
     };
     let mut identities = BTreeMap::new();
-    for binding in history.durable_identity_bindings() {
-        let Some(session_id) = binding.session_id() else {
-            continue;
-        };
-        let identity =
-            crate::member_comms_id::durable_identity_for_roster_member(binding.identity().as_ref());
+    for binding in &bindings {
+        let identity = binding.identity.clone();
+        let session_id = &binding.session_id;
         let previous = state.identities.get(&identity);
-        match source
-            .read_identity(&identity, binding, session_id, previous)
-            .await
-        {
+        match read_identity(source, binding, previous).await {
             Ok(IdentityRead::Unchanged | IdentityRead::Moved) => {
                 if let Some(previous) = previous {
                     identities.insert(identity, previous.clone());
@@ -699,7 +763,7 @@ async fn round(
                 // identity gone from the bindings, drops them.
                 let same_binding = previous.is_some_and(|previous| {
                     previous.record.session_id == session_id.to_string()
-                        && previous.record.generation == binding.generation().get()
+                        && previous.record.generation == binding.generation
                 });
                 match previous.filter(|_| same_binding) {
                     Some(previous) => {
@@ -983,3 +1047,7 @@ impl super::UnifiedRuntime {
 #[cfg(test)]
 #[path = "continuity_mirror_blob_tests.rs"]
 mod blob_tests;
+
+#[cfg(test)]
+#[path = "continuity_mirror_core_tests.rs"]
+mod core_tests;
