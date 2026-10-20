@@ -807,9 +807,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `blobs/` into that store before its first 0.9.4 start; otherwise every
   turn of a session whose context names a moved image fails ("required
   image blob is unavailable"). Before `--apply` writes anything, the census
-  imports each session only the projection holds for trial into a scratch
-  session store, through the import's own steps, so one dry run names every
-  session the import would refuse (`LayoutRefused`, with Core's reason).
+  runs the import itself on each session only the projection holds, every
+  step `--apply` runs for it, against a scratch directory, so one dry run
+  names every session the import would refuse (`LayoutRefused`, with the
+  import's reason).
   A session whose authority in `runtime.sqlite` has lost its body, which no
   release can load, refuses the census; `--discard-bodyless <session id>`
   (repeatable) lets `--apply` discard it after the backup, import the

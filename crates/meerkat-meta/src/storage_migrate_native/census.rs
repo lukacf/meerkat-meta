@@ -2012,9 +2012,9 @@ pub(super) async fn classify_session(
     }
 }
 
-/// The scratch session store a census imports each `RuntimeMissing` copy
+/// The scratch state directory a census imports each `RuntimeMissing` copy
 /// into for trial.
-pub(super) const IMPORT_TRIAL_FILE_NAME: &str = "import-trial.sqlite";
+pub(super) const IMPORT_TRIAL_DIR_NAME: &str = "import-trial";
 
 /// What the import will do with each `RuntimeMissing` row, proved before
 /// `--apply` writes anything.
@@ -2026,15 +2026,16 @@ pub(super) const IMPORT_TRIAL_FILE_NAME: &str = "import-trial.sqlite";
 /// a different one would refuse the import's create-only write, so the row
 /// is refused here as [`SessionCensusClass::ImportRowConflict`].
 ///
-/// Every other row is imported for trial into a scratch session store of
-/// its own ([`IMPORT_TRIAL_FILE_NAME`] in `scratch`), through the import's
-/// I2 and I3, on the copy the import writes (its inline images moved to blob
-/// references). Core's session store lays the copy out as head-canonical
-/// rows only at I3, with checks the census's layout check does not run, so a
-/// copy Core refuses there is refused here as
-/// [`SessionCensusClass::LayoutRefused`] with Core's reason: one dry run
-/// names every session `--apply` would stop on. `runtime_copy` is `None` for
-/// a new directory, which holds no row yet.
+/// Every other row is imported for trial: the import's own
+/// [`super::import::import_session`] (I1-I4) runs on the copy, against the
+/// native session store, runtime store and blob store of a scratch state
+/// directory of its own ([`IMPORT_TRIAL_DIR_NAME`] in `scratch`, never the
+/// census's copy of `runtime.sqlite`). Core's session store lays a copy out
+/// as head-canonical rows only at I3, with checks the census's layout check
+/// does not run, so a copy the import refuses there, or at any other step,
+/// is refused here as [`SessionCensusClass::LayoutRefused`] with the
+/// import's refusal: one dry run names every session `--apply` would stop
+/// on. `runtime_copy` is `None` for a new directory, which holds no row yet.
 pub(super) async fn predict_import_rows(
     runtime_copy: Option<&Path>,
     scratch: &Path,
@@ -2053,11 +2054,15 @@ pub(super) async fn predict_import_rows(
                 .map_err(|error| format!("session store on {}: {error}", path.display()))
         })
         .transpose()?;
-    let trial_path = scratch.join(IMPORT_TRIAL_FILE_NAME);
-    let trial: Arc<dyn SessionStore> = Arc::new(
-        meerkat_store::SqliteSessionStore::open(trial_path.clone())
-            .map_err(|error| format!("trial session store on {}: {error}", trial_path.display()))?,
-    );
+    let trial_dir = scratch.join(IMPORT_TRIAL_DIR_NAME);
+    std::fs::create_dir_all(&trial_dir)
+        .map_err(|error| format!("trial directory {}: {error}", trial_dir.display()))?;
+    let (sessions, runtime) = super::import::open_native_pair(&trial_dir)?;
+    let trial = super::import::NativeImportStores {
+        sessions,
+        runtime,
+        blobs: Arc::new(super::import::RealmBlobs::open(&trial_dir)?),
+    };
     for row in rows
         .iter_mut()
         .filter(|row| row.class == SessionCensusClass::RuntimeMissing)
@@ -2073,17 +2078,17 @@ pub(super) async fn predict_import_rows(
         };
         let Some(existing) = existing else {
             let copy = remint_copy(&row.session_id, projection).await?;
-            match trial_import(&trial, copy.session).await {
-                Ok(()) => row
+            match super::import::import_session(&trial, &copy.session).await {
+                Ok(_) => row
                     .detail
                     .push_str("; the session store holds no row for it, so the import creates one"),
-                Err(reason) => {
+                Err(refusal) => {
                     *row = SessionCensusRow::new(
                         row.session_id.clone(),
                         SessionCensusClass::LayoutRefused,
                         row.identities.clone(),
                         format!(
-                            "{}; a trial import into a scratch session store refuses it: {reason}",
+                            "{}; a trial import into a scratch directory refuses it: {refusal}",
                             row.detail
                         ),
                         None,
@@ -2113,37 +2118,6 @@ pub(super) async fn predict_import_rows(
             }
         }
     }
-    Ok(())
-}
-
-/// The import's I2 and I3 for one copy, on `trial`: the copy as the import
-/// writes it (its inline images moved to blob references), created and
-/// crossed into head-canonical authority. The reason names the step Core
-/// refused and Core's error.
-async fn trial_import(
-    trial: &Arc<dyn SessionStore>,
-    session: meerkat_core::Session,
-) -> Result<(), String> {
-    let session = match session.with_inline_images_externalized() {
-        Ok(Some(moved)) => moved.session,
-        Ok(None) => session,
-        Err(error) => {
-            return Err(format!(
-                "its inline images cannot move to the blob store: {error}"
-            ));
-        }
-    };
-    trial
-        .save_authoritative_projection_if_current_revision(&session, None)
-        .await
-        .map_err(|error| format!("the import's I2 (create the row): {error}"))?;
-    let incremental = Arc::clone(trial).as_incremental().ok_or_else(|| {
-        "the trial session store does not own head-canonical authority".to_owned()
-    })?;
-    incremental
-        .cross_head_canonical_authority(session.id())
-        .await
-        .map_err(|error| format!("the import's I3 (cross the row): {error}"))?;
     Ok(())
 }
 
@@ -3124,23 +3098,24 @@ pub(super) mod tests {
         )
     }
 
-    /// The census imports every copy it admits as `RuntimeMissing` for trial,
-    /// on a scratch session store, through the import's I2 and I3: a copy
-    /// Core's session store refuses there is refused before `--apply` writes
-    /// anything, with Core's reason, and the census still lays out every
-    /// other row. Here Core refuses the trial's create-only write: the
-    /// scratch store already holds another row for the session.
+    /// The census runs the import itself (I1-I4) on every copy it admits as
+    /// `RuntimeMissing`, against a scratch state directory of its own: a copy
+    /// the import refuses is refused before `--apply` writes anything, with
+    /// the import's refusal, and the census still takes every other row. Here
+    /// the import refuses at I2: the scratch session store already holds a
+    /// different row for the session.
     #[tokio::test]
-    async fn a_copy_the_session_store_refuses_to_import_is_refused_by_the_census() {
+    async fn a_copy_the_trial_import_refuses_is_refused_by_the_census() {
         let refused = extended(&meerkat_core::Session::new(), &["opening", "second"]);
         let admitted = compacted_over_a_tool_result_image("iVBORw0KGgo=");
         let projection = bodies_holding(&[&refused, &admitted]).await;
         let scratch = tempfile::tempdir().unwrap();
         {
-            let trial = meerkat_store::SqliteSessionStore::open(
-                scratch.path().join(IMPORT_TRIAL_FILE_NAME),
-            )
-            .unwrap();
+            let trial_dir = scratch.path().join(IMPORT_TRIAL_DIR_NAME);
+            std::fs::create_dir_all(&trial_dir).unwrap();
+            let trial =
+                meerkat_store::SqliteSessionStore::open(trial_dir.join(RUNTIME_DB_FILE_NAME))
+                    .unwrap();
             let mut other = refused.clone();
             other.push(message("a turn the copy does not hold"));
             trial.save(&other).await.unwrap();
@@ -3162,10 +3137,11 @@ pub(super) mod tests {
         );
         assert!(!rows[0].admitted);
         assert!(
-            rows[0].detail.starts_with(
-                "the projection copy is the seed; a trial import into a scratch session store \
-                 refuses it: the import's I2 (create the row): "
-            ),
+            rows[0].detail.starts_with(&format!(
+                "the projection copy is the seed; a trial import into a scratch directory \
+                 refuses it: session {}: the session store already holds a different row (",
+                refused.id()
+            )),
             "{}",
             rows[0].detail
         );
@@ -3184,12 +3160,12 @@ pub(super) mod tests {
         );
     }
 
-    /// A copy Core lays out and crosses, inline images and a compacted
-    /// history included, stays admitted with the detail it had, and the
-    /// census's copy of `runtime.sqlite` is not written: the trial runs on a
-    /// store of its own.
+    /// A copy the trial import takes (I1-I4: created, crossed and activated),
+    /// inline images and a compacted history included, stays admitted with
+    /// the detail it had, and the census's copy of `runtime.sqlite` is not
+    /// written: the trial runs in a scratch directory of its own.
     #[tokio::test]
-    async fn a_copy_the_session_store_crosses_stays_admitted() {
+    async fn a_copy_the_trial_import_takes_stays_admitted() {
         let session = compacted_over_a_tool_result_image("iVBORw0KGgo=");
         let projection = bodies_holding(&[&session]).await;
         let scratch = tempfile::tempdir().unwrap();
