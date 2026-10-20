@@ -325,8 +325,11 @@ pub enum StorageLayoutError {
     /// provider supplies holds no session at all: its backend lost its data,
     /// or the store does not outlive the process. Starting would bring every
     /// bound identity back on a lost session, where its turns fail, so the
-    /// build refuses. Restore the backend's runtime data, or start on a new,
-    /// empty state directory or provider realm.
+    /// build refuses. Restore the backend's runtime data; or start over on a
+    /// new, empty state directory (and a new mob store, if one is passed with
+    /// `persistent_mob_storage()`): the identities then start from the
+    /// roster on fresh sessions, and their custody and generation history
+    /// starts over.
     RuntimeStoreLostSessions {
         state_dir: PathBuf,
         bound_identities: usize,
@@ -529,8 +532,10 @@ impl Display for StorageLayoutError {
                 "state directory {} has {bound_identities} identity binding(s) that name a \
                  session, but the runtime store of storage provider {provider} holds no \
                  session: its backend lost its data, or the store does not outlive the \
-                 process. Restore the backend's runtime data, or start on a new, empty state \
-                 directory or provider realm",
+                 process. Restore the backend's runtime data; or start over on a new, empty \
+                 state directory (and a new mob store, if you pass one with \
+                 persistent_mob_storage()): the identities then start from the roster on fresh \
+                 sessions, and their custody and generation history starts over",
                 state_dir.display()
             ),
             Self::RuntimeStoreUnreadable {

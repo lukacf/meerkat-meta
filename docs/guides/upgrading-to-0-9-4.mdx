@@ -474,7 +474,7 @@ STORAGE_RESOLUTION (`-32014`). Rows marked builder only reach a Rust
 | `MigrationIncomplete` | A migration stopped part way. | Run `--apply` again. |
 | `RuntimeInUse` | Another process holds the runtime's custody lock. | Stop it. |
 | `RuntimeStoreMissing` | Identities are bound to sessions, but `runtime.sqlite` is missing or holds no session. | Restore `runtime.sqlite` together with its `-wal` file from the same backup; do not start on the directory without it. |
-| `RuntimeStoreLostSessions` (builder only, `UnifiedRuntimeBuilderError::StorageLayout`) | Identities are bound to sessions, but a non-disk `storage_provider()` backend's runtime store holds no session: the backend lost its data, or the store does not outlive the process. | Restore the backend's runtime data, or start on a new, empty state directory or provider realm. |
+| `RuntimeStoreLostSessions` (builder only, `UnifiedRuntimeBuilderError::StorageLayout`) | Identities are bound to sessions, but a non-disk `storage_provider()` backend's runtime store holds no session: the backend lost its data, or the store does not outlive the process. | Restore the backend's runtime data; or start over on a new, empty state directory (and a new mob store, if you pass one with `persistent_mob_storage()`): the identities then start from the roster on fresh sessions, and their custody and generation history starts over. |
 | `RuntimeStoreUnreadable` (builder only) | That backend's runtime store could not be read for the check. | Make the backend readable, then start again. |
 | `ConflictingConfiguration` naming `ephemeral_runtime_store(true)` (builder only) | An identity-first build without `persistent_state()`, a non-disk `storage_provider()` or `mob_spec()` keeps its sessions in memory, so a restart would start every identity with an empty transcript. | Build with `persistent_state()`, or with a `storage_provider()` whose backend keeps the sessions; or declare `ephemeral_runtime_store(true)` if sessions may end with the process. |
 | `RuntimeLockUnreadable`, `StartupProbeUnreadable` | A lock file or a store could not be read. | Fix the file, then start again. |
@@ -513,10 +513,15 @@ against that store instead, once the provider has opened its realm and before
 any identity wakes: identities bound to sessions while the store holds no
 session at all refuse with `RuntimeStoreLostSessions`. This happens when the
 backend lost its runtime data, or when the store does not outlive the
-process. Without this check such a start went ahead, and each bound identity
-came back Active on its lost session, where its turns and resets failed with
-`session not found`. Restore the backend's data, or start on a new, empty
-state directory or provider realm. An identity that does come back on a lost
+process. Without this check such a start went ahead: an identity that was live
+at the last shutdown came back Active on its lost session, where its turns,
+resets and deletes failed with `session not found`; any other bound identity
+started fresh, with no history (its status reports `replaced_session`).
+Restore the backend's runtime data; or start over on a new, empty state
+directory (and a new mob store, if you pass one with
+`persistent_mob_storage()`): the identities then start from the roster on
+fresh sessions, and their custody and generation history starts over. An
+identity that does come back on a lost
 session (see the known limitations for the stores this check cannot read)
 recovers when you retire it (`IdentityRuntime::retire`): its next wake starts
 it on a new, empty session. The check reads continuity records in the state

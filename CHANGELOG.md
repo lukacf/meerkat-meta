@@ -1391,11 +1391,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   durable member bindings in the mob store) is refused with
   `UnifiedRuntimeBuilderError::StorageLayout(StorageLayoutError::RuntimeStoreLostSessions)`,
   naming the binding count and the provider: the backend lost its data, or
-  the store does not outlive the process. Before, the start went ahead, and
-  such an identity came back Active on its lost session, where its turns and
-  resets failed with `session not found`; it did not start fresh.
-  Restore the backend's runtime data, or start on a new, empty state
-  directory or provider realm. A store that holds any session starts as
+  the store does not outlive the process. Before, the start went ahead: an
+  identity that was live at the last shutdown came back Active on its lost
+  session, where its turns, resets and deletes failed with
+  `session not found`; any other bound identity started fresh, with no
+  history (its status reports `replaced_session`). Restore the backend's
+  runtime data; or start over on a new, empty state directory (and a new mob
+  store, if you pass one with `persistent_mob_storage()`): the identities then
+  start from the roster on fresh sessions, and their custody and generation
+  history starts over. A store that holds any session starts as
   before (the check does not look for one identity's missing session); a
   store that cannot be read is refused (`RuntimeStoreUnreadable`). The
   check runs before any identity wakes, on `persistent_state()` and
@@ -1418,10 +1422,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   passed to `UnifiedRuntimeBuilder::mob_storage()` without a persistent path
   that in fact outlives the process, nor those of a host-built `mob_spec()`,
   which brings its own runtime store. If such a runtime store loses every
-  session, the build does not refuse, and those identities' turns fail with
-  `session not found` until each one is retired (`IdentityRuntime::retire`),
-  after which its next wake starts it on a new, empty session. A check that
-  reads any mob storage is planned for 0.9.4.1.
+  session, the build does not refuse: an identity that was live at the last
+  shutdown comes back Active on its lost session, where its turns, resets
+  and deletes fail with `session not found` until it is retired
+  (`IdentityRuntime::retire`; its next wake then starts it fresh), and any
+  other bound identity starts fresh, with no history (its status reports
+  `replaced_session`). A check that reads any mob storage is planned for
+  0.9.4.1.
 - A lost or replaced state directory cannot be detected: the identity
   bindings are recorded in it, so a start over an emptied or replaced
   directory starts every identity with an empty transcript and does not

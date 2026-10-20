@@ -3630,8 +3630,8 @@ fn refused_for_lost_sessions(
 /// (here: a new backend with empty stores, as an in-memory runtime store is
 /// after a restart) while the local mob store still binds the roster member
 /// to a session is refused typed. Before the fix it started, and the member
-/// came back Active on its lost session, where its turns and resets fail
-/// with "session not found".
+/// came back Active on its lost session, where its turns, resets and deletes
+/// fail with "session not found".
 #[tokio::test]
 async fn a_non_disk_provider_that_lost_every_session_refuses_the_restart() {
     let tmp = tempfile::tempdir().unwrap();
