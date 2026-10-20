@@ -180,8 +180,10 @@ pub fn parse_options(
     if !options.enabled {
         return Ok(None);
     }
-    let mut config = AnnouncementConfig::default();
-    config.member_tools_in_child_mobs = options.member_tools_in_child_mobs;
+    let mut config = AnnouncementConfig {
+        member_tools_in_child_mobs: options.member_tools_in_child_mobs,
+        ..AnnouncementConfig::default()
+    };
     if let Some(batch) = options.batch {
         let policy = &mut config.policy;
         policy.max_count = batch.max_count.unwrap_or(policy.max_count);
