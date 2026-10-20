@@ -705,10 +705,13 @@ fn dispatch_alpha_answering_builds(gateway: &mut Gateway, dispatch_id: &str) -> 
 const IDENTITY_LEASE_TTL: Duration = Duration::from_secs(30);
 
 /// Poll `meta/status_identity` for `identity` until Core's reconciler has
-/// converged it (a runtime id, and an active intent revision equal to the
-/// desired one), answering every callback, builds included. Panics with the last
-/// status once the lease TTL plus `WEDGE_BACKSTOP` has passed.
-fn await_identity_converged(gateway: &mut Gateway, identity: &str) -> Value {
+/// converged it at `min_revision` or later (a runtime id, a desired intent
+/// revision of at least `min_revision`, and an active intent revision equal to
+/// it), answering every callback, builds included. Without the minimum an
+/// earlier converged revision would satisfy the wait before the latest one
+/// lands. Panics with the last status once the lease TTL plus `WEDGE_BACKSTOP`
+/// has passed.
+fn await_identity_converged(gateway: &mut Gateway, identity: &str, min_revision: u64) -> Value {
     let deadline = Instant::now() + IDENTITY_LEASE_TTL + WEDGE_BACKSTOP;
     let mut attempt = 0_u32;
     loop {
@@ -734,6 +737,9 @@ fn await_identity_converged(gateway: &mut Gateway, identity: &str) -> Value {
         // Two absent revisions would compare equal: the active one must be a
         // revision.
         if status["agent_runtime_id"].is_string()
+            && convergence["desired_intent_revision"]
+                .as_u64()
+                .is_some_and(|desired| desired >= min_revision)
             && convergence["active_intent_revision"].is_u64()
             && convergence["active_intent_revision"] == convergence["desired_intent_revision"]
         {
@@ -741,8 +747,8 @@ fn await_identity_converged(gateway: &mut Gateway, identity: &str) -> Value {
         }
         assert!(
             Instant::now() < deadline,
-            "{identity} did not converge within the identity lease TTL plus \
-             {WEDGE_BACKSTOP:?}: {status}"
+            "{identity} did not converge at revision {min_revision} or later within the \
+             identity lease TTL plus {WEDGE_BACKSTOP:?}: {status}"
         );
         // Keep answering callbacks between the reads.
         let _ = gateway.wait_for(
@@ -1378,13 +1384,15 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         json!(2),
         "apply must land revision 2: {apply:#?}"
     );
+    let applied_revision = 2;
     // The applied declaration changes the member's tool categories, so Core
     // replaces the member to converge it: it retires the member and spawns its
     // successor at the next generation, on the same session. Await that before
     // the restart, so the comparison after it sees the restart alone; a stop
     // in the middle of the replacement would leave its respawn to the next
-    // process.
-    let converged = await_identity_converged(&mut gateway, ALIAS);
+    // process. The wait requires the applied revision: the adoption's
+    // revision 1 also reads as converged until revision 2 lands.
+    let converged = await_identity_converged(&mut gateway, ALIAS, applied_revision);
     let generation = |status: &Value| {
         status["generation"]
             .as_u64()
@@ -1448,7 +1456,11 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
     // process replacement, so this is the same runtime id, not a new one.
     // Asserted rather than assumed: a restart that rotated the binding would
     // show here.
-    let phase2_runtime = runtime_identity(&await_identity_converged(&mut gateway, ALIAS));
+    let phase2_runtime = runtime_identity(&await_identity_converged(
+        &mut gateway,
+        ALIAS,
+        applied_revision,
+    ));
     assert_eq!(
         phase1_runtime, phase2_runtime,
         "a restart resumes the same incarnation; a changed runtime id here would mean the \
