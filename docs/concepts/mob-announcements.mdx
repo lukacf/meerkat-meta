@@ -53,10 +53,13 @@ A subscriber can be:
 
 Members announce and subscribe for themselves through the `mob_announcements`
 tool bundle (`mob_announce` and `mob_subscription`) when their profile lists
-it in `tools.rust_bundles`. A member announces into its own mob as itself and
-manages only its own subscriptions. It may name its own mob and the mobs above
-and below it among the mobs members created, never a sibling's. Each call is
-attributed to exactly one member or refused, within per-member limits.
+it in `tools.rust_bundles`. A member of a mob a member created gets them only
+under the host's `member_tools_in_child_mobs` ceiling, by naming
+`mob_announcements` in its own profile's `tools.bundles`. A member announces
+into its own mob as itself and manages only its own subscriptions. It may name
+its own mob and the mobs above and below it among the mobs members created,
+never a sibling's. Each call is attributed to exactly one member or refused,
+within per-member limits.
 
 ## Delivery
 
