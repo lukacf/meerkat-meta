@@ -1253,6 +1253,13 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
             .unwrap_or_else(|| panic!("{ALIAS} must have a runtime id: {status}"))
             .to_string()
     };
+    // The member the phase-1 dispatch spawned, before any intent existed.
+    let before_adoption = rpc_result(
+        &mut gateway,
+        "status1",
+        "meta/status_identity",
+        json!({ "identity": ALIAS }),
+    );
     // Adoption must state the EXACT existing baseline. `meta/status_identity`
     // does not project runtime_mode, so read it from the member surface, which
     // does, rather than guessing a default that would be rejected as a change.
@@ -1377,7 +1384,18 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
     // the restart, so the comparison after it sees the restart alone; a stop
     // in the middle of the replacement would leave its respawn to the next
     // process.
-    let phase1_runtime = runtime_identity(&await_identity_converged(&mut gateway, ALIAS));
+    let converged = await_identity_converged(&mut gateway, ALIAS);
+    let generation = |status: &Value| {
+        status["generation"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{ALIAS} must have a generation: {status}"))
+    };
+    assert!(
+        generation(&converged) > generation(&before_adoption),
+        "converging the applied declaration replaces the member at a later generation: \
+         before {before_adoption}, converged {converged}"
+    );
+    let phase1_runtime = runtime_identity(&converged);
 
     gateway.send(json!({
         "jsonrpc": "2.0",
@@ -1502,7 +1520,7 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
 
     // NOTE for whoever extends this: the applied declaration already outlives
     // a NEW generation in phase 1, because Core converges it by replacing the
-    // member. A restart resumes the same incarnation, as asserted above.
+    // member, and a restart resumes that incarnation; both are asserted above.
 }
 
 // ---------------------------------------------------------------------------
