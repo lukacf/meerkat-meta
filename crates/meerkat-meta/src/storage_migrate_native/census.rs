@@ -2926,6 +2926,41 @@ mod tests {
         assert_eq!(class, SessionCensusClass::Equal, "{detail}");
     }
 
+    fn video_message(text: &str) -> meerkat_core::Message {
+        meerkat_core::Message::User(meerkat_core::types::UserMessage::with_blocks(vec![
+            meerkat_core::types::ContentBlock::Text {
+                text: text.to_owned(),
+            },
+            meerkat_core::types::ContentBlock::Video {
+                media_type: "video/mp4".to_owned(),
+                duration_ms: 1_000,
+                data: meerkat_core::types::VideoData::Inline {
+                    data: "AAAAIGZ0eXBpc29t".to_owned(),
+                },
+            },
+        ]))
+    }
+
+    /// A history compacted after a turn that carried an inline video, as
+    /// 0.9.3 wrote such a body: the video sits inline in the compaction's
+    /// delta rows, since video has no blob form. Core lays the session out
+    /// with the video as row content, so the census admits it with the class
+    /// its copies prove.
+    #[test]
+    fn a_compaction_over_an_inline_video_is_admitted() {
+        let mut session = extended(&meerkat_core::Session::new(), &["opening", "second"]);
+        commit_test_compaction(&mut session, 2, "first summary");
+        session.push(video_message("watch this"));
+        session.push(message("after the video"));
+        commit_test_compaction(&mut session, 2, "second summary");
+        let (class, detail) = layout_checked(
+            SessionCensusClass::Equal,
+            "inline video".to_owned(),
+            &session,
+        );
+        assert_eq!(class, SessionCensusClass::Equal, "{detail}");
+    }
+
     /// A session only the projection holds, re-anchored past its oldest
     /// rewrite: Core's store answers its retained records alone. 0.9.3's
     /// store refused to lay that graph out and 0.9.3 seeded the session
