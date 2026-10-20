@@ -1631,7 +1631,7 @@ async fn continuity_mirror_bigquery_sink_caches_the_token_source_token() {
 async fn continuity_mirror_bigquery_sink_puts_with_a_new_token_after_the_old_one_expires() {
     use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
     let mut responses = vec![mirror_no_snapshot_yet()];
-    responses.extend((0..5).map(|_| MockHttpResponse::json(json!({}))));
+    responses.extend((0..6).map(|_| MockHttpResponse::json(json!({}))));
     let server = MockHttpServer::start(responses);
     let (source, fetches) = mirror_counting_token_source(Duration::from_millis(400));
     let sink = mirror_sink_with_token_source(&server, source.with_refresh_margin(Duration::ZERO));
