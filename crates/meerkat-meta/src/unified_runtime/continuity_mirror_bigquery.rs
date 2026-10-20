@@ -1,25 +1,31 @@
 //! A [`ContinuityMirrorSink`] that streams the mirror into BigQuery.
 //!
-//! BigQuery's streaming inserts only append, so a `put` cannot replace the
-//! previous copy in place. Each `put` tags its rows with one `snapshot_ms`,
-//! a wall-clock millisecond count kept strictly above the previous one, and
-//! writes the sessions, then the records, and last one row into the
-//! snapshots table that names this `snapshot_ms` and the row counts. A `put`
-//! is complete once its snapshots row is in; the rows of a `put` that failed
-//! part way have none, so no reader takes them.
+//! BigQuery's streaming inserts only append. Each `put` tags its rows with
+//! one `snapshot_ms` and writes the changed sessions, then every record, and
+//! last one row into the snapshots table that names this `snapshot_ms` and
+//! the row counts. A `put` is complete once its snapshots row is in; the rows
+//! of a `put` that failed part way have none, so no reader takes them, and
+//! the mirror offers the changed sessions again. `snapshot_ms` is the wall
+//! clock in milliseconds, kept strictly above the previous `put`'s and, from
+//! the first `put` of a process on, above the newest snapshots row the table
+//! already holds, so a clock that stepped back across a restart still
+//! numbers new `put`s above the old ones.
 //!
 //! A row carries at most 4 MiB of a session's base64 `data` (BigQuery refuses
 //! a streamed request over 10 MB), so a longer value goes out as several
 //! rows, numbered by `part` from 0, that all carry the number of rows in
 //! `parts`.
 //!
-//! The tables must exist, with these columns (`<p>` is the table prefix):
+//! The tables must exist, with these columns (`<p>` is the table prefix),
+//! and the credentials must allow streaming inserts into them and queries
+//! over `<p>_snapshots`:
 //!
 //! - `<p>_records`: `identity`, `agent_runtime_id`, `session_id` (STRING),
 //!   `generation`, `checkpoint_version`, `snapshot_ms` (INT64);
 //! - `<p>_sessions`: `session_id`, `data` (STRING), `part`, `parts`,
 //!   `snapshot_ms` (INT64);
-//! - `<p>_snapshots`: `snapshot_ms`, `records`, `sessions` (INT64).
+//! - `<p>_snapshots`: `snapshot_ms`, `records`, `sessions`,
+//!   `changed_sessions` (INT64).
 //!
 //! A restore reads the newest complete `put`, `@s` = `SELECT MAX(snapshot_ms)
 //! FROM <p>_snapshots`, back into the files the continuity export reads: the
@@ -39,14 +45,16 @@
 //! QUALIFY ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY snapshot_ms DESC) = 1;
 //! ```
 //!
-//! Keep the `<p>_snapshots` rows: they mark which `put`s completed.
+//! Keep every `<p>_snapshots` row: it marks a complete `put`. A session's
+//! rows may be deleted once a newer complete `put` holds a copy of it, and a
+//! record row once a newer `put` is complete.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
-use super::continuity_mirror::{ContinuityMirrorSink, ContinuityMirrorSnapshot};
+use super::continuity_mirror::{ContinuityMirrorSink, ContinuityMirrorUpdate};
 use crate::runtime::BigQuerySessionStoreAdapter;
 
 /// BigQuery refuses an `insertAll` request over 10 MB, so the rows of one
@@ -69,11 +77,14 @@ pub struct BigQueryMirrorSink {
     snapshots_table: String,
     put_deadline: Duration,
     last_snapshot_ms: AtomicU64,
+    /// Whether `last_snapshot_ms` has been raised to the newest snapshots
+    /// row the table held when this process first put.
+    snapshot_ms_seeded: tokio::sync::Mutex<bool>,
 }
 
 impl BigQueryMirrorSink {
-    /// How long one `put` may take unless [`Self::with_put_deadline`] sets
-    /// another bound.
+    /// How long one `put` may take unless
+    /// [`Self::with_put_deadline`] sets another bound.
     pub const DEFAULT_PUT_DEADLINE: Duration = Duration::from_mins(5);
 
     /// A sink over `adapter`'s project, dataset, credentials and endpoint,
@@ -87,18 +98,19 @@ impl BigQueryMirrorSink {
             snapshots_table: format!("{table_prefix}_snapshots"),
             put_deadline: Self::DEFAULT_PUT_DEADLINE,
             last_snapshot_ms: AtomicU64::new(0),
+            snapshot_ms_seeded: tokio::sync::Mutex::new(false),
         }
     }
 
-    /// Fail a `put` that has not completed within `deadline`. Each request
-    /// also has the adapter's own HTTP timeout.
+    /// Fail a `put` that has not completed within `deadline`.
+    /// Each request also has the adapter's own HTTP timeout.
     pub fn with_put_deadline(mut self, deadline: Duration) -> Self {
         self.put_deadline = deadline;
         self
     }
 
     /// The wall clock in milliseconds, kept strictly above the previous
-    /// `put`'s so two `put`s never share an id.
+    /// value so two `put`s never share an id.
     fn next_snapshot_ms(&self) -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -120,20 +132,67 @@ impl BigQueryMirrorSink {
         }
     }
 
+    fn table_error(table: &str, error: impl std::fmt::Debug) -> String {
+        format!("BigQuery table {table}: {error:?}")
+    }
+
     async fn insert(&self, table: &str, rows: Vec<Value>) -> Result<(), String> {
         for chunk in chunks_under(rows, MAX_REQUEST_BYTES, MAX_REQUEST_ROWS)? {
             self.adapter
                 .insert_json_rows(table, chunk)
                 .await
-                .map_err(|error| format!("BigQuery table {table}: {error:?}"))?;
+                .map_err(|error| Self::table_error(table, error))?;
         }
         Ok(())
     }
 
-    async fn put_within_deadline(&self, snapshot: &ContinuityMirrorSnapshot) -> Result<(), String> {
+    /// The first column of `query`'s rows; `table` names the table it reads
+    /// in errors.
+    async fn query(&self, table: &str, query: &str) -> Result<Vec<String>, String> {
+        self.adapter
+            .query_first_column(query)
+            .await
+            .map_err(|error| Self::table_error(table, error))
+    }
+
+    fn qualified(&self, table: &str) -> Result<String, String> {
+        self.adapter
+            .qualified_table_name(table)
+            .map_err(|error| Self::table_error(table, error))
+    }
+
+    /// Raise the snapshot clock to the newest snapshots row the table holds,
+    /// once per process.
+    async fn seed_snapshot_ms(&self) -> Result<(), String> {
+        let mut seeded = self.snapshot_ms_seeded.lock().await;
+        if *seeded {
+            return Ok(());
+        }
+        let table = self.qualified(&self.snapshots_table)?;
+        let newest = self
+            .query(
+                &self.snapshots_table,
+                &format!("SELECT MAX(snapshot_ms) FROM `{table}`"),
+            )
+            .await?;
+        if let Some(newest) = newest.first() {
+            let newest = newest.parse::<u64>().map_err(|error| {
+                Self::table_error(
+                    &self.snapshots_table,
+                    format!("snapshot_ms {newest}: {error}"),
+                )
+            })?;
+            self.last_snapshot_ms.fetch_max(newest, Ordering::Relaxed);
+        }
+        *seeded = true;
+        Ok(())
+    }
+
+    async fn put_within_deadline(&self, update: &ContinuityMirrorUpdate) -> Result<(), String> {
+        self.seed_snapshot_ms().await?;
         let snapshot_ms = self.next_snapshot_ms();
         let mut sessions = Vec::new();
-        for session in &snapshot.sessions {
+        for session in &update.changed_sessions {
             let mut fields = Map::new();
             fields.insert(
                 "session_id".to_string(),
@@ -146,7 +205,7 @@ impl BigQueryMirrorSink {
                 snapshot_ms,
             ));
         }
-        let records = snapshot
+        let records = update
             .records
             .iter()
             .map(|row| tagged(row, snapshot_ms))
@@ -157,8 +216,9 @@ impl BigQueryMirrorSink {
             &self.snapshots_table,
             vec![serde_json::json!({
                 "snapshot_ms": snapshot_ms.to_string(),
-                "records": snapshot.records.len(),
-                "sessions": snapshot.sessions.len(),
+                "records": update.records.len(),
+                "sessions": update.session_ids.len(),
+                "changed_sessions": update.changed_sessions.len(),
             })],
         )
         .await
@@ -262,8 +322,8 @@ fn chunks_under(
 
 #[async_trait::async_trait]
 impl ContinuityMirrorSink for BigQueryMirrorSink {
-    async fn put(&self, snapshot: &ContinuityMirrorSnapshot) -> Result<(), String> {
-        tokio::time::timeout(self.put_deadline, self.put_within_deadline(snapshot))
+    async fn put(&self, update: &ContinuityMirrorUpdate) -> Result<(), String> {
+        tokio::time::timeout(self.put_deadline, self.put_within_deadline(update))
             .await
             .unwrap_or_else(|_| {
                 Err(format!(

@@ -446,6 +446,88 @@ impl BigQuerySessionStoreAdapter {
         Ok(())
     }
 
+    /// `table` of this adapter's dataset as standard SQL names it:
+    /// `project.dataset.table`.
+    pub(crate) fn qualified_table_name(
+        &self,
+        table: &str,
+    ) -> Result<String, BigQuerySessionStoreError> {
+        let project_id = self.resolve_project_id()?;
+        Ok(format!("{project_id}.{}.{table}", self.dataset))
+    }
+
+    /// Runs `query` (standard SQL) and returns the first column of every
+    /// result row as text, waiting for the job to complete and following the
+    /// result pages. A null cell is skipped.
+    pub(crate) async fn query_first_column(
+        &self,
+        query: &str,
+    ) -> Result<Vec<String>, BigQuerySessionStoreError> {
+        let project_id = self.resolve_project_id()?;
+        let access_token = self.resolve_access_token()?;
+        let endpoint = format!("{}/projects/{project_id}/queries", self.api_base_url());
+        let request = serde_json::json!({
+            "query": query,
+            "useLegacySql": false,
+            "maxResults": 10000,
+        });
+        let mut response = self
+            .send_json_request(
+                reqwest::Method::POST,
+                &endpoint,
+                &access_token,
+                Some(&request),
+            )
+            .await?;
+        let mut values = Vec::new();
+        loop {
+            let complete = response
+                .get("jobComplete")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if complete {
+                let rows = response.get("rows").and_then(Value::as_array);
+                for row in rows.into_iter().flatten() {
+                    if let Some(value) = row.pointer("/f/0/v").and_then(Value::as_str) {
+                        values.push(value.to_string());
+                    }
+                }
+            }
+            let page_token = response.get("pageToken").and_then(Value::as_str);
+            if complete && page_token.is_none() {
+                return Ok(values);
+            }
+            let job_id = response
+                .pointer("/jobReference/jobId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    BigQuerySessionStoreError::InvalidQueryResponse(
+                        "an unfinished or paged query response names no jobReference.jobId"
+                            .to_string(),
+                    )
+                })?;
+            let mut params = vec![("maxResults", "10000".to_string())];
+            if let Some(location) = response
+                .pointer("/jobReference/location")
+                .and_then(Value::as_str)
+            {
+                params.push(("location", location.to_string()));
+            }
+            if complete && let Some(token) = page_token {
+                params.push(("pageToken", token.to_string()));
+            }
+            let results = reqwest::Url::parse_with_params(&format!("{endpoint}/{job_id}"), &params)
+                .map_err(|err| {
+                    BigQuerySessionStoreError::Configuration(format!(
+                        "BigQuery query results endpoint: {err}"
+                    ))
+                })?;
+            response = self
+                .send_json_request(reqwest::Method::GET, results.as_str(), &access_token, None)
+                .await?;
+        }
+    }
+
     pub async fn read_rows(&self) -> Result<Vec<SessionPersistenceRow>, BigQuerySessionStoreError> {
         let fq_table = self.fully_qualified_table()?;
         let query = format!(
