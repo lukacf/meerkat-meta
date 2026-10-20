@@ -11,8 +11,9 @@
 //! members, which must be gone after boot 2's restore, and the members'
 //! edge kept.
 //!
-//! A member this process never materialized (a worker Core restored, say)
-//! does not stop the reconcile of the other edges either.
+//! A raw member this process never materialized (a worker Core restored,
+//! say) does not stop the reconcile of the other edges either; an identity
+//! member without a binding still fails it closed.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -516,15 +517,16 @@ async fn a_definition_declared_edge_is_never_churned_by_the_topology() {
     booted.unified.shutdown().await;
 }
 
-/// A roster member this process never materialized (a worker Core restored
-/// after a restart, say) has no live runtime binding, so the wire projection
-/// cannot name its incarnation. It must not stop the reconcile of every other
-/// edge: its wire counts as skipped, and the managed edges still converge.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_member_without_a_runtime_binding_does_not_stop_the_edge_reconcile() {
-    let mob_id = next_mob_id("edge-unbound-member");
-    let temp = tempfile::TempDir::new().expect("temp dir");
-    let state_path = temp.path().join("state");
+/// Boot the three-identity team, spawn `extra` on the mob itself with
+/// `labels` (no bridge binding records it, as for a member Core restores that
+/// this process has not materialized), wire it to the lead, and unwire the
+/// lead from the member so the reconcile has a managed edge to put back.
+async fn team_with_an_unbound_member(
+    mob_prefix: &str,
+    state_path: &std::path::Path,
+    extra: &str,
+    labels: BTreeMap<String, String>,
+) -> Booted {
     let lead = id("identity:lead-1");
     let member = id("identity:member-1");
     let peer = id("identity:member-2");
@@ -537,40 +539,33 @@ async fn a_member_without_a_runtime_binding_does_not_stop_the_edge_reconcile() {
         edges: Mutex::new(vec![
             ManagedPeerEdge::new(lead.clone(), member.clone()).unwrap(),
             ManagedPeerEdge::new(lead.clone(), peer.clone()).unwrap(),
-            ManagedPeerEdge::new(member.clone(), peer.clone()).unwrap(),
+            ManagedPeerEdge::new(member.clone(), peer).unwrap(),
         ]),
     });
     let booted = boot(
-        &state_path,
-        definition(&mob_id),
+        state_path,
+        definition(&next_mob_id(mob_prefix)),
         &roster,
         Some(topology as Arc<dyn TopologyProvider>),
     )
     .await;
-
-    // A worker spawned on the mob itself, as Core restores one: the bridge
-    // records no runtime binding for it. It is wired to the lead.
     let handle = booted.unified.mob_handle();
-    let worker = "investigation-worker-1";
+    let mut extra_spec =
+        SpawnMemberSpec::from_wire("personal".to_string(), extra.to_string(), None, None, None);
+    if !labels.is_empty() {
+        extra_spec = extra_spec.with_labels(labels);
+    }
     handle
-        .spawn_spec(SpawnMemberSpec::from_wire(
-            "personal".to_string(),
-            worker.to_string(),
-            None,
-            None,
-            None,
-        ))
+        .spawn_spec(extra_spec)
         .await
-        .expect("spawn the worker");
+        .expect("spawn the unbound member");
     handle
         .wire(
-            meerkat_mob::AgentIdentity::from(worker),
+            meerkat_mob::AgentIdentity::from(extra),
             meerkat_meta::member_comms_id::mob_member_id(lead.as_str()),
         )
         .await
-        .expect("wire the worker to the lead");
-
-    // One managed edge for the reconcile to put back.
+        .expect("wire the unbound member to the lead");
     let runtime_of = |identity: &AgentIdentity| {
         booted
             .runtime_ids
@@ -584,6 +579,28 @@ async fn a_member_without_a_runtime_binding_does_not_stop_the_edge_reconcile() {
         .unwire_peer(&runtime_of(&lead), &runtime_of(&member))
         .await
         .expect("unwire the lead from the member");
+    booted
+}
+
+/// A raw roster member (no `agent_identity` label: a worker a member
+/// spawned, say) that this process never materialized has no live runtime
+/// binding, so the wire projection cannot name its incarnation. The identity
+/// topology never manages a raw member's wires, so it must not stop the
+/// reconcile of every other edge: its wire is left out, and the managed edges
+/// converge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_raw_member_without_a_runtime_binding_does_not_stop_the_edge_reconcile() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let booted = team_with_an_unbound_member(
+        "edge-unbound-raw-member",
+        &temp.path().join("state"),
+        "investigation-worker-1",
+        BTreeMap::new(),
+    )
+    .await;
+    let lead = id("identity:lead-1");
+    let member = id("identity:member-1");
+    let peer = id("identity:member-2");
 
     let report = booted.unified.reconcile_edges().await;
     assert!(report.failures.is_empty(), "nothing fails: {report:?}");
@@ -593,10 +610,9 @@ async fn a_member_without_a_runtime_binding_does_not_stop_the_edge_reconcile() {
         "the unwired edge is wired again: {report:?}"
     );
     assert_eq!(report.retained_edges.len(), 2, "{report:?}");
-    assert_eq!(
-        report.skipped_missing_members,
-        vec![DesiredPeerEdge::new(lead.as_str(), worker).unwrap()],
-        "the worker's wire is skipped until it has a binding: {report:?}"
+    assert!(
+        report.skipped_missing_members.is_empty(),
+        "a raw member's wire is no managed edge to skip: {report:?}"
     );
     assert_eq!(
         live_identity_edges(&booted.bridge, &booted.runtime_ids).await,
@@ -606,6 +622,39 @@ async fn a_member_without_a_runtime_binding_does_not_stop_the_edge_reconcile() {
             pair(&member, &peer),
         ]),
         "every managed edge is live"
+    );
+    booted.unified.shutdown().await;
+}
+
+/// An identity member (labelled `agent_identity`, as every identity-first
+/// spawn is) that this process has not materialized has no binding either,
+/// but its wires are identity topology: reading them as absent would let a
+/// disconnect or a reconcile drop a live edge from the managed set without
+/// unwiring it. The reconcile still fails closed on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identity_member_without_a_runtime_binding_fails_the_edge_reconcile_closed() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let ghost = meerkat_meta::member_comms_id::mob_member_id("identity:ghost-1");
+    let booted = team_with_an_unbound_member(
+        "edge-unbound-identity-member",
+        &temp.path().join("state"),
+        ghost.as_str(),
+        BTreeMap::from([("agent_identity".to_string(), "identity:ghost-1".to_string())]),
+    )
+    .await;
+
+    let report = booted.unified.reconcile_edges().await;
+    assert_eq!(report.failures.len(), 1, "{report:?}");
+    assert_eq!(report.failures[0].operation, "inspect", "{report:?}");
+    assert!(
+        report.failures[0].error.contains(&format!(
+            "no live runtime binding recorded for roster member {ghost}"
+        )),
+        "the inspect fails closed on the identity member: {report:?}"
+    );
+    assert!(
+        report.wired_edges.is_empty() && report.unwired_edges.is_empty(),
+        "nothing is wired or unwired on a projection that failed: {report:?}"
     );
     booted.unified.shutdown().await;
 }

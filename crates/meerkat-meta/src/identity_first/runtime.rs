@@ -5340,29 +5340,6 @@ impl IdentityRuntime {
             .collect())
     }
 
-    /// The member wires the bridge leaves out of the two projections above
-    /// because an endpoint has no live runtime binding yet, as pairs of the
-    /// members' public aliases.
-    pub(crate) async fn unbound_member_wires(
-        &self,
-    ) -> Result<Vec<(String, String)>, IdentityRuntimeError> {
-        let Some(bridge) = self.bridge.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let wires = bridge.unbound_member_wires().await.map_err(|error| {
-            IdentityRuntimeError::Internal(format!("bridge unbound_member_wires: {error}"))
-        })?;
-        Ok(wires
-            .into_iter()
-            .map(|(a, b)| {
-                (
-                    crate::member_comms_id::runtime_alias_str(&a).into_owned(),
-                    crate::member_comms_id::runtime_alias_str(&b).into_owned(),
-                )
-            })
-            .collect())
-    }
-
     pub(crate) fn identity_edge_ownership(&self) -> IdentityEdgeOwnership {
         *self
             .identity_edge_ownership
