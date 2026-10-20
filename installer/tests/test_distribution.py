@@ -491,6 +491,29 @@ def test_stale_sdk_or_frontend_cannot_be_packaged(bundle_source, tmp_path):
     assert not (tmp_path / "stale-web.zip").exists()
 
 
+def test_installed_package_sources_in_the_frontend_map_are_not_source_inputs(bundle_source, tmp_path):
+    root, wheel, _ = bundle_source
+    # A dependency's own source map can name files its package does not ship
+    # (inline-style-parser 0.2.7 names index.js, the MCP SDK its TypeScript
+    # sources and a pnpm store), and esbuild carries those names into app.js.map.
+    source_map = root / "web/dist/app.js.map"
+    data = json.loads(source_map.read_text())
+    data["sources"] += ["../node_modules/inline-style-parser/index.js",
+        "../node_modules/node_modules/.pnpm/content-type@1.0.5/node_modules/content-type/index.js"]
+    data["sourcesContent"] += ["module.exports = function parse() {};\n", "exports.parse = parse;\n"]
+    source_map.write_text(json.dumps(data))
+    copied = unpack(root, wheel, tmp_path / "dependencies.zip")
+    manifest = json.loads((copied / distribution.MANIFEST).read_text())
+    assert sorted(manifest["frontend_source_sha256"]) == ["installer/web/app.jsx", "installer/web/styles.css"]
+    # The checkout's own sources are still compared, and a missing one is stale.
+    data["sources"].append("../missing.jsx")
+    data["sourcesContent"].append("export const missing = true;\n")
+    source_map.write_text(json.dumps(data))
+    with pytest.raises(distribution.DistributionError, match="frontend is stale"):
+        distribution.package(root, wheel, tmp_path / "missing-source.zip")
+    assert not (tmp_path / "missing-source.zip").exists()
+
+
 def test_manifest_path_forgery_and_symlinks_do_not_escape(bundle_source, tmp_path):
     root, wheel, _ = bundle_source
     copied = unpack(root, wheel, tmp_path / "paths.zip")
