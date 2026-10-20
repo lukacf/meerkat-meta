@@ -13844,13 +13844,13 @@ async fn prime_access_cache_from_runtime_in_namespace(
     )
 }
 
-/// The access attributes of the members the console lists for `handle`
-/// (operationally visible members, including retiring ones), each as the
-/// console projects the member ([`projected_console_member_labels`] and
-/// [`crate::runtime::console_member_access_attributes`]). Adds the console
-/// identity of every structural roster row to `roster_identities`, so a row
-/// the console does not list keeps its last recorded value instead of the
-/// spawn registry's.
+/// The access attributes of every structural roster row of `handle`,
+/// including rows the console does not list, each as the console projects
+/// the member ([`projected_console_member_labels`] and
+/// [`crate::runtime::console_member_access_attributes`]). Recording every row
+/// keeps cached attributes for an identity whose only rows have ended, also
+/// after a restart. Adds each row's console identity to `roster_identities`,
+/// which keeps the spawn registry's value off it.
 async fn live_member_access_attributes(
     handle: &MobHandle,
     host_identity: Option<&str>,
@@ -13858,7 +13858,8 @@ async fn live_member_access_attributes(
     registered: &BTreeMap<String, BTreeMap<String, String>>,
     roster_identities: &mut BTreeSet<String>,
 ) -> Vec<AgentResourceAttributes> {
-    for entry in handle.list_all_members().await {
+    let entries = handle.list_all_members().await;
+    for entry in &entries {
         let alias = crate::member_comms_id::runtime_alias_str(entry.agent_identity.as_str());
         roster_identities.insert(
             crate::member_comms_id::durable_identity_label(&entry.labels)
@@ -13866,9 +13867,7 @@ async fn live_member_access_attributes(
                 .to_string(),
         );
     }
-    handle
-        .list_members_including_retiring()
-        .await
+    entries
         .into_iter()
         .map(|entry| {
             // Roster ids are comms-safe encodings (meerkat 0.7); the
