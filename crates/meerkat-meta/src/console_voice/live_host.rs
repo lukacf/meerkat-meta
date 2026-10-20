@@ -382,8 +382,11 @@ pub(crate) mod tests {
     use std::sync::atomic::AtomicUsize;
     use tower::ServiceExt as _;
 
-    // These real hosts share upstream process-wide projection budgets.
-    static SHARED_HOST_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+    // These real hosts share upstream process-wide projection budgets: Core
+    // admits one live open projection per process at a time and refuses a
+    // concurrent one. Every test in this crate that opens a real live channel
+    // takes this lock (the unified runtime's builder tests too).
+    pub(crate) static SHARED_HOST_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     /// Console voice puts Meerkat's barge-in hint on the call's caption
     /// stream for the channel the hint names; the newest hint wins.

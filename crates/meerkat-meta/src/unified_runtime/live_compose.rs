@@ -300,13 +300,11 @@ mod tests {
 
     use super::{LiveComposeError, LiveOptions};
     use crate::console_voice::live_host::tests::{
-        ProviderFixture, Summary, SummaryScenario, config, rpc,
+        ProviderFixture, SHARED_HOST_TEST_LOCK, Summary, SummaryScenario, config, rpc,
     };
     use crate::public_live_config::PublicLiveRegistration;
     use crate::unified_runtime::UnifiedRuntime;
     use crate::unified_runtime::types::UnifiedRuntimeBuilderError;
-
-    static BUILDER_LIVE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn definition(id: &str) -> meerkat_mob::MobDefinition {
         meerkat_mob::MobDefinition::from_toml(&format!(
@@ -419,7 +417,7 @@ comms = true
 
     #[tokio::test]
     async fn console_voice_without_a_persistent_store_fails_the_build_closed() {
-        let _guard = BUILDER_LIVE_TEST_LOCK.lock().await;
+        let _guard = SHARED_HOST_TEST_LOCK.lock().await;
         let Err(error) = Box::pin(
             UnifiedRuntime::builder()
                 .definition(definition("builder-voice-ephemeral"))
@@ -442,7 +440,7 @@ comms = true
 
     #[tokio::test]
     async fn the_live_router_refuses_an_open_console_when_voice_is_composed() {
-        let _guard = BUILDER_LIVE_TEST_LOCK.lock().await;
+        let _guard = SHARED_HOST_TEST_LOCK.lock().await;
         let built = build_embedder_runtime("builder-voice-open-console", false).await;
         let mut open = authenticated_decisions();
         open.console.require_app_auth = false;
@@ -463,7 +461,7 @@ comms = true
 
     #[tokio::test]
     async fn builder_console_voice_and_live_share_one_owner_through_the_built_router() {
-        let _guard = BUILDER_LIVE_TEST_LOCK.lock().await;
+        let _guard = SHARED_HOST_TEST_LOCK.lock().await;
         let built = build_embedder_runtime("builder-voice-shared", true).await;
         let runtime = &built.runtime;
         let realtime = Arc::clone(&built.realtime);
@@ -573,7 +571,7 @@ comms = true
 
     #[tokio::test]
     async fn live_without_a_public_base_url_fails_the_build_closed() {
-        let _guard = BUILDER_LIVE_TEST_LOCK.lock().await;
+        let _guard = SHARED_HOST_TEST_LOCK.lock().await;
         let directory = tempfile::Builder::new()
             .prefix("builder-live-url-")
             .tempdir_in(".rct")
