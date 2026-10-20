@@ -169,7 +169,10 @@ writes the first-boot manifest (see [The first boot](#the-first-boot)),
 retires the old projection, and removes the journal after its last step. It
 retires `sessions.sqlite3` by replacing it with a retired stamp, and
 `continuity.sqlite3` by emptying its session tables; the identity records in
-`continuity.sqlite3` stay.
+`continuity.sqlite3` stay. The conversion and the import move each image a
+session holds inline, its compacted history included, to the state
+directory's blob store (`blobs/`) and sync it there before they write the
+row that names it; the census row says how many images move.
 
 **A run that stops part way** (a crash, a kill, a power loss, or a step that
 fails, which `--apply` reports as `ApplyFailed`) leaves the journal, and 0.9.4

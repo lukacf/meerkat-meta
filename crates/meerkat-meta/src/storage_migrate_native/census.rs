@@ -2143,25 +2143,51 @@ fn suffix_class(
 /// layout of the retained history decides (a graph re-anchored past its
 /// oldest rewrites lays out from its retired base, as the conversion seeds
 /// it), so the census refuses exactly what the apply would, and before any
-/// write.
+/// write. The session laid out is the one `--apply` writes: every image the
+/// session holds inline, its compacted history included, moved to a blob
+/// reference by Core's own pure transform (inline video stays row content).
+/// The detail says how many images move to the blob store.
 pub(super) fn layout_checked(
     class: SessionCensusClass,
     detail: String,
     session: &meerkat_core::Session,
 ) -> (SessionCensusClass, String) {
-    let layout = session
-        .validated_transcript_history_state()
-        .map_err(|error| error.to_string())
-        .and_then(|history| {
-            meerkat_core::strand_layout_for_retained_history(session, history.as_ref())
-                .map_err(|error| error.to_string())
-        });
+    let (detail, layout) = match session.with_inline_images_externalized() {
+        Ok(None) => (detail, head_canonical_layout(session)),
+        Ok(Some(moved)) => (
+            format!("{detail}; {}", images_moved(moved.payloads.len())),
+            head_canonical_layout(&moved.session),
+        ),
+        Err(error) => (
+            detail,
+            Err(format!(
+                "its inline images cannot move to the blob store: {error}"
+            )),
+        ),
+    };
     match layout {
-        Ok(_) => (class, detail),
+        Ok(()) => (class, detail),
         Err(reason) => (
             SessionCensusClass::LayoutRefused,
             format!("{detail}; Core cannot lay the session out as head-canonical rows: {reason}"),
         ),
+    }
+}
+
+fn head_canonical_layout(session: &meerkat_core::Session) -> Result<(), String> {
+    let history = session
+        .validated_transcript_history_state()
+        .map_err(|error| error.to_string())?;
+    meerkat_core::strand_layout_for_retained_history(session, history.as_ref())
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn images_moved(count: usize) -> String {
+    if count == 1 {
+        "1 inline image moves to the blob store".to_owned()
+    } else {
+        format!("{count} inline images move to the blob store")
     }
 }
 
@@ -2488,7 +2514,7 @@ pub(crate) fn state_dir_mob_store(state_dir: &Path) -> Result<Option<PathBuf>, S
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// The doctor finds a directory's mob store the way the census does.
@@ -2511,9 +2537,7 @@ mod tests {
             Some(gateway.path().join(EVENT_LOG_DB_FILE_NAME))
         );
     }
-    use crate::storage_migrate_native::relation::tests::{
-        commit_test_compaction, compacted_over_a_tool_result_image,
-    };
+    use crate::storage_migrate_native::relation::tests::commit_test_compaction;
 
     fn message(text: &str) -> meerkat_core::Message {
         meerkat_core::Message::User(meerkat_core::types::UserMessage::text(text))
@@ -2963,6 +2987,43 @@ mod tests {
         assert_eq!(class, SessionCensusClass::Equal, "{detail}");
     }
 
+    /// A session that compacted twice with a tool result's inline image in
+    /// the second compaction's delta, as 0.9.3 wrote such a body when a
+    /// session compacted after a tool returned a screenshot. Core lays it
+    /// out as head-canonical rows only with the image moved to the blob
+    /// store.
+    pub(in crate::storage_migrate_native) fn compacted_over_a_tool_result_image(
+        data: &str,
+    ) -> meerkat_core::Session {
+        let user =
+            |text: &str| meerkat_core::Message::User(meerkat_core::types::UserMessage::text(text));
+        let mut session = meerkat_core::Session::new();
+        session.push(user("opening"));
+        session.push(user("second"));
+        commit_test_compaction(&mut session, 2, "first summary");
+        session.push(meerkat_core::Message::ToolResults {
+            results: vec![meerkat_core::types::ToolResult::with_blocks(
+                "view-image-call".to_owned(),
+                vec![
+                    meerkat_core::types::ContentBlock::Text {
+                        text: "the screenshot".to_owned(),
+                    },
+                    meerkat_core::types::ContentBlock::Image {
+                        media_type: "image/png".to_owned(),
+                        data: meerkat_core::types::ImageData::Inline {
+                            data: data.to_owned(),
+                        },
+                    },
+                ],
+                false,
+            )],
+            created_at: chrono::Utc::now(),
+        });
+        session.push(user("after the image"));
+        commit_test_compaction(&mut session, 2, "second summary");
+        session
+    }
+
     /// A history compacted after a tool returned an image inline, as 0.9.3
     /// wrote such a body: the image sits inline in the tool result rows of
     /// the compaction's delta. The census moves the images to the blob store
@@ -2981,6 +3042,78 @@ mod tests {
             detail.contains("1 inline image moves to the blob store"),
             "{detail}"
         );
+    }
+
+    /// A history compacted seven times and re-anchored, whose every
+    /// compaction swallowed a tool result with two inline images and an
+    /// inbound comms notice with one, as a 0.8.x-era host wrote them: the
+    /// census admits it, with the images its retained history holds moved
+    /// to the blob store.
+    #[test]
+    fn a_re_anchored_history_with_tool_result_and_notice_images_is_admitted() {
+        let image = |data: &str| meerkat_core::types::ContentBlock::Image {
+            media_type: "image/png".to_owned(),
+            data: meerkat_core::types::ImageData::Inline {
+                data: data.to_owned(),
+            },
+        };
+        use base64::Engine as _;
+        let mut session = extended(&meerkat_core::Session::new(), &["start"]);
+        for round in 0..7 {
+            let data = |slot: char| {
+                base64::engine::general_purpose::STANDARD.encode(format!("PNG r{round}{slot}"))
+            };
+            session.push(meerkat_core::Message::tool_results(vec![
+                meerkat_core::types::ToolResult::with_blocks(
+                    format!("camera-{round}"),
+                    vec![image(&data('a')), image(&data('b'))],
+                    false,
+                ),
+            ]));
+            session.push(meerkat_core::Message::SystemNotice(
+                meerkat_core::types::SystemNoticeMessage::with_block(
+                    meerkat_core::types::SystemNoticeKind::Comms,
+                    None,
+                    meerkat_core::types::SystemNoticeBlock::Comms {
+                        kind: meerkat_core::types::CommsNoticeKind::Message,
+                        direction: meerkat_core::types::SystemNoticeDirection::Incoming,
+                        peer: None,
+                        sender_taint: None,
+                        request_id: None,
+                        intent: None,
+                        status: None,
+                        summary: None,
+                        payload: None,
+                        content: vec![image(&data('c'))],
+                        delivery_id: None,
+                        in_reply_to: None,
+                    },
+                ),
+            ));
+            let end = session.messages().len() - 1;
+            commit_test_compaction(&mut session, end, "summary so far");
+        }
+        session.push(message("after the last compaction"));
+        assert!(
+            session
+                .retire_transcript_history(meerkat_core::TranscriptHistoryRetention::default())
+                .unwrap()
+                >= 1,
+            "the history re-anchors"
+        );
+        let (class, detail) = layout_checked(
+            SessionCensusClass::Equal,
+            "the copies agree".to_owned(),
+            &session,
+        );
+        assert_eq!(class, SessionCensusClass::Equal, "{detail}");
+        // The retained occurrences keep at least the last round's images.
+        let moved = detail
+            .split("; ")
+            .find_map(|part| part.strip_suffix(" inline images move to the blob store"))
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("{detail}"));
+        assert!(moved >= 3, "{detail}");
     }
 
     /// A session only the projection holds, re-anchored past its oldest

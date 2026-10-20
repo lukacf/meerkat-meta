@@ -520,9 +520,12 @@ fn runtime_id_of(
 
 /// Convert `runtime.sqlite` in place: open the session store on the file
 /// first, so the conversion finds the co-located store's schema, then seed
-/// every runtime's session there from its committed WholeBlob body. A
-/// conversion stopped part way finishes here, and a converted file converts
-/// nothing.
+/// every runtime's session there from its committed WholeBlob body. Core
+/// first stores every image those bodies hold inline in the realm blob
+/// store, and the images are synced there before the conversion's first
+/// write: the seeded rows name them by their content address (the WholeBlob
+/// bodies keep them inline). A conversion stopped part way finishes here,
+/// and a converted file converts nothing.
 fn convert_runtime(
     state_dir: &Path,
 ) -> Result<meerkat_runtime::StandaloneWholeBlobConversionReport, String> {
@@ -530,8 +533,22 @@ fn convert_runtime(
     let store = meerkat_store::SqliteSessionStore::open(path.clone())
         .map_err(|error| format!("session store schema on {}: {error}", path.display()))?;
     drop(store);
-    meerkat_runtime::SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
-        .map_err(|error| format!("convert {}: {error}", path.display()))
+    let blobs = super::import::RealmBlobs::open(state_dir)?;
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|error| format!("the conversion needs the migration's runtime: {error}"))?;
+    let stage = handle
+        .block_on(
+            meerkat_runtime::SqliteRuntimeStore::stage_standalone_whole_blob_media(
+                path.clone(),
+                blobs.store(),
+            ),
+        )
+        .map_err(|error| format!("store the inline images of {}: {error}", path.display()))?;
+    blobs.sync(stage.stored())?;
+    meerkat_runtime::SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_staged_media(
+        &path, &stage,
+    )
+    .map_err(|error| format!("convert {}: {error}", path.display()))
 }
 
 /// Create the native pair in a new state directory: Core's session store
@@ -743,7 +760,7 @@ fn remove_if_present(path: &Path) -> Result<(), String> {
     }
 }
 
-fn sync_file(path: &Path) -> Result<(), String> {
+pub(super) fn sync_file(path: &Path) -> Result<(), String> {
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| format!("sync {}: {error}", path.display()))
@@ -751,7 +768,7 @@ fn sync_file(path: &Path) -> Result<(), String> {
 
 /// Sync a directory's entries. Only POSIX directories can be opened and
 /// synced; elsewhere the rename is as durable as the platform makes it.
-fn sync_dir(dir: &Path) -> Result<(), String> {
+pub(super) fn sync_dir(dir: &Path) -> Result<(), String> {
     if cfg!(unix) {
         File::open(dir)
             .and_then(|handle| handle.sync_all())
@@ -777,6 +794,15 @@ mod tests {
             }],
             ..ApplyPlan::default()
         }
+    }
+
+    /// The conversion step on a blocking thread, where `run` takes it.
+    async fn convert_on_a_blocking_thread(state_dir: &Path) {
+        let state_dir = state_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || convert_runtime(&state_dir))
+            .await
+            .expect("the conversion thread")
+            .expect("the conversion");
     }
 
     /// An unpacked copy of one 0.9.3 gateway state directory (see
@@ -933,7 +959,7 @@ mod tests {
         );
 
         let claimed = unpack("s1b-plain");
-        convert_runtime(claimed.path()).unwrap();
+        convert_on_a_blocking_thread(claimed.path()).await;
         fs::write(
             claimed.path().join(NATIVE_MIGRATION_JOURNAL_FILE_NAME),
             b"not a journal",
@@ -978,7 +1004,7 @@ mod tests {
         journal
             .finish(dir.path(), ApplyStep::StartConversion)
             .unwrap();
-        convert_runtime(dir.path()).unwrap();
+        convert_on_a_blocking_thread(dir.path()).await;
         let backups = journal.backups.clone();
         let report =
             migrate_state_dir_native(&NativeMigrateRequest::new(dir.path(), MigrateMode::Apply))
@@ -1069,7 +1095,7 @@ mod tests {
         journal
             .finish(converted.path(), ApplyStep::StartConversion)
             .unwrap();
-        convert_runtime(converted.path()).unwrap();
+        convert_on_a_blocking_thread(converted.path()).await;
         journal
             .finish(converted.path(), ApplyStep::ConvertRuntime)
             .unwrap();
@@ -1150,7 +1176,7 @@ mod tests {
     #[tokio::test]
     async fn an_applied_runtime_hydrates_its_inline_images_from_the_realm_blob_store() {
         use crate::storage_migrate::MigrateMode;
-        use crate::storage_migrate_native::relation::tests::compacted_over_a_tool_result_image;
+        use crate::storage_migrate_native::census::tests::compacted_over_a_tool_result_image;
         use crate::storage_migrate_native::{
             NativeLayoutStatus, NativeMigrateRequest, migrate_state_dir_native,
             native_layout_status,
