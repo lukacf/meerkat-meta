@@ -10,6 +10,9 @@
 //! boot 2 restarts with a provider that drops the lead's edges to the
 //! members, which must be gone after boot 2's restore, and the members'
 //! edge kept.
+//!
+//! A member this process never materialized (a worker Core restored, say)
+//! does not stop the reconcile of the other edges either.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,8 +31,10 @@ use meerkat_meta::identity_first::{
     MobSessionBridge, MutableRosterProvider, SessionBridge, TopologyContext, TopologyError,
 };
 use meerkat_meta::mob_composition_manifest::persistent_mob_storage;
-use meerkat_meta::{DiscoverySpec, MetaConfig, MobBootstrapOptions, MobBootstrapSpec};
-use meerkat_mob::{MobDefinition, ProfileName};
+use meerkat_meta::{
+    DesiredPeerEdge, DiscoverySpec, MetaConfig, MobBootstrapOptions, MobBootstrapSpec,
+};
+use meerkat_mob::{MobDefinition, ProfileName, SpawnMemberSpec};
 
 #[path = "support/llm_usage.rs"]
 mod llm_usage;
@@ -507,6 +512,100 @@ async fn a_definition_declared_edge_is_never_churned_by_the_topology() {
         (wired_boot2, unwired_boot2),
         (wired_boot1, 0),
         "no wire/unwire churn across the restart and its reconciles"
+    );
+    booted.unified.shutdown().await;
+}
+
+/// A roster member this process never materialized (a worker Core restored
+/// after a restart, say) has no live runtime binding, so the wire projection
+/// cannot name its incarnation. It must not stop the reconcile of every other
+/// edge: its wire counts as skipped, and the managed edges still converge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_without_a_runtime_binding_does_not_stop_the_edge_reconcile() {
+    let mob_id = next_mob_id("edge-unbound-member");
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state_path = temp.path().join("state");
+    let lead = id("identity:lead-1");
+    let member = id("identity:member-1");
+    let peer = id("identity:member-2");
+    let roster = vec![
+        spec("identity:lead-1"),
+        spec("identity:member-1"),
+        spec("identity:member-2"),
+    ];
+    let topology = Arc::new(TeamTopology {
+        edges: Mutex::new(vec![
+            ManagedPeerEdge::new(lead.clone(), member.clone()).unwrap(),
+            ManagedPeerEdge::new(lead.clone(), peer.clone()).unwrap(),
+            ManagedPeerEdge::new(member.clone(), peer.clone()).unwrap(),
+        ]),
+    });
+    let booted = boot(
+        &state_path,
+        definition(&mob_id),
+        &roster,
+        Some(topology as Arc<dyn TopologyProvider>),
+    )
+    .await;
+
+    // A worker spawned on the mob itself, as Core restores one: the bridge
+    // records no runtime binding for it. It is wired to the lead.
+    let handle = booted.unified.mob_handle();
+    let worker = "investigation-worker-1";
+    handle
+        .spawn_spec(SpawnMemberSpec::from_wire(
+            "personal".to_string(),
+            worker.to_string(),
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect("spawn the worker");
+    handle
+        .wire(
+            meerkat_mob::AgentIdentity::from(worker),
+            meerkat_meta::member_comms_id::mob_member_id(lead.as_str()),
+        )
+        .await
+        .expect("wire the worker to the lead");
+
+    // One managed edge for the reconcile to put back.
+    let runtime_of = |identity: &AgentIdentity| {
+        booted
+            .runtime_ids
+            .iter()
+            .find(|(_, bound)| *bound == identity)
+            .map(|(runtime_id, _)| runtime_id.clone())
+            .expect("a materialized identity")
+    };
+    booted
+        .bridge
+        .unwire_peer(&runtime_of(&lead), &runtime_of(&member))
+        .await
+        .expect("unwire the lead from the member");
+
+    let report = booted.unified.reconcile_edges().await;
+    assert!(report.failures.is_empty(), "nothing fails: {report:?}");
+    assert_eq!(
+        report.wired_edges,
+        vec![DesiredPeerEdge::new(lead.as_str(), member.as_str()).unwrap()],
+        "the unwired edge is wired again: {report:?}"
+    );
+    assert_eq!(report.retained_edges.len(), 2, "{report:?}");
+    assert_eq!(
+        report.skipped_missing_members,
+        vec![DesiredPeerEdge::new(lead.as_str(), worker).unwrap()],
+        "the worker's wire is skipped until it has a binding: {report:?}"
+    );
+    assert_eq!(
+        live_identity_edges(&booted.bridge, &booted.runtime_ids).await,
+        BTreeSet::from([
+            pair(&lead, &member),
+            pair(&lead, &peer),
+            pair(&member, &peer),
+        ]),
+        "every managed edge is live"
     );
     booted.unified.shutdown().await;
 }

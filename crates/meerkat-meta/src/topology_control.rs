@@ -1577,6 +1577,23 @@ impl TopologyRuntimeHandle {
                 report.skipped_missing_members.push(logical);
             }
         }
+        // A member Core restored that this process has not materialized has
+        // no live runtime binding, so its wires cannot be named by
+        // incarnation. The wire projections leave them out instead of
+        // failing every edge; each counts as skipped until a later reconcile
+        // finds the binding.
+        let unbound_wires = match context.runtime.unbound_member_wires().await {
+            Ok(wires) => wires,
+            Err(error) => return identity_reconcile_failure("inspect_unbound", error.to_string()),
+        };
+        for (a, b) in unbound_wires {
+            let Ok(logical) = DesiredPeerEdge::new(a, b) else {
+                continue;
+            };
+            if !report.skipped_missing_members.contains(&logical) {
+                report.skipped_missing_members.push(logical);
+            }
+        }
         // Reconcile unwires every managed edge that is not desired and, when
         // a topology provider owns the topology, every live identity edge
         // that no declared owner wants (one wired before a restart is live

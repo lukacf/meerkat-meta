@@ -4537,6 +4537,16 @@ pub trait SessionBridge: Send + Sync {
         self.current_member_wires().await
     }
 
+    /// Return same-mob member wires, either directed half present, with an
+    /// endpoint that has no live runtime binding recorded yet, by roster
+    /// member id. The two projections above leave such wires out: they name
+    /// incarnations, and a member's incarnation is known only once its create
+    /// or resume materialization records the binding (a member Core restored
+    /// that this process has not materialized has none).
+    async fn unbound_member_wires(&self) -> Result<Vec<(String, String)>, BridgeError> {
+        Ok(Vec::new())
+    }
+
     /// Unwire two active same-mob members by their concrete runtime IDs.
     async fn unwire_peer(
         &self,
@@ -4801,6 +4811,16 @@ impl CompactionFloorRegistry {
             .get(identity.as_str())
             .map(|entry| entry.floor)
     }
+}
+
+/// The roster's member wires, split by whether both endpoints have a live
+/// runtime binding recorded.
+#[derive(Default)]
+struct MemberWires {
+    /// Wires between two bound members, by runtime id.
+    bound: Vec<(AgentRuntimeId, AgentRuntimeId)>,
+    /// Wires with an endpoint that has no binding yet, by roster member id.
+    unbound: Vec<(String, String)>,
 }
 
 pub struct MobSessionBridge {
@@ -5659,10 +5679,7 @@ impl MobSessionBridge {
         );
     }
 
-    async fn member_wires(
-        &self,
-        require_reciprocal: bool,
-    ) -> Result<Vec<(AgentRuntimeId, AgentRuntimeId)>, BridgeError> {
+    async fn member_wires(&self, require_reciprocal: bool) -> Result<MemberWires, BridgeError> {
         let members = self.handle.list_members_including_retiring().await;
         let runtime_members = self.runtime_members.read().await;
         let member_runtimes = runtime_members
@@ -5702,29 +5719,32 @@ impl MobSessionBridge {
         // to a bare durable identity like `agent:alpha`, and `AgentRuntimeId`
         // validates only non-empty/no-space/no-slash - so that parse SUCCEEDS
         // and mints a runtime id that names no incarnation at all. A missing
-        // mapping is a bookkeeping gap, and the honest answer is to say so.
-        let resolve = |member_id: &str| -> Result<AgentRuntimeId, BridgeError> {
+        // mapping is a bookkeeping gap: a member Core restored that this
+        // process has not materialized yet has none. Its wires are set apart
+        // by roster id rather than failing the projection of every other
+        // wire; a recorded binding that does not parse still fails it.
+        let resolve = |member_id: &str| -> Result<Option<AgentRuntimeId>, BridgeError> {
             // Wires report incarnations, and an incarnation cannot be derived from a
             // stable roster id - the generation simply is not in it. So this one has
             // no strict-derivation fallback available: bookkeeping or nothing.
-            let runtime_id = member_runtimes.get(member_id).ok_or_else(|| {
-                BridgeError::Mob(format!(
-                    "no live runtime binding recorded for roster member {member_id}; the wire \
-                     projection cannot name its incarnation (retryable: the mapping is \
-                     populated at create/resume materialization)"
-                ))
-            })?;
-            AgentRuntimeId::parse(runtime_id).map_err(|error| {
+            let Some(runtime_id) = member_runtimes.get(member_id) else {
+                return Ok(None);
+            };
+            AgentRuntimeId::parse(runtime_id).map(Some).map_err(|error| {
                 BridgeError::Mob(format!(
                     "recorded runtime binding {runtime_id} for roster member {member_id} is not \
                      a valid runtime id: {error}"
                 ))
             })
         };
-        edges
-            .into_iter()
-            .map(|(a, b)| Ok((resolve(&a)?, resolve(&b)?)))
-            .collect()
+        let mut wires = MemberWires::default();
+        for (a, b) in edges {
+            match (resolve(&a)?, resolve(&b)?) {
+                (Some(runtime_a), Some(runtime_b)) => wires.bound.push((runtime_a, runtime_b)),
+                _ => wires.unbound.push((a, b)),
+            }
+        }
+        Ok(wires)
     }
 
     async fn runtime_session_id(
@@ -8445,13 +8465,17 @@ impl SessionBridge for MobSessionBridge {
     async fn current_member_wires(
         &self,
     ) -> Result<Vec<(AgentRuntimeId, AgentRuntimeId)>, BridgeError> {
-        self.member_wires(true).await
+        Ok(self.member_wires(true).await?.bound)
     }
 
     async fn current_member_wires_any_half(
         &self,
     ) -> Result<Vec<(AgentRuntimeId, AgentRuntimeId)>, BridgeError> {
-        self.member_wires(false).await
+        Ok(self.member_wires(false).await?.bound)
+    }
+
+    async fn unbound_member_wires(&self) -> Result<Vec<(String, String)>, BridgeError> {
+        Ok(self.member_wires(false).await?.unbound)
     }
 
     async fn unwire_peer(&self, a: &AgentRuntimeId, b: &AgentRuntimeId) -> Result<(), BridgeError> {
@@ -9288,6 +9312,10 @@ impl SessionBridge for super::PublicSessionBridge {
         &self,
     ) -> Result<Vec<(AgentRuntimeId, AgentRuntimeId)>, BridgeError> {
         self.bridge.current_member_wires_any_half().await
+    }
+
+    async fn unbound_member_wires(&self) -> Result<Vec<(String, String)>, BridgeError> {
+        self.bridge.unbound_member_wires().await
     }
 
     async fn unwire_peer(&self, a: &AgentRuntimeId, b: &AgentRuntimeId) -> Result<(), BridgeError> {
