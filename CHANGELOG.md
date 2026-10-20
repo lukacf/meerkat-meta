@@ -549,6 +549,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   own YAML parsing already used serde-saphyr, and the Meerkat Core 0.9.4
   crates parse SKILL.md frontmatter with serde-saphyr as well, so `deny.toml`
   no longer ignores that advisory.
+- Meta's lockfile takes rustls-webpki 0.103.16 and webpki-roots 1.0.10, so
+  TLS certificate verification no longer accepts the distrusted emSign
+  intermediates (RUSTSEC-2026-0382, RUSTSEC-2026-0381).
 - Open event streams decide each frame right before they send it, under the
   access configuration committed at that point: the console timeline and
   identity streams, `/agents/{agent_id}/events`, `/mob/events`,
