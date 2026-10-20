@@ -34,6 +34,7 @@ mod bootstrap_completion;
 #[cfg(test)]
 mod bootstrap_completion_tests;
 pub mod builder;
+pub mod continuity_mirror;
 /// Completes an application from a held identity bootstrap's held members,
 /// with the pass's [`crate::identity_first::HeldCompletion`]; see
 /// [`UnifiedRuntime::bootstrap_installed_identity_first_context_held_until`].
