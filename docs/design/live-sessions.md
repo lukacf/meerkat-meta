@@ -208,8 +208,14 @@ An open keeps that admission until its provider has acknowledged its seed:
 for a console voice call, through the browser's WebRTC offer and the
 provider's answer. A console voice open made during another call's setup is
 refused before anything opens, as the retryable `voice_open_busy` on the
-console side and `-32054` on `meta/live/open`. Open again, with backoff; the
-open succeeds once the other call's setup has finished.
+console side and `-32054` on `meta/live/open`. Open again, with backoff. A
+console retry carries a new `request_id`: `meta/console/voice/open` answers
+a repeated `request_id` with the refusal it recorded for it, unlike
+`voice_busy`, whose retry repeats the same request. The open succeeds once
+the other call's setup has finished.
+A `-32054` error carries `data.kind: "live_open_busy"` and
+`data.retryable: true`, so `meta/live/open` clients can branch on the kind as
+they do for `-32050`.
 
 Library embedders constructing a `MobBootstrapSpec::new` must install the
 builder's shared `default_mob_tools` slot with `with_agent_mob_tools`, after

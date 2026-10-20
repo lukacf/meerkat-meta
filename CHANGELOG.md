@@ -1176,9 +1176,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its setup: for a console voice call, through the browser's WebRTC offer and
   the provider's answer. An open during another call's setup is now refused
   as the typed, retryable `voice_open_busy` on the console and `-32054` on
-  `meta/live/open`. Open again with backoff; the open succeeds once the other
-  call's setup has finished. Needs Meerkat 0.9.4's typed `Backpressured` open
-  refusal.
+  `meta/live/open`. Open again with backoff; a console retry needs a new
+  `request_id`, because the console answers a repeated `request_id` with the
+  refusal it recorded for it. The open succeeds once the other call's setup
+  has finished. Needs Meerkat 0.9.4's typed `Backpressured` open refusal.
 - A roster pass retires a live member that carries the identity-first
   `agent_identity` label when the roster no longer lists its identity,
   including a member Meta 0.9.3 spawned without the durable-identity marker.

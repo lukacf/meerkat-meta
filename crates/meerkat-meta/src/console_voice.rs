@@ -140,6 +140,7 @@ pub(crate) enum VoiceError {
     /// Another live open on this gateway was still being prepared, so this
     /// open was refused before anything opened. A new open succeeds once
     /// that open is prepared.
+    #[cfg_attr(not(feature = "openai-live"), allow(dead_code))]
     OpenBusy,
     HostFailed,
     ContextReadFailed,
@@ -181,7 +182,7 @@ impl VoiceError {
             Self::OpenBusy => (
                 -32000,
                 "voice_open_busy",
-                "Another voice call is starting on this host; open again shortly",
+                "Another live call is starting on this gateway; open again shortly",
             ),
             Self::HostFailed => (-32000, "voice_host_failed", "Voice host operation failed"),
             Self::ContextReadFailed => (
