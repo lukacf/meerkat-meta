@@ -365,7 +365,8 @@ impl UnifiedRuntimeBuilder {
     /// source for a lost state directory that is never read at boot (see
     /// [`continuity_mirror`](super::continuity_mirror)). The runtime owns the
     /// mirror: shutdown writes a last copy, and dropping the runtime stops it.
-    /// A runtime with no durable identity copies nothing.
+    /// `build()` refuses it on a runtime that is not identity-first, which has
+    /// no durable identity to copy.
     pub fn continuity_mirror(
         mut self,
         sink: Arc<dyn super::continuity_mirror::ContinuityMirrorSink>,

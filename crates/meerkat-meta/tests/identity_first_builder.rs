@@ -4578,3 +4578,165 @@ async fn a_slow_first_continuity_mirror_put_is_offered_again() {
         .await
         .expect("shutdown");
 }
+
+/// The copy never follows a loss: when the runtime store loses an
+/// identity's session while its binding stays, the mirror keeps the last
+/// copied record and session, through more rounds and through shutdown.
+#[tokio::test]
+async fn the_continuity_mirror_keeps_its_copy_when_the_store_loses_a_session() {
+    use meerkat_meta::unified_runtime::continuity_mirror::{
+        ContinuityMirrorTimings, JsonlFileMirrorSink,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let mirror_dir = tmp.path().join("mirror");
+    let mob_id = unique_builder_mob_id();
+    let runtime = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(test_definition_with_id(&mob_id))
+            .persistent_state(&root)
+            .roster_provider(Arc::new(StubRosterProvider::new(vec![durable_spec(
+                "agent:alice",
+            )])))
+            .identity_runtime_instance_id("continuity-mirror-loss-test")
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .continuity_mirror_with_timings(
+                Arc::new(JsonlFileMirrorSink::new(&mirror_dir)),
+                ContinuityMirrorTimings {
+                    interval: Duration::from_millis(50),
+                    put_deadline: Duration::from_secs(10),
+                    stop_deadline: Duration::from_secs(10),
+                },
+            )
+            .build(),
+    )
+    .await
+    .expect("build");
+    let identity = AgentIdentity::parse("agent:alice").unwrap();
+    runtime
+        .identity_runtime()
+        .expect("identity runtime")
+        .send(
+            &identity,
+            &meerkat_core::ContentInput::Text("keep me".to_string()),
+        )
+        .await
+        .expect("turn");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let (session_id, copied) = loop {
+        let records = mirror_lines(&mirror_dir, "records.jsonl");
+        if let Some(record) = records.first() {
+            let session_id = record["session_id"].as_str().unwrap().to_string();
+            let sessions = mirror_lines(&mirror_dir, "sessions.jsonl");
+            if let Some(row) = sessions
+                .iter()
+                .find(|row| row["session_id"] == session_id.as_str())
+                && mirrored_session(&mirror_dir, &session_id).is_some_and(|session| {
+                    serde_json::to_string(session.messages())
+                        .unwrap()
+                        .contains("keep me")
+                })
+            {
+                break (session_id, row["data"].clone());
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the turn was never copied"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    // The runtime store loses the session: every row that names it goes.
+    {
+        let connection = rusqlite::Connection::open(
+            root.join(meerkat_meta::storage_layout::RUNTIME_DB_FILE_NAME),
+        )
+        .unwrap();
+        connection.busy_timeout(Duration::from_secs(10)).unwrap();
+        let tables: Vec<String> = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut deleted = 0;
+        for table in tables {
+            let has_session_id = connection
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'session_id'"
+                ))
+                .unwrap()
+                .exists([])
+                .unwrap();
+            if has_session_id {
+                deleted += connection
+                    .execute(
+                        &format!("DELETE FROM \"{table}\" WHERE session_id = ?1"),
+                        [&session_id],
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(deleted > 0, "the store held the session");
+    }
+
+    let counts = runtime.continuity_mirror_counts().await.expect("mirror");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while counts.kept_after_loss.load(Ordering::Relaxed) + counts.failures.load(Ordering::Relaxed)
+        == 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no round saw the loss"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // More rounds, then shutdown with its last round: the copy holds.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(60), runtime.shutdown()).await;
+    let records = mirror_lines(&mirror_dir, "records.jsonl");
+    assert_eq!(records.len(), 1, "the record stays: {records:?}");
+    assert_eq!(records[0]["session_id"], session_id.as_str());
+    let sessions = mirror_lines(&mirror_dir, "sessions.jsonl");
+    let row = sessions
+        .iter()
+        .find(|row| row["session_id"] == session_id.as_str())
+        .expect("the session stays in the copy");
+    assert_eq!(
+        row["data"], copied,
+        "the last copied document is kept as it was"
+    );
+}
+
+/// A mirror on a runtime that is not identity-first would copy nothing, so
+/// the build refuses it rather than run a silent no-op.
+#[tokio::test]
+async fn the_continuity_mirror_is_refused_on_a_runtime_that_is_not_identity_first() {
+    use meerkat_meta::unified_runtime::continuity_mirror::JsonlFileMirrorSink;
+    let tmp = tempfile::tempdir().unwrap();
+    let result = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(test_definition_with_id(&unique_builder_mob_id()))
+            .persistent_state(tmp.path().join("root"))
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .continuity_mirror(
+                Arc::new(JsonlFileMirrorSink::new(tmp.path().join("mirror"))),
+                Duration::from_secs(1),
+            )
+            .build(),
+    )
+    .await;
+    let error = match result {
+        Ok(runtime) => {
+            runtime.shutdown().await;
+            panic!("a runtime that is not identity-first must refuse the mirror");
+        }
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("continuity_mirror()") && error.contains("not identity-first"),
+        "{error}"
+    );
+}

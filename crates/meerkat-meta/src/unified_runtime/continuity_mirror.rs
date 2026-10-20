@@ -333,9 +333,13 @@ pub struct ContinuityMirrorCounts {
     /// Rounds or identities that failed: a binding read, a session read, a
     /// put that failed, panicked or passed its deadline.
     pub failures: AtomicU64,
-    /// Identities seen with no session to copy: `Absent`, or archived and not
-    /// revivable. They keep no rows.
+    /// Identities seen with no session to copy (`Absent`, or archived and not
+    /// revivable) and nothing copied before: there is nothing to keep.
     pub not_mirrored: AtomicU64,
+    /// Rounds that kept an identity's last copied rows because its session
+    /// read `Absent` or archived-and-not-revivable while its binding was
+    /// unchanged: the copy never follows a loss.
+    pub kept_after_loss: AtomicU64,
 }
 
 /// The mirror's state between rounds.
@@ -349,6 +353,8 @@ struct MirrorState {
     accepted: Option<(Vec<ContinuityMirrorRecord>, BTreeSet<String>)>,
     /// The last sequence handed to the sink.
     sequence: u64,
+    /// Identities already warned about an unreadable session.
+    warned_lost: BTreeSet<String>,
 }
 
 /// Wall-clock milliseconds, kept strictly above `previous`.
@@ -397,7 +403,29 @@ async fn round(
                 identities.insert(identity, mirrored);
             }
             Ok(IdentityRead::NotMirrored) => {
-                counts.not_mirrored.fetch_add(1, Ordering::Relaxed);
+                // The copy never follows a loss: under the same binding the
+                // last copied rows stay. Only a binding that moved, or an
+                // identity gone from the bindings, drops them.
+                let same_binding = previous.is_some_and(|previous| {
+                    previous.record.session_id == session_id.to_string()
+                        && previous.record.generation == binding.generation().get()
+                });
+                match previous.filter(|_| same_binding) {
+                    Some(previous) => {
+                        counts.kept_after_loss.fetch_add(1, Ordering::Relaxed);
+                        if state.warned_lost.insert(identity.clone()) {
+                            tracing::warn!(
+                                identity = %identity,
+                                session_id = %session_id,
+                                "continuity mirror: session unreadable, keeping the last copied rows"
+                            );
+                        }
+                        identities.insert(identity, previous.clone());
+                    }
+                    None => {
+                        counts.not_mirrored.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
             Err(error) => {
                 counts.failures.fetch_add(1, Ordering::Relaxed);
@@ -565,6 +593,12 @@ impl super::UnifiedRuntime {
         sink: Arc<dyn ContinuityMirrorSink>,
         timings: ContinuityMirrorTimings,
     ) -> Result<(), String> {
+        if self.identity_first_context.is_none() {
+            return Err(
+                "this runtime is not identity-first, so it has no durable identity to copy"
+                    .to_string(),
+            );
+        }
         let bridge = self
             .session_bridge
             .clone()
