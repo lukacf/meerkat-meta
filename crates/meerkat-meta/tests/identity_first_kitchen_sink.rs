@@ -31,14 +31,14 @@ use meerkat_mob::{
 
 use meerkat_meta::UnifiedRuntimeBuilder;
 use meerkat_meta::contact_directory::ContactDirectory;
-use meerkat_meta::identity_first::contracts::{AgentCustomizer, TopologyProvider};
+use meerkat_meta::identity_first::contracts::{AgentCustomizer, RosterProvider, TopologyProvider};
 use meerkat_meta::identity_first::orchestrator::RestoreOutcome;
 use meerkat_meta::identity_first::{
     AgentAddressability, AgentBuildContext, AgentBuildDraft, AgentIdentity, ContinuityStore,
-    CustomizerError, DurabilityPolicy, DurableAgentSpec, IdentityLifecycleState, IdentityRuntime,
-    IdentityRuntimeConfig, IdentityRuntimeError, LocalContinuityStore, LocalLeaseProvider,
-    ManagedPeerEdge, MemberRuntimeBinding, SessionBridge, TopologyContext, TopologyError,
-    wire_cross_mob_by_identity,
+    CustomizerError, DurabilityPolicy, DurableAgentSpec, IdentityFirstRuntimeContext,
+    IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig, IdentityRuntimeError,
+    LocalContinuityStore, LocalLeaseProvider, ManagedPeerEdge, MemberRuntimeBinding, RosterContext,
+    RosterError, SessionBridge, TopologyContext, TopologyError, wire_cross_mob_by_identity,
 };
 use meerkat_meta::mob_handle_runtime::SessionCreatedContext;
 
@@ -71,6 +71,14 @@ fn smoke_model() -> String {
 
 fn id(name: &str) -> AgentIdentity {
     AgentIdentity::parse(name).unwrap()
+}
+
+/// Whether `edges` link `a` and `b`, in either order.
+fn has_edge(edges: &[ManagedPeerEdge], a: &str, b: &str) -> bool {
+    edges.iter().any(|edge| {
+        let (x, y) = (edge.a().as_str(), edge.b().as_str());
+        (x == a && y == b) || (x == b && y == a)
+    })
 }
 
 /// Default timeout for wait operations in the kitchen sink test.
@@ -225,6 +233,21 @@ impl TopologyProvider for MutableTopology {
 }
 
 // ---------------------------------------------------------------------------
+// Roster provider for the installed identity runtimes
+// ---------------------------------------------------------------------------
+
+/// The roster an installed identity runtime's context names. Every phase
+/// passes its own roster to `restore_flow`.
+struct FixedRoster(Vec<DurableAgentSpec>);
+
+#[async_trait]
+impl RosterProvider for FixedRoster {
+    async fn roster(&self, _context: &RosterContext) -> Result<Vec<DurableAgentSpec>, RosterError> {
+        Ok(self.0.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Topology-aware customizer (injects subscriber names into prompts)
 // ---------------------------------------------------------------------------
 
@@ -307,7 +330,7 @@ impl AgentCustomizer for JokeCollabCustomizer {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "composes standalone IdentityRuntime::new outside its UnifiedRuntime; 0.9 supports installed runtimes; rewrite tracked for 0.9.4.1"]
+#[ignore = "integration-real: live API, ~120s"]
 async fn e2e_kitchen_sink_two_mob_chaos() {
     if !has_api_key() {
         eprintln!("Skipping kitchen-sink: no ANTHROPIC_API_KEY");
@@ -341,7 +364,7 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         .expect("contact directory");
 
     // Build both UnifiedRuntimes
-    let rt_authors = UnifiedRuntimeBuilder::default()
+    let mut rt_authors = UnifiedRuntimeBuilder::default()
         .definition(author_definition(&model))
         .persistent_state(&author_state)
         .comms(true)
@@ -350,7 +373,7 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         .await
         .expect("build author runtime");
 
-    let rt_critics = UnifiedRuntimeBuilder::default()
+    let mut rt_critics = UnifiedRuntimeBuilder::default()
         .definition(critic_definition(&model))
         .persistent_state(&critic_state)
         .comms(true)
@@ -358,14 +381,6 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         .build()
         .await
         .expect("build critic runtime");
-
-    // Register peer handles (bidirectional)
-    rt_authors
-        .register_peer_mob("critics", rt_critics.mob_handle())
-        .await;
-    rt_critics
-        .register_peer_mob("authors", rt_authors.mob_handle())
-        .await;
 
     // Get bridges
     let author_bridge: Arc<dyn SessionBridge> = rt_authors
@@ -389,8 +404,8 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
     let author_leases = Arc::new(LocalLeaseProvider::new());
     let critic_leases = Arc::new(LocalLeaseProvider::new());
 
-    // Identity runtimes
-    let author_irt = IdentityRuntime::new(IdentityRuntimeConfig {
+    // Identity runtimes, installed in their runtimes once the rosters exist
+    let author_irt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
         continuity_store: author_store.clone() as Arc<dyn ContinuityStore>,
         lease_provider: author_leases.clone(),
         runtime_instance_id: "authors-v1".to_string(),
@@ -398,8 +413,8 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         durability_policy: DurabilityPolicy::SyncWriteThrough,
         bridge: Some(author_bridge),
         default_timeout: None,
-    });
-    let critic_irt = IdentityRuntime::new(IdentityRuntimeConfig {
+    }));
+    let critic_irt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
         continuity_store: critic_store.clone() as Arc<dyn ContinuityStore>,
         lease_provider: critic_leases.clone(),
         runtime_instance_id: "critics-v1".to_string(),
@@ -407,7 +422,7 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         durability_policy: DurabilityPolicy::SyncWriteThrough,
         bridge: Some(critic_bridge),
         default_timeout: None,
-    });
+    }));
 
     // Rosters
     let author_roster = vec![
@@ -425,6 +440,29 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         spec("judge:x", AgentAddressability::InternalOnly, "judge"),
         spec("judge:y", AgentAddressability::InternalOnly, "judge"),
     ];
+
+    // Install each identity runtime in its UnifiedRuntime: the mob then
+    // credits it its members' turn completions (the output waits below wake
+    // on them), and it is the authority for its identities' generated
+    // aliases in cross-mob wiring. Every phase passes its roster to
+    // restore_flow itself.
+    rt_authors.install_identity_first_context(Arc::new(IdentityFirstRuntimeContext::new(
+        Arc::clone(&author_irt),
+        Arc::new(FixedRoster(author_roster.clone())),
+        None,
+        None,
+        Some(author_definition(&model)),
+    )));
+    rt_critics.install_identity_first_context(Arc::new(IdentityFirstRuntimeContext::new(
+        Arc::clone(&critic_irt),
+        Arc::new(FixedRoster(critic_roster.clone())),
+        None,
+        None,
+        Some(critic_definition(&model)),
+    )));
+    // Register each peer with its identity runtime (bidirectional).
+    rt_authors.register_peer_runtime(&rt_critics).await;
+    rt_critics.register_peer_runtime(&rt_authors).await;
 
     // Topology providers (mutable for later phases)
     let author_topo = MutableTopology::new(vec![
@@ -807,7 +845,7 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
     let dir2 = ContactDirectory::from_toml("[mobs]\nauthors = \"inproc\"\ncritics = \"inproc\"")
         .expect("contact directory v2");
 
-    let rt_authors = UnifiedRuntimeBuilder::default()
+    let mut rt_authors = UnifiedRuntimeBuilder::default()
         .definition(author_definition(&model))
         .persistent_state(&author_state)
         .comms(true)
@@ -816,7 +854,7 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         .await
         .expect("rebuild author runtime");
 
-    let rt_critics = UnifiedRuntimeBuilder::default()
+    let mut rt_critics = UnifiedRuntimeBuilder::default()
         .definition(critic_definition(&model))
         .persistent_state(&critic_state)
         .comms(true)
@@ -824,13 +862,6 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         .build()
         .await
         .expect("rebuild critic runtime");
-
-    rt_authors
-        .register_peer_mob("critics", rt_critics.mob_handle())
-        .await;
-    rt_critics
-        .register_peer_mob("authors", rt_authors.mob_handle())
-        .await;
 
     let author_bridge2: Arc<dyn SessionBridge> = rt_authors
         .session_bridge()
@@ -846,7 +877,7 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
     let critic_leases2 = Arc::new(LocalLeaseProvider::new());
 
     // Build author IdentityRuntime but DO NOT call restore_flow yet
-    let author_irt2 = IdentityRuntime::new(IdentityRuntimeConfig {
+    let author_irt2 = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
         continuity_store: author_store.clone() as Arc<dyn ContinuityStore>,
         lease_provider: author_leases2.clone(),
         runtime_instance_id: "authors-v2".to_string(),
@@ -854,7 +885,15 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         durability_policy: DurabilityPolicy::SyncWriteThrough,
         bridge: Some(author_bridge2),
         default_timeout: None,
-    });
+    }));
+
+    rt_authors.install_identity_first_context(Arc::new(IdentityFirstRuntimeContext::new(
+        Arc::clone(&author_irt2),
+        Arc::new(FixedRoster(author_roster.clone())),
+        None,
+        None,
+        Some(author_definition(&model)),
+    )));
 
     // -- Pre-restore dispatch test --
     eprintln!("[Phase 4] Pre-restore dispatch test (should fail with structured error)...");
@@ -878,7 +917,7 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         .await
         .expect("author restore_flow v2");
 
-    let critic_irt2 = IdentityRuntime::new(IdentityRuntimeConfig {
+    let critic_irt2 = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
         continuity_store: critic_store.clone() as Arc<dyn ContinuityStore>,
         lease_provider: critic_leases2.clone(),
         runtime_instance_id: "critics-v2".to_string(),
@@ -886,7 +925,17 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         durability_policy: DurabilityPolicy::SyncWriteThrough,
         bridge: Some(critic_bridge2),
         default_timeout: None,
-    });
+    }));
+
+    rt_critics.install_identity_first_context(Arc::new(IdentityFirstRuntimeContext::new(
+        Arc::clone(&critic_irt2),
+        Arc::new(FixedRoster(critic_roster.clone())),
+        None,
+        None,
+        Some(critic_definition(&model)),
+    )));
+    rt_authors.register_peer_runtime(&rt_critics).await;
+    rt_critics.register_peer_runtime(&rt_authors).await;
 
     let critic_result2 = critic_irt2
         .restore_flow(
@@ -1011,24 +1060,33 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         .await
         .expect("author restore_flow v3");
 
-    // Verify lead:author prompt now only mentions writer:a
-    let lead_v3_draft = match author_result3.outcomes.get(&id("lead:author")).unwrap() {
-        RestoreOutcome::Created { draft, .. } | RestoreOutcome::Resumed { draft, .. } => draft,
-        other => panic!("unexpected lead:author outcome: {other:?}"),
-    };
-    let lead_v3_prompt = lead_v3_draft
-        .system_prompt
-        .as_ref()
-        .expect("lead:author v3 should have prompt");
+    // lead:author is live, so restore_flow resumes it on the session (and
+    // prompt) it runs; the new topology shows in the managed edges.
     assert!(
-        lead_v3_prompt.contains("writer:a"),
-        "lead:author prompt should still mention writer:a: {lead_v3_prompt}"
+        matches!(
+            author_result3.outcomes.get(&id("lead:author")),
+            Some(RestoreOutcome::Resumed { .. })
+        ),
+        "lead:author should resume: {:?}",
+        author_result3.outcomes.get(&id("lead:author"))
     );
     assert!(
-        !lead_v3_prompt.contains("writer:b"),
-        "lead:author prompt should NOT mention writer:b: {lead_v3_prompt}"
+        has_edge(&author_result3.managed_edges, "lead:author", "writer:a"),
+        "the topology should still link lead:author and writer:a: {:?}",
+        author_result3.managed_edges
     );
-    eprintln!("[Phase 5] lead:author prompt updated: {lead_v3_prompt}");
+    assert!(
+        !author_result3
+            .managed_edges
+            .iter()
+            .any(|edge| edge.a().as_str() == "writer:b" || edge.b().as_str() == "writer:b"),
+        "the topology should no longer name writer:b: {:?}",
+        author_result3.managed_edges
+    );
+    eprintln!(
+        "[Phase 5] topology updated: {:?}",
+        author_result3.managed_edges
+    );
 
     // Verify writer:a is unaffected
     let wa_status = author_irt2
@@ -1124,18 +1182,12 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         wb_v4.agent_runtime_id, wb_v4.session_id
     );
 
-    // Verify lead:author prompt is back to both writers
-    let lead_v4_draft = match author_result4.outcomes.get(&id("lead:author")).unwrap() {
-        RestoreOutcome::Created { draft, .. } | RestoreOutcome::Resumed { draft, .. } => draft,
-        other => panic!("unexpected lead:author outcome: {other:?}"),
-    };
-    let lead_v4_prompt = lead_v4_draft
-        .system_prompt
-        .as_ref()
-        .expect("lead:author v4 should have prompt");
+    // The topology links lead:author to both writers again.
     assert!(
-        lead_v4_prompt.contains("writer:a") && lead_v4_prompt.contains("writer:b"),
-        "lead:author prompt should mention both writers again: {lead_v4_prompt}"
+        has_edge(&author_result4.managed_edges, "lead:author", "writer:a")
+            && has_edge(&author_result4.managed_edges, "lead:author", "writer:b"),
+        "the topology should link lead:author to both writers again: {:?}",
+        author_result4.managed_edges
     );
 
     // Verify writer:b can receive messages after return
