@@ -1141,4 +1141,64 @@ mod tests {
             NativeLayoutStatus::Native
         );
     }
+
+    /// A runtime whose committed WholeBlob body compacted over a tool
+    /// result's inline image converts: `--apply` moves the image to the
+    /// realm blob store before the conversion's first write, the converted
+    /// session names it by its content address, and it hydrates from
+    /// `blobs/` in the state directory.
+    #[tokio::test]
+    async fn an_applied_runtime_hydrates_its_inline_images_from_the_realm_blob_store() {
+        use crate::storage_migrate::MigrateMode;
+        use crate::storage_migrate_native::relation::tests::compacted_over_a_tool_result_image;
+        use crate::storage_migrate_native::{
+            NativeLayoutStatus, NativeMigrateRequest, migrate_state_dir_native,
+            native_layout_status,
+        };
+        use meerkat::SessionStore as _;
+        use meerkat_runtime::RuntimeStore as _;
+        const SCREENSHOT: &str = "iVBORw0KGgo=";
+        let dir = unpack("s1b-plain");
+        let session = compacted_over_a_tool_result_image(SCREENSHOT);
+        let path = dir.path().join(RUNTIME_DB_FILE_NAME);
+        let whole_blob = meerkat_runtime::SqliteRuntimeStore::new_whole_blob(&path).unwrap();
+        whole_blob
+            .commit_session_snapshot(
+                &meerkat_runtime::LogicalRuntimeId::for_session(session.id()),
+                meerkat_runtime::store::SerializedSessionSnapshot {
+                    session_snapshot: serde_json::to_vec(&session).unwrap().into(),
+                },
+            )
+            .await
+            .unwrap();
+        drop(whole_blob);
+
+        let report =
+            migrate_state_dir_native(&NativeMigrateRequest::new(dir.path(), MigrateMode::Apply))
+                .await;
+        assert!(report.refusals.is_empty(), "{report:#?}");
+        assert!(report.applied.is_some(), "{report:#?}");
+        assert_eq!(native_layout_status(dir.path()), NativeLayoutStatus::Native);
+
+        let converted = meerkat_store::SqliteSessionStore::open(path)
+            .unwrap()
+            .load(session.id())
+            .await
+            .unwrap()
+            .expect("the converted session");
+        let document = serde_json::to_string(&converted).unwrap();
+        assert!(
+            !document.contains(SCREENSHOT),
+            "the converted session holds the image inline"
+        );
+        let blob_id = meerkat_core::content_blob_id("image/png", SCREENSHOT);
+        assert!(document.contains(blob_id.as_str()), "{document}");
+        let blobs = crate::blob_store::Base64BlobStoreAdapter::new(std::sync::Arc::new(
+            crate::blob_store::ObjectStoreBlobStore::local(dir.path().join("blobs")).unwrap(),
+        ));
+        let image = meerkat_core::BlobStore::get(&blobs, &blob_id)
+            .await
+            .expect("the image hydrates from blobs/");
+        assert_eq!(image.data, SCREENSHOT);
+    }
 }

@@ -533,4 +533,51 @@ mod tests {
         let detail = row_difference(&session, &longer).expect("a longer transcript differs");
         assert!(detail.contains("transcript digest"), "{detail}");
     }
+
+    /// The native pair and realm blob store an import writes, on a new
+    /// state directory.
+    fn native_stores(state_dir: &Path) -> NativeImportStores {
+        let (sessions, runtime) = open_native_pair(state_dir).expect("the native pair");
+        NativeImportStores { sessions, runtime }
+    }
+
+    /// A copy whose compacted history holds an inline image imports: the
+    /// image goes to the realm blob store before the row that names it, the
+    /// row holds the image by its content address, and a rerun keeps the
+    /// row.
+    #[tokio::test]
+    async fn an_import_moves_the_copys_inline_images_to_the_realm_blob_store() {
+        const SCREENSHOT: &str = "iVBORw0KGgo=";
+        let dir = tempfile::tempdir().unwrap();
+        let stores = native_stores(dir.path());
+        let session = super::super::relation::tests::compacted_over_a_tool_result_image(SCREENSHOT);
+
+        let import = import_session(&stores, &session)
+            .await
+            .expect("the copy imports");
+        assert_eq!(import.row, ImportedRow::Created, "{import:?}");
+        let row = stores
+            .sessions
+            .load(session.id())
+            .await
+            .unwrap()
+            .expect("the row");
+        let document = serde_json::to_string(&row).unwrap();
+        assert!(
+            !document.contains(SCREENSHOT),
+            "the row holds the image inline"
+        );
+        let blob_id = meerkat_core::content_blob_id("image/png", SCREENSHOT);
+        assert!(document.contains(blob_id.as_str()), "{document}");
+        let blobs = crate::blob_store::Base64BlobStoreAdapter::new(Arc::new(
+            crate::blob_store::ObjectStoreBlobStore::local(dir.path().join("blobs")).unwrap(),
+        ));
+        let image = meerkat_core::BlobStore::get(&blobs, &blob_id)
+            .await
+            .expect("the image hydrates from blobs/");
+        assert_eq!(image.data, SCREENSHOT);
+
+        let again = import_session(&stores, &session).await.expect("the rerun");
+        assert_eq!(again.row, ImportedRow::Kept, "{again:?}");
+    }
 }
