@@ -1395,6 +1395,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Core-only tool on the same directory). Elsewhere on Linux it is detected:
   there the new runtime starts only when the kernel's lock table shows this
   process as the custody lock's only holder.
+- If a host drops a runtime without calling `shutdown()` and its tokio
+  runtime ends before the background teardown runs, the mob's member names
+  stay registered for the rest of the process, so rebuilding the same mob id
+  in that process is refused. Call `shutdown()` before ending the tokio
+  runtime, or rebuild under a new mob id.
 - `meta_gateway identity-reset` keeps no copy of the first-boot manifest it
   rewrites. If that file becomes unreadable, the copy
   `storage-migrate-native --apply` kept lacks the reset rows: run
