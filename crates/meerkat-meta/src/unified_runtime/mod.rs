@@ -5165,7 +5165,7 @@ mod tests {
         }
     }
 
-    fn capture_tracing<T>(body: impl FnOnce() -> T) -> (T, String) {
+    pub(super) fn capture_tracing<T>(body: impl FnOnce() -> T) -> (T, String) {
         let writer = CaptureWriter::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(writer.clone())

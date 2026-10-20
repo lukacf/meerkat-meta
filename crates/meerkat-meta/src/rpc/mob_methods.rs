@@ -995,7 +995,9 @@ pub(super) async fn handle_ensure_member(
                     // upstream; reconcile after every ensure so the crew
                     // topology converges regardless of the order hosts
                     // materialize members in. Inert without an edge policy;
-                    // idempotent otherwise.
+                    // idempotent otherwise. An incomplete reconcile pages and
+                    // logs each failed edge operation inside
+                    // `reconcile_edges`, so the report needs nothing here.
                     let _ = runtime.reconcile_edges().await;
                     let entries = handle.list_members_including_retiring().await;
                     let entry = entries.into_iter().find(|e| e.agent_identity == mid);
