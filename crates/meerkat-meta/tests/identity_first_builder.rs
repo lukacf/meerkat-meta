@@ -4319,7 +4319,7 @@ async fn the_continuity_mirror_copies_each_identity_current_session() {
 
     // The mirror follows committed state: wait until every turn and the
     // image's blob are in the copy.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     while !session_text("agent:alice")
         .is_some_and(|text| text.contains("mirror me") && text.contains("and a second turn"))
         || !session_text("agent:bob").is_some_and(|text| text.contains("bob's image"))
@@ -4335,7 +4335,7 @@ async fn the_continuity_mirror_copies_each_identity_current_session() {
     }
 
     // Shutdown stops the runtime-owned mirror itself, with a last round.
-    tokio::time::timeout(Duration::from_secs(60), runtime.shutdown())
+    tokio::time::timeout(Duration::from_mins(1), runtime.shutdown())
         .await
         .expect("shutdown with a mirror and no stop() from the host ends");
 
@@ -4677,7 +4677,7 @@ async fn the_continuity_mirror_keeps_its_copy_when_the_store_loses_a_session() {
         )
         .await
         .expect("turn");
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     let (session_id, copied) = loop {
         let records = mirror_lines(&mirror_dir, "records.jsonl");
         if let Some(record) = records.first() {
@@ -4750,7 +4750,7 @@ async fn the_continuity_mirror_keeps_its_copy_when_the_store_loses_a_session() {
     }
     // More rounds, then shutdown with its last round: the copy holds.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let _ = tokio::time::timeout(Duration::from_secs(60), runtime.shutdown()).await;
+    let _ = tokio::time::timeout(Duration::from_mins(1), runtime.shutdown()).await;
     let records = mirror_lines(&mirror_dir, "records.jsonl");
     assert_eq!(records.len(), 1, "the record stays: {records:?}");
     assert_eq!(records[0]["session_id"], session_id.as_str());
@@ -4768,36 +4768,53 @@ async fn the_continuity_mirror_keeps_its_copy_when_the_store_loses_a_session() {
 /// A dormant identity stays in the copy: retire keeps the member's history
 /// (its next wake resumes the same session), the archived session reads
 /// Revivable, and the mirror goes on copying it rather than holding it as a
-/// loss.
+/// loss. A fresh mirror on the next start, with no rows of its own, copies
+/// the dormant identity's session too: it can only do so by reading it.
 #[tokio::test]
 async fn the_continuity_mirror_keeps_copying_a_dormant_identity() {
     use meerkat_meta::unified_runtime::continuity_mirror::{
         ContinuityMirrorTimings, JsonlFileMirrorSink,
     };
     let tmp = tempfile::tempdir().unwrap();
-    let mirror_dir = tmp.path().join("mirror");
+    let root = tmp.path().join("root");
     let mob_id = unique_builder_mob_id();
-    let runtime = Box::pin(
+    let start = |mirror_dir: std::path::PathBuf| {
         UnifiedRuntimeBuilder::default()
             .definition(test_definition_with_id(&mob_id))
-            .persistent_state(tmp.path().join("root"))
+            .persistent_state(&root)
             .roster_provider(Arc::new(StubRosterProvider::new(vec![durable_spec(
                 "agent:alice",
             )])))
             .identity_runtime_instance_id("continuity-mirror-dormant-test")
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .continuity_mirror_with_timings(
-                Arc::new(JsonlFileMirrorSink::new(&mirror_dir)),
+                Arc::new(JsonlFileMirrorSink::new(mirror_dir)),
                 ContinuityMirrorTimings {
                     interval: Duration::from_millis(50),
                     put_deadline: Duration::from_secs(10),
                     stop_deadline: Duration::from_secs(10),
                 },
             )
-            .build(),
-    )
-    .await
-    .expect("build");
+            .build()
+    };
+    // The session id the copy in `dir` names for alice, once that session
+    // holds `text`.
+    let copied = |dir: &std::path::Path, text: &str| {
+        let records = mirror_lines(dir, "records.jsonl");
+        records.first().and_then(|record| {
+            let session_id = record["session_id"].as_str()?.to_string();
+            mirrored_session(dir, &session_id)
+                .filter(|session| {
+                    serde_json::to_string(session.messages())
+                        .unwrap()
+                        .contains(text)
+                })
+                .map(|_| session_id)
+        })
+    };
+
+    let mirror_dir = tmp.path().join("mirror");
+    let runtime = Box::pin(start(mirror_dir.clone())).await.expect("build");
     let identity = AgentIdentity::parse("agent:alice").unwrap();
     let identity_runtime = runtime.identity_runtime().expect("identity runtime");
     identity_runtime
@@ -4807,22 +4824,9 @@ async fn the_continuity_mirror_keeps_copying_a_dormant_identity() {
         )
         .await
         .expect("turn");
-    let copied = |text: &str| {
-        let records = mirror_lines(&mirror_dir, "records.jsonl");
-        records.first().and_then(|record| {
-            let session_id = record["session_id"].as_str()?.to_string();
-            mirrored_session(&mirror_dir, &session_id)
-                .filter(|session| {
-                    serde_json::to_string(session.messages())
-                        .unwrap()
-                        .contains(text)
-                })
-                .map(|_| session_id)
-        })
-    };
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     let session_id = loop {
-        if let Some(session_id) = copied("before the retire") {
+        if let Some(session_id) = copied(&mirror_dir, "before the retire") {
             break session_id;
         }
         assert!(
@@ -4843,16 +4847,42 @@ async fn the_continuity_mirror_keeps_copying_a_dormant_identity() {
     );
     assert_eq!(counts.failures.load(Ordering::Relaxed), 0);
     assert_eq!(
-        copied("before the retire").as_deref(),
+        copied(&mirror_dir, "before the retire").as_deref(),
         Some(session_id.as_str())
     );
-    tokio::time::timeout(Duration::from_secs(60), runtime.shutdown())
+    tokio::time::timeout(Duration::from_mins(1), runtime.shutdown())
         .await
         .expect("shutdown");
     assert_eq!(
-        copied("before the retire").as_deref(),
+        copied(&mirror_dir, "before the retire").as_deref(),
         Some(session_id.as_str())
     );
+
+    // The next start, with a new mirror directory: the first round has no
+    // last rows to keep, so the dormant session is in the copy only if the
+    // round read it.
+    let mirror_dir = tmp.path().join("mirror-after-restart");
+    let runtime = Box::pin(start(mirror_dir.clone()))
+        .await
+        .expect("restart over the dormant identity");
+    let counts = runtime.continuity_mirror_counts().await.expect("mirror");
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    while copied(&mirror_dir, "before the retire").as_deref() != Some(session_id.as_str()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a fresh mirror never copied the dormant session: records {:?}, not mirrored {}, \
+             failures {}",
+            mirror_lines(&mirror_dir, "records.jsonl"),
+            counts.not_mirrored.load(Ordering::Relaxed),
+            counts.failures.load(Ordering::Relaxed),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(counts.not_mirrored.load(Ordering::Relaxed), 0);
+    assert_eq!(counts.failures.load(Ordering::Relaxed), 0);
+    tokio::time::timeout(Duration::from_mins(1), runtime.shutdown())
+        .await
+        .expect("shutdown after the restart");
 }
 
 /// A mirror on a runtime that is not identity-first would copy nothing, so
@@ -4982,7 +5012,7 @@ async fn a_continuity_mirror_blob_the_sink_refuses_holds_back_only_its_session()
 
     // While the sink refuses blobs, alice's image turn is held and bob's turn
     // goes out: alice keeps her last rows, if she has any.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     while sink.refused.load(Ordering::SeqCst) == 0
         || !session_text("agent:bob").is_some_and(|text| text.contains("bob's plain turn"))
     {
@@ -5002,7 +5032,7 @@ async fn a_continuity_mirror_blob_the_sink_refuses_holds_back_only_its_session()
 
     // Once the sink takes blobs, alice's image turn follows with its blob.
     sink.refusing.store(false, Ordering::SeqCst);
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     while !session_text("agent:alice").is_some_and(|text| text.contains("alice's image")) {
         assert!(
             std::time::Instant::now() < deadline,
@@ -5024,7 +5054,7 @@ async fn a_continuity_mirror_blob_the_sink_refuses_holds_back_only_its_session()
         session_text("agent:bob").is_some_and(|text| text.contains("bob's plain turn")),
         "bob keeps his rows"
     );
-    tokio::time::timeout(Duration::from_secs(60), runtime.shutdown())
+    tokio::time::timeout(Duration::from_mins(1), runtime.shutdown())
         .await
         .expect("shutdown ends");
 }

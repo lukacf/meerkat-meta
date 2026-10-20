@@ -2,6 +2,8 @@
 //! read seam: one failing identity does not stall the others, the put
 //! sequence rises, and the copy never follows a loss.
 
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
 use std::sync::Mutex;
 
 use meerkat_core::Session;
@@ -14,7 +16,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 /// What the fake answers for one session.
 #[derive(Clone)]
 enum FakeLoad {
-    Active(Session),
+    Active(Box<Session>),
     Absent,
     Fails,
 }
@@ -71,7 +73,7 @@ impl MirrorRead for FakeRead {
             .get(&session_id.to_string())
             .cloned()
         {
-            Some(FakeLoad::Active(session)) => Ok(ResumeSessionLoad::Active(Box::new(session))),
+            Some(FakeLoad::Active(session)) => Ok(ResumeSessionLoad::Active(session)),
             Some(FakeLoad::Absent) | None => Ok(ResumeSessionLoad::Absent),
             Some(FakeLoad::Fails) => Err(format!("session {session_id}: the store failed")),
         }
@@ -117,6 +119,10 @@ fn with_message(mut session: Session, text: &str) -> Session {
     session
 }
 
+fn active(session: Session) -> FakeLoad {
+    FakeLoad::Active(Box::new(session))
+}
+
 async fn run_round(
     read: &FakeRead,
     sink: &Updates,
@@ -152,7 +158,7 @@ async fn one_failing_identity_does_not_stall_the_others() -> TestResult {
     let (bob_session_id, bob_session) = session("bob");
     read.bind("agent:alice", &alice_session_id, 1);
     read.bind("agent:bob", &bob_session_id, 1);
-    read.answer(&alice_session_id, FakeLoad::Active(alice_session.clone()));
+    read.answer(&alice_session_id, active(alice_session.clone()));
     read.answer(&bob_session_id, FakeLoad::Fails);
 
     // Bob's read fails: alice still goes out, bob is counted.
@@ -170,19 +176,20 @@ async fn one_failing_identity_does_not_stall_the_others() -> TestResult {
 
     // Bob recovers: he goes out, and alice's unchanged session is not sent
     // again.
-    read.answer(&bob_session_id, FakeLoad::Active(bob_session));
+    read.answer(&bob_session_id, active(bob_session));
     run_round(&read, &sink, &mut state, &counts).await;
-    let accepted = sink.accepted.lock().unwrap();
-    assert_eq!(accepted.len(), 2);
-    assert_eq!(identities(&accepted[1]), ["agent:alice", "agent:bob"]);
-    assert_eq!(changed(&accepted[1]), [bob_session_id.to_string().as_str()]);
+    {
+        let accepted = sink.accepted.lock().unwrap();
+        assert_eq!(accepted.len(), 2);
+        assert_eq!(identities(&accepted[1]), ["agent:alice", "agent:bob"]);
+        assert_eq!(changed(&accepted[1]), [bob_session_id.to_string().as_str()]);
+    }
 
     // Then bob fails again after being copied: he keeps his last rows.
-    drop(accepted);
     read.answer(&bob_session_id, FakeLoad::Fails);
     read.answer(
         &alice_session_id,
-        FakeLoad::Active(with_message(alice_session, "alice again")),
+        active(with_message(alice_session, "alice again")),
     );
     run_round(&read, &sink, &mut state, &counts).await;
     let accepted = sink.accepted.lock().unwrap();
@@ -203,11 +210,11 @@ async fn the_put_sequence_rises_over_puts() -> TestResult {
     let mut state = MirrorState::default();
     let (session_id, first) = session("first");
     read.bind("agent:alice", &session_id, 1);
-    read.answer(&session_id, FakeLoad::Active(first.clone()));
+    read.answer(&session_id, active(first.clone()));
     run_round(&read, &sink, &mut state, &counts).await;
     // Nothing changed: no put.
     run_round(&read, &sink, &mut state, &counts).await;
-    read.answer(&session_id, FakeLoad::Active(with_message(first, "second")));
+    read.answer(&session_id, active(with_message(first, "second")));
     run_round(&read, &sink, &mut state, &counts).await;
     let accepted = sink.accepted.lock().unwrap();
     assert_eq!(accepted.len(), 2, "an unchanged round puts nothing");
@@ -230,7 +237,7 @@ async fn an_absent_session_under_the_same_binding_keeps_its_rows() -> TestResult
     let mut state = MirrorState::default();
     let (session_id, copied) = session("keep me");
     read.bind("agent:alice", &session_id, 1);
-    read.answer(&session_id, FakeLoad::Active(copied));
+    read.answer(&session_id, active(copied));
     run_round(&read, &sink, &mut state, &counts).await;
 
     // The store loses the session, the binding stays: the record stays.
@@ -249,7 +256,7 @@ async fn an_absent_session_under_the_same_binding_keeps_its_rows() -> TestResult
     // The binding moves to a new session: now the old rows are replaced.
     let (moved_id, moved) = session("after a reset");
     read.bind("agent:alice", &moved_id, 2);
-    read.answer(&moved_id, FakeLoad::Active(moved));
+    read.answer(&moved_id, active(moved));
     run_round(&read, &sink, &mut state, &counts).await;
     let accepted = sink.accepted.lock().unwrap();
     assert_eq!(accepted.len(), 2);
