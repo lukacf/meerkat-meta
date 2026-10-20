@@ -1437,6 +1437,74 @@ async fn identity_first_builder_lazy_console_lists_and_inspects_dormant_identiti
     );
 }
 
+/// The console identity list answers Core's member id on a live identity's
+/// row, the value `meta/status_identity` answers: the live roster row the
+/// list prefers keeps the durable row's member id of the same binding.
+#[tokio::test]
+async fn the_console_identity_list_answers_a_live_identity_member_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mob_id = unique_builder_mob_id();
+    let runtime = Arc::new(
+        Box::pin(
+            UnifiedRuntimeBuilder::default()
+                .definition(test_definition_with_id(&mob_id))
+                .persistent_state(tmp.path().join("root"))
+                .roster_provider(Arc::new(StubRosterProvider::new(vec![durable_spec(
+                    "agent:alice",
+                )])))
+                .identity_runtime_instance_id("console-member-id-test")
+                .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+                .build(),
+        )
+        .await
+        .expect("build"),
+    );
+    let identity = AgentIdentity::parse("agent:alice").unwrap();
+    let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+    identity_runtime
+        .send(
+            &identity,
+            &meerkat_core::ContentInput::Text("make me live".to_string()),
+        )
+        .await
+        .expect("turn");
+    let status = identity_runtime.status(&identity).await.expect("status");
+    assert!(
+        status.agent_runtime_id.is_some(),
+        "alice is live: {status:?}"
+    );
+    let member_id = status
+        .member_id
+        .clone()
+        .expect("a bound identity has a member id");
+
+    let aggregator = MetaConsoleAggregator::in_memory();
+    aggregator.register_runtime(ConsoleRuntimeRegistration {
+        runtime_key: "runtime-a".to_string(),
+        runtime: runtime.clone(),
+        identity_namespace: "prod".to_string(),
+        visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
+    });
+    let records = aggregator
+        .list_identities()
+        .await
+        .expect("console identity list");
+    let alice = records
+        .iter()
+        .filter(|record| record.identity == "prod/agent:alice")
+        .collect::<Vec<_>>();
+    assert_eq!(alice.len(), 1, "one row for alice: {records:#?}");
+    assert_eq!(
+        alice[0].member_id.as_deref(),
+        Some(member_id.as_str()),
+        "{records:#?}"
+    );
+    drop(identity_runtime);
+    tokio::time::timeout(Duration::from_mins(1), runtime.shutdown())
+        .await
+        .expect("shutdown");
+}
+
 #[tokio::test]
 async fn identity_first_builder_rejects_zero_background_warm_concurrency() {
     let tmp = tempfile::tempdir().unwrap();

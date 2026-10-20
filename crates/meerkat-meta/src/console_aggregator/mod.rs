@@ -4200,8 +4200,18 @@ fn dedupe_identity_records(records: Vec<ConsoleIdentityRecord>) -> Vec<ConsoleId
                 &record.runtime_member_id,
             ))
             .and_modify(|current| {
+                let member_id = current
+                    .member_id
+                    .clone()
+                    .or_else(|| record.member_id.clone());
                 if identity_record_prefer(&record, current) {
                     *current = record.clone();
+                }
+                // Core's member id of the binding comes from the durable row;
+                // the live roster row of the same binding, which the list
+                // prefers, carries none, so the merged row keeps it.
+                if current.member_id.is_none() {
+                    current.member_id = member_id;
                 }
             })
             .or_insert(record);
@@ -11810,6 +11820,50 @@ comms = true
             dedupe_identity_records(vec![durable, other_generation, live]).len(),
             3,
             "two generations of the binding stay apart, and the roster row realizes neither alone"
+        );
+    }
+
+    #[test]
+    fn dedupe_identity_records_keeps_the_durable_member_id_when_the_live_row_wins() {
+        // The durable row carries Core's member id of the binding (the
+        // census and `meta/status_identity` value); the live roster
+        // projection of the same binding, which the list prefers, has none.
+        let member_id = crate::member_comms_id::roster_member_id_for_identity("review:singleton")
+            .as_str()
+            .to_string();
+        let mut durable = identity_record_for_test("test/review:singleton");
+        durable.runtime_member_id = "rt:review:singleton:0".to_string();
+        durable.member_id = Some(member_id.clone());
+        let mut live = identity_record_for_test("test/review:singleton");
+        live.runtime_member_id = "review:singleton".to_string();
+        live.labels
+            .insert("agent_identity".to_string(), "review:singleton".to_string());
+
+        for records in [
+            vec![durable.clone(), live.clone()],
+            vec![live.clone(), durable.clone()],
+        ] {
+            let records = dedupe_identity_records(records);
+            assert_eq!(records.len(), 1, "{records:#?}");
+            assert_eq!(records[0].runtime_member_id, "rt:review:singleton:0");
+            assert_eq!(
+                records[0].member_id.as_deref(),
+                Some(member_id.as_str()),
+                "the merged row keeps the binding's member id: {records:#?}"
+            );
+        }
+
+        // A roster row on another session is another binding: it never takes
+        // the durable row's member id.
+        let mut other_session = live;
+        other_session.session_id = Some("session-other".to_string());
+        let records = dedupe_identity_records(vec![durable, other_session]);
+        assert_eq!(records.len(), 2, "{records:#?}");
+        assert!(
+            records.iter().any(|record| {
+                record.session_id.as_deref() == Some("session-other") && record.member_id.is_none()
+            }),
+            "{records:#?}"
         );
     }
 

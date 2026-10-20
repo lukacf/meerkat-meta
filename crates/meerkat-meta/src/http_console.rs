@@ -7549,7 +7549,7 @@ fn console_identity_inspect_json_from_identity_status(
         .map(crate::identity_first::AgentRuntimeId::as_str)
         .map(ToString::to_string)
         .or_else(|| live_alias.map(|alias| alias.runtime_member_id.clone()));
-    json!({
+    let mut value = json!({
         "identity": status.identity.as_str(),
         "state": status.state.wire_str(),
         "role": status.profile.as_ref().map(ProfileName::as_str),
@@ -7565,7 +7565,13 @@ fn console_identity_inspect_json_from_identity_status(
         "topology_peers": topology_peers,
         "output_preview": Value::Null,
         "response_phase": response_phase,
-    })
+    });
+    // Core's mob member id of the identity's binding, as on
+    // `meta/status_identity`: present only when Core holds one.
+    if let Some(member_id) = status.member_id.as_ref() {
+        value["member_id"] = json!(member_id);
+    }
+    value
 }
 
 fn console_identity_inspect_json_from_record(
@@ -7573,7 +7579,7 @@ fn console_identity_inspect_json_from_record(
     response_phase: Option<String>,
 ) -> Value {
     let record = &inspection.identity;
-    json!({
+    let mut value = json!({
         "identity": record.identity,
         "state": record.health,
         "role": record.labels.get("role"),
@@ -7588,7 +7594,11 @@ fn console_identity_inspect_json_from_record(
         "topology_peers": inspection.peers,
         "output_preview": Value::Null,
         "response_phase": response_phase,
-    })
+    });
+    if let Some(member_id) = record.member_id.as_ref() {
+        value["member_id"] = json!(member_id);
+    }
+    value
 }
 
 fn lifecycle_archive_cleanup_completed(error: &str) -> bool {
@@ -25494,6 +25504,83 @@ mod console_identity_row_keys_tests {
                     "the continuity object lost {key}: {row}"
                 );
             }
+        }
+    }
+
+    /// Every console identity row answers Core's member id of the identity's
+    /// binding when it has one, as `meta/status_identity` does, and omits it
+    /// when the identity has no binding.
+    #[test]
+    fn identity_rows_answer_the_binding_member_id() {
+        let bound: crate::identity_first::IdentityStatus = serde_json::from_value(json!({
+            "identity": "console:identity-row",
+            "state": "active",
+            "addressability": "addressable",
+            "generation": 4,
+            "member_id": "mk--console--identity-row",
+        }))
+        .expect("identity status");
+        let unbound: crate::identity_first::IdentityStatus = serde_json::from_value(json!({
+            "identity": "console:identity-row",
+            "state": "active",
+            "addressability": "addressable",
+        }))
+        .expect("identity status");
+        for row in [
+            console_identity_status_json_from_identity_status(&bound, None),
+            console_identity_inspect_json_from_identity_status(&bound, None, None),
+        ] {
+            assert_eq!(
+                row["member_id"],
+                json!("mk--console--identity-row"),
+                "{row}"
+            );
+        }
+        for row in [
+            console_identity_status_json_from_identity_status(&unbound, None),
+            console_identity_inspect_json_from_identity_status(&unbound, None, None),
+        ] {
+            assert!(row.get("member_id").is_none(), "{row}");
+        }
+
+        let mut record = crate::console_aggregator::ConsoleIdentityRecord {
+            identity: "console:identity-row".to_string(),
+            display_name: "Identity row".to_string(),
+            runtime_key: "runtime".to_string(),
+            runtime_member_id: "rt:console:identity-row:4".to_string(),
+            session_id: Some("session-1".to_string()),
+            member_id: Some("mk--console--identity-row".to_string()),
+            visibility: crate::console_aggregator::ConsoleVisibility::Addressable,
+            addressable: true,
+            health: "ready".to_string(),
+            topology_peers: Vec::new(),
+            labels: std::collections::BTreeMap::new(),
+        };
+        let inspect_record = |record: &crate::console_aggregator::ConsoleIdentityRecord| {
+            console_identity_inspect_json_from_record(
+                &crate::console_aggregator::ConsoleIdentityInspection {
+                    identity: record.clone(),
+                    peers: Vec::new(),
+                },
+                None,
+            )
+        };
+        for row in [
+            console_identity_status_json_from_record(&record, None),
+            inspect_record(&record),
+        ] {
+            assert_eq!(
+                row["member_id"],
+                json!("mk--console--identity-row"),
+                "{row}"
+            );
+        }
+        record.member_id = None;
+        for row in [
+            console_identity_status_json_from_record(&record, None),
+            inspect_record(&record),
+        ] {
+            assert!(row.get("member_id").is_none(), "{row}");
         }
     }
 

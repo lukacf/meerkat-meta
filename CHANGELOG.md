@@ -920,8 +920,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Core's mob member id of the identity's last binding, live or retired (the
   roster member id: the identity itself when it is already a valid comms
   name, its `mk--...` encoding otherwise), from the same binding as
-  `session_id`, and absent when Core holds no binding; identity records of
-  `meta/console/list_identities` carry it too. Both SDKs read it
+  `session_id`, and absent when Core holds no binding, on the SDK gateway
+  and the console gateway alike; identity records of
+  `meta/console/list_identities` carry it too, for a live identity as for a
+  dormant one. Both SDKs read it
   (`IdentityStatus.member_id` and `IdentityInspection.member_id`, TypeScript
   `memberId`; Python `ConsoleIdentityRecord.member_id`). Read-only and
   additive on the wire.
