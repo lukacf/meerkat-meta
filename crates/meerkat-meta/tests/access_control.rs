@@ -458,7 +458,7 @@ fn unchanged_experience_preserves_publication_but_changed_member_attributes_inva
     );
 
     experience_for(&controller, "root@example.test", &snapshot);
-    let (_, stamp) = publication.observe(|| ()).expect("primed publication");
+    let ((), stamp) = publication.observe(|| ()).expect("primed publication");
     // Recording the exact expected values must be a no-op. This checks the
     // final member's alias/role/labels, the agent-only row and unrelated cache.
     let mut expected = AgentResourceAttributes {
@@ -492,7 +492,7 @@ fn unchanged_experience_preserves_publication_but_changed_member_attributes_inva
         stamp.check_current(),
         Err(PublicationError::Changed)
     ));
-    let (_, changed) = publication.observe(|| ()).expect("changed publication");
+    let ((), changed) = publication.observe(|| ()).expect("changed publication");
     expected.labels = snapshot.members[1].labels.clone();
     expected.role = Some("reviewer".to_string());
     controller.record_agent_attributes(expected);

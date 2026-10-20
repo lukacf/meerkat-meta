@@ -1089,6 +1089,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Access attributes of the live members of agent-created sub-mobs are now
+  the same on every route and every console, as the console experience
+  records them: the runtime alias as the agent id, the roster role, and the
+  roster and registered labels plus `delegate_host_identity`, `group`
+  (`Coordinators` when neither the roster nor the spawn registry sets one)
+  and `source_mob_id`. Before, the roster priming of the stream, RPC, send and
+  timeline routes and of app calls recorded such a member with the spawn
+  registry's value only (no agent id, the registered `role` label, the
+  registered labels), while a console showing implicit delegates recorded the
+  member's value, so the cached attributes depended on which route recorded
+  them last. Label and role rules on these attributes now apply to these
+  members on every console, including consoles that do not show implicit
+  delegates. Lineage labels still come only from the spawn registry. A
+  sub-mob member never replaces the value of a primary member that has the
+  same runtime alias or durable identity, on any route. An identity known
+  only to the spawn registry, with no live member, keeps the registry's
+  value.
+
 - Requires Meerkat 0.9.4: every Meerkat dependency is pinned to `=0.9.4`.
 - `/console/experience` takes an identity-first member's session from the
   identity runtime, the owner `/console/identities` reads, and never serves
@@ -1212,16 +1230,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- Polling an unchanged console roster no longer changes the shared access
-  facts. For each identity that is both a listed agent and a roster member,
-  every console request recorded the agent's attributes (without labels) and
-  then the member's, so it changed the cached attributes twice and published
-  two access changes although nothing had changed. Any observation made under
-  the joined authorization publication in between stopped checking current,
-  and an operation bound to it was refused as changed. A request now records
-  each identity's final attributes once, the member's taking precedence over
-  the agent entry as before. A real change of a member's labels, role or
-  agent id still publishes.
+- An unchanged roster no longer changes the shared access facts, whichever
+  console route records them. Every console experience request recorded an
+  identity that is both a listed agent and a roster member twice: the
+  agent's attributes (without labels), then the member's. The roster priming
+  of the stream, RPC, send and timeline routes recorded two roster entries
+  under one durable identity in turn, merging the spawn registry's labels
+  into the first only, and an app call for a live identity-first member
+  recorded the member a second time from its identity status. Each of these
+  changed the cached attributes and published an access change although
+  nothing had changed, and alternating routes did so on every request. Any
+  observation made under the joined authorization publication in between
+  stopped checking current, and an operation bound to it was refused as
+  changed. Every route now records one final value per identity, the one the
+  console experience records: a member's attributes take precedence over the
+  agent entry, the last member under a durable identity wins, and an app call
+  does not record a live member again. A real change of a member's labels,
+  role or agent id still publishes.
 
 - A console voice open made while another live open on the same gateway was
   still being set up answered `voice_host_failed` ("Voice host operation

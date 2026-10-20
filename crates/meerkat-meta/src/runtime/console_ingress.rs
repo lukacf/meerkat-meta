@@ -466,20 +466,65 @@ fn prime_access_attributes(controller: &AccessController, snapshot: &ConsoleLive
             },
         );
     }
-    for member in &snapshot.members {
-        let identity = console_member_console_identity(member).to_string();
-        attributes.insert(
-            identity.clone(),
-            AgentResourceAttributes {
-                identity,
-                agent_id: Some(member.agent_identity.clone()),
-                role: Some(member.role.clone()),
-                labels: member.labels.clone(),
-            },
-        );
-    }
+    attributes.extend(fold_console_member_attributes(snapshot.members.iter().map(
+        |member| {
+            console_member_access_attributes(&member.agent_identity, &member.role, &member.labels)
+        },
+    )));
     for attributes in attributes.into_values() {
         controller.record_agent_attributes(attributes);
+    }
+}
+
+/// One final access value per console identity from live members listed as
+/// the console lists them, primary members first. A member whose runtime
+/// alias an earlier member holds is skipped, as the console shows the first
+/// one. A member of an agent-created sub-mob (it carries
+/// `delegate_host_identity`) never replaces a primary member's value under
+/// the same identity. Otherwise the last member under an identity wins. The
+/// console experience and every route's roster priming fold through this, so
+/// they record the same value.
+pub(crate) fn fold_console_member_attributes(
+    members: impl IntoIterator<Item = AgentResourceAttributes>,
+) -> std::collections::BTreeMap<String, AgentResourceAttributes> {
+    let mut seen_aliases = std::collections::BTreeSet::new();
+    let mut primary_identities = std::collections::BTreeSet::new();
+    let mut folded = std::collections::BTreeMap::new();
+    for attributes in members {
+        if let Some(alias) = attributes.agent_id.as_ref()
+            && !seen_aliases.insert(alias.clone())
+        {
+            continue;
+        }
+        let sub_mob_member = attributes.labels.contains_key("delegate_host_identity");
+        if sub_mob_member && primary_identities.contains(&attributes.identity) {
+            continue;
+        }
+        if !sub_mob_member {
+            primary_identities.insert(attributes.identity.clone());
+        }
+        folded.insert(attributes.identity.clone(), attributes);
+    }
+    folded
+}
+
+/// The access attributes recorded for a live member: its console identity
+/// (the durable identity label, else the runtime alias), the alias, its role
+/// and its console labels. Every route that records a live member records
+/// this value, so the cached attributes never depend on which route recorded
+/// them last.
+pub(crate) fn console_member_access_attributes(
+    agent_identity: &str,
+    role: &str,
+    labels: &std::collections::BTreeMap<String, String>,
+) -> AgentResourceAttributes {
+    AgentResourceAttributes {
+        identity: crate::member_comms_id::durable_identity_label(labels)
+            .unwrap_or(agent_identity)
+            .to_string(),
+        agent_id: Some(agent_identity.to_string()),
+        role: Some(role.to_string()),
+        labels: labels.clone(),
     }
 }
 

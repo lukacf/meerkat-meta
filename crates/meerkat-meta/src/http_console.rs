@@ -12763,21 +12763,15 @@ async fn walk_console_snapshot_read_model(
             if processed.contains(mob_id.as_str()) {
                 continue;
             }
-            // Meerkat 0.7: the owner bridge binding is machine-owned state,
-            // no longer a definition-level index.
-            let Some(owner_authority) = delegate_handle.owner_bridge_session_lifecycle_authority()
-            else {
-                processed.insert(mob_id.to_string());
-                continue;
-            };
-            let owner_session_id = owner_authority.bridge_session_id.to_string();
-            let Some(host_identity) = state
-                .session_owner_by_id
-                .get(owner_session_id.as_str())
-                .cloned()
-            else {
-                continue;
-            };
+            let host_identity =
+                match delegate_mob_host(&delegate_handle, &state.session_owner_by_id) {
+                    DelegateMobHost::NotMemberOwned => {
+                        processed.insert(mob_id.to_string());
+                        continue;
+                    }
+                    DelegateMobHost::OwnerUnknown => continue,
+                    DelegateMobHost::Host(host_identity) => host_identity,
+                };
             collect_console_session_index_for_handle(&delegate_handle, &mut state).await;
             let (delegate_members, _delegate_owner_index) = project_console_members_from_handle(
                 &delegate_handle,
@@ -12799,6 +12793,33 @@ async fn walk_console_snapshot_read_model(
     }
     state.delegate_member_groups = delegate_groups;
     state
+}
+
+/// How the console treats an agent-created sub-mob in its snapshot walk.
+enum DelegateMobHost {
+    /// The mob has no owner bridge session: it is never a delegate group.
+    NotMemberOwned,
+    /// The owning session belongs to no member indexed yet.
+    OwnerUnknown,
+    /// The mob is the delegate group of the member owning its session.
+    Host(String),
+}
+
+/// The member hosting `delegate_handle` as a delegate group: the member whose
+/// bridge session owns the mob, looked up in `session_owner_by_id`.
+fn delegate_mob_host(
+    delegate_handle: &MobHandle,
+    session_owner_by_id: &BTreeMap<String, String>,
+) -> DelegateMobHost {
+    // Meerkat 0.7: the owner bridge binding is machine-owned state, no longer
+    // a definition-level index.
+    let Some(owner_authority) = delegate_handle.owner_bridge_session_lifecycle_authority() else {
+        return DelegateMobHost::NotMemberOwned;
+    };
+    session_owner_by_id
+        .get(owner_authority.bridge_session_id.to_string().as_str())
+        .cloned()
+        .map_or(DelegateMobHost::OwnerUnknown, DelegateMobHost::Host)
 }
 
 async fn collect_console_session_index_for_handle(
@@ -13693,10 +13714,14 @@ fn baseline_spec_visible_to_console(
 /// so it never clears delegate-member attributes primed by the experience
 /// projection; the experience path owns wholesale rebuild + eviction.
 ///
-/// Console metadata registered by agent-tool spawns (`spawned_by` lineage,
-/// spawn labels) fills label gaps the roster does not carry, and identities
-/// known only to the spawn registry (e.g. members of agent-created sub-mobs)
-/// are primed registry-only so lineage rules resolve for them too.
+/// Each member is recorded as the console experience records it: one final
+/// value per console identity, with the console's labels (console metadata
+/// registered by agent-tool spawns, such as `spawned_by` lineage and spawn
+/// labels, fills the gaps the roster does not carry). The members of
+/// agent-created sub-mobs are recorded the same way, with their delegate host
+/// and source mob, so an identity never holds a different value depending on
+/// which route recorded it last. An identity known only to the spawn registry
+/// is primed registry-only, so lineage rules resolve for it too.
 pub(crate) async fn prime_access_cache_from_runtime(
     runtime: &MobRuntime,
     access: &AccessController,
@@ -13704,8 +13729,7 @@ pub(crate) async fn prime_access_cache_from_runtime(
     if !access.enabled() {
         return;
     }
-    let registered = runtime.console_identity_labels().await;
-    prime_access_cache_from_handle_with_registry(&runtime.handle(), access, &registered).await;
+    prime_access_cache_from_runtime_in_namespace(runtime, access, "").await;
     if let Some(identity_runtime) = runtime.installed_identity_runtime() {
         prime_current_runtime_aliases(&identity_runtime, access).await;
     }
@@ -13747,15 +13771,12 @@ pub(crate) async fn prime_access_cache_from_handle(handle: &MobHandle, access: &
     if !access.enabled() {
         return;
     }
-    prime_access_cache_from_handle_with_registry(handle, access, &BTreeMap::new()).await;
-}
-
-async fn prime_access_cache_from_handle_with_registry(
-    handle: &MobHandle,
-    access: &AccessController,
-    registered: &BTreeMap<String, BTreeMap<String, String>>,
-) {
-    prime_access_cache_from_handle_with_registry_namespace(handle, access, registered, "").await;
+    let registered = BTreeMap::new();
+    let mut roster_identities = BTreeSet::new();
+    let members =
+        live_member_access_attributes(handle, None, None, &registered, &mut roster_identities)
+            .await;
+    record_live_and_registered_attributes(access, members, &registered, &roster_identities, "");
 }
 
 fn namespace_console_identity(identity: &str, namespace: &str) -> String {
@@ -13781,42 +13802,109 @@ fn namespace_console_attributes(
     attributes
 }
 
-async fn prime_access_cache_from_handle_with_registry_namespace(
-    handle: &MobHandle,
+/// Record the access attributes of `runtime`'s live members as the console
+/// experience records them, one final value per console identity, and the
+/// spawn registry's attributes for each registered identity no live member
+/// names. The members of agent-created sub-mobs count as live members,
+/// found and labelled as the console's snapshot finds and labels them.
+/// Returns the recorded live identities, namespaced.
+async fn prime_access_cache_from_runtime_in_namespace(
+    runtime: &MobRuntime,
     access: &AccessController,
-    registered: &BTreeMap<String, BTreeMap<String, String>>,
     namespace: &str,
-) {
-    let mut registry_only: BTreeMap<&String, &BTreeMap<String, String>> =
-        registered.iter().collect();
-    for entry in handle.list_all_members().await {
-        // Roster ids are comms-safe encodings (meerkat 0.7); the console/ABAC
-        // attribute space uses the public alias.
-        let member_identity =
-            crate::member_comms_id::runtime_alias_str(entry.agent_identity.as_str()).into_owned();
-        // Console identity may be overridden by a label, mirroring
-        // `console_member_console_identity`.
-        let console_identity = crate::member_comms_id::durable_identity_label(&entry.labels)
-            .map_or_else(|| member_identity.clone(), ToString::to_string);
-        let mut labels = entry.labels.clone();
-        // Roster labels are caller-controlled; only the spawn registry may
-        // assert lineage, or a spoofed `spawned_by` could mint inherited
-        // visibility (or hide a member behind a denied parent).
-        crate::console_spawn::sanitize_unverified_lineage_labels(&mut labels);
-        if let Some(spawn_labels) = registry_only.remove(&console_identity) {
-            crate::console_spawn::merge_registered_labels(&mut labels, spawn_labels);
-        }
-        access.record_agent_attributes(namespace_console_attributes(
-            AgentResourceAttributes {
-                identity: console_identity,
-                agent_id: Some(member_identity),
-                role: Some(entry.role.to_string()),
-                labels,
-            },
-            namespace,
-        ));
+) -> BTreeSet<String> {
+    let registered = runtime.console_identity_labels().await;
+    let mut roster_identities = BTreeSet::new();
+    let mut members = live_member_access_attributes(
+        &runtime.handle(),
+        None,
+        None,
+        &registered,
+        &mut roster_identities,
+    )
+    .await;
+    for (mob_id, delegate_handle, host_identity) in delegate_mobs_with_hosts(runtime).await {
+        members.extend(
+            live_member_access_attributes(
+                &delegate_handle,
+                Some(host_identity.as_str()),
+                Some(mob_id.as_str()),
+                &registered,
+                &mut roster_identities,
+            )
+            .await,
+        );
     }
-    for (identity, spawn_labels) in registry_only {
+    record_live_and_registered_attributes(
+        access,
+        members,
+        &registered,
+        &roster_identities,
+        namespace,
+    )
+}
+
+/// The access attributes of the members the console lists for `handle`
+/// (operationally visible members, including retiring ones), each as the
+/// console projects the member ([`projected_console_member_labels`] and
+/// [`crate::runtime::console_member_access_attributes`]). Adds the console
+/// identity of every structural roster row to `roster_identities`, so a row
+/// the console does not list keeps its last recorded value instead of the
+/// spawn registry's.
+async fn live_member_access_attributes(
+    handle: &MobHandle,
+    host_identity: Option<&str>,
+    source_mob_id: Option<&str>,
+    registered: &BTreeMap<String, BTreeMap<String, String>>,
+    roster_identities: &mut BTreeSet<String>,
+) -> Vec<AgentResourceAttributes> {
+    for entry in handle.list_all_members().await {
+        let alias = crate::member_comms_id::runtime_alias_str(entry.agent_identity.as_str());
+        roster_identities.insert(
+            crate::member_comms_id::durable_identity_label(&entry.labels)
+                .unwrap_or(alias.as_ref())
+                .to_string(),
+        );
+    }
+    handle
+        .list_members_including_retiring()
+        .await
+        .into_iter()
+        .map(|entry| {
+            // Roster ids are comms-safe encodings (meerkat 0.7); the
+            // console/ABAC attribute space uses the public alias.
+            let alias = crate::member_comms_id::runtime_alias_str(entry.agent_identity.as_str())
+                .into_owned();
+            let labels = projected_console_member_labels(
+                &entry.labels,
+                &alias,
+                host_identity,
+                source_mob_id,
+                registered,
+            );
+            crate::runtime::console_member_access_attributes(&alias, entry.role.as_str(), &labels)
+        })
+        .collect()
+}
+
+/// Record `members` (primary members first) one final value per console
+/// identity, folded as the console experience folds them
+/// ([`crate::runtime::fold_console_member_attributes`]), then the spawn
+/// registry's attributes for each registered identity that neither a member
+/// nor a roster row in `roster_identities` names. Returns the recorded member
+/// identities, namespaced.
+fn record_live_and_registered_attributes(
+    access: &AccessController,
+    members: Vec<AgentResourceAttributes>,
+    registered: &BTreeMap<String, BTreeMap<String, String>>,
+    roster_identities: &BTreeSet<String>,
+    namespace: &str,
+) -> BTreeSet<String> {
+    let final_by_identity = crate::runtime::fold_console_member_attributes(members);
+    for (identity, spawn_labels) in registered {
+        if final_by_identity.contains_key(identity) || roster_identities.contains(identity) {
+            continue;
+        }
         access.record_agent_attributes(namespace_console_attributes(
             AgentResourceAttributes {
                 identity: identity.clone(),
@@ -13827,6 +13915,92 @@ async fn prime_access_cache_from_handle_with_registry_namespace(
             namespace,
         ));
     }
+    let mut recorded = BTreeSet::new();
+    for attributes in final_by_identity.into_values() {
+        let attributes = namespace_console_attributes(attributes, namespace);
+        recorded.insert(attributes.identity.clone());
+        access.record_agent_attributes(attributes);
+    }
+    recorded
+}
+
+/// The agent-created sub-mobs the console shows as delegate groups, each
+/// with its host member, found as the console's snapshot walk finds them: a
+/// mob whose owner bridge session belongs to a member of the primary mob or
+/// of a sub-mob found before it.
+async fn delegate_mobs_with_hosts(runtime: &MobRuntime) -> Vec<(String, MobHandle, String)> {
+    let Some(mcp_state) = runtime.agent_mob_mcp_state() else {
+        return Vec::new();
+    };
+    let handle = runtime.handle();
+    let mut index = ConsoleSnapshotReadModelState::default();
+    collect_console_session_index_for_handle(&handle, &mut index).await;
+    let mut processed = BTreeSet::from([handle.mob_id().to_string()]);
+    let mut delegates = Vec::new();
+    loop {
+        let mut progressed = false;
+        for (mob_id, delegate_handle) in Box::pin(mcp_state.mob_handles_snapshot())
+            .await
+            .unwrap_or_default()
+        {
+            if processed.contains(mob_id.as_str()) {
+                continue;
+            }
+            match delegate_mob_host(&delegate_handle, &index.session_owner_by_id) {
+                DelegateMobHost::NotMemberOwned => {
+                    processed.insert(mob_id.to_string());
+                }
+                DelegateMobHost::OwnerUnknown => {}
+                DelegateMobHost::Host(host_identity) => {
+                    collect_console_session_index_for_handle(&delegate_handle, &mut index).await;
+                    processed.insert(mob_id.to_string());
+                    delegates.push((mob_id.to_string(), delegate_handle, host_identity));
+                    progressed = true;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    delegates
+}
+
+/// The console labels of one roster member, as the console projects them:
+/// the roster labels without unverified lineage, gaps filled from the spawn
+/// registry (looked up under the member's console identity), and, for a
+/// member of an agent-created sub-mob, its delegate host and source mob.
+/// Roster labels win, except lineage, which only the spawn registry may
+/// assert. The console's member rows and every route's access priming use
+/// this projection, so all of them record one value per identity.
+fn projected_console_member_labels(
+    roster_labels: &BTreeMap<String, String>,
+    alias: &str,
+    host_identity: Option<&str>,
+    source_mob_id: Option<&str>,
+    registered_labels: &BTreeMap<String, BTreeMap<String, String>>,
+) -> BTreeMap<String, String> {
+    let mut labels = roster_labels.clone();
+    crate::console_spawn::sanitize_unverified_lineage_labels(&mut labels);
+    let console_identity_key =
+        crate::member_comms_id::durable_identity_label(roster_labels).unwrap_or(alias);
+    if let Some(spawn_labels) = registered_labels.get(console_identity_key) {
+        crate::console_spawn::merge_registered_labels(&mut labels, spawn_labels);
+    }
+    if let Some(host_identity) = host_identity {
+        labels
+            .entry("delegate_host_identity".to_string())
+            .or_insert_with(|| host_identity.to_string());
+        labels
+            .entry("group".to_string())
+            .or_insert_with(|| "Coordinators".to_string());
+    }
+    if let Some(source_mob_id) = source_mob_id {
+        labels
+            .entry("source_mob_id".to_string())
+            .or_insert_with(|| source_mob_id.to_string());
+    }
+    labels
 }
 
 async fn project_console_members_from_handle(
@@ -13861,30 +14035,17 @@ async fn project_console_members_from_handle(
             handle.definition(),
             entry.role.as_str(),
         );
-        let mut labels = entry.labels.clone();
         // Spawn-time console metadata (group/display labels, spawned_by
         // lineage) fills gaps the roster does not carry; roster labels win —
         // except lineage, which only the spawn registry may assert (this
         // projection feeds the experience-path ABAC attribute rebuild).
-        crate::console_spawn::sanitize_unverified_lineage_labels(&mut labels);
-        let console_identity_key = crate::member_comms_id::durable_identity_label(&entry.labels)
-            .unwrap_or(identity.as_str());
-        if let Some(spawn_labels) = registered_labels.get(console_identity_key) {
-            crate::console_spawn::merge_registered_labels(&mut labels, spawn_labels);
-        }
-        if let Some(host_identity) = host_identity {
-            labels
-                .entry("delegate_host_identity".to_string())
-                .or_insert_with(|| host_identity.to_string());
-            labels
-                .entry("group".to_string())
-                .or_insert_with(|| "Coordinators".to_string());
-        }
-        if let Some(source_mob_id) = source_mob_id {
-            labels
-                .entry("source_mob_id".to_string())
-                .or_insert_with(|| source_mob_id.to_string());
-        }
+        let labels = projected_console_member_labels(
+            &entry.labels,
+            &identity,
+            host_identity,
+            source_mob_id,
+            registered_labels,
+        );
         let mut wired_to: Vec<String> = entry
             .wired_to
             .iter()
@@ -26552,5 +26713,551 @@ mod mob_announcement_console_access_tests {
                 "{method}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod console_access_priming_tests {
+    //! Every route records one final access value per console identity, so
+    //! alternating the console experience with the roster priming of the
+    //! stream, RPC, send and timeline routes publishes no access change while
+    //! the roster is unchanged.
+    use super::*;
+    use crate::access::{AccessControlConfig, AccessController, AgentResourceAttributes};
+    use crate::console_aggregator::AllowAllConsoleVisibilityPolicy;
+    use crate::mob_handle_runtime::MobRuntime;
+    use crate::runtime::{ConsoleLiveSnapshot, ConsoleRestJsonRequest};
+    use crate::{MobBootstrapOptions, MobBootstrapSpec};
+    use meerkat_authorization::publication::LocalAuthorizationPublication;
+    use meerkat_client::TestClient;
+    use meerkat_mob::{
+        AgentIdentity, MobDefinition, MobRuntimeMode, MobStorage, ProfileName, SpawnMemberSpec,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    async fn runtime(mob_id: &str, root: &std::path::Path) -> TestResult<MobRuntime> {
+        let definition = MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\n\
+             [profiles.worker.tools]\ncomms = true\n"
+        ))?;
+        let runtime = MobRuntime::bootstrap(
+            MobBootstrapSpec::ephemeral(
+                definition,
+                MobStorage::in_memory(),
+                root.to_path_buf(),
+                4,
+                None,
+            )
+            .expect("build the access priming fixture spec")
+            .with_options(MobBootstrapOptions {
+                allow_ephemeral_sessions: true,
+                notify_orchestrator_on_resume: true,
+                default_llm_client: Some(Arc::new(TestClient::default())),
+            }),
+        )
+        .await?;
+        Ok(runtime)
+    }
+
+    async fn turn_driven_member(
+        runtime: &MobRuntime,
+        member: &str,
+        labels: Option<BTreeMap<String, String>>,
+    ) -> TestResult {
+        let mut spec =
+            SpawnMemberSpec::new(ProfileName::from("worker"), AgentIdentity::from(member));
+        spec.runtime_mode = Some(MobRuntimeMode::TurnDriven);
+        spec.labels = labels;
+        runtime.handle().ensure_member(spec).await?;
+        Ok(())
+    }
+
+    fn joined_controller() -> TestResult<(AccessController, LocalAuthorizationPublication)> {
+        let controller = AccessController::new(AccessControlConfig {
+            enabled: true,
+            admins: vec!["root@example.test".to_string()],
+            ..AccessControlConfig::default()
+        })?;
+        let publication = LocalAuthorizationPublication::new();
+        controller
+            .join_authorization_publication(publication.clone())
+            .map_err(|_| "a fresh controller joins its first publication")?;
+        Ok((controller, publication))
+    }
+
+    /// One console experience request over the live roster, as a console
+    /// that shows the members of agent-created sub-mobs serves it.
+    async fn console_experience(
+        runtime: &MobRuntime,
+        controller: &AccessController,
+    ) -> ConsoleLiveSnapshot {
+        let (snapshot, _) = Box::pin(build_live_snapshot(
+            runtime,
+            &[],
+            None,
+            &AllowAllConsoleVisibilityPolicy,
+            &ConsoleSnapshotReadModel::default(),
+            None,
+        ))
+        .await;
+        let decisions = RuntimeDecisionState::local_console(
+            crate::ConsolePolicy {
+                require_app_auth: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let response = crate::runtime::handle_console_rest_json_route_with_snapshot_and_access(
+            &decisions,
+            &ConsoleRestJsonRequest {
+                method: "GET".to_string(),
+                path: "/console/experience".to_string(),
+                auth: Some(crate::ConsoleAccessRequest {
+                    provider: crate::AuthProvider::GoogleOAuth,
+                    email: "root@example.test".to_string(),
+                }),
+            },
+            Some(&snapshot),
+            Some(controller),
+        );
+        assert_eq!(response.status, 200, "experience: {:?}", response.body);
+        snapshot
+    }
+
+    /// A member of an agent-created sub-mob gets one access value whichever
+    /// route records it: the console experience shows it as its host's
+    /// delegate, and the roster priming records the same value, so
+    /// alternating the two publishes no access change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn console_and_roster_priming_record_one_value_for_a_sub_mob_member() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let runtime = runtime("access-priming-delegates", root.path()).await?;
+        turn_driven_member(&runtime, "lead", None).await?;
+        let lead_session = runtime
+            .handle()
+            .resolve_bridge_session_id(&AgentIdentity::from("lead"))
+            .await
+            .ok_or("the lead has a bridge session")?;
+        let mob_tools = runtime
+            .agent_mob_mcp_state()
+            .ok_or("the runtime carries agent mob tools")?;
+        let child_definition: MobDefinition = serde_json::from_value(json!({
+            "id": "access-priming-delegates-child",
+            "profiles": { "worker": {
+                "model": "gpt-5.5",
+                "runtime_mode": "turn_driven",
+                "tools": { "comms": true }
+            } }
+        }))?;
+        let child_id = Box::pin(mob_tools.mob_create_definition_with_owner_bridge_session(
+            child_definition,
+            lead_session,
+            true,
+            false,
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+        Box::pin(mob_tools.mob_spawn(
+            &child_id,
+            ProfileName::from("worker"),
+            AgentIdentity::from("helper"),
+            Some(MobRuntimeMode::TurnDriven),
+            None,
+            None,
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+        // The spawn registry knows the helper, as an agent-tool spawn
+        // records it.
+        let sink = crate::console_spawn::ConsoleSpawnSink::new(ConsoleEventStore::new());
+        runtime.install_console_spawn_sink(sink.clone());
+        sink.project_spawned_member(&crate::console_spawn::ConsoleSpawnSeed {
+            mob_id: Some(child_id.to_string()),
+            member_id: "helper".to_string(),
+            identity: "helper".to_string(),
+            initial_message: None,
+            // The spawn named the same role as the helper's roster role.
+            labels: BTreeMap::from([
+                ("display_name".to_string(), "Helper".to_string()),
+                ("role".to_string(), "worker".to_string()),
+            ]),
+            spawned_by: Some("lead".to_string()),
+            spawned_by_session: None,
+            via_tool: "mob_spawn_member".to_string(),
+        })
+        .await;
+
+        let (controller, publication) = joined_controller()?;
+        let snapshot = console_experience(&runtime, &controller).await;
+        assert!(
+            snapshot
+                .members
+                .iter()
+                .any(|member| member.agent_identity == "helper"
+                    && member
+                        .labels
+                        .get("delegate_host_identity")
+                        .map(String::as_str)
+                        == Some("lead")),
+            "the console shows the helper as the lead's delegate: {:?}",
+            snapshot.members
+        );
+        prime_access_cache_from_runtime(&runtime, &controller).await;
+        let quiet = publication
+            .observe(|| ())
+            .map_err(|_| "a quiet publication")?
+            .1;
+        for _ in 0..2 {
+            console_experience(&runtime, &controller).await;
+            prime_access_cache_from_runtime(&runtime, &controller).await;
+        }
+        assert!(
+            quiet.check_current().is_ok(),
+            "alternating the console experience and the roster priming publishes no access change"
+        );
+        Ok(())
+    }
+
+    /// An identity known only to the spawn registry, with no live member on
+    /// any mob, keeps the registry's value on every route: no agent id, the
+    /// registered role and the registered labels.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_registered_identity_without_a_live_member_keeps_the_registry_value() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let runtime = runtime("access-priming-registry-only", root.path()).await?;
+        turn_driven_member(&runtime, "lead", None).await?;
+        let sink = crate::console_spawn::ConsoleSpawnSink::new(ConsoleEventStore::new());
+        runtime.install_console_spawn_sink(sink.clone());
+        sink.project_spawned_member(&crate::console_spawn::ConsoleSpawnSeed {
+            mob_id: Some("access-priming-registry-only-departed".to_string()),
+            member_id: "departed".to_string(),
+            identity: "departed".to_string(),
+            initial_message: None,
+            labels: BTreeMap::from([
+                ("role".to_string(), "worker".to_string()),
+                ("tier".to_string(), "public".to_string()),
+            ]),
+            spawned_by: Some("lead".to_string()),
+            spawned_by_session: None,
+            via_tool: "mob_spawn_member".to_string(),
+        })
+        .await;
+        let registered = runtime
+            .console_identity_labels()
+            .await
+            .get("departed")
+            .cloned()
+            .ok_or("the spawn registry knows the departed identity")?;
+        let (controller, publication) = joined_controller()?;
+        prime_access_cache_from_runtime(&runtime, &controller).await;
+        let quiet = publication
+            .observe(|| ())
+            .map_err(|_| "a quiet publication")?
+            .1;
+        // Recording the exact registry value changes nothing: the cache
+        // holds it.
+        controller.record_agent_attributes(AgentResourceAttributes {
+            identity: "departed".to_string(),
+            agent_id: None,
+            role: Some("worker".to_string()),
+            labels: registered,
+        });
+        prime_access_cache_from_runtime(&runtime, &controller).await;
+        console_experience(&runtime, &controller).await;
+        prime_access_cache_from_runtime(&runtime, &controller).await;
+        assert!(
+            quiet.check_current().is_ok(),
+            "the registry value stays the identity's one value on every route"
+        );
+        Ok(())
+    }
+
+    /// Two live roster entries under one durable identity give the identity
+    /// one final value per call on every route, so repeated and alternating
+    /// primes publish no access change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn duplicate_durable_identities_record_one_value_per_identity() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let runtime = runtime("access-priming-duplicates", root.path()).await?;
+        for member in ["first", "second"] {
+            turn_driven_member(
+                &runtime,
+                member,
+                Some(BTreeMap::from([(
+                    "agent_identity".to_string(),
+                    "shared".to_string(),
+                )])),
+            )
+            .await?;
+        }
+        let (controller, publication) = joined_controller()?;
+        prime_access_cache_from_handle(&runtime.handle(), &controller).await;
+        console_experience(&runtime, &controller).await;
+        let quiet = publication
+            .observe(|| ())
+            .map_err(|_| "a quiet publication")?
+            .1;
+        for _ in 0..2 {
+            prime_access_cache_from_handle(&runtime.handle(), &controller).await;
+            prime_access_cache_from_runtime(&runtime, &controller).await;
+            console_experience(&runtime, &controller).await;
+        }
+        assert!(
+            quiet.check_current().is_ok(),
+            "repeated and alternating primes of an unchanged roster publish no access change"
+        );
+        Ok(())
+    }
+    /// An agent-created sub-mob owned by the lead's bridge session, as the
+    /// agent mob tools create it.
+    async fn lead_owned_sub_mob(
+        runtime: &MobRuntime,
+        child_id: &str,
+    ) -> TestResult<(meerkat_mob::MobId, MobHandle)> {
+        let lead_session = runtime
+            .handle()
+            .resolve_bridge_session_id(&AgentIdentity::from("lead"))
+            .await
+            .ok_or("the lead has a bridge session")?;
+        let mob_tools = runtime
+            .agent_mob_mcp_state()
+            .ok_or("the runtime carries agent mob tools")?;
+        let child_definition: MobDefinition = serde_json::from_value(json!({
+            "id": child_id,
+            "profiles": { "worker": {
+                "model": "gpt-5.5",
+                "runtime_mode": "turn_driven",
+                "tools": { "comms": true }
+            } }
+        }))?;
+        let child_id = Box::pin(mob_tools.mob_create_definition_with_owner_bridge_session(
+            child_definition,
+            lead_session,
+            true,
+            false,
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+        let child = Box::pin(mob_tools.handle_for(&child_id))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((child_id, child))
+    }
+
+    /// A sub-mob member spawned with `labels`, as an agent-tool spawn
+    /// carries them.
+    async fn sub_mob_member(
+        child: &MobHandle,
+        member: &str,
+        labels: BTreeMap<String, String>,
+    ) -> TestResult {
+        let mut spec =
+            SpawnMemberSpec::new(ProfileName::from("worker"), AgentIdentity::from(member));
+        spec.runtime_mode = Some(MobRuntimeMode::TurnDriven);
+        spec.labels = Some(labels);
+        child.ensure_member(spec).await?;
+        Ok(())
+    }
+
+    /// The access value of the console's row for `alias`, read from the
+    /// first member the console lists under it.
+    fn listed_value(
+        snapshot: &ConsoleLiveSnapshot,
+        alias: &str,
+    ) -> TestResult<AgentResourceAttributes> {
+        let member = snapshot
+            .members
+            .iter()
+            .find(|member| member.agent_identity == alias)
+            .ok_or("the console lists the member")?;
+        Ok(AgentResourceAttributes {
+            identity: member
+                .labels
+                .get("agent_identity")
+                .cloned()
+                .unwrap_or_else(|| member.agent_identity.clone()),
+            agent_id: Some(member.agent_identity.clone()),
+            role: Some(member.role.clone()),
+            labels: member.labels.clone(),
+        })
+    }
+
+    /// A sub-mob member that reuses a primary member's runtime alias never
+    /// replaces the primary member's access value on any route: the console
+    /// lists the first member under an alias, the primary one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sub_mob_member_with_a_primary_alias_keeps_the_primary_value() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let runtime = runtime("access-priming-alias-collision", root.path()).await?;
+        turn_driven_member(
+            &runtime,
+            "lead",
+            Some(BTreeMap::from([(
+                "tier".to_string(),
+                "primary".to_string(),
+            )])),
+        )
+        .await?;
+        let (_child_id, child) =
+            lead_owned_sub_mob(&runtime, "access-priming-alias-collision-child").await?;
+        sub_mob_member(
+            &child,
+            "lead",
+            BTreeMap::from([("tier".to_string(), "sub-mob".to_string())]),
+        )
+        .await?;
+
+        let (controller, publication) = joined_controller()?;
+        let snapshot = console_experience(&runtime, &controller).await;
+        let primary = listed_value(&snapshot, "lead")?;
+        assert_eq!(
+            primary.labels.get("tier").map(String::as_str),
+            Some("primary"),
+            "the console lists the primary lead"
+        );
+        prime_access_cache_from_runtime(&runtime, &controller).await;
+        let quiet = publication
+            .observe(|| ())
+            .map_err(|_| "a quiet publication")?
+            .1;
+        for _ in 0..2 {
+            console_experience(&runtime, &controller).await;
+            prime_access_cache_from_runtime(&runtime, &controller).await;
+        }
+        // The primary lead's value is the one the cache holds.
+        controller.record_agent_attributes(primary);
+        assert!(
+            quiet.check_current().is_ok(),
+            "the primary member's value stays the alias's value on every route"
+        );
+        Ok(())
+    }
+
+    /// A sub-mob member that claims a primary member's durable identity (an
+    /// agent-tool spawn may set the `agent_identity` label) never replaces
+    /// the primary member's access value on any route.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sub_mob_member_claiming_a_primary_identity_keeps_the_primary_value() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let runtime = runtime("access-priming-identity-claim", root.path()).await?;
+        turn_driven_member(
+            &runtime,
+            "lead",
+            Some(BTreeMap::from([(
+                "tier".to_string(),
+                "primary".to_string(),
+            )])),
+        )
+        .await?;
+        let (_child_id, child) =
+            lead_owned_sub_mob(&runtime, "access-priming-identity-claim-child").await?;
+        sub_mob_member(
+            &child,
+            "shadow",
+            BTreeMap::from([
+                ("agent_identity".to_string(), "lead".to_string()),
+                ("tier".to_string(), "sub-mob".to_string()),
+            ]),
+        )
+        .await?;
+
+        let (controller, publication) = joined_controller()?;
+        let snapshot = console_experience(&runtime, &controller).await;
+        assert!(
+            snapshot
+                .members
+                .iter()
+                .any(|member| member.agent_identity == "shadow"),
+            "the console lists the sub-mob member: {:?}",
+            snapshot.members
+        );
+        let primary = listed_value(&snapshot, "lead")?;
+        prime_access_cache_from_runtime(&runtime, &controller).await;
+        let quiet = publication
+            .observe(|| ())
+            .map_err(|_| "a quiet publication")?
+            .1;
+        for _ in 0..2 {
+            console_experience(&runtime, &controller).await;
+            prime_access_cache_from_runtime(&runtime, &controller).await;
+        }
+        // The primary lead's value is the one the cache holds for `lead`.
+        controller.record_agent_attributes(primary);
+        assert!(
+            quiet.check_current().is_ok(),
+            "the primary member's value stays the identity's value on every route"
+        );
+        Ok(())
+    }
+
+    /// The roster priming alone, as a console that does not show implicit
+    /// delegates leaves it, records a sub-mob member with the fields the
+    /// CHANGELOG names: the runtime alias as agent id, the roster role, and
+    /// the roster and registered labels plus `delegate_host_identity`,
+    /// `group` (`Coordinators` by default) and `source_mob_id`, which is the
+    /// console's projection of the member.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_roster_priming_alone_records_a_sub_mob_member_as_the_console_projects_it()
+    -> TestResult {
+        let root = tempfile::tempdir()?;
+        let runtime = runtime("access-priming-fields", root.path()).await?;
+        turn_driven_member(&runtime, "lead", None).await?;
+        let (child_id, child) = lead_owned_sub_mob(&runtime, "access-priming-fields-child").await?;
+        sub_mob_member(&child, "helper", BTreeMap::new()).await?;
+        let sink = crate::console_spawn::ConsoleSpawnSink::new(ConsoleEventStore::new());
+        runtime.install_console_spawn_sink(sink.clone());
+        sink.project_spawned_member(&crate::console_spawn::ConsoleSpawnSeed {
+            mob_id: Some(child_id.to_string()),
+            member_id: "helper".to_string(),
+            identity: "helper".to_string(),
+            initial_message: None,
+            labels: BTreeMap::from([("role".to_string(), "worker".to_string())]),
+            spawned_by: Some("lead".to_string()),
+            spawned_by_session: None,
+            via_tool: "mob_spawn_member".to_string(),
+        })
+        .await;
+
+        let (controller, publication) = joined_controller()?;
+        prime_access_cache_from_runtime(&runtime, &controller).await;
+        // The console's projection of the helper, read without recording it.
+        let (snapshot, _) = Box::pin(build_live_snapshot(
+            &runtime,
+            &[],
+            None,
+            &AllowAllConsoleVisibilityPolicy,
+            &ConsoleSnapshotReadModel::default(),
+            None,
+        ))
+        .await;
+        let helper = listed_value(&snapshot, "helper")?;
+        assert_eq!(helper.agent_id.as_deref(), Some("helper"));
+        assert_eq!(helper.role.as_deref(), Some("worker"));
+        for (key, value) in [
+            ("delegate_host_identity", "lead"),
+            ("group", "Coordinators"),
+            ("source_mob_id", child_id.as_str()),
+            ("spawned_by", "lead"),
+        ] {
+            assert_eq!(
+                helper.labels.get(key).map(String::as_str),
+                Some(value),
+                "the helper's {key}"
+            );
+        }
+        let quiet = publication
+            .observe(|| ())
+            .map_err(|_| "a quiet publication")?
+            .1;
+        controller.record_agent_attributes(helper);
+        assert!(
+            quiet.check_current().is_ok(),
+            "the roster priming alone recorded the console's projection of the helper"
+        );
+        Ok(())
     }
 }
