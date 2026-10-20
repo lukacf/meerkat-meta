@@ -5004,6 +5004,13 @@ struct DirtyRestartClient {
 }
 
 impl LlmClient for DirtyRestartClient {
+    fn project_replay_messages(
+        &self,
+        messages: &[meerkat_core::Message],
+    ) -> Result<Vec<meerkat_core::Message>, LlmError> {
+        self.inner.project_replay_messages(messages)
+    }
+
     fn stream<'a>(
         &'a self,
         request: &'a LlmRequest,
