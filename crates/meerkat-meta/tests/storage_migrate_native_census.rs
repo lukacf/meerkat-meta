@@ -677,20 +677,104 @@ async fn in_memory_mob_storage_resumes_each_identity_through_the_manifest() {
     assert_eq!(native_layout_status(dir.path()), NativeLayoutStatus::Native);
 }
 
+/// Both projections hold rows a release reads: the continuity projection's
+/// session bodies, and in `sessions.sqlite3` a session row, or a row of
+/// another table the retirement would lose. Nothing says which copy 0.9.3
+/// served, so the census refuses the directory as ambiguous.
 #[tokio::test]
 async fn both_projections_present_is_ambiguous() {
+    for rows in [
+        "CREATE TABLE sessions (session_id TEXT); INSERT INTO sessions VALUES ('s');",
+        "CREATE TABLE runtime_inputs (input_id TEXT); INSERT INTO runtime_inputs VALUES ('i');",
+    ] {
+        let dir = unpack("s1-roster");
+        edit(dir.path(), "sessions.sqlite3", rows);
+        let report = census(dir.path()).await;
+        assert_eq!(report.shape, None, "{rows}: {report:#?}");
+        assert!(
+            matches!(
+                report.refusals.as_slice(),
+                [NativeMigrateRefusal::AmbiguousProjection]
+            ),
+            "{rows}: {report:#?}"
+        );
+        assert!(report.sessions.is_empty(), "{rows}: {report:#?}");
+    }
+}
+
+/// A `sessions.sqlite3` as a 0.9.3 host can leave it beside its continuity
+/// projection: an empty session store with an empty runtime table, whose
+/// only rows are in the schedule tables no release reads since Meta 0.9.0
+/// keeps its schedules in `schedule.sqlite`.
+fn write_inert_sessions_database(state_dir: &Path) {
+    drop(
+        meerkat_store::SqliteSessionStore::open(state_dir.join("sessions.sqlite3"))
+            .expect("an empty session store"),
+    );
+    edit(
+        state_dir,
+        "sessions.sqlite3",
+        "CREATE TABLE runtime_inputs (input_id TEXT PRIMARY KEY); \
+         CREATE TABLE schedule_schedules (schedule_id TEXT PRIMARY KEY, schedule_json TEXT); \
+         CREATE TABLE schedule_occurrences (occurrence_id TEXT PRIMARY KEY, occurrence_json TEXT); \
+         CREATE TABLE schedule_receipts (receipt_id TEXT PRIMARY KEY, receipt_json TEXT); \
+         INSERT INTO schedule_schedules VALUES ('s1', '{}'), ('s2', '{}'); \
+         INSERT INTO schedule_occurrences VALUES ('o1', '{}'), ('o2', '{}'), ('o3', '{}'); \
+         INSERT INTO schedule_receipts VALUES ('r1', '{}');",
+    );
+}
+
+/// A `sessions.sqlite3` that holds no session and nothing else a release
+/// reads is no second projection: the continuity projection is the one. The
+/// census admits the directory as the continuity layout, and `--apply`
+/// retires the empty file with its stamp, so 0.9.4 starts on the directory.
+/// Its schedule rows stay in its pre-apply backup.
+#[tokio::test]
+async fn an_inert_sessions_database_beside_the_continuity_projection_is_retired() {
     let dir = unpack("s1-roster");
-    std::fs::write(dir.path().join("sessions.sqlite3"), b"").expect("touch");
+    write_inert_sessions_database(dir.path());
     let report = census(dir.path()).await;
-    assert_eq!(report.shape, None);
-    assert!(
-        matches!(
-            report.refusals.as_slice(),
-            [NativeMigrateRefusal::AmbiguousProjection]
-        ),
+    assert_eq!(
+        report.shape,
+        Some(GatewayStateShape::ContinuityProjection),
         "{report:#?}"
     );
-    assert!(report.sessions.is_empty());
+    assert_eq!(
+        class_counts(&report),
+        counts(&[("Equal", 3)]),
+        "{report:#?}"
+    );
+    assert_only_census_refusals(&report, 0);
+
+    let report =
+        migrate_state_dir_native(&NativeMigrateRequest::new(dir.path(), MigrateMode::Apply)).await;
+    assert!(report.refusals.is_empty(), "{report:#?}");
+    let applied = report.applied.as_ref().expect("applied");
+    assert_eq!(
+        applied.retired,
+        vec![
+            "continuity.sqlite3".to_owned(),
+            "sessions.sqlite3".to_owned()
+        ],
+        "{applied:#?}"
+    );
+    assert_eq!(native_layout_status(dir.path()), NativeLayoutStatus::Native);
+    let backup = applied
+        .backups
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("sessions.sqlite3."))
+        })
+        .unwrap_or_else(|| panic!("the sessions database's backup: {applied:#?}"));
+    let schedules: i64 = rusqlite::Connection::open(backup)
+        .expect("open the backup")
+        .query_row("SELECT COUNT(*) FROM schedule_schedules", [], |row| {
+            row.get(0)
+        })
+        .expect("count the backup's schedules");
+    assert_eq!(schedules, 2);
 }
 
 /// A session database under a name no release reads (here a copy of the

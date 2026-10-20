@@ -154,9 +154,10 @@ runtime store with Meta's session projection, checks every identity against
 Core's mob store, and prints a report (`--json` for machine-readable output,
 which spells the names below in snake_case). The scratch directory is
 removed when the run ends. A read-only open of a database
-in WAL mode may leave empty `-wal` and `-shm` files beside it; nothing else
-changes. Exit code 0 means clean, 1 means at least one refusal, 2 a usage
-error.
+in WAL mode may leave empty `-wal` and `-shm` files beside it, and the
+maintenance fence empty `*.mpresence` lock files beside the databases;
+nothing else changes. Exit code 0 means clean, 1 means at least one
+refusal, 2 a usage error.
 
 **`--apply`** refuses while the census refuses any row, so a refused directory
 stays usable by 0.9.3. Otherwise it writes

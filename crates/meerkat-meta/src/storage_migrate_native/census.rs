@@ -66,6 +66,16 @@ const RUNTIME_EXECUTION_CUSTODY_SUFFIX: &str = ".execution-custody";
 /// snapshot row.
 const CONTINUITY_SESSION_BODY_TABLES: [&str; 2] = ["continuity_session_heads", "session_snapshots"];
 
+/// The tables of a `sessions.sqlite3` whose rows no release reads: the schema
+/// bookkeeping, and the schedule tables an older layout kept there. Meta
+/// reads schedules only from `schedule.sqlite` (since 0.9.0).
+const INERT_SESSIONS_TABLES: [&str; 4] = [
+    "meerkat_schema",
+    "schedule_schedules",
+    "schedule_occurrences",
+    "schedule_receipts",
+];
+
 /// The 0.9.3 layouts the verb knows how to migrate: a gateway's, and an
 /// application's that embeds the runtime builder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -402,7 +412,10 @@ pub enum NativeMigrateRefusal {
     /// `store_path` naming a file, run `meta_gateway storage-migrate
     /// --state-dir <dir> --session-db <file> --apply` first.
     NoProjection,
-    /// Both `sessions.sqlite3` and `continuity.sqlite3` are present.
+    /// Both `sessions.sqlite3` and `continuity.sqlite3` hold rows a release
+    /// reads: a session body in the continuity file, and in the sessions file
+    /// a session or another row its retirement would lose. Nothing says which
+    /// copy 0.9.3 served.
     AmbiguousProjection,
     /// The maintenance fence could not be taken: an operation another
     /// process had in flight did not drain. The fence detects no idle process:
@@ -752,7 +765,7 @@ pub async fn migrate_state_dir_native(request: &NativeMigrateRequest) -> NativeM
             return report;
         }
     };
-    let shape = projections.shape(&mob_storage);
+    let mut shape = projections.shape(&mob_storage);
     report.shape = Some(shape);
     report.mob_storage = Some(mob_storage);
 
@@ -821,17 +834,39 @@ pub async fn migrate_state_dir_native(request: &NativeMigrateRequest) -> NativeM
     let held = matches!(mode, MigrateMode::Apply).then_some(held);
 
     if shape == GatewayStateShape::SessionsProjectionWithBindings {
-        // Decided on the copy: a session body in continuity.sqlite3 means
-        // both files hold sessions, and nothing says which copy 0.9.3 served.
+        // Decided on the copies. A session body in continuity.sqlite3 makes
+        // it the projection, unless sessions.sqlite3 holds a row a release
+        // reads too: then both files hold sessions, and nothing says which
+        // copy 0.9.3 served.
         match continuity_session_ids(&scratch.path().join(CANONICAL_CONTINUITY_DB_FILE_NAME)) {
             Ok(bodies) if bodies.is_empty() => {}
-            Ok(_) => {
-                report.shape = None;
-                report
-                    .refusals
-                    .push(NativeMigrateRefusal::AmbiguousProjection);
-                return report;
-            }
+            Ok(_) => match sessions_database_holds_rows(
+                &scratch.path().join(CANONICAL_SESSIONS_DB_FILE_NAME),
+            ) {
+                // No session and nothing else a release reads: the sessions
+                // file is no projection. `--apply` retires it with its stamp,
+                // and its pre-apply backup keeps the rows it held.
+                Ok(false) => {
+                    if let Some(mob_storage) = report.mob_storage.as_ref() {
+                        shape = Projections::Continuity.shape(mob_storage);
+                        report.shape = Some(shape);
+                    }
+                }
+                Ok(true) => {
+                    report.shape = None;
+                    report
+                        .refusals
+                        .push(NativeMigrateRefusal::AmbiguousProjection);
+                    return report;
+                }
+                Err(detail) => {
+                    report.shape = None;
+                    report
+                        .refusals
+                        .push(NativeMigrateRefusal::ProjectionUnreadable { detail });
+                    return report;
+                }
+            },
             Err(detail) => {
                 report.shape = None;
                 report
@@ -1190,8 +1225,15 @@ fn retired_projections(shape: GatewayStateShape, files: ProjectionFiles) -> Vec<
     };
     match shape {
         GatewayStateShape::SessionsProjection => vec![sessions()],
+        // A sessions file beside the continuity projection held no session
+        // and nothing else a release reads (decided on the census copies). It
+        // takes its retired stamp too: 0.9.4 refuses a sessions database
+        // that is not retired.
         GatewayStateShape::ContinuityProjection
-        | GatewayStateShape::ContinuityProjectionInMemoryMob => vec![continuity()],
+        | GatewayStateShape::ContinuityProjectionInMemoryMob => match files.sessions {
+            Some(_) => vec![continuity(), sessions()],
+            None => vec![continuity()],
+        },
         GatewayStateShape::SessionsProjectionWithBindings => vec![sessions(), continuity()],
         // An export's directory holds no local projection.
         GatewayStateShape::ContinuityExportNew | GatewayStateShape::ContinuityExportInPlace => {
@@ -1206,7 +1248,8 @@ enum Projections {
     Sessions,
     Continuity,
     /// Both files: the builder layout when `continuity.sqlite3` holds no
-    /// session body (decided on the copies), ambiguous otherwise.
+    /// session body, the continuity layout when `sessions.sqlite3` holds no
+    /// row a release reads, ambiguous otherwise (decided on the copies).
     Both,
 }
 
@@ -1798,6 +1841,47 @@ fn continuity_session_ids(path: &Path) -> Result<BTreeSet<String>, String> {
     Ok(session_ids)
 }
 
+/// Whether the sessions database at `path` holds a row a release reads: a
+/// row of any table but [`INERT_SESSIONS_TABLES`]. A file that holds none
+/// carries no session, and retiring it loses nothing a release reads.
+fn sessions_database_holds_rows(path: &Path) -> Result<bool, String> {
+    let conn = meerkat_sqlite::open(path, meerkat_sqlite::ConnectionProfile::ReadOnly)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let tables = {
+        let mut statement = conn
+            .prepare(
+                "SELECT name FROM main.sqlite_master WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'",
+            )
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        names
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("{}: {error}", path.display()))?
+    };
+    for table in tables {
+        if INERT_SESSIONS_TABLES.contains(&table.as_str()) {
+            continue;
+        }
+        let holds: bool = conn
+            .query_row(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM main.\"{}\")",
+                    table.replace('"', "\"\"")
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("{table}: {error}"))?;
+        if holds {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The first of `runtime_ids` that is not `session_id`'s own runtime id
 /// (every one of them when the session id does not parse).
 fn foreign_runtime_id<'a>(session_id: &str, runtime_ids: &'a [String]) -> Option<&'a str> {
@@ -1841,9 +1925,13 @@ pub(super) async fn classify_session(
             SessionCensusClass::BodilessRuntime,
             format!(
                 "runtime.sqlite's WholeBlob authority references a body the file does not hold \
-                 (runtime {}); the projection {} a copy",
+                 (runtime {}); the projection {}",
                 runtime_ids.join(", "),
-                if in_projection { "holds" } else { "holds no" }
+                if in_projection {
+                    "holds a copy"
+                } else {
+                    "holds no copy"
+                }
             ),
         );
     }
@@ -1859,9 +1947,13 @@ pub(super) async fn classify_session(
             SessionCensusClass::RuntimeLifecycleOnly,
             format!(
                 "runtime.sqlite has a catalog entry (lifecycle terminal fact: {}) and no committed \
-                 snapshot; the projection {} a copy",
+                 snapshot; the projection {}",
                 lifecycle.map_or("none".to_owned(), |terminal| format!("{terminal:?}")),
-                if in_projection { "holds" } else { "holds no" }
+                if in_projection {
+                    "holds a copy"
+                } else {
+                    "holds no copy"
+                }
             ),
             None,
         ),

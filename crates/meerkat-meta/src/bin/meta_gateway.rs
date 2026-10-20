@@ -1949,7 +1949,8 @@ const STORAGE_MIGRATE_NATIVE_USAGE: &str = "usage: meta_gateway storage-migrate-
      A dry run (the default) runs the census: it classifies every session by \
      comparing runtime.sqlite with the session projection, on scratch \
      copies, and changes no database in the state directory (a read-only \
-     open of a WAL database may leave its empty -wal and -shm files).\n\
+     open of a WAL database may leave its empty -wal and -shm files, and the \
+     maintenance fence empty *.mpresence lock files beside the databases).\n\
      --apply carries out a clean census: it backs up runtime.sqlite and each \
      projection database beside them (registered *.pre-* backups the storage \
      doctor lists), converts runtime.sqlite in place onto Meerkat's native \
