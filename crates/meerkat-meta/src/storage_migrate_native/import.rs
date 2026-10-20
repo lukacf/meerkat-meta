@@ -10,12 +10,17 @@
 //!
 //! - I1: the session's rewrite history validates, and Core can lay it out as
 //!   head-canonical rows. This is the census's own check, run again before
-//!   the first write.
+//!   the first write, on the session the import writes: the copy with every
+//!   image it holds inline, its compacted history included, moved to a blob
+//!   reference by Core's own pure transform.
 //! - I2: `save_authoritative_projection_if_current_revision(session, None)`,
-//!   which only creates the row, in one transaction. A rerun that finds a row
-//!   compares the transcript digest and the model-routing control history.
-//!   An equal row is kept; a different one refuses, and nothing is written.
-//!   It never compares whole sessions.
+//!   which only creates the row, in one transaction, once the images the
+//!   transform moved are in the realm blob store (`blobs/` in the state
+//!   directory, the store the native composition hydrates them from) and
+//!   synced there: no row names an image the store does not hold. A rerun
+//!   that finds a row compares the transcript digest and the model-routing
+//!   control history. An equal row is kept; a different one refuses, and
+//!   nothing is written. It never compares whole sessions.
 //! - I3: `cross_head_canonical_authority` for this one id. The bulk store
 //!   activation is never called: it would cross rows the census never
 //!   admitted.
@@ -31,16 +36,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use meerkat::SessionStore;
+use meerkat_core::BlobStore as _;
 use meerkat_core::types::SessionId;
-use meerkat_core::{HeadCanonicalAuthorityCrossing, Session};
+use meerkat_core::{BlobId, HeadCanonicalAuthorityCrossing, InlineImagePayload, Session};
 use meerkat_runtime::{HeadCanonicalRuntimeAuthorityActivation, RuntimeStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::census::{META_RUNTIME_LOCK_FILE_NAME, SessionCensusClass, layout_checked, remint_copy};
 use super::export_census::ExportProjection;
+use crate::blob_store::{Base64BlobStoreAdapter, ObjectStoreBlobStore};
 use crate::identity_first::{ContinuitySessionStoreAdapter, LocalContinuityStore};
-use crate::storage_layout::RUNTIME_DB_FILE_NAME;
+use crate::storage_layout::{BLOB_ROOT_DIR_NAME, RUNTIME_DB_FILE_NAME};
 
 /// Where an apply run reads the sessions it imports. The journal keeps it,
 /// so a run that stopped part way reads the same copies again.
@@ -73,11 +80,13 @@ pub(crate) enum ProjectionStore {
 }
 
 /// The stores an import writes: exactly the session store and runtime store
-/// the native composition opens on the state directory.
+/// the native composition opens on the state directory, and the realm blob
+/// store it hydrates images from.
 #[derive(Clone)]
 pub(crate) struct NativeImportStores {
     pub(crate) sessions: Arc<dyn SessionStore>,
     pub(crate) runtime: Arc<dyn RuntimeStore>,
+    pub(crate) blobs: Arc<RealmBlobs>,
 }
 
 /// One import step, as refusals and the report name it.
@@ -87,7 +96,8 @@ pub(crate) struct NativeImportStores {
 pub enum ImportStep {
     /// I1: decode and validate.
     Validate,
-    /// I2: create the session store row.
+    /// I2: create the session store row, the images it names stored in the
+    /// realm blob store first.
     CreateRow,
     /// I3: cross the row into head-canonical authority.
     Cross,
@@ -198,6 +208,84 @@ pub(crate) fn open_native_pair(state_dir: &Path) -> Result<NativePair, String> {
     Ok((Arc::new(sessions), Arc::new(runtime)))
 }
 
+/// The realm blob store `--apply` moves inline images to: `blobs/` in the
+/// state directory, the local store the native composition hydrates image
+/// references from, holding each image under the address Core gives it
+/// ([`meerkat_core::content_blob_id`]).
+pub(crate) struct RealmBlobs {
+    state_dir: PathBuf,
+    local: Arc<ObjectStoreBlobStore>,
+    store: Base64BlobStoreAdapter,
+}
+
+impl RealmBlobs {
+    pub(crate) fn open(state_dir: &Path) -> Result<Self, String> {
+        let root = state_dir.join(BLOB_ROOT_DIR_NAME);
+        let local = Arc::new(
+            ObjectStoreBlobStore::local(root.clone())
+                .map_err(|error| format!("blob store at {}: {error}", root.display()))?,
+        );
+        Ok(Self {
+            state_dir: state_dir.to_path_buf(),
+            store: Base64BlobStoreAdapter::new(local.clone()),
+            local,
+        })
+    }
+
+    /// Core's face of the store.
+    pub(crate) fn store(&self) -> &dyn meerkat_core::BlobStore {
+        &self.store
+    }
+
+    /// Store each image under its content address, then sync them all.
+    pub(crate) async fn put(&self, payloads: &[InlineImagePayload]) -> Result<(), String> {
+        for payload in payloads {
+            let stored = self
+                .store
+                .put_image(&payload.media_type, &payload.data)
+                .await
+                .map_err(|error| format!("store image {}: {error}", payload.blob_id.as_str()))?;
+            if stored.blob_id != payload.blob_id {
+                return Err(format!(
+                    "the blob store addressed image {} as {}",
+                    payload.blob_id.as_str(),
+                    stored.blob_id.as_str()
+                ));
+            }
+        }
+        self.sync(payloads.iter().map(|payload| &payload.blob_id))
+    }
+
+    /// Make the images `stored` names durable: their files, then every
+    /// directory that names them, up to the state directory. The object
+    /// store's local puts rename into place without a sync, and a row must
+    /// not outlast an image it names.
+    pub(crate) fn sync<'a>(
+        &self,
+        stored: impl IntoIterator<Item = &'a BlobId>,
+    ) -> Result<(), String> {
+        let mut dirs = std::collections::BTreeSet::new();
+        for blob_id in stored {
+            let files = self
+                .local
+                .local_files(blob_id)
+                .ok_or_else(|| "the realm blob store has no local root".to_owned())?;
+            for file in files {
+                super::apply::sync_file(&file)?;
+                if let Some(dir) = file.parent() {
+                    dirs.insert(dir.to_path_buf());
+                }
+            }
+        }
+        if dirs.is_empty() {
+            return Ok(());
+        }
+        dirs.insert(self.state_dir.join(BLOB_ROOT_DIR_NAME));
+        dirs.insert(self.state_dir.clone());
+        dirs.iter().try_for_each(|dir| super::apply::sync_dir(dir))
+    }
+}
+
 /// Hold the directory's Meta runtime lock exclusively for as long as the
 /// returned file lives. A 0.9.3 directory has no lock file, so this
 /// creates it; a holder refuses.
@@ -232,7 +320,12 @@ pub(crate) async fn import_planned(
 ) -> Result<(), String> {
     let reader = ImportReader::open(state_dir, source, backups)?;
     let (sessions, runtime) = open_native_pair(state_dir)?;
-    let stores = NativeImportStores { sessions, runtime };
+    let blobs = Arc::new(RealmBlobs::open(state_dir)?);
+    let stores = NativeImportStores {
+        sessions,
+        runtime,
+        blobs,
+    };
     for session_id in pending {
         let copy = remint_copy(session_id, &reader.store)
             .await
@@ -343,6 +436,23 @@ pub(crate) async fn import_session(
         });
     }
 
+    // The session the import writes: the copy with its inline images moved
+    // to blob references, the session I1 laid out, and those images.
+    let moved;
+    let (session, images) = match session.with_inline_images_externalized() {
+        Ok(None) => (session, &[][..]),
+        Ok(Some(externalized)) => {
+            moved = externalized;
+            (&moved.session, moved.payloads.as_slice())
+        }
+        Err(error) => {
+            return Err(SessionImportRefusal::Invalid {
+                session_id,
+                detail: format!("its inline images cannot move to the blob store: {error}"),
+            });
+        }
+    };
+
     // I2.
     let existing = stores
         .sessions
@@ -358,6 +468,13 @@ pub(crate) async fn import_session(
             ImportedRow::Kept
         }
         None => {
+            // The images first, synced: no row names an image the store
+            // does not hold.
+            stores
+                .blobs
+                .put(images)
+                .await
+                .map_err(failed(ImportStep::CreateRow))?;
             stores
                 .sessions
                 .save_authoritative_projection_if_current_revision(session, None)
@@ -538,7 +655,12 @@ mod tests {
     /// state directory.
     fn native_stores(state_dir: &Path) -> NativeImportStores {
         let (sessions, runtime) = open_native_pair(state_dir).expect("the native pair");
-        NativeImportStores { sessions, runtime }
+        let blobs = Arc::new(RealmBlobs::open(state_dir).expect("the realm blob store"));
+        NativeImportStores {
+            sessions,
+            runtime,
+            blobs,
+        }
     }
 
     /// A copy whose compacted history holds an inline image imports: the
@@ -550,7 +672,7 @@ mod tests {
         const SCREENSHOT: &str = "iVBORw0KGgo=";
         let dir = tempfile::tempdir().unwrap();
         let stores = native_stores(dir.path());
-        let session = super::super::relation::tests::compacted_over_a_tool_result_image(SCREENSHOT);
+        let session = super::super::census::tests::compacted_over_a_tool_result_image(SCREENSHOT);
 
         let import = import_session(&stores, &session)
             .await

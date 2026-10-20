@@ -373,43 +373,6 @@ pub(super) mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
     }
 
-    /// A session that compacted twice with a tool result's inline image in
-    /// the second compaction's delta, as 0.9.3 wrote such a body when a
-    /// session compacted after a tool returned a screenshot. Core lays it
-    /// out as head-canonical rows only with the image moved to the blob
-    /// store.
-    pub(in crate::storage_migrate_native) fn compacted_over_a_tool_result_image(
-        data: &str,
-    ) -> meerkat_core::Session {
-        let user =
-            |text: &str| meerkat_core::Message::User(meerkat_core::types::UserMessage::text(text));
-        let mut session = meerkat_core::Session::new();
-        session.push(user("opening"));
-        session.push(user("second"));
-        commit_test_compaction(&mut session, 2, "first summary");
-        session.push(meerkat_core::Message::ToolResults {
-            results: vec![meerkat_core::types::ToolResult::with_blocks(
-                "view-image-call".to_owned(),
-                vec![
-                    meerkat_core::types::ContentBlock::Text {
-                        text: "the screenshot".to_owned(),
-                    },
-                    meerkat_core::types::ContentBlock::Image {
-                        media_type: "image/png".to_owned(),
-                        data: meerkat_core::types::ImageData::Inline {
-                            data: data.to_owned(),
-                        },
-                    },
-                ],
-                false,
-            )],
-            created_at: chrono::Utc::now(),
-        });
-        session.push(user("after the image"));
-        commit_test_compaction(&mut session, 2, "second summary");
-        session
-    }
-
     /// Direct proof test for the durable-behind admission (independent of
     /// the chain walk's own acceptance behavior): a durable row that is a
     /// strict digest-prefix of the sealed parent proves the chain; a

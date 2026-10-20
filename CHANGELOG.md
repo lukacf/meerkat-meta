@@ -775,7 +775,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   keeps that copy while the manifest exists), and retires the old
   session projection (`sessions.sqlite3`
   takes a retired stamp; `continuity.sqlite3` keeps its identity records and
-  loses its session rows).
+  loses its session rows). The conversion and the import move each image a
+  session holds inline, its compacted history included, to the state
+  directory's blob store (`blobs/`) and sync it there before they write the
+  row that names it; the census row says how many images move.
   A session whose authority in `runtime.sqlite` has lost its body, which no
   release can load, refuses the census; `--discard-bodyless <session id>`
   (repeatable) lets `--apply` discard it after the backup, import the
