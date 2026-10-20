@@ -1386,7 +1386,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - An incomplete edge reconcile logs each failed edge operation at ERROR
   (`operation`, `edge_a`, `edge_b`, `error`; the first five, then a count
   of the rest) next to its `reconcile_incomplete` line, which carries only
-  the counts. Before, no log line named the edge or the step that failed.
+  the counts. Before, no log line named the failed edge, and most failed
+  steps logged nothing.
 - The console Memory and WorkGraph panels no longer move their controls when
   a refresh fails or recovers. Memory rendered the refresh error above its
   tabs and body, and WorkGraph rendered it above the work items, which stay
