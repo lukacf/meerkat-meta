@@ -437,26 +437,14 @@ async fn new_blobs_are_put_once_each() -> TestResult {
     let counts = ContinuityMirrorCounts::default();
     let mut put_blobs = BTreeSet::new();
 
-    let put = put_new_blobs(
-        &blobs,
-        &sink,
-        DEADLINE,
-        &ids(&['a', 'b']),
-        &mut put_blobs,
-        &counts,
-    );
+    let wanted = ids(&['a', 'b']);
+    let put = put_new_blobs(&blobs, &sink, DEADLINE, &wanted, &mut put_blobs, &counts);
     assert!(put.await);
     assert_eq!(sink.take(), [id('a'), id('b')]);
 
     // A later session that references a and c puts only c.
-    let put = put_new_blobs(
-        &blobs,
-        &sink,
-        DEADLINE,
-        &ids(&['a', 'c']),
-        &mut put_blobs,
-        &counts,
-    );
+    let wanted = ids(&['a', 'c']);
+    let put = put_new_blobs(&blobs, &sink, DEADLINE, &wanted, &mut put_blobs, &counts);
     assert!(put.await);
     assert_eq!(sink.take(), [id('c')]);
     assert_eq!(counts.blobs.load(Ordering::Relaxed), 3);
@@ -471,14 +459,8 @@ async fn a_blob_the_store_lacks_is_counted_and_never_holds_the_session() -> Test
     let counts = ContinuityMirrorCounts::default();
     let mut put_blobs = BTreeSet::new();
 
-    let put = put_new_blobs(
-        &blobs,
-        &sink,
-        DEADLINE,
-        &ids(&['a', 'm']),
-        &mut put_blobs,
-        &counts,
-    );
+    let wanted = ids(&['a', 'm']);
+    let put = put_new_blobs(&blobs, &sink, DEADLINE, &wanted, &mut put_blobs, &counts);
     assert!(put.await, "the session goes out without the missing blob");
     assert_eq!(sink.take(), [id('a')]);
     assert_eq!(counts.missing_blobs.load(Ordering::Relaxed), 1);
@@ -508,11 +490,12 @@ async fn a_blob_the_sink_does_not_take_or_the_store_cannot_read_holds_the_sessio
     ] {
         let counts = ContinuityMirrorCounts::default();
         let mut put_blobs = BTreeSet::new();
+        let wanted = ids(&['a', 'b']);
         let put = put_new_blobs(
             &blobs,
             &sink,
             Duration::from_millis(200),
-            &ids(&['a', 'b']),
+            &wanted,
             &mut put_blobs,
             &counts,
         );
