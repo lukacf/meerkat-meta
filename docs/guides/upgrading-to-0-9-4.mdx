@@ -507,10 +507,13 @@ later release.
 ## What changes for identities
 
 - **View states:** an identity is `active`, `dormant` or `broken`. The 0.9.3
-  states `retiring`, `suspended` and `uninitialized` are gone. The status and
-  the inspection carry Core's facts: the generation, the session and runtime
-  Core binds, Core's convergence status for an intent-managed identity, the
-  last wake refusal and the session a fresh wake replaced.
+  states `retiring`, `suspended` and `uninitialized` are gone. Meta's 0.9.3
+  `broken` mark is not migrated: after the upgrade Core's history decides an
+  identity's state, so an identity that 0.9.3 marked broken can come up
+  `active`. The status and the inspection carry Core's facts: the generation,
+  the session and runtime Core binds, Core's convergence status for an
+  intent-managed identity, the last wake refusal and the session a fresh wake
+  replaced.
 - **Typed refusals:** an identity Core cannot resume answers
   `IdentityUnresumableError` (`-32051`, final); history Core cannot read yet
   answers `IdentityHistoryUnavailableError` (`-32052`, retryable); an identity
