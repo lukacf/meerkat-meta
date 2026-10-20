@@ -505,12 +505,21 @@ def test_installed_package_sources_in_the_frontend_map_are_not_source_inputs(bun
     copied = unpack(root, wheel, tmp_path / "dependencies.zip")
     manifest = json.loads((copied / distribution.MANIFEST).read_text())
     assert sorted(manifest["frontend_source_sha256"]) == ["installer/web/app.jsx", "installer/web/styles.css"]
+    # A name spelled through node_modules that resolves to a checkout source is
+    # still compared: where it resolves decides, not its spelling.
+    (root / "web/node_modules/x").mkdir(parents=True)
+    spelled = {"sources": data["sources"] + ["../node_modules/x/../../app.jsx"],
+        "sourcesContent": data["sourcesContent"] + ["export const older = true;\n"]}
+    source_map.write_text(json.dumps(spelled))
+    with pytest.raises(distribution.DistributionError, match="frontend is stale"):
+        distribution.package(root, wheel, tmp_path / "spelled-source.zip")
     # The checkout's own sources are still compared, and a missing one is stale.
     data["sources"].append("../missing.jsx")
     data["sourcesContent"].append("export const missing = true;\n")
     source_map.write_text(json.dumps(data))
     with pytest.raises(distribution.DistributionError, match="frontend is stale"):
         distribution.package(root, wheel, tmp_path / "missing-source.zip")
+    assert not (tmp_path / "spelled-source.zip").exists()
     assert not (tmp_path / "missing-source.zip").exists()
 
 
