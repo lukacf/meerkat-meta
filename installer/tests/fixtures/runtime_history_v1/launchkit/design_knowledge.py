@@ -154,10 +154,10 @@ delivery receipt can establish native admission without establishing a completed
 agent turn or domain work. Observe the actual destination turn, application
 callback and authoritative outcome/readback separately.
 
-Identity memory, shared local notes and Elephant serve different needs. Memory
-preserves an owner's history; notes are shared team artifacts; Elephant is a
-separate provenance-aware knowledge service. Choose knowledge from what should
-be remembered, shared, corrected and retrieved. An Elephant read grant does not
+Identity memory, shared local notes and the knowledge service serve different needs. Memory
+preserves an owner's history; notes are shared team artifacts; the knowledge service is a
+separate provenance-aware service. Choose knowledge from what should
+be remembered, shared, corrected and retrieved. A knowledge-service read grant does not
 ingest sources or authorize fact writes. Internal notes can be writable while
 outside actions stay read-only. Prompts cannot enforce approval or tenant isolation.
 A verified MCP grant supplies tools, not inbound Slack/Telegram chat, recurring
@@ -251,7 +251,7 @@ CAPABILITIES = {
         "Per-profile model/provider, memory, shell, builtin, WorkGraph and scheduling tool flags. tools.read_only compiles the native read-only execution policy while retaining category grants; it does not establish private egress or autonomous callback capability.",
         "Workspace UTF-8 text reads, shared local SQLite notes, exact-name MCP allowlists.",
         "Official MCP SDK stdio/HTTP connections discovered from registry metadata or supplied configuration.",
-        "Optional existing or source-built local Elephant; agent endpoint is read-only and space-scoped. The generated knowledge/manage.py helper supports operator-led file ingestion with a separate operator token and live semantic-readiness verification; ingest can complete asynchronously.",
+        "Optional existing or source-built local knowledge service; agent endpoint is read-only and space-scoped. The generated knowledge/manage.py helper supports operator-led file ingestion with a separate operator token and live semantic-readiness verification; ingest can complete asynchronously.",
         "Mac/Linux package, service files, GCP VM deployment script, private local credentials and persistent SQLite state.",
     ],
     "requires_extension": [
@@ -260,7 +260,7 @@ CAPABILITIES = {
         "Application-owned registry discovery, entity membership/subscriptions and automatic population-change policies using the supported desired-roster hooks. The compiler supplies the validated native reconciliation seam, not these business rules or access/privacy policy.",
         "Ephemeral worker profiles, elastic worker fleets and runtime spawn policy in generated deployments.",
         "Preconfigured recurring triggers: the compiler supports per-class native scheduling access, not installed recurrence. On pinned MobKit 0.8.42, a granted agent can author current_session prompt recurrence; MobKit persists the stable mob-member target and each firing is an agent turn. Registered host-runnable callbacks do not create a schedule, and the advertised native authoring schema omits host_runnable targets. Preserve unresolved installation and destination delivery checks.",
-        "Automatic Elephant ingestion/write pipeline, arbitrary PDF/Office extraction and document synchronization. Operator-led ingestion of individual files is supported separately.",
+        "Automatic knowledge-service ingestion/write pipeline, arbitrary PDF/Office extraction and document synchronization. Operator-led ingestion of individual files is supported separately.",
         "A generic external-action approval gate. Exact tool scopes or an actual connector's review mechanism are required.",
     ],
     "design_rule": "Never silently drop an explicitly requested feature. Explain its concrete extension requirement, offer a supported first version, and obtain the user's choice before treating that requirement as satisfied.",

@@ -25,8 +25,8 @@
       "sha256": "2687bba02470681c97cfdc21aeafda1a0553bd2c4a7f15fb161803fb1b0a8210"
     },
     "design_knowledge.py": {
-      "bytes": 28134,
-      "sha256": "a1fa12eb834e97728fc26b7bd6de32b6c23e7eb0006c427fca43e177115bef66"
+      "bytes": 28176,
+      "sha256": "c6aec68f448d827c2e731c8158a66ed367034d3defe777b4676f902f98cd27ff"
     },
     "elephant_setup.py": {
       "bytes": 8249,
@@ -136,7 +136,7 @@
   "kind": "original-historical-046-compiler-test-inputs",
   "limits": "Original .46 compiler and complete public inputs. Inert generated test packages and mocked worker receipts remain synthetic contract coverage, not actual .46 native qualification. Genuine retained package provenance is separate.",
   "modified": {
-    "design_knowledge.py": "Project names and source paths in PATTERNS and SOURCES are replaced with neutral descriptions. COMMS_PROTOCOL, the only name the compiler imports from this file, is unchanged."
+    "design_knowledge.py": "Project and product names, and source paths, in FOUNDATIONS, PATTERNS, CAPABILITIES and SOURCES are replaced with neutral descriptions. COMMS_PROTOCOL, the only name the compiler imports from this file, is unchanged."
   },
   "source": "installer/.artifacts/tool-library-private-first-use-20261006T084506Z-86145aee/qualified-runtime/launch-r5/launchkit"
 }
