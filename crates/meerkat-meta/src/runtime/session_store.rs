@@ -377,15 +377,6 @@ impl BigQuerySessionStoreAdapter {
             return Ok(());
         }
 
-        let project_id = self.resolve_project_id()?;
-        let access_token = self.resolve_access_token()?;
-        let endpoint = format!(
-            "{}/projects/{project_id}/datasets/{}/tables/{}/insertAll",
-            self.api_base_url(),
-            self.dataset,
-            self.table
-        );
-
         let mut request_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let payload_json = serde_json::to_string(&row.payload)
@@ -401,8 +392,33 @@ impl BigQuerySessionStoreAdapter {
                     .map_err(|err| BigQuerySessionStoreError::Serialize(err.to_string()))?;
                 row_json["labels_json"] = serde_json::Value::String(labels_json);
             }
-            request_rows.push(serde_json::json!({ "json": row_json }));
+            request_rows.push(row_json);
         }
+        self.insert_json_rows(&self.table, request_rows).await
+    }
+
+    /// Streams `rows`, each a JSON object in the schema of `table`, into that
+    /// table of this adapter's dataset with one `insertAll` request. Any row
+    /// error fails the call.
+    pub(crate) async fn insert_json_rows(
+        &self,
+        table: &str,
+        rows: Vec<Value>,
+    ) -> Result<(), BigQuerySessionStoreError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let project_id = self.resolve_project_id()?;
+        let access_token = self.resolve_access_token()?;
+        let endpoint = format!(
+            "{}/projects/{project_id}/datasets/{}/tables/{table}/insertAll",
+            self.api_base_url(),
+            self.dataset
+        );
+        let request_rows: Vec<Value> = rows
+            .into_iter()
+            .map(|row| serde_json::json!({ "json": row }))
+            .collect();
         let request = serde_json::json!({
             "ignoreUnknownValues": false,
             "skipInvalidRows": false,
