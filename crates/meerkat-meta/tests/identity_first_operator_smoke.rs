@@ -87,8 +87,12 @@ fn spec(name: &str, addr: AgentAddressability, profile: &str) -> DurableAgentSpe
     }
 }
 
-/// Build a MobDefinition for operator smoke tests.
-fn operator_definition(model: &str) -> MobDefinition {
+/// Build a MobDefinition for operator smoke tests. `test` makes the mob id
+/// unique per test: member inproc participant names are
+/// `{mob_id}/{role}/{identity}` and process-global, so the members of a
+/// runtime a test leaves registered (one dropped without shutdown) never
+/// block another test's members when the rows share one test process.
+fn operator_definition(model: &str, test: &str) -> MobDefinition {
     let mut profiles = BTreeMap::new();
 
     profiles.insert(
@@ -141,7 +145,7 @@ fn operator_definition(model: &str) -> MobDefinition {
         })),
     );
 
-    let mut definition = MobDefinition::explicit(MobId::from("ops-smoke"));
+    let mut definition = MobDefinition::explicit(MobId::from(format!("ops-smoke-{test}")));
     definition.profiles = profiles;
     definition.wiring = WiringRules {
         auto_wire_orchestrator: false,
@@ -219,7 +223,7 @@ async fn e2e_smoke_01_identity_first_send_real_llm() {
 
     // --- Build the shipped runtime ---
     let unified = UnifiedRuntimeBuilder::default()
-        .definition(operator_definition(&model))
+        .definition(operator_definition(&model, "01"))
         .persistent_state(&state_path)
         .comms(true)
         .build()
@@ -374,7 +378,7 @@ async fn e2e_smoke_02_dynamic_roster_add_subscriber() {
     eprintln!("[SMOKE-02] Building UnifiedRuntime with model={model}...");
 
     let unified = UnifiedRuntimeBuilder::default()
-        .definition(operator_definition(&model))
+        .definition(operator_definition(&model, "02"))
         .persistent_state(&state_path)
         .comms(true)
         .build()
@@ -566,7 +570,7 @@ async fn e2e_smoke_03_respawn_preserves_history() {
     eprintln!("[SMOKE-03] Building UnifiedRuntime with model={model}...");
 
     let unified = UnifiedRuntimeBuilder::default()
-        .definition(operator_definition(&model))
+        .definition(operator_definition(&model, "03"))
         .persistent_state(&state_path)
         .comms(true)
         .build()
@@ -758,7 +762,7 @@ async fn e2e_smoke_04_reset_clean_slate() {
     eprintln!("[SMOKE-04] Building UnifiedRuntime with model={model}...");
 
     let unified = UnifiedRuntimeBuilder::default()
-        .definition(operator_definition(&model))
+        .definition(operator_definition(&model, "04"))
         .persistent_state(&state_path)
         .comms(true)
         .build()
@@ -903,7 +907,7 @@ async fn e2e_smoke_05_async_checkpoint_durability() {
     eprintln!("[SMOKE-05] Building UnifiedRuntime with model={model}...");
 
     let unified = UnifiedRuntimeBuilder::default()
-        .definition(operator_definition(&model))
+        .definition(operator_definition(&model, "05"))
         .persistent_state(&state_path)
         .comms(true)
         .build()
@@ -1081,7 +1085,7 @@ async fn e2e_smoke_07_delete_and_recreate() {
     eprintln!("[SMOKE-07] Building UnifiedRuntime with model={model}...");
 
     let unified = UnifiedRuntimeBuilder::default()
-        .definition(operator_definition(&model))
+        .definition(operator_definition(&model, "07"))
         .persistent_state(&state_path)
         .comms(true)
         .build()
@@ -1340,7 +1344,7 @@ async fn e2e_smoke_08_customizer_topology_prompts() {
     eprintln!("[SMOKE-08] Building UnifiedRuntime with model={model}...");
 
     let unified = UnifiedRuntimeBuilder::default()
-        .definition(operator_definition(&model))
+        .definition(operator_definition(&model, "08"))
         .persistent_state(&state_path)
         .comms(true)
         .build()
