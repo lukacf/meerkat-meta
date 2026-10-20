@@ -1260,7 +1260,7 @@ async fn e2e_smoke_07_delete_and_recreate() {
 }
 
 // ===========================================================================
-// SMOKE-08: Customizer uses topology for dynamic prompts
+// SMOKE-08: Customizer builds prompts from topology; roster changes reach live members as edges
 //
 // TopologyProvider wires alpha↔alice and alpha↔bob. Customizer appends
 // subscriber names to alpha's system prompt. Verify the prompt content
@@ -1511,40 +1511,36 @@ async fn e2e_smoke_08_customizer_topology_prompts() {
         other => panic!("expected Created for dave, got {other:?}"),
     }
 
-    // alpha's new draft should include dave
-    let alpha_v2_draft = match result2.outcomes.get(&id("review:alpha")).unwrap() {
-        RestoreOutcome::Created { draft, .. } | RestoreOutcome::Resumed { draft, .. } => {
-            draft.clone()
-        }
-        other => panic!("unexpected alpha v2 outcome: {other:?}"),
+    // alpha and beta are live, so restore_flow resumes them on the sessions
+    // (and prompts) they were built with: the customizer runs at build time
+    // only. The new topology shows in the restore's managed edges.
+    for name in ["review:alpha", "review:beta"] {
+        assert!(
+            matches!(
+                result2.outcomes.get(&id(name)),
+                Some(RestoreOutcome::Resumed { .. })
+            ),
+            "{name} should resume: {:?}",
+            result2.outcomes.get(&id(name))
+        );
+    }
+    let linked = |a: &str, b: &str| {
+        result2.managed_edges.iter().any(|edge| {
+            let (x, y) = (edge.a().as_str(), edge.b().as_str());
+            (x == a && y == b) || (x == b && y == a)
+        })
     };
-    let alpha_v2_prompt = alpha_v2_draft
-        .system_prompt
-        .expect("alpha v2 should have system_prompt");
     assert!(
-        alpha_v2_prompt.contains("personal:dave"),
-        "alpha v2 prompt should mention dave: {alpha_v2_prompt}"
-    );
-    eprintln!("[SMOKE-08] alpha v2 prompt: {alpha_v2_prompt}");
-
-    // beta's prompt should be unchanged (still only carol)
-    let beta_v2_draft = match result2.outcomes.get(&id("review:beta")).unwrap() {
-        RestoreOutcome::Created { draft, .. } | RestoreOutcome::Resumed { draft, .. } => {
-            draft.clone()
-        }
-        other => panic!("unexpected beta v2 outcome: {other:?}"),
-    };
-    let beta_v2_prompt = beta_v2_draft
-        .system_prompt
-        .expect("beta v2 should have system_prompt");
-    assert!(
-        beta_v2_prompt.contains("personal:carol"),
-        "beta v2 prompt should still mention carol: {beta_v2_prompt}"
+        linked("review:alpha", "personal:dave"),
+        "the topology should link alpha and dave: {:?}",
+        result2.managed_edges
     );
     assert!(
-        !beta_v2_prompt.contains("personal:dave"),
-        "beta v2 prompt should NOT mention dave: {beta_v2_prompt}"
+        linked("review:beta", "personal:carol") && !linked("review:beta", "personal:dave"),
+        "the topology should still link beta to carol only: {:?}",
+        result2.managed_edges
     );
+    eprintln!("[SMOKE-08] topology v2: {:?}", result2.managed_edges);
 
     // Verify total managed edges is now 4
     assert_eq!(
@@ -1555,7 +1551,7 @@ async fn e2e_smoke_08_customizer_topology_prompts() {
 
     let elapsed = start.elapsed();
     eprintln!(
-        "[SMOKE-08] PASSED in {:.1}s - customizer + topology dynamic prompts ✓",
+        "[SMOKE-08] PASSED in {:.1}s - customizer prompts at build + topology edges ✓",
         elapsed.as_secs_f64(),
     );
 }
