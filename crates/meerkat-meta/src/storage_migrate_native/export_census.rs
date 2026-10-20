@@ -297,14 +297,17 @@ pub(super) async fn census_continuity_export(
             false,
         ));
     }
-    // A new directory has no session store yet: every import creates its row.
-    if mode == ContinuityExportMode::InPlace
-        && let Err(detail) = predict_import_rows(
-            &scratch.path().join(RUNTIME_DB_FILE_NAME),
-            &census_projection.store,
-            &mut report.sessions,
-        )
-        .await
+    // A new directory has no session store yet: every import creates its
+    // row, and each is still imported for trial on a scratch store.
+    let runtime_copy =
+        (mode == ContinuityExportMode::InPlace).then(|| scratch.path().join(RUNTIME_DB_FILE_NAME));
+    if let Err(detail) = predict_import_rows(
+        runtime_copy.as_deref(),
+        scratch.path(),
+        &census_projection.store,
+        &mut report.sessions,
+    )
+    .await
     {
         report
             .refusals
