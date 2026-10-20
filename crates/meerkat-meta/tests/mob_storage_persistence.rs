@@ -319,9 +319,17 @@ async fn install_realized_routing_fixture(
     session_id: &meerkat_core::SessionId,
     target_model: &str,
 ) -> RealizedRoutingFixture {
-    // Sessions live in Core's pair on runtime.sqlite: the session store's
-    // plain save commits the head-canonical delta the runtime resumes from.
-    let session_store = meerkat_store::SqliteSessionStore::open(state_root.join("runtime.sqlite"))
+    use meerkat_runtime::RuntimeStore as _;
+
+    // Sessions live in Core's pair on runtime.sqlite, where the runtime
+    // store's head-canonical authority is the session's only authority: a
+    // session-store save would move the physical head past it, and the next
+    // boot could not resume the member. Commit the fixture as one boundary on
+    // the runtime store instead, extending the head it last issued.
+    let runtime_db = state_root.join("runtime.sqlite");
+    let runtime_store = meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(&runtime_db)
+        .expect("open the runtime store for the routing fixture");
+    let session_store = meerkat_store::SqliteSessionStore::open(runtime_db)
         .expect("open the session store for the routing fixture");
     let mut session = session_store
         .load(session_id)
@@ -369,10 +377,35 @@ async fn install_realized_routing_fixture(
         .set_session_metadata(metadata)
         .expect("persist applied routing identity");
 
-    session_store
-        .save(&session)
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(session_id);
+    let observed = runtime_store
+        .load_session_boundary_authority(&runtime_id)
+        .await
+        .expect("read the session's runtime authority")
+        .expect("the session has a runtime authority")
+        .head_canonical()
+        .expect("the native pair's authority is head-canonical")
+        .boundary_head()
+        .clone();
+    let mutation = meerkat_core::session_store::PreparedHeadCanonicalMutation::prepare(
+        &session,
+        Some(observed),
+    )
+    .expect("prepare the realized routing fixture");
+    runtime_store
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            meerkat_runtime::PreparedRuntimeSessionCommit::snapshot_only(
+                meerkat_core::lifecycle::core_executor::BoundSessionCommit::head_canonical_from_session(
+                    &session, mutation,
+                )
+                .expect("bind the realized routing fixture"),
+            ),
+        )
         .await
         .expect("commit the realized routing fixture");
+    // The next boot takes the runtime store's execution custody.
+    drop(runtime_store);
 
     RealizedRoutingFixture {
         request_id,
