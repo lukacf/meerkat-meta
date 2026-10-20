@@ -185,6 +185,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Meta Forge's packager accepts the frontend it has just built. esbuild
+  carries the file names that installed packages' own source maps give
+  (inline-style-parser's `index.js`, the MCP SDK's TypeScript sources) into
+  `web/dist/app.js.map`, and the stale-frontend check read every named file,
+  so packaging a fresh build stopped with `FileNotFoundError`. The check now
+  compares and records only the checkout's own sources, skips sources under
+  `node_modules` (which `package-lock.json` pins), and refuses a missing
+  checkout source as a stale frontend.
 - Meta Forge's local knowledge service starts and becomes ready for semantic
   ingestion. `knowledge/manage.py up` used to stop before the service started:
   the pinned source commit could not be fetched, and every available revision
