@@ -4120,10 +4120,16 @@ async fn strict_incremental_persistence_refuses_a_whole_blob_provider_session_st
 
 // --- the continuity mirror ---------------------------------------------------
 
-/// The self-hosted model the mirror harness's profile names: a restore boots
-/// it under the same name, so the copy is restorable without provider keys.
-/// The harness itself runs on `TestClient` and never calls the server.
+/// The self-hosted model the mirror harness's text identity runs on: a restore
+/// boots it under the same name, so that identity's copy resumes without
+/// provider keys. The harness itself runs on `TestClient` and never calls the
+/// server.
 const SLOT8_MODEL: &str = "slot8-fixture-model";
+
+/// The catalog model the mirror harness's image identity runs on. Meta's image
+/// gate refuses every self-hosted model, so the image-bearing session needs a
+/// catalog model that takes images.
+const SLOT8_IMAGE_MODEL: &str = "gpt-5.5";
 
 fn slot8_definition_toml(mob_id: &str) -> String {
     format!(
@@ -4137,6 +4143,13 @@ provider = "self_hosted"
 runtime_mode = "turn_driven"
 
 [profiles.default.tools]
+comms = true
+
+[profiles.vision]
+model = "{SLOT8_IMAGE_MODEL}"
+runtime_mode = "turn_driven"
+
+[profiles.vision.tools]
 comms = true
 "#
     )
@@ -4225,12 +4238,14 @@ fn mirrored_session(dir: &std::path::Path, session_id: &str) -> Option<meerkat_c
     )
 }
 
-/// The runtime-owned continuity mirror copies an identity's current record,
-/// its committed session (a plain turn and an image turn) and the image's
-/// blob, in the rows the continuity export's JSON Lines provider and
-/// restore_blobs.py read. Shutdown writes the last copy without a stop() from
-/// the host. With SLOT8_MIRROR_OUT set, the files and the source facts a
-/// restore check needs are copied there.
+/// The runtime-owned continuity mirror copies each identity's current record,
+/// its committed session and the blobs that session references, in the rows
+/// the continuity export's JSON Lines provider and restore_blobs.py read.
+/// alice runs on the self-hosted model with two plain turns; bob runs on a
+/// catalog model with an image turn, since Meta's image gate refuses every
+/// self-hosted model. Shutdown writes the last copy without a stop() from the
+/// host. With SLOT8_MIRROR_OUT set, the files and the source facts a restore
+/// check needs are copied there.
 #[tokio::test]
 async fn the_continuity_mirror_copies_each_identity_current_session() {
     use meerkat_meta::unified_runtime::continuity_mirror::JsonlFileMirrorSink;
@@ -4239,6 +4254,8 @@ async fn the_continuity_mirror_copies_each_identity_current_session() {
     let root = tmp.path().join("root");
     let mirror_dir = tmp.path().join("mirror");
     let mob_id = unique_builder_mob_id();
+    let alice_spec = durable_spec("agent:alice");
+    let bob_spec = durable_spec_with_profile("agent:bob", "vision");
     let runtime = Box::pin(
         UnifiedRuntimeBuilder::default()
             .definition(
@@ -4250,9 +4267,10 @@ async fn the_continuity_mirror_copies_each_identity_current_session() {
                     .expect("mirror harness host config"),
             )
             .persistent_state(&root)
-            .roster_provider(Arc::new(StubRosterProvider::new(vec![durable_spec(
-                "agent:alice",
-            )])))
+            .roster_provider(Arc::new(StubRosterProvider::new(vec![
+                alice_spec.clone(),
+                bob_spec.clone(),
+            ])))
             .identity_runtime_instance_id("continuity-mirror-test")
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .continuity_mirror(
@@ -4263,21 +4281,21 @@ async fn the_continuity_mirror_copies_each_identity_current_session() {
     )
     .await
     .expect("build over persistent state with a mirror");
-    let identity = AgentIdentity::parse("agent:alice").unwrap();
+    let alice = AgentIdentity::parse("agent:alice").unwrap();
+    let bob = AgentIdentity::parse("agent:bob").unwrap();
     let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+    for text in ["mirror me", "and a second turn"] {
+        identity_runtime
+            .send(&alice, &meerkat_core::ContentInput::Text(text.to_string()))
+            .await
+            .expect("alice's plain turn");
+    }
     identity_runtime
         .send(
-            &identity,
-            &meerkat_core::ContentInput::Text("mirror me".to_string()),
-        )
-        .await
-        .expect("plain turn");
-    identity_runtime
-        .send(
-            &identity,
+            &bob,
             &meerkat_core::ContentInput::Blocks(vec![
                 meerkat_core::types::ContentBlock::Text {
-                    text: "and this image".to_string(),
+                    text: "bob's image".to_string(),
                 },
                 meerkat_core::types::ContentBlock::Image {
                     media_type: "image/png".to_string(),
@@ -4288,33 +4306,33 @@ async fn the_continuity_mirror_copies_each_identity_current_session() {
             ]),
         )
         .await
-        .expect("image turn");
+        .expect("bob's image turn");
 
-    // The mirror follows committed state: wait until both turns and the
+    let session_text = |identity: &str| {
+        let records = mirror_lines(&mirror_dir, "records.jsonl");
+        let record = records
+            .iter()
+            .find(|record| record["identity"] == identity)?;
+        let session = mirrored_session(&mirror_dir, record["session_id"].as_str().unwrap())?;
+        Some(serde_json::to_string(session.messages()).unwrap())
+    };
+
+    // The mirror follows committed state: wait until every turn and the
     // image's blob are in the copy.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let session_id = loop {
-        let records = mirror_lines(&mirror_dir, "records.jsonl");
-        if let Some(record) = records.first() {
-            let session_id = record["session_id"].as_str().unwrap().to_string();
-            if let Some(session) = mirrored_session(&mirror_dir, &session_id) {
-                let text = serde_json::to_string(session.messages()).unwrap();
-                if text.contains("mirror me")
-                    && text.contains("and this image")
-                    && !mirror_lines(&mirror_dir, "blobs.jsonl").is_empty()
-                {
-                    break session_id;
-                }
-            }
-        }
+    while !session_text("agent:alice")
+        .is_some_and(|text| text.contains("mirror me") && text.contains("and a second turn"))
+        || !session_text("agent:bob").is_some_and(|text| text.contains("bob's image"))
+        || mirror_lines(&mirror_dir, "blobs.jsonl").is_empty()
+    {
         assert!(
             std::time::Instant::now() < deadline,
-            "the mirror never showed both turns and the image: records {:?}, counts {:?}",
+            "the mirror never showed every turn and the image: records {:?}, counts {:?}",
             mirror_lines(&mirror_dir, "records.jsonl"),
             runtime.continuity_mirror_counts().await,
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    }
 
     // Shutdown stops the runtime-owned mirror itself, with a last round.
     tokio::time::timeout(Duration::from_secs(60), runtime.shutdown())
@@ -4322,34 +4340,54 @@ async fn the_continuity_mirror_copies_each_identity_current_session() {
         .expect("shutdown with a mirror and no stop() from the host ends");
 
     let records = mirror_lines(&mirror_dir, "records.jsonl");
-    assert_eq!(records.len(), 1, "{records:?}");
-    assert_eq!(
-        mirror_keys(&records[0]),
-        [
-            "agent_runtime_id",
-            "checkpoint_version",
-            "generation",
-            "identity",
-            "session_id"
-        ],
-        "exactly the JSON Lines provider's record keys"
-    );
-    assert_eq!(records[0]["identity"], "agent:alice");
+    assert_eq!(records.len(), 2, "{records:?}");
+    for record in &records {
+        assert_eq!(
+            mirror_keys(record),
+            [
+                "agent_runtime_id",
+                "checkpoint_version",
+                "generation",
+                "identity",
+                "session_id"
+            ],
+            "exactly the JSON Lines provider's record keys"
+        );
+    }
+    let session_of = |identity: &str| {
+        let record = records
+            .iter()
+            .find(|record| record["identity"] == identity)
+            .unwrap_or_else(|| panic!("no record for {identity}: {records:?}"));
+        let session_id = record["session_id"].as_str().unwrap();
+        let session = mirrored_session(&mirror_dir, session_id).unwrap();
+        assert_eq!(session.id().to_string(), session_id);
+        session
+    };
+    let alice_session = session_of("agent:alice");
+    let bob_session = session_of("agent:bob");
     let sessions = mirror_lines(&mirror_dir, "sessions.jsonl");
-    assert_eq!(sessions.len(), 1, "one row per session");
-    assert_eq!(mirror_keys(&sessions[0]), ["data", "session_id"]);
-    let session = mirrored_session(&mirror_dir, &session_id).unwrap();
-    assert_eq!(session.id().to_string(), session_id);
+    assert_eq!(sessions.len(), 2, "one row per session");
+    for session in &sessions {
+        assert_eq!(mirror_keys(session), ["data", "session_id"]);
+    }
     let blobs = mirror_lines(&mirror_dir, "blobs.jsonl");
     assert_eq!(blobs.len(), 1, "{blobs:?}");
     assert_eq!(mirror_keys(&blobs[0]), ["blob_id", "data", "media_type"]);
     assert_eq!(blobs[0]["media_type"], "image/png");
     assert_eq!(blobs[0]["data"], MIRROR_TEST_PNG);
+    let blob_id = blobs[0]["blob_id"].as_str().unwrap();
     assert!(
-        serde_json::to_string(session.messages())
+        serde_json::to_string(bob_session.messages())
             .unwrap()
-            .contains(blobs[0]["blob_id"].as_str().unwrap()),
-        "the session references the mirrored blob"
+            .contains(blob_id),
+        "bob's session references the mirrored blob"
+    );
+    assert!(
+        !serde_json::to_string(alice_session.messages())
+            .unwrap()
+            .contains(blob_id),
+        "alice's session names no blob"
     );
 
     if let Some(out) = std::env::var_os("SLOT8_MIRROR_OUT") {
@@ -4358,26 +4396,35 @@ async fn the_continuity_mirror_copies_each_identity_current_session() {
         for name in ["records.jsonl", "sessions.jsonl", "blobs.jsonl"] {
             std::fs::copy(mirror_dir.join(name), out.join(name)).unwrap();
         }
-        std::fs::write(out.join("identity.txt"), "agent:alice\n").unwrap();
-        std::fs::write(out.join("mob-id.txt"), format!("{mob_id}\n")).unwrap();
-        std::fs::write(out.join("profile.txt"), "default\n").unwrap();
-        std::fs::write(out.join("model.txt"), format!("{SLOT8_MODEL}\n")).unwrap();
-        std::fs::write(out.join("mob-config.toml"), slot8_definition_toml(&mob_id)).unwrap();
-        std::fs::write(
-            out.join("host-config.toml"),
-            slot8_host_config_toml(&mob_id),
-        )
-        .unwrap();
-        std::fs::write(
-            out.join("roster-spec.json"),
-            serde_json::to_string_pretty(&durable_spec("agent:alice")).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            out.join("source-messages.json"),
-            serde_json::to_string_pretty(session.messages()).unwrap(),
-        )
-        .unwrap();
+        let write =
+            |name: &str, contents: String| std::fs::write(out.join(name), contents).unwrap();
+        write("mob-id.txt", format!("{mob_id}\n"));
+        write("mob-config.toml", slot8_definition_toml(&mob_id));
+        write("host-config.toml", slot8_host_config_toml(&mob_id));
+        // alice: the self-hosted identity a restore resumes and runs a turn on.
+        write("identity.txt", "agent:alice\n".to_string());
+        write("profile.txt", "default\n".to_string());
+        write("model.txt", format!("{SLOT8_MODEL}\n"));
+        write(
+            "roster-spec.json",
+            serde_json::to_string_pretty(&alice_spec).unwrap(),
+        );
+        write(
+            "source-messages.json",
+            serde_json::to_string_pretty(alice_session.messages()).unwrap(),
+        );
+        // bob: the image-bearing identity whose blob a restore copies back.
+        write("image-identity.txt", "agent:bob\n".to_string());
+        write("image-profile.txt", "vision\n".to_string());
+        write("image-model.txt", format!("{SLOT8_IMAGE_MODEL}\n"));
+        write(
+            "image-roster-spec.json",
+            serde_json::to_string_pretty(&bob_spec).unwrap(),
+        );
+        write(
+            "image-source-messages.json",
+            serde_json::to_string_pretty(bob_session.messages()).unwrap(),
+        );
     }
 }
 
@@ -4718,6 +4765,96 @@ async fn the_continuity_mirror_keeps_its_copy_when_the_store_loses_a_session() {
     );
 }
 
+/// A dormant identity stays in the copy: retire keeps the member's history
+/// (its next wake resumes the same session), the archived session reads
+/// Revivable, and the mirror goes on copying it rather than holding it as a
+/// loss.
+#[tokio::test]
+async fn the_continuity_mirror_keeps_copying_a_dormant_identity() {
+    use meerkat_meta::unified_runtime::continuity_mirror::{
+        ContinuityMirrorTimings, JsonlFileMirrorSink,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let mirror_dir = tmp.path().join("mirror");
+    let mob_id = unique_builder_mob_id();
+    let runtime = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(test_definition_with_id(&mob_id))
+            .persistent_state(tmp.path().join("root"))
+            .roster_provider(Arc::new(StubRosterProvider::new(vec![durable_spec(
+                "agent:alice",
+            )])))
+            .identity_runtime_instance_id("continuity-mirror-dormant-test")
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .continuity_mirror_with_timings(
+                Arc::new(JsonlFileMirrorSink::new(&mirror_dir)),
+                ContinuityMirrorTimings {
+                    interval: Duration::from_millis(50),
+                    put_deadline: Duration::from_secs(10),
+                    stop_deadline: Duration::from_secs(10),
+                },
+            )
+            .build(),
+    )
+    .await
+    .expect("build");
+    let identity = AgentIdentity::parse("agent:alice").unwrap();
+    let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+    identity_runtime
+        .send(
+            &identity,
+            &meerkat_core::ContentInput::Text("before the retire".to_string()),
+        )
+        .await
+        .expect("turn");
+    let copied = |text: &str| {
+        let records = mirror_lines(&mirror_dir, "records.jsonl");
+        records.first().and_then(|record| {
+            let session_id = record["session_id"].as_str()?.to_string();
+            mirrored_session(&mirror_dir, &session_id)
+                .filter(|session| {
+                    serde_json::to_string(session.messages())
+                        .unwrap()
+                        .contains(text)
+                })
+                .map(|_| session_id)
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let session_id = loop {
+        if let Some(session_id) = copied("before the retire") {
+            break session_id;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the turn was never copied"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    identity_runtime.retire(&identity).await.expect("retire");
+    let counts = runtime.continuity_mirror_counts().await.expect("mirror");
+    // Rounds after the retire: the dormant identity is copied, not lost.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        counts.kept_after_loss.load(Ordering::Relaxed),
+        0,
+        "a dormant identity's session reads Revivable, not lost"
+    );
+    assert_eq!(counts.failures.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        copied("before the retire").as_deref(),
+        Some(session_id.as_str())
+    );
+    tokio::time::timeout(Duration::from_secs(60), runtime.shutdown())
+        .await
+        .expect("shutdown");
+    assert_eq!(
+        copied("before the retire").as_deref(),
+        Some(session_id.as_str())
+    );
+}
+
 /// A mirror on a runtime that is not identity-first would copy nothing, so
 /// the build refuses it rather than run a silent no-op.
 #[tokio::test]
@@ -4786,15 +4923,13 @@ async fn a_continuity_mirror_blob_the_sink_refuses_holds_back_only_its_session()
         refusing: AtomicBool::new(true),
         refused: AtomicUsize::new(0),
     });
+    // A catalog model that takes images: Meta's image gate refuses every
+    // self-hosted model, so the restore harness's profile cannot carry one.
     let runtime = Box::pin(
         UnifiedRuntimeBuilder::default()
             .definition(
-                meerkat_mob::MobDefinition::from_toml(&slot8_definition_toml(&mob_id))
-                    .expect("mirror harness definition"),
-            )
-            .meerkat_config(
-                toml::from_str::<meerkat::Config>(&slot8_host_config_toml(&mob_id))
-                    .expect("mirror harness host config"),
+                meerkat_mob::MobDefinition::from_toml(&test_definition_toml(&mob_id))
+                    .expect("blob hold definition"),
             )
             .persistent_state(&root)
             .roster_provider(Arc::new(StubRosterProvider::new(vec![
