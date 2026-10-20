@@ -113,10 +113,21 @@ function exitDetailOf(exit: Record<string, unknown>): string | undefined {
   const target = asString(exit.target_identity);
   const order = asNumber(exit.participant_order);
   const round = asNumber(exit.round);
+  // `participant_fork_instruction_refused` carries a typed refusal: the cause
+  // tag and the inherited instruction keys it concerns.
+  const refusal = asRecord(exit.refusal);
+  const refusalCause = asString(asRecord(refusal?.cause)?.kind);
+  const refusalKeys = refusal && Array.isArray(refusal.keys) ? refusal.keys.length : 0;
   const parts: string[] = [];
   if (order !== undefined) parts.push(`slot ${order}`);
   if (round !== undefined) parts.push(`round ${round + 1}`);
   if (target) parts.push(target);
+  if (refusalCause) {
+    parts.push(
+      `fork instruction refusal: ${refusalCause.replace(/_/g, " ")}` +
+        (refusalKeys > 0 ? ` (${refusalKeys} key${refusalKeys === 1 ? "" : "s"})` : ""),
+    );
+  }
   if (detail) parts.push(detail);
   return parts.length > 0 ? parts.join(" · ") : undefined;
 }
