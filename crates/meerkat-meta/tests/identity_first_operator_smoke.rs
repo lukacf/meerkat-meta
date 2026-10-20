@@ -31,10 +31,10 @@ use meerkat_meta::identity_first::contracts::{AgentCustomizer, TopologyProvider}
 use meerkat_meta::identity_first::orchestrator::{RestoreOutcome, restore_flow};
 use meerkat_meta::identity_first::{
     AgentAddressability, AgentBuildContext, AgentBuildDraft, AgentIdentity, ContinuityStore,
-    CorrelationId, CustomizerError, DispatchInput, DispatchOrigin, DurabilityPolicy,
-    DurableAgentSpec, IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig,
-    IdentityRuntimeError, LocalContinuityStore, LocalLeaseProvider, ManagedPeerEdge, SessionBridge,
-    TopologyContext, TopologyError,
+    CorrelationId, CustomizerError, DispatchIdempotencyKey, DispatchInput, DispatchOrigin,
+    DurabilityPolicy, DurableAgentSpec, IdentityLifecycleState, IdentityRuntime,
+    IdentityRuntimeConfig, IdentityRuntimeError, LocalContinuityStore, LocalLeaseProvider,
+    ManagedPeerEdge, SessionBridge, TopologyContext, TopologyError,
 };
 use meerkat_meta::member_comms_id::roster_member_id_for_identity;
 use meerkat_meta::mob_handle_runtime::SessionCreatedContext;
@@ -961,15 +961,19 @@ async fn e2e_smoke_05_async_checkpoint_durability() {
         }
     }
 
-    // Dispatch to review agent (InternalOnly) with correlation_id
+    // Dispatch to review agent (InternalOnly) as one scheduled occurrence: a
+    // dedup pair of idempotency key and correlation id (a half-pair is
+    // refused, and a Scheduler-lane correlation is a canonical UUID).
     eprintln!("[SMOKE-05] Dispatching to review:main with correlation_id...");
     let dispatch_input = DispatchInput {
         content: meerkat_core::ContentInput::Text(
             "Run weekly review. Say REVIEW_DONE.".to_string(),
         ),
         origin: DispatchOrigin::Scheduler,
-        correlation_id: Some(CorrelationId::new("review-2026-W13")),
-        idempotency_key: None,
+        correlation_id: Some(CorrelationId::new(
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, b"review-2026-W13").to_string(),
+        )),
+        idempotency_key: Some(DispatchIdempotencyKey::new("review-2026-W13")),
     };
     let (token, is_durable) = identity_rt
         .dispatch(&id("review:main"), &dispatch_input)
