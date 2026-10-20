@@ -333,7 +333,8 @@ impl UnifiedRuntimeBuilder {
     /// Ignored since 0.9.4: identity continuity and leases live in the state
     /// directory, and the runtime never reads or writes this store. Migrate
     /// 0.9.3 identities with the continuity export (see the continuity
-    /// export guide). The external path still requires the pair with
+    /// export guide). To keep an external copy, use
+    /// [`continuity_mirror`](Self::continuity_mirror). The external path still requires the pair with
     /// [`lease_provider`](Self::lease_provider) until both methods are
     /// removed, and `build()` logs a warning when either is set.
     pub fn continuity_store(
@@ -364,7 +365,7 @@ impl UnifiedRuntimeBuilder {
     /// source for a lost state directory that is never read at boot (see
     /// [`continuity_mirror`](super::continuity_mirror)). The runtime owns the
     /// mirror: shutdown writes a last copy, and dropping the runtime stops it.
-    /// It needs an identity-first runtime; `build()` refuses it otherwise.
+    /// A runtime with no durable identity copies nothing.
     pub fn continuity_mirror(
         mut self,
         sink: Arc<dyn super::continuity_mirror::ContinuityMirrorSink>,
@@ -1375,7 +1376,7 @@ impl UnifiedRuntimeBuilder {
             tracing::warn!(
                 "continuity_store() and lease_provider() are ignored since 0.9.4: identity \
                  continuity and leases live in the state directory. Migrate 0.9.3 identities \
-                 with the continuity export"
+                 with the continuity export; to keep an external copy, use continuity_mirror()"
             );
         }
         self.materialize_storage_provider().await?;

@@ -262,6 +262,45 @@ again. The provider keeps the records and where each session's line starts,
 and reads one snapshot at a time, so memory follows the largest session as
 with any provider.
 
+## Restoring a lost 0.9.4 state directory from a continuity mirror
+
+A Rust host whose state directory sits on a volume it could lose can keep a
+live copy outside it: `UnifiedRuntimeBuilder::continuity_mirror(sink,
+interval)`. The SDKs and `rpc_gateway` have no mirror option, and none of the
+0.9.3 continuity seams is a copy: `meta/init` refuses the 0.9.3 continuity
+parameters, and the Rust builder ignores `continuity_store()` and
+`lease_provider()` with a warning. The runtime copies, for
+each durable identity, its current record, its committed session and the
+image blobs that session references, every `interval` and once more at
+shutdown. It never reads the copy at boot: the state directory stays the
+authority, and a turn never waits on the copy. `JsonlFileMirrorSink` writes
+`records.jsonl` and `sessions.jsonl`, in the shape the JSON Lines provider
+above reads, and `blobs.jsonl`; a host writes elsewhere by implementing
+`ContinuityMirrorSink`. To restore into a new, empty state directory:
+
+```bash
+CONTINUITY_EXPORT_RECORDS=mirror/records.jsonl CONTINUITY_EXPORT_SESSIONS=mirror/sessions.jsonl \
+  python3 continuity_export.py --provider jsonl_provider:from_env \
+  --identities-file identities.txt --output continuity-export.jsonl
+meta_gateway storage-migrate-native --state-dir <new dir> \
+  --continuity-export continuity-export.jsonl --apply
+python3 restore_blobs.py --blobs mirror/blobs.jsonl --state-dir <new dir>
+```
+
+List the identities of `records.jsonl` in `identities.txt`. Start the gateway
+with only `persistent_state` pointing at the new directory: no `scratch_dir`,
+continuity store or lease provider, and leave the mob storage at its durable
+default, so each identity resumes its own session. Register the same models
+and provider configuration as the source: a restored session keeps its model,
+and a resume whose model is not registered is refused, keeping the session. The copy lags the runtime
+by up to one interval, so a restore can miss the turns committed after the
+last copy, and like every export it carries only each identity's current
+session. A put that takes longer than its deadline (ten minutes by default)
+is offered again on the next round; the first put after a start carries
+every session, so a slow sink needs a longer deadline:
+`continuity_mirror_with_timings`.
+
+
 ## 4. Check the file
 
 ```bash

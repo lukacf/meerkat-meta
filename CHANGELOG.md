@@ -681,6 +681,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   e6313295da8d492cf830b69f296096c2be25801f468371b6d914e2e0a116f9e2  jsonl_provider.py
   019f097c7e5107ccfaffa36cc1a1699ccebdfa1bd404f02563689a10ca34a4f5  jsonl-provider.mjs
   ```
+- `UnifiedRuntimeBuilder::continuity_mirror(sink, interval)` keeps a live
+  copy of each durable identity's current record, committed session and
+  referenced image blobs outside the state directory, as a restore source for
+  a lost state directory; the copy is never read at boot. The runtime owns
+  the mirror: it re-reads a session only when its store authority changed,
+  writes through a `ContinuityMirrorSink` (`JsonlFileMirrorSink` writes the
+  `records.jsonl` and `sessions.jsonl` the continuity export's JSON Lines
+  provider reads, and `blobs.jsonl`), never makes a turn wait, and writes a
+  last copy at shutdown. `docs/guides/continuity-export.mdx` has the restore
+  steps.
 - `GatewayHostComposition::operation_refusal_observer` lets a gateway host
   install Core's operation refusal observer on each gateway member factory.
   The gateway asks it with the same construction as `compose_member_factory`,

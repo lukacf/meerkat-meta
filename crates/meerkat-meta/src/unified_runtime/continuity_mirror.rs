@@ -41,7 +41,10 @@ use crate::identity_first::bridge::SessionBridge;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContinuityMirrorTimings {
     pub interval: Duration,
-    /// Past it a put counts as failed and the next round retries.
+    /// Past it a put counts as failed, and the next round offers the same rows
+    /// again. Size it for the sink: the first put after a start carries every
+    /// session. A put that outlives it never makes a turn wait, it only delays
+    /// the next round.
     pub put_deadline: Duration,
     /// Past it shutdown aborts the last round and goes on.
     pub stop_deadline: Duration,
@@ -51,7 +54,7 @@ impl Default for ContinuityMirrorTimings {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(30),
-            put_deadline: Duration::from_mins(1),
+            put_deadline: Duration::from_mins(10),
             stop_deadline: Duration::from_secs(30),
         }
     }
@@ -81,6 +84,9 @@ pub struct ContinuityMirrorSession {
 /// What one put hands the sink.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContinuityMirrorUpdate {
+    /// Strictly increasing across puts and across restarts of the runtime:
+    /// wall-clock milliseconds, kept above the previous put's value.
+    pub sequence: u64,
     /// Every mirrored identity's record, sorted by identity.
     pub records: Vec<ContinuityMirrorRecord>,
     /// The sessions whose document changed since the last accepted put, sorted
@@ -91,6 +97,15 @@ pub struct ContinuityMirrorUpdate {
 }
 
 /// Where the mirror writes.
+///
+/// A put carries every record and only the sessions that changed. A sink that
+/// replaces whole files (like [`JsonlFileMirrorSink`]) can ignore the
+/// sequence. An append-only sink writes the update's `sequence` on every row
+/// and a completion row for that sequence last; a restore then takes the
+/// records of the latest COMPLETE sequence and, for each session those records
+/// name, its latest row from a complete sequence at or before it. Records of
+/// an identity the mirror no longer copies are not in that latest sequence, so
+/// a restore does not bring them back.
 #[async_trait::async_trait]
 pub trait ContinuityMirrorSink: Send + Sync {
     async fn put(&self, update: &ContinuityMirrorUpdate) -> Result<(), String>;
@@ -104,11 +119,17 @@ pub trait ContinuityMirrorSink: Send + Sync {
 /// whose session is missing, even after a crash between the steps.
 pub struct JsonlFileMirrorSink {
     dir: PathBuf,
+    /// One writer at a time: a put whose future passed its deadline keeps
+    /// writing on its blocking thread, and the next put waits for it.
+    writing: Arc<std::sync::Mutex<()>>,
 }
 
 impl JsonlFileMirrorSink {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            writing: Arc::new(std::sync::Mutex::new(())),
+        }
     }
 
     fn put_blocking(&self, update: &ContinuityMirrorUpdate) -> Result<(), String> {
@@ -130,11 +151,18 @@ impl ContinuityMirrorSink for JsonlFileMirrorSink {
     async fn put(&self, update: &ContinuityMirrorUpdate) -> Result<(), String> {
         let sink = Self {
             dir: self.dir.clone(),
+            writing: Arc::clone(&self.writing),
         };
         let update = update.clone();
-        tokio::task::spawn_blocking(move || sink.put_blocking(&update))
-            .await
-            .map_err(|error| format!("the file sink's writer ended: {error}"))?
+        tokio::task::spawn_blocking(move || {
+            let _writing = sink
+                .writing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sink.put_blocking(&update)
+        })
+        .await
+        .map_err(|error| format!("the file sink's writer ended: {error}"))?
     }
 }
 
@@ -202,6 +230,8 @@ enum IdentityRead {
     /// No durable session to copy (`Absent`), or an archived one the lifecycle
     /// cannot revive (`ArchivedNotRevivable`): the identity is not mirrored.
     NotMirrored,
+    /// The binding moved while the body was read: keep the last rows.
+    Moved,
 }
 
 impl ContinuityMirrorSource {
@@ -247,6 +277,23 @@ impl ContinuityMirrorSource {
             // A load this build does not know: the identity keeps its last rows.
             _ => return Err(format!("session {session_id}: an unknown resume load")),
         };
+        // A consistent pair: if the identity's binding moved while the body was
+        // read, this tick keeps the last rows and the next one reads again.
+        let durable_identity = crate::identity_first::AgentIdentity::parse(identity)
+            .map_err(|error| format!("identity {identity}: {error}"))?;
+        let current = self
+            .bridge
+            .last_member_binding(&durable_identity)
+            .await
+            .map_err(|error| format!("member binding: {error}"))?;
+        if current
+            .as_ref()
+            .and_then(meerkat_mob::MemberBinding::session_id)
+            != Some(session_id)
+            || current.as_ref().map(|current| current.generation().get()) != Some(generation)
+        {
+            return Ok(IdentityRead::Moved);
+        }
         let document = session
             .to_persisted_bytes()
             .map_err(|error| format!("session {session_id}: {error}"))?;
@@ -300,6 +347,17 @@ struct MirrorState {
     pending: BTreeMap<String, ContinuityMirrorSession>,
     /// The update the sink last accepted, compared without its documents.
     accepted: Option<(Vec<ContinuityMirrorRecord>, BTreeSet<String>)>,
+    /// The last sequence handed to the sink.
+    sequence: u64,
+}
+
+/// Wall-clock milliseconds, kept strictly above `previous`.
+fn next_sequence(previous: u64) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    now.max(previous.saturating_add(1))
 }
 
 async fn round(
@@ -329,7 +387,7 @@ async fn round(
             .read_identity(&identity, binding, session_id, previous)
             .await
         {
-            Ok(IdentityRead::Unchanged) => {
+            Ok(IdentityRead::Unchanged | IdentityRead::Moved) => {
                 if let Some(previous) = previous {
                     identities.insert(identity, previous.clone());
                 }
@@ -372,7 +430,9 @@ async fn round(
     {
         return;
     }
+    state.sequence = next_sequence(state.sequence);
     let update = ContinuityMirrorUpdate {
+        sequence: state.sequence,
         records,
         changed_sessions: state.pending.values().cloned().collect(),
         session_ids,
@@ -392,8 +452,16 @@ async fn round(
         Ok(Err(_elapsed)) => {
             counts.failures.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
-                deadline_ms = put_deadline.as_millis() as u64,
-                "continuity mirror: the sink did not answer before its deadline"
+                deadline_ms = u64::try_from(put_deadline.as_millis()).unwrap_or(u64::MAX),
+                records = update.records.len(),
+                sessions = update.changed_sessions.len(),
+                session_bytes = update
+                    .changed_sessions
+                    .iter()
+                    .map(|session| session.data.len())
+                    .sum::<usize>(),
+                "continuity mirror: the sink did not answer before its put deadline; the next round \
+                 offers the same rows again (raise the deadline for a slow sink)"
             );
         }
         Err(_panic) => {
@@ -425,14 +493,20 @@ impl ContinuityMirror {
         let task = tokio::spawn(async move {
             let mut state = MirrorState::default();
             loop {
-                round(
+                let ran = AssertUnwindSafe(round(
                     &source,
                     sink.as_ref(),
                     timings.put_deadline,
                     &mut state,
                     &task_counts,
-                )
+                ))
+                .catch_unwind()
                 .await;
+                if ran.is_err() {
+                    task_counts.failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("continuity mirror: a round panicked; the next one starts over");
+                    state = MirrorState::default();
+                }
                 if *stopped.borrow() {
                     return;
                 }
