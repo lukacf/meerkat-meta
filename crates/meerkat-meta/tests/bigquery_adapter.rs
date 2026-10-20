@@ -1612,7 +1612,7 @@ async fn continuity_mirror_bigquery_sink_caches_the_token_source_token() {
         MockHttpResponse::json(json!({})),
         MockHttpResponse::json(json!({})),
     ]);
-    let (source, fetches) = mirror_counting_token_source(Duration::from_secs(3600));
+    let (source, fetches) = mirror_counting_token_source(Duration::from_hours(1));
     mirror_sink_with_token_source(&server, source)
         .put(&mirror_update())
         .await
@@ -1674,7 +1674,7 @@ async fn continuity_mirror_bigquery_sink_sends_a_refused_insert_again_with_a_new
         MockHttpResponse::json(json!({})),
         MockHttpResponse::json(json!({})),
     ]);
-    let (source, fetches) = mirror_counting_token_source(Duration::from_secs(3600));
+    let (source, fetches) = mirror_counting_token_source(Duration::from_hours(1));
     let sink = mirror_sink_with_token_source(&server, source);
     sink.put(&mirror_update())
         .await
@@ -1710,7 +1710,7 @@ async fn continuity_mirror_bigquery_sink_sends_a_refused_insert_again_with_a_new
 async fn continuity_mirror_bigquery_sink_fails_a_put_when_bigquery_refuses_the_new_token_too() {
     use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
     let server = MockHttpServer::start(vec![mirror_unauthorized(), mirror_unauthorized()]);
-    let (source, _fetches) = mirror_counting_token_source(Duration::from_secs(3600));
+    let (source, _fetches) = mirror_counting_token_source(Duration::from_hours(1));
     let sink = mirror_sink_with_token_source(&server, source);
     let error = sink
         .put(&mirror_update())
@@ -1763,7 +1763,7 @@ async fn continuity_mirror_bigquery_sink_sends_a_failed_request_once() {
         status_code: 500,
         ..MockHttpResponse::json(json!({"error": {"code": 500}}))
     }]);
-    let (source, fetches) = mirror_counting_token_source(Duration::from_secs(3600));
+    let (source, fetches) = mirror_counting_token_source(Duration::from_hours(1));
     let sink = mirror_sink_with_token_source(&server, source);
     let error = sink
         .put(&mirror_update())
