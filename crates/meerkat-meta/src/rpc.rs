@@ -9816,9 +9816,14 @@ shell = true
             catalogs["result"]["runtime_flows"][0]["id"],
             json!("runtime_rpc_main")
         );
+        // The list also reads the draft store. An explicit store path keeps it
+        // off the host's gateway home, which another Meta install on the same
+        // machine may own (its drafts would add rows, and an unadopted
+        // predecessor home refuses the call).
+        let drafts = tempfile::tempdir()?;
         let listed = super::handle_mobpack_authoring_rpc_with_runtime(
             "meta/mobpacks/list",
-            &json!({}),
+            &json!({ "store_path": drafts.path().join("drafts.json") }),
             json!(2),
             Some(&runtime),
         )
@@ -9826,6 +9831,11 @@ shell = true
         let listed: Value = serde_json::to_value(listed)?;
         assert_eq!(listed["result"]["runtime_backed"], json!(true));
         assert_eq!(listed["result"]["rows"][0]["id"], json!("runtime_rpc_main"));
+        assert_eq!(
+            listed["result"]["rows"].as_array().map(Vec::len),
+            Some(1),
+            "an empty draft store adds no rows"
+        );
 
         let fetched = super::handle_mobpack_authoring_rpc_with_runtime(
             "meta/mobpacks/get",

@@ -221,13 +221,18 @@ fn a_failed_cleanup_after_start_timeout_retains_then_reaps_the_module() {
 /// After a failed start the runtime must not keep the module's stdout open:
 /// a descendant that inherited it then gets EPIPE. A reader thread left
 /// blocked on the pipe would keep it open instead.
+///
+/// The probe writes from a subshell of its own. Some shells (macOS /bin/sh)
+/// keep a builtin printf's output buffered after the write failed, and flush
+/// it into the next redirection; the subshell takes that buffer with it, so
+/// the outcome FIFO only ever receives `open` or `closed`.
 #[test]
 fn a_failed_start_leaves_no_reader_holding_the_module_output() {
     let temp = tempfile::tempdir().unwrap();
     let go = fifo(temp.path(), "go");
     let outcome = fifo(temp.path(), "outcome");
     let script = format!(
-        "(trap '' PIPE; read _ < '{go}'; if printf 'late\\n' 2>/dev/null; then echo open > '{outcome}'; else echo closed > '{outcome}'; fi) & exec sleep 30",
+        "(trap '' PIPE; read _ < '{go}'; if (printf 'late\\n') 2>/dev/null; then echo open > '{outcome}'; else echo closed > '{outcome}'; fi) & exec sleep 30",
         go = go.display(),
         outcome = outcome.display()
     );
