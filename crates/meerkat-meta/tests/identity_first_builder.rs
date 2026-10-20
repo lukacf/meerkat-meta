@@ -4994,3 +4994,140 @@ async fn strict_incremental_persistence_refuses_whole_snapshot_continuity_store(
         Ok(_) => panic!("strict mode must refuse a whole-snapshot continuity store"),
     }
 }
+
+#[derive(Default)]
+struct DirtyRestartClient {
+    inner: meerkat_client::TestClient,
+    requests: Mutex<Vec<LlmRequest>>,
+}
+
+impl LlmClient for DirtyRestartClient {
+    fn stream<'a>(
+        &'a self,
+        request: &'a LlmRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
+        self.requests.lock().unwrap().push(request.clone());
+        self.inner.stream(request)
+    }
+
+    fn provider(&self) -> meerkat_core::Provider {
+        self.inner.provider()
+    }
+
+    fn health_check<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LlmError>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A process exit leaves the mob ledger Running. Unlike a stopped mob's
+/// deferred activation, this restores members inside prepare(), before the
+/// identity runtime is built. Its continuity adapter must already know the
+/// persisted owners when recovery commits the runtime tail.
+#[tokio::test]
+async fn identity_persistent_builder_registers_owners_before_dirty_prepare() {
+    const CHILD_STATE: &str = "META_BUILDER_DIRTY_OWNER_STATE";
+    const TEST_NAME: &str = "identity_persistent_builder_registers_owners_before_dirty_prepare";
+    const MOB_ID: &str = "builder-dirty-owner-regression";
+    const SEED: &str = "committed-before-dirty-exit-f6f9d3";
+
+    let child_state = std::env::var_os(CHILD_STATE);
+    let temp = child_state.is_none().then(|| tempfile::tempdir().unwrap());
+    let state = child_state
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| temp.as_ref().unwrap().path().to_path_buf());
+    if child_state.is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST_NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_STATE, &state)
+            .env("MEERKAT_DISABLE_GRAPH_DECODE_MEMO", "1")
+            .env("RUST_MIN_STACK", "33554432")
+            .output()
+            .expect("run first boot in an isolated process");
+        assert!(
+            output.status.success(),
+            "first boot failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let identity = AgentIdentity::parse("agent:dirty-owner").unwrap();
+    let client = Arc::new(DirtyRestartClient::default());
+    let roster = Arc::new(StubRosterProvider::new(vec![durable_spec(
+        identity.as_str(),
+    )]));
+    let (mob_storage, mob_provenance) =
+        meerkat_meta::mob_composition_manifest::persistent_mob_storage(state.join("mob.sqlite3"))
+            .expect("open persistent mob journal");
+    let runtime = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(test_definition_with_id(MOB_ID))
+            .mob_storage(mob_storage, mob_provenance)
+            .persistent_state(&state)
+            .continuity_from_state_dir(&state)
+            .await
+            .expect("open authoritative continuity")
+            .roster_provider(roster.clone())
+            .default_llm_client(client.clone())
+            .build(),
+    )
+    .await
+    .expect("bootstrap continuity-backed runtime");
+    let identities = runtime.identity_runtime().unwrap();
+    assert!(identities.identity_bootstrap_status().ready);
+    let status = identities.status(&identity).await.unwrap();
+    assert_eq!(status.state, IdentityLifecycleState::Active);
+    let session_id = status.session_id.unwrap().to_string();
+    assert!(
+        client.requests.lock().unwrap().is_empty(),
+        "restoration alone must not invoke the model"
+    );
+
+    if child_state.is_some() {
+        identities
+            .send_awaiting_commit(
+                &identity,
+                &meerkat_core::ContentInput::Text(SEED.to_string()),
+            )
+            .await
+            .expect("seed turn commits");
+        std::fs::write(state.join("expected-session-id"), session_id).unwrap();
+        assert_eq!(
+            runtime.mob_handle().status().await.unwrap(),
+            meerkat_mob::MobState::Running
+        );
+        // Intentionally bypass every destructor and shutdown: this is the
+        // production failure mode, not a graceful stop followed by restart.
+        std::process::exit(0);
+    }
+
+    assert_eq!(
+        session_id,
+        std::fs::read_to_string(state.join("expected-session-id")).unwrap(),
+        "dirty recovery must preserve the native session binding"
+    );
+    identities
+        .send_awaiting_commit(
+            &identity,
+            &meerkat_core::ContentInput::Text("continue after dirty recovery".to_string()),
+        )
+        .await
+        .expect("restored session admits and commits another real turn");
+    assert!(
+        client.requests.lock().unwrap().iter().any(|request| {
+            serde_json::to_string(&request.messages)
+                .unwrap()
+                .contains(SEED)
+        }),
+        "the restored model context must contain the committed pre-exit turn"
+    );
+    let shutdown = runtime.shutdown().await;
+    assert!(shutdown.cleanup_completed(), "{shutdown:?}");
+}
