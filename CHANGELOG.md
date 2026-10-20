@@ -1297,6 +1297,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is refused instead of queueing behind the hold: as retryable
   (`IdentityWakeRetryable`), or as `ToolArtifactRefused` when the host's tool
   artifact is refused.
+- After an unclean stop (a crash or a kill, so no Stop is recorded), the
+  identity bootstrap publishes the restored members' customizer tools, as
+  it does before the lift after a clean stop, and releases their run-start
+  holds. Before, meerkat's resume revived the members while the mob was
+  built, the bootstrap skipped the publication that precedes a lift, and the
+  mob build's early `customize_build` runs before the mob handle exists
+  (`AgentRuntimeServices::mob_handle()` is `None` there). So a customizer
+  whose tools need the handle left every restored member held until a send
+  reached it, and a member reached only by peer messages stayed held. A
+  restored member's resolved tool list (`meta/identity/resolved_tools`)
+  shows the published tools once the member has run a turn.
 - A resume that collides with a spawn of the same member still in Core's
   custody (a client retry) adopts that spawn once Core has committed the
   member. Before, it could read the member's session binding before the
