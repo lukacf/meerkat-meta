@@ -87,7 +87,7 @@ meerkat-models = { version = "=0.9.4" }
 # to meerkat-store/memory); explicit `memory` enables need `memory-store-session`.
 # `local-authorization`: the realm-scoped MCP credential source the gateway's
 # member factories install and the realm owner's service-secret writes
-# (`GatewayRealmMcpInstallation`). Private 0.9 pair only.
+# (`GatewayRealmMcpInstallation`).
 meerkat = { version = "=0.9.4", features = ["comms", "skills", "mcp", "memory-store", "memory-store-session", "jsonl-store", "session-store", "sqlite-store", "live", "openai-realtime", "local-authorization"] }
 meerkat-openai = { version = "=0.9.4", optional = true }
 # READ-ONLY host-side access to meerkat's OWN session semantic memory for the
@@ -100,12 +100,11 @@ meerkat-memory = { version = "=0.9.4" }
 meerkat-live = { version = "=0.9.4" }
 # `local-authorization`: the native grant work configuration an embedder
 # installs through UnifiedRuntimeBuilder::native_grant_work_configuration
-# (D50 S1). Private 0.9 pair only: published 0.8.51 lacks the feature.
+# (D50 S1).
 meerkat-runtime = { version = "=0.9.4", features = ["sqlite-store", "live", "local-authorization"] }
 # The local authorization publication the Console access facts join, so a
 # native consent eligibility observed from them is invalidated by their
 # changes (and the host-side grant owner for the native grant tests).
-# Private 0.9 pair only.
 meerkat-authorization = { version = "=0.9.4" }
 meerkat-session = { version = "=0.9.4", features = ["session-store"] }
 # Shared SQLite mechanics (storage-unification): named connection profiles,
@@ -235,7 +234,7 @@ meerkat = { version = "=0.9.4", features = ["test-realtime-fixtures"] }
 # session instead of the process-wide count every parallel test moves.
 meerkat-core = { version = "=0.9.4", features = ["test-support"] }
 # The host-side contract types for the native grant configuration tests
-# (D50 S1). Private 0.9 pair only.
+# (D50 S1).
 meerkat-authorization-contracts = { version = "=0.9.4" }
 # `test-support` (test-only) exposes meerkat-runtime's run-start hold read, so
 # the restart test can assert a restored member without its customizer tools
