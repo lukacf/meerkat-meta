@@ -695,14 +695,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   streams the continuity mirror into BigQuery tables named after a prefix.
   Each put appends the changed sessions and every record under the update's
   sequence and writes its completion row last, so a restore reads only
-  complete puts; a session over 4 MiB goes out as numbered part rows. The
-  module documentation lists the tables' columns and the queries that read
-  the restore files back. `BigQuerySessionStoreAdapter::with_access_token_source`
-  takes tokens from a `BigQueryAccessTokenSource`, which caches each token
-  until near its expiry and fetches a new one when BigQuery answers 401, so
-  a long-running adapter outlives a token's lifetime;
-  `BigQuerySessionStoreError::is_access_token_refusal` tells those failures
-  apart.
+  complete puts. It writes each blob a session references once, also across
+  restarts, and a session or blob over 4 MiB goes out as numbered part rows.
+  The module documentation lists the tables' columns and the queries that
+  read the restore files back.
+  `BigQuerySessionStoreAdapter::with_access_token_source` takes tokens from a
+  `BigQueryAccessTokenSource`, which caches each token until near its expiry
+  and fetches a new one when BigQuery answers 401, so a long-running adapter
+  outlives a token's lifetime; `BigQuerySessionStoreError::is_access_token_refusal`
+  tells those failures apart.
 - `GatewayHostComposition::operation_refusal_observer` lets a gateway host
   install Core's operation refusal observer on each gateway member factory.
   The gateway asks it with the same construction as `compose_member_factory`,

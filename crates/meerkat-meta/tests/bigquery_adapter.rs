@@ -1774,3 +1774,154 @@ async fn continuity_mirror_bigquery_sink_sends_a_failed_request_once() {
     assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(sink.auth_failures(), 0);
 }
+
+fn mirror_blob(
+    blob_id: &str,
+) -> meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorBlob {
+    meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorBlob {
+        blob_id: blob_id.to_string(),
+        media_type: "image/png".to_string(),
+        data: "iVBORw0KGgo=".to_string(),
+    }
+}
+
+fn mirror_blob_id(fill: &str) -> String {
+    format!("sha256:{}", fill.repeat(64))
+}
+
+/// The first `put_blob` reads which blobs the blobs table already holds a
+/// complete copy of; a blob it holds is not written again, a new one is
+/// written once as part rows, and a repeated id makes no request.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_puts_each_blob_once_and_skips_blobs_bigquery_holds() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let held = mirror_blob_id("a");
+    let fresh = mirror_blob_id("b");
+    let server = MockHttpServer::start(vec![
+        MockHttpResponse::json(json!({
+            "jobComplete": true,
+            "rows": [{"f": [{"v": held.clone()}]}, {"f": [{"v": held.clone()}]}],
+        })),
+        MockHttpResponse::json(json!({})),
+    ]);
+    let sink = mirror_sink(&server);
+    sink.put_blob(&mirror_blob(&held))
+        .await
+        .expect("a blob BigQuery holds is kept");
+    sink.put_blob(&mirror_blob(&fresh))
+        .await
+        .expect("a new blob streams into BigQuery");
+    sink.put_blob(&mirror_blob(&fresh))
+        .await
+        .expect("a repeated blob id is kept");
+
+    let requests = server.captured_requests();
+    assert_eq!(
+        mirror_request_paths(&requests),
+        vec![
+            MIRROR_QUERY_PATH.to_string(),
+            mirror_table_path("continuity_blobs"),
+        ]
+    );
+    assert_eq!(
+        mirror_query_text(&requests[0]),
+        "SELECT blob_id FROM `mirror-project.mirror_dataset.continuity_blobs` \
+         GROUP BY blob_id, snapshot_ms HAVING COUNT(*) = ANY_VALUE(parts)"
+    );
+    let rows = mirror_request_rows(&requests[1]);
+    assert_eq!(rows.len(), 1);
+    let snapshot_ms = rows[0]["snapshot_ms"].clone();
+    assert!(
+        snapshot_ms
+            .as_str()
+            .is_some_and(|ms| ms.parse::<u64>().is_ok())
+    );
+    assert_eq!(
+        rows[0],
+        json!({
+            "blob_id": fresh,
+            "media_type": "image/png",
+            "data": "iVBORw0KGgo=",
+            "part": 0,
+            "parts": 1,
+            "snapshot_ms": snapshot_ms,
+        })
+    );
+}
+
+/// The held blob ids query waits for an unfinished job and reads every
+/// result page before the sink decides which blobs to write.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_reads_every_page_of_the_held_blob_ids() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let first = mirror_blob_id("c");
+    let second = mirror_blob_id("d");
+    let job = json!({"projectId": "mirror-project", "jobId": "job-1", "location": "EU"});
+    let server = MockHttpServer::start(vec![
+        MockHttpResponse::json(json!({"jobComplete": false, "jobReference": job.clone()})),
+        MockHttpResponse::json(json!({
+            "jobComplete": true,
+            "jobReference": job.clone(),
+            "rows": [{"f": [{"v": first.clone()}]}],
+            "pageToken": "page-2",
+        })),
+        MockHttpResponse::json(json!({
+            "jobComplete": true,
+            "jobReference": job,
+            "rows": [{"f": [{"v": second.clone()}]}],
+        })),
+    ]);
+    let sink = mirror_sink(&server);
+    sink.put_blob(&mirror_blob(&second))
+        .await
+        .expect("a blob on the last page is kept");
+    sink.put_blob(&mirror_blob(&first))
+        .await
+        .expect("a blob on the first page is kept");
+
+    let requests = server.captured_requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path))
+            .collect::<Vec<_>>(),
+        vec![
+            format!("POST {MIRROR_QUERY_PATH}"),
+            format!("GET {MIRROR_QUERY_PATH}/job-1?maxResults=10000&location=EU"),
+            format!("GET {MIRROR_QUERY_PATH}/job-1?maxResults=10000&location=EU&pageToken=page-2"),
+        ]
+    );
+}
+
+/// A blob whose insert fails is written again by the next `put_blob` of its
+/// id, without reading the held ids again.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_writes_a_blob_again_after_its_insert_fails() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let blob_id = mirror_blob_id("e");
+    let server = MockHttpServer::start(vec![
+        MockHttpResponse::json(json!({"jobComplete": true})),
+        MockHttpResponse::json(json!({
+            "insertErrors": [{"index": 0, "errors": [{"reason": "invalid"}]}]
+        })),
+        MockHttpResponse::json(json!({})),
+    ]);
+    let sink = mirror_sink(&server);
+    let error = sink
+        .put_blob(&mirror_blob(&blob_id))
+        .await
+        .expect_err("row errors fail the blob put");
+    assert!(error.contains("continuity_blobs"), "{error}");
+    sink.put_blob(&mirror_blob(&blob_id))
+        .await
+        .expect("the next blob put writes the blob");
+
+    assert_eq!(
+        mirror_request_paths(&server.captured_requests()),
+        vec![
+            MIRROR_QUERY_PATH.to_string(),
+            mirror_table_path("continuity_blobs"),
+            mirror_table_path("continuity_blobs"),
+        ]
+    );
+}

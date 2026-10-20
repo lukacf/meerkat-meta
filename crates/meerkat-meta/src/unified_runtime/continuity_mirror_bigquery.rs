@@ -15,11 +15,11 @@
 //! Install the sink with
 //! [`crate::UnifiedRuntimeBuilder::continuity_mirror_with_timings`] and a
 //! `put_deadline` no shorter than the sink's own
-//! ([`BigQueryMirrorSink::DEFAULT_PUT_DEADLINE`] unless
-//! [`BigQueryMirrorSink::with_put_deadline`] sets another). The mirror's
-//! default deadline of one minute bounds every `put`, and the first `put`
-//! after a start writes every session, so size the deadline for streaming
-//! the whole state: about one `insertAll` request per 8 MiB of base64
+//! ([`BigQueryMirrorSink::DEFAULT_PUT_DEADLINE`], ten minutes like the
+//! mirror's default, unless [`BigQueryMirrorSink::with_put_deadline`] sets
+//! another). Both deadlines bound every `put` and `put_blob`, and the first
+//! `put` after a start writes every session, so size them for streaming the
+//! whole state: about one `insertAll` request per 8 MiB of base64
 //! documents. Give each runtime its own table prefix: the `put`s of two
 //! runtimes on the same tables interleave, and a restore would mix their
 //! records. A sink that runs for longer than a Google access token lives
@@ -29,26 +29,33 @@
 //! it. An error on the access token reads "BigQuery access token refused or
 //! unavailable", and [`BigQueryMirrorSink::auth_failures`] counts them.
 //!
-//! A row carries at most 4 MiB of a session's base64 `data` (BigQuery refuses
-//! a streamed request over 10 MB), so a longer value goes out as several
-//! rows, numbered by `part` from 0, that all carry the number of rows in
-//! `parts`.
+//! `put_blob` writes each blob into the blobs table once: the first
+//! `put_blob` of a process reads which blobs the table holds a complete copy
+//! of, and a blob it holds, or one this process wrote, is not written again.
+//!
+//! A row carries at most 4 MiB of a session's or a blob's base64 `data`
+//! (BigQuery refuses a streamed request over 10 MB), so a longer value goes
+//! out as several rows, numbered by `part` from 0, that all carry the number
+//! of rows in `parts`; a copy is complete when all its parts are in.
 //!
 //! The tables must exist, with these columns (`<p>` is the table prefix),
 //! and the credentials must allow streaming inserts into them and queries
-//! over `<p>_snapshots`:
+//! over `<p>_snapshots` and `<p>_blobs`:
 //!
 //! - `<p>_records`: `identity`, `agent_runtime_id`, `session_id` (STRING),
 //!   `generation`, `checkpoint_version`, `snapshot_ms` (INT64);
 //! - `<p>_sessions`: `session_id`, `data` (STRING), `part`, `parts`,
 //!   `snapshot_ms` (INT64);
+//! - `<p>_blobs`: `blob_id`, `media_type`, `data` (STRING), `part`, `parts`,
+//!   `snapshot_ms` (INT64);
 //! - `<p>_snapshots`: `snapshot_ms`, `records`, `sessions`,
 //!   `changed_sessions` (INT64).
 //!
 //! A restore reads the newest complete `put`, `@s` = `SELECT MAX(snapshot_ms)
-//! FROM <p>_snapshots`, back into the files the continuity export reads: the
-//! records of that `put`, and for each session they name, its newest copy
-//! from a complete `put` at or before it.
+//! FROM <p>_snapshots`, back into the files the continuity export and
+//! `restore_blobs.py` read: the records of that `put`; for each session they
+//! name, its newest copy from a complete `put` at or before it; and one
+//! complete copy of each blob.
 //!
 //! ```sql
 //! -- records.jsonl
@@ -61,18 +68,28 @@
 //!   AND session_id IN (SELECT session_id FROM <p>_records WHERE snapshot_ms = @s)
 //! GROUP BY session_id, snapshot_ms
 //! QUALIFY ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY snapshot_ms DESC) = 1;
+//! -- blobs.jsonl
+//! SELECT blob_id, ANY_VALUE(media_type) AS media_type,
+//!   STRING_AGG(data, '' ORDER BY part) AS data
+//! FROM <p>_blobs GROUP BY blob_id, snapshot_ms
+//! HAVING COUNT(*) = ANY_VALUE(parts)
+//! QUALIFY ROW_NUMBER() OVER (PARTITION BY blob_id ORDER BY snapshot_ms DESC) = 1;
 //! ```
 //!
-//! Keep every `<p>_snapshots` row: it marks a complete `put`. A session's
-//! rows may be deleted once a newer complete `put` holds a copy of it, and a
-//! record row once a newer `put` is complete.
+//! Keep every `<p>_snapshots` row, which marks a complete `put`, and every
+//! `<p>_blobs` row, since a blob is written only once. A session's rows may be
+//! deleted once a newer complete `put` holds a copy of it, and a record row
+//! once a newer `put` is complete.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
-use super::continuity_mirror::{ContinuityMirrorSink, ContinuityMirrorUpdate};
+use super::continuity_mirror::{
+    ContinuityMirrorBlob, ContinuityMirrorSink, ContinuityMirrorUpdate,
+};
 use crate::runtime::{BigQuerySessionStoreAdapter, BigQuerySessionStoreError};
 
 /// BigQuery refuses an `insertAll` request over 10 MB, so the rows of one
@@ -92,6 +109,7 @@ pub struct BigQueryMirrorSink {
     adapter: BigQuerySessionStoreAdapter,
     records_table: String,
     sessions_table: String,
+    blobs_table: String,
     snapshots_table: String,
     put_deadline: Duration,
     last_snapshot_ms: AtomicU64,
@@ -99,11 +117,15 @@ pub struct BigQueryMirrorSink {
     /// row the table held when this process first put.
     snapshot_ms_seeded: tokio::sync::Mutex<bool>,
     auth_failures: AtomicU64,
+    /// The ids of the blobs `<p>_blobs` holds a complete copy of: read by the
+    /// first `put_blob`, and again after that read fails.
+    held_blobs: tokio::sync::Mutex<Option<BTreeSet<String>>>,
 }
 
 impl BigQueryMirrorSink {
-    /// How long one `put` may take unless [`Self::with_put_deadline`] sets
-    /// another bound: the mirror's default put deadline too.
+    /// How long one `put` or `put_blob` may take unless
+    /// [`Self::with_put_deadline`] sets another bound: the mirror's default
+    /// put deadline too.
     pub const DEFAULT_PUT_DEADLINE: Duration = Duration::from_mins(10);
 
     /// A sink over `adapter`'s project, dataset, credentials and endpoint,
@@ -114,15 +136,17 @@ impl BigQueryMirrorSink {
             adapter,
             records_table: format!("{table_prefix}_records"),
             sessions_table: format!("{table_prefix}_sessions"),
+            blobs_table: format!("{table_prefix}_blobs"),
             snapshots_table: format!("{table_prefix}_snapshots"),
             put_deadline: Self::DEFAULT_PUT_DEADLINE,
             last_snapshot_ms: AtomicU64::new(0),
             snapshot_ms_seeded: tokio::sync::Mutex::new(false),
+            held_blobs: tokio::sync::Mutex::new(None),
             auth_failures: AtomicU64::new(0),
         }
     }
 
-    /// Fail a `put` that has not completed within `deadline`.
+    /// Fail a `put` or `put_blob` that has not completed within `deadline`.
     /// Each request also has the adapter's own HTTP timeout.
     pub fn with_put_deadline(mut self, deadline: Duration) -> Self {
         self.put_deadline = deadline;
@@ -252,6 +276,54 @@ impl BigQueryMirrorSink {
         )
         .await
     }
+
+    async fn put_blob_within_deadline(&self, blob: &ContinuityMirrorBlob) -> Result<(), String> {
+        let mut held = self.held_blobs.lock().await;
+        let ids = match held.take() {
+            Some(ids) => ids,
+            None => {
+                let table = self.qualified(&self.blobs_table)?;
+                self.query(
+                    &self.blobs_table,
+                    &format!(
+                        "SELECT blob_id FROM `{table}` GROUP BY blob_id, snapshot_ms \
+                         HAVING COUNT(*) = ANY_VALUE(parts)"
+                    ),
+                )
+                .await?
+                .into_iter()
+                .collect()
+            }
+        };
+        let ids = held.insert(ids);
+        if ids.contains(&blob.blob_id) {
+            return Ok(());
+        }
+        let mut fields = Map::new();
+        fields.insert("blob_id".to_string(), Value::String(blob.blob_id.clone()));
+        fields.insert(
+            "media_type".to_string(),
+            Value::String(blob.media_type.clone()),
+        );
+        let rows = data_rows(
+            &fields,
+            &blob.data,
+            MAX_PART_BYTES,
+            self.next_snapshot_ms(wall_clock_ms()),
+        );
+        self.insert(&self.blobs_table, rows).await?;
+        ids.insert(blob.blob_id.clone());
+        Ok(())
+    }
+}
+
+/// The wall clock in milliseconds: the id of a blob copy.
+fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// `row` as a JSON object with `snapshot_ms` added.
@@ -357,6 +429,17 @@ impl ContinuityMirrorSink for BigQueryMirrorSink {
             .unwrap_or_else(|_| {
                 Err(format!(
                     "the BigQuery mirror put did not complete within {:?}",
+                    self.put_deadline
+                ))
+            })
+    }
+
+    async fn put_blob(&self, blob: &ContinuityMirrorBlob) -> Result<(), String> {
+        tokio::time::timeout(self.put_deadline, self.put_blob_within_deadline(blob))
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "the BigQuery mirror blob put did not complete within {:?}",
                     self.put_deadline
                 ))
             })
