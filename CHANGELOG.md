@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-10-20
+
 ### Breaking
 
 - Behaviour-only: the traceability YAML that `validate_traceability_statuses`,
@@ -1024,6 +1026,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Requires Meerkat 0.9.4: every Meerkat dependency is pinned to `=0.9.4`.
 - `/console/experience` takes an identity-first member's session from the
   identity runtime, the owner `/console/identities` reads, and never serves
   a fact walked under an earlier identity binding. The first read after a

@@ -4,6 +4,8 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+## 0.9.4
+
 - `MemberReloadRequiredError` (an `RpcError`), with
   `MEMBER_RELOAD_REQUIRED_CODE` (`-32029`) and `MEMBER_RELOAD_REQUIRED_KIND`
   (`"mob_member_reload_required"`): `MobHandle.force_cancel_member` raises it
