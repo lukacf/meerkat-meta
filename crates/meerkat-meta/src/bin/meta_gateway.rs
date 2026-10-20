@@ -2267,8 +2267,9 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         );
         spec.resolved_storage = Some(resolved_storage);
         if let Some(announcements) = announcements.as_ref() {
-            // The host's own profiles name the member tool bundle; no child
-            // mob profile gets it.
+            // The host's own profiles name the member tool bundle; under the
+            // ceiling a child mob profile mounts it by naming it in its
+            // tools.bundles.
             spec = announcements.register_member_tools(spec);
         }
         (

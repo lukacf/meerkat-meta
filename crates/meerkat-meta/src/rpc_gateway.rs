@@ -4258,30 +4258,34 @@ actions = ["agent.view"]
         Ok(())
     }
 
-    /// `runtime_options.mob_announcements.member_tools_in_child_mobs` fails
-    /// gateway init: each child mob profile must opt in to the member tools
-    /// itself, so the gateway-wide grant is refused, naming the missing
-    /// per-profile opt-in.
+    /// `runtime_options.mob_announcements.member_tools_in_child_mobs` is the
+    /// ceiling of the per-profile opt-in: gateway init takes it, and the
+    /// composed configuration carries it. Without it the ceiling is off.
     #[test]
-    fn gateway_runtime_options_refuse_member_tools_in_child_mobs() {
-        let refused = parse_gateway_runtime_options(
-            &json!({ "runtime_options": { "mob_announcements": {
-                "enabled": true,
-                "member_tools_in_child_mobs": true
-            } } }),
-            None,
-        )
-        .map(|_| ());
-        assert_eq!(
-            refused,
-            Err(crate::mob_announcements::AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn
-                .to_string())
-        );
-        assert!(
-            matches!(&refused, Err(error) if error.contains("member_tools_in_child_mobs")
-                && error.contains("per-profile opt-in")),
-            "{refused:?}"
-        );
+    fn gateway_runtime_options_take_the_member_tools_ceiling_for_child_mobs() {
+        let state = std::path::Path::new("/nonexistent-state");
+        for (ceiling, expected) in [
+            (json!(true), true),
+            (json!(false), false),
+            (Value::Null, false),
+        ] {
+            let mut options = json!({ "enabled": true });
+            if !ceiling.is_null() {
+                options["member_tools_in_child_mobs"] = ceiling;
+            }
+            let parsed = parse_gateway_runtime_options(
+                &json!({ "runtime_options": { "mob_announcements": options } }),
+                Some(state),
+            )
+            .expect("the ceiling is an option, not a refusal");
+            assert_eq!(
+                parsed
+                    .mob_announcements
+                    .expect("enabled")
+                    .member_tools_in_child_mobs,
+                expected
+            );
+        }
     }
 
     #[test]
@@ -16970,9 +16974,8 @@ external_addressable = true
         }
         slots.extend(crate::storage_health::scratch_ring_buffer_slots());
         if let Some(announcements) = announcements.as_ref() {
-            // The host's own profiles name the bundle. No child mob profile
-            // gets it: that takes a per-profile opt-in this build cannot
-            // offer yet, so the configuration that would grant it refuses.
+            // The host's own profiles name the bundle; under the ceiling a
+            // child mob profile mounts it by naming it in its tools.bundles.
             spec = announcements.register_member_tools(spec);
         }
         // The M4 census had no mob slot at all, which is why an in-memory mob

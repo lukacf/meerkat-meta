@@ -142,10 +142,6 @@ struct BatchOptions {
 pub enum AnnouncementOptionsError {
     /// An option is malformed or out of range; the message names it.
     Invalid(String),
-    /// `member_tools_in_child_mobs` would hand the member tools to every
-    /// inline profile of every mob a member creates. Each child mob profile
-    /// has to opt in itself, and this build cannot offer that opt-in yet.
-    ChildMemberToolsNeedProfileOptIn,
 }
 
 impl From<String> for AnnouncementOptionsError {
@@ -158,10 +154,6 @@ impl std::fmt::Display for AnnouncementOptionsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Invalid(message) => f.write_str(message),
-            Self::ChildMemberToolsNeedProfileOptIn => f.write_str(
-                "member_tools_in_child_mobs is refused: each child mob profile must opt in to the \
-                 member tools itself, and this build cannot offer that per-profile opt-in yet",
-            ),
         }
     }
 }
@@ -185,15 +177,11 @@ pub fn parse_options(
 ) -> Result<Option<AnnouncementConfig>, AnnouncementOptionsError> {
     let options: AnnouncementOptions =
         serde_json::from_value(value.clone()).map_err(|error| format!("{path}: {error}"))?;
-    // Refused whether or not announcements are enabled: an operator who sets
-    // it would believe it does something.
-    if options.member_tools_in_child_mobs {
-        return Err(AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn);
-    }
     if !options.enabled {
         return Ok(None);
     }
     let mut config = AnnouncementConfig::default();
+    config.member_tools_in_child_mobs = options.member_tools_in_child_mobs;
     if let Some(batch) = options.batch {
         let policy = &mut config.policy;
         policy.max_count = batch.max_count.unwrap_or(policy.max_count);
@@ -224,12 +212,11 @@ pub fn parse_options(
         current.subscriptions = limits.subscriptions.unwrap_or(current.subscriptions);
         current.per_mob = limits.per_mob.unwrap_or(current.per_mob);
     }
-    config.validate().map_err(|error| match error {
-        AnnouncementOptionsError::Invalid(message) => {
+    config
+        .validate()
+        .map_err(|AnnouncementOptionsError::Invalid(message)| {
             AnnouncementOptionsError::Invalid(format!("{path}.{message}"))
-        }
-        other => other,
-    })?;
+        })?;
     Ok(Some(config))
 }
 
@@ -273,32 +260,43 @@ impl AnnouncementComposition {
         self
     }
 
-    /// Put the member tool bundle ([`tools::TOOL_BUNDLE`]) on `spec`. The
+    /// Put the member tool bundle ([`tools::TOOL_BUNDLE`]) on `spec`, before
+    /// the runtime is built and so before any child mob can be created. The
     /// host's own profiles that name it in `tools.rust_bundles` get the
-    /// member tools; no child mob profile does, since that takes a
-    /// per-profile opt-in this build cannot offer yet.
+    /// member tools. Under the ceiling
+    /// ([`AnnouncementConfig::member_tools_in_child_mobs`]) it is offered to
+    /// child mobs, and a child mob profile mounts it only by naming it in
+    /// its `tools.bundles`; otherwise it is the host's alone.
     pub fn register_member_tools(
         &self,
         spec: crate::mob_handle_runtime::MobBootstrapSpec,
     ) -> crate::mob_handle_runtime::MobBootstrapSpec {
-        let (name, dispatcher) = self.member_tool_bundle();
-        spec.register_tool_bundle_with_availability(
-            name,
-            dispatcher,
-            meerkat_mob_mcp::ChildToolBundleAvailability::HostOnly,
-        )
+        let (name, dispatcher, availability) = self.member_tool_bundle();
+        spec.register_tool_bundle_with_availability(name, dispatcher, availability)
     }
 
-    /// The member tool bundle's name and dispatcher, for a composer that
-    /// collects its bundles before it resolves a spec. Host only.
+    /// The member tool bundle's name, dispatcher and availability to child
+    /// mobs, for a composer that collects its bundles before it resolves a
+    /// spec: offered under the ceiling, never supplied to every child
+    /// profile, and the host's alone otherwise.
     pub(crate) fn member_tool_bundle(
         &self,
-    ) -> (&'static str, Arc<dyn meerkat_core::AgentToolDispatcher>) {
+    ) -> (
+        &'static str,
+        Arc<dyn meerkat_core::AgentToolDispatcher>,
+        meerkat_mob_mcp::ChildToolBundleAvailability,
+    ) {
+        let availability = if self.config.member_tools_in_child_mobs {
+            meerkat_mob_mcp::ChildToolBundleAvailability::ChildOffered
+        } else {
+            meerkat_mob_mcp::ChildToolBundleAvailability::HostOnly
+        };
         (
             tools::TOOL_BUNDLE,
             Arc::new(tools::MobAnnouncementTools::new(Arc::clone(
                 &self.member_tools,
             ))),
+            availability,
         )
     }
 

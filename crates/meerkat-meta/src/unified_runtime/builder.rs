@@ -1056,7 +1056,9 @@ impl UnifiedRuntimeBuilder {
     /// announce to their mob and receive what they subscribe to in batches,
     /// and the host's own profiles that name
     /// [`crate::mob_announcements::tools::TOOL_BUNDLE`] in
-    /// `tools.rust_bundles` get the member tools.
+    /// `tools.rust_bundles` get the member tools. With
+    /// `member_tools_in_child_mobs` the bundle is offered to child mobs, and
+    /// a child mob profile mounts it by naming it in its `tools.bundles`.
     ///
     /// Needs [`Self::persistent_state`], which holds the announcement
     /// database, and an identity-first runtime ([`Self::roster_provider`]);
@@ -1304,7 +1306,7 @@ impl UnifiedRuntimeBuilder {
                 {
                     composition = composition.with_peer_request_window(window_ms);
                 }
-                let (name, dispatcher) = composition.member_tool_bundle();
+                let (name, dispatcher, availability) = composition.member_tool_bundle();
                 if self.tool_bundles.contains_key(name) {
                     return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
                         format!(
@@ -1313,13 +1315,8 @@ impl UnifiedRuntimeBuilder {
                         ),
                     ));
                 }
-                self.tool_bundles.insert(
-                    name.to_string(),
-                    (
-                        dispatcher,
-                        meerkat_mob_mcp::ChildToolBundleAvailability::HostOnly,
-                    ),
-                );
+                self.tool_bundles
+                    .insert(name.to_string(), (dispatcher, availability));
                 Some(composition)
             }
             None => None,

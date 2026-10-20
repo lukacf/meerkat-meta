@@ -7555,15 +7555,15 @@ fn child_member_options_are_read_and_bounded() {
         "the member tools are host-only by default"
     );
     assert_eq!(defaults.child_limits, ChildMemberLimits::default());
-    let refused = super::parse_runtime_options(&serde_json::json!({
+    let ceiling = super::parse_runtime_options(&serde_json::json!({
         "enabled": true,
         "member_tools_in_child_mobs": true
     }))
-    .map(|_| ());
-    assert_eq!(
-        refused,
-        Err(super::AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn),
-        "the gateway-wide grant of the member tools to child mobs is refused, typed"
+    .unwrap()
+    .unwrap();
+    assert!(
+        ceiling.member_tools_in_child_mobs,
+        "the option sets the ceiling of the child profiles' opt-in"
     );
     for limits in [
         serde_json::json!({ "subscriptions": 0 }),
@@ -9109,21 +9109,6 @@ async fn the_builder_refuses_mob_announcements_it_cannot_compose() {
     let message = refusal(
         identity_first_test_builder(state.path(), "mob-k-refused", "")
             .await
-            .mob_announcements(AnnouncementConfig {
-                member_tools_in_child_mobs: true,
-                ..AnnouncementConfig::default()
-            })
-            .build()
-            .await,
-    );
-    assert!(
-        message.contains("member_tools_in_child_mobs is refused"),
-        "{message}"
-    );
-    let state = tempfile::tempdir().expect("state dir");
-    let message = refusal(
-        identity_first_test_builder(state.path(), "mob-k-refused", "")
-            .await
             .register_tool_bundle(
                 super::tools::TOOL_BUNDLE,
                 Arc::new(super::tools::MobAnnouncementTools::new(Arc::new(
@@ -9140,44 +9125,78 @@ async fn the_builder_refuses_mob_announcements_it_cannot_compose() {
     );
 }
 
-/// Every constructor refuses the gateway-wide child mob grant of the member
-/// tools through the one check: the options parser (enabled or not), the
-/// composition and the owner itself.
+/// Every constructor takes the ceiling of the member tools in child mobs:
+/// the options parser carries it, the composition offers the member tool
+/// bundle to child mobs under it (never supplies it to every child
+/// profile) and keeps it the host's alone without it, and the owner is
+/// built either way.
 #[test]
-fn every_constructor_refuses_the_child_mob_member_tools_grant() {
-    // Refused even disabled: an operator who sets it would believe it does
-    // something.
+fn every_constructor_takes_the_member_tools_ceiling_for_child_mobs() {
     assert!(matches!(
         super::parse_options(
             &serde_json::json!({ "enabled": false, "member_tools_in_child_mobs": true }),
             "mob_announcements",
         ),
-        Err(super::AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn)
+        Ok(None)
     ));
+    let parsed = super::parse_options(
+        &serde_json::json!({ "enabled": true, "member_tools_in_child_mobs": true }),
+        "mob_announcements",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(parsed.member_tools_in_child_mobs);
     let granted = AnnouncementConfig {
         member_tools_in_child_mobs: true,
         ..AnnouncementConfig::default()
     };
-    assert!(matches!(
-        super::AnnouncementComposition::new(granted),
-        Err(super::AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn)
-    ));
+    let (_, _, availability) = super::AnnouncementComposition::new(granted)
+        .expect("the ceiling composes")
+        .member_tool_bundle();
+    assert_eq!(
+        availability,
+        meerkat_mob_mcp::ChildToolBundleAvailability::ChildOffered
+    );
+    let (_, _, availability) = super::AnnouncementComposition::new(AnnouncementConfig::default())
+        .expect("the default composes")
+        .member_tool_bundle();
+    assert_eq!(
+        availability,
+        meerkat_mob_mcp::ChildToolBundleAvailability::HostOnly
+    );
     let (_dir, store) = temp_store();
-    let refused = AnnouncementService::new(
+    let service = AnnouncementService::new(
         Arc::new(store) as Arc<dyn AnnouncementStore>,
         Arc::new(ScriptedNative::new()) as Arc<dyn NativeDelivery>,
         granted,
-    );
+    )
+    .expect("the owner is built under the ceiling");
+    assert!(service.config().member_tools_in_child_mobs);
+}
+
+/// A runtime the builder composes takes the ceiling as every gateway does.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_builder_composes_mob_announcements_under_the_member_tools_ceiling() {
+    let state = tempfile::tempdir().expect("state dir");
+    let runtime = Box::pin(
+        identity_first_test_builder(state.path(), "mob-k-ceiling", "")
+            .await
+            .mob_announcements(AnnouncementConfig {
+                member_tools_in_child_mobs: true,
+                ..AnnouncementConfig::default()
+            })
+            .build(),
+    )
+    .await
+    .expect("the ceiling composes on a builder runtime");
     assert!(
-        matches!(
-            refused,
-            Err(AnnouncementError::Configuration(
-                super::AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn
-            ))
-        ),
-        "{:?}",
-        refused.err()
+        runtime
+            .mob_announcements()
+            .expect("attached")
+            .config()
+            .member_tools_in_child_mobs
     );
+    runtime.shutdown().await;
 }
 
 /// A batch owed again after a refused submission waits out the quiet window

@@ -2873,8 +2873,8 @@ pub(crate) struct AgentMobChildPolicy {
 
 impl AgentMobChildPolicy {
     /// Whether there is anything to forward: without a registry, a binding,
-    /// a child-available bundle or a registration hook, the installed state
-    /// already matches.
+    /// a bundle available or offered to child mobs, or a registration hook,
+    /// the installed state already matches.
     fn is_empty(&self) -> bool {
         self.registry.is_none()
             && self.binding.is_none()
@@ -9867,8 +9867,13 @@ impl MobBootstrapSpec {
                 .get(name)
                 .copied()
                 .unwrap_or_default();
-            has_child_bundles |=
-                availability == meerkat_mob_mcp::ChildToolBundleAvailability::ChildAvailable;
+            // An offered bundle is forwarded like an available one: child
+            // mob creation checks every opt-in against the offer.
+            has_child_bundles |= matches!(
+                availability,
+                meerkat_mob_mcp::ChildToolBundleAvailability::ChildAvailable
+                    | meerkat_mob_mcp::ChildToolBundleAvailability::ChildOffered
+            );
             bundles = bundles.register(name.clone(), Arc::clone(dispatcher), availability);
         }
         AgentMobChildPolicy {

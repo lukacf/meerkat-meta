@@ -2237,3 +2237,36 @@ async fn a_weak_identity_runtime_retains_none_of_the_agent_tool_composition() {
         "no public owner after the admission closed"
     );
 }
+
+/// A bundle offered to child mobs is forwarded to child mob creation like a
+/// child-available one, so a create can check its profiles' opt-ins against
+/// the offer even when nothing else is forwarded. A host-only bundle alone
+/// forwards nothing.
+#[test]
+fn an_offered_bundle_is_forwarded_to_child_mob_creation() {
+    let dir = tempfile::tempdir().expect("dir");
+    let forwards = |availability| {
+        let tools: Arc<dyn meerkat_core::AgentToolDispatcher> =
+            Arc::new(HostTools(Arc::new(Mutex::new(Vec::new()))));
+        !MobBootstrapSpec::ephemeral(
+            root_definition(&unique("mob-offer")),
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            None,
+        )
+        .expect("spec")
+        .register_tool_bundle_with_availability("host", tools, availability)
+        .agent_mob_child_policy()
+        .is_empty()
+    };
+    assert!(forwards(
+        meerkat_mob_mcp::ChildToolBundleAvailability::ChildOffered
+    ));
+    assert!(forwards(
+        meerkat_mob_mcp::ChildToolBundleAvailability::ChildAvailable
+    ));
+    assert!(!forwards(
+        meerkat_mob_mcp::ChildToolBundleAvailability::HostOnly
+    ));
+}

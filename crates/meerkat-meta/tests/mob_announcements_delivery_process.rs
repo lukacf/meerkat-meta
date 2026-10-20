@@ -70,6 +70,9 @@ const CHILD_MEMBER: &str = "worker-1";
 /// The prompt the loopback model answers by creating the child mob and
 /// spawning its member.
 const CREATE_MARKER: &str = "CREATE-CHILD-MOB";
+/// Like [`CREATE_MARKER`], with a child profile that opts in to the member
+/// tools in its `tools.bundles`.
+const CREATE_OPTED_MARKER: &str = "CREATE-OPTED-CHILD-MOB";
 /// The child member's first prompt: offered the member tools, it subscribes
 /// itself to the lead's mob.
 const SUBSCRIBE_MARKER: &str = "SUBSCRIBE-TO-THE-ROOT-MOB";
@@ -356,8 +359,13 @@ fn tool_call(id: &str, name: &str, arguments: &Value) -> String {
 }
 
 /// The lead's calls: create the child mob, then spawn its member with the
-/// prompt that subscribes it.
-fn create_child_call() -> String {
+/// prompt that subscribes it. `opt_in` has the child profile name the
+/// member tool bundle in its `tools.bundles`.
+fn create_child_call(opt_in: bool) -> String {
+    let mut tools = json!({ "comms": true });
+    if opt_in {
+        tools["bundles"] = json!(["mob_announcements"]);
+    }
     tool_call(
         "call-create-1",
         "mob_create",
@@ -369,7 +377,7 @@ fn create_child_call() -> String {
                         "model": MODEL,
                         "provider": "self_hosted",
                         "runtime_mode": "turn_driven",
-                        "tools": { "comms": true }
+                        "tools": tools
                     }
                 }
             }
@@ -475,8 +483,17 @@ async fn chat_completions(
         return ([("content-type", "text/event-stream")], spawn_child_call());
     }
     if !answers_a_tool {
+        if last.contains(CREATE_OPTED_MARKER) {
+            return (
+                [("content-type", "text/event-stream")],
+                create_child_call(true),
+            );
+        }
         if last.contains(CREATE_MARKER) {
-            return ([("content-type", "text/event-stream")], create_child_call());
+            return (
+                [("content-type", "text/event-stream")],
+                create_child_call(false),
+            );
         }
         if last.contains(DESTROY_MARKER) {
             return (
@@ -1346,10 +1363,16 @@ fn boot_lead(label: &str, state: &Path, host_config: &Path, child_tools: bool) -
 
 /// The lead creates the child mob and spawns its member, whose first turn
 /// answers the subscribe prompt. Returns once that turn reached the model.
-fn create_child(gateway: &mut Gateway, log: &Arc<Mutex<ModelLog>>) {
+/// `opt_in` has the child profile opt in to the member tools.
+fn create_child(gateway: &mut Gateway, log: &Arc<Mutex<ModelLog>>, opt_in: bool) {
+    let marker = if opt_in {
+        CREATE_OPTED_MARKER
+    } else {
+        CREATE_MARKER
+    };
     gateway.call(
         "meta/send",
-        json!({ "identity": LEAD, "content": format!("{CREATE_MARKER}: start a team") }),
+        json!({ "identity": LEAD, "content": format!("{marker}: start a team") }),
     );
     let start = Instant::now();
     loop {
@@ -1490,16 +1513,11 @@ fn wait_until_ended(gateway: &mut Gateway, id: &str) -> Value {
     }
 }
 
-/// P1: with `member_tools_in_child_mobs`, a member of a mob the lead
-/// created is offered the member tools, subscribes itself to the lead's
-/// mob from its own turn, and receives what is announced there.
-///
-/// Parked while that option is refused: a child mob profile must opt in to
-/// the member tools itself, which this build cannot offer yet. A lib test
-/// fails from the release that ships mob announcements on while this is
-/// still parked.
+/// P1: under the `member_tools_in_child_mobs` ceiling, a member of a mob
+/// the lead created, whose profile opts in to the member tools in its
+/// `tools.bundles`, is offered them, subscribes itself to the lead's mob
+/// from its own turn, and receives what is announced there.
 #[test]
-#[ignore = "needs a per-profile opt-in for child mob profiles"]
 fn a_member_of_a_mob_a_member_created_subscribes_itself_to_the_mob_above() {
     let state = tempfile::tempdir().expect("state dir");
     let config_dir = tempfile::tempdir().expect("config dir");
@@ -1509,7 +1527,7 @@ fn a_member_of_a_mob_a_member_created_subscribes_itself_to_the_mob_above() {
     std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
     let mut gateway = boot_lead("child-tools", state.path(), &host_config, true);
 
-    create_child(&mut gateway, &log);
+    create_child(&mut gateway, &log, true);
     let offered = child_turn_tools(&log);
     for tool in MEMBER_TOOLS {
         assert!(
@@ -1549,6 +1567,30 @@ fn a_member_of_a_mob_a_member_created_subscribes_itself_to_the_mob_above() {
     gateway.shutdown_and_reap();
 }
 
+/// Under the ceiling, a child profile that does not opt in gets no member
+/// tools: the bundle is offered to child mobs, never supplied to every
+/// child profile.
+#[test]
+fn under_the_ceiling_a_child_profile_without_the_opt_in_gets_no_member_tools() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let mut gateway = boot_lead("child-no-opt-in", state.path(), &host_config, true);
+
+    create_child(&mut gateway, &log, false);
+    let offered = child_turn_tools(&log);
+    for tool in MEMBER_TOOLS {
+        assert!(
+            !offered.iter().any(|name| name == tool),
+            "a child profile without the opt-in is not given {tool}: {offered:?}"
+        );
+    }
+    gateway.shutdown_and_reap();
+}
+
 /// Boot a gateway whose lead creates a mob and spawns its member, and
 /// subscribe that member to the lead's mob through the host RPC. Without
 /// the option the member is not offered the member tools.
@@ -1559,7 +1601,7 @@ fn host_subscribed_child(
     log: &Arc<Mutex<ModelLog>>,
 ) -> (Gateway, Value) {
     let mut gateway = boot_lead(label, state, host_config, false);
-    create_child(&mut gateway, log);
+    create_child(&mut gateway, log, false);
     let offered = child_turn_tools(log);
     for tool in MEMBER_TOOLS {
         assert!(

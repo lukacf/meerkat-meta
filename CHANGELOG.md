@@ -212,12 +212,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`runtime_options.mob_announcements.child_member_limits`); a put past a
   bound is refused with `child_member_limit`.
 
-- `member_tools_in_child_mobs` in the mob announcement options is refused
-  when set, on every surface and even with `enabled: false`: each child mob
-  profile has to opt in to the member tools itself,
-  which this release cannot offer yet, and the gateway-wide grant to every
-  child profile is not handed out. The host RPC subscribes members of child
-  mobs instead.
+- Members of mobs members create can use the mob announcement member tools.
+  `member_tools_in_child_mobs` in the mob announcement options, on every
+  surface, is the ceiling: with it the `mob_announcements` bundle is offered
+  to child mobs, never supplied to every child profile, and a child mob
+  profile gets the tools only by naming `mob_announcements` in its own
+  `tools.bundles`. Without it a child create whose profile names the bundle
+  is refused, and a member that opted in under a ceiling since lowered is
+  built without the tools. A child member's own subscriptions count against
+  `member_limits` and `child_member_limits`.
 
 - Keyed cross-mob inject. Two new control verbs, `inject_keyed` and
   `inject_status`, deliver one keyed continuation to a member of the serving
@@ -434,6 +437,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   text as the summary. That failure names the stop reason, so a refused
   summary reads as refused rather than as a cancel or a truncation, and a
   summary stream that ends without its terminal event is reported apart.
+
+### Known limitations
+
+- A member that leaves a mob ends nothing for mob announcements. No 0.9.4
+  gateway answers `member_departed`, and none records a final fact that a
+  member retired or was deleted, so the member's subscriptions wait, typed,
+  as for a member that is not registered. Its owed batches expire after the
+  retention window, and `subscriptions/cancel` ends its subscriptions.
 
 ## [0.9.3] - 2026-10-18
 

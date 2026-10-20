@@ -99,25 +99,24 @@ pub struct AnnouncementConfig {
     /// Bounds on subscriptions for members of mobs hosted here other than
     /// this gateway's own.
     pub child_limits: ChildMemberLimits,
-    /// Whether members of mobs members create may call the member tools.
-    /// Always false in this build: the gateway-wide grant is refused at
-    /// configuration, since each child mob profile must opt in itself.
+    /// The ceiling of the member tools in mobs members create. With it, the
+    /// member tool bundle is offered to child mobs: a child mob profile
+    /// mounts it only by naming it in its own `tools.bundles` opt-in, and
+    /// only its members' calls are attributed through this gateway's
+    /// runtime. Without it the bundle is the host's alone: a child create
+    /// that names it is refused, and a member a lowered ceiling no longer
+    /// covers is built without it.
     pub member_tools_in_child_mobs: bool,
 }
 
 impl AnnouncementConfig {
     /// Refuse a configuration no host composes, whichever surface built
-    /// it: the gateway-wide grant of the member tools to child mobs (each
-    /// child mob profile must opt in itself, and this build cannot offer
-    /// that yet) and a policy, window or limit out of range. Every
-    /// constructor runs this one check: the options parser,
+    /// it: a policy, window or limit out of range. Every constructor runs
+    /// this one check: the options parser,
     /// [`super::AnnouncementComposition::new`] and
     /// [`AnnouncementService::new`].
     pub fn validate(&self) -> Result<(), super::AnnouncementOptionsError> {
-        use super::AnnouncementOptionsError::{ChildMemberToolsNeedProfileOptIn, Invalid};
-        if self.member_tools_in_child_mobs {
-            return Err(ChildMemberToolsNeedProfileOptIn);
-        }
+        use super::AnnouncementOptionsError::Invalid;
         self.policy
             .validate()
             .map_err(|error| Invalid(format!("batch: {error}")))?;

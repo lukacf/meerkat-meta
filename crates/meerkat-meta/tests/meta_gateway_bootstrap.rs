@@ -1533,10 +1533,6 @@ fn meta_gateway_refuses_mob_announcements_it_cannot_compose() {
             "persistent_sessions: true",
         ),
         (
-            json!({ "mob_announcements": { "enabled": false, "member_tools_in_child_mobs": true } }),
-            "member_tools_in_child_mobs is refused",
-        ),
-        (
             json!({ "mob_announcements": { "enabled": true, "retention_ms": 0 } }),
             "mob_announcements.retention_ms must be at least",
         ),
@@ -1620,4 +1616,30 @@ fn meta_gateway_serves_keyed_inject_status_on_its_control_listener() {
         matches!(outcome, KeyedInjectCallOutcome::Answered(_)),
         "{outcome:?}"
     );
+}
+
+/// meta_gateway takes the ceiling of the member tools in child mobs from
+/// its init, with announcements on or off.
+#[cfg(unix)]
+#[test]
+fn meta_gateway_takes_the_member_tools_ceiling_for_child_mobs() {
+    for enabled in [true, false] {
+        let workspace = TempDir::new().expect("workspace");
+        let gateway = ComposedGateway::launch(
+            workspace.path(),
+            "meta-ceiling",
+            json!({ "mob_announcements": { "enabled": enabled, "member_tools_in_child_mobs": true } }),
+            &[],
+        )
+        .unwrap_or_else(|answer| panic!("the ceiling is an option, not a refusal: {answer}"));
+        let listed = gateway.call("meta/mob_announcements/subscriptions/list", json!({}));
+        if enabled {
+            assert_eq!(listed["result"]["subscriptions"], json!([]), "{listed}");
+        } else {
+            assert_eq!(
+                listed["error"]["data"]["kind"], "mob_announcements_unavailable",
+                "{listed}"
+            );
+        }
+    }
 }

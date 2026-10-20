@@ -201,12 +201,16 @@ pace.
 ## Member tools
 
 A member profile opts into the `mob_announcements` tool bundle by listing it
-in `tools.rust_bundles`. The bundle is host-only: mobs members create never
-receive it, and the host RPC subscribes their members (see Members of mobs
-members created). Members of those mobs, which untrusted content can steer,
-may get the tools only through a per-profile opt-in that this release
-cannot offer yet, so `member_tools_in_child_mobs`, a grant to every inline
-profile of every child mob, is refused at launch. It has two tools:
+in `tools.rust_bundles`. Mobs members create receive it only under the
+host's ceiling, `member_tools_in_child_mobs`, which offers the bundle to
+child mobs: a child mob profile, which untrusted content can steer, mounts
+it only by naming it in its own `tools.bundles`, and a profile that does not
+gets nothing. Without the ceiling the bundle is the host's alone, and the
+host RPC subscribes members of child mobs (see Members of mobs members
+created). A child member's calls are attributed through this gateway's
+runtime only under the ceiling. Its own subscriptions count against
+`member_limits` like any member's, and, as subscriptions of a member of a
+mob hosted here, against `child_member_limits`. It has two tools:
 
 - `mob_announce` `{topics, body, key?, correlation_id?}`: announce into the
   caller's own mob, as `{"kind": "member", "identity": ...}`. A retry with
@@ -450,14 +454,14 @@ Every surface lowers into one `AnnouncementComposition`, in two steps and in
 this order:
 
 - `AnnouncementComposition::new` refuses a configuration
-  `AnnouncementConfig::validate` refuses: the gateway-wide grant of the
-  member tools to child mob profiles, and a batch policy, retention window,
+  `AnnouncementConfig::validate` refuses: a batch policy, retention window,
   settle check bound or limit out of range. It is the one check: the options
   parser and `AnnouncementService::new` run it too, so no surface composes
-  what another refuses. `member_tools_in_child_mobs` is refused even with
-  `enabled: false`.
+  what another refuses.
 - `register_member_tools` puts the member tool bundle on the mob spec before
-  the runtime is built, for the host's own profiles only.
+  the runtime is built, so before any child mob can be created: for the
+  host's own profiles, and offered to child mobs under
+  `member_tools_in_child_mobs`.
 - `compose` opens the announcement database, attaches the owner to the
   runtime, binds the member tools, starts the dispatcher and follows the mob
   set. It runs once the runtime's identity runtime is installed and before
@@ -522,6 +526,13 @@ that change state.
   removes the roster entry and adds it back). A retired member's
   subscriptions therefore wait until its mob completes, resets, is created
   again or is destroyed, or until they are cancelled.
+- Lowering the ceiling (`member_tools_in_child_mobs` set, then a restart
+  without it) withholds the member tools from child members that opted in:
+  Meerkat builds them without the bundle and reports it as withheld, and
+  nothing refuses their mob. A subscription a child member made itself
+  keeps its delivery path, since delivery goes through this gateway's
+  runtime whatever the ceiling; only its own calls stop, as it no longer has
+  the tools. The host RPC still manages its subscriptions.
 - Members of this gateway's own mob and members on peer gateways: no
   gateway of this release records a final fact that a member left, so a
   member that left waits like one that is not registered. Its owed batches
