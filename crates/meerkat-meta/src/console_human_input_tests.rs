@@ -2242,3 +2242,47 @@ async fn console_member_rows_show_a_self_hosted_model_vision_flag() {
     unified.mob_runtime().stop_runtime_delivery();
     stopped.unwrap();
 }
+
+/// `meta/send_message` to a member checks images with the same source: the
+/// `vision = true` self-hosted worker takes the image, the other is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_self_hosted_vision_model_takes_an_image_through_meta_send_message() {
+    let state = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let unified = self_hosted_vision_workers(state.path()).await;
+    let send = |member_id: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "meta/send_message",
+            "params": {
+                "member_id": member_id,
+                "content": serde_json::to_value(image_turn()).unwrap(),
+            },
+        })
+        .to_string()
+    };
+
+    let blind: serde_json::Value = serde_json::from_str(
+        &crate::rpc::handle_unified_rpc_json(&unified, &send("blind-worker"), WAIT, None, None)
+            .await,
+    )
+    .unwrap();
+    let seeing: serde_json::Value = serde_json::from_str(
+        &crate::rpc::handle_unified_rpc_json(&unified, &send("seeing-worker"), WAIT, None, None)
+            .await,
+    )
+    .unwrap();
+    assert!(
+        blind["error"]["message"].as_str().is_some_and(
+            |message| message.contains("target member model cannot accept image input")
+        ),
+        "a self-hosted model without the flag is refused images: {blind:#}"
+    );
+    assert!(
+        seeing["error"].is_null() && !seeing["result"].is_null(),
+        "a vision = true self-hosted model takes the image: {seeing:#}"
+    );
+    let stopped = unified.mob_handle().stop().await;
+    unified.mob_runtime().stop_runtime_delivery();
+    stopped.unwrap();
+}
