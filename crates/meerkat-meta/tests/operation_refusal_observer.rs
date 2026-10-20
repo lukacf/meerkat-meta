@@ -14,6 +14,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -79,16 +80,27 @@ impl AgentToolDispatcher for RefusingBundle {
     }
 }
 
-/// Calls the refused tool, then ends the turn once the call has a result.
+/// Calls the refused tool exactly once after the host arms the probe.
 /// It marks `answered` when the model is asked again with that result.
 struct RefusedCallClient {
     answered: tokio::sync::watch::Sender<bool>,
+    probe_pending: AtomicBool,
 }
 
 impl RefusedCallClient {
     fn new() -> (Arc<Self>, tokio::sync::watch::Receiver<bool>) {
         let (answered, seen) = tokio::sync::watch::channel(false);
-        (Arc::new(Self { answered }), seen)
+        (
+            Arc::new(Self {
+                answered,
+                probe_pending: AtomicBool::new(false),
+            }),
+            seen,
+        )
+    }
+
+    fn arm_probe(&self) {
+        self.probe_pending.store(true, Ordering::Release);
     }
 }
 
@@ -99,11 +111,16 @@ impl LlmClient for RefusedCallClient {
     }
 
     fn stream<'a>(&'a self, request: &'a LlmRequest) -> meerkat_client::types::LlmStream<'a> {
-        let after_tool = matches!(request.messages.last(), Some(Message::ToolResults { .. }));
+        let after_tool = request.messages.iter().any(|message| {
+            matches!(message, Message::ToolResults { results, .. }
+                if results.iter().any(|result| result.tool_use_id == REFUSED_CALL))
+        });
         if after_tool {
             self.answered.send_replace(true);
         }
-        let (event, stop_reason) = if after_tool {
+        // Autonomous startup or an additional host turn is not another probe.
+        // One issued call still must produce exactly one observer notification.
+        let (event, stop_reason) = if !self.probe_pending.swap(false, Ordering::AcqRel) {
             (
                 LlmEvent::TextDelta {
                     delta: "done".to_string(),
@@ -210,7 +227,7 @@ fn refused_call() -> Vec<(
 
 /// Spawns the member and sends it one message; its turn calls the refused
 /// tool.
-async fn spawn_and_send(runtime: &UnifiedRuntime) {
+async fn spawn_and_send(runtime: &UnifiedRuntime, client: &RefusedCallClient) {
     runtime
         .spawn(SpawnMemberSpec::from_wire(
             "worker".to_string(),
@@ -221,6 +238,7 @@ async fn spawn_and_send(runtime: &UnifiedRuntime) {
         ))
         .await
         .expect("spawn");
+    client.arm_probe();
     meerkat_meta::send_message_on_mob(&runtime.mob_handle(), MEMBER, "hello".to_string())
         .await
         .expect("send message");
@@ -236,14 +254,14 @@ async fn a_persistent_member_reports_its_refused_call_to_the_host_observer() {
         UnifiedRuntime::builder()
             .definition(definition("refusal-observer-persistent"))
             .persistent_state(state.path().join("state"))
-            .default_llm_client(client)
+            .default_llm_client(client.clone())
             .register_tool_bundle("refusing", Arc::new(RefusingBundle))
             .operation_refusal_observer(observer.clone())
             .build(),
     )
     .await
     .expect("runtime builds");
-    spawn_and_send(&runtime).await;
+    spawn_and_send(&runtime, &client).await;
     assert_eq!(observer.observed(answered).await, refused_call());
     runtime.shutdown().await;
 }
@@ -257,14 +275,14 @@ async fn a_temp_dir_member_reports_its_refused_call_to_the_host_observer() {
     let runtime = Box::pin(
         UnifiedRuntime::builder()
             .definition(definition("refusal-observer-temp-dir"))
-            .default_llm_client(client)
+            .default_llm_client(client.clone())
             .register_tool_bundle("refusing", Arc::new(RefusingBundle))
             .operation_refusal_observer(observer.clone())
             .build(),
     )
     .await
     .expect("runtime builds");
-    spawn_and_send(&runtime).await;
+    spawn_and_send(&runtime, &client).await;
     assert_eq!(observer.observed(answered).await, refused_call());
     runtime.shutdown().await;
 }
@@ -300,13 +318,14 @@ async fn a_scratch_member_reports_its_refused_call_to_the_host_observer() {
             .roster_provider(roster)
             .scratch_dir(scratch.path())
             .identity_runtime_instance_id("refusal-observer-scratch")
-            .default_llm_client(client)
+            .default_llm_client(client.clone())
             .register_tool_bundle("refusing", Arc::new(RefusingBundle))
             .operation_refusal_observer(observer.clone())
             .build(),
     )
     .await
     .expect("runtime builds");
+    client.arm_probe();
     run_host_turn(&runtime, &identity).await;
     assert_eq!(observer.observed(answered).await, refused_call());
     runtime.mob_handle().stop().await.unwrap();
