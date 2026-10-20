@@ -321,6 +321,25 @@ pub enum StorageLayoutError {
         state_dir: PathBuf,
         bound_identities: usize,
     },
+    /// Identities are bound to sessions, but the runtime store a storage
+    /// provider supplies holds no session at all: its backend lost its data,
+    /// or the store does not outlive the process. Starting would bring every
+    /// bound identity back on a lost session, where its turns fail, so the
+    /// build refuses. Restore the backend's runtime data, or start on a new,
+    /// empty state directory or provider realm.
+    RuntimeStoreLostSessions {
+        state_dir: PathBuf,
+        bound_identities: usize,
+        provider: String,
+    },
+    /// The runtime store a storage provider supplies could not be read while
+    /// the build checked it for the sessions identities are bound to.
+    /// `detail` is the backend's error.
+    RuntimeStoreUnreadable {
+        state_dir: PathBuf,
+        provider: String,
+        detail: String,
+    },
     /// A startup check could not read one of the state directory's stores.
     StartupProbeUnreadable {
         state_dir: PathBuf,
@@ -499,6 +518,30 @@ impl Display for StorageLayoutError {
                  session, but its runtime.sqlite is missing or holds no session; restore \
                  runtime.sqlite together with its -wal file from the backup taken with the rest \
                  of the directory",
+                state_dir.display()
+            ),
+            Self::RuntimeStoreLostSessions {
+                state_dir,
+                bound_identities,
+                provider,
+            } => write!(
+                f,
+                "state directory {} has {bound_identities} identity binding(s) that name a \
+                 session, but the runtime store of storage provider {provider} holds no \
+                 session: its backend lost its data, or the store does not outlive the \
+                 process. Restore the backend's runtime data, or start on a new, empty state \
+                 directory or provider realm",
+                state_dir.display()
+            ),
+            Self::RuntimeStoreUnreadable {
+                state_dir,
+                provider,
+                detail,
+            } => write!(
+                f,
+                "the runtime store of storage provider {provider} could not be read to check \
+                 the sessions of the identities bound in state directory {}: {detail}; make \
+                 the backend readable, then start again",
                 state_dir.display()
             ),
             Self::StartupProbeUnreadable {

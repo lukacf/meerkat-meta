@@ -587,6 +587,7 @@ comms = true
         .lease_provider(Arc::new(LocalLeaseProvider::new()))
         .roster_provider(roster)
         .scratch_dir(scratch.path())
+        .ephemeral_runtime_store(true)
         .identity_runtime_instance_id("console-binding")
         .default_llm_client(Arc::new(NeverCalledClient))
         .build()

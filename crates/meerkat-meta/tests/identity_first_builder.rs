@@ -901,6 +901,7 @@ async fn identity_first_builder_blob_store_accepted_with_external_path() {
         .lease_provider(Arc::new(StubLeaseProvider))
         .roster_provider(Arc::new(StubRosterProvider::new(vec![])))
         .scratch_dir(tmp.path())
+        .ephemeral_runtime_store(true)
         .blob_store(Arc::new(meerkat_store::FsBlobStore::new(
             tmp.path().join("blobs"),
         )));
@@ -935,6 +936,7 @@ async fn injected_stores_over_scratch_boot_without_a_realm_declaration() {
                 meerkat_meta::blob_store::ObjectStoreBlobStore::memory(),
             ))
             .scratch_dir(&scratch)
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("injected-stores-scratch-test")
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .build(),
@@ -962,6 +964,7 @@ async fn identity_first_builder_bootstraps_and_exposes_identity_runtime() {
             .lease_provider(Arc::new(StubLeaseProvider))
             .roster_provider(roster)
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-test")
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .build(),
@@ -1001,6 +1004,7 @@ async fn identity_first_builder_reset_reprofiles_from_current_roster_provider() 
             ))
             .roster_provider(roster.clone())
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-reset-reprofile-test")
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .build(),
@@ -1065,6 +1069,7 @@ async fn identity_first_builder_reset_reprofiles_with_roster_context() {
             ))
             .roster_provider(roster.clone())
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-reset-reprofile-context-test")
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .build(),
@@ -1143,6 +1148,7 @@ async fn identity_first_send_does_not_park_mob_actor_until_turn_completion() {
             .lease_provider(Arc::new(StubLeaseProvider))
             .roster_provider(roster)
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-slow-send-test")
             // The turn is deliberately far longer than the budgets below. This
             // test never waits for it to finish - it stops the mob while the
@@ -1226,6 +1232,7 @@ async fn identity_first_builder_lazy_materialize_registers_large_ready_roster_wi
             .lease_provider(Arc::new(StubLeaseProvider))
             .roster_provider(Arc::new(StubRosterProvider::new(specs)))
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-lazy-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyMaterialize)
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
@@ -1365,6 +1372,7 @@ async fn identity_first_builder_lazy_console_lists_and_inspects_dormant_identiti
                 .lease_provider(Arc::new(StubLeaseProvider))
                 .roster_provider(Arc::new(StubRosterProvider::new(specs)))
                 .scratch_dir(tmp.path())
+                .ephemeral_runtime_store(true)
                 .identity_runtime_instance_id("builder-lazy-console-test")
                 .identity_bootstrap_mode(IdentityBootstrapMode::LazyMaterialize)
                 .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
@@ -1435,6 +1443,7 @@ async fn identity_first_builder_rejects_zero_background_warm_concurrency() {
             "agent:alpha",
         )])))
         .scratch_dir(tmp.path())
+        .ephemeral_runtime_store(true)
         .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 0 })
         .default_llm_client(Arc::new(meerkat_client::TestClient::default()));
 
@@ -1452,6 +1461,7 @@ async fn identity_first_builder_rejects_excessive_background_warm_concurrency() 
             "agent:alpha",
         )])))
         .scratch_dir(tmp.path())
+        .ephemeral_runtime_store(true)
         .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 17 })
         .default_llm_client(Arc::new(meerkat_client::TestClient::default()));
 
@@ -1554,6 +1564,7 @@ async fn identity_first_builder_background_warm_is_tracked_to_active() {
             .lease_provider(Arc::new(StubLeaseProvider))
             .roster_provider(Arc::new(StubRosterProvider::new(specs)))
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-background-warm-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
                 concurrency: 2,
@@ -1616,6 +1627,7 @@ async fn identity_first_builder_failed_pre_spawn_hook_never_starts_background_wa
         )])))
         .agent_customizer(customizer.clone())
         .scratch_dir(tmp.path())
+        .ephemeral_runtime_store(true)
         .identity_runtime_instance_id("builder-failed-hook-background-warm-test")
         .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 1 })
         .pre_spawn_hook(hook)
@@ -1928,6 +1940,7 @@ async fn identity_first_background_warm_bounds_concurrency_and_reports_failure()
             .roster_provider(Arc::new(StubRosterProvider::new(specs)))
             .agent_customizer(customizer.clone())
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-background-warm-bounded-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
                 concurrency: 2,
@@ -2000,6 +2013,7 @@ async fn identity_first_shutdown_cancels_blocked_background_warm() {
             )])))
             .agent_customizer(customizer.clone())
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-background-warm-shutdown-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
                 concurrency: 1,
@@ -2044,6 +2058,7 @@ async fn identity_first_shutdown_joins_abandoned_foreground_materialization_clea
                 )])))
                 .agent_customizer(customizer.clone())
                 .scratch_dir(tmp.path())
+                .ephemeral_runtime_store(true)
                 .identity_runtime_instance_id("builder-foreground-materialize-shutdown-test")
                 .identity_bootstrap_mode(IdentityBootstrapMode::LazyMaterialize)
                 .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
@@ -2096,6 +2111,7 @@ async fn identity_first_shutdown_joins_abandoned_reconcile_transaction() {
                 .roster_provider(roster.clone())
                 .agent_customizer(customizer.clone())
                 .scratch_dir(tmp.path())
+                .ephemeral_runtime_store(true)
                 .identity_runtime_instance_id("builder-abandoned-reconcile-shutdown-test")
                 .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
                 .build(),
@@ -2171,6 +2187,7 @@ async fn identity_first_reconcile_publishes_nonterminal_status_before_provider_w
                 )])))
                 .topology_provider(topology.clone())
                 .scratch_dir(tmp.path())
+                .ephemeral_runtime_store(true)
                 .identity_runtime_instance_id("builder-reconcile-readiness-test")
                 .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
                 .build(),
@@ -2246,6 +2263,7 @@ async fn identity_first_superseded_warm_task_cannot_complete_new_reconcile_barri
                 .roster_provider(roster.clone())
                 .agent_customizer(customizer.clone())
                 .scratch_dir(tmp.path())
+                .ephemeral_runtime_store(true)
                 .identity_runtime_instance_id("builder-reconcile-generation-test")
                 .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
                     concurrency: 1,
@@ -2326,6 +2344,7 @@ async fn identity_first_lazy_reconcile_serializes_with_foreground_materializatio
                 .roster_provider(roster.clone())
                 .agent_customizer(customizer.clone())
                 .scratch_dir(tmp.path())
+                .ephemeral_runtime_store(true)
                 .identity_runtime_instance_id("builder-lazy-materialize-reconcile-race-test")
                 .identity_bootstrap_mode(IdentityBootstrapMode::LazyMaterialize)
                 .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
@@ -2417,6 +2436,7 @@ async fn identity_first_retired_identity_is_removed_by_topology_refresh() {
             .lease_provider(Arc::new(StubLeaseProvider))
             .roster_provider(roster.clone())
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-retired-identity-removal-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
                 concurrency: 2,
@@ -2497,6 +2517,7 @@ async fn identity_first_lazy_reconcile_retires_members_removed_from_roster() {
             .lease_provider(Arc::new(StubLeaseProvider))
             .roster_provider(roster.clone())
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-lazy-roster-removal-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
                 concurrency: 2,
@@ -2564,6 +2585,7 @@ async fn identity_bootstrap_status_tracks_reset_retire_materialize_and_delete() 
                 identity.as_str(),
             )])))
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-bootstrap-lifecycle-status-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
                 concurrency: 1,
@@ -2625,6 +2647,7 @@ async fn identity_bootstrap_status_tracks_reset_retire_materialize_and_delete() 
                 delete_identity.as_str(),
             )])))
             .scratch_dir(delete_tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-bootstrap-delete-status-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyMaterialize)
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
@@ -2671,6 +2694,7 @@ async fn identity_first_reconcile_provider_failure_is_terminal_and_not_ready() {
                 calls: AtomicUsize::new(0),
             }))
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-reconcile-failure-status-test")
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .build(),
@@ -2733,6 +2757,7 @@ async fn identity_first_builder_lazy_topology_refresh_stays_metadata_only() {
             .roster_provider(Arc::new(StubRosterProvider::new(specs)))
             .topology_provider(topology)
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-lazy-refresh-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyMaterialize)
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
@@ -2799,6 +2824,7 @@ async fn identity_first_builder_lazy_run_flow_materializes_ops_shaped_roster_bef
             .roster_provider(Arc::new(StubRosterProvider::new(specs)))
             .topology_provider(topology)
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-lazy-flow-test")
             .identity_bootstrap_mode(IdentityBootstrapMode::LazyMaterialize)
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
@@ -2919,6 +2945,7 @@ async fn identity_first_builder_refreshes_desired_topology_from_providers() {
                 edges: edges.clone(),
             }))
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .build(),
     )
@@ -3019,6 +3046,7 @@ async fn identity_first_external_member_restore_supplies_generated_owner_binding
             .lease_provider(Arc::new(StubLeaseProvider))
             .roster_provider(roster)
             .scratch_dir(tmp.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("builder-external-owner-binding-test")
             .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
             .build(),
@@ -3552,6 +3580,109 @@ async fn a_non_disk_provider_build_restarts_with_a_bound_member() {
             );
         }
     }
+}
+
+/// One persistent build over `provider` on `root` whose roster binds
+/// `agent:alice`, shut down again on success. `first` declares a fresh
+/// meerkat-level realm, as a first start over a new backend must.
+async fn start_over_durable_stub(
+    root: &std::path::Path,
+    mob_id: &str,
+    provider: Arc<DurableStubBundleProvider>,
+    first: bool,
+) -> Result<(), meerkat_meta::unified_runtime::UnifiedRuntimeBuilderError> {
+    let mut builder = UnifiedRuntimeBuilder::default()
+        .definition(test_definition_with_id(mob_id))
+        .storage_provider(provider)
+        .persistent_state(root)
+        .ephemeral_blobs(true)
+        .roster_provider(Arc::new(StubRosterProvider::new(vec![durable_spec(
+            "agent:alice",
+        )])))
+        .identity_runtime_instance_id("builder-provider-lost-runtime-test")
+        .default_llm_client(Arc::new(meerkat_client::TestClient::default()));
+    if first {
+        builder = builder.meerkat_level_realm(meerkat_meta::MeerkatLevelRealmDeclaration::Fresh);
+    }
+    let runtime = Box::pin(builder.build()).await?;
+    runtime.shutdown().await;
+    Ok(())
+}
+
+/// Whether `result` is the typed refusal of bindings whose provider-held
+/// runtime store holds no session.
+fn refused_for_lost_sessions(
+    result: &Result<(), meerkat_meta::unified_runtime::UnifiedRuntimeBuilderError>,
+) -> bool {
+    matches!(
+        result,
+        Err(meerkat_meta::unified_runtime::UnifiedRuntimeBuilderError::StorageLayout(
+            meerkat_meta::storage_layout::StorageLayoutError::RuntimeStoreLostSessions {
+                bound_identities: 1,
+                provider,
+                ..
+            }
+        )) if provider == "stub-durable-bundle"
+    )
+}
+
+/// A restart over a non-disk provider whose runtime store lost every session
+/// (here: a new backend with empty stores, as an in-memory runtime store is
+/// after a restart) while the local mob store still binds the roster member
+/// to a session is refused typed. Before the fix it started, and the member
+/// came back Active on its lost session, where its turns and resets fail
+/// with "session not found".
+#[tokio::test]
+async fn a_non_disk_provider_that_lost_every_session_refuses_the_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let mob_id = unique_builder_mob_id();
+    let first = Arc::new(DurableStubBundleProvider {
+        meerkat: DurableStubRemoteMeerkatProvider::new(),
+    });
+    start_over_durable_stub(&root, &mob_id, first, true)
+        .await
+        .expect("the first start binds the member");
+
+    let lost = Arc::new(DurableStubBundleProvider {
+        meerkat: DurableStubRemoteMeerkatProvider::new(),
+    });
+    let restarted = start_over_durable_stub(&root, &mob_id, lost, false).await;
+    assert!(
+        refused_for_lost_sessions(&restarted),
+        "a restart whose provider runtime store lost every session must refuse \
+         typed, got: {restarted:?}"
+    );
+}
+
+/// The external path (continuity_store + lease_provider + scratch_dir, no
+/// persistent_state, no storage provider, no mob spec) keeps its sessions in
+/// an in-memory runtime store, so a restart would start every bound identity
+/// with an empty transcript. The build refuses that unless
+/// `ephemeral_runtime_store(true)` declares it; before the fix it started
+/// silently.
+#[tokio::test]
+async fn the_external_path_refuses_an_undeclared_in_memory_runtime_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let external = || {
+        UnifiedRuntimeBuilder::default()
+            .definition(test_definition_with_id(&unique_builder_mob_id()))
+            .continuity_store(Arc::new(StubContinuityStore))
+            .lease_provider(Arc::new(StubLeaseProvider))
+            .roster_provider(Arc::new(StubRosterProvider::new(vec![])))
+            .scratch_dir(tmp.path())
+            .identity_runtime_instance_id("builder-external-in-memory-test")
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+    };
+    Box::pin(assert_build_err_contains(
+        external(),
+        "declare ephemeral_runtime_store(true)",
+    ))
+    .await;
+    let runtime = Box::pin(external().ephemeral_runtime_store(true).build())
+        .await
+        .expect("the declared in-memory runtime store builds");
+    runtime.shutdown().await;
 }
 
 /// One provider-backed build over `root` (scratch or persistent), with an

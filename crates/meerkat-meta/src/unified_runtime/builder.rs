@@ -147,6 +147,9 @@ pub struct UnifiedRuntimeBuilder {
     binary_blob_store: Option<Arc<dyn crate::blob_store::BinaryBlobStore>>,
     ephemeral_blobs: bool,
     ephemeral_runtime_store: bool,
+    /// Whether the caller set `continuity_store()` or `lease_provider()`,
+    /// both ignored since 0.9.4 (a warning at build).
+    injected_continuity_seams: bool,
     schedule_store: Option<Arc<dyn meerkat::ScheduleStore>>,
     workgraph_store: Option<Arc<dyn meerkat::WorkGraphStore>>,
     storage_provider: Option<Arc<dyn crate::storage_provider::MetaStorageProvider>>,
@@ -321,16 +324,18 @@ impl UnifiedRuntimeBuilder {
 
     /// Set an external `ContinuityStore` for the identity-first path.
     ///
-    /// Supply [`lease_provider`](Self::lease_provider) with it — the pair is
-    /// one substrate (fencing floors are store-coupled). May coexist with
-    /// `persistent_state()` (M4): the external substrate stays the identity
-    /// and session authority while the state directory supplies the
-    /// meerkat-shared local stores.
+    /// Ignored since 0.9.4: identity continuity and leases live in the state
+    /// directory, and the runtime never reads or writes this store. Migrate
+    /// 0.9.3 identities with the continuity export (see the continuity
+    /// export guide). The external path still requires the pair with
+    /// [`lease_provider`](Self::lease_provider) until both methods are
+    /// removed, and `build()` logs a warning when either is set.
     pub fn continuity_store(
         mut self,
         store: Arc<dyn crate::identity_first::contracts::ContinuityStore>,
     ) -> Self {
         self.continuity_store = Some(store);
+        self.injected_continuity_seams = true;
         self
     }
 
@@ -350,13 +355,16 @@ impl UnifiedRuntimeBuilder {
 
     /// Set an external `LeaseProvider` for the identity-first path.
     ///
-    /// Supply [`continuity_store`](Self::continuity_store) with it; see
-    /// there for the `persistent_state()` coexistence semantics.
+    /// Ignored since 0.9.4, like
+    /// [`continuity_store`](Self::continuity_store): identity continuity and
+    /// leases live in the state directory, and the runtime never calls this
+    /// provider. Migrate 0.9.3 identities with the continuity export.
     pub fn lease_provider(
         mut self,
         provider: Arc<dyn crate::identity_first::contracts::LeaseProvider>,
     ) -> Self {
         self.lease_provider = Some(provider);
+        self.injected_continuity_seams = true;
         self
     }
 
@@ -780,7 +788,17 @@ impl UnifiedRuntimeBuilder {
 
     /// Declare that the runtime store is intentionally ephemeral
     /// (in-memory), for a [`storage_provider`](Self::storage_provider) realm
-    /// opened on a [`scratch_dir`](Self::scratch_dir).
+    /// opened on a [`scratch_dir`](Self::scratch_dir), or for an
+    /// identity-first build on the external path.
+    ///
+    /// An identity-first build without
+    /// [`persistent_state`](Self::persistent_state), a non-disk
+    /// [`storage_provider`](Self::storage_provider) or a
+    /// [`mob_spec`](Self::mob_spec) keeps its sessions in memory, so every
+    /// session ends with the process and a restart starts every identity
+    /// with an empty transcript. `build()` refuses that configuration with
+    /// [`UnifiedRuntimeBuilderError::ConflictingConfiguration`] unless this
+    /// declaration says so on purpose.
     ///
     /// A [`persistent_state`](Self::persistent_state) build refuses it:
     /// sessions live in the runtime store under the state directory, so a
@@ -846,9 +864,10 @@ impl UnifiedRuntimeBuilder {
     /// instead of local files; the built-in disk backend keeps the flat
     /// local composition.
     ///
-    /// Requires an identity-first configuration (`roster_provider()`): the
-    /// provider's continuity store is the session authority. The realm root
-    /// comes from `persistent_state()` or `scratch_dir()` (ephemeral local
+    /// Requires an identity-first configuration (`roster_provider()`). The
+    /// sessions live in the provider's runtime store, which the build checks
+    /// against the identities' bindings before any identity wakes. The realm
+    /// root comes from `persistent_state()` or `scratch_dir()` (ephemeral local
     /// disk — the operator shape).
     ///
     /// [`MetaStorageProvider`]: crate::storage_provider::MetaStorageProvider
@@ -1310,6 +1329,18 @@ impl UnifiedRuntimeBuilder {
                     .to_string(),
             ));
         }
+        // 0.9.4 keeps identity continuity and leases in the state directory:
+        // an injected pair is validated and handed on, but never read or
+        // written (the native migration reads the 0.9.3 files itself). Keyed
+        // on the caller's own calls: a storage provider and the state
+        // directory's own substrate fill the same fields.
+        if self.injected_continuity_seams {
+            tracing::warn!(
+                "continuity_store() and lease_provider() are ignored since 0.9.4: identity \
+                 continuity and leases live in the state directory. Migrate 0.9.3 identities \
+                 with the continuity export"
+            );
+        }
         self.materialize_storage_provider().await?;
 
         let has_continuity_store = self.continuity_store.is_some();
@@ -1336,13 +1367,9 @@ impl UnifiedRuntimeBuilder {
             || has_identity_runtime_instance_id
             || self.identity_bootstrap_mode_configured;
         // REQ-23, lifted (M4): an external continuity/lease pair may coexist
-        // with persistent_state() — the external substrate stays the
-        // identity and session authority while the state directory supplies
-        // the meerkat-shared local stores (runtime, workgraph, blobs, ...).
-        // The genuinely contradictory combination keeps a typed error: half
-        // an external substrate. The bundled store cannot split authority
-        // with an external half — the lease provider's fencing floor is
-        // coupled to its continuity store's persisted high-water.
+        // with persistent_state(). Since 0.9.4 the pair is ignored (see the
+        // warning above): the state directory holds identities and sessions.
+        // Half a pair keeps its typed error until both methods are removed.
         if has_persistent_state && (has_continuity_store != has_lease_provider) {
             return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
                 "continuity_store() and lease_provider() must be supplied together — the lease \
@@ -1384,6 +1411,27 @@ impl UnifiedRuntimeBuilder {
                      roster_provider() + scratch_dir(); missing: {}",
                     missing.join(", ")
                 ),
+            ));
+        }
+        // Without a state directory, a non-disk provider's backend or a
+        // caller's mob spec, the sessions of an identity-first build live in
+        // an in-memory runtime store: a restart would start every bound
+        // identity with an empty transcript. That is a declaration, never a
+        // default.
+        if !has_persistent_state
+            && wants_identity_first
+            && self.provider_meerkat_stores.is_none()
+            && self.mob_spec.is_none()
+            && !self.ephemeral_runtime_store
+        {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "this identity-first build keeps its sessions in an in-memory runtime store \
+                 (no persistent_state(), no non-disk storage_provider(), no mob_spec()), so a \
+                 restart would start every identity with an empty transcript. Build with \
+                 persistent_state(), or with a storage_provider() whose backend keeps the \
+                 sessions, or declare ephemeral_runtime_store(true) if sessions may end with \
+                 the process"
+                    .to_string(),
             ));
         }
 
@@ -2626,6 +2674,19 @@ impl UnifiedRuntimeBuilder {
                     .await?,
             )
         };
+        // The bindings check the state directory claim could not run: the
+        // runtime store lives in the provider's backend, so read it through
+        // the store, before any identity wakes onto an empty transcript.
+        if let Some(stores) = self.provider_meerkat_stores.as_ref() {
+            let mob_store = self.durable_mob_store();
+            crate::native_startup::refuse_lost_runtime_store(
+                &ctx.state_dir,
+                mob_store.as_deref(),
+                stores.runtime_store.as_ref(),
+                &stores.provider_name,
+            )
+            .await?;
+        }
         // Retain the provider's per-slot durability declarations for the
         // census: the health surfaces must report the provider-declared
         // resolutions verbatim, not the local defaults those declarations

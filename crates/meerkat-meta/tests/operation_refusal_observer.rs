@@ -319,6 +319,7 @@ async fn a_scratch_member_reports_its_refused_call_to_the_host_observer() {
             .lease_provider(Arc::new(LocalLeaseProvider::new()))
             .roster_provider(roster)
             .scratch_dir(scratch.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("refusal-observer-scratch")
             .default_llm_client(client)
             .register_tool_bundle("refusing", Arc::new(RefusingBundle))

@@ -465,7 +465,8 @@ refuse only a second host of the same session, after the checks above.
 ### Startup refusals
 
 0.9.4 checks the state directory before it opens any store, and refuses with
-STORAGE_RESOLUTION (`-32014`):
+STORAGE_RESOLUTION (`-32014`). Rows marked builder only reach a Rust
+`UnifiedRuntimeBuilder` caller as a build error; no gateway reaches them:
 
 | Refusal | Meaning | Do |
 |---|---|---|
@@ -473,6 +474,9 @@ STORAGE_RESOLUTION (`-32014`):
 | `MigrationIncomplete` | A migration stopped part way. | Run `--apply` again. |
 | `RuntimeInUse` | Another process holds the runtime's custody lock. | Stop it. |
 | `RuntimeStoreMissing` | Identities are bound to sessions, but `runtime.sqlite` is missing or holds no session. | Restore `runtime.sqlite` together with its `-wal` file from the same backup; do not start on the directory without it. |
+| `RuntimeStoreLostSessions` (builder only, `UnifiedRuntimeBuilderError::StorageLayout`) | Identities are bound to sessions, but a non-disk `storage_provider()` backend's runtime store holds no session: the backend lost its data, or the store does not outlive the process. | Restore the backend's runtime data, or start on a new, empty state directory or provider realm. |
+| `RuntimeStoreUnreadable` (builder only) | That backend's runtime store could not be read for the check. | Make the backend readable, then start again. |
+| `ConflictingConfiguration` naming `ephemeral_runtime_store(true)` (builder only) | An identity-first build without `persistent_state()`, a non-disk `storage_provider()` or `mob_spec()` keeps its sessions in memory, so a restart would start every identity with an empty transcript. | Build with `persistent_state()`, or with a `storage_provider()` whose backend keeps the sessions; or declare `ephemeral_runtime_store(true)` if sessions may end with the process. |
 | `RuntimeLockUnreadable`, `StartupProbeUnreadable` | A lock file or a store could not be read. | Fix the file, then start again. |
 | `SessionDatabaseOverrideRetired` (`meta_gateway`) | `store_path` names a file. | See [A session database named by store_path](#a-session-database-named-by-store_path). |
 | `UnrecognizedSessionDatabase` | A session database sits in the directory under an unknown name. | The same section. |
@@ -503,12 +507,24 @@ Core holds no live member. No Core runtime path releases the lease at
 shutdown; a Core fix is planned for a later release.
 
 **A runtime store in a storage provider.** The `RuntimeStoreMissing` check
-reads only a local `runtime.sqlite`. A composition whose runtime store is a
-non-disk `storage_provider()` backend skips it: if the backend has lost
-sessions the mob still binds, those identities start fresh, with no history.
-Startup does not refuse, and only each identity's status reports it
-(`replaced_session`). A check that covers provider backends is planned for a
-later release.
+reads only a local `runtime.sqlite`. A `UnifiedRuntimeBuilder` composition
+whose runtime store is a non-disk `storage_provider()` backend is checked
+against that store instead, once the provider has opened its realm and before
+any identity wakes: identities bound to sessions while the store holds no
+session at all refuse with `RuntimeStoreLostSessions`. This happens when the
+backend lost its runtime data, or when the store does not outlive the
+process. Without this check such a start went ahead, and each bound identity
+came back Active on its lost session, where its turns and resets failed with
+`session not found`. Restore the backend's data, or start on a new, empty
+state directory or provider realm. An identity that does come back on a lost
+session (see the known limitations for the stores this check cannot read)
+recovers when you retire it (`IdentityRuntime::retire`): its next wake starts
+it on a new, empty session. The check reads continuity records in the state
+directory and the mob store under it or at a `persistent_mob_storage()` path;
+mob storage without a persistent path and a host-built `mob_spec()` are not
+read yet, see the known limitations.
+Back up the state directory as well: a lost or replaced one cannot be
+detected.
 
 `meta/init_progress` no longer reports the `prewarm` phase:
 `owner_publication` now covers only the early roster callback.

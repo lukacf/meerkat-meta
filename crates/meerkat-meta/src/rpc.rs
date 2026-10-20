@@ -11582,6 +11582,7 @@ comms = true
             .lease_provider(Arc::new(LocalLeaseProvider::new()))
             .roster_provider(roster)
             .scratch_dir(scratch.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("send-message-reservation-settlement-test")
             .default_llm_client(Arc::new(TestClient::for_provider(
                 meerkat_core::Provider::OpenAI,
@@ -11803,6 +11804,7 @@ comms = true
             .lease_provider(Arc::new(LocalLeaseProvider::new()))
             .roster_provider(roster)
             .scratch_dir(scratch.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("send-message-memory-preparation-test")
             .agent_memory(
                 memory.clone(),

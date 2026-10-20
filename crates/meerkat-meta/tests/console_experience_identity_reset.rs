@@ -154,6 +154,7 @@ comms = true
             .lease_provider(Arc::new(LocalLeaseProvider::new()))
             .roster_provider(roster.clone())
             .scratch_dir(scratch.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("console-experience-identity-reset")
             .default_llm_client(Arc::new(QuietClient))
             .build()

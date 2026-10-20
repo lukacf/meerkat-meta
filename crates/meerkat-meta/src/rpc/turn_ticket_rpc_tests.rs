@@ -699,6 +699,7 @@ async fn live_runtime_with(
         .lease_provider(Arc::new(LocalLeaseProvider::new()))
         .roster_provider(roster.clone())
         .scratch_dir(scratch.path())
+        .ephemeral_runtime_store(true)
         .identity_runtime_instance_id("turn-tickets-live")
         .default_llm_client(Arc::new(client.clone()))
         .build()

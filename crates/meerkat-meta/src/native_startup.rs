@@ -1,6 +1,7 @@
 //! The checks every persistent Meta composition runs on its state directory
 //! after claiming it ([`crate::state_dir_claim`]) and before it opens any
-//! store, in this order:
+//! store, in this order (a storage provider's runtime store is checked once
+//! the provider has opened its realm, see the third):
 //!
 //! 1. No other process hosts runtimes there. Core holds a shared lock on
 //!    `runtime.sqlite.execution-custody` for each runtime it hosts, so an
@@ -30,7 +31,10 @@
 //!    holds no session are refused; restoring the runtime store is the
 //!    remedy. A composition whose runtime store is a storage provider's
 //!    backend ([`RuntimeStoreLocation::StorageProvider`]) has no
-//!    `runtime.sqlite` here to compare with, so this check does not run.
+//!    `runtime.sqlite` here to compare with, so the claim skips this file
+//!    check; the builder runs `refuse_lost_runtime_store` instead, through
+//!    the provider's runtime store, after the provider has opened its realm
+//!    (on `persistent_state` and `scratch_dir` realms alike).
 //!
 //! The database probes read with SQLite `mode=ro` (never `immutable=1`,
 //! which would not see the write-ahead log) and fail closed.
@@ -130,8 +134,10 @@ pub enum RuntimeStoreLocation {
     StateDir,
     /// A non-disk storage provider's meerkat-level bundle: sessions and
     /// runtime authority live in the provider's backend, and no
-    /// `runtime.sqlite` exists under the state directory, so the bindings
-    /// check does not run.
+    /// `runtime.sqlite` exists under the state directory, so the claim skips
+    /// the file check; the builder checks the bindings against the
+    /// provider's runtime store (`refuse_lost_runtime_store`) once the
+    /// provider has opened its realm.
     StorageProvider,
 }
 
@@ -169,6 +175,68 @@ pub async fn refuse_unready_state_dir_for(
         });
     }
     Ok(())
+}
+
+/// The bindings check (the third, see the module docs) for a composition
+/// whose runtime store is a storage provider's backend, read through the
+/// store itself once the provider has opened its realm (a `persistent_state`
+/// or a `scratch_dir` realm alike). Identities bound to a session, counted
+/// as [`refuse_unready_state_dir`] counts them, while that store holds no
+/// session at all are refused: the backend lost its data, or the store does
+/// not outlive the process, and each identity would otherwise come back on a
+/// session that no longer exists. A store that holds any session passes:
+/// this check does not look for one identity's missing session.
+///
+/// # Errors
+///
+/// [`StorageLayoutError::RuntimeStoreLostSessions`] for bindings whose
+/// provider-held runtime store holds no session,
+/// [`StorageLayoutError::RuntimeStoreUnreadable`] when that store cannot be
+/// read, and [`StorageLayoutError::StartupProbeUnreadable`] when the
+/// continuity database or the mob store cannot be read.
+pub(crate) async fn refuse_lost_runtime_store(
+    state_dir: &Path,
+    mob_store: Option<&Path>,
+    runtime_store: &dyn meerkat_runtime::RuntimeStore,
+    provider: &str,
+) -> Result<(), StorageLayoutError> {
+    let bound_identities = bound_identity_count(state_dir, mob_store).await?;
+    if bound_identities == 0 {
+        return Ok(());
+    }
+    let holds_a_session = runtime_store
+        .list_runtime_session_catalog_entries(meerkat_core::SessionFilter {
+            limit: Some(1),
+            ..meerkat_core::SessionFilter::default()
+        })
+        .await
+        .map(|entries| !entries.is_empty())
+        .map_err(|error| error.to_string());
+    lost_runtime_store_verdict(state_dir, provider, bound_identities, holds_a_session)
+}
+
+/// The decision of [`refuse_lost_runtime_store`] once `bound_identities`
+/// (more than zero) and the catalog probe are known: whether the provider's
+/// runtime store holds a session, or why it could not be read.
+fn lost_runtime_store_verdict(
+    state_dir: &Path,
+    provider: &str,
+    bound_identities: usize,
+    holds_a_session: Result<bool, String>,
+) -> Result<(), StorageLayoutError> {
+    match holds_a_session {
+        Err(detail) => Err(StorageLayoutError::RuntimeStoreUnreadable {
+            state_dir: state_dir.to_path_buf(),
+            provider: provider.to_string(),
+            detail,
+        }),
+        Ok(true) => Ok(()),
+        Ok(false) => Err(StorageLayoutError::RuntimeStoreLostSessions {
+            state_dir: state_dir.to_path_buf(),
+            bound_identities,
+            provider: provider.to_string(),
+        }),
+    }
 }
 
 /// Refuse a layout that names a separate session database (a `store_path`
@@ -779,6 +847,63 @@ mod tests {
 
         let fresh = tempfile::tempdir().expect("tempdir");
         refuse_unready_state_dir(fresh.path(), None)
+            .await
+            .expect("a directory without bindings starts");
+    }
+
+    /// A storage provider's runtime store that holds no session while an
+    /// identity is bound to one refuses typed, naming the binding count and
+    /// the provider.
+    #[tokio::test]
+    async fn bindings_without_a_session_in_the_provider_runtime_store_refuse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        bind_one_identity(dir.path());
+        let empty = meerkat_runtime::InMemoryRuntimeStore::new();
+        let refused = refuse_lost_runtime_store(dir.path(), None, &empty, "stub").await;
+        assert!(
+            matches!(
+                refused,
+                Err(StorageLayoutError::RuntimeStoreLostSessions {
+                    bound_identities: 1,
+                    ref provider,
+                    ..
+                }) if provider == "stub"
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// A provider runtime store whose catalog cannot be read refuses typed,
+    /// naming the provider and the backend's error: an unreadable store is
+    /// no evidence either way, so the build does not start over it.
+    #[test]
+    fn an_unreadable_provider_runtime_store_refuses() {
+        let refused = lost_runtime_store_verdict(
+            Path::new("/state"),
+            "stub",
+            1,
+            Err("backend unreachable".to_string()),
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(StorageLayoutError::RuntimeStoreUnreadable {
+                    ref provider,
+                    ref detail,
+                    ..
+                }) if provider == "stub" && detail == "backend unreachable"
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// Without bindings, an empty provider runtime store starts: a fresh
+    /// installation and an in-memory substrate bind nothing yet.
+    #[tokio::test]
+    async fn no_bindings_start_over_an_empty_provider_runtime_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = meerkat_runtime::InMemoryRuntimeStore::new();
+        refuse_lost_runtime_store(dir.path(), None, &empty, "stub")
             .await
             .expect("a directory without bindings starts");
     }

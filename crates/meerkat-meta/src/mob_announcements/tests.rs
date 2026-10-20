@@ -9090,6 +9090,7 @@ async fn the_builder_refuses_mob_announcements_it_cannot_compose() {
             .lease_provider(Arc::new(crate::identity_first::LocalLeaseProvider::new()))
             .roster_provider(Arc::new(StatusRoster))
             .scratch_dir(scratch.path())
+            .ephemeral_runtime_store(true)
             .mob_announcements(AnnouncementConfig::default())
             .build()
             .await,

@@ -72,8 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bindings in the mob store) while `runtime.sqlite` is missing or holds no
   session (`RuntimeStoreMissing`: restore `runtime.sqlite` together with its
   `-wal` file from the same backup; a composition whose runtime store is a
-  non-disk `storage_provider()` backend keeps no `runtime.sqlite` there and
-  skips this check); and a check that cannot read a store,
+  non-disk `storage_provider()` backend keeps no `runtime.sqlite` there, so
+  its bindings are checked against that backend instead, see Fixed); and a
+  check that cannot read a store,
   the mob store included (`RuntimeLockUnreadable`,
   `StartupProbeUnreadable`). `meta_gateway` refuses
   a `store_path` with a file extension that is not an existing directory
@@ -83,11 +84,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`/srv/meta.d`). A file that holds sessions moves into the layout with
   `meta_gateway storage-migrate --state-dir <dir> --session-db <file>
   --apply`, followed by `storage-migrate-native`.
-- `StorageLayoutError` gains the variants above (`StateDirInUse`,
-  `StateDirUnavailable`, `NativeStorageMigrationRequired`, `RuntimeInUse`,
-  `RuntimeLockUnreadable`, `RuntimeStoreMissing`, `StartupProbeUnreadable`,
-  `SessionDatabaseOverrideRetired`, `MobStorageUndeclared`) and is now
-  `#[non_exhaustive]`, so variants added later are not breaking.
+- `StorageLayoutError` gains the variants above and those of the storage
+  provider check under Fixed (`StateDirInUse`, `StateDirUnavailable`,
+  `NativeStorageMigrationRequired`, `RuntimeInUse`, `RuntimeLockUnreadable`,
+  `RuntimeStoreMissing`, `RuntimeStoreLostSessions`, `RuntimeStoreUnreadable`,
+  `StartupProbeUnreadable`, `SessionDatabaseOverrideRetired`,
+  `MobStorageUndeclared`) and is now `#[non_exhaustive]`, so variants added
+  later are not breaking.
+- An identity-first `UnifiedRuntimeBuilder` build without
+  `persistent_state()`, a non-disk `storage_provider()` or `mob_spec()` (the
+  external path: `continuity_store()`, `lease_provider()`, `roster_provider()`
+  and `scratch_dir()`) keeps its sessions in an in-memory runtime store, so a
+  restart silently started every identity with an empty transcript.
+  `build()` now refuses it with `ConflictingConfiguration`, naming the
+  remedies: build with `persistent_state()`, or with a `storage_provider()`
+  whose backend keeps the sessions, or declare
+  `ephemeral_runtime_store(true)` when sessions may end with the process.
 - A persistent composition refuses in-memory stores that its state directory
   would outlive: a declared in-memory runtime store (`rpc_gateway`
   `runtime_options.runtime_store` with `persistent_state`, `-32014`;
@@ -1144,6 +1156,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   re-activates the source's effective instructions in the child, and `refuse`
   refuses every fork that would inherit one. The council card shows the
   refusal's cause.
+- `UnifiedRuntimeBuilder::continuity_store()` and `lease_provider()` are
+  accepted but ignored: since 0.9.4 identity continuity and leases live in
+  the state directory, and nothing at runtime reads or writes an injected
+  continuity store or calls an injected lease provider. Only
+  `meta_gateway storage-migrate-native` reads continuity, from the 0.9.3
+  files of the directory it migrates. `build()` logs a warning when either
+  is set. The external path still requires the pair until both methods are
+  removed in a later release. To carry 0.9.3 identities from an external
+  continuity store into 0.9.4, write them to the file that
+  `storage-migrate-native` imports (see the continuity export guide).
 
 ### Fixed
 
@@ -1363,6 +1385,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   predecessor's spawn-time restrictions to the inner session service.
   Unforwarded, meerkat's default refuses that read, and every member respawn
   through Meta would be refused.
+- A `UnifiedRuntimeBuilder` build over a non-disk `storage_provider()`
+  backend whose runtime store holds no session while identities are still
+  bound to sessions (continuity records in the state directory, or Core's
+  durable member bindings in the mob store) is refused with
+  `UnifiedRuntimeBuilderError::StorageLayout(StorageLayoutError::RuntimeStoreLostSessions)`,
+  naming the binding count and the provider: the backend lost its data, or
+  the store does not outlive the process. Before, the start went ahead, and
+  such an identity came back Active on its lost session, where its turns and
+  resets failed with `session not found`; it did not start fresh.
+  Restore the backend's runtime data, or start on a new, empty state
+  directory or provider realm. A store that holds any session starts as
+  before (the check does not look for one identity's missing session); a
+  store that cannot be read is refused (`RuntimeStoreUnreadable`). The
+  check runs before any identity wakes, on `persistent_state()` and
+  `scratch_dir()` realms alike.
 
 ### Known limitations
 
@@ -1374,13 +1411,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`scoped_delivery_rejected`) while Core holds no live member. No Core
   runtime path releases the lease at shutdown; a Core fix is planned for a
   later release.
-- With a non-disk `storage_provider()` backend holding the runtime store,
-  startup does not check that store against the mob's identity bindings: the
-  `RuntimeStoreMissing` check reads only a local `runtime.sqlite`. If the
-  backend has lost sessions the mob still binds, those identities start
-  fresh, with no history: startup does not refuse, and only each identity's
-  status reports it (`replaced_session`). A check that covers provider
-  backends is planned for a later release.
+- The check of a storage provider's runtime store counts the bindings it can
+  read before the mob starts: continuity records in the state directory, and
+  the mob store under the state directory or at the path given with
+  `persistent_mob_storage()`. It does not see bindings held by mob storage
+  passed to `UnifiedRuntimeBuilder::mob_storage()` without a persistent path
+  that in fact outlives the process, nor those of a host-built `mob_spec()`,
+  which brings its own runtime store. If such a runtime store loses every
+  session, the build does not refuse, and those identities' turns fail with
+  `session not found` until each one is retired (`IdentityRuntime::retire`),
+  after which its next wake starts it on a new, empty session. A check that
+  reads any mob storage is planned for 0.9.4.1.
+- A lost or replaced state directory cannot be detected: the identity
+  bindings are recorded in it, so a start over an emptied or replaced
+  directory starts every identity with an empty transcript and does not
+  refuse. Back up the state directory.
 - A member that leaves a mob ends nothing for mob announcements. No 0.9.4
   gateway answers `member_departed`, and none records a final fact that a
   member retired or was deleted, so the member's subscriptions wait, typed,
