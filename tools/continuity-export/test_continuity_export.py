@@ -5,8 +5,12 @@ The provider fixtures behave like a host's 0.9.3 provider object: their result
 values carry the 0.9.3 ``to_dict`` wire shapes, copied here because the export
 runs in the host's 0.9.3 environment and imports nothing from the SDK.
 
-PublishedPinTests checks the pins that CHANGELOG.md and docs/ publish for both
-scripts against the scripts' bytes.
+JsonlProviderTests covers jsonl_provider.py, the provider over two JSON Lines
+files; continuity-export.test.mjs runs the same cases against
+jsonl-provider.mjs.
+
+PublishedPinTests checks the pins that CHANGELOG.md and docs/ publish for the
+scripts and the providers against their bytes.
 
 Run: python3 tools/continuity-export/test_continuity_export.py
 Rewrite this script's golden file: META_WRITE_CONTINUITY_EXPORT_FIXTURE=1 python3 ...
@@ -16,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import errno
+import gzip
 import hashlib
 import importlib.util
 import json
@@ -43,6 +48,13 @@ SPEC = importlib.util.spec_from_file_location("continuity_export", SCRIPT)
 ce = importlib.util.module_from_spec(SPEC)
 sys.modules["continuity_export"] = ce
 SPEC.loader.exec_module(ce)
+
+JSONL_PROVIDER = HERE / "jsonl_provider.py"
+JSONL_SPEC = importlib.util.spec_from_file_location("jsonl_provider", JSONL_PROVIDER)
+jp = importlib.util.module_from_spec(JSONL_SPEC)
+sys.modules["jsonl_provider"] = jp
+JSONL_SPEC.loader.exec_module(jp)
+H_REMOTE = ROOT / "crates/meerkat-meta/tests/fixtures/released_0_9_3_h_remote"
 
 SESSION_ALPHA = "019ecb20-4899-7292-a2b4-c81bc7a44258"
 SESSION_SMILE = "019f0000-0000-7000-8000-000000000001"
@@ -1515,16 +1527,16 @@ class CommandLineTests(unittest.TestCase):
 # that ships the scripts they follow [Unreleased]. The release commit that
 # turns [Unreleased] into a version moves the docs pins with it.
 
-PINNED_SCRIPTS = ("continuity_export.py", "continuity-export.mjs")
+# The export scripts and the JSON Lines providers that run beside them.
+PINNED_SCRIPTS = ("continuity_export.py", "continuity-export.mjs", "jsonl_provider.py", "jsonl-provider.mjs")
+_PINNED_SCRIPT = "|".join(re.escape(script) for script in PINNED_SCRIPTS)
 PIN_URL_FORM = "https://raw.githubusercontent.com/lukacf/meerkat-meta/<tag>/tools/continuity-export/<script>"
 PIN_URL = re.compile(
     r"https://raw\.githubusercontent\.com/lukacf/meerkat-meta/"
     r"(?P<tag>v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)"
-    r"/tools/continuity-export/(?P<script>continuity_export\.py|continuity-export\.mjs)"
+    rf"/tools/continuity-export/(?P<script>{_PINNED_SCRIPT})"
 )
-PIN_LINE = re.compile(
-    r"[ \t]*(?P<digest>[0-9a-f]{64})  (?P<script>continuity_export\.py|continuity-export\.mjs)[ \t]*"
-)
+PIN_LINE = re.compile(rf"[ \t]*(?P<digest>[0-9a-f]{{64}})  (?P<script>{_PINNED_SCRIPT})[ \t]*")
 URL_TOKEN = re.compile(r"[a-z]+://[^\s`'\"<>()\[\]]+")
 # A run of exactly 64 hex digits (a 40-digit commit id is not a digest).
 HEX_RUN = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])")
@@ -1570,7 +1582,7 @@ def read_pins(label: str, text: str, errors: list[str], first_line: int = 1) -> 
 
 
 def check_document(label: str, pins: Pins, errors: list[str]) -> None:
-    """A document that pins either script pins both, at one tag, with one
+    """A document that pins any script pins them all, at one tag, with one
     digest each."""
     if not pins:
         return
@@ -1673,14 +1685,17 @@ def guide_text(value: str) -> str:
     return " ".join(value.split()).rstrip(".").lower()
 
 
-def pin_block(tag: str, py: str = "a" * 64, mjs: str = "b" * 64) -> str:
+def pin_block(tag: str, py: str = "a" * 64, mjs: str = "b" * 64,
+              provider_py: str = "e" * 64, provider_mjs: str = "f" * 64) -> str:
     base = f"https://raw.githubusercontent.com/lukacf/meerkat-meta/{tag}/tools/continuity-export"
-    return (f"{base}/continuity_export.py\n{base}/continuity-export.mjs\n"
-            f"{py}  continuity_export.py\n{mjs}  continuity-export.mjs\n")
+    digests = (py, mjs, provider_py, provider_mjs)
+    return ("".join(f"{base}/{script}\n" for script in PINNED_SCRIPTS)
+            + "".join(f"{digest}  {script}\n" for digest, script in zip(digests, PINNED_SCRIPTS)))
 
 
 class PublishedPinTests(unittest.TestCase):
-    DIGESTS = {"continuity_export.py": "a" * 64, "continuity-export.mjs": "b" * 64}
+    DIGESTS = {"continuity_export.py": "a" * 64, "continuity-export.mjs": "b" * 64,
+               "jsonl_provider.py": "e" * 64, "jsonl-provider.mjs": "f" * 64}
 
     def test_the_changelog_and_the_docs_pin_the_scripts_as_they_are(self):
         digests = {script: hashlib.sha256((HERE / script).read_bytes()).hexdigest()
@@ -1759,6 +1774,10 @@ class PublishedPinTests(unittest.TestCase):
             "one script only": (f"{url}continuity_export.py\n{'a' * 64}  continuity_export.py\n",
                                 ["no pin URL for continuity-export.mjs",
                                  "0 SHA-256 pins for continuity-export.mjs"]),
+            "the scripts without the providers": (
+                f"{url}continuity_export.py\n{url}continuity-export.mjs\n"
+                f"{'a' * 64}  continuity_export.py\n{'b' * 64}  continuity-export.mjs\n",
+                ["no pin URL for jsonl_provider.py", "0 SHA-256 pins for jsonl-provider.mjs"]),
             "two tags": (pin_block("v0.9.4").replace("v0.9.4/tools/continuity-export/continuity-export.mjs",
                                                      "v0.9.5/tools/continuity-export/continuity-export.mjs"),
                          ["the pin URLs name 2 tags"]),
@@ -1792,6 +1811,254 @@ class PublishedPinTests(unittest.TestCase):
             sorted(int(match["code"]) for match in GUIDE_EXIT_ROW.finditer(guide)),
             [0, ce.EXIT_REFUSED, ce.EXIT_USAGE, ce.EXIT_PROVIDER, ce.EXIT_INVALID_FILE],
         )
+
+
+# ---------------------------------------------------------------------------
+# The JSON Lines provider (jsonl_provider.py)
+# ---------------------------------------------------------------------------
+
+JSONL_RECORDS_HEADER = "identity, agent_runtime_id, session_id, generation, checkpoint_version"
+
+
+def jsonl(rows: list[Any]) -> str:
+    return "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+
+
+def record_row(identity: str, runtime: str, session_id: str, generation: Any, checkpoint: Any) -> dict[str, Any]:
+    return {
+        "identity": identity,
+        "agent_runtime_id": runtime,
+        "session_id": session_id,
+        "generation": generation,
+        "checkpoint_version": checkpoint,
+    }
+
+
+def session_row(session_id: str, document: bytes) -> dict[str, str]:
+    return {"session_id": session_id, "data": base64.b64encode(document).decode()}
+
+
+def golden_record_rows() -> list[dict[str, Any]]:
+    """golden_store()'s records as a host's tables give them: a session id
+    spelled in upper case, and integers some SQL tools write as strings."""
+    return [
+        record_row("agent:alpha", "rt-alpha", SESSION_ALPHA.upper(), "2", 7),
+        record_row(IDENTITY_SMILE, "rt-smile", SESSION_SMILE, 0, "1"),
+    ]
+
+
+def golden_session_rows() -> list[dict[str, str]]:
+    """golden_store()'s snapshots, in two more spellings, and one session no
+    record names."""
+    return [
+        session_row("{" + SESSION_ALPHA + "}", DOC_ALPHA),
+        session_row(SESSION_SMILE.replace("-", ""), DOC_SMILE),
+        session_row(SESSION_OTHER, b"not the current session of any identity"),
+    ]
+
+
+def capture_rows(capture: str) -> tuple[list[str], list[dict[str, Any]], list[dict[str, str]], bytes]:
+    """A released 0.9.3 remote-continuity capture's export, taken apart into
+    the identities, records and sessions a host's tables would give."""
+    exported = gzip.decompress((H_REMOTE / f"{capture}-export.jsonl.gz").read_bytes())
+    identities: list[str] = []
+    records: list[dict[str, Any]] = []
+    sessions: list[dict[str, str]] = []
+    for line in entry_lines(exported):
+        entry = json.loads(line)
+        identities.append(entry["identity"])
+        if entry["state"] == "ready":
+            records.append(entry["record"])
+            sessions.append({"session_id": entry["record"]["session_id"], "data": entry["document"]["base64"]})
+    return identities, records, sessions, exported
+
+
+# Input errors both providers report the same way: (records lines, sessions
+# lines, the file the error names, the message after "<path> line ").
+# continuity-export.test.mjs holds the same table.
+RECORD_OK = '{"identity":"agent:a","agent_runtime_id":"rt","session_id":"' + SESSION_ALPHA + '","generation":0,"checkpoint_version":1}'
+SESSION_OK = '{"session_id":"' + SESSION_ALPHA + '","data":"aGk="}'
+JSONL_INPUT_ERRORS = [
+    ("not JSON", ["{"], [SESSION_OK], "records", "1: the line is not JSON: "),
+    ("not an object", ["[1]"], [SESSION_OK], "records", "1: the line is not a JSON object"),
+    ("a non-JSON number", ['{"identity":"agent:a","agent_runtime_id":"rt","session_id":"' + SESSION_ALPHA
+                           + '","generation":NaN,"checkpoint_version":1}'], [SESSION_OK], "records",
+     "1: the line is not JSON: "),
+    ("a repeated key", ['{"identity":"agent:a","identity":"agent:b","agent_runtime_id":"rt","session_id":"'
+                        + SESSION_ALPHA + '","generation":0,"checkpoint_version":1}'], [SESSION_OK], "records",
+     '1: key "identity" is repeated'),
+    ("a missing key", ['{"identity":"agent:a","agent_runtime_id":"rt","session_id":"' + SESSION_ALPHA
+                       + '","generation":0}'], [SESSION_OK], "records",
+     f"1: the object must have exactly the keys {JSONL_RECORDS_HEADER} (missing checkpoint_version)"),
+    ("unexpected keys", [RECORD_OK[:-1] + ',"zeta":1,"deleted":false}'], [SESSION_OK], "records",
+     f'1: the object must have exactly the keys {JSONL_RECORDS_HEADER} (unexpected "deleted", "zeta")'),
+    ("an identity that is not a string", [RECORD_OK.replace('"agent:a"', "5")], [SESSION_OK], "records",
+     "1: identity is not a string"),
+    ("a repeated identity", [RECORD_OK, "", RECORD_OK], [SESSION_OK], "records",
+     '3: identity "agent:a" is repeated (first on line 1)'),
+    ("a session id it cannot read", [RECORD_OK], ['{"session_id":"nope","data":"aGk="}'], "sessions",
+     '1: session_id "nope" is not a session id'),
+    ("a repeated session", [RECORD_OK], [SESSION_OK, SESSION_OK.replace(SESSION_ALPHA, SESSION_ALPHA.upper())],
+     "sessions", f"2: session {SESSION_ALPHA} is repeated (first on line 1)"),
+    ("base64 with a line break", [RECORD_OK], [SESSION_OK.replace("aGk=", "aGk=\\naGk=")], "sessions",
+     "1: data is not standard base64 with padding and without line breaks"),
+    ("base64 without padding", [RECORD_OK], [SESSION_OK.replace("aGk=", "aGk")], "sessions",
+     "1: data is not standard base64 with padding and without line breaks"),
+    ("the URL-safe alphabet", [RECORD_OK], [SESSION_OK.replace("aGk=", "-_8=")], "sessions",
+     "1: data is not standard base64 with padding and without line breaks"),
+    ("data that is not a string", [RECORD_OK], [SESSION_OK.replace('"aGk="', "7")], "sessions",
+     "1: data is not standard base64 with padding and without line breaks"),
+]
+
+
+class JsonlProviderTests(TempDirTestCase):
+    def write(self, name: str, text: str | bytes) -> Path:
+        path = self.tmp / name
+        path.write_bytes(text if isinstance(text, bytes) else text.encode("utf-8"))
+        return path
+
+    def provider(self, records: str | bytes, sessions: str | bytes) -> Any:
+        return jp.JsonlContinuityProvider(self.write("records.jsonl", records), self.write("sessions.jsonl", sessions))
+
+    async def test_writes_the_golden_file_from_a_hosts_rows(self):
+        # A byte order mark, a blank line and a whitespace line are skipped.
+        provider = self.provider(
+            jsonl(golden_record_rows()),
+            "\ufeff" + jsonl(golden_session_rows()) + "\n \t\r\n",
+        )
+        target = self.tmp / "export.jsonl"
+        export = await ce.export_continuity(provider, GOLDEN_IDENTITIES, target)
+        self.assertEqual(target.read_bytes(), (FIXTURES / "written_by_python.jsonl").read_bytes())
+        self.assert_golden_entries(export)
+
+    async def test_rebuilds_the_released_remote_captures_byte_for_byte(self):
+        # storage_migrate_native_census.rs imports these exact files (for
+        # example a_remote_export_imports_into_a_new_directory), so a host's
+        # rows exported through this provider are what the migration verb
+        # admits.
+        for capture in ("memory", "durable"):
+            with self.subTest(capture=capture):
+                identities, records, sessions, exported = capture_rows(capture)
+                self.assertEqual(len(records), 4)
+                provider = self.provider(jsonl(records), jsonl(sessions))
+                target = self.tmp / f"{capture}.jsonl"
+                await ce.export_continuity(provider, identities, target)
+                self.assertEqual(target.read_bytes(), exported)
+
+    def test_the_command_line_takes_the_provider_from_the_environment(self):
+        records = self.write("records.jsonl", jsonl(golden_record_rows()))
+        sessions = self.write("sessions.jsonl", jsonl(golden_session_rows()))
+        target = self.tmp / "export.jsonl"
+        identities = [arg for identity in GOLDEN_IDENTITIES for arg in ("--identity", identity)]
+        env = {**os.environ, jp.RECORDS_ENV: str(records), jp.SESSIONS_ENV: str(sessions)}
+        # The provider is importable from the script's directory, wherever the
+        # export runs.
+        run = subprocess.run(
+            [sys.executable, str(SCRIPT), "--provider", "jsonl_provider:from_env", *identities,
+             "--output", str(target)],
+            cwd=self.tmp, env=env, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(target.read_bytes(), (FIXTURES / "written_by_python.jsonl").read_bytes())
+
+        del env[jp.SESSIONS_ENV]
+        run = subprocess.run(
+            [sys.executable, str(SCRIPT), "--provider", "jsonl_provider:from_env", *identities,
+             "--output", str(self.tmp / "other.jsonl")],
+            cwd=self.tmp, env=env, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(run.returncode, ce.EXIT_PROVIDER)
+        self.assertIn(f"{jp.SESSIONS_ENV} is not set", run.stderr)
+        self.assertFalse((self.tmp / "other.jsonl").exists())
+
+    async def test_an_identity_the_list_misses_is_refused_as_unlisted(self):
+        provider = self.provider(jsonl(golden_record_rows()), jsonl(golden_session_rows()))
+        refused = await self.refused(provider, ["agent:alpha"])
+        self.assertEqual([(row.row_class, row.identity) for row in refused.refusals],
+                         [(ce.UNLISTED, IDENTITY_SMILE)])
+
+    async def test_a_listed_identity_without_a_record_is_uninitialized(self):
+        provider = self.provider(jsonl(golden_record_rows()), jsonl(golden_session_rows()))
+        target = self.tmp / "export.jsonl"
+        export = await ce.export_continuity(provider, [*GOLDEN_IDENTITIES, "agent:gamma"], target)
+        self.assertEqual({entry.identity: entry.state for entry in export.entries}["agent:gamma"], "uninitialized")
+
+    async def test_a_missing_snapshot_follows_the_exports_policy(self):
+        records = jsonl([record_row("agent:a", "rt", SESSION_RENAMED, 0, 1)])
+        provider = self.provider(records, jsonl(golden_session_rows()))
+        refused = await self.refused(provider, ["agent:a"])
+        self.assertEqual([(row.row_class, row.identity) for row in refused.refusals],
+                         [(ce.RUNTIME_MISSING, "agent:a")])
+        target = self.tmp / "fresh.jsonl"
+        export = await ce.export_continuity(provider, ["agent:a"], target, missing_snapshot="fresh")
+        self.assertEqual([(entry.identity, entry.state) for entry in export.entries], [("agent:a", "uninitialized")])
+
+    async def test_other_values_reach_the_export_as_the_file_holds_them(self):
+        # The export checks values by the 0.9.3 gateway's rules: a string that
+        # is not plain decimal digits, a float and a negative number are
+        # refused as Unreadable; the largest u64 is a valid record.
+        for generation in ("007", 1.5, -1, "1e3", True):
+            with self.subTest(generation=generation):
+                provider = self.provider(jsonl([record_row("agent:a", "rt", SESSION_ALPHA, generation, 1)]),
+                                         jsonl([session_row(SESSION_ALPHA, b"doc")]))
+                refused = await self.refused(provider, ["agent:a"])
+                self.assertEqual([row.row_class for row in refused.refusals], [ce.UNREADABLE])
+        largest = 2**64 - 1
+        provider = self.provider(jsonl([record_row("agent:a", "rt", SESSION_ALPHA, str(largest), largest)]),
+                                 jsonl([session_row(SESSION_ALPHA, b"doc")]))
+        export = await ce.export_continuity(provider, ["agent:a"], self.tmp / "export.jsonl")
+        self.assertEqual((export.entries[0].record.generation, export.entries[0].record.checkpoint_version),
+                         (largest, largest))
+
+    def test_resolve_record_by_session_answers_from_the_records_file(self):
+        provider = self.provider(
+            jsonl([*golden_record_rows(), record_row("agent:b", "rt-b", SESSION_OTHER, 0, 0),
+                   record_row("agent:c", "rt-c", SESSION_OTHER.upper(), 0, 0)]),
+            jsonl(golden_session_rows()),
+        )
+        record, fencing_token, checkpoint_version = provider.resolve_record_by_session(SESSION_ALPHA)
+        self.assertEqual(record, record_row("agent:alpha", "rt-alpha", SESSION_ALPHA.upper(), 2, 7))
+        self.assertEqual((fencing_token, checkpoint_version), (None, 7))
+        # A session no record names, or two records name, has no single record.
+        self.assertIsNone(provider.resolve_record_by_session(SESSION_RENAMED))
+        self.assertIsNone(provider.resolve_record_by_session(SESSION_OTHER))
+
+    def test_reads_a_snapshot_only_when_the_export_asks(self):
+        sessions = self.write("sessions.jsonl", jsonl(golden_session_rows()))
+        provider = jp.JsonlContinuityProvider(self.write("records.jsonl", jsonl(golden_record_rows())), sessions)
+        self.assertEqual(provider.load_session_snapshot(SESSION_SMILE),
+                         {"data": base64.b64encode(DOC_SMILE).decode()})
+        self.assertIsNone(provider.load_session_snapshot(SESSION_RENAMED))
+        # The provider keeps where each line starts, so a file rewritten after
+        # it opened is caught rather than read as another session.
+        sessions.write_text(jsonl([session_row(SESSION_RENAMED, DOC_ALPHA), *golden_session_rows()]), encoding="utf-8")
+        with self.assertRaises(jp.JsonlProviderInputError) as caught:
+            provider.load_session_snapshot(SESSION_ALPHA)
+        self.assertEqual(str(caught.exception), f"{sessions} line 1: the file changed after the provider opened it")
+
+    def test_input_errors_name_the_file_and_the_line(self):
+        for name, records, sessions, which, message in JSONL_INPUT_ERRORS:
+            with self.subTest(name):
+                records_path = self.write("records.jsonl", "".join(line + "\n" for line in records))
+                sessions_path = self.write("sessions.jsonl", "".join(line + "\n" for line in sessions))
+                with self.assertRaises(jp.JsonlProviderInputError) as caught:
+                    jp.JsonlContinuityProvider(records_path, sessions_path)
+                path = records_path if which == "records" else sessions_path
+                self.assertTrue(str(caught.exception).startswith(f"{path} line {message}"), str(caught.exception))
+        records_path = self.write("records.jsonl", b"\xff\n")
+        with self.assertRaises(jp.JsonlProviderInputError) as caught:
+            jp.JsonlContinuityProvider(records_path, self.write("sessions.jsonl", SESSION_OK + "\n"))
+        self.assertEqual(str(caught.exception), f"{records_path} line 1: the line is not valid UTF-8")
+
+    def test_from_env_names_a_missing_variable(self):
+        for missing in (jp.RECORDS_ENV, jp.SESSIONS_ENV):
+            with self.subTest(missing=missing):
+                env = {jp.RECORDS_ENV: "records.jsonl", jp.SESSIONS_ENV: "sessions.jsonl"}
+                del env[missing]
+                with mock.patch.dict(os.environ, env, clear=True):
+                    with self.assertRaises(jp.JsonlProviderInputError) as caught:
+                        jp.from_env()
+                self.assertTrue(str(caught.exception).startswith(f"{missing} is not set"))
 
 
 if __name__ == "__main__":

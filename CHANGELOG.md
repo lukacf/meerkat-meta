@@ -659,16 +659,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   empty transcript, and lists each with its 0.9.3 record. The file holds one
   entry per line under a header that counts, measures and hashes them, and
   both scripts write and read it one entry at a time. `--verify` checks an
-  export file. Both scripts ship in the `v0.9.4` tag:
-  download them from there and check their SHA-256 digests before running
-  either (`sha256sum --check`, or `shasum -a 256 --check` on macOS, reads the
-  two digest lines below). `docs/guides/continuity-export.mdx` has the steps.
+  export file. Beside them, `jsonl_provider.py` and `jsonl-provider.mjs` are
+  a provider over two JSON Lines files, one of continuity records and one of
+  session snapshots, for a host whose 0.9.3 records and snapshots sit in its
+  own tables: the export reads them through it (`--provider
+  jsonl_provider:from_env`, or `./jsonl-provider.mjs#fromEnv` with Node.js)
+  instead of a provider the host writes. Like every export, it carries only
+  each identity's current session. The scripts and the providers ship in the
+  `v0.9.4` tag: download them from there and check their SHA-256 digests
+  before running any of them (`sha256sum --check`, or `shasum -a 256 --check`
+  on macOS, reads the four digest lines below).
+  `docs/guides/continuity-export.mdx` has the steps.
 
   ```text
   https://raw.githubusercontent.com/lukacf/meerkat-meta/v0.9.4/tools/continuity-export/continuity_export.py
   https://raw.githubusercontent.com/lukacf/meerkat-meta/v0.9.4/tools/continuity-export/continuity-export.mjs
+  https://raw.githubusercontent.com/lukacf/meerkat-meta/v0.9.4/tools/continuity-export/jsonl_provider.py
+  https://raw.githubusercontent.com/lukacf/meerkat-meta/v0.9.4/tools/continuity-export/jsonl-provider.mjs
   36ffe2f8da8e0e68a85b31b7045197a37cec9ba19fe9f9223872cf266457ae80  continuity_export.py
   228771596cf78882d112bb574befc5a7c79913b755317dda00a7342235c7831e  continuity-export.mjs
+  e6313295da8d492cf830b69f296096c2be25801f468371b6d914e2e0a116f9e2  jsonl_provider.py
+  019f097c7e5107ccfaffa36cc1a1699ccebdfa1bd404f02563689a10ca34a4f5  jsonl-provider.mjs
   ```
 - `GatewayHostComposition::operation_refusal_observer` lets a gateway host
   install Core's operation refusal observer on each gateway member factory.

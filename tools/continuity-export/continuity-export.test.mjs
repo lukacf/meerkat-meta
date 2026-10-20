@@ -5,6 +5,9 @@
 // to the gateway unchanged, snapshots carry `data: Uint8Array`, and
 // resolveRecordBySession answers with a camelCase record.
 //
+// The "jsonl provider" cases run test_continuity_export.py's JsonlProviderTests
+// against jsonl-provider.mjs.
+//
 // Run: node --test tools/continuity-export/continuity-export.test.mjs
 // Rewrite this script's golden file: META_WRITE_CONTINUITY_EXPORT_FIXTURE=1 node --test ...
 
@@ -17,7 +20,9 @@ import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 import * as ce from "./continuity-export.mjs";
+import * as jp from "./jsonl-provider.mjs";
 
 const SCRIPT = fileURLToPath(new URL("./continuity-export.mjs", import.meta.url));
 const FIXTURES = fileURLToPath(
@@ -1612,5 +1617,377 @@ describe("continuity export command line", () => {
       assert.equal(result.status, ce.EXIT_INVALID_FILE);
       assert.match(result.stderr, /refused/);
     });
+  });
+});
+
+// -- The JSON Lines provider (jsonl-provider.mjs) -------------------------------
+//
+// The same cases as JsonlProviderTests in test_continuity_export.py, against
+// jsonl-provider.mjs.
+
+const PROVIDER = fileURLToPath(new URL("./jsonl-provider.mjs", import.meta.url));
+const H_REMOTE = fileURLToPath(
+  new URL("../../crates/meerkat-meta/tests/fixtures/released_0_9_3_h_remote/", import.meta.url),
+);
+const JSONL_RECORDS_HEADER = "identity, agent_runtime_id, session_id, generation, checkpoint_version";
+
+const jsonl = (rows) => rows.map((row) => `${JSON.stringify(row)}\n`).join("");
+const sessionRow = (sessionId, document) => ({ session_id: sessionId, data: Buffer.from(document).toString("base64") });
+
+/**
+ * goldenStore()'s records as a host's tables give them: a session id spelled in
+ * upper case, and integers some SQL tools write as strings.
+ */
+function goldenRecordRows() {
+  return [
+    wireRecord("agent:alpha", "rt-alpha", SESSION_ALPHA.toUpperCase(), "2", 7),
+    wireRecord(IDENTITY_SMILE, "rt-smile", SESSION_SMILE, 0, "1"),
+  ];
+}
+
+/** goldenStore()'s snapshots, in two more spellings, and one session no record names. */
+function goldenSessionRows() {
+  return [
+    sessionRow(`{${SESSION_ALPHA}}`, DOC_ALPHA),
+    sessionRow(SESSION_SMILE.replaceAll("-", ""), DOC_SMILE),
+    sessionRow(SESSION_OTHER, encode("not the current session of any identity")),
+  ];
+}
+
+/** A released 0.9.3 remote-continuity capture's export, taken apart into rows. */
+async function captureRows(capture) {
+  const exported = gunzipSync(await readFile(join(H_REMOTE, `${capture}-export.jsonl.gz`)));
+  const identities = [];
+  const records = [];
+  const sessions = [];
+  for (const line of entryLines(exported)) {
+    const entry = JSON.parse(line);
+    identities.push(entry.identity);
+    if (entry.state === "ready") {
+      records.push(entry.record);
+      sessions.push({ session_id: entry.record.session_id, data: entry.document.base64 });
+    }
+  }
+  return { identities, records, sessions, exported };
+}
+
+// Input errors both providers report the same way: [name, records lines,
+// sessions lines, the file the error names, the message after "<path> line "].
+// test_continuity_export.py holds the same table.
+const RECORD_OK = `{"identity":"agent:a","agent_runtime_id":"rt","session_id":"${SESSION_ALPHA}","generation":0,"checkpoint_version":1}`;
+const SESSION_OK = `{"session_id":"${SESSION_ALPHA}","data":"aGk="}`;
+const JSONL_INPUT_ERRORS = [
+  ["not JSON", ["{"], [SESSION_OK], "records", "1: the line is not JSON: "],
+  ["not an object", ["[1]"], [SESSION_OK], "records", "1: the line is not a JSON object"],
+  [
+    "a non-JSON number",
+    [`{"identity":"agent:a","agent_runtime_id":"rt","session_id":"${SESSION_ALPHA}","generation":NaN,"checkpoint_version":1}`],
+    [SESSION_OK],
+    "records",
+    "1: the line is not JSON: ",
+  ],
+  [
+    "a repeated key",
+    [`{"identity":"agent:a","identity":"agent:b","agent_runtime_id":"rt","session_id":"${SESSION_ALPHA}","generation":0,"checkpoint_version":1}`],
+    [SESSION_OK],
+    "records",
+    '1: key "identity" is repeated',
+  ],
+  [
+    "a missing key",
+    [`{"identity":"agent:a","agent_runtime_id":"rt","session_id":"${SESSION_ALPHA}","generation":0}`],
+    [SESSION_OK],
+    "records",
+    `1: the object must have exactly the keys ${JSONL_RECORDS_HEADER} (missing checkpoint_version)`,
+  ],
+  [
+    "unexpected keys",
+    [`${RECORD_OK.slice(0, -1)},"zeta":1,"deleted":false}`],
+    [SESSION_OK],
+    "records",
+    `1: the object must have exactly the keys ${JSONL_RECORDS_HEADER} (unexpected "deleted", "zeta")`,
+  ],
+  ["an identity that is not a string", [RECORD_OK.replace('"agent:a"', "5")], [SESSION_OK], "records", "1: identity is not a string"],
+  ["a repeated identity", [RECORD_OK, "", RECORD_OK], [SESSION_OK], "records", '3: identity "agent:a" is repeated (first on line 1)'],
+  ["a session id it cannot read", [RECORD_OK], ['{"session_id":"nope","data":"aGk="}'], "sessions", '1: session_id "nope" is not a session id'],
+  [
+    "a repeated session",
+    [RECORD_OK],
+    [SESSION_OK, SESSION_OK.replace(SESSION_ALPHA, SESSION_ALPHA.toUpperCase())],
+    "sessions",
+    `2: session ${SESSION_ALPHA} is repeated (first on line 1)`,
+  ],
+  [
+    "base64 with a line break",
+    [RECORD_OK],
+    [SESSION_OK.replace("aGk=", "aGk=\\naGk=")],
+    "sessions",
+    "1: data is not standard base64 with padding and without line breaks",
+  ],
+  [
+    "base64 without padding",
+    [RECORD_OK],
+    [SESSION_OK.replace("aGk=", "aGk")],
+    "sessions",
+    "1: data is not standard base64 with padding and without line breaks",
+  ],
+  [
+    "the URL-safe alphabet",
+    [RECORD_OK],
+    [SESSION_OK.replace("aGk=", "-_8=")],
+    "sessions",
+    "1: data is not standard base64 with padding and without line breaks",
+  ],
+  [
+    "data that is not a string",
+    [RECORD_OK],
+    [SESSION_OK.replace('"aGk="', "7")],
+    "sessions",
+    "1: data is not standard base64 with padding and without line breaks",
+  ],
+];
+
+async function jsonlProvider(directory, records, sessions) {
+  const recordsPath = join(directory, "records.jsonl");
+  const sessionsPath = join(directory, "sessions.jsonl");
+  await writeFile(recordsPath, records);
+  await writeFile(sessionsPath, sessions);
+  return new jp.JsonlContinuityProvider(recordsPath, sessionsPath);
+}
+
+function inputError(run) {
+  try {
+    run();
+  } catch (error) {
+    assert.ok(error instanceof jp.JsonlProviderInputError, `expected an input error, got ${String(error)}`);
+    return error.message;
+  }
+  assert.fail("expected an input error");
+}
+
+function runWithProvider(directory, env, ...args) {
+  const childEnv = { ...process.env, ...env };
+  delete childEnv.FORCE_COLOR;
+  delete childEnv.NO_COLOR;
+  for (const [name, value] of Object.entries(env)) if (value === undefined) delete childEnv[name];
+  return spawnSync(process.execPath, [SCRIPT, ...args], { cwd: directory, encoding: "utf8", timeout: 60_000, env: childEnv });
+}
+
+describe("jsonl provider", () => {
+  it("writes the golden file from a host's rows", async () => {
+    await withTempDir(async (directory) => {
+      // A byte order mark, a blank line and a whitespace line are skipped.
+      const provider = await jsonlProvider(directory, jsonl(goldenRecordRows()), `\ufeff${jsonl(goldenSessionRows())}\n \t\r\n`);
+      const target = join(directory, "export.jsonl");
+      const exported = await ce.exportContinuity(provider, GOLDEN_IDENTITIES, target);
+      assert.deepEqual(await readFile(target), await readFile(join(FIXTURES, "written_by_node.jsonl")));
+      assertGoldenEntries(exported);
+    });
+  });
+
+  it("rebuilds the released remote captures' entries byte for byte", async () => {
+    // storage_migrate_native_census.rs imports these exact files (for example
+    // a_remote_export_imports_into_a_new_directory). The Python script wrote
+    // them, so only the header's writer differs.
+    for (const capture of ["memory", "durable"]) {
+      await withTempDir(async (directory) => {
+        const { identities, records, sessions, exported } = await captureRows(capture);
+        assert.equal(records.length, 4);
+        const provider = await jsonlProvider(directory, jsonl(records), jsonl(sessions));
+        const target = join(directory, `${capture}.jsonl`);
+        await ce.exportContinuity(provider, identities, target);
+        const [header, entries] = splitFile(await readFile(target));
+        const [capturedHeader, capturedEntries] = splitFile(exported);
+        assert.deepEqual({ ...header, writer: "python" }, capturedHeader);
+        assert.equal(header.writer, "node");
+        assert.deepEqual(entries, capturedEntries);
+      });
+    }
+  });
+
+  it("the command line takes the provider from the environment", async () => {
+    await withTempDir(async (directory) => {
+      await writeFile(join(directory, "records.jsonl"), jsonl(goldenRecordRows()));
+      await writeFile(join(directory, "sessions.jsonl"), jsonl(goldenSessionRows()));
+      const identities = GOLDEN_IDENTITIES.flatMap((identity) => ["--identity", identity]);
+      const env = {
+        [jp.RECORDS_ENV]: join(directory, "records.jsonl"),
+        [jp.SESSIONS_ENV]: join(directory, "sessions.jsonl"),
+      };
+      const result = runWithProvider(directory, env, "--provider", `${PROVIDER}#fromEnv`, ...identities, "--output", "export.jsonl");
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(await readFile(join(directory, "export.jsonl")), await readFile(join(FIXTURES, "written_by_node.jsonl")));
+
+      const missing = runWithProvider(
+        directory,
+        { ...env, [jp.SESSIONS_ENV]: undefined },
+        "--provider",
+        `${PROVIDER}#fromEnv`,
+        ...identities,
+        "--output",
+        "other.jsonl",
+      );
+      assert.equal(missing.status, ce.EXIT_PROVIDER);
+      assert.match(missing.stderr, new RegExp(`${jp.SESSIONS_ENV} is not set`));
+      assert.equal(await exists(join(directory, "other.jsonl")), false);
+    });
+  });
+
+  it("refuses an identity the list misses as Unlisted", async () => {
+    await withTempDir(async (directory) => {
+      const provider = await jsonlProvider(directory, jsonl(goldenRecordRows()), jsonl(goldenSessionRows()));
+      const error = await refused((target) => ce.exportContinuity(provider, ["agent:alpha"], target), directory);
+      assert.deepEqual(rows(error), [`${IDENTITY_SMILE}|${ce.UNLISTED}`]);
+    });
+  });
+
+  it("exports a listed identity without a record as uninitialized", async () => {
+    await withTempDir(async (directory) => {
+      const provider = await jsonlProvider(directory, jsonl(goldenRecordRows()), jsonl(goldenSessionRows()));
+      const exported = await ce.exportContinuity(provider, [...GOLDEN_IDENTITIES, "agent:gamma"], join(directory, "export.jsonl"));
+      assert.equal(exported.entries.find((entry) => entry.identity === "agent:gamma").state, "uninitialized");
+    });
+  });
+
+  it("leaves a missing snapshot to the export's policy", async () => {
+    await withTempDir(async (directory) => {
+      const provider = await jsonlProvider(
+        directory,
+        jsonl([wireRecord("agent:a", "rt", SESSION_RENAMED, 0, 1)]),
+        jsonl(goldenSessionRows()),
+      );
+      const error = await refused((target) => ce.exportContinuity(provider, ["agent:a"], target), directory);
+      assert.deepEqual(rows(error), [`agent:a|${ce.RUNTIME_MISSING}`]);
+      const exported = await ce.exportContinuity(provider, ["agent:a"], join(directory, "fresh.jsonl"), { missingSnapshot: "fresh" });
+      assert.deepEqual(exported.entries.map((entry) => [entry.identity, entry.state]), [["agent:a", "uninitialized"]]);
+    });
+  });
+
+  it("hands other values to the export as the file holds them", async () => {
+    // The export refuses each of these as Unreadable. JSON.parse reads 1.0 as
+    // 1, so a float literal is handed on as its text.
+    for (const generation of ["007", 1.5, -1, "1e3", true, "__1.0__"]) {
+      await withTempDir(async (directory) => {
+        const record = JSON.stringify(wireRecord("agent:a", "rt", SESSION_ALPHA, 0, 1)).replace(
+          '"generation":0',
+          `"generation":${generation === "__1.0__" ? "1.0" : JSON.stringify(generation)}`,
+        );
+        const provider = await jsonlProvider(directory, `${record}\n`, jsonl([sessionRow(SESSION_ALPHA, encode("doc"))]));
+        const error = await refused((target) => ce.exportContinuity(provider, ["agent:a"], target), directory);
+        assert.deepEqual(rows(error), [`agent:a|${ce.UNREADABLE}`], String(generation));
+      });
+    }
+    await withTempDir(async (directory) => {
+      const largest = Number.MAX_SAFE_INTEGER;
+      const provider = await jsonlProvider(
+        directory,
+        jsonl([wireRecord("agent:a", "rt", SESSION_ALPHA, String(largest), largest)]),
+        jsonl([sessionRow(SESSION_ALPHA, encode("doc"))]),
+      );
+      const exported = await ce.exportContinuity(provider, ["agent:a"], join(directory, "export.jsonl"));
+      assert.deepEqual([exported.entries[0].record.generation, exported.entries[0].record.checkpointVersion], [largest, largest]);
+    });
+  });
+
+  it("refuses an integer above 2^53 - 1 and names the Python scripts", async () => {
+    for (const [generation, text] of [['"9007199254740992"', "9007199254740992"], ["18446744073709551615", "18446744073709551615"]]) {
+      await withTempDir(async (directory) => {
+        const record = RECORD_OK.replace('"generation":0', `"generation":${generation}`);
+        await writeFile(join(directory, "records.jsonl"), `${record}\n`);
+        await writeFile(join(directory, "sessions.jsonl"), `${SESSION_OK}\n`);
+        const message = inputError(
+          () => new jp.JsonlContinuityProvider(join(directory, "records.jsonl"), join(directory, "sessions.jsonl")),
+        );
+        assert.equal(
+          message,
+          `${join(directory, "records.jsonl")} line 1: generation ${text} is above 2^53 - 1, the largest integer ` +
+            "this script holds exactly; export with the Python scripts",
+        );
+      });
+    }
+  });
+
+  it("answers resolveRecordBySession from the records file", async () => {
+    await withTempDir(async (directory) => {
+      const provider = await jsonlProvider(
+        directory,
+        jsonl([
+          ...goldenRecordRows(),
+          wireRecord("agent:b", "rt-b", SESSION_OTHER, 0, 0),
+          wireRecord("agent:c", "rt-c", SESSION_OTHER.toUpperCase(), 0, 0),
+        ]),
+        jsonl(goldenSessionRows()),
+      );
+      assert.deepEqual(provider.resolveRecordBySession(SESSION_ALPHA), {
+        record: {
+          identity: "agent:alpha",
+          agentRuntimeId: "rt-alpha",
+          sessionId: SESSION_ALPHA.toUpperCase(),
+          generation: 2,
+          checkpointVersion: 7,
+        },
+        fencingToken: null,
+        checkpointVersion: 7,
+      });
+      // A session no record names, or two records name, has no single record.
+      assert.equal(provider.resolveRecordBySession(SESSION_RENAMED), null);
+      assert.equal(provider.resolveRecordBySession(SESSION_OTHER), null);
+    });
+  });
+
+  it("reads a snapshot only when the export asks", async () => {
+    await withTempDir(async (directory) => {
+      const provider = await jsonlProvider(directory, jsonl(goldenRecordRows()), jsonl(goldenSessionRows()));
+      assert.deepEqual(new Uint8Array(provider.loadSessionSnapshot(SESSION_SMILE).data), DOC_SMILE);
+      assert.equal(provider.loadSessionSnapshot(SESSION_RENAMED), null);
+      // The provider keeps where each line starts, so a file rewritten after it
+      // opened is caught rather than read as another session.
+      const sessionsPath = join(directory, "sessions.jsonl");
+      await writeFile(sessionsPath, jsonl([sessionRow(SESSION_RENAMED, DOC_ALPHA), ...goldenSessionRows()]));
+      assert.equal(
+        inputError(() => provider.loadSessionSnapshot(SESSION_ALPHA)),
+        `${sessionsPath} line 1: the file changed after the provider opened it`,
+      );
+    });
+  });
+
+  it("names the file and the line of an input error", async () => {
+    for (const [name, records, sessions, which, message] of JSONL_INPUT_ERRORS) {
+      await withTempDir(async (directory) => {
+        const recordsPath = join(directory, "records.jsonl");
+        const sessionsPath = join(directory, "sessions.jsonl");
+        await writeFile(recordsPath, records.map((line) => `${line}\n`).join(""));
+        await writeFile(sessionsPath, sessions.map((line) => `${line}\n`).join(""));
+        const error = inputError(() => new jp.JsonlContinuityProvider(recordsPath, sessionsPath));
+        const path = which === "records" ? recordsPath : sessionsPath;
+        assert.ok(error.startsWith(`${path} line ${message}`), `${name}: ${error}`);
+      });
+    }
+    await withTempDir(async (directory) => {
+      const recordsPath = join(directory, "records.jsonl");
+      await writeFile(recordsPath, Buffer.from([0xff, 0x0a]));
+      await writeFile(join(directory, "sessions.jsonl"), `${SESSION_OK}\n`);
+      assert.equal(
+        inputError(() => new jp.JsonlContinuityProvider(recordsPath, join(directory, "sessions.jsonl"))),
+        `${recordsPath} line 1: the line is not valid UTF-8`,
+      );
+    });
+  });
+
+  it("fromEnv names a missing variable", () => {
+    for (const missing of [jp.RECORDS_ENV, jp.SESSIONS_ENV]) {
+      const saved = { [jp.RECORDS_ENV]: process.env[jp.RECORDS_ENV], [jp.SESSIONS_ENV]: process.env[jp.SESSIONS_ENV] };
+      try {
+        process.env[jp.RECORDS_ENV] = "records.jsonl";
+        process.env[jp.SESSIONS_ENV] = "sessions.jsonl";
+        delete process.env[missing];
+        assert.ok(inputError(() => jp.fromEnv()).startsWith(`${missing} is not set`));
+      } finally {
+        for (const [name, value] of Object.entries(saved)) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
+    }
   });
 });
