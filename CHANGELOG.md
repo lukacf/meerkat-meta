@@ -1207,6 +1207,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Polling an unchanged console roster no longer changes the shared access
+  facts. For each identity that is both a listed agent and a roster member,
+  every console request recorded the agent's attributes (without labels) and
+  then the member's, so it changed the cached attributes twice and published
+  two access changes although nothing had changed. Any observation made under
+  the joined authorization publication in between stopped checking current,
+  and an operation bound to it was refused as changed. A request now records
+  each identity's final attributes once, the member's taking precedence over
+  the agent entry as before. A real change of a member's labels, role or
+  agent id still publishes.
+
 - A console voice open made while another live open on the same gateway was
   still being set up answered `voice_host_failed` ("Voice host operation
   failed"), as if the host were broken. Meerkat admits live opens one at a

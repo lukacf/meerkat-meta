@@ -417,6 +417,92 @@ fn identity_first_console_identity_drives_filtering() {
 }
 
 #[test]
+fn unchanged_experience_preserves_publication_but_changed_member_attributes_invalidate() {
+    use meerkat_authorization::publication::{LocalAuthorizationPublication, PublicationError};
+
+    let controller = AccessController::new(ops_access_config()).expect("controller");
+    let publication = LocalAuthorizationPublication::new();
+    controller
+        .join_authorization_publication(publication.clone())
+        .expect("join publication");
+    let unrelated = AgentResourceAttributes {
+        identity: "another-runtime/worker".to_string(),
+        agent_id: Some("unrelated-member".to_string()),
+        role: Some("worker".to_string()),
+        labels: BTreeMap::from([("org".to_string(), "other".to_string())]),
+    };
+    controller.record_agent_attributes(unrelated.clone());
+    let identity = "namespace/identity:ops-lead";
+    let mut snapshot = snapshot_with_members(vec![
+        member("old-runtime", "old-role", &[("agent_identity", identity)]),
+        member(
+            "member-runtime-7",
+            "lead",
+            &[("agent_identity", identity), ("org", "payments")],
+        ),
+    ]);
+    snapshot.agents.push(
+        serde_json::from_value(json!({
+            "agent_id": "member-runtime-7", "member_id": "member-runtime-7",
+            "label": "Lead", "kind": "meerkat", "identity": identity,
+            "role": "agent-projection-role"
+        }))
+        .expect("overlapping agent"),
+    );
+    snapshot.agents.push(
+        serde_json::from_value(json!({
+            "agent_id": "agent-only", "member_id": "agent-only",
+            "label": "Agent only", "kind": "meerkat", "role": "scout"
+        }))
+        .expect("agent-only projection"),
+    );
+
+    experience_for(&controller, "root@example.test", &snapshot);
+    let (_, stamp) = publication.observe(|| ()).expect("primed publication");
+    // Recording the exact expected values must be a no-op. This checks the
+    // final member's alias/role/labels, the agent-only row and unrelated cache.
+    let mut expected = AgentResourceAttributes {
+        identity: identity.to_string(),
+        agent_id: Some("member-runtime-7".to_string()),
+        role: Some("lead".to_string()),
+        labels: snapshot.members[1].labels.clone(),
+    };
+    controller.record_agent_attributes(expected.clone());
+    controller.record_agent_attributes(AgentResourceAttributes {
+        identity: "agent-only".to_string(),
+        agent_id: Some("agent-only".to_string()),
+        role: Some("scout".to_string()),
+        labels: BTreeMap::new(),
+    });
+    controller.record_agent_attributes(unrelated);
+    assert!(stamp.check_current().is_ok(), "final attributes changed");
+
+    experience_for(&controller, "root@example.test", &snapshot);
+    assert!(
+        stamp.check_current().is_ok(),
+        "unchanged experience published"
+    );
+
+    snapshot.members[1]
+        .labels
+        .insert("org".to_string(), "people".to_string());
+    snapshot.members[1].role = "reviewer".to_string();
+    experience_for(&controller, "root@example.test", &snapshot);
+    assert!(matches!(
+        stamp.check_current(),
+        Err(PublicationError::Changed)
+    ));
+    let (_, changed) = publication.observe(|| ()).expect("changed publication");
+    expected.labels = snapshot.members[1].labels.clone();
+    expected.role = Some("reviewer".to_string());
+    controller.record_agent_attributes(expected);
+    assert!(
+        changed.check_current().is_ok(),
+        "changed attributes were not retained"
+    );
+}
+
+#[test]
 fn disabled_controller_changes_nothing() {
     let controller = AccessController::disabled();
     let snapshot = snapshot_with_members(vec![

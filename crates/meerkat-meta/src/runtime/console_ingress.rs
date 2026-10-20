@@ -445,26 +445,41 @@ fn apply_memory_to_experience(
 /// label/role selectors resolve on surfaces that only carry an identity
 /// string (timeline frames, send requests, SSE streams).
 fn prime_access_attributes(controller: &AccessController, snapshot: &ConsoleLiveSnapshot) {
+    // Fold the snapshot to one final attribute set per identity, then record
+    // each once. Members carry the richer attribute set, so a member's entry
+    // replaces the agent entry of the same identity. Recording the agent
+    // entry first would change the cached attributes, and publish, twice on
+    // every poll of an unchanged roster.
+    let mut attributes = std::collections::BTreeMap::new();
     for agent in &snapshot.agents {
         let identity = agent
             .identity
             .clone()
             .unwrap_or_else(|| agent.agent_id.clone());
-        controller.record_agent_attributes(AgentResourceAttributes {
-            identity,
-            agent_id: Some(agent.agent_id.clone()),
-            role: agent.role.clone(),
-            labels: std::collections::BTreeMap::new(),
-        });
+        attributes.insert(
+            identity.clone(),
+            AgentResourceAttributes {
+                identity,
+                agent_id: Some(agent.agent_id.clone()),
+                role: agent.role.clone(),
+                labels: std::collections::BTreeMap::new(),
+            },
+        );
     }
-    // Members carry the richer attribute set; record them last so they win.
     for member in &snapshot.members {
-        controller.record_agent_attributes(AgentResourceAttributes {
-            identity: console_member_console_identity(member).to_string(),
-            agent_id: Some(member.agent_identity.clone()),
-            role: Some(member.role.clone()),
-            labels: member.labels.clone(),
-        });
+        let identity = console_member_console_identity(member).to_string();
+        attributes.insert(
+            identity.clone(),
+            AgentResourceAttributes {
+                identity,
+                agent_id: Some(member.agent_identity.clone()),
+                role: Some(member.role.clone()),
+                labels: member.labels.clone(),
+            },
+        );
+    }
+    for attributes in attributes.into_values() {
+        controller.record_agent_attributes(attributes);
     }
 }
 
@@ -2050,5 +2065,130 @@ fn auth_error_reason(error: &DecisionPolicyError) -> &'static str {
         DecisionPolicyError::InvalidServiceIdentity => "invalid_service_identity",
         DecisionPolicyError::ServiceIdentityNotAllowlisted => "service_identity_not_allowlisted",
         _ => "policy_denied",
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod access_priming_tests {
+    use super::*;
+    use crate::access::{ACTION_AGENT_VIEW, AccessControlConfig, AccessEffect, AccessRule};
+    use meerkat_authorization::publication::LocalAuthorizationPublication;
+    use std::collections::BTreeMap;
+
+    fn agent(identity: &str, role: &str) -> ConsoleAgentLiveSnapshot {
+        ConsoleAgentLiveSnapshot {
+            agent_id: identity.to_string(),
+            member_id: identity.to_string(),
+            label: identity.to_string(),
+            kind: "member".to_string(),
+            identity: Some(identity.to_string()),
+            role: Some(role.to_string()),
+            state: None,
+            session_id: None,
+            model_capabilities: ConsoleModelCapabilities::default(),
+            response_phase: None,
+            watched: None,
+            alert_level: None,
+            degraded: None,
+            degraded_reason: None,
+        }
+    }
+
+    fn member(identity: &str, role: &str, tier: &str) -> ConsoleMember {
+        ConsoleMember {
+            agent_identity: identity.to_string(),
+            role: role.to_string(),
+            state: "active".to_string(),
+            model_capabilities: ConsoleModelCapabilities::default(),
+            runtime_mode: None,
+            session_id: None,
+            wired_to: Vec::new(),
+            labels: BTreeMap::from([
+                ("agent_identity".to_string(), identity.to_string()),
+                ("profile_name".to_string(), role.to_string()),
+                ("tier".to_string(), tier.to_string()),
+            ]),
+            progress: None,
+        }
+    }
+
+    /// A roster that names an identity both as an agent and as a member
+    /// changes no access fact however often the console polls it unchanged:
+    /// the member's richer attributes are what is recorded, an agent-only
+    /// identity keeps its own, and a changed member label publishes once.
+    #[test]
+    fn repeated_polls_of_an_unchanged_snapshot_publish_no_access_change() {
+        let controller = AccessController::new(AccessControlConfig {
+            enabled: true,
+            admins: vec!["root@example.test".to_string()],
+            rules: vec![
+                AccessRule {
+                    id: "everyone-views".to_string(),
+                    actions: vec![ACTION_AGENT_VIEW.to_string()],
+                    agents: vec!["*".to_string()],
+                    ..AccessRule::default()
+                },
+                AccessRule {
+                    id: "deny-secret".to_string(),
+                    effect: AccessEffect::Deny,
+                    actions: vec![ACTION_AGENT_VIEW.to_string()],
+                    match_labels: BTreeMap::from([("tier".to_string(), "secret".to_string())]),
+                    ..AccessRule::default()
+                },
+            ],
+            ..AccessControlConfig::default()
+        })
+        .expect("controller");
+        let publication = LocalAuthorizationPublication::new();
+        controller
+            .join_authorization_publication(publication.clone())
+            .expect("first join");
+        let mut snapshot = ConsoleLiveSnapshot {
+            runtime_id: None,
+            running: Some(true),
+            loaded_modules: Vec::new(),
+            agents: vec![agent("scout", "worker"), agent("solo", "worker")],
+            members: vec![member("scout", "worker", "public")],
+            has_mob_runtime: true,
+            unobserved: None,
+        };
+        // The first poll records the roster.
+        prime_access_attributes(&controller, &snapshot);
+        let quiet = publication.observe(|| ()).expect("quiet publication").1;
+        for _ in 0..3 {
+            prime_access_attributes(&controller, &snapshot);
+        }
+        assert!(
+            quiet.check_current().is_ok(),
+            "an unchanged snapshot publishes no access change"
+        );
+        let view = controller.view_for_subject(None);
+        assert!(
+            view.knows_agent("solo"),
+            "an agent-only identity keeps its attributes"
+        );
+        assert!(view.allows_agent(ACTION_AGENT_VIEW, "scout"));
+
+        snapshot.members[0]
+            .labels
+            .insert("tier".to_string(), "secret".to_string());
+        prime_access_attributes(&controller, &snapshot);
+        assert!(
+            quiet.check_current().is_err(),
+            "a changed member label publishes"
+        );
+        let changed = publication.observe(|| ()).expect("quiet publication").1;
+        prime_access_attributes(&controller, &snapshot);
+        assert!(
+            changed.check_current().is_ok(),
+            "the next poll of the changed snapshot publishes nothing"
+        );
+        assert!(
+            !controller
+                .view_for_subject(None)
+                .allows_agent(ACTION_AGENT_VIEW, "scout"),
+            "the member's richer attributes stay recorded"
+        );
     }
 }
