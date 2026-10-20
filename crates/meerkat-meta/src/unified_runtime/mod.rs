@@ -648,6 +648,61 @@ fn held_setup_prelude(
     })
 }
 
+/// No lift is staged when the mob resumed Running (an unclean stop left its
+/// log Running): meerkat's own resume revived the persisted members while the
+/// mob was built, before any activation step, so the publication that
+/// precedes a lift never runs. The mob build's early publication ran before
+/// the mob handle existed, and meerkat holds the run starts of each restored
+/// member it could not publish for. Publish the `owed` members' tools now, as
+/// before a lift and with the identity runtime's services, and release the
+/// holds of those that publish; the others stay held until their wake or
+/// delivery publishes.
+async fn publish_customizer_tools_after_resume(
+    context: &crate::identity_first::IdentityFirstRuntimeContext,
+    owed: &[crate::identity_first::DurableAgentSpec],
+) {
+    if owed.is_empty() {
+        return;
+    }
+    context
+        .runtime
+        .ensure_customizer_tool_dispatchers(owed)
+        .await;
+    let release_owed = context
+        .runtime
+        .prepublish_customizer_tools(owed, context.customizer.as_deref())
+        .await;
+    context
+        .runtime
+        .release_customizer_tool_holds(&release_owed)
+        .await;
+}
+
+/// [`publish_customizer_tools_after_resume`] as a held bootstrap's prelude,
+/// run in its tracked operation like [`held_setup_prelude`]: it starts no
+/// publication once the setup's terminal decision is `Abort`.
+fn held_resume_prelude(
+    context: Arc<crate::identity_first::IdentityFirstRuntimeContext>,
+    owed: Vec<crate::identity_first::DurableAgentSpec>,
+    observer: Option<UnifiedRuntimeBootstrapPhaseObserver>,
+    terminal: Arc<crate::identity_first::held_bootstrap::HeldTerminal>,
+) -> crate::identity_first::held_bootstrap::HeldSetupPrelude {
+    Box::pin(async move {
+        if terminal.is_aborted() {
+            return Err(
+                crate::identity_first::IdentityRuntimeError::HeldBootstrapRefused(
+                    terminal.abort_refusal(),
+                ),
+            );
+        }
+        publish_customizer_tools_after_resume(&context, &owed).await;
+        if let Some(observer) = observer.as_ref() {
+            observer(UnifiedRuntimeBootstrapPhase::RestoreRoster);
+        }
+        Ok(())
+    })
+}
+
 impl std::ops::Deref for UnifiedRuntime {
     type Target = UnifiedRuntimeCore;
 
@@ -1595,11 +1650,27 @@ impl UnifiedRuntime {
         let pending = self.pending_mob_activation.get_mut().take();
         let reconcile_after_materialization =
             pending.is_some() && !context.bootstrap_mode().is_lazy();
+        // The mob resumed Running: no lift, but the restored members still
+        // owe their customizer tools.
+        let owed = if pending.is_none() {
+            context
+                .runtime
+                .roster_owing_customizer_tools_after_resume(roster)
+                .await
+        } else {
+            Vec::new()
+        };
         let prelude = match pending {
             Some(pending) => Some(held_setup_prelude(
                 pending,
                 Arc::clone(&context),
                 roster.to_vec(),
+                self.bootstrap_phase_observer.get().cloned(),
+                Arc::clone(&terminal),
+            )),
+            None if !owed.is_empty() => Some(held_resume_prelude(
+                Arc::clone(&context),
+                owed,
                 self.bootstrap_phase_observer.get().cloned(),
                 Arc::clone(&terminal),
             )),
@@ -1705,6 +1776,12 @@ impl UnifiedRuntime {
             if !reconcile_after_materialization {
                 self.reconcile_bootstrap_edges_if_configured().await;
             }
+        } else {
+            let owed = context
+                .runtime
+                .roster_owing_customizer_tools_after_resume(roster)
+                .await;
+            publish_customizer_tools_after_resume(&context, &owed).await;
         }
         self.report_bootstrap_phase(UnifiedRuntimeBootstrapPhase::RestoreRoster);
         match context.bootstrap_roster(roster).await {

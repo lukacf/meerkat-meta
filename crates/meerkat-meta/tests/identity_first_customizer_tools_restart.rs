@@ -142,6 +142,32 @@ impl AgentCustomizer for ToolCustomizer {
     }
 }
 
+/// A host customizer that declares [`TOOL`] only when its build context
+/// carries the mob handle, as a host whose tools act on the mob does.
+#[derive(Default)]
+struct HandleToolCustomizer {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl AgentCustomizer for HandleToolCustomizer {
+    async fn customize_build(
+        &self,
+        context: &AgentBuildContext,
+        _spec: &DurableAgentSpec,
+        draft: &mut AgentBuildDraft,
+    ) -> Result<(), CustomizerError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if context.runtime_services.mob_handle().is_none() {
+            return Err(CustomizerError::Io(
+                "mob handle missing for the host's tools".to_string(),
+            ));
+        }
+        draft.local_external_tools = LocalExternalToolOverlay::new(Arc::new(HostTools));
+        Ok(())
+    }
+}
+
 #[derive(Clone, Default)]
 struct CaptureClient {
     requests: Arc<std::sync::Mutex<Vec<String>>>,
@@ -197,7 +223,7 @@ async fn boot(
     mob_id: &str,
     state: &Path,
     capture: CaptureClient,
-    customizer: Arc<ToolCustomizer>,
+    customizer: Arc<dyn AgentCustomizer>,
     mode: IdentityBootstrapMode,
 ) -> meerkat_meta::UnifiedRuntime {
     Box::pin(
@@ -468,5 +494,107 @@ async fn a_publication_before_the_lift_releases_the_hold_the_mob_build_staged() 
         .expect("send boot-2 turn");
     wait_for_turn(&capture, 1, "boot 2's first turn").await;
     assert!(capture.last().expect("captured request").contains(TOOL));
+    runtime.shutdown().await;
+}
+
+/// Set in the child process of
+/// [`a_member_restored_after_an_unclean_stop_lists_its_customizer_tools_before_the_first_turn`]:
+/// the state directory its first boot runs in.
+const UNCLEAN_STOP_CHILD_STATE: &str = "META_CUSTOMIZER_TOOLS_UNCLEAN_STOP_CHILD_STATE";
+
+/// After an unclean stop (a kill: no Stop is recorded, so the mob log stays
+/// Running) meerkat's own resume revives the member while the mob is built,
+/// and no lift is staged. The mob build's early publication runs before the
+/// mob handle exists, so a customizer whose tools need it fails there and the
+/// member is held; the bootstrap must still publish its tools, with the
+/// runtime's services (which carry the handle), and release the hold, as it
+/// does after a clean stop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_restored_after_an_unclean_stop_lists_its_customizer_tools_before_the_first_turn()
+{
+    const MOB_ID: &str = "customizer-tools-restart-d";
+    if let Some(state) = std::env::var_os(UNCLEAN_STOP_CHILD_STATE) {
+        // The child: the first boot, a turn, then an exit without shutdown.
+        let capture = CaptureClient::default();
+        let runtime = boot(
+            MOB_ID,
+            Path::new(&state),
+            capture.clone(),
+            Arc::new(ToolCustomizer::default()),
+            IdentityBootstrapMode::EagerMaterialize,
+        )
+        .await;
+        runtime
+            .identity_runtime()
+            .expect("identity runtime")
+            .send(
+                &id(MEMBER),
+                &meerkat_core::ContentInput::Text("hello".to_string()),
+            )
+            .await
+            .expect("send boot-1 turn");
+        wait_for_turn(&capture, 1, "boot 1's turn").await;
+        sleep(Duration::from_millis(500)).await;
+        std::process::exit(0);
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "a_member_restored_after_an_unclean_stop_lists_its_customizer_tools_before_the_first_turn",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(UNCLEAN_STOP_CHILD_STATE, &state)
+        .status()
+        .expect("run the first boot in a child process");
+    assert!(child.success(), "the child's first boot failed: {child}");
+
+    let capture = CaptureClient::default();
+    let customizer = Arc::new(HandleToolCustomizer::default());
+    let runtime = boot(
+        MOB_ID,
+        &state,
+        capture.clone(),
+        customizer.clone(),
+        IdentityBootstrapMode::LazyMaterialize,
+    )
+    .await;
+    let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+    // Before any turn: the tools are published and the hold is released, so
+    // a run Core starts on its own (a restored queued input, a keep-alive
+    // turn, a peer message) is not held and carries them.
+    let status = identity_runtime.status(&id(MEMBER)).await.expect("status");
+    assert!(
+        status.customizer_tools_pending.is_none(),
+        "the restored member's customizer tools are published before any turn: {status:?}"
+    );
+    assert_eq!(
+        member_run_starts_held(&runtime).await,
+        Some(false),
+        "the hold the mob build staged is released after the unclean stop too"
+    );
+    assert_eq!(
+        customizer.calls.load(Ordering::SeqCst),
+        2,
+        "the mob build's early publication (no handle yet) and the bootstrap's"
+    );
+    assert_eq!(capture.count(), 0, "no turn has run yet");
+
+    identity_runtime
+        .send(
+            &id(MEMBER),
+            &meerkat_core::ContentInput::Text("after the unclean stop".to_string()),
+        )
+        .await
+        .expect("send boot-2 turn");
+    wait_for_turn(&capture, 1, "boot 2's first turn").await;
+    assert!(capture.last().expect("captured request").contains(TOOL));
+    // The member was built by meerkat's resume before the publication; its
+    // tool scope snapshot is taken at a turn boundary, so it lists the tools
+    // once the member has run.
+    assert!(resolved_tools(&runtime).await.contains(&TOOL.to_string()));
     runtime.shutdown().await;
 }

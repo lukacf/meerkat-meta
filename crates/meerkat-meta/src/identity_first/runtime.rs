@@ -4746,6 +4746,39 @@ impl IdentityRuntime {
         release_owed
     }
 
+    /// The roster entries whose customizer tools a bootstrap with no lift
+    /// staged still owes: the mob resumed Running (an unclean stop left its
+    /// log Running), so meerkat's own resume revived its persisted members
+    /// while the mob was built, before any activation step. Each entry is
+    /// still pending (the mob build's early publication failed, so meerkat
+    /// holds its member's run starts) or names a member Core already holds
+    /// live. A freshly created mob holds none: its members are created by the
+    /// roster pass, which publishes their tools itself.
+    pub(crate) async fn roster_owing_customizer_tools_after_resume(
+        &self,
+        roster: &[DurableAgentSpec],
+    ) -> Vec<DurableAgentSpec> {
+        let history = match self.bridge.as_ref() {
+            Some(bridge) => bridge.member_binding_history().await.ok(),
+            None => None,
+        };
+        let pending = self
+            .customizer_tools_pending
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        roster
+            .iter()
+            .filter(|spec| {
+                pending.contains(&spec.identity)
+                    || CoreViewFacts::of(history.as_ref(), &spec.identity).live
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Release the run-start hold of each identity whose customizer tools
     /// were published before the lift although the mob build's earlier
     /// publication had failed (see [`Self::prepublish_customizer_tools`]).
