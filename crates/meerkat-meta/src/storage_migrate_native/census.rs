@@ -2511,7 +2511,9 @@ mod tests {
             Some(gateway.path().join(EVENT_LOG_DB_FILE_NAME))
         );
     }
-    use crate::storage_migrate_native::relation::tests::commit_test_compaction;
+    use crate::storage_migrate_native::relation::tests::{
+        commit_test_compaction, compacted_over_a_tool_result_image,
+    };
 
     fn message(text: &str) -> meerkat_core::Message {
         meerkat_core::Message::User(meerkat_core::types::UserMessage::text(text))
@@ -2959,6 +2961,26 @@ mod tests {
             &session,
         );
         assert_eq!(class, SessionCensusClass::Equal, "{detail}");
+    }
+
+    /// A history compacted after a tool returned an image inline, as 0.9.3
+    /// wrote such a body: the image sits inline in the tool result rows of
+    /// the compaction's delta. The census moves the images to the blob store
+    /// the way `--apply` does, through Core's pure transform, and admits the
+    /// session with the class its copies prove.
+    #[test]
+    fn a_compaction_over_an_inline_tool_result_image_is_admitted() {
+        let session = compacted_over_a_tool_result_image("iVBORw0KGgo=");
+        let (class, detail) = layout_checked(
+            SessionCensusClass::Equal,
+            "the copies agree".to_owned(),
+            &session,
+        );
+        assert_eq!(class, SessionCensusClass::Equal, "{detail}");
+        assert!(
+            detail.contains("1 inline image moves to the blob store"),
+            "{detail}"
+        );
     }
 
     /// A session only the projection holds, re-anchored past its oldest
