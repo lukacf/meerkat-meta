@@ -1642,44 +1642,81 @@ impl UnifiedRuntimeBuilder {
         // attaches - their decorators read the slot per call).
         let dispatch_taint_slot = mob_spec.dispatch_taint_slot();
         let live_plan = self.live_plan(&mut mob_spec)?;
+        // Resolve one roster for this boot before preparing the mob. A dirty
+        // Running log can restore members and commit recovered runtime tails
+        // inside prepare, before the identity runtime itself is constructed.
+        let identity_roster_specs = if wants_identity_first {
+            let provider = self.roster_provider.as_ref().ok_or_else(|| {
+                UnifiedRuntimeBuilderError::Bootstrap(UnifiedRuntimeBootstrapError::IdentityFirst(
+                    "identity-first validation requires roster_provider".to_string(),
+                ))
+            })?;
+            Some(
+                provider
+                    .roster(&RosterContext {
+                        mob_definition: Some(mob_spec.definition.clone()),
+                        previous_identities: Vec::new(),
+                    })
+                    .await
+                    .map_err(|error| {
+                        UnifiedRuntimeBuilderError::Bootstrap(
+                            UnifiedRuntimeBootstrapError::IdentityFirst(format!(
+                                "roster provider failed before mob preparation: {error}"
+                            )),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        if let (Some(store), Some(adapter), Some(roster)) = (
+            self.continuity_store.as_ref(),
+            continuity_session_store.as_ref(),
+            identity_roster_specs.as_ref(),
+        ) {
+            // Publish into the SAME adapter that backs the session service.
+            // Registration after prepare cannot authorize earlier recovery
+            // writes. Resolve every authoritative fact before publishing any;
+            // uncertainty must refuse this boot before recovery can mutate it.
+            let states = IdentityRuntime::resolve_persisted_owner_states(store, roster)
+                .await
+                .map_err(|error| {
+                    UnifiedRuntimeBuilderError::Bootstrap(
+                        UnifiedRuntimeBootstrapError::IdentityFirst(format!(
+                            "resolve persisted owners before mob preparation: {error}"
+                        )),
+                    )
+                })?;
+            IdentityRuntime::publish_persisted_owner_states(adapter, &states)
+                .await
+                .map_err(|error| {
+                    UnifiedRuntimeBuilderError::Bootstrap(
+                        UnifiedRuntimeBootstrapError::IdentityFirst(format!(
+                            "publish persisted owners before mob preparation: {error}"
+                        )),
+                    )
+                })?;
+        }
         // A persistent mob can be restored while `bootstrap` builds it (a log
         // that was left Running revives every member inside meerkat's own
         // resume), before any identity activation step. Publish each roster
         // identity's customizer tools first, so those builds carry them (#563).
         let early_customizer_tools_pending = match (
             customizer_tool_registry.as_ref(),
-            self.roster_provider.as_ref(),
+            identity_roster_specs.as_ref(),
             agent_customizer.as_ref(),
             storage_layout.as_ref(),
         ) {
-            (Some(registry), Some(roster_provider), Some(customizer), Some(_)) => {
-                match roster_provider
-                    .roster(&RosterContext {
-                        mob_definition: Some(mob_spec.definition.clone()),
-                        previous_identities: Vec::new(),
-                    })
-                    .await
-                {
-                    Ok(roster) => {
-                        crate::identity_first::customizer_tools::prepublish(
-                            registry,
-                            &roster,
-                            customizer.as_ref(),
-                            AgentRuntimeServices::empty(),
-                            &[],
-                            &[],
-                        )
-                        .await
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "roster provider failed before the mob build; customizer tools are \
-                             published by each identity's materialization instead"
-                        );
-                        BTreeMap::new()
-                    }
-                }
+            (Some(registry), Some(roster), Some(customizer), Some(_)) => {
+                crate::identity_first::customizer_tools::prepublish(
+                    registry,
+                    roster,
+                    customizer.as_ref(),
+                    AgentRuntimeServices::empty(),
+                    &[],
+                    &[],
+                )
+                .await
             }
             _ => BTreeMap::new(),
         };
@@ -1874,19 +1911,11 @@ impl UnifiedRuntimeBuilder {
             ));
             identity_runtime.set_topology_controller(topology_controller.clone());
 
-            let roster_specs = roster_provider
-                .roster(&RosterContext {
-                    mob_definition: Some(runtime.mob_runtime.handle().definition().clone()),
-                    previous_identities: Vec::new(),
-                })
-                .await
-                .map_err(|err| {
-                    UnifiedRuntimeBuilderError::Bootstrap(
-                        UnifiedRuntimeBootstrapError::IdentityFirst(format!(
-                            "roster provider failed: {err}"
-                        )),
-                    )
-                })?;
+            let roster_specs = identity_roster_specs.ok_or_else(|| {
+                UnifiedRuntimeBuilderError::Bootstrap(UnifiedRuntimeBootstrapError::IdentityFirst(
+                    "identity roster was not resolved before mob preparation".to_string(),
+                ))
+            })?;
 
             let identity_context = Arc::new(IdentityFirstRuntimeContext::new_with_bootstrap_mode(
                 identity_runtime,
