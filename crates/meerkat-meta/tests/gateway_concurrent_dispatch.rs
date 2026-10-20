@@ -1225,10 +1225,10 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
     );
     let session_id = session_id_of_alpha(&mut gateway, "status0");
 
-    // Declarations are keyed on the STABLE durable identity. The runtime id is
-    // read only to prove it CHANGES across the process boundary: it is a
-    // per-binding incarnation, so durable state keyed on it could not survive a
-    // restart. That is the whole point of the contract under test.
+    // Declarations are keyed on the STABLE durable identity, not on the
+    // runtime id: that is a per-binding incarnation, and the apply below moves
+    // the identity to a new one. The runtime id is read only to prove that the
+    // restart itself keeps the incarnation the apply left.
     let rpc_result = |gateway: &mut Gateway, id: &str, method: &str, params: Value| -> Value {
         gateway.send(json!({
             "jsonrpc": "2.0",
@@ -1253,12 +1253,6 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
             .unwrap_or_else(|| panic!("{ALIAS} must have a runtime id: {status}"))
             .to_string()
     };
-    let phase1_runtime = runtime_identity(&rpc_result(
-        &mut gateway,
-        "status1",
-        "meta/status_identity",
-        json!({ "identity": ALIAS }),
-    ));
     // Adoption must state the EXACT existing baseline. `meta/status_identity`
     // does not project runtime_mode, so read it from the member surface, which
     // does, rather than guessing a default that would be rejected as a change.
@@ -1377,6 +1371,13 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         json!(2),
         "apply must land revision 2: {apply:#?}"
     );
+    // The applied declaration changes the member's tool categories, so Core
+    // replaces the member to converge it: it retires the member and spawns its
+    // successor at the next generation, on the same session. Await that before
+    // the restart, so the comparison after it sees the restart alone; a stop
+    // in the middle of the replacement would leave its respawn to the next
+    // process.
+    let phase1_runtime = runtime_identity(&await_identity_converged(&mut gateway, ALIAS));
 
     gateway.send(json!({
         "jsonrpc": "2.0",
@@ -1424,11 +1425,11 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
     // expires (`IDENTITY_LEASE_TTL` after its last renewal) and Core's
     // reconciler converges it. Await that rather than read it at once.
     //
-    // A plain restart RESUMES the same incarnation: the generation is minted
-    // per identity by Meerkat and is preserved across process replacement, so
-    // this is the same runtime id, not a new one. Asserted rather than assumed,
-    // because the incarnation-change property is exercised by the respawn
-    // below and this pins down which of the two is which.
+    // A plain restart RESUMES the incarnation the converged apply left: the
+    // generation is minted per identity by Meerkat and is preserved across
+    // process replacement, so this is the same runtime id, not a new one.
+    // Asserted rather than assumed: a restart that rotated the binding would
+    // show here.
     let phase2_runtime = runtime_identity(&await_identity_converged(&mut gateway, ALIAS));
     assert_eq!(
         phase1_runtime, phase2_runtime,
@@ -1499,13 +1500,9 @@ fn adopted_and_applied_declaration_survives_a_real_process_restart() {
         "the adopted identity is host-managed after the restart: {status}"
     );
 
-    // NOTE for whoever extends this: the incarnation-change property (durable
-    // declaration state outliving a NEW generation) is NOT covered here. A
-    // restart resumes the same incarnation, as asserted above, so forcing a
-    // successor needs a respawn - and `meta/respawn_member` does not return
-    // within the wedge backstop in this callback-hosted fixture, so wiring it
-    // in would trade coverage for a 60-second hang. Covering it needs either a
-    // respawn-capable fixture or a separate lane.
+    // NOTE for whoever extends this: the applied declaration already outlives
+    // a NEW generation in phase 1, because Core converges it by replacing the
+    // member. A restart resumes the same incarnation, as asserted above.
 }
 
 // ---------------------------------------------------------------------------
