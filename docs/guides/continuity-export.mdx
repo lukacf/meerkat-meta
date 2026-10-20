@@ -276,7 +276,9 @@ shutdown. It never reads the copy at boot: the state directory stays the
 authority, and a turn never waits on the copy. `JsonlFileMirrorSink` writes
 `records.jsonl` and `sessions.jsonl`, in the shape the JSON Lines provider
 above reads, and `blobs.jsonl`; a host writes elsewhere by implementing
-`ContinuityMirrorSink`. To restore into a new, empty state directory:
+`ContinuityMirrorSink`. `BigQueryMirrorSink` writes the copy into BigQuery
+tables; its module documentation has the queries that read the three files
+back out of them. To restore into a new, empty state directory:
 
 ```bash
 CONTINUITY_EXPORT_RECORDS=mirror/records.jsonl CONTINUITY_EXPORT_SESSIONS=mirror/sessions.jsonl \

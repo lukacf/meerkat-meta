@@ -1,15 +1,33 @@
 //! A [`ContinuityMirrorSink`] that streams the mirror into BigQuery.
 //!
 //! BigQuery's streaming inserts only append. Each `put` tags its rows with
-//! one `snapshot_ms` and writes the changed sessions, then every record, and
-//! last one row into the snapshots table that names this `snapshot_ms` and
-//! the row counts. A `put` is complete once its snapshots row is in; the rows
-//! of a `put` that failed part way have none, so no reader takes them, and
-//! the mirror offers the changed sessions again. `snapshot_ms` is the wall
-//! clock in milliseconds, kept strictly above the previous `put`'s and, from
-//! the first `put` of a process on, above the newest snapshots row the table
-//! already holds, so a clock that stepped back across a restart still
-//! numbers new `put`s above the old ones.
+//! the update's `sequence` as `snapshot_ms` and writes the changed sessions,
+//! then every record, and last one row into the snapshots table that names
+//! this `snapshot_ms` and the row counts. A `put` is complete once its
+//! snapshots row is in; the rows of a `put` that failed part way have none,
+//! so no reader takes them, and the mirror offers the changed sessions
+//! again. The sink keeps `snapshot_ms` strictly above the previous `put`'s
+//! and, from the first `put` of a process on, above the newest snapshots row
+//! the table already holds: a wall clock that stepped back across a restart
+//! raises `snapshot_ms` above the update's `sequence` rather than numbering
+//! new `put`s below the old ones.
+//!
+//! Install the sink with
+//! [`crate::UnifiedRuntimeBuilder::continuity_mirror_with_timings`] and a
+//! `put_deadline` no shorter than the sink's own
+//! ([`BigQueryMirrorSink::DEFAULT_PUT_DEADLINE`] unless
+//! [`BigQueryMirrorSink::with_put_deadline`] sets another). The mirror's
+//! default deadline of one minute bounds every `put`, and the first `put`
+//! after a start writes every session, so size the deadline for streaming
+//! the whole state: about one `insertAll` request per 8 MiB of base64
+//! documents. Give each runtime its own table prefix: the `put`s of two
+//! runtimes on the same tables interleave, and a restore would mix their
+//! records. A sink that runs for longer than a Google access token lives
+//! (about an hour) needs an adapter with a token source
+//! ([`BigQuerySessionStoreAdapter::with_access_token_source`]): it caches the
+//! token until near its expiry and fetches a new one when BigQuery refuses
+//! it. An error on the access token reads "BigQuery access token refused or
+//! unavailable", and [`BigQueryMirrorSink::auth_failures`] counts them.
 //!
 //! A row carries at most 4 MiB of a session's base64 `data` (BigQuery refuses
 //! a streamed request over 10 MB), so a longer value goes out as several
@@ -50,12 +68,12 @@
 //! record row once a newer `put` is complete.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde_json::{Map, Value};
 
 use super::continuity_mirror::{ContinuityMirrorSink, ContinuityMirrorUpdate};
-use crate::runtime::BigQuerySessionStoreAdapter;
+use crate::runtime::{BigQuerySessionStoreAdapter, BigQuerySessionStoreError};
 
 /// BigQuery refuses an `insertAll` request over 10 MB, so the rows of one
 /// table go out in requests of at most this many bytes of row JSON.
@@ -80,12 +98,13 @@ pub struct BigQueryMirrorSink {
     /// Whether `last_snapshot_ms` has been raised to the newest snapshots
     /// row the table held when this process first put.
     snapshot_ms_seeded: tokio::sync::Mutex<bool>,
+    auth_failures: AtomicU64,
 }
 
 impl BigQueryMirrorSink {
-    /// How long one `put` may take unless
-    /// [`Self::with_put_deadline`] sets another bound.
-    pub const DEFAULT_PUT_DEADLINE: Duration = Duration::from_mins(5);
+    /// How long one `put` may take unless [`Self::with_put_deadline`] sets
+    /// another bound: the mirror's default put deadline too.
+    pub const DEFAULT_PUT_DEADLINE: Duration = Duration::from_mins(10);
 
     /// A sink over `adapter`'s project, dataset, credentials and endpoint,
     /// writing the tables named after `table_prefix`; the adapter's own
@@ -99,6 +118,7 @@ impl BigQueryMirrorSink {
             put_deadline: Self::DEFAULT_PUT_DEADLINE,
             last_snapshot_ms: AtomicU64::new(0),
             snapshot_ms_seeded: tokio::sync::Mutex::new(false),
+            auth_failures: AtomicU64::new(0),
         }
     }
 
@@ -109,17 +129,12 @@ impl BigQueryMirrorSink {
         self
     }
 
-    /// The wall clock in milliseconds, kept strictly above the previous
-    /// value so two `put`s never share an id.
-    fn next_snapshot_ms(&self) -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| {
-                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-            });
+    /// `at_least`, raised strictly above the previous value so two `put`s
+    /// never share an id.
+    fn next_snapshot_ms(&self, at_least: u64) -> u64 {
         let mut last = self.last_snapshot_ms.load(Ordering::Relaxed);
         loop {
-            let next = now.max(last.saturating_add(1));
+            let next = at_least.max(last.saturating_add(1));
             match self.last_snapshot_ms.compare_exchange_weak(
                 last,
                 next,
@@ -132,7 +147,21 @@ impl BigQueryMirrorSink {
         }
     }
 
-    fn table_error(table: &str, error: impl std::fmt::Debug) -> String {
+    /// How many requests failed on the access token: BigQuery refused it
+    /// (401) or the adapter's token source failed.
+    pub fn auth_failures(&self) -> u64 {
+        self.auth_failures.load(Ordering::Relaxed)
+    }
+
+    /// `error` of a request on `table`, worded so an access token failure
+    /// reads as one, and counted in [`Self::auth_failures`].
+    fn table_error(&self, table: &str, error: &BigQuerySessionStoreError) -> String {
+        if error.is_access_token_refusal() {
+            self.auth_failures.fetch_add(1, Ordering::Relaxed);
+            return format!(
+                "BigQuery access token refused or unavailable (table {table}): {error:?}"
+            );
+        }
         format!("BigQuery table {table}: {error:?}")
     }
 
@@ -141,7 +170,7 @@ impl BigQueryMirrorSink {
             self.adapter
                 .insert_json_rows(table, chunk)
                 .await
-                .map_err(|error| Self::table_error(table, error))?;
+                .map_err(|error| self.table_error(table, &error))?;
         }
         Ok(())
     }
@@ -152,13 +181,13 @@ impl BigQueryMirrorSink {
         self.adapter
             .query_first_column(query)
             .await
-            .map_err(|error| Self::table_error(table, error))
+            .map_err(|error| self.table_error(table, &error))
     }
 
     fn qualified(&self, table: &str) -> Result<String, String> {
         self.adapter
             .qualified_table_name(table)
-            .map_err(|error| Self::table_error(table, error))
+            .map_err(|error| self.table_error(table, &error))
     }
 
     /// Raise the snapshot clock to the newest snapshots row the table holds,
@@ -177,9 +206,9 @@ impl BigQueryMirrorSink {
             .await?;
         if let Some(newest) = newest.first() {
             let newest = newest.parse::<u64>().map_err(|error| {
-                Self::table_error(
-                    &self.snapshots_table,
-                    format!("snapshot_ms {newest}: {error}"),
+                format!(
+                    "BigQuery table {}: snapshot_ms {newest}: {error}",
+                    self.snapshots_table
                 )
             })?;
             self.last_snapshot_ms.fetch_max(newest, Ordering::Relaxed);
@@ -190,7 +219,7 @@ impl BigQueryMirrorSink {
 
     async fn put_within_deadline(&self, update: &ContinuityMirrorUpdate) -> Result<(), String> {
         self.seed_snapshot_ms().await?;
-        let snapshot_ms = self.next_snapshot_ms();
+        let snapshot_ms = self.next_snapshot_ms(update.sequence);
         let mut sessions = Vec::new();
         for session in &update.changed_sessions {
             let mut fields = Map::new();
@@ -384,14 +413,14 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_ids_strictly_increase() {
+    fn snapshot_ids_follow_the_sequence_and_strictly_increase() {
         let sink = BigQueryMirrorSink::new(
             BigQuerySessionStoreAdapter::new_native("dataset", "unused"),
             "continuity",
         );
-        let first = sink.next_snapshot_ms();
-        let second = sink.next_snapshot_ms();
-        let third = sink.next_snapshot_ms();
-        assert!(first < second && second < third);
+        assert_eq!(sink.next_snapshot_ms(100), 100);
+        assert_eq!(sink.next_snapshot_ms(250), 250);
+        assert_eq!(sink.next_snapshot_ms(250), 251);
+        assert_eq!(sink.next_snapshot_ms(7), 252);
     }
 }

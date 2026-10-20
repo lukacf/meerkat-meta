@@ -1211,6 +1211,7 @@ fn mirror_update() -> meerkat_meta::unified_runtime::continuity_mirror::Continui
         ContinuityMirrorRecord, ContinuityMirrorSession, ContinuityMirrorUpdate,
     };
     ContinuityMirrorUpdate {
+        sequence: MIRROR_SEQUENCE,
         records: vec![
             ContinuityMirrorRecord {
                 identity: "agent:alice".to_string(),
@@ -1248,6 +1249,9 @@ fn mirror_sink(
 }
 
 const MIRROR_QUERY_PATH: &str = "/bigquery/v2/projects/mirror-project/queries";
+
+/// The sequence of `mirror_update()`: 2026-10-20 in wall-clock milliseconds.
+const MIRROR_SEQUENCE: u64 = 1_792_454_400_000;
 
 fn mirror_table_path(name: &str) -> String {
     format!("/bigquery/v2/projects/mirror-project/datasets/mirror_dataset/tables/{name}/insertAll")
@@ -1324,11 +1328,7 @@ async fn continuity_mirror_bigquery_sink_writes_sessions_records_then_the_snapsh
     let records = mirror_request_rows(&requests[2]);
     let snapshot = mirror_request_rows(&requests[3]);
     let snapshot_ms = snapshot[0]["snapshot_ms"].clone();
-    assert!(
-        snapshot_ms
-            .as_str()
-            .is_some_and(|ms| ms.parse::<u64>().is_ok())
-    );
+    assert_eq!(snapshot_ms, json!(MIRROR_SEQUENCE.to_string()));
     assert_eq!(
         snapshot,
         vec![json!({
@@ -1374,12 +1374,13 @@ async fn continuity_mirror_bigquery_sink_writes_sessions_records_then_the_snapsh
     }));
 }
 
-/// A snapshots row the table already holds above the wall clock (a clock
-/// that stepped back across a restart) numbers the next `put` above it.
+/// A snapshots row the table already holds above the update's sequence (a
+/// wall clock that stepped back across a restart) numbers the next `put`
+/// above it.
 #[tokio::test]
 async fn continuity_mirror_bigquery_sink_numbers_puts_above_the_newest_snapshot_it_finds() {
     use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
-    let ahead = unix_ms() + 86_400_000;
+    let ahead = MIRROR_SEQUENCE + 86_400_000;
     let server = MockHttpServer::start(vec![
         MockHttpResponse::json(json!({
             "jobComplete": true,
@@ -1539,4 +1540,237 @@ async fn continuity_mirror_bigquery_sink_writes_only_records_when_no_session_cha
     let snapshot = mirror_request_rows(&requests[2]);
     assert_eq!(snapshot[0]["sessions"], json!(2));
     assert_eq!(snapshot[0]["changed_sessions"], json!(0));
+}
+
+/// A token source handing out `token-1`, `token-2`, ... in fetch order, each
+/// valid for `lifetime`, and the count of its fetches.
+fn mirror_counting_token_source(
+    lifetime: Duration,
+) -> (
+    meerkat_meta::BigQueryAccessTokenSource,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let fetches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&fetches);
+    let source = meerkat_meta::BigQueryAccessTokenSource::new(move || {
+        let fetch = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        async move {
+            Ok(meerkat_meta::BigQueryAccessToken {
+                token: format!("token-{fetch}"),
+                expires_at: Some(SystemTime::now() + lifetime),
+            })
+        }
+    });
+    (source, fetches)
+}
+
+fn mirror_sink_with_token_source(
+    server: &MockHttpServer,
+    source: meerkat_meta::BigQueryAccessTokenSource,
+) -> meerkat_meta::unified_runtime::continuity_mirror_bigquery::BigQueryMirrorSink {
+    meerkat_meta::unified_runtime::continuity_mirror_bigquery::BigQueryMirrorSink::new(
+        BigQuerySessionStoreAdapter::new_native("mirror_dataset", "unused_table")
+            .with_project_id("mirror-project")
+            .with_access_token("fixed-token")
+            .with_access_token_source(source)
+            .with_api_base_url(format!("{}/bigquery/v2", server.base_url())),
+        "continuity",
+    )
+}
+
+fn mirror_bearers(server: &MockHttpServer) -> Vec<String> {
+    server
+        .captured_requests()
+        .iter()
+        .map(|request| {
+            request
+                .headers
+                .get("authorization")
+                .cloned()
+                .expect("authorization header")
+        })
+        .collect()
+}
+
+fn mirror_unauthorized() -> MockHttpResponse {
+    MockHttpResponse {
+        status_code: 401,
+        ..MockHttpResponse::json(json!({
+            "error": {"code": 401, "message": "Request had invalid authentication credentials."}
+        }))
+    }
+}
+
+/// A token source's token is cached: one fetch serves every request of a
+/// `put`, and it wins over a fixed token.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_caches_the_token_source_token() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let server = MockHttpServer::start(vec![
+        mirror_no_snapshot_yet(),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+    ]);
+    let (source, fetches) = mirror_counting_token_source(Duration::from_secs(3600));
+    mirror_sink_with_token_source(&server, source)
+        .put(&mirror_update())
+        .await
+        .expect("the snapshot streams into BigQuery");
+
+    assert_eq!(
+        mirror_bearers(&server),
+        vec!["Bearer token-1".to_string(); 4]
+    );
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A token that expires while the mirror runs is replaced: the next `put`
+/// completes with the token the source fetches anew.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_puts_with_a_new_token_after_the_old_one_expires() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let mut responses = vec![mirror_no_snapshot_yet()];
+    responses.extend((0..5).map(|_| MockHttpResponse::json(json!({}))));
+    let server = MockHttpServer::start(responses);
+    let (source, fetches) = mirror_counting_token_source(Duration::from_millis(400));
+    let sink = mirror_sink_with_token_source(&server, source.with_refresh_margin(Duration::ZERO));
+    sink.put(&mirror_update())
+        .await
+        .expect("the first put streams with the first token");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut update = mirror_update();
+    update.sequence += 1;
+    sink.put(&update)
+        .await
+        .expect("the next put streams with a new token");
+
+    let requests = server.captured_requests();
+    assert_eq!(
+        mirror_request_paths(&requests)[4..],
+        [
+            mirror_table_path("continuity_sessions"),
+            mirror_table_path("continuity_records"),
+            mirror_table_path("continuity_snapshots"),
+        ]
+    );
+    let mut expected = vec!["Bearer token-1".to_string(); 4];
+    expected.extend(vec!["Bearer token-2".to_string(); 3]);
+    assert_eq!(mirror_bearers(&server), expected);
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(sink.auth_failures(), 0);
+}
+
+/// An insert BigQuery refuses with 401 was not applied, so the adapter
+/// fetches a new token and sends that insert once more; the `put` completes
+/// with its snapshots row last.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_sends_a_refused_insert_again_with_a_new_token() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let server = MockHttpServer::start(vec![
+        mirror_no_snapshot_yet(),
+        mirror_unauthorized(),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+    ]);
+    let (source, fetches) = mirror_counting_token_source(Duration::from_secs(3600));
+    let sink = mirror_sink_with_token_source(&server, source);
+    sink.put(&mirror_update())
+        .await
+        .expect("the put completes with the new token");
+
+    assert_eq!(
+        mirror_request_paths(&server.captured_requests()),
+        vec![
+            MIRROR_QUERY_PATH.to_string(),
+            mirror_table_path("continuity_sessions"),
+            mirror_table_path("continuity_sessions"),
+            mirror_table_path("continuity_records"),
+            mirror_table_path("continuity_snapshots"),
+        ]
+    );
+    assert_eq!(
+        mirror_bearers(&server),
+        vec![
+            "Bearer token-1".to_string(),
+            "Bearer token-1".to_string(),
+            "Bearer token-2".to_string(),
+            "Bearer token-2".to_string(),
+            "Bearer token-2".to_string(),
+        ]
+    );
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(sink.auth_failures(), 0);
+}
+
+/// A 401 that comes back after the refresh fails the `put` as an access token
+/// failure, with no token text in the error, and is counted.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_fails_a_put_when_bigquery_refuses_the_new_token_too() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let server = MockHttpServer::start(vec![mirror_unauthorized(), mirror_unauthorized()]);
+    let (source, _fetches) = mirror_counting_token_source(Duration::from_secs(3600));
+    let sink = mirror_sink_with_token_source(&server, source);
+    let error = sink
+        .put(&mirror_update())
+        .await
+        .expect_err("a second 401 fails the put");
+    assert!(
+        error.contains("BigQuery access token refused or unavailable"),
+        "{error}"
+    );
+    assert!(error.contains("again after a refresh"), "{error}");
+    assert!(!error.contains("token-"), "{error}");
+    assert_eq!(server.captured_requests().len(), 2);
+    assert_eq!(sink.auth_failures(), 1);
+}
+
+/// A token source that fails fails the `put` as an access token failure
+/// before any request is sent.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_fails_a_put_when_the_token_source_fails() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let server = MockHttpServer::start(Vec::new());
+    let sink = mirror_sink_with_token_source(
+        &server,
+        meerkat_meta::BigQueryAccessTokenSource::new(|| async {
+            Err("the metadata server did not answer".to_string())
+        }),
+    );
+    let error = sink
+        .put(&mirror_update())
+        .await
+        .expect_err("the token source fails the put");
+    assert!(
+        error.contains("BigQuery access token refused or unavailable"),
+        "{error}"
+    );
+    assert!(
+        error.contains("the metadata server did not answer"),
+        "{error}"
+    );
+    assert!(server.captured_requests().is_empty());
+    assert_eq!(sink.auth_failures(), 1);
+}
+
+/// Only a 401 is sent again: a 500 fails the `put` after one attempt, with no
+/// new token.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_sends_a_failed_request_once() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let server = MockHttpServer::start(vec![MockHttpResponse {
+        status_code: 500,
+        ..MockHttpResponse::json(json!({"error": {"code": 500}}))
+    }]);
+    let (source, fetches) = mirror_counting_token_source(Duration::from_secs(3600));
+    let sink = mirror_sink_with_token_source(&server, source);
+    let error = sink
+        .put(&mirror_update())
+        .await
+        .expect_err("a 500 fails the put");
+    assert!(error.contains("status 500"), "{error}");
+    assert_eq!(server.captured_requests().len(), 1);
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(sink.auth_failures(), 0);
 }

@@ -96,11 +96,11 @@ pub use rpc::{
     run_rpc_capabilities_boundary_once,
 };
 pub use session_store::{
-    BigQueryGcConfig, BigQuerySessionStoreAdapter, BigQuerySessionStoreError, GcErrorCallback,
-    JsonFileSessionStore, JsonFileSessionStoreError, JsonStoreLockRecord, SessionPersistenceRow,
-    SessionStoreContract, SessionStoreKind, materialize_latest_session_rows,
-    materialize_live_session_rows, run_periodic_gc, run_periodic_gc_with_error_callback,
-    session_store_contracts,
+    BigQueryAccessToken, BigQueryAccessTokenSource, BigQueryGcConfig, BigQuerySessionStoreAdapter,
+    BigQuerySessionStoreError, GcErrorCallback, JsonFileSessionStore, JsonFileSessionStoreError,
+    JsonStoreLockRecord, SessionPersistenceRow, SessionStoreContract, SessionStoreKind,
+    materialize_latest_session_rows, materialize_live_session_rows, run_periodic_gc,
+    run_periodic_gc_with_error_callback, session_store_contracts,
 };
 pub use supervisor::{run_discovered_module_once, run_module_boundary_once};
 

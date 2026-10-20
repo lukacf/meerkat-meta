@@ -260,7 +260,8 @@ pub use rpc::{
 };
 pub use rpc::{RpcCapabilities, RpcCapabilitiesError, parse_rpc_capabilities};
 pub use runtime::{
-    AuthenticatedConsoleHuman, BaselineRuntimeError, BigQueryGcConfig, BigQuerySessionStoreAdapter,
+    AuthenticatedConsoleHuman, BaselineRuntimeError, BigQueryAccessToken,
+    BigQueryAccessTokenSource, BigQueryGcConfig, BigQuerySessionStoreAdapter,
     BigQuerySessionStoreError, CONSOLE_HUMAN_TRUST_DOMAIN_PREFIX, ConfigResolutionError,
     ConsoleAgentLiveSnapshot, ConsoleHumanNotCurrent, ConsoleLiveSnapshot,
     ConsoleModelCapabilities, ConsoleRestJsonRequest, ConsoleRestJsonResponse,
