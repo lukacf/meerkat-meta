@@ -1776,8 +1776,13 @@ function runWithProvider(directory, env, ...args) {
 describe("jsonl provider", () => {
   it("writes the golden file from a host's rows", async () => {
     await withTempDir(async (directory) => {
-      // A byte order mark, a blank line and a whitespace line are skipped.
-      const provider = await jsonlProvider(directory, jsonl(goldenRecordRows()), `\ufeff${jsonl(goldenSessionRows())}\n \t\r\n`);
+      // CRLF line ends, a byte order mark, a blank line and a whitespace line.
+      const crlf = (text) => text.replaceAll("\n", "\r\n");
+      const provider = await jsonlProvider(
+        directory,
+        crlf(jsonl(goldenRecordRows())),
+        `\ufeff${crlf(jsonl(goldenSessionRows()))}\n \t\r\n`,
+      );
       const target = join(directory, "export.jsonl");
       const exported = await ce.exportContinuity(provider, GOLDEN_IDENTITIES, target);
       assert.deepEqual(await readFile(target), await readFile(join(FIXTURES, "written_by_node.jsonl")));

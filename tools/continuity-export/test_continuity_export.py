@@ -1921,10 +1921,10 @@ class JsonlProviderTests(TempDirTestCase):
         return jp.JsonlContinuityProvider(self.write("records.jsonl", records), self.write("sessions.jsonl", sessions))
 
     async def test_writes_the_golden_file_from_a_hosts_rows(self):
-        # A byte order mark, a blank line and a whitespace line are skipped.
+        # CRLF line ends, a byte order mark, a blank line and a whitespace line.
         provider = self.provider(
-            jsonl(golden_record_rows()),
-            "\ufeff" + jsonl(golden_session_rows()) + "\n \t\r\n",
+            jsonl(golden_record_rows()).replace("\n", "\r\n"),
+            "\ufeff" + jsonl(golden_session_rows()).replace("\n", "\r\n") + "\n \t\r\n",
         )
         target = self.tmp / "export.jsonl"
         export = await ce.export_continuity(provider, GOLDEN_IDENTITIES, target)
@@ -2035,6 +2035,26 @@ class JsonlProviderTests(TempDirTestCase):
         with self.assertRaises(jp.JsonlProviderInputError) as caught:
             provider.load_session_snapshot(SESSION_ALPHA)
         self.assertEqual(str(caught.exception), f"{sessions} line 1: the file changed after the provider opened it")
+
+    def test_opening_holds_no_snapshot(self):
+        # The provider keeps where each session's line starts, not the
+        # snapshots: opening it over 32 MiB of documents stays far below that,
+        # and a snapshot is read when the export asks for it.
+        documents = [bytes([index]) * (1 << 20) for index in range(32)]
+        sessions = [session_row(f"019f0000-0000-7000-8000-{index:012x}", document)
+                    for index, document in enumerate(documents)]
+        records_path = self.write("records.jsonl", jsonl(golden_record_rows()))
+        sessions_path = self.write("sessions.jsonl", jsonl(sessions))
+        tracemalloc.start()
+        try:
+            provider = jp.JsonlContinuityProvider(records_path, sessions_path)
+            current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 16 << 20)
+        self.assertLess(current, 1 << 20)
+        snapshot = provider.load_session_snapshot(sessions[3]["session_id"])
+        self.assertEqual(base64.b64decode(snapshot["data"]), documents[3])
 
     def test_input_errors_name_the_file_and_the_line(self):
         for name, records, sessions, which, message in JSONL_INPUT_ERRORS:
