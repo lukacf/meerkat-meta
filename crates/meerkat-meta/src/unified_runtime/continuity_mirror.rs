@@ -460,7 +460,7 @@ enum IdentityRead {
     Unchanged,
     /// A new or changed session, with its row and the ids of the blobs its
     /// document references.
-    Changed(Mirrored, ContinuityMirrorSession, BTreeSet<String>),
+    Changed(Box<Mirrored>, ContinuityMirrorSession, BTreeSet<String>),
     /// No durable session to copy (`Absent`), or an archived one the lifecycle
     /// cannot revive (`ArchivedNotRevivable`): the identity is not mirrored.
     NotMirrored,
@@ -631,11 +631,11 @@ async fn read_identity(
         data: base64::engine::general_purpose::STANDARD.encode(&document),
     };
     Ok(IdentityRead::Changed(
-        Mirrored {
+        Box::new(Mirrored {
             record,
             authority,
             document_sha256,
-        },
+        }),
         row,
         blob_ids,
     ))
@@ -745,7 +745,7 @@ async fn round(
                 .await
                 {
                     state.pending.insert(row.session_id.clone(), row);
-                    identities.insert(identity, mirrored);
+                    identities.insert(identity, *mirrored);
                 } else {
                     tracing::warn!(
                         identity = %identity,
@@ -955,7 +955,7 @@ impl ContinuityMirror {
                     return;
                 }
                 tokio::select! {
-                    _ = tokio::time::sleep(timings.interval) => {}
+                    () = tokio::time::sleep(timings.interval) => {}
                     // A stop runs one last round above, then returns.
                     _ = stopped.changed() => {}
                 }

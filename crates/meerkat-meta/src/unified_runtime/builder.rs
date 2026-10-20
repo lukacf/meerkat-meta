@@ -2385,14 +2385,14 @@ impl UnifiedRuntimeBuilder {
             runtime.start_event_log(event_log_config);
         }
 
-        if let Some((sink, timings)) = self.continuity_mirror {
-            if let Err(error) = runtime.install_continuity_mirror(sink, timings).await {
-                let build_error = UnifiedRuntimeBuilderError::ConflictingConfiguration(format!(
-                    "continuity_mirror(): {error}"
-                ));
-                runtime.shutdown().await;
-                return Err(build_error);
-            }
+        if let Some((sink, timings)) = self.continuity_mirror
+            && let Err(error) = runtime.install_continuity_mirror(sink, timings).await
+        {
+            let build_error = UnifiedRuntimeBuilderError::ConflictingConfiguration(format!(
+                "continuity_mirror(): {error}"
+            ));
+            runtime.shutdown().await;
+            return Err(build_error);
         }
 
         Ok(runtime)
