@@ -95,6 +95,12 @@ pub struct UnifiedRuntimeBuilder {
     /// documents per turn (see
     /// [`require_incremental_session_persistence`](Self::require_incremental_session_persistence)).
     require_incremental_session_persistence: bool,
+    /// The continuity mirror to install (see
+    /// [`continuity_mirror`](Self::continuity_mirror)).
+    continuity_mirror: Option<(
+        Arc<dyn super::continuity_mirror::ContinuityMirrorSink>,
+        super::continuity_mirror::ContinuityMirrorTimings,
+    )>,
 
     // --- Identity-first external path ---
     continuity_store: Option<Arc<dyn crate::identity_first::contracts::ContinuityStore>>,
@@ -350,6 +356,37 @@ impl UnifiedRuntimeBuilder {
     /// session store may not be. Off by default.
     pub fn require_incremental_session_persistence(mut self, required: bool) -> Self {
         self.require_incremental_session_persistence = required;
+        self
+    }
+
+    /// Keep a live copy of each durable identity's current record and
+    /// committed session in `sink`, refreshed every `interval`: a restore
+    /// source for a lost state directory that is never read at boot (see
+    /// [`continuity_mirror`](super::continuity_mirror)). The runtime owns the
+    /// mirror: shutdown writes a last copy, and dropping the runtime stops it.
+    /// It needs an identity-first runtime; `build()` refuses it otherwise.
+    pub fn continuity_mirror(
+        mut self,
+        sink: Arc<dyn super::continuity_mirror::ContinuityMirrorSink>,
+        interval: std::time::Duration,
+    ) -> Self {
+        let timings = super::continuity_mirror::ContinuityMirrorTimings {
+            interval,
+            ..Default::default()
+        };
+        self.continuity_mirror = Some((sink, timings));
+        self
+    }
+
+    /// [`continuity_mirror`](Self::continuity_mirror) with every timing set:
+    /// the interval, how long one sink put may take, and how long the last
+    /// round at shutdown may take.
+    pub fn continuity_mirror_with_timings(
+        mut self,
+        sink: Arc<dyn super::continuity_mirror::ContinuityMirrorSink>,
+        timings: super::continuity_mirror::ContinuityMirrorTimings,
+    ) -> Self {
+        self.continuity_mirror = Some((sink, timings));
         self
     }
 
@@ -2344,6 +2381,16 @@ impl UnifiedRuntimeBuilder {
         let mut runtime = runtime;
         if let Some(event_log_config) = self.event_log_config {
             runtime.start_event_log(event_log_config);
+        }
+
+        if let Some((sink, timings)) = self.continuity_mirror {
+            if let Err(error) = runtime.install_continuity_mirror(sink, timings).await {
+                let build_error = UnifiedRuntimeBuilderError::ConflictingConfiguration(format!(
+                    "continuity_mirror(): {error}"
+                ));
+                runtime.shutdown().await;
+                return Err(build_error);
+            }
         }
 
         Ok(runtime)

@@ -356,6 +356,9 @@ pub struct UnifiedRuntimeCore {
     /// when the loop stops draining. Observation only — aborted first during
     /// shutdown so the intentional actor stop cannot fire a false page.
     actor_loop_probe_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    /// The continuity mirror the builder installed. Shutdown stops it, with a
+    /// last round, before the mob quiesces; dropping the runtime aborts it.
+    continuity_mirror: tokio::sync::Mutex<Option<continuity_mirror::ContinuityMirror>>,
     /// The probe's published verdict (live / stalled / terminated), shared
     /// with the identity-first delivery path so a send issued while a stall
     /// is open fails fast naming the `stall_id` instead of waiting the whole
@@ -884,6 +887,7 @@ impl UnifiedRuntime {
                 mob_events: mob_events_store,
                 mob_events_subscriber_task: tokio::sync::Mutex::new(mob_events_task),
                 actor_loop_probe_task: tokio::sync::Mutex::new(actor_loop_probe_task),
+                continuity_mirror: tokio::sync::Mutex::new(None),
                 actor_loop_health,
                 implicit_delegate_retirement_task: tokio::sync::Mutex::new(None),
                 implicit_delegate_identity_runtime: identity_runtime_authority,

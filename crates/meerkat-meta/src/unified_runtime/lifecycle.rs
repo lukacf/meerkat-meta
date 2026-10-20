@@ -267,6 +267,17 @@ impl UnifiedRuntime {
             task.abort();
             let _ = task.await;
         }
+        // The continuity mirror writes its last copy while the mob still
+        // serves reads; the mirror's own deadline bounds the wait.
+        let continuity_mirror = self.continuity_mirror.lock().await.take();
+        if let Some(mirror) = continuity_mirror {
+            let counts = mirror.stop().await;
+            tracing::info!(
+                writes = counts.writes.load(Ordering::Relaxed),
+                failures = counts.failures.load(Ordering::Relaxed),
+                "continuity mirror stopped"
+            );
+        }
         // The fact tail owns only a lossy wake projection, so shutdown does
         // not drain it. Abort and join the sole runtime-owned task before
         // taking down the authoritative WorkGraph-bearing mob runtime.
