@@ -179,6 +179,36 @@ def test_exact_target_launcher_selects_actual_registry_before_returning_original
     assert not f.implementation.root.exists() and not f.deployment.root.exists() and f.calls == []
 
 
+def test_toolkit_application_launcher_binds_registry_and_build_owner_to_model_owner(dispatch, tmp_path, monkeypatch):
+    from launchkit.connect_application_startup import _ModelConfiguration
+    from test_managed_model_factory_selection import model_source
+    f = dispatch
+    selection = model_source(tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", selection["credential_config_root"])
+    owner = _ModelConfiguration.observe(selection)
+    chosen = launch.ToolkitApplicationSelection(f.initial.target, owner)
+    modules = {"trusted_local.selection": SimpleNamespace(runtime=lambda: chosen),
+        "launchkit.forge_application_host": SimpleNamespace(ForgeApplicationHost=ForgeApplicationHost),
+        "launchkit.runtime_selection": SimpleNamespace(MetaToolkitRuntimeTarget=MetaToolkitRuntimeTarget),
+        "launchkit.server": SimpleNamespace(app=f.app,
+            select_local_application_runtime=f.namespace["select_local_application_runtime"],
+            select_application_host=lambda value: pytest.fail("A product target cannot select a manual host."))}
+
+    def load(name):
+        assert name in modules, "Unexpected global server/runtime import"
+        return modules[name]
+
+    monkeypatch.setenv(launch.FACTORY_ENV, "trusted_local.selection:runtime")
+    monkeypatch.setattr(launch.importlib, "import_module", load)
+    assert launch.create_app() is f.app
+    registry = f.namespace["application_host"]
+    assert type(registry) is LocalApplicationRegistry and registry.runtime_target is f.initial.target
+    assert registry._selected_model_configuration() == selection
+    build_id, host = prepare_build(f, registry)
+    factory = registry._builds[(f.initial.saved["id"], build_id)].factory
+    assert factory.host is host and factory._selected_model_configuration() == selection
+
+
 def test_duplicate_original_runtime_selection_preserves_callbacks_without_source_creation(dispatch):
     f = dispatch
     registry = select_runtime(f)

@@ -2,7 +2,8 @@
 
 META_FORGE_APPLICATION_HOST_FACTORY names a synchronous zero-argument Python
 factory as module:factory. It returns an original application host or an exact
-qualified product runtime target, or original local and Linux control selections.
+qualified product runtime target, optionally with its application model
+configuration owner, or original local and Linux control selections.
 Targets enable source creation inside deliberate Build; the launcher itself
 does not prepare, install or start applications.
 """
@@ -70,6 +71,33 @@ class OrdinaryMetaApplicationSelection:
             self.model_configuration.require_filesystem_current()
 
 
+@dataclass(frozen=True)
+class ToolkitApplicationSelection:
+    """The trusted launcher selects a Meta Toolkit product with its model owner.
+
+    Local Build and Install owners retain this original application model
+    configuration custody, as they do for an ordinary selection. Constructing
+    this value does not read credentials or establish provider readiness. It
+    is never parsed from an HTTP request, blueprint, package or environment.
+    """
+
+    runtime_target: object
+    model_configuration: object
+
+    def __post_init__(self):
+        _require_toolkit_selection(self)
+
+
+def _require_toolkit_selection(selected):
+    from .connect_application_startup import _ModelConfiguration
+    from .runtime_selection import MetaToolkitRuntimeTarget
+    if (type(selected.runtime_target) is not MetaToolkitRuntimeTarget
+            or type(selected.model_configuration) is not _ModelConfiguration):
+        raise TypeError("Select the exact Meta Toolkit product and its original application model configuration owner.")
+    selected.model_configuration.require_environment()
+    selected.model_configuration.require_filesystem_current()
+
+
 def create_app():
     """Uvicorn --factory entry point; configured failures stop startup."""
     module, attribute = _factory_reference(os.environ.get(FACTORY_ENV))
@@ -86,12 +114,18 @@ def create_app():
     host_type = importlib.import_module("launchkit.forge_application_host").ForgeApplicationHost
     target_type = importlib.import_module("launchkit.runtime_selection").MetaToolkitRuntimeTarget
     selected = factory()
-    if type(selected) not in (host_type, target_type, ApplicationRuntimeSelection, OrdinaryMetaApplicationSelection):
+    if type(selected) not in (host_type, target_type, ApplicationRuntimeSelection,
+            OrdinaryMetaApplicationSelection, ToolkitApplicationSelection):
         if inspect.iscoroutine(selected):
             selected.close()
-        raise TypeError("The trusted factory must return an exact ForgeApplicationHost, MetaToolkitRuntimeTarget, ApplicationRuntimeSelection or OrdinaryMetaApplicationSelection.")
+        raise TypeError("The trusted factory must return an exact ForgeApplicationHost, MetaToolkitRuntimeTarget, ApplicationRuntimeSelection, OrdinaryMetaApplicationSelection or ToolkitApplicationSelection.")
     server = importlib.import_module("launchkit.server")
-    if type(selected) is OrdinaryMetaApplicationSelection:
+    if type(selected) is ToolkitApplicationSelection:
+        _require_toolkit_selection(selected)
+        server.select_local_application_runtime(selected.runtime_target,
+            model_configuration=selected.model_configuration)
+        _require_toolkit_selection(selected)
+    elif type(selected) is OrdinaryMetaApplicationSelection:
         options = {"ordinary_meta_gateway": selected.gateway}
         if selected.model_configuration is not None:
             selected.model_configuration.require_environment()

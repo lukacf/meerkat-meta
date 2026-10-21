@@ -1364,6 +1364,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   application ("Replacing the selected candidate needs a separately bound
   runtime transition"); it now sends the host-owned runtime refresh of the
   current independently accepted build, and is offered only for that build.
+- Meta Forge can keep a trusted launcher's application model configuration for
+  a Meta Toolkit product. A launcher factory that returns a bare
+  `MetaToolkitRuntimeTarget` passes none, so Install of an application with a
+  managed-host model class ended with "Trusted setup inputs were not retained
+  (CustodyError)" ("Managed-host models require the original trusted
+  preparation model configuration"). The factory can now return
+  `ToolkitApplicationSelection(runtime_target, model_configuration)`. It carries
+  the same model configuration owner as `OrdinaryMetaApplicationSelection` and
+  is checked the same way at selection. A bare target is unchanged and still
+  refuses managed-host models.
 - Meta Forge's Linux isolation works on Python builds whose `fcntl` module
   lacks the memfd seal names, such as the standalone CPython builds uv
   installs. Forge sealed its seccomp filter and accepted remote input with

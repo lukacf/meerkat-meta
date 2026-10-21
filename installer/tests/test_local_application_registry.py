@@ -438,3 +438,48 @@ async def test_install_recovery_refuses_changed_original_build_without_effects(r
             build_id=result["build_id"])
     assert before == source_bytes(directory)
     assert not lost._builds and not lost._installations and not f.service.launched
+
+
+@pytest.mark.parametrize("custody", [False, True], ids=["bare-target", "model-owner"])
+async def test_managed_host_product_install_retains_inputs_only_with_launcher_model_owner(
+        registry, tmp_path, monkeypatch, custody):
+    """A launcher's model owner reaches the managed-host product's retained inputs."""
+    from launchkit.connect_application_startup import _ModelConfiguration
+    from test_managed_model_factory_selection import model_source
+    f = registry
+    selection = model_source(tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", selection["credential_config_root"])
+    owner = _ModelConfiguration.observe(selection) if custody else None
+    # The server's local runtime selection constructs this registry from the
+    # launcher's owner; a bare product target supplies none.
+    f.registry = LocalApplicationRegistry(guide_store=f.store, implementation=f.implementation,
+        deployment=f.service, runtime_target=f.target,
+        model_configuration=None if owner is None else owner.selection())
+    f.implementation.prepare_workspace = f.registry.prepare_workspace
+    for name, method in (("application_host_selection", "selected_host"),
+            ("application_setup_retention", "retain_installation_inputs"),
+            ("application_setup_selection", "_selected_startup"),
+            ("application_setup_preparation", "prepare_application"),
+            ("application_setup_continuation", "continue_application_startup")):
+        setattr(f.service, name, getattr(f.registry, method))
+    saved = new_guide(f)
+    saved["proposal"]["agent_classes"][0]["model_auth"] = "managed_host"
+    saved = f.store.save(saved, saved["version"])
+    result = await build(f, saved)
+    await accept_source_fixture(f, result)
+    if not custody:
+        with pytest.raises(CustodyError, match="Managed-host models require the original trusted preparation model configuration"):
+            await install_fixture(f, saved, result, monkeypatch)
+        refused = deployment.read_receipt(f.service._directory(saved["id"]))
+        assert refused["status"] == "stopped" and refused["phase"] == "configure"
+        assert refused["detail"].startswith("Trusted setup inputs were not retained (CustodyError).")
+        return
+    directory, destination = await install_fixture(f, saved, result, monkeypatch)
+    receipt = deployment.read_receipt(directory)
+    host = f.registry.selected_host(saved["id"], receipt["deployment_id"])
+    assert host._retained_preparation_inputs.model_configuration == selection
+    async with f.service.lock:
+        chosen = host._selected_preparation(f.service, saved["id"], receipt["deployment_id"])
+    assert chosen["model_configuration"] == selection
+    policy = json.loads((destination / ".mobkit/forge-local-setup/local-application-policy.json").read_bytes())
+    assert policy["model_configuration"] == selection
