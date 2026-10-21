@@ -4,6 +4,7 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -557,3 +558,26 @@ async def test_worker_refuses_a_closure_for_another_cpython_before_creating_the_
         with pytest.raises(RuntimeError, match="inert venv creation"):
             await install
         assert commands[0][1:4] == ["-I", "-m", "venv"]
+
+
+DARWIN_ARM64_CP311 = {"python_tag": "cp311", "abi_tag": "cp311", "implementation": "cpython", "system": "Darwin",
+    "machine": "arm64", "glibc_minimum": [0, 0], "macos": (14, 5)}
+MACOS_ARM64_CLOSURE = ("pydantic_core-2.27.2-cp311-cp311-macosx_11_0_arm64.whl",
+    "cryptography-44.0.0-cp39-abi3-macosx_10_9_universal2.whl", "httpx-0.28.1-py3-none-any.whl")
+
+
+@pytest.mark.parametrize("host, extra, refused", [
+    ({}, (), None),
+    ({"python_tag": "cp312", "abi_tag": "cp312"}, (), r"built for CPython 3\.11, but this Forge runs CPython 3\.12"),
+    ({}, ("rpds_py-0.22.3-cp311-cp311-macosx_10_12_x86_64.whl",), "do not support this computer"),
+    ({}, ("cffi-1.17.1-cp311-cp311-macosx_15_0_arm64.whl",), "do not support this computer")],
+    ids=["matching", "other-cpython", "x86_64-wheel", "newer-macos"])
+def test_darwin_arm64_host_admits_its_matching_closure_and_refuses_others(host, extra, refused):
+    # _wheel_compatible knows only Linux platform tags. A macOS arm64 Forge on
+    # the closure's CPython must still be admitted; architecture, macOS version
+    # and CPython mismatches are refused.
+    reason = deployment.selected_interpreter_refusal(closure(*MACOS_ARM64_CLOSURE, *extra), {**DARWIN_ARM64_CP311, **host})
+    if refused is None:
+        assert reason is None
+    else:
+        assert re.search(refused, reason)
