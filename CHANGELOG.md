@@ -1358,6 +1358,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Meta Forge accepts a `meerkat-toolkit` 0.9.4 wheel, whose native host
   requires `meerkat-meta==0.9.4`, instead of refusing every Toolkit wheel but
   0.9.0; the exact version, METADATA, RECORD and payload checks are unchanged.
+- Meta Forge's "Rebuild with updated runtime" moves an application built from a
+  host-selected Meta and Toolkit runtime to the installer's current runtime.
+  It sent the legacy framework refresh, which the server refuses for such an
+  application ("Replacing the selected candidate needs a separately bound
+  runtime transition"); it now sends the host-owned runtime refresh of the
+  current independently accepted build, and is offered only for that build.
 - Meta Forge's Linux isolation works on Python builds whose `fcntl` module
   lacks the memfd seal names, such as the standalone CPython builds uv
   installs. Forge sealed its seccomp filter and accepted remote input with
