@@ -5,14 +5,16 @@ admission, lease and command owners. No native, SDK, dependency, shell or Python
 child executes. Mock readiness cannot establish installed application success.
 """
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from copy import deepcopy
+import io
 import json
 import os
 from pathlib import Path
 import socket
 import subprocess
 import sys
+import sysconfig
 from types import SimpleNamespace
 
 import pytest
@@ -139,6 +141,45 @@ async def test_direct_preparation_reuses_original_executor_pair_and_prefix_argum
     f.current = False
     with pytest.raises(DraftConflict, match="owner changed"):
         current()
+
+
+async def test_site_probe_avoids_debian_system_default_without_running_site_startup(direct, monkeypatch):
+    """Execute only the worker's stdlib probe, with Debian's default layout.
+
+    The existing inert executor still owns every command. No interpreter,
+    installed .pth, authored application, SDK or native runtime executes.
+    """
+    f = direct
+    original = f.executor.command
+    observed = []
+
+    def debian_path(name, scheme=None, vars=None):
+        observed.append((name, scheme, vars))
+        assert name == "purelib" and vars == {
+            "base": str(f.destination / ".venv"), "platbase": str(f.destination / ".venv")}
+        if scheme in {"posix_venv", "venv"}:
+            return str(f.executor.site)
+        # Python 3.11-3.13 with -S may select Debian's system scheme. venv
+        # created site-packages, so this plausible path does not exist.
+        return str(f.destination / ".venv/local/lib/python3.12/dist-packages")
+
+    async def command(argv, phase, timeout, **options):
+        result = await original(argv, phase, timeout, **options)
+        if phase != "Selected SDK site path":
+            return result
+        assert argv[1:4] == ["-I", "-S", "-c"]
+        with monkeypatch.context() as patch:
+            patch.setattr(sys, "executable", str(f.destination / ".venv/bin/python"))
+            patch.setattr(sysconfig, "get_path", debian_path)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exec(compile(argv[4], "<selected-stdlib-site-probe>", "exec"), {})
+        return output.getvalue()
+
+    result = await worker._install_selected_product(f.executor, f.artifacts, f.fence, command)
+    assert result["site_packages"] == f.executor.site
+    assert observed and observed[0][1] in {"posix_venv", "venv"}
+    assert len(f.executor.sdk_calls) == len(f.executor.prefix_calls) == 1
 
 
 @pytest.mark.parametrize("refusal", ["false", "raises", "awaitable"])
