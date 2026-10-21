@@ -6988,7 +6988,9 @@ impl MobBootstrapSpec {
         if let Some(machine) = runtime_adapter.as_ref() {
             factory = factory.with_image_generation_machine(weak_image_generation_machine(machine));
         }
-        let config = agent_config.unwrap_or_default();
+        let config = crate::compaction_policy::with_meta_compaction_defaults(
+            agent_config.unwrap_or_default(),
+        );
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
@@ -7456,7 +7458,9 @@ impl MobBootstrapSpec {
             factory = factory
                 .with_image_generation_machine(weak_image_generation_machine(&runtime_adapter));
         }
-        let config = agent_config.unwrap_or_default();
+        let config = crate::compaction_policy::with_meta_compaction_defaults(
+            agent_config.unwrap_or_default(),
+        );
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
@@ -7773,7 +7777,9 @@ impl MobBootstrapSpec {
         wait_for_document_mcp: bool,
     ) -> Result<Self, StorageResolutionError> {
         caps.image_generation |= mob_definition_may_use_image_generation(&definition);
-        let config = agent_config.unwrap_or_default();
+        let config = crate::compaction_policy::with_meta_compaction_defaults(
+            agent_config.unwrap_or_default(),
+        );
         // A composite storage provider's realm supplies the session store with
         // its runtime store (Core's pair); otherwise both are process-local,
         // the declared choice of this mode.
