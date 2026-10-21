@@ -36,6 +36,7 @@ def services(monkeypatch):
     operations = SimpleNamespace(submit=AsyncMock(name="guide_operations.submit"))
     guide = SimpleNamespace(apply=AsyncMock(name="guide.apply"),
         attachments=SimpleNamespace(resolve=lambda identity, values: values), input_surface=lambda: {})
+    deployment.agent_team_availability = lambda: {"available": True}
     monkeypatch.setattr(server, "deployment", deployment)
     monkeypatch.setattr(server, "rehearsal", rehearsal)
     monkeypatch.setattr(server, "guide_operations", operations)

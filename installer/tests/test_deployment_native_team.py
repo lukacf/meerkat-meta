@@ -317,3 +317,54 @@ def test_native_http_schema_and_routes_have_no_fake_application_build(monkeypatc
     package = client.get(base + "/package?source_kind=native-team&version=4")
     assert package.status_code == 200 and package.content == b"owned-package"
     assert client.get(base + "/package?source_kind=application&version=4").status_code == 422
+
+
+def product_launched(service):
+    """Select a per-user application registry the way a product launcher does."""
+    service.application_host_selection = lambda *args, **kwargs: None
+    return service
+
+
+async def test_product_launched_forge_refuses_agent_team_export_options_and_install(service, tmp_path):
+    # An installed product Forge runs its applications on Meta 0.9.4; an agent
+    # team package installs the MobKit 0.8 runtime, so none is exported or installed.
+    product_launched(service)
+    refusal = deployment.AGENT_TEAM_PRODUCT_UNAVAILABLE
+    assert service.agent_team_availability() == {"available": False, "reason": refusal}
+    with pytest.raises(DraftConflict) as export:
+        await service.native_package(service.guide.identity, 4)
+    with pytest.raises(DraftConflict) as options:
+        await service.options(service.guide.identity, source_kind="native-team", version=4)
+    with pytest.raises(DraftConflict) as install:
+        await service.submit(service.guide.identity, 4, None, str(tmp_path / "team"), {"OPENAI_API_KEY": PRIVATE},
+            source_kind="native-team", source_id="a" * 64, source_digest="b" * 64)
+    assert str(export.value) == str(options.value) == str(install.value) == refusal
+    assert "Build application" in refusal and "MobKit 0.8" in refusal
+    assert not (tmp_path / "team").exists() and not service.root.exists() and not service.tasks
+
+
+async def test_source_entry_keeps_exporting_and_offering_the_agent_team(service):
+    # The developer source entry selects no application registry.
+    assert service.application_host_selection is None
+    assert service.agent_team_availability() == {"available": True}
+    payload, source, _ = await service.native_package(service.guide.identity, 4)
+    assert payload and source["source_kind"] == "native-team"
+    options = await service.options(service.guide.identity, source_kind="native-team", version=4)
+    assert options["source_kind"] == "native-team" and options["source_id"] == source["source_id"]
+
+
+def test_product_launched_http_routes_refuse_agent_team_packages(monkeypatch):
+    refusal = deployment.AGENT_TEAM_PRODUCT_UNAVAILABLE
+    owner = SimpleNamespace(agent_team_availability=lambda: {"available": False, "reason": refusal},
+        native_package=AsyncMock(side_effect=DraftConflict(refusal)))
+    monkeypatch.setattr(server, "deployment", owner)
+    monkeypatch.setattr(server, "planner_capability", lambda: {"available": False})
+    monkeypatch.setattr(server, "cloud_capability", lambda: {"available": False})
+    client = TestClient(server.app)  # No lifespan; no native or main-store access.
+    capabilities = client.get("/api/capabilities")
+    assert capabilities.status_code == 200
+    assert capabilities.json()["agent_team"] == {"available": False, "reason": refusal}
+    package = client.get(f"/api/guide/{uuid.uuid4()}/deployment/package?source_kind=native-team&version=4")
+    assert (package.status_code, package.json()["detail"]) == (409, refusal)
+    archive = client.post("/api/blueprint/package", json={"schema_version": 2})
+    assert (archive.status_code, archive.json()["detail"]) == (409, refusal)

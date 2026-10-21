@@ -281,13 +281,14 @@ function guideActivityScrollTop(scroll) {
       scroll.getBoundingClientRect().top - scroll.clientHeight + 16));
 }
 
-export function guideStatusText({ state, error, appError, busy, ready, review, question, progress }) {
+export function guideStatusText({ state, error, appError, busy, ready, review, question, progress, agentTeamAvailable = true }) {
   if (error || appError) return "The guide needs your attention. Your saved setup is preserved.";
   if (busy) return state?.operation?.detail || "Your guide is checking the design. You can keep writing below.";
   const failure = savedGuideFailure(state);
   if (failure) return failure.detail || "The guide could not finish this response. Your saved setup is preserved. Retry when ready.";
   if (progress) return progress.title;
-  if (ready) return "Plan accepted. Download your agent team, or build a custom application.";
+  if (ready) return agentTeamAvailable ? "Plan accepted. Download your agent team, or build a custom application."
+    : "Plan accepted. Build your application to install it.";
   if (review) return "Your proposal is ready to review.";
   if (state?.status === "refining") return "Your updated draft is saved. Keep refining it, or explore the next step below.";
   return question?.title || "Your guide is ready.";
@@ -626,6 +627,8 @@ export function GuidedSetup({
   const [error, setError] = useState(""),
     [manualNote, setManualNote] = useState(null),
     [pendingMessage, setPendingMessage] = useState(null);
+  // A product-launched Forge offers no agent team package: Build application is its path.
+  const agentTeamAvailable = config?.capabilities?.agent_team?.available !== false;
   const [runtime, setRuntime] = useState(config?.architect ?? null),
     [mobilePanel, setMobilePanel] = useState("chat");
   const latestMobilePanel = useRef(mobilePanel);
@@ -757,7 +760,7 @@ export function GuidedSetup({
     (!sendingMessage || sendingMessage.status === "unconfirmed");
   const sendUnconfirmed = sendingMessage?.status === "unconfirmed" || creationUnconfirmed;
   latestLifecycle.current = { receipts: { build: implementation, trial: rehearsal, deployment, remoteDeployment },
-    flags: { active, pendingChanges: !!manualNote, designBusy: busy || applyUnconfirmed || sendUnconfirmed, packageBusy, buildObservation, buildAdmissionPending, deploymentObservation, remoteObservation } };
+    flags: { active, pendingChanges: !!manualNote, designBusy: busy || applyUnconfirmed || sendUnconfirmed, packageBusy, buildObservation, buildAdmissionPending, deploymentObservation, remoteObservation, agentTeamAvailable } };
   const timeline = useGuideTimeline(active ? state : null);
 
   function savedManual(id) {
@@ -2148,7 +2151,7 @@ export function GuidedSetup({
   const requirements = unresolvedRequirements(state, plan);
   const checkedApplication = implementationCanDownload(implementation, state);
   const progress = setupProgress(state, { build: implementation, trial: rehearsal, deployment, remoteDeployment },
-    { pendingChanges: !!manualNote, designBusy: busy || applyUnconfirmed || sendUnconfirmed || state.operation?.status === "running", buildObservation, buildAdmissionPending, deploymentObservation, remoteObservation });
+    { pendingChanges: !!manualNote, designBusy: busy || applyUnconfirmed || sendUnconfirmed || state.operation?.status === "running", buildObservation, buildAdmissionPending, deploymentObservation, remoteObservation, agentTeamAvailable });
   const hasLifecycle = setupProgressHasLifecycle(state, { build: implementation, trial: rehearsal, deployment, remoteDeployment });
   const applicationBuildRequired = setupNeedsApplicationBuild(state, implementation, { buildObservation });
   const optionalBuildProgress = applicationBuildRequired && !hasLifecycle && state.status !== "ready";
@@ -2213,7 +2216,7 @@ export function GuidedSetup({
     build_id: implementation.build_id, source_digest: implementation.source_digest,
     actions: progress.actions,
   } : null;
-  const statusText = guideStatusText({ state, error, appError, busy, ready, review, question, progress: primaryProgress });
+  const statusText = guideStatusText({ state, error, appError, busy, ready, review, question, progress: primaryProgress, agentTeamAvailable });
   const file =
     validation?.files?.find((f) => f.path === selectedFile) ||
     validation?.files?.[0];
@@ -2600,7 +2603,7 @@ export function GuidedSetup({
                 </AgentMessage>
               </div>
             )}
-            {(state.proposal || state.blueprint) && !busy && <NativeTeamPackage state={state} packageBusy={packageBusy} blocked={blocked}
+            {agentTeamAvailable && (state.proposal || state.blueprint) && !busy && <NativeTeamPackage state={state} packageBusy={packageBusy} blocked={blocked}
               deploymentObservation={deploymentObservation}
               onInstall={(displayed) => navigateInstallation("native-team", displayed)}
               onPackage={inspectPackage} Icon={Icon} targetRef={teamPackageRef} downloadedKey={nativeDownloadedKey} onRevise={revisePackagePlan} />}
@@ -2621,7 +2624,8 @@ export function GuidedSetup({
               </div>
               <div ref={implementationRef} role="region" aria-label="Application build" tabIndex={-1}>
               <p className="setup-custom-application-intro"><strong>Custom application</strong>
-                <span>Use the builder when your requested outcomes need custom screens or application code. The agent team package does not implement remaining application work.</span></p>
+                <span>{agentTeamAvailable ? "Use the builder when your requested outcomes need custom screens or application code. The agent team package does not implement remaining application work."
+                  : "Build application turns your proposal into an application and installs your agents with it."}</span></p>
               <ImplementationPanel state={state} plan={plan} designBusy={busy || applyUnconfirmed || sendUnconfirmed || state.operation?.status === "running"}
                 selectionScope={lifecycleSelection.current} pendingManual={!!manualNote} Icon={Icon} admittedReceipt={implementationAdmission}
                 navigation={implementationNavigation} onNavigate={navigateProgressAction} onRevise={revisePackagePlan}
@@ -2629,7 +2633,8 @@ export function GuidedSetup({
               </div>
               <div id="setup-deployment" ref={deploymentRef}>
               <DeploymentPanel state={state} plan={plan} build={implementation}
-                initialSourceKind={deploymentCanPrepare(implementation, state) ? "application" : "native-team"}
+                initialSourceKind={!agentTeamAvailable || deploymentCanPrepare(implementation, state) ? "application" : "native-team"}
+                agentTeamAvailable={agentTeamAvailable}
                 sourceNavigation={deploymentNavigation}
                 selectionScope={lifecycleSelection.current} designBusy={busy || applyUnconfirmed || sendUnconfirmed || state.operation?.status === "running"} pendingManual={!!manualNote} Icon={Icon}
                 onReceipt={acceptDeploymentReceipt} onRemoteReceipt={acceptRemoteDeploymentReceipt} remoteTargetRef={remoteDeploymentRef}

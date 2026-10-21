@@ -155,7 +155,7 @@ function currentRestoredUpdate(deployment, build, guide) {
 
 /** Explain current host receipts without rewriting the guide's historical claims. */
 export function setupProgress(guide, { build, trial, deployment, remoteDeployment } = {}, flags = {}) {
-  const { pendingChanges = false, designBusy = false } = flags;
+  const { pendingChanges = false, designBusy = false, agentTeamAvailable = true } = flags;
   if (!guide?.id || !(guide.proposal || guide.blueprint) || pendingChanges || designBusy) return null;
   const buildKnown = buildObservationKnown(flags);
   const admissionPending = flags.buildAdmissionPending === true;
@@ -301,11 +301,12 @@ export function setupProgress(guide, { build, trial, deployment, remoteDeploymen
     if (setupNeedsApplicationBuild(guide, build, flags)) return { title: 'Your application needs to be built',
       detail: 'Your current plan includes application work that the agent team package does not implement. Open the builder to create and check the application from this proposal.',
       actions: [action('build', 'Build application')] };
-    if (nativeTeamCanInstall(guide)) return { title: 'Your agent team is ready to install',
+    // A Forge that offers no agent team package leads to the builder instead.
+    if (agentTeamAvailable && nativeTeamCanInstall(guide)) return { title: 'Your agent team is ready to install',
       detail: 'Check the selected destination, then set up private credentials and start the Console, agents and tools. No custom application build is needed.',
       actions: [installAction('Install agent team', 'native-team'), action('package', 'Download package'),
         action('build', 'Optional custom application')] };
-    if (nativeTeamPackagePlan(guide)) return { title: 'Your agent team package is available',
+    if (agentTeamAvailable && nativeTeamPackagePlan(guide)) return { title: 'Your agent team package is available',
       detail: 'Get the Console and team from your current plan. Use the builder when your outcomes need custom screens or application code.',
       actions: [action('package', 'Get your agent team'), action('build', 'Optional custom application')] };
     if (guide.readiness?.context_ready === true && (guide.readiness?.decision_blockers?.length || 0) > 0) return { kind: 'discovery', title: 'Resolve your open setup decisions',

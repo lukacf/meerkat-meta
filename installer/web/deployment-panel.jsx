@@ -48,11 +48,13 @@ function canonicalInstallDestination(value, homeDirectory) {
 }
 
 export function DeploymentPanel({ state, plan, build, designBusy, pendingManual, Icon, onReceipt, onRemoteReceipt, remoteTargetRef, onRepairReceipt, onChooseCloudProject,
-  initialSourceKind = "application", sourceNavigation = null, selectionScope }) {
+  initialSourceKind = "application", sourceNavigation = null, selectionScope, agentTeamAvailable = true }) {
   const selectionToken = selectionScope?.token();
   const selectionBlocked = !guideSelectionAvailable(selectionScope, state, selectionToken);
   const optionsRequest = useRef(0);
-  const [sourceKind, setSourceKind] = useState(initialSourceKind);
+  const [chosenSourceKind, setSourceKind] = useState(initialSourceKind);
+  // A Forge that offers no agent team package installs applications only.
+  const sourceKind = agentTeamAvailable ? chosenSourceKind : "application";
   const sourceChoice = useRef({ guideId: state.id, explicit: false });
   const sourceKey = deploymentSourceKey(build, state, sourceKind);
   const nativeTeam = sourceKind === "native-team";
@@ -863,12 +865,12 @@ export function DeploymentPanel({ state, plan, build, designBusy, pendingManual,
   return <section className="deployment-panel" aria-disabled={selectionBlocked} {...guideSelectionEvents(selectionScope, state, selectionToken)} aria-label="Installation and operation" data-deployment-status={receipt?.status || handoff?.status || "not-installed"}>
     {showInstallation && <>
     <span className="setup-eyebrow">INSTALL & RUN</span>
-    <fieldset className="deployment-run-mode"><legend>What to install</legend>
+    {agentTeamAvailable && <fieldset className="deployment-run-mode"><legend>What to install</legend>
       <label><input type="radio" name="deployment-source" value="native-team" checked={nativeTeam}
         disabled={selectionBlocked || busy} onChange={() => chooseSource("native-team")} /> Agent team - Console, agents and configured tools</label>
       <label><input type="radio" name="deployment-source" value="application" checked={!nativeTeam}
         disabled={selectionBlocked || busy} onChange={() => chooseSource("application")} /> Custom application - independently checked build</label>
-    </fieldset>
+    </fieldset>}
     {receipt && deploymentSourceKind(receipt) !== sourceKind && <p className="deployment-note" role="status">{nativeTeam
       ? "Agent team is selected for a separate installation. Your installed custom application and its controls are shown below."
       : "Custom application is selected for a separate installation. Your installed agent team and its controls are shown below."}</p>}

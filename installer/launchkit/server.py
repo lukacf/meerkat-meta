@@ -428,7 +428,7 @@ def cloud_capability() -> dict:
 @app.get("/api/capabilities")
 async def capabilities():
     return {"planner": planner_capability(), "platform": "mac" if platform.system() == "Darwin" else "linux", "gcp": await asyncio.to_thread(cloud_capability), "version": VERSION,
-            "rehearsal": {"start_request_replay": True}}
+            "rehearsal": {"start_request_replay": True}, "agent_team": deployment.agent_team_availability()}
 
 
 class BlueprintBody(BaseModel):
@@ -1679,9 +1679,17 @@ async def validate_blueprint(value: dict):
         raise HTTPException(422, str(error)) from None
 
 
+def require_agent_team_export():
+    """Refuse an agent team package where this Forge does not offer one."""
+    availability = deployment.agent_team_availability()
+    if not availability["available"]:
+        raise HTTPException(409, availability["reason"])
+
+
 @app.post("/api/blueprint/package")
 async def blueprint_package(value: dict):
     from .compiler import build_archive
+    require_agent_team_export()
     spec = blueprint_or_error(value)
     try:
         archive = await asyncio.to_thread(build_archive, spec)
@@ -2007,6 +2015,7 @@ async def preview(spec: DeploymentSpec):
 @app.post("/api/package")
 async def package(spec: DeploymentSpec):
     from .generator import build_archive
+    require_agent_team_export()
     return Response(build_archive(spec), media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{spec.project.slug}.zip"'})
 
 
