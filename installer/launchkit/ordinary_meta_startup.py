@@ -54,6 +54,9 @@ class OrdinaryMetaStartup:
     """
 
     require_tool_policy_source = False
+    # Its Console keeps the configured password login. Native Console login
+    # enrollment needs a selected Toolkit runtime, which this path never has.
+    console_login = False
 
     def __init__(self, *, project_lease, accepted_source, gateway,
                  definition, compiled_policies, startup_timeout,
