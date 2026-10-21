@@ -20,18 +20,22 @@ from .runtime_selection import candidate_selection, selected_runtime_artifacts
 
 
 PUBLIC_EXTRA = {"LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_NOTICES.md"}
+# The application's ordinary Meta RPC gateway, paired with the selected Meta SDK.
+ORDINARY_GATEWAY = "vendor/ordinary/rpc_gateway"
 MAX_TOTAL = 4 * 1024 * 1024 * 1024
 MAX_FILES = 8192
 
 
-def candidate_readme(guide, target, origin):
+def candidate_readme(guide, target, origin, *, ordinary=False):
     host = ("Linux x86_64 with glibc 2.39 or newer" if target.target == "linux-x86_64"
         else "Apple Silicon macOS 13.5 or newer")
+    ordinary_note = (f"\nApplications without a connection setup helper use the included Meta "
+        f"{target.meta.version} RPC gateway with that Meta SDK.\n" if ordinary else "")
     return f"""# Meta Forge local candidate
 
 The Forge guide uses Core {guide.core_version} and Meta {guide.version}. The
 application uses the separately selected Meta {target.meta.version} and Toolkit
-{target.toolkit.version} SDK pair. Its native product origin is `{origin}`.
+{target.toolkit.version} SDK pair. Its native product origin is `{origin}`.{ordinary_note}
 Artifact integrity and source checks do not establish that a
 particular installed application has completed its useful task.
 
@@ -134,7 +138,7 @@ def _ordinary(path, limit, *, allow_empty=False):
 def _public_path(name):
     if name in PUBLIC_EXTRA:
         return True
-    if name.startswith("vendor/product/") or name in {"vendor/guide/rpc_gateway", guide_sdk.WHEEL}:
+    if name.startswith("vendor/product/") or name in {"vendor/guide/rpc_gateway", ORDINARY_GATEWAY, guide_sdk.WHEEL}:
         from pathlib import PurePosixPath
 
         path = PurePosixPath(name)
@@ -163,18 +167,22 @@ def _pinned_guide_sdk():
         raise legacy.DistributionError(str(exc)) from exc
 
 
-def package(root, target, guide, output):
+def package(root, target, guide, output, *, ordinary_gateway=None):
     """Select public source and the actual owner's complete product closure.
 
     The target and guide selection come from the original trusted packaging
     owner. The existing native reader still validates the producer records and
     exact wheel/source/dependency bytes. This is not installed useful-work proof.
+    An optional ordinary gateway is the owner's Meta RPC gateway release for
+    the target's Meta SDK version, for applications without a setup helper.
     """
     from .bootstrap import SelectedGuideRuntime
+    from .connect_installer_caller import ExactFile
     from .dom_check import prepare_dependencies
 
     root, output = Path(root).resolve(strict=True), Path(output).absolute()
     if (type(target) is not MetaToolkitRuntimeTarget or type(guide) is not SelectedGuideRuntime
+            or ordinary_gateway is not None and type(ordinary_gateway) is not ExactFile
             or output.exists() or output.is_symlink()):
         raise legacy.DistributionError("Select exact product inputs and a fresh archive output.")
     _pinned_guide_sdk()
@@ -223,9 +231,12 @@ def package(root, target, guide, output):
         for pin in target.dependency_wheels]
     source_files["vendor/guide/rpc_gateway"] = guide.gateway.path
     source_files[guide_sdk.WHEEL] = root / guide_sdk.WHEEL
+    if ordinary_gateway is not None:
+        source_files[ORDINARY_GATEWAY] = ordinary_gateway.path
     with tempfile.TemporaryDirectory(prefix="forge-product-dom-") as temporary:
         candidate_document = Path(temporary).resolve(strict=True) / "README.md"
-        candidate_document.write_text(candidate_readme(guide, target, artifacts.origin))
+        candidate_document.write_text(candidate_readme(guide, target, artifacts.origin,
+            ordinary=ordinary_gateway is not None))
         candidate_document.chmod(0o600)
         source_files["README.md"] = candidate_document
         dependencies, dom_hash = prepare_dependencies(Path(temporary).resolve(), source=root.parent / "console")
@@ -248,7 +259,7 @@ def package(root, target, guide, output):
             limit = MAX_PRODUCT_ARCHIVE_BYTES if name.startswith("vendor/") else legacy.MAX_FILE
             hashed, size = _ordinary(path, limit, allow_empty=not name.startswith("vendor/"))
             file_records[name] = {"sha256": hashed, "bytes": size}
-            modes[name] = dom_files.get(name, 0o700 if name == "vendor/guide/rpc_gateway" else
+            modes[name] = dom_files.get(name, 0o700 if name in {"vendor/guide/rpc_gateway", ORDINARY_GATEWAY} else
                 0o755 if name == "start.sh" else 0o600 if name.startswith("vendor/product/") else 0o644)
             total += size
         if len(source_files) > MAX_FILES or total > MAX_TOTAL:
@@ -258,6 +269,12 @@ def package(root, target, guide, output):
         if file_records[guide_sdk.WHEEL] != {"sha256": guide_sdk.SHA256, "bytes": guide_sdk.SIZE}:
             raise legacy.DistributionError("The Guide client SDK differs from its reviewed wheel.")
         guide_hash, guide_size = _ordinary(guide.gateway.path, MAX_PRODUCT_ARCHIVE_BYTES)
+        ordinary = None
+        if ordinary_gateway is not None:
+            if file_records[ORDINARY_GATEWAY]["sha256"] != ordinary_gateway.sha256:
+                raise legacy.DistributionError("The ordinary Meta gateway differs from its selected release bytes.")
+            ordinary = {"version": target.meta.version,
+                "gateway": {"path": ORDINARY_GATEWAY, **file_records[ORDINARY_GATEWAY]}}
         data = {"format": FORMAT, "product": {"selection": selection, "paths": paths},
             "guide": {"version": guide.version, "core_version": guide.core_version,
                 "meta_source": guide.meta_source, "core_source": guide.core_source,
@@ -267,6 +284,8 @@ def package(root, target, guide, output):
             "dom_dependencies_sha256": dom_hash, "files": file_records, "file_modes": modes,
             "support": {"native_target": target.target, "native_origin": artifacts.origin,
                 "installed_use_accepted": False}}
+        if ordinary is not None:
+            data["ordinary"] = ordinary
         content = (json.dumps(data, sort_keys=True, indent=2, ensure_ascii=True) + "\n").encode()
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("xb") as stream, zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -301,7 +320,7 @@ def verify(root):
     data = json.loads(raw, object_pairs_hook=legacy._unique_object)
     names = {"format", "product", "guide", "frontend_source_sha256", "dom_dependencies_sha256",
         "files", "file_modes", "support"}
-    if (type(data) is not dict or data.keys() != names or data["format"] != FORMAT
+    if (type(data) is not dict or data.keys() not in (names, names | {"ordinary"}) or data["format"] != FORMAT
             or type(data["files"]) is not dict or type(data["file_modes"]) is not dict
             or data["files"].keys() != data["file_modes"].keys()
             or not (legacy.REQUIRED | {"LICENSE-MIT", "LICENSE-APACHE", "vendor/guide/rpc_gateway"}) <= data["files"].keys()
@@ -342,12 +361,21 @@ def verify(root):
                 os.fchmod(descriptor, mode)
         finally:
             os.close(descriptor)
-    for parent in (root / "vendor/guide", root / "vendor/product"):
+    ordinary = data.get("ordinary")
+    if (ORDINARY_GATEWAY in data["files"]) != (ordinary is not None) or ordinary is not None and (
+            type(ordinary) is not dict or ordinary.keys() != {"version", "gateway"}
+            or data["file_modes"][ORDINARY_GATEWAY] != 0o700
+            or ordinary["gateway"] != {"path": ORDINARY_GATEWAY, **data["files"][ORDINARY_GATEWAY]}):
+        raise legacy.DistributionError("The ordinary Meta gateway differs from its selected bytes.")
+    for parent in (root / "vendor/guide", root / "vendor/product",
+            *((root / "vendor/ordinary",) if ordinary is not None else ())):
         if parent.is_symlink() or not parent.is_dir() or parent.stat().st_uid != os.getuid():
             raise legacy.DistributionError("The product runtime parent is not an owned ordinary directory.")
         parent.chmod(0o700)
     target = relocate_selection(data["product"]["selection"], data["product"]["paths"], root)
     selected_runtime_artifacts(target)
+    if ordinary is not None and ordinary["version"] != target.meta.version:
+        raise legacy.DistributionError("The ordinary Meta gateway is not the selected Meta SDK's release.")
     guide = data["guide"]
     if (type(guide) is not dict or guide.keys() != {"version", "core_version", "meta_source", "core_source", "gateway", "sdk"}
             or guide["version"] != guide_sdk.SELECTED_VERSION

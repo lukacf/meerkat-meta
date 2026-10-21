@@ -18,6 +18,7 @@ _private_model_route = None
 _private_model_custody = None
 _selected_target = None
 _selected_root = None
+_selected_ordinary_gateway = None
 
 
 def configure_private_model_route(route, custody):
@@ -67,7 +68,7 @@ def relocate_selection(selection, paths, root):
 
 def open_selection(root=None):
     """Verify public package bytes, then join the original native selection."""
-    global _selected_target, _selected_root
+    global _selected_target, _selected_root, _selected_ordinary_gateway
     from . import distribution
     from .bootstrap import (SelectedGuideRuntime, configure_selected_guide_runtime,
         selected_guide_runtime)
@@ -91,13 +92,31 @@ def open_selection(root=None):
         core_source=guide["core_source"], _model_route=_private_model_route,
         _model_custody=_private_model_custody)
     configure_selected_guide_runtime(selected)
+    ordinary = data.get("ordinary")
+    _selected_ordinary_gateway = (None if ordinary is None else
+        ExactFile(_local(root, ordinary["gateway"]["path"]), ordinary["gateway"]["sha256"]))
     _selected_target, _selected_root = target, root
     return target
 
 
+def selected_ordinary_gateway():
+    """The package's Meta RPC gateway for the selected SDK, or None."""
+    if _selected_target is None:
+        raise ValueError("Open the packaged runtime before selecting its ordinary gateway.")
+    return _selected_ordinary_gateway
+
+
 def create_app():
-    """Shipping Uvicorn factory entry: select before importing the server."""
+    """Shipping Uvicorn factory entry: select before importing the server.
+
+    A package that includes the selected Meta release's RPC gateway also
+    builds ordinary applications, those without a connection setup helper.
+    """
     selected = open_selection()
+    gateway = selected_ordinary_gateway()
     server = importlib.import_module("launchkit.server")
-    server.select_local_application_runtime(selected)
+    if gateway is None:
+        server.select_local_application_runtime(selected)
+    else:
+        server.select_local_application_runtime(selected, ordinary_meta_gateway=gateway)
     return server.app
