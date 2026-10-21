@@ -559,6 +559,9 @@ class LocalApplicationRegistry:
         host = self.selected_host(guide_id, deployment_id, staged_update_allowed=False)
         if host is None:
             raise CustodyError("This installation has no trusted replacement source owner.")
+        if not callable(getattr(host, "_selected_replacement", None)):
+            # A helperless application has no installed replacement owner.
+            raise CustodyError("The original installation cannot be redirected to another build or source owner.")
         result = host._selected_replacement(guide_id, deployment_id, update_id)
         if self.selected_host(guide_id, deployment_id, staged_update_allowed=False) is not host:
             raise CustodyError("The original installed replacement owner changed.")

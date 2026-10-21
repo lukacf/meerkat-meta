@@ -457,3 +457,19 @@ async def test_only_a_pending_staged_update_keeps_the_original_owner(ordinary_re
     update_receipt(directory, update={**staged["update"], "status": "snapshotting"})
     with pytest.raises(CustodyError, match="cannot be redirected to another build or source owner"):
         f.registry._selected_startup(saved["id"], directory.name)
+
+
+async def test_apply_after_reload_refuses_a_helperless_staged_update_cleanly(ordinary_registry, monkeypatch):
+    f = ordinary_registry
+    saved = ordinary_guide(f)
+    result = await build(f, saved)
+    await accept_source_fixture(f, result)
+    directory, _ = await install_fixture(f, saved, result, monkeypatch)
+    staged = await staged_improvement(f, saved, result, directory)
+    store, implementation, service, owner = reloaded_registry(f)
+    monkeypatch.setattr(service, "_launch", lambda *args, **kwargs: None)
+    # After a Forge restart, Start retains the staged binding as the original.
+    await service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
+    with pytest.raises(CustodyError, match="cannot be redirected to another build or source owner"):
+        owner._selected_replacement(saved["id"], directory.name, staged["update"]["update_id"])
+    assert deployment.read_receipt(directory)["update"]["update_id"] == staged["update"]["update_id"]
