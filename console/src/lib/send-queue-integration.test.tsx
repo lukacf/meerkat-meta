@@ -8,6 +8,7 @@ import { createConsoleSendAttempt, beginConsoleSendAttempt } from "../../../pack
 import { consoleSendStorageKey, saveConsoleSendAttempts } from "./send-attempt-storage";
 import { createConsoleContextRecord } from "../../../packages/console-core/src/context-record";
 import { ACCEPTANCE_NOTICE_GRACE_MS, PendingStack, type PendingItem } from "../panels/PendingStack";
+import { idleSettleClock } from "./idle-reconcile";
 
 const identity = "identity:queue-agent";
 function seed(twoPanes = false) {
@@ -2136,5 +2137,244 @@ describe("checked access saves", () => {
       expect(await screen.findByText("alice@example.test", { exact: true })).toBeVisible();
       expect(screen.getByTestId("access-edit-admins")).toBeEnabled();
     });
+  });
+});
+
+describe("idle status poll settles a fold the frames left open", () => {
+  const scope = { identity, runtimeKey: "owner-runtime", sessionId: "owner-session", sourceKind: "console_event" as const };
+  // The user's turn stops at a host callback and a runtime-started
+  // continuation finishes it under its own lineage; or the user's turn
+  // settles and a frame with no lifecycle ids arrives before the
+  // continuation. Either way no terminal closes what the frames opened.
+  const stuckFrames: Record<"paused" | "idless", ConsoleFrame[]> = {
+    paused: [
+      { ...scope, id: "q-input", event: "user_input", interactionId: "question", status: "delivered", timestampMs: 1000, data: { content: "Set it up and answer" } },
+      { ...scope, id: "q-start", event: "run_started", interactionId: "question", runId: "question-run", timestampMs: 1001, data: {} },
+      { ...scope, id: "q-tool", event: "tool_call_requested", interactionId: "question", runId: "question-run", timestampMs: 1002, data: { id: "setup", name: "setup_selected_install" } },
+      { ...scope, id: "q-turn", event: "turn_completed", interactionId: "question", runId: "question-run", timestampMs: 1003, data: { stop_reason: "tool_use" } },
+      { ...scope, id: "q-pause", event: "interaction_callback_pending", interactionId: "question", timestampMs: 1004, data: {} },
+      { ...scope, id: "c-start", event: "run_started", runId: "continuation-run", timestampMs: 2000, data: {} },
+      { ...scope, id: "c-text", event: "text_complete", runId: "continuation-run", timestampMs: 2001, data: { content: "Here is the answer" } },
+      { ...scope, id: "c-turn", event: "turn_completed", runId: "continuation-run", timestampMs: 2002, data: { stop_reason: "end_turn" } },
+      { ...scope, id: "c-end", event: "interaction_complete", runId: "continuation-run", timestampMs: 2003, data: {} },
+    ],
+    idless: [
+      { ...scope, id: "q-input", event: "user_input", interactionId: "question", status: "delivered", timestampMs: 1000, data: { content: "Set it up and answer" } },
+      { ...scope, id: "q-start", event: "run_started", interactionId: "question", runId: "question-run", timestampMs: 1001, data: {} },
+      { ...scope, id: "q-end", event: "interaction_complete", interactionId: "question", runId: "question-run", timestampMs: 1004, data: {} },
+      { identity, sourceKind: "console_event", id: "setup-done", event: "tool_execution_completed", timestampMs: 1500, data: { id: "setup", name: "setup_selected_install" } },
+      { ...scope, id: "c-start", event: "run_started", runId: "continuation-run", timestampMs: 2000, data: {} },
+      { ...scope, id: "c-text", event: "text_complete", runId: "continuation-run", timestampMs: 2001, data: { content: "Here is the answer" } },
+      { ...scope, id: "c-end", event: "interaction_complete", runId: "continuation-run", timestampMs: 2003, data: {} },
+    ],
+  };
+  const WORKING = "Queue agent is working";
+  // The settlement's clock: each poll below runs a regular poll interval
+  // after the previous one unless a test says otherwise.
+  let nowMs = 1_000_000;
+  const realNow = idleSettleClock.now;
+  beforeEach(() => { nowMs = 1_000_000; idleSettleClock.now = () => nowMs; });
+  afterEach(() => { idleSettleClock.now = realNow; });
+  const BUSY = { response_phase: "waiting", run_state: "run_open" } as const;
+  const IDLE = { response_phase: null, run_state: "idle" } as const;
+
+  function harness(frames: ConsoleFrame[]) {
+    const send = vi.fn(async (input: { identity: string }) => ({ interaction_id: "next-turn", identity: input.identity }));
+    const fake = transport(send as never);
+    let status: { response_phase: string | null; run_state: string } = { ...BUSY };
+    const baseExperience = fake.loadExperience;
+    const loadExperience = vi.fn(async () => {
+      const base = await baseExperience();
+      return {
+        ...base,
+        identity_status: { rows: [{ identity, state: "running", addressability: "addressable",
+          progress: { run_state: status.run_state, in_flight_work: status.run_state === "idle" ? 0 : 1 } }] },
+        agent_sidebar: { ...base.agent_sidebar, live_snapshot: { ...base.agent_sidebar?.live_snapshot,
+          agents: base.agent_sidebar!.live_snapshot!.agents!.map(agent => ({ ...agent, response_phase: status.response_phase })) } },
+      } as never;
+    });
+    fake.loadExperience = loadExperience;
+    const live: { receive?: (frame: never) => void } = {};
+    fake.subscribeTimeline = (_input, next) => { live.receive = next; return () => {}; };
+    fake.queryTimeline = async () => ({ available: true, frames });
+    let trigger = 0;
+    const push = async (frame: Partial<ConsoleFrame>) => {
+      await act(async () => { live.receive?.({ ...scope, data: {}, ...frame } as never); });
+    };
+    // One status poll, triggered by a frame that is not part of the
+    // member's conversation (it does not enter the member's log).
+    const poll = async (next: { response_phase: string | null; run_state: string }, gapMs = 15_000) => {
+      nowMs += gapMs;
+      status = { ...next };
+      const before = loadExperience.mock.calls.length;
+      trigger += 1;
+      await act(async () => {
+        live.receive?.({ id: `poll-${trigger}`, event: "state_changed", identity, timestampMs: 9_000_000 + trigger, data: {} } as never);
+      });
+      await waitFor(() => expect(loadExperience.mock.calls.length).toBeGreaterThan(before), { timeout: 2_000 });
+      await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, 50)); });
+    };
+    const start = async () => {
+      render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
+      await waitFor(() => expect(live.receive).toBeTypeOf("function"));
+    };
+    return { fake, send, loadExperience, push, poll, start };
+  }
+  const working = () => screen.queryByLabelText(WORKING);
+
+  it.each(["paused", "idless"] as const)("Working clears on the second idle poll in a row, not the first (%s)", async (variant) => {
+    const h = harness(stuckFrames[variant]);
+    await h.start();
+    await screen.findByLabelText(WORKING);
+    await h.poll(BUSY);
+    expect(working()).not.toBeNull();
+    await h.poll(IDLE);
+    expect(working()).not.toBeNull();
+    await h.poll(IDLE);
+    await waitFor(() => expect(working()).toBeNull());
+  });
+
+  it("two idle polls 150 ms apart do not settle; one a poll interval after the first does", async () => {
+    const h = harness(stuckFrames.paused);
+    await h.start();
+    await screen.findByLabelText(WORKING);
+    await h.poll(IDLE);
+    // Another member's lifecycle event triggers a poll right away.
+    await h.poll(IDLE, 150);
+    expect(working()).not.toBeNull();
+    await h.poll(IDLE, 150);
+    expect(working()).not.toBeNull();
+    await h.poll(IDLE, 15_000);
+    await waitFor(() => expect(working()).toBeNull());
+  });
+
+  it.each(["paused", "idless"] as const)("a send queued behind the stale fold leaves once two polls report idle (%s)", async (variant) => {
+    const h = harness(stuckFrames[variant]);
+    await h.start();
+    await screen.findByLabelText(WORKING);
+    await compose("after the continuation");
+    await screen.findByTestId("pending-stack");
+    await h.poll(BUSY);
+    await h.poll(IDLE);
+    expect(h.send).not.toHaveBeenCalled();
+    await h.poll(IDLE);
+    await waitFor(() => expect(h.send).toHaveBeenCalledTimes(1), { timeout: 3_000 });
+  });
+
+  it("nothing closes while the server reports a live run (a response phase, or an open run)", async () => {
+    const h = harness(stuckFrames.paused);
+    await h.start();
+    await screen.findByLabelText(WORKING);
+    for (const live of [
+      { response_phase: "waiting", run_state: "idle" },
+      { response_phase: null, run_state: "run_open" },
+      { response_phase: "generating", run_state: "run_open" },
+    ]) {
+      await h.poll(live);
+      await h.poll(live);
+      expect(working()).not.toBeNull();
+    }
+  });
+
+  it("a same-id resume is unchanged: the paused turn stays Working and its own terminal settles it", async () => {
+    const paused = stuckFrames.paused.slice(0, 5);
+    const h = harness(paused);
+    await h.start();
+    await screen.findByLabelText(WORKING);
+    // The server reports a paused interaction as not idle.
+    for (let i = 0; i < 3; i++) await h.poll({ response_phase: "tool-executing", run_state: "idle" });
+    expect(working()).not.toBeNull();
+    // The host answered the callback; the SAME interaction resumes and ends.
+    await h.push({ id: "r-start", event: "run_started", interactionId: "question", runId: "resumed-run", timestampMs: 3000, data: { input: { kind: "pending_tool_results" } } });
+    await h.push({ id: "r-delta", event: "text_delta", interactionId: "question", runId: "resumed-run", timestampMs: 3001, data: { delta: "Done" } });
+    expect(working()).not.toBeNull();
+    await h.push({ id: "r-end", event: "interaction_complete", interactionId: "question", runId: "resumed-run", timestampMs: 3002, data: {} });
+    await waitFor(() => expect(working()).toBeNull());
+    await h.poll(IDLE);
+    await h.poll(IDLE);
+    await compose("a follow-up");
+    await waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("pending-stack")).toBeNull();
+  });
+
+  it("a normal busy turn is unchanged: no idle poll settles it mid-turn", async () => {
+    const h = harness([]);
+    await h.start();
+    await h.poll(IDLE);
+    await compose("a normal question");
+    await waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    await h.push({ id: "t-input", event: "user_input", interactionId: "next-turn", status: "delivered", timestampMs: 5000, data: { content: "a normal question" } });
+    await h.push({ id: "t-start", event: "run_started", interactionId: "next-turn", runId: "turn-run", timestampMs: 5001, data: {} });
+    await screen.findByLabelText(WORKING);
+    await h.poll(BUSY);
+    await h.poll(BUSY);
+    expect(working()).not.toBeNull();
+    // A run before its first output can read idle once; a frame then
+    // arrives before the next poll, so the count starts again.
+    await h.poll(IDLE);
+    await h.push({ id: "t-delta", event: "text_delta", interactionId: "next-turn", runId: "turn-run", timestampMs: 5002, data: { delta: "Thinking" } });
+    await h.poll(IDLE);
+    expect(working()).not.toBeNull();
+    await h.push({ id: "t-end", event: "interaction_complete", interactionId: "next-turn", runId: "turn-run", timestampMs: 5003, data: {} });
+    await waitFor(() => expect(working()).toBeNull());
+  });
+
+  it("a runtime-started run with no output yet is not settled by the first idle poll, only by the second", async () => {
+    const h = harness([]);
+    await h.start();
+    await h.push({ id: "rt-start", event: "run_started", runId: "runtime-run", timestampMs: 6000, data: {} });
+    await screen.findByLabelText(WORKING);
+    await h.poll(IDLE);
+    expect(working()).not.toBeNull();
+    await h.poll(IDLE);
+    await waitFor(() => expect(working()).toBeNull());
+  });
+
+  it("a rebuild of the fold after reconciliation stays idle", async () => {
+    const h = harness(stuckFrames.paused);
+    await h.start();
+    await screen.findByLabelText(WORKING);
+    await h.poll(IDLE);
+    await h.poll(IDLE);
+    await waitFor(() => expect(working()).toBeNull());
+    // A history snapshot replays the whole fold; a late frame of the settled
+    // turn arrives out of order.
+    await h.push({ id: "late-tool", event: "tool_execution_completed", interactionId: "question", runId: "question-run", timestampMs: 1600, data: { id: "setup", name: "setup_selected_install" } });
+    await h.push({ id: "history", event: "assistant_history_snapshot", timestampMs: 7000, data: { complete: true, session_id: "owner-session" } });
+    await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, 50)); });
+    expect(working()).toBeNull();
+    // The rebuilt busy fold stays idle too: a new message is sent, not queued.
+    await compose("after the rebuild");
+    await waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("pending-stack")).toBeNull();
+  });
+
+  it("a frame between two idle polls starts the count again", async () => {
+    const h = harness(stuckFrames.idless);
+    await h.start();
+    await screen.findByLabelText(WORKING);
+    await h.poll(IDLE);
+    await h.push({ identity, sourceKind: "console_event", id: "late-idless", event: "tool_result_received", timestampMs: 2500, data: {} });
+    await h.poll(IDLE);
+    expect(working()).not.toBeNull();
+    await h.poll(IDLE);
+    await waitFor(() => expect(working()).toBeNull());
+  });
+
+  it("a frame that arrives while the idle poll is in flight keeps the fold", async () => {
+    const h = harness(stuckFrames.paused);
+    await h.start();
+    await screen.findByLabelText(WORKING);
+    await h.poll(IDLE);
+    let answer!: (value: never) => void;
+    const idle = await h.loadExperience();
+    h.loadExperience.mockImplementationOnce(() => new Promise(resolve => { answer = resolve as never; }));
+    const before = h.loadExperience.mock.calls.length;
+    await h.push({ id: "trigger-idle", event: "state_changed", timestampMs: 9_500_000, data: {} });
+    await waitFor(() => expect(h.loadExperience.mock.calls.length).toBeGreaterThan(before), { timeout: 2_000 });
+    // A new turn's start arrives before the poll answers.
+    await h.push({ id: "next-start", event: "run_started", interactionId: "next", runId: "next-run", timestampMs: 4000, data: {} });
+    await act(async () => { answer(idle); await new Promise((resolve) => window.setTimeout(resolve, 50)); });
+    expect(working()).not.toBeNull();
   });
 });

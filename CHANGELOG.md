@@ -1230,6 +1230,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Console: a member's chat no longer stays "working" after the member
+  finished. When a turn stopped at a host callback (an approved setup, for
+  example) and the runtime continued it on its own, the continuation's
+  frames closed only their own run, so the paused turn (or a frame without
+  lifecycle ids) kept the chat "working" and queued every new message. The
+  Console now treats the member status poll as the idle signal: when two
+  polls at least 10 s apart report no response phase and no open run, with
+  no new frame for the member since the first, every frame the Console had
+  seen is settled, the working indicator clears and a queued message is
+  sent. The settled point survives a full rebuild of the activity fold. A
+  poll that reports the member busy (including a turn paused at a
+  callback), a frame that arrives while a poll is in flight or between the
+  two polls, and the Console's own send in flight each leave the chat as it
+  is.
 - A Meta-hosted member's own mob operator tools (`spawn_member`,
   `spawn_many_members` and the rest) admit against its session's mob
   operator authority, including a host's narrowing of it. Meerkat 0.9.4
@@ -1358,8 +1372,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Meta Forge accepts a `meerkat-toolkit` 0.9.4 wheel, whose native host
   requires `meerkat-meta==0.9.4`, instead of refusing every Toolkit wheel but
   0.9.0; the exact version, METADATA, RECORD and payload checks are unchanged.
-- Meta Forge's "Rebuild with updated runtime" moves an application built from a
-  host-selected Meta and Toolkit runtime to the installer's current runtime.
+- Meta Forge's "Rebuild with updated runtime" builds a new package of an
+  application built from a host-selected Meta and Toolkit runtime on the
+  installer's current runtime (see Known limitations).
   It sent the legacy framework refresh, which the server refuses for such an
   application ("Replacing the selected candidate needs a separately bound
   runtime transition"); it now sends the host-owned runtime refresh of the
@@ -1670,6 +1685,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   turn ends. Install it with `UnifiedRuntime::install_identity_first_context`
   (or let the builder's identity-first composition make the runtime), and
   register peer mobs with `register_peer_runtime`.
+- Meta Forge cannot yet update a Meta Toolkit product application after its
+  setup. "Stage accepted update" refuses ("This application retains a Fresh
+  bootstrap attempt..."). Applying a runtime update built with "Rebuild with
+  updated runtime" to an installed product application is also refused, as
+  before 0.9.4. To run a newer build, install it into a new empty folder and
+  set it up again there. The new installation starts with a fresh setup and
+  none of the old installation's conversations or application data. The old
+  folder keeps its setup, history and data unchanged and can still be started.
+  Stop the old application before you start the new one. An application on the
+  Meta Toolkit Connect route that was installed before 0.9.4 keeps its Console
+  without the "Connect setup" button; its setup page stays at
+  /host/toolkit/setup on its Console address.
 
 ## [0.9.3] - 2026-10-18
 

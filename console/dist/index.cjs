@@ -43993,146 +43993,6 @@ async function withConsoleSendStorageLock(key, update) {
   }
 }
 
-// src/ConsoleApp.tsx
-var import_react49 = __toESM(require("react"));
-
-// src/lib/agents.ts
-function buildConsoleIdentityAliasMap(agents) {
-  const map4 = /* @__PURE__ */ new Map();
-  for (const agent of agents) {
-    const canonical = (agent.identity || agent.member_id || agent.agent_id || "").trim();
-    if (!canonical) continue;
-    const labelIdentity = typeof agent.labels?.agent_identity === "string" ? agent.labels.agent_identity.trim() : "";
-    for (const alias of [agent.identity, agent.member_id, agent.agent_id, labelIdentity]) {
-      const key = alias?.trim();
-      if (key && !map4.has(key)) map4.set(key, canonical);
-    }
-  }
-  return map4;
-}
-function canonicalConsoleIdentityFromMap(identity, aliases) {
-  const normalized = identity?.trim() || "";
-  if (!normalized) return "";
-  return aliases.get(normalized) ?? normalized;
-}
-function normalizeModelCapabilities(entry) {
-  const record8 = entry && typeof entry === "object" ? entry : {};
-  const caps = record8.model_capabilities && typeof record8.model_capabilities === "object" ? record8.model_capabilities : {};
-  return { image_input: caps.image_input === true };
-}
-function normalizeAgents(experience, modules) {
-  const identityStatusRows = Array.isArray(experience?.identity_status?.rows) ? experience.identity_status.rows : [];
-  const normalizedIdentityStatusRows = identityStatusRows.map((entry) => normalizeIdentityStatusRow(entry)).filter((entry) => entry !== null);
-  const identityStatusByIdentity = new Map(
-    normalizedIdentityStatusRows.map((row) => [row.identity, row])
-  );
-  const snapshotAgents = experience?.agent_sidebar?.live_snapshot?.agents;
-  if (Array.isArray(snapshotAgents) && snapshotAgents.length > 0) {
-    const agents = snapshotAgents.map((entry) => {
-      const entryIdentity = typeof entry.identity === "string" ? entry.identity.trim() : "";
-      const entryMemberId = typeof entry.member_id === "string" ? entry.member_id.trim() : "";
-      const entryLabels = entry.labels && typeof entry.labels === "object" ? entry.labels : {};
-      const durableAgentIdentity = typeof entryLabels.agent_identity === "string" ? entryLabels.agent_identity.trim() : "";
-      const statusRow = identityStatusByIdentity.get(durableAgentIdentity) || identityStatusByIdentity.get(entryIdentity) || identityStatusByIdentity.get(entryMemberId) || normalizeIdentityStatusRow(entry);
-      const watchFields = normalizeSidebarWatchFields(entry);
-      const responsePhase = normalizeResponsePhase(entry.response_phase);
-      const modelCapabilities = entry.model_capabilities !== void 0 ? normalizeModelCapabilities(entry) : normalizeModelCapabilities(identityStatusRows.find((row) => {
-        const normalized = normalizeIdentityStatusRow(row);
-        return normalized?.identity === statusRow?.identity;
-      }));
-      return {
-        ...statusRow?.identity ? { identity: statusRow.identity } : durableAgentIdentity ? { identity: durableAgentIdentity } : entry.identity ? { identity: String(entry.identity) } : {},
-        agent_id: String(entry.agent_id || statusRow?.identity || durableAgentIdentity || entry.identity || entry.member_id || ""),
-        member_id: String(entry.member_id || statusRow?.identity || entry.identity || entry.agent_id || ""),
-        ...typeof entry.session_id === "string" && entry.session_id.trim() ? { session_id: entry.session_id.trim() } : {},
-        label: String(entry.label || statusRow?.display_name || entry.display_name || statusRow?.identity || entry.identity || entry.member_id || entry.agent_id || "unknown"),
-        kind: String(entry.kind || statusRow?.role || entry.role || "module_agent"),
-        ...statusRow?.role !== void 0 ? { role: statusRow.role } : entry.role !== void 0 ? { role: String(entry.role) } : {},
-        ...statusRow?.state !== void 0 ? { state: statusRow.state } : entry.state !== void 0 ? { state: String(entry.state) } : {},
-        ...statusRow?.addressability ? { addressability: statusRow.addressability } : {},
-        ...statusRow?.generation !== void 0 ? { generation: statusRow.generation } : {},
-        ...statusRow?.progress !== void 0 ? { progress: statusRow.progress } : {},
-        ...(entry.response_phase === null || responsePhase !== null) && { response_phase: responsePhase },
-        ...entry.wired_to !== void 0 && { wired_to: entry.wired_to },
-        ...statusRow?.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : entry.labels !== void 0 ? { labels: entry.labels } : {},
-        ...entry.group !== void 0 && { group: String(entry.group) },
-        ...entry.subgroup !== void 0 && { subgroup: String(entry.subgroup) },
-        ...entry.addressable !== void 0 ? { addressable: Boolean(entry.addressable) } : statusRow?.addressability ? { addressable: statusRow.addressability === "addressable" } : {},
-        ...entry.affordances !== void 0 && { affordances: entry.affordances },
-        model_capabilities: modelCapabilities,
-        ...watchFields,
-        ...(() => {
-          const unobserved = normalizeUnobservedFacts(entry.unobserved) ?? statusRow?.unobserved;
-          return unobserved ? { unobserved } : {};
-        })()
-      };
-    });
-    const seen = new Set(
-      agents.flatMap((agent) => [agent.identity, agent.member_id, agent.agent_id]).filter((value) => Boolean(value)).map((value) => value.toLowerCase())
-    );
-    for (const statusRow of normalizedIdentityStatusRows) {
-      if (seen.has(statusRow.identity.toLowerCase())) continue;
-      const addressable = statusRow.addressability === "addressable";
-      agents.push({
-        identity: statusRow.identity,
-        agent_id: statusRow.identity,
-        member_id: statusRow.identity,
-        label: String(statusRow.display_name || statusRow.identity),
-        kind: String(statusRow.role || "identity"),
-        ...statusRow.role !== void 0 ? { role: statusRow.role } : {},
-        state: statusRow.state,
-        addressability: statusRow.addressability,
-        ...statusRow.generation !== void 0 ? { generation: statusRow.generation } : {},
-        ...statusRow.progress !== void 0 ? { progress: statusRow.progress } : {},
-        ...statusRow.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : {},
-        ...statusRow.labels?.group ? { group: statusRow.labels.group } : {},
-        ...statusRow.labels?.console_subgroup ? { subgroup: statusRow.labels.console_subgroup } : statusRow.labels?.org ? { subgroup: statusRow.labels.org } : {},
-        addressable,
-        affordances: { can_send_message: addressable },
-        model_capabilities: { image_input: false },
-        ...statusRow.unobserved ? { unobserved: statusRow.unobserved } : {}
-      });
-      seen.add(statusRow.identity.toLowerCase());
-    }
-    return agents;
-  }
-  if (Array.isArray(identityStatusRows) && identityStatusRows.length > 0) {
-    return identityStatusRows.map((entry) => {
-      const statusRow = normalizeIdentityStatusRow(entry);
-      const identity = statusRow?.identity || "";
-      const modelCapabilities = normalizeModelCapabilities(entry);
-      return {
-        identity,
-        agent_id: String(identity),
-        member_id: identity ? "identity-only:".concat(identity) : "",
-        ...typeof statusRow?.session_id === "string" && statusRow.session_id.trim() ? { session_id: statusRow.session_id.trim() } : {},
-        label: String(statusRow?.display_name || identity || "unknown"),
-        kind: String(statusRow?.role || "identity"),
-        ...statusRow?.role !== void 0 ? { role: statusRow.role } : {},
-        ...statusRow?.state !== void 0 ? { state: statusRow.state } : {},
-        ...statusRow?.addressability ? { addressability: statusRow.addressability } : {},
-        ...statusRow?.generation !== void 0 ? { generation: statusRow.generation } : {},
-        ...statusRow?.progress !== void 0 ? { progress: statusRow.progress } : {},
-        ...statusRow?.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : {},
-        addressable: false,
-        affordances: { can_send_message: false },
-        model_capabilities: modelCapabilities,
-        ...statusRow?.unobserved ? { unobserved: statusRow.unobserved } : {}
-      };
-    });
-  }
-  if (Array.isArray(modules) && modules.length > 0) {
-    return modules.map((moduleId) => ({
-      agent_id: String(moduleId),
-      member_id: String(moduleId),
-      label: String(moduleId),
-      kind: "module_agent",
-      model_capabilities: { image_input: false }
-    }));
-  }
-  return [];
-}
-
 // src/lib/council-entries.ts
 var COUNCIL_TOOL_NAME = "council";
 var COUNCIL_TOOL_EVENTS = /* @__PURE__ */ new Set([
@@ -48400,6 +48260,187 @@ function createUserEntry2(message, images = [], options = {}) {
 }
 function appendOptimisticConversationEntry2(entries, optimisticEntry) {
   return optimisticEntry ? [...entries, optimisticEntry] : entries;
+}
+
+// src/lib/idle-reconcile.ts
+function agentReportsIdle(agent) {
+  return agent.response_phase === null && agent.progress?.run_state === "idle";
+}
+var IDLE_SETTLE_MIN_GAP_MS = 1e4;
+var idleSettleClock = { now: () => Date.now() };
+function decideIdleSettlement(args) {
+  if (!agentReportsIdle(args.agent)) return "reset";
+  if (args.logVersionAtRequest === void 0 || args.logVersionAtRequest !== args.logVersionNow) return "reset";
+  if (args.sendInFlight) return "reset";
+  if (!args.foldBusy && args.foldPhase === null) return "reset";
+  if (!args.armed || args.armed.version !== args.logVersionNow) return "arm";
+  return args.nowMs - args.armed.atMs >= IDLE_SETTLE_MIN_GAP_MS ? "settle" : "wait";
+}
+function consoleFrameKey(frame) {
+  if (frame.id) return frame.id;
+  if (frame.cursor) return frame.cursor;
+  return "".concat(frame.event, ":").concat(frame.identity || "", ":").concat(frame.interactionId || "", ":").concat(frame.timestampMs || 0);
+}
+function idleWatermarkFor(frames) {
+  if (frames.length === 0) return void 0;
+  let newest = Number.NEGATIVE_INFINITY;
+  const settledKeys = /* @__PURE__ */ new Set();
+  for (const frame of frames) {
+    settledKeys.add(consoleFrameKey(frame));
+    if (frame.sourceKind !== WORKGRAPH_LOCAL_SOURCE_KIND && typeof frame.timestampMs === "number" && frame.timestampMs > newest) {
+      newest = frame.timestampMs;
+    }
+  }
+  return { timestampMs: newest, settledKeys };
+}
+function isAfterIdleWatermark(frame, watermark) {
+  if (!watermark) return true;
+  if (watermark.settledKeys.has(consoleFrameKey(frame))) return false;
+  return !(typeof frame.timestampMs === "number" && frame.timestampMs < watermark.timestampMs);
+}
+function framesAfterIdleWatermark(frames, watermark) {
+  if (!watermark) return frames;
+  return frames.filter((frame) => isAfterIdleWatermark(frame, watermark));
+}
+
+// src/ConsoleApp.tsx
+var import_react49 = __toESM(require("react"));
+
+// src/lib/agents.ts
+function buildConsoleIdentityAliasMap(agents) {
+  const map4 = /* @__PURE__ */ new Map();
+  for (const agent of agents) {
+    const canonical = (agent.identity || agent.member_id || agent.agent_id || "").trim();
+    if (!canonical) continue;
+    const labelIdentity = typeof agent.labels?.agent_identity === "string" ? agent.labels.agent_identity.trim() : "";
+    for (const alias of [agent.identity, agent.member_id, agent.agent_id, labelIdentity]) {
+      const key = alias?.trim();
+      if (key && !map4.has(key)) map4.set(key, canonical);
+    }
+  }
+  return map4;
+}
+function canonicalConsoleIdentityFromMap(identity, aliases) {
+  const normalized = identity?.trim() || "";
+  if (!normalized) return "";
+  return aliases.get(normalized) ?? normalized;
+}
+function normalizeModelCapabilities(entry) {
+  const record8 = entry && typeof entry === "object" ? entry : {};
+  const caps = record8.model_capabilities && typeof record8.model_capabilities === "object" ? record8.model_capabilities : {};
+  return { image_input: caps.image_input === true };
+}
+function normalizeAgents(experience, modules) {
+  const identityStatusRows = Array.isArray(experience?.identity_status?.rows) ? experience.identity_status.rows : [];
+  const normalizedIdentityStatusRows = identityStatusRows.map((entry) => normalizeIdentityStatusRow(entry)).filter((entry) => entry !== null);
+  const identityStatusByIdentity = new Map(
+    normalizedIdentityStatusRows.map((row) => [row.identity, row])
+  );
+  const snapshotAgents = experience?.agent_sidebar?.live_snapshot?.agents;
+  if (Array.isArray(snapshotAgents) && snapshotAgents.length > 0) {
+    const agents = snapshotAgents.map((entry) => {
+      const entryIdentity = typeof entry.identity === "string" ? entry.identity.trim() : "";
+      const entryMemberId = typeof entry.member_id === "string" ? entry.member_id.trim() : "";
+      const entryLabels = entry.labels && typeof entry.labels === "object" ? entry.labels : {};
+      const durableAgentIdentity = typeof entryLabels.agent_identity === "string" ? entryLabels.agent_identity.trim() : "";
+      const statusRow = identityStatusByIdentity.get(durableAgentIdentity) || identityStatusByIdentity.get(entryIdentity) || identityStatusByIdentity.get(entryMemberId) || normalizeIdentityStatusRow(entry);
+      const watchFields = normalizeSidebarWatchFields(entry);
+      const responsePhase = normalizeResponsePhase(entry.response_phase);
+      const modelCapabilities = entry.model_capabilities !== void 0 ? normalizeModelCapabilities(entry) : normalizeModelCapabilities(identityStatusRows.find((row) => {
+        const normalized = normalizeIdentityStatusRow(row);
+        return normalized?.identity === statusRow?.identity;
+      }));
+      return {
+        ...statusRow?.identity ? { identity: statusRow.identity } : durableAgentIdentity ? { identity: durableAgentIdentity } : entry.identity ? { identity: String(entry.identity) } : {},
+        agent_id: String(entry.agent_id || statusRow?.identity || durableAgentIdentity || entry.identity || entry.member_id || ""),
+        member_id: String(entry.member_id || statusRow?.identity || entry.identity || entry.agent_id || ""),
+        ...typeof entry.session_id === "string" && entry.session_id.trim() ? { session_id: entry.session_id.trim() } : {},
+        label: String(entry.label || statusRow?.display_name || entry.display_name || statusRow?.identity || entry.identity || entry.member_id || entry.agent_id || "unknown"),
+        kind: String(entry.kind || statusRow?.role || entry.role || "module_agent"),
+        ...statusRow?.role !== void 0 ? { role: statusRow.role } : entry.role !== void 0 ? { role: String(entry.role) } : {},
+        ...statusRow?.state !== void 0 ? { state: statusRow.state } : entry.state !== void 0 ? { state: String(entry.state) } : {},
+        ...statusRow?.addressability ? { addressability: statusRow.addressability } : {},
+        ...statusRow?.generation !== void 0 ? { generation: statusRow.generation } : {},
+        ...statusRow?.progress !== void 0 ? { progress: statusRow.progress } : {},
+        ...(entry.response_phase === null || responsePhase !== null) && { response_phase: responsePhase },
+        ...entry.wired_to !== void 0 && { wired_to: entry.wired_to },
+        ...statusRow?.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : entry.labels !== void 0 ? { labels: entry.labels } : {},
+        ...entry.group !== void 0 && { group: String(entry.group) },
+        ...entry.subgroup !== void 0 && { subgroup: String(entry.subgroup) },
+        ...entry.addressable !== void 0 ? { addressable: Boolean(entry.addressable) } : statusRow?.addressability ? { addressable: statusRow.addressability === "addressable" } : {},
+        ...entry.affordances !== void 0 && { affordances: entry.affordances },
+        model_capabilities: modelCapabilities,
+        ...watchFields,
+        ...(() => {
+          const unobserved = normalizeUnobservedFacts(entry.unobserved) ?? statusRow?.unobserved;
+          return unobserved ? { unobserved } : {};
+        })()
+      };
+    });
+    const seen = new Set(
+      agents.flatMap((agent) => [agent.identity, agent.member_id, agent.agent_id]).filter((value) => Boolean(value)).map((value) => value.toLowerCase())
+    );
+    for (const statusRow of normalizedIdentityStatusRows) {
+      if (seen.has(statusRow.identity.toLowerCase())) continue;
+      const addressable = statusRow.addressability === "addressable";
+      agents.push({
+        identity: statusRow.identity,
+        agent_id: statusRow.identity,
+        member_id: statusRow.identity,
+        label: String(statusRow.display_name || statusRow.identity),
+        kind: String(statusRow.role || "identity"),
+        ...statusRow.role !== void 0 ? { role: statusRow.role } : {},
+        state: statusRow.state,
+        addressability: statusRow.addressability,
+        ...statusRow.generation !== void 0 ? { generation: statusRow.generation } : {},
+        ...statusRow.progress !== void 0 ? { progress: statusRow.progress } : {},
+        ...statusRow.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : {},
+        ...statusRow.labels?.group ? { group: statusRow.labels.group } : {},
+        ...statusRow.labels?.console_subgroup ? { subgroup: statusRow.labels.console_subgroup } : statusRow.labels?.org ? { subgroup: statusRow.labels.org } : {},
+        addressable,
+        affordances: { can_send_message: addressable },
+        model_capabilities: { image_input: false },
+        ...statusRow.unobserved ? { unobserved: statusRow.unobserved } : {}
+      });
+      seen.add(statusRow.identity.toLowerCase());
+    }
+    return agents;
+  }
+  if (Array.isArray(identityStatusRows) && identityStatusRows.length > 0) {
+    return identityStatusRows.map((entry) => {
+      const statusRow = normalizeIdentityStatusRow(entry);
+      const identity = statusRow?.identity || "";
+      const modelCapabilities = normalizeModelCapabilities(entry);
+      return {
+        identity,
+        agent_id: String(identity),
+        member_id: identity ? "identity-only:".concat(identity) : "",
+        ...typeof statusRow?.session_id === "string" && statusRow.session_id.trim() ? { session_id: statusRow.session_id.trim() } : {},
+        label: String(statusRow?.display_name || identity || "unknown"),
+        kind: String(statusRow?.role || "identity"),
+        ...statusRow?.role !== void 0 ? { role: statusRow.role } : {},
+        ...statusRow?.state !== void 0 ? { state: statusRow.state } : {},
+        ...statusRow?.addressability ? { addressability: statusRow.addressability } : {},
+        ...statusRow?.generation !== void 0 ? { generation: statusRow.generation } : {},
+        ...statusRow?.progress !== void 0 ? { progress: statusRow.progress } : {},
+        ...statusRow?.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : {},
+        addressable: false,
+        affordances: { can_send_message: false },
+        model_capabilities: modelCapabilities,
+        ...statusRow?.unobserved ? { unobserved: statusRow.unobserved } : {}
+      };
+    });
+  }
+  if (Array.isArray(modules) && modules.length > 0) {
+    return modules.map((moduleId) => ({
+      agent_id: String(moduleId),
+      member_id: String(moduleId),
+      label: String(moduleId),
+      kind: "module_agent",
+      model_capabilities: { image_input: false }
+    }));
+  }
+  return [];
 }
 
 // src/lib/errors.ts
@@ -62966,6 +63007,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const [sendingPanels, setSendingPanels] = import_react49.default.useState(
     /* @__PURE__ */ new Set()
   );
+  const sendingPanelsRef = import_react49.default.useRef(sendingPanels);
+  sendingPanelsRef.current = sendingPanels;
   const [pinnedAgentIds, setPinnedAgentIds] = import_react49.default.useState(
     /* @__PURE__ */ new Set()
   );
@@ -63363,9 +63406,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     clearOptimisticUserByContent(identity, frame);
   }
   function frameKey(frame) {
-    if (frame.id) return frame.id;
-    if (frame.cursor) return frame.cursor;
-    return "".concat(frame.event, ":").concat(frame.identity || "", ":").concat(frame.interactionId || "", ":").concat(frame.timestampMs || 0);
+    return consoleFrameKey(frame);
   }
   function appendFrame(identity, frame) {
     const log = getOrCreateLog(identity);
@@ -63429,6 +63470,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       recomputeBusyStateFromLog(identity);
       return;
     }
+    if (!isAfterIdleWatermark(frame, log.idleSettledThrough)) return;
     const ts = frame.timestampMs ?? log.busyFoldedThroughMs;
     if (!log.busyFoldValid || ts < log.busyFoldedThroughMs || frame.sourceKind === "session_history") {
       recomputeBusyStateFromLog(identity);
@@ -63445,8 +63487,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   function recomputeBusyStateFromLog(identity) {
     const log = getOrCreateLog(identity);
     const lifecycle = new ConsoleActivityProjection();
-    let foldedThrough = Number.NEGATIVE_INFINITY;
-    const ordered = sortedEvents(log).sort((a, b2) => {
+    let foldedThrough = log.idleSettledThrough?.timestampMs ?? Number.NEGATIVE_INFINITY;
+    const ordered = framesAfterIdleWatermark(sortedEvents(log), log.idleSettledThrough).sort((a, b2) => {
       const timeDelta = (a.timestampMs || 0) - (b2.timestampMs || 0);
       if (timeDelta !== 0) return timeDelta;
       const rankDelta = busyTransitionSortRank(a) - busyTransitionSortRank(b2);
@@ -64036,6 +64078,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     if (frame.sourceKind === "session_history" || frame.event === "assistant_history_snapshot" || frame.event === "frame_updated") {
       return recomputePhaseForIdentity(identity);
     }
+    if (!isAfterIdleWatermark(frame, identityLogRef.current[identity]?.idleSettledThrough)) return false;
     let changed = false;
     for (const panel of dockRef.current.viewState.panels) {
       const target = panel.target;
@@ -64074,9 +64117,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     return changed;
   }
   function recomputePhaseForIdentity(identity) {
-    const frames = getSortedFrames(identity).filter(
-      (frame) => PANEL_ROUTABLE_EVENTS.has(frame.event)
-    );
+    const frames = framesAfterIdleWatermark(
+      getSortedFrames(identity),
+      identityLogRef.current[identity]?.idleSettledThrough
+    ).filter((frame) => PANEL_ROUTABLE_EVENTS.has(frame.event));
     const phase2 = inferResponsePhaseFromFrames(frames, null);
     let changed = false;
     for (const panel of dockRef.current.viewState.panels) {
@@ -64089,12 +64133,62 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     }
     return changed;
   }
+  const settleIdleIdentitiesRef = import_react49.default.useRef(() => {
+  });
+  function settleIdleIdentities(agents2, logVersionsAtRequest) {
+    let changed = false;
+    const nowMs = idleSettleClock.now();
+    for (const agent of agents2) {
+      for (const identity of /* @__PURE__ */ new Set([agent.identity, agent.member_id, agent.agent_id])) {
+        if (!identity) continue;
+        const log = identityLogRef.current[identity];
+        if (!log) continue;
+        const suffix = ":agent-chat:".concat(identity);
+        const sendInFlight = [...sendingPanelsRef.current].some((panelKey) => panelKey.endsWith(suffix)) || Object.keys(optimisticUserByPanelKeyRef.current).some((panelKey) => panelKey.endsWith(suffix));
+        const panelPhase = Object.entries(phaseValueByKey.current).find(
+          ([panelKey, phase2]) => panelKey.endsWith(suffix) && phase2 != null
+        )?.[1] ?? null;
+        const decision = decideIdleSettlement({
+          agent,
+          logVersionAtRequest: logVersionsAtRequest.get(identity),
+          logVersionNow: log.version,
+          sendInFlight,
+          foldBusy: log.busyLifecycle.busy || isIdentityBusy(identity),
+          foldPhase: log.busyLifecycle.phase ?? panelPhase,
+          armed: log.idlePollArmed,
+          nowMs
+        });
+        if (decision === "arm") log.idlePollArmed = { version: log.version, atMs: nowMs };
+        if (decision !== "settle") {
+          if (decision === "reset") log.idlePollArmed = void 0;
+          continue;
+        }
+        log.idlePollArmed = void 0;
+        const watermark = idleWatermarkFor(log.events);
+        if (!watermark) continue;
+        log.idleSettledThrough = watermark;
+        log.busyLifecycle = new ConsoleActivityProjection();
+        log.busyFoldedThroughMs = watermark.timestampMs;
+        log.busyFoldValid = true;
+        identityLifecycleRef.current[identity] = { interactionOpen: false, runOpen: false };
+        applyBusyState(identity, false);
+        clearPhaseForIdentity(identity);
+        maybeDrainHead(identity);
+        changed = true;
+      }
+    }
+    if (changed) forceRender();
+  }
+  settleIdleIdentitiesRef.current = settleIdleIdentities;
   const loadExperience = import_react49.default.useCallback(() => {
     if (experienceLoadInFlightRef.current && experienceLoadGenerationRef.current === lifetimeRef.current.generation) {
       return experienceLoadInFlightRef.current;
     }
     let request;
     request = (async () => {
+      const logVersionsAtRequest = new Map(
+        Object.entries(identityLogRef.current).map(([identity, log]) => [identity, log.version])
+      );
       const [experienceJson, modulesJson] = await Promise.all([
         consoleTransport.loadExperience(),
         consoleTransport.loadModules?.() ?? Promise.resolve({ modules: [] })
@@ -64108,6 +64202,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       const nextAgents = normalizeAgents(experienceJson, loadedModules);
       setExperience(experienceJson);
       setAgents((current) => internAgents(current, nextAgents));
+      settleIdleIdentitiesRef.current(nextAgents, logVersionsAtRequest);
       setActiveActivityPresetId(
         (c) => c || experienceJson.console_config?.rail?.active_preset_id || experienceJson.activity_feed?.active_preset_id || "all"
       );
@@ -65980,7 +66075,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       panelKey
     );
     const honorLocalPhase = hasLocalPhase && (isSending || optimisticEntry !== null);
-    const phase2 = panelPhaseFor(panelKey, sortedFrames, {
+    const phase2 = panelPhaseFor(panelKey, framesAfterIdleWatermark(sortedFrames, identityLog.idleSettledThrough), {
       localPhase: honorLocalPhase ? phaseRef.current[panelKey] ?? null : null,
       hasLocalPhase: honorLocalPhase,
       serverPhase: agent?.response_phase ?? null
