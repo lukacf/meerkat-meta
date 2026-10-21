@@ -174,8 +174,8 @@ ORDINARY_SOURCE_UNAVAILABLE = (
     "connection setup helper needs. Use a Forge package that includes that gateway, or "
     "add the connection setup helper to the plan. Your plan is preserved.")
 ORDINARY_TARGET_UNSUPPORTED = (
-    "An application without a connection setup helper can be built here only for this "
-    "Mac or Linux computer. Change the plan's destination, or add the connection setup "
+    "An application without a connection setup helper can be built here only for a Mac "
+    "or Linux destination. Change the plan's destination, or add the connection setup "
     "helper. Your plan is preserved.")
 
 
