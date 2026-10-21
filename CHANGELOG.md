@@ -1497,6 +1497,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   current outcome, superseding the earlier recommendation without inventing
   a new choice, and Forge's acceptance review checks that outcome and its
   readback after a restart.
+- Meta Forge now stops and starts an installed application whose update was
+  staged but not applied. Before this fix, once an update was staged, Stop
+  reported "The original installation cannot be redirected to another build
+  or source owner." after stopping the application, and Start in the same
+  Forge session refused with the same text. With an earlier Forge, restart
+  Forge and start the application again.
 - `/console/experience` reports `health_overview.live_snapshot.running` as
   the mob's owner answers when the experience is read, as `meta/status`
   does. It came from the console's cached roster walk, and was `true` when
@@ -1762,17 +1768,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (or let the builder's identity-first composition make the runtime), and
   register peer mobs with `register_peer_runtime`.
 - Meta Forge cannot yet update a Meta Toolkit product application after its
-  setup. "Stage accepted update" refuses ("This application retains a Fresh
-  bootstrap attempt..."). Applying a runtime update built with "Rebuild with
-  updated runtime" to an installed product application is also refused, as
-  before 0.9.4. To run a newer build, install it into a new empty folder and
-  set it up again there. The new installation starts with a fresh setup and
-  none of the old installation's conversations or application data. The old
-  folder keeps its setup, history and data unchanged and can still be started.
-  Stop the old application before you start the new one. An application on the
-  Meta Toolkit Connect route that was installed before 0.9.4 keeps its Console
-  without the "Connect setup" button; its setup page stays at
-  /host/toolkit/setup on its Console address.
+  setup. Depending on how the installation was set up, either "Stage accepted
+  update" refuses ("This application retains a Fresh bootstrap attempt..."),
+  or staging succeeds and "Apply and verify update" refuses (for example "The
+  original installation cannot be redirected to another build or source
+  owner."). The installed application is not changed and still starts with its
+  installed build. On the Meta Toolkit Connect route, an update staged before
+  the application's first setup can make that setup refuse ("Preparation
+  inputs differ from the original stopped product owner."). Applying a runtime
+  update built with "Rebuild with updated runtime" to an installed product
+  application is also refused, as before 0.9.4. To run a newer build, install
+  it into a new empty folder and set it up again there. The new installation
+  starts with a fresh setup and none of the old installation's conversations
+  or application data. The old folder keeps its setup, history and data
+  unchanged and can still be started. Stop the old application before you
+  start the new one. An application on the Meta Toolkit Connect route that was
+  installed before 0.9.4 keeps its Console without the "Connect setup" button;
+  its setup page stays at /host/toolkit/setup on its Console address.
 - Meta Forge application installs need CPython 3.11 in this release, the
   version the Toolkit packages are built for. On Ubuntu 24.04, install
   CPython 3.11 (for example with `uv python install 3.11`), stop Forge, move
@@ -1788,6 +1800,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   against the verified installation, so a changed or damaged file is
   refused instead of run. On a small machine (2 vCPU) this check can take
   several minutes on every Start. Faster verification is planned for 0.9.5.
+- On a small machine (2 vCPU), "Stage accepted update" can keep Meta Forge's
+  own pages from refreshing for several minutes while it checks the update;
+  Forge responds again once staging completes. A faster Stage that keeps
+  Forge responsive is planned for 0.9.5.
 
 ## [0.9.3] - 2026-10-18
 
