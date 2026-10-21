@@ -18,7 +18,8 @@ import {
 import "./implementation-panel.css";
 import { CheckerSetup } from "./checker-setup.jsx";
 import { BuildSelectionRecovery } from "./build-selection-recovery.jsx";
-import { packagePreparationReason, retainsCandidateFramework, PACKAGE_REVISION_PROMPT } from "./package-availability.mjs";
+import { packagePreparationReason, retainsCandidateFramework, candidateRuntimeRefreshReady,
+  PACKAGE_REVISION_PROMPT } from "./package-availability.mjs";
 
 const implementationUrl = (id) => `/api/guide/${encodeURIComponent(id)}/implementation`;
 
@@ -300,6 +301,7 @@ export function ImplementationPanel({ state, plan, designBusy, pendingManual, Ic
   const decisionBlocked = (state.readiness?.decision_blockers?.length || 0) > 0;
   const packageReason = packagePreparationReason(state, plan);
   const retainedContinuation = !statusUnconfirmed && retainsCandidateFramework(receipt, state);
+  const candidateRefreshBlocked = retainedContinuation && !candidateRuntimeRefreshReady(receipt, state);
   const canBuild = (!packageReason || retainedContinuation) && !statusUnconfirmed && !decisionBlocked && checker?.status === 'ready' && !!(state.proposal || state.blueprint) && !designBusy && !pendingManual && !submitting && !running;
   const needsFeedback = current && receipt?.status === "completed" && acceptance?.passed;
   const canRefreshFramework = current && ["completed", "failed", "interrupted"].includes(receipt?.status) &&
@@ -333,8 +335,15 @@ export function ImplementationPanel({ state, plan, designBusy, pendingManual, Ic
         (refreshFramework || !retainsCandidateFramework(latestReceipt.current, latest.current)) ||
         (latest.current?.readiness?.decision_blockers?.length || 0) > 0 ||
         buildAdmissionPending.current.has(state.id) || refreshFramework && !canRefreshFramework ||
+        refreshFramework && retainsCandidateFramework(latestReceipt.current, latest.current) &&
+          !candidateRuntimeRefreshReady(latestReceipt.current, latest.current) ||
         !refreshFramework && needsFeedback && !text.trim()) return;
-    const submitted = { guideId: state.id, version: state.version, text, editRevision: feedbackEditRevision.current,
+    // A host-selected product moves to the host's current runtime only through
+    // the host-owned refresh of its exact accepted build, which carries no
+    // request: the unsent draft stays with the page.
+    const candidateRefresh = refreshFramework && retainsCandidateFramework(latestReceipt.current, latest.current);
+    const submitted = { guideId: state.id, version: state.version, text: candidateRefresh ? "" : text,
+      editRevision: feedbackEditRevision.current,
       previousBuildId: receipt?.build_id || null, navigationRevision: navigationLifetime.current.revision, selectionToken };
     const ownsAdmission = () => buildAdmissionPending.current.get(submitted.guideId) === submitted;
     const stillHere = () => ownsAdmission() && ownerCurrent() && latest.current?.id === submitted.guideId &&
@@ -343,7 +352,10 @@ export function ImplementationPanel({ state, plan, designBusy, pendingManual, Ic
     setSubmissions(previous => ({ ...previous, [submitted.guideId]: submitted })); setError("");
     try {
       const body = { version: submitted.version, request: submitted.text.trim(), previous_build_id: submitted.previousBuildId };
-      if (refreshFramework) {
+      if (candidateRefresh) {
+        body.refresh_framework = true;
+        body.preserve_design = true;
+      } else if (refreshFramework) {
         body.refresh_framework = true;
         body.request ||= "Rebuild this application using the current MobKit runtime. Preserve its requested behavior, agent design and authored application code. Verify the refreshed application and run independent review.";
         body.request += `\n\nRefresh the runtime in build ${submitted.previousBuildId}.`;
@@ -546,7 +558,8 @@ export function ImplementationPanel({ state, plan, designBusy, pendingManual, Ic
     {canRefreshFramework && <details className="implementation-runtime-update">
       <summary>Runtime and host updates</summary>
       <p className="implementation-detail">Rebuild with the runtime and generated application host available in this installer, keeping your application work. The new package will be tested and independently reviewed. Your installed application and any packages you have downloaded stay available. You can recover the installed version's source package from its Run area.</p>
-      <button className="setup-action" onClick={() => build(true)} disabled={selectionBlocked || !canBuild || !!packageReason}>Rebuild with updated runtime</button>
+      {candidateRefreshBlocked && <p className="implementation-detail">The runtime update starts from this application's independently accepted build.</p>}
+      <button className="setup-action" onClick={() => build(true)} disabled={selectionBlocked || !canBuild || !!packageReason || candidateRefreshBlocked}>Rebuild with updated runtime</button>
     </details>}
     {diagnostics.length > 0 && <details className="implementation-report">
       <summary>Build diagnostics - {diagnostics.length} {diagnostics.length === 1 ? "entry" : "entries"}</summary>

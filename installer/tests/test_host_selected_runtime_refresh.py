@@ -67,6 +67,31 @@ async def test_normal_refresh_selects_new_trusted_host_product_and_preserves_acc
     assert candidate_selection(f.registry.runtime_target) == candidate_selection(f.target)
 
 
+
+@pytest.mark.parametrize('new_runtime', [False, True], ids=['same-runtime', 'new-runtime'])
+async def test_legacy_refresh_request_is_refused_and_the_host_owned_refresh_admitted_for_a_product(
+        registry, products, monkeypatch, new_runtime):
+    """The browser's runtime update must take the host-owned refresh for a host-selected product."""
+    from fastapi import HTTPException
+    f = registry
+    saved = new_guide(f)
+    first = await build(f, saved)
+    await accept_source_fixture(f, first)
+    current_host = LocalApplicationRegistry(guide_store=f.store, implementation=f.implementation,
+        deployment=f.service, runtime_target=products[1].target if new_runtime else f.target)
+    f.implementation.prepare_workspace = current_host.prepare_workspace
+    monkeypatch.setattr(server, 'implementation', f.implementation)
+    monkeypatch.setattr(server, 'application_host', current_host)
+    with pytest.raises(HTTPException, match='separately bound runtime transition') as refused:
+        await server.build_implementation(saved['id'], server.ImplementationRequest(
+            version=saved['version'], previous_build_id=first['build_id'], refresh_framework=True,
+            request=f"Rebuild this application.\n\nRefresh the runtime in build {first['build_id']}."))
+    assert refused.value.status_code == 409
+    result = await server.build_implementation(saved['id'], server.ImplementationRequest(
+        version=saved['version'], previous_build_id=first['build_id'], refresh_framework=True,
+        preserve_design=True))
+    assert result['build_id'] != first['build_id']
+
 @pytest.mark.parametrize('defect', ['foreign-owner', 'sdk-family', 'platform', 'source-race'])
 def test_refresh_route_refuses_invalid_current_host_selection_before_worker_admission(
         stop_api, products, monkeypatch, defect):

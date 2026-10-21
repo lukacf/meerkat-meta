@@ -662,6 +662,51 @@ for (const status of ["failed", "interrupted"]) test(`mounted ${status} host ref
   });
 });
 
+const candidateDigest = "c".repeat(64);
+const acceptedCandidateBuild = (changes = {}) => {
+  const accepted = acceptedRuntimeBuild();
+  return { ...accepted, source_digest: candidateDigest,
+    acceptance: { ...accepted.acceptance, source_digest: candidateDigest },
+    framework: { runtime_candidate: { format: "forge-meta-toolkit-runtime-selection-v1" } }, ...changes };
+};
+
+test("mounted candidate runtime refresh sends the host-owned preserve-design request and keeps the unsent draft", async () => {
+  const initial = acceptedCandidateBuild(), bodies = [];
+  await mounted({ initial, onPost({ target, body }) {
+    assert.equal(target, endpoint);
+    bodies.push(body);
+    return response(receipt("runtime-B", { status: "queued" }));
+  } }, async (ui) => {
+    const update = ui.button("Rebuild with updated runtime");
+    assert.ok(update && !update.disabled);
+    await ui.flush(() => { update.click(); update.click(); });
+    assert.equal(ui.calls.filter((call) => call.method === "POST").length, 1);
+    assert.equal(ui.current().build_id, "runtime-B");
+    assert.equal(ui.text(), initialDraft, "The builder note was not sent, so it stays on the page");
+    assert.equal(ui.savedDraft(), initialDraft);
+  });
+  assert.deepEqual(bodies, [{ version: state.version, request: "", previous_build_id: initial.build_id,
+    refresh_framework: true, preserve_design: true }]);
+});
+
+for (const [defect, changes] of [
+  ["failed", { status: "failed", ready_to_package: false }],
+  ["interrupted", { status: "interrupted", ready_to_package: false }],
+  ["untrusted acceptance", { acceptance_trusted: false }],
+  ["stale acceptance", { acceptance_current: false }],
+  ["unverified source", { source_verified: false }],
+  ["not ready to package", { ready_to_package: false }],
+]) test(`mounted candidate runtime refresh is offered only for the exact accepted build: ${defect}`, async () => {
+  await mounted({ initial: acceptedCandidateBuild(changes), draft: "" }, async (ui) => {
+    const update = ui.button("Rebuild with updated runtime");
+    assert.ok(update && update.disabled);
+    assert.match(ui.dom.window.document.querySelector(".implementation-runtime-update").textContent,
+      /starts from this application's independently accepted build/);
+    await ui.flush(() => update.click());
+    assert.equal(ui.calls.filter((call) => call.method === "POST").length, 0);
+  });
+});
+
 test("mounted rejected runtime refresh preserves the exact feedback draft", async () => {
   await mounted({ initial: acceptedRuntimeBuild(), onPost({ body }) {
     assert.equal(body.refresh_framework, true);

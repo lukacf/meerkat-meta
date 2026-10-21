@@ -1,4 +1,5 @@
 """Inert launcher controls with safe suppliers and no production server import."""
+import hashlib
 from pathlib import Path
 import inspect
 import shlex
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from launchkit import application_host_launch as launch
+from launchkit import connect_application_startup as startup
 
 
 class SelectedHost:
@@ -92,12 +94,8 @@ def test_ordinary_selection_rejects_untyped_runtime_or_gateway(gateway):
 
 def test_ordinary_application_retains_explicit_model_owner_without_selecting_guide(supplier, tmp_path, monkeypatch):
     from launchkit.connect_installer_caller import ExactFile
-    from launchkit.connect_application_startup import _ModelConfiguration
     from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
-    from test_managed_model_factory_selection import model_source
-    selection = model_source(tmp_path, monkeypatch)
-    monkeypatch.setenv("XDG_CONFIG_HOME", selection["credential_config_root"])
-    owner = _ModelConfiguration.observe(selection)
+    owner = model_owner(tmp_path, monkeypatch)
     target = object.__new__(MetaToolkitRuntimeTarget)
     gateway = ExactFile(tmp_path / "ordinary-rpc", "a" * 64)
     chosen = launch.OrdinaryMetaApplicationSelection(target, gateway, owner)
@@ -113,12 +111,8 @@ def test_ordinary_application_retains_explicit_model_owner_without_selecting_gui
 
 def test_changed_application_model_source_refuses_before_server_selection(supplier, tmp_path, monkeypatch):
     from launchkit.connect_installer_caller import ExactFile, CustodyError
-    from launchkit.connect_application_startup import _ModelConfiguration
     from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
-    from test_managed_model_factory_selection import model_source
-    selection = model_source(tmp_path, monkeypatch)
-    monkeypatch.setenv("XDG_CONFIG_HOME", selection["credential_config_root"])
-    owner = _ModelConfiguration.observe(selection)
+    owner = model_owner(tmp_path, monkeypatch)
     target = object.__new__(MetaToolkitRuntimeTarget)
     gateway = ExactFile(tmp_path / "ordinary-rpc", "a" * 64)
     chosen = launch.OrdinaryMetaApplicationSelection(target, gateway, owner)
@@ -137,6 +131,92 @@ def test_application_model_configuration_needs_actual_custody_owner(tmp_path, va
     target = object.__new__(MetaToolkitRuntimeTarget)
     with pytest.raises(TypeError, match="original application model configuration owner"):
         launch.OrdinaryMetaApplicationSelection(target, ExactFile(tmp_path / "rpc", "a" * 64), value)
+
+
+def model_owner(tmp_path, monkeypatch):
+    """An inert private model source with Linux custody for this feature only.
+
+    The launcher supplier replaces import_module, so build the owner without
+    first imports of Forge services or other test modules.
+    """
+    directory = tmp_path / "model-owner"
+    directory.mkdir(mode=0o700)
+    config = directory / "host.toml"
+    content = b'[model]\nselected = "inert-custody-specimen"\n'
+    config.write_bytes(content)
+    config.chmod(0o600)
+    root = directory / "xdg"
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(startup, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(root))
+    return startup._ModelConfiguration.observe({"host_config": {"path": str(config),
+        "sha256": hashlib.sha256(content).hexdigest()}, "credential_config_root": str(root)})
+
+
+def test_toolkit_application_forwards_explicit_model_owner_to_local_runtime(supplier, tmp_path, monkeypatch):
+    from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
+    owner = model_owner(tmp_path, monkeypatch)
+    target = object.__new__(MetaToolkitRuntimeTarget)
+    chosen = launch.ToolkitApplicationSelection(target, owner)
+    supplier.modules["trusted_operator.selection"].make_host = lambda: chosen
+    calls = []
+    supplier.modules["launchkit.server"].select_local_application_runtime = (
+        lambda value, **options: calls.append((value, options)))
+    assert launch.create_app() is supplier.app
+    assert calls == [(target, {"model_configuration": owner})]
+    assert calls[0][0] is target and calls[0][1]["model_configuration"] is owner
+    assert not any("guide_runtime" in str(call) for call in supplier.calls)
+
+
+def test_bare_toolkit_target_still_selects_no_application_model_owner(supplier):
+    target_type = supplier.modules["launchkit.runtime_selection"].MetaToolkitRuntimeTarget
+    target = target_type()
+    supplier.modules["trusted_operator.selection"].make_host = lambda: target
+    calls = []
+    supplier.modules["launchkit.server"].select_local_application_runtime = (
+        lambda value, **options: calls.append((value, options)))
+    assert launch.create_app() is supplier.app
+    assert calls == [(target, {})] and calls[0][0] is target
+
+
+def test_changed_toolkit_model_source_refuses_before_server_selection(supplier, tmp_path, monkeypatch):
+    from launchkit.connect_installer_caller import CustodyError
+    from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
+    owner = model_owner(tmp_path, monkeypatch)
+    chosen = launch.ToolkitApplicationSelection(object.__new__(MetaToolkitRuntimeTarget), owner)
+    supplier.modules["trusted_operator.selection"].make_host = lambda: chosen
+    supplier.modules["launchkit.server"].select_local_application_runtime = (
+        lambda *args, **kwargs: pytest.fail("Changed source cannot reach server selection"))
+    owner.host_config.path.write_text("Changed inert nonsecret model source.\n")
+    with pytest.raises(CustodyError):
+        launch.create_app()
+
+
+@pytest.mark.parametrize("defect", ["target-none", "target-lookalike", "owner-none", "owner-selection",
+    "owner-path", "owner-object"])
+def test_toolkit_application_needs_exact_product_and_model_owner(tmp_path, monkeypatch, defect):
+    from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
+    owner = model_owner(tmp_path, monkeypatch)
+    target = object.__new__(MetaToolkitRuntimeTarget)
+    target, value = {"target-none": (None, owner),
+        "target-lookalike": (SimpleNamespace(target="linux-x86_64"), owner),
+        "owner-none": (target, None), "owner-selection": (target, owner.selection()),
+        "owner-path": (target, str(owner.host_config.path)), "owner-object": (target, object())}[defect]
+    with pytest.raises(TypeError, match="exact Meta Toolkit product and its original application model configuration owner"):
+        launch.ToolkitApplicationSelection(target, value)
+
+
+def test_forged_toolkit_application_refuses_before_server_selection(supplier, tmp_path, monkeypatch):
+    from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
+    owner = model_owner(tmp_path, monkeypatch)
+    chosen = launch.ToolkitApplicationSelection(object.__new__(MetaToolkitRuntimeTarget), owner)
+    # A frozen value can still be forged after construction; selection rechecks it.
+    object.__setattr__(chosen, "model_configuration", owner.selection())
+    supplier.modules["trusted_operator.selection"].make_host = lambda: chosen
+    supplier.modules["launchkit.server"].select_local_application_runtime = (
+        lambda *args, **kwargs: pytest.fail("A forged selection cannot reach server selection"))
+    with pytest.raises(TypeError, match="original application model configuration owner"):
+        launch.create_app()
 
 
 @pytest.mark.parametrize("value", [None, "", "module", ":factory", "module:",
