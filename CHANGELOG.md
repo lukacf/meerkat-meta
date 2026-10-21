@@ -1230,6 +1230,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Console: a member's chat no longer stays "working" after the member
+  finished. When a turn stopped at a host callback (an approved setup, for
+  example) and the runtime continued it on its own, the continuation's
+  frames closed only their own run, so the paused turn (or a frame without
+  lifecycle ids) kept the chat "working" and queued every new message. The
+  Console now treats the member status poll as the idle signal: when it
+  reports no response phase and no open run, every frame the Console had
+  seen when it asked is settled, the working indicator clears and a queued
+  message is sent. A frame that arrives while the poll is in flight, a
+  poll that reports the member busy, and the Console's own send in flight
+  each leave the chat as it is.
 - A Meta-hosted member's own mob operator tools (`spawn_member`,
   `spawn_many_members` and the rest) admit against its session's mob
   operator authority, including a host's narrowing of it. Meerkat 0.9.4

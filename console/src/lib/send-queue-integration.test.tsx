@@ -2138,3 +2138,125 @@ describe("checked access saves", () => {
     });
   });
 });
+
+describe("idle status poll settles a fold the frames left open", () => {
+  const scope = { identity, runtimeKey: "owner-runtime", sessionId: "owner-session", sourceKind: "console_event" as const };
+  // The user's turn stops at a host callback and a runtime-started
+  // continuation finishes it under its own lineage; or the user's turn
+  // settles and a frame with no lifecycle ids arrives before the
+  // continuation. Either way no terminal closes what the frames opened.
+  const stuckFrames: Record<"paused" | "idless", ConsoleFrame[]> = {
+    paused: [
+      { ...scope, id: "q-input", event: "user_input", interactionId: "question", status: "delivered", timestampMs: 1000, data: { content: "Set it up and answer" } },
+      { ...scope, id: "q-start", event: "run_started", interactionId: "question", runId: "question-run", timestampMs: 1001, data: {} },
+      { ...scope, id: "q-tool", event: "tool_call_requested", interactionId: "question", runId: "question-run", timestampMs: 1002, data: { id: "setup", name: "setup_selected_install" } },
+      { ...scope, id: "q-turn", event: "turn_completed", interactionId: "question", runId: "question-run", timestampMs: 1003, data: { stop_reason: "tool_use" } },
+      { ...scope, id: "q-pause", event: "interaction_callback_pending", interactionId: "question", timestampMs: 1004, data: {} },
+      { ...scope, id: "c-start", event: "run_started", runId: "continuation-run", timestampMs: 2000, data: {} },
+      { ...scope, id: "c-text", event: "text_complete", runId: "continuation-run", timestampMs: 2001, data: { content: "Here is the answer" } },
+      { ...scope, id: "c-turn", event: "turn_completed", runId: "continuation-run", timestampMs: 2002, data: { stop_reason: "end_turn" } },
+      { ...scope, id: "c-end", event: "interaction_complete", runId: "continuation-run", timestampMs: 2003, data: {} },
+    ],
+    idless: [
+      { ...scope, id: "q-input", event: "user_input", interactionId: "question", status: "delivered", timestampMs: 1000, data: { content: "Set it up and answer" } },
+      { ...scope, id: "q-start", event: "run_started", interactionId: "question", runId: "question-run", timestampMs: 1001, data: {} },
+      { ...scope, id: "q-end", event: "interaction_complete", interactionId: "question", runId: "question-run", timestampMs: 1004, data: {} },
+      { identity, sourceKind: "console_event", id: "setup-done", event: "tool_execution_completed", timestampMs: 1500, data: { id: "setup", name: "setup_selected_install" } },
+      { ...scope, id: "c-start", event: "run_started", runId: "continuation-run", timestampMs: 2000, data: {} },
+      { ...scope, id: "c-text", event: "text_complete", runId: "continuation-run", timestampMs: 2001, data: { content: "Here is the answer" } },
+      { ...scope, id: "c-end", event: "interaction_complete", runId: "continuation-run", timestampMs: 2003, data: {} },
+    ],
+  };
+
+  function stuckTransport(variant: "paused" | "idless") {
+    const send = vi.fn(async (input: { identity: string }) => ({ interaction_id: "after-idle", identity: input.identity }));
+    const fake = transport(send as never);
+    const status: { response_phase: string | null; run_state: string } = { response_phase: "waiting", run_state: "run_open" };
+    const baseExperience = fake.loadExperience;
+    const loadExperience = vi.fn(async () => {
+      const base = await baseExperience();
+      return {
+        ...base,
+        identity_status: { rows: [{ identity, state: "running", addressability: "addressable",
+          progress: { run_state: status.run_state, in_flight_work: status.run_state === "idle" ? 0 : 1 } }] },
+        agent_sidebar: { ...base.agent_sidebar, live_snapshot: { ...base.agent_sidebar?.live_snapshot,
+          agents: base.agent_sidebar!.live_snapshot!.agents!.map(agent => ({ ...agent, response_phase: status.response_phase })) } },
+      } as never;
+    });
+    fake.loadExperience = loadExperience;
+    const live: { receive?: (frame: never) => void } = {};
+    fake.subscribeTimeline = (_input, next) => { live.receive = next; return () => {}; };
+    fake.queryTimeline = async () => ({ available: true, frames: stuckFrames[variant] });
+    // Each poll is triggered by a frame that is not part of the member's
+    // conversation, so the poll's coverage guard holds.
+    const poll = async (trigger: string) => {
+      const before = loadExperience.mock.calls.length;
+      await act(async () => {
+        live.receive?.({ id: trigger, event: "state_changed", identity, timestampMs: 3000, data: {} } as never);
+      });
+      await waitFor(() => expect(loadExperience.mock.calls.length).toBeGreaterThan(before), { timeout: 2_000 });
+      await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, 50)); });
+    };
+    return { fake, send, status, live, poll };
+  }
+
+  it.each(["paused", "idless"] as const)("an idle poll clears Working; a busy poll does not (%s)", async (variant) => {
+    const { fake, status, live, poll } = stuckTransport(variant);
+    render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
+    await waitFor(() => expect(live.receive).toBeTypeOf("function"));
+    await screen.findByLabelText("Queue agent is working");
+
+    await poll("trigger-busy");
+    expect(screen.getByLabelText("Queue agent is working")).toBeTruthy();
+
+    status.response_phase = null;
+    await poll("trigger-phase-only");
+    expect(screen.getByLabelText("Queue agent is working")).toBeTruthy();
+
+    status.run_state = "idle";
+    await poll("trigger-idle");
+    await waitFor(() => expect(screen.queryByLabelText("Queue agent is working")).toBeNull());
+  });
+
+  it.each(["paused", "idless"] as const)("a send queued behind the stale fold leaves once the poll reports idle (%s)", async (variant) => {
+    const { fake, send, status, live, poll } = stuckTransport(variant);
+    render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
+    await waitFor(() => expect(live.receive).toBeTypeOf("function"));
+    await screen.findByLabelText("Queue agent is working");
+    await compose("after the continuation");
+    await screen.findByTestId("pending-stack");
+
+    await poll("trigger-busy");
+    expect(send).not.toHaveBeenCalled();
+
+    status.response_phase = null;
+    status.run_state = "idle";
+    await poll("trigger-idle");
+    await waitFor(() => expect(send).toHaveBeenCalledTimes(1), { timeout: 3_000 });
+  });
+
+  it("a frame that arrives while the idle poll is in flight keeps the fold", async () => {
+    const { fake, status, live } = stuckTransport("paused");
+    let answer!: (value: never) => void;
+    const loadExperience = fake.loadExperience as ReturnType<typeof vi.fn>;
+    render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
+    await waitFor(() => expect(live.receive).toBeTypeOf("function"));
+    await screen.findByLabelText("Queue agent is working");
+    status.response_phase = null;
+    status.run_state = "idle";
+    const idle = await loadExperience();
+    loadExperience.mockImplementationOnce(() => new Promise(resolve => { answer = resolve as never; }));
+    const before = loadExperience.mock.calls.length;
+    await act(async () => {
+      live.receive?.({ id: "trigger-idle", event: "state_changed", identity, timestampMs: 3000, data: {} } as never);
+    });
+    await waitFor(() => expect(loadExperience.mock.calls.length).toBeGreaterThan(before), { timeout: 2_000 });
+    // A new turn's start arrives before the poll answers.
+    await act(async () => {
+      live.receive?.({ identity, runtimeKey: "owner-runtime", sessionId: "owner-session", sourceKind: "console_event",
+        id: "next-start", event: "run_started", interactionId: "next", runId: "next-run", timestampMs: 4000, data: {} } as never);
+    });
+    await act(async () => { answer(idle); await new Promise((resolve) => window.setTimeout(resolve, 50)); });
+    expect(screen.getByLabelText("Queue agent is working")).toBeTruthy();
+  });
+});

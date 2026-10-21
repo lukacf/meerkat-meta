@@ -43993,6 +43993,32 @@ async function withConsoleSendStorageLock(key, update) {
   }
 }
 
+// src/lib/idle-reconcile.ts
+function agentReportsIdle(agent) {
+  return agent.response_phase === null && agent.progress?.run_state === "idle";
+}
+function shouldSettleIdleIdentity(args) {
+  if (!agentReportsIdle(args.agent)) return false;
+  if (args.logVersionAtRequest === void 0 || args.logVersionAtRequest !== args.logVersionNow) return false;
+  if (args.sendInFlight) return false;
+  return args.foldBusy || args.foldPhase !== null;
+}
+function idleWatermarkFor(frames) {
+  let newest = Number.NEGATIVE_INFINITY;
+  for (const frame of frames) {
+    if (typeof frame.timestampMs === "number" && frame.timestampMs > newest) newest = frame.timestampMs;
+  }
+  return newest;
+}
+function isAfterIdleWatermark(frame, watermark) {
+  if (watermark === void 0 || watermark === Number.NEGATIVE_INFINITY) return true;
+  return typeof frame.timestampMs === "number" && frame.timestampMs > watermark;
+}
+function framesAfterIdleWatermark(frames, watermark) {
+  if (watermark === void 0 || watermark === Number.NEGATIVE_INFINITY) return frames;
+  return frames.filter((frame) => isAfterIdleWatermark(frame, watermark));
+}
+
 // src/ConsoleApp.tsx
 var import_react49 = __toESM(require("react"));
 
@@ -62966,6 +62992,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const [sendingPanels, setSendingPanels] = import_react49.default.useState(
     /* @__PURE__ */ new Set()
   );
+  const sendingPanelsRef = import_react49.default.useRef(sendingPanels);
+  sendingPanelsRef.current = sendingPanels;
   const [pinnedAgentIds, setPinnedAgentIds] = import_react49.default.useState(
     /* @__PURE__ */ new Set()
   );
@@ -63429,6 +63457,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       recomputeBusyStateFromLog(identity);
       return;
     }
+    if (!isAfterIdleWatermark(frame, log.idleSettledThroughMs)) return;
     const ts = frame.timestampMs ?? log.busyFoldedThroughMs;
     if (!log.busyFoldValid || ts < log.busyFoldedThroughMs || frame.sourceKind === "session_history") {
       recomputeBusyStateFromLog(identity);
@@ -63445,8 +63474,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   function recomputeBusyStateFromLog(identity) {
     const log = getOrCreateLog(identity);
     const lifecycle = new ConsoleActivityProjection();
-    let foldedThrough = Number.NEGATIVE_INFINITY;
-    const ordered = sortedEvents(log).sort((a, b2) => {
+    let foldedThrough = log.idleSettledThroughMs ?? Number.NEGATIVE_INFINITY;
+    const ordered = framesAfterIdleWatermark(sortedEvents(log), log.idleSettledThroughMs).sort((a, b2) => {
       const timeDelta = (a.timestampMs || 0) - (b2.timestampMs || 0);
       if (timeDelta !== 0) return timeDelta;
       const rankDelta = busyTransitionSortRank(a) - busyTransitionSortRank(b2);
@@ -64036,6 +64065,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     if (frame.sourceKind === "session_history" || frame.event === "assistant_history_snapshot" || frame.event === "frame_updated") {
       return recomputePhaseForIdentity(identity);
     }
+    if (!isAfterIdleWatermark(frame, identityLogRef.current[identity]?.idleSettledThroughMs)) return false;
     let changed = false;
     for (const panel of dockRef.current.viewState.panels) {
       const target = panel.target;
@@ -64074,9 +64104,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     return changed;
   }
   function recomputePhaseForIdentity(identity) {
-    const frames = getSortedFrames(identity).filter(
-      (frame) => PANEL_ROUTABLE_EVENTS.has(frame.event)
-    );
+    const frames = framesAfterIdleWatermark(
+      getSortedFrames(identity),
+      identityLogRef.current[identity]?.idleSettledThroughMs
+    ).filter((frame) => PANEL_ROUTABLE_EVENTS.has(frame.event));
     const phase2 = inferResponsePhaseFromFrames(frames, null);
     let changed = false;
     for (const panel of dockRef.current.viewState.panels) {
@@ -64089,12 +64120,52 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     }
     return changed;
   }
+  const settleIdleIdentitiesRef = import_react49.default.useRef(() => {
+  });
+  function settleIdleIdentities(agents2, logVersionsAtRequest) {
+    let changed = false;
+    for (const agent of agents2) {
+      for (const identity of /* @__PURE__ */ new Set([agent.identity, agent.member_id, agent.agent_id])) {
+        if (!identity) continue;
+        const log = identityLogRef.current[identity];
+        if (!log) continue;
+        const suffix = ":agent-chat:".concat(identity);
+        const sendInFlight = [...sendingPanelsRef.current].some((panelKey) => panelKey.endsWith(suffix)) || Object.keys(optimisticUserByPanelKeyRef.current).some((panelKey) => panelKey.endsWith(suffix));
+        const panelPhase = Object.entries(phaseValueByKey.current).find(
+          ([panelKey, phase2]) => panelKey.endsWith(suffix) && phase2 != null
+        )?.[1] ?? null;
+        if (!shouldSettleIdleIdentity({
+          agent,
+          logVersionAtRequest: logVersionsAtRequest.get(identity),
+          logVersionNow: log.version,
+          sendInFlight,
+          foldBusy: log.busyLifecycle.busy || isIdentityBusy(identity),
+          foldPhase: log.busyLifecycle.phase ?? panelPhase
+        })) continue;
+        const watermark = idleWatermarkFor(log.events);
+        log.idleSettledThroughMs = watermark;
+        log.busyLifecycle = new ConsoleActivityProjection();
+        log.busyFoldedThroughMs = watermark;
+        log.busyFoldValid = true;
+        identityLifecycleRef.current[identity] = { interactionOpen: false, runOpen: false };
+        applyBusyState(identity, false);
+        clearPhaseForIdentity(identity);
+        maybeDrainHead(identity);
+        changed = true;
+      }
+    }
+    if (changed) forceRender();
+  }
+  settleIdleIdentitiesRef.current = settleIdleIdentities;
   const loadExperience = import_react49.default.useCallback(() => {
     if (experienceLoadInFlightRef.current && experienceLoadGenerationRef.current === lifetimeRef.current.generation) {
       return experienceLoadInFlightRef.current;
     }
     let request;
     request = (async () => {
+      const logVersionsAtRequest = new Map(
+        Object.entries(identityLogRef.current).map(([identity, log]) => [identity, log.version])
+      );
       const [experienceJson, modulesJson] = await Promise.all([
         consoleTransport.loadExperience(),
         consoleTransport.loadModules?.() ?? Promise.resolve({ modules: [] })
@@ -64108,6 +64179,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       const nextAgents = normalizeAgents(experienceJson, loadedModules);
       setExperience(experienceJson);
       setAgents((current) => internAgents(current, nextAgents));
+      settleIdleIdentitiesRef.current(nextAgents, logVersionsAtRequest);
       setActiveActivityPresetId(
         (c) => c || experienceJson.console_config?.rail?.active_preset_id || experienceJson.activity_feed?.active_preset_id || "all"
       );
@@ -65980,7 +66052,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       panelKey
     );
     const honorLocalPhase = hasLocalPhase && (isSending || optimisticEntry !== null);
-    const phase2 = panelPhaseFor(panelKey, sortedFrames, {
+    const phase2 = panelPhaseFor(panelKey, framesAfterIdleWatermark(sortedFrames, identityLog.idleSettledThroughMs), {
       localPhase: honorLocalPhase ? phaseRef.current[panelKey] ?? null : null,
       hasLocalPhase: honorLocalPhase,
       serverPhase: agent?.response_phase ?? null
