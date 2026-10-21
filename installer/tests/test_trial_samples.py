@@ -139,7 +139,9 @@ def test_requested_trial_contract_requires_shared_behavior_and_independent_sourc
 
 
 def test_correction_contract_records_an_outcome_without_a_feasible_choice():
-    assert "that no option is feasible or that the decision is underdetermined" in IMPLEMENTATION_PROMPT
-    assert "supersede the earlier recommendation without inventing" in IMPLEMENTATION_PROMPT
-    assert "Exercise a correction that leaves no feasible option, or an underdetermined decision" in ACCEPTANCE_PROMPT
+    assert "Where findings recommend among options, they must be able to record" in IMPLEMENTATION_PROMPT
+    assert "that no option is feasible or that the decision is\nunderdetermined" in IMPLEMENTATION_PROMPT
+    assert "must supersede the earlier recommendation\nwithout inventing a replacement choice" in IMPLEMENTATION_PROMPT
+    assert ("Where findings recommend among options,\nexercise a correction that leaves no feasible option, "
+            "or an underdetermined decision") in ACCEPTANCE_PROMPT
     assert "check for an authoritative saved outcome and corrected readback after restart" in ACCEPTANCE_PROMPT

@@ -92,10 +92,11 @@ and the corrected current readback after restart. A failed conflicting write or 
 message is not an authoritative saved correction. Inspect whether withdrawn claims
 remain in a current answer, or agent provenance repair chatter crowds out the useful
 conclusion, uncertainty and next action. Keep an inspectable audit and a brief visible
-correction when it affects a decision. Use concrete counterexamples through existing
-production callbacks/rendering; no particular schema, roster or UI framework is needed.
-Exercise a correction that leaves no feasible option, or an underdetermined decision,
+correction when it affects a decision. Where findings recommend among options,
+exercise a correction that leaves no feasible option, or an underdetermined decision,
 and check for an authoritative saved outcome and corrected readback after restart.
+Use concrete counterexamples through existing production callbacks/rendering; no
+particular schema, roster or UI framework is needed.
 For asynchronous UI, inspect keyboard focus and expanded details through real
 application state changes. A concrete counterexample is a focused confirmation
 control removed by a completed result, leaving focus on the document body instead
