@@ -84,6 +84,14 @@ async def test_absent_compiled_policy_preserves_sdk_optional_policy_semantics(ca
 
 
 @pytest.mark.asyncio
+async def test_actual_meta_runtime_store_provider_is_retained(case):
+    store = object()
+    config = await configure(case, runtime_store=store)
+    assert config.runtime_store is store
+    case.owner._check_config(config, case.app)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('change', ['writable', 'symlink', 'hardlink', 'fifo'])
 async def test_public_definition_modes_do_not_admit_unsafe_source(case, change):
     f = case
@@ -199,7 +207,7 @@ async def test_failed_start_settles_same_runtime_without_retry(case, monkeypatch
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('field,value', [
-    ('session_builder', object()), ('session_store', object()), ('agent_customizer', object()),
+    ('session_builder', object()), ('runtime_store', object()), ('agent_customizer', object()),
     ('auth_config', object()), ('http_listen', '0.0.0.0:9999'),
     ('console_require_app_auth', False), ('meerkat_config_path', '/another/config'),
 ])
