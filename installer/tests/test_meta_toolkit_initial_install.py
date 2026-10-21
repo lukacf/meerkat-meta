@@ -505,3 +505,55 @@ async def test_original_queue_owner_refuses_ordinary_product_start_before_lifecy
         deployment.DeploymentService._launch(f.service, f.directory, mode)
     assert deployment.read_receipt(f.directory) == before
     assert not f.service.tasks and not f.service.worker_admissions
+
+
+CP312_LINUX = {"python_tag": "cp312", "abi_tag": "cp312", "implementation": "cpython", "system": "Linux",
+    "machine": "x86_64", "glibc_minimum": [2, 39], "macos": (0, 0)}
+ORIGINAL_INTERPRETER_REFUSAL = getattr(deployment, "selected_interpreter_refusal", None)
+
+
+def closure(*names):
+    return SimpleNamespace(dependency_wheels=tuple(SimpleNamespace(path=Path("/selected") / name) for name in names))
+
+
+async def test_cp311_closure_under_cp312_forge_refuses_fresh_install_before_publication(initial, monkeypatch):
+    # The inert fixture's dependency is pure Python; model the product's
+    # cp311-only compiled closure (the real helper) under a cp312 Forge.
+    def cp311_only(target, interpreter=None):
+        return ORIGINAL_INTERPRETER_REFUSAL(closure(
+            "pydantic_core-2.27.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "httpx-0.28.1-py3-none-any.whl"), CP312_LINUX)
+    monkeypatch.setattr(deployment, "selected_interpreter_refusal", cp311_only, raising=False)
+    f = initial
+    fresh = (await f.service.options(f.guide_id, f.build_id))["fresh_install"]
+    assert fresh["available"] is False and "next_step" not in fresh
+    assert "built for CPython 3.11" in fresh["reason"] and "runs CPython 3.12" in fresh["reason"]
+    assert "PYTHON_BIN" in fresh["reason"]
+    with pytest.raises(DraftConflict, match=r"CPython 3\.11"):
+        await f.submit()
+    assert not f.destination.exists() and not f.service.launched
+
+
+@pytest.mark.parametrize("built_for", ["cp311", "cp312"])
+async def test_worker_refuses_a_closure_for_another_cpython_before_creating_the_venv(tmp_path, monkeypatch, built_for):
+    # The application venv inherits Forge's interpreter. Without this refusal a
+    # cp311-only closure under cp312 fails only in pip, mid-install.
+    monkeypatch.setattr(deployment, "forge_interpreter", lambda: CP312_LINUX, raising=False)
+    selected = closure(f"cffi-1.17.1-{built_for}-{built_for}-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "cryptography-44.0.0-cp39-abi3-manylinux_2_28_x86_64.whl", "httpx-0.28.1-py3-none-any.whl")
+    destination = tmp_path / "application"
+    destination.mkdir(mode=0o700)
+    supervisor = SimpleNamespace(stop=asyncio.Event(), destination=destination)
+    commands = []
+    async def command(arguments, *args, **kwargs):
+        commands.append(arguments)
+        raise RuntimeError("inert venv creation")
+    install = worker._install_selected_product(supervisor, SimpleNamespace(selection=selected), lambda: True, command)
+    if built_for == "cp311":
+        with pytest.raises(DraftConflict, match=r"built for CPython 3\.11.*runs CPython 3\.12.*PYTHON_BIN"):
+            await install
+        assert commands == [] and not (destination / ".venv").exists()
+    else:
+        with pytest.raises(RuntimeError, match="inert venv creation"):
+            await install
+        assert commands[0][1:4] == ["-I", "-m", "venv"]

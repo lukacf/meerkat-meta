@@ -112,6 +112,17 @@ virtual environment. An existing `.venv` is retained and must itself run Python
 3.11 or newer. If it is incompatible or broken, startup stops before installing
 dependencies. Selecting `PYTHON_BIN` does not upgrade that environment.
 
+Application installs use the same Python as Forge, and the Toolkit packages in
+this release are built for CPython 3.11. On another CPython, Forge refuses the
+install before installing anything and names the version it needs. Debian 12's
+`python3` is 3.11. On Ubuntu 24.04, whose `python3` is 3.12, install CPython 3.11
+with `uv python install 3.11` (or `python3.11` and `python3.11-venv` from the
+deadsnakes PPA), then start Forge from a fresh unpack with `PYTHON_BIN` set to it:
+
+```bash
+PYTHON_BIN="$(uv python find 3.11)" bash start.sh
+```
+
 If creating the environment or preparing pip fails, Forge prints the prerequisite
 and recovery steps before dependency installation or server startup. A partial
 `.venv` is retained. Correct the Python installation first, then use the backup

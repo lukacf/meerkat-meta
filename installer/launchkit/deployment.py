@@ -12,6 +12,7 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import platform
 import re
 import stat
 import sys
@@ -39,6 +40,57 @@ PRIVATE_RUNTIME_UPDATE_ONLY = "This private runtime candidate is admitted only t
 PRODUCT_CONFIGURE_REQUIRED = "This selected Meta/Toolkit installation needs its original Configure startup inputs. Ordinary Start and background startup are unavailable."
 AGENT_TEAM_PRODUCT_UNAVAILABLE = ("Agent team packages are not available in this Forge: they install the older MobKit 0.8 "
     "runtime. Use Build application to build and install your agents as an application on Meta 0.9.4.")
+
+
+def forge_interpreter():
+    """Forge's own CPython: the worker creates every application venv from it."""
+    tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    try:
+        libc = os.confstr("CS_GNU_LIBC_VERSION") or ""
+    except (AttributeError, ValueError, OSError):
+        libc = ""
+    glibc = re.fullmatch(r"glibc ([0-9]+)\.([0-9]+).*", libc)
+    macos = re.match(r"([0-9]+)\.([0-9]+)", platform.mac_ver()[0] + ".0")
+    return {"python_tag": tag, "abi_tag": tag, "implementation": "cpython",
+        "system": platform.system(), "machine": platform.machine(),
+        "glibc_minimum": [int(glibc[1]), int(glibc[2])] if glibc else [0, 0],
+        "macos": (int(macos[1]), int(macos[2])) if macos else (0, 0)}
+
+
+def selected_interpreter_refusal(target, interpreter=None):
+    """Why Forge's interpreter cannot install the selected dependency wheels, or None.
+
+    The application venv inherits Forge's interpreter, so an incompatible
+    compiled wheel would otherwise fail midway, after the selected SDK pair
+    is already installed in that venv.
+    """
+    from .remote_product_control import _wheel_compatible
+    host = forge_interpreter() if interpreter is None else interpreter
+
+    def macos_platform(tag):
+        found = re.fullmatch(r"macosx_([0-9]+)_([0-9]+)_([a-z0-9_]+)", tag)
+        return tag == "any" or (found is not None and found[3] in {host["machine"], "universal2"}
+            and (int(found[1]), int(found[2])) <= host["macos"])
+
+    def compatible(name):
+        if host["system"] == "Linux":
+            return _wheel_compatible(name, host)
+        # _wheel_compatible knows only Linux platform tags: it checks the python
+        # and ABI tags, and the macOS platform tags are checked here.
+        head, _, platforms = name.removesuffix(".whl").rpartition("-")
+        return _wheel_compatible(head + "-any.whl", host) and any(map(macos_platform, platforms.split(".")))
+
+    refused = [name for name in (Path(wheel.path).name for wheel in target.dependency_wheels) if not compatible(name)]
+    if not refused:
+        return None
+    running = "3." + host["python_tag"][3:]
+    needed = sorted({"3." + tag[3:] for name in refused for tag in name.split("-")[-3].split(".")
+        if re.fullmatch(r"cp3[0-9]+", tag)} - {running})
+    if needed:
+        return (f"This product's application packages are built for CPython {' or '.join(needed)}, but this Forge "
+            f"runs CPython {running}, so installing them would fail midway. Start Forge from a fresh unpack with "
+            f"PYTHON_BIN set to a CPython {needed[0]} interpreter, as the README describes, then install again.")
+    return f"This product's application packages do not support this computer: {', '.join(refused[:3])}."
 
 
 def product_runtime_source(files, selected, *, verified_artifacts=None, source_custody=None):
@@ -1447,7 +1499,8 @@ class DeploymentService:
         await await_validation(verify_selected_application_dependencies,
             files.get("requirements.application.txt", (b"", 0o644))[0], artifacts)
         from types import SimpleNamespace
-        return SimpleNamespace(selection=selected, artifacts=artifacts)
+        return SimpleNamespace(selection=selected, artifacts=artifacts,
+            interpreter_refusal=selected_interpreter_refusal(artifacts.selection))
 
     async def options(self, guide_id, build_id=None, *, console_port=None, source_kind="application", version=None):
         if source_kind not in {"application", "native-team"}:
@@ -1517,6 +1570,7 @@ class DeploymentService:
                 raise DraftConflict("The selected product changed while preparing setup. Reload before installing.")
         observation = observe_local_console_port(deployment["port"] if console_port is None else console_port,
                                                 suggest_alternate=True) if supported or console_port is not None else None
+        refusal = getattr(product, "interpreter_refusal", None)
         return {"build_id": status["build_id"], "guide_version": status["guide_version"],
                 "source_digest": source["source_digest"], **native_fields(source),
                 "current_guide_version": state["version"], "current": True,
@@ -1526,9 +1580,10 @@ class DeploymentService:
                 "host_provider_keys": keys if supported else [], "target": target, "host_target": host_target,
                 "handoff": handoff, "console_scope": console_scope, "knowledge_mode": deployment["knowledge"]["mode"],
                 "supported": supported, "default_execution_mode": "interactive",
-                "fresh_install": {"available": supported and ("runtimeCandidate" not in deployment or product is not None),
-                    "reason": PRIVATE_RUNTIME_UPDATE_ONLY if "runtimeCandidate" in deployment and product is None else None,
-                    **({"next_step": "configure"} if product is not None else {})},
+                "fresh_install": {"available": supported and ("runtimeCandidate" not in deployment or product is not None)
+                        and refusal is None,
+                    "reason": refusal or (PRIVATE_RUNTIME_UPDATE_ONLY if "runtimeCandidate" in deployment and product is None else None),
+                    **({"next_step": "configure"} if product is not None and refusal is None else {})},
                 **({"console_port_observation": observation} if observation is not None else {}),
                 "execution_modes": [
                     {"id": "interactive", "label": "While Forge is open", "available": supported,
@@ -1572,6 +1627,8 @@ class DeploymentService:
             product = await self._initial_product(guide_id, build_id, source, files) if source_kind == "application" else None
             if "runtimeCandidate" in definition and product is None:
                 raise DraftConflict(PRIVATE_RUNTIME_UPDATE_ONLY)
+            if product is not None and product.interpreter_refusal:
+                raise DraftConflict(product.interpreter_refusal)
             if product is not None and execution_mode != "interactive":
                 raise DraftConflict(PRODUCT_CONFIGURE_REQUIRED)
             if source["build_id"] != build_id or not package_matches(source, state):

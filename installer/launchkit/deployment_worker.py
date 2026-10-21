@@ -1441,7 +1441,7 @@ async def _install_selected_product(supervisor, artifacts, require_current, comm
         _sdk_location)
     from .product_runtime_custody import (await_product_validation, require_product_source,
         require_product_installation)
-    from .deployment import _DestinationSourceObservation
+    from .deployment import _DestinationSourceObservation, selected_interpreter_refusal
     source_observation = None
     def current(fence=require_current):
         if supervisor.stop.is_set():
@@ -1483,6 +1483,11 @@ async def _install_selected_product(supervisor, artifacts, require_current, comm
             destination=supervisor.destination, files=files)
         source_observation = _DestinationSourceObservation(read_receipt(supervisor.directory), files)
         current()
+    # The venv below inherits this interpreter: refuse a closure it cannot
+    # install before anything is installed into it.
+    refusal = selected_interpreter_refusal(artifacts.selection)
+    if refusal is not None:
+        raise DraftConflict(refusal)
     venv = supervisor.destination / ".venv"
     if not venv.exists() and not venv.is_symlink():
         venv.mkdir(mode=0o700)
