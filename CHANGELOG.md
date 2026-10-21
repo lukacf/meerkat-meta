@@ -1321,8 +1321,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lists the published tools before its first turn (see the next item).
 - `meta/identity/resolved_tools`, and `resolved_tools_for_session` and
   `resolved_tools_for_member` in Rust, answer the tools the member's next
-  model request carries: meerkat's catalog view of the member's live tool
-  dispatcher. Before, they answered the member's tool scope as its last
+  model request carries under its active filters: meerkat's catalog view of
+  the member's live tool dispatcher. Before, they answered the member's tool scope as its last
   model call left it, and meerkat refreshes that scope from the dispatcher
   only when a model call starts. So tools published after meerkat built the
   member were listed only once it had run a turn, although that turn carried
