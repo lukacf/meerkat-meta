@@ -168,8 +168,13 @@ def test_installed_update_to_a_refreshed_connect_product_admits_its_console(
     assert candidate["config/console.toml"] == (expected, 0o644)
     retained = old_product.successor_workspace.framework_provenance()["retained_template_paths"]
     assert ("config/console.toml" in retained) is (predecessor == "customized")
-    assert updates.runtime_dependency_transition(previous, candidate, original_receipt(previous),
-        runtime_target=target) is not None
+    receipt = original_receipt(previous)
+    changes, blockers = updates.compatibility(previous, candidate, receipt, runtime_target=target)
+    assert blockers == []
+    assert ({"path": "config/console.toml", "change": "changed"} in changes) is (predecessor == "compiler-default")
+    # The Console change is admitted only as a product framework path of this refresh.
+    descriptor = updates.runtime_dependency_transition(previous, candidate, receipt, runtime_target=target)
+    assert descriptor is not None and "config/console.toml" in descriptor["protected_paths"]
     directory, destination, identity = staged(tmp_path, selected)
     updates.activate(directory, identity)
     installed = (destination / "config/console.toml").read_bytes()
