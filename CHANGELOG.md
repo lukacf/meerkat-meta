@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.9.4] - 2026-10-21
+## [0.9.4] - 2026-10-22
 
 ### Breaking
 
@@ -1478,6 +1478,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   enrollment, which such an application does not have, so after every
   sign-in it answered 503 ("Console login enrollment is unavailable"). It now
   signs in with the Console password, as the configured user.
+- Meta Forge's guidance for the applications it builds now covers a
+  correction that leaves no feasible option, or a decision that the evidence
+  leaves open. Such an application can save that as its authoritative
+  current outcome, superseding the earlier recommendation without inventing
+  a new choice, and Forge's acceptance review checks that outcome and its
+  readback after a restart.
 - `/console/experience` reports `health_overview.live_snapshot.running` as
   the mob's owner answers when the experience is read, as `meta/status`
   does. It came from the console's cached roster walk, and was `true` when
@@ -1763,6 +1769,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   product application before any transfer, as 0.9.3 did; install it on the
   computer that runs Forge. On Linux the product needs glibc 2.39 or newer, so
   Debian 12 (glibc 2.36) cannot run it.
+- Meta Forge re-verifies a Meta/Toolkit product application's installation on
+  each Start, before the application launches: the native runtime, the Meta
+  and Toolkit SDK packages and the application source are read and checked
+  against the verified installation, so a changed or damaged file is
+  refused instead of run. On a small machine (2 vCPU) this check can take
+  several minutes on every Start. Faster verification is planned for 0.9.5.
 
 ## [0.9.3] - 2026-10-18
 
