@@ -3,6 +3,7 @@ import { captureGuideSelection, guideSelectionAvailable, guideSelectionEvents } 
 import React, { useEffect, useRef, useState } from "react";
 import { DeploymentActivity } from "./deployment-activity.jsx";
 import { request, requestBlob } from "./state.mjs";
+import { readDeploymentSetup } from "./deployment-setup-read.mjs";
 import { packagePreparationReason } from "./package-availability.mjs";
 import { deploymentRequiredFields, deploymentFieldId, deploymentRemovableFields, deploymentFieldIssues } from "./deployment-configuration.mjs";
 import { deploymentCanPrepare, deploymentCanFreshInstall, deploymentFreshInstallRestriction, deploymentCanSubmit, deploymentConsole, deploymentIsActive,
@@ -456,7 +457,7 @@ export function DeploymentPanel({ state, plan, build, designBusy, pendingManual,
     try {
       const query = selected.sourceKind === "native-team" ? { source_kind: "native-team", version: selected.version }
         : { build_id: selected.buildId };
-      const next = await request(`${deploymentUrl(selected.guideId)}/options?${new URLSearchParams(query)}`);
+      const next = await readDeploymentSetup(`${deploymentUrl(selected.guideId)}/options?${new URLSearchParams(query)}`);
       if (!ownerCurrent() || selected.generation !== generation.current || latest.current.state.id !== selected.guideId ||
           latest.current.sourceKey !== selected.sourceKey || latest.current.state.version !== selected.version ||
           deploymentSourceKind(next) !== selected.sourceKind ||
@@ -539,7 +540,7 @@ export function DeploymentPanel({ state, plan, build, designBusy, pendingManual,
       const query = new URLSearchParams(selected.intent === "settings" ?
         { deployment_id: receipt.deployment_id, console_port: port } : selected.sourceKind === "native-team"
         ? { source_kind: "native-team", version: selected.version, console_port: port } : { build_id: selected.buildId, console_port: port });
-      const next = await request(`${deploymentUrl(selected.guideId)}/${selected.intent === "settings" ? "settings" : "options"}?${query}`);
+      const next = await readDeploymentSetup(`${deploymentUrl(selected.guideId)}/${selected.intent === "settings" ? "settings" : "options"}?${query}`);
       if (!current()) return;
       if (selected.intent !== "settings" && selected.sourceKind === "native-team" &&
           (next.source_id !== selected.nativeSourceId || next.source_digest !== selected.nativeSourceDigest))
