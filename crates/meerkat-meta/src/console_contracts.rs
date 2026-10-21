@@ -6,6 +6,58 @@ use serde_json::Value;
 pub const IDENTITY_STREAM_NAME: &str = "identity";
 pub const ALL_EVENTS_STREAM_NAME: &str = "all_events";
 pub const SYSTEM_EVENT_IDENTITY: &str = "_system";
+/// Identity of the console's synthetic source-gap markers.
+pub(crate) const CONSOLE_GAP_IDENTITY: &str = "__console__";
+
+/// Whether `identity` is one of the console's runtime-plane identities:
+/// [`SYSTEM_EVENT_IDENTITY`] (the runtime's own events, such as identity-less
+/// memory events) or [`CONSOLE_GAP_IDENTITY`]. The console treats frames
+/// under them as the runtime's, never a member's, so no member may take one.
+pub(crate) fn is_runtime_plane_identity(identity: &str) -> bool {
+    identity == SYSTEM_EVENT_IDENTITY || identity == CONSOLE_GAP_IDENTITY
+}
+
+/// Most distinct members [`warn_runtime_plane_member_drop`] remembers.
+const RUNTIME_PLANE_DROP_WARNINGS_CAP: usize = 1024;
+
+/// Log that a console writer dropped a member's event because it resolved to
+/// a runtime-plane identity: once per runtime id (or, without one, per
+/// member id) per process, so a member that keeps emitting does not flood the
+/// log. Past the cap a drop logs at debug only.
+pub(crate) fn warn_runtime_plane_member_drop(
+    member_id: &str,
+    runtime_id: Option<&str>,
+    identity: &str,
+    writer: &'static str,
+) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let first = {
+        let mut warned = WARNED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        warned.len() < RUNTIME_PLANE_DROP_WARNINGS_CAP
+            && warned.insert(runtime_id.unwrap_or(member_id).to_string())
+    };
+    if first {
+        tracing::warn!(
+            member_id,
+            runtime_id = runtime_id.unwrap_or_default(),
+            identity,
+            writer,
+            "dropping a member's console event: it resolves to a reserved runtime-plane identity"
+        );
+    } else {
+        tracing::debug!(
+            member_id,
+            runtime_id = runtime_id.unwrap_or_default(),
+            identity,
+            writer,
+            "dropping a member's console event: it resolves to a reserved runtime-plane identity"
+        );
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleIdentityEventEnvelope {

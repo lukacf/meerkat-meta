@@ -48,6 +48,10 @@ pub(crate) fn new_console_spawn_sink_slot() -> SharedConsoleSpawnSinkSlot {
 pub(crate) const SPAWNED_BY_LABEL: &str = "spawned_by";
 /// Console-side label key recording which tool performed the spawn.
 pub(crate) const VIA_TOOL_LABEL: &str = "via_tool";
+/// Console-side label key recording the session of the spawning agent's
+/// incarnation, so captured lineage binds the parent incarnation that
+/// performed the spawn and not a later member under the same identity.
+pub(crate) const SPAWNED_BY_SESSION_LABEL: &str = "spawned_by_session";
 
 /// One spawned member, as seen by the agent-tool spawn path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +72,8 @@ pub(crate) struct ConsoleSpawnSeed {
     pub(crate) labels: BTreeMap<String, String>,
     /// Identity of the agent that performed the spawn, when known.
     pub(crate) spawned_by: Option<String>,
+    /// Session of the spawning agent's incarnation, when known.
+    pub(crate) spawned_by_session: Option<String>,
     /// Tool that performed the spawn (`mob_spawn_member`, `delegate`, ...).
     pub(crate) via_tool: String,
 }
@@ -102,15 +108,17 @@ impl ConsoleSpawnSink {
         if identity.is_empty() || member_id.is_empty() {
             return;
         }
-        // The system identity is reserved for runtime-plane events: the
-        // console aggregator exempts it from the roster-visibility gate and
-        // identity namespacing, so a member registered under this name
-        // would bypass both. Spawn surfaces reject the name; this is the
-        // projection-side backstop for paths that skip that validation.
-        if identity == crate::console_contracts::SYSTEM_EVENT_IDENTITY {
-            tracing::warn!(
+        // The runtime-plane identities name the console's own events: the
+        // console aggregator exempts them from the roster-visibility gate,
+        // so a member registered under one would bypass it. Every creation
+        // path refuses them; this projection-side backstop covers a member
+        // created before they did.
+        if crate::console_contracts::is_runtime_plane_identity(identity) {
+            crate::console_contracts::warn_runtime_plane_member_drop(
                 member_id,
-                "refusing to project a spawned member under the reserved system identity"
+                None,
+                identity,
+                "spawn projection",
             );
             return;
         }
@@ -139,6 +147,25 @@ impl ConsoleSpawnSink {
                 // spawner must also evict any previously registered lineage.
                 self.console_events
                     .unregister_identity_label(identity, SPAWNED_BY_LABEL)
+                    .await;
+            }
+        }
+        // The spawning incarnation binds the lineage; without one, a stale
+        // binding from an earlier spawn must not stay registered.
+        match seed
+            .spawned_by
+            .as_deref()
+            .and(seed.spawned_by_session.as_deref())
+            .map(str::trim)
+            .filter(|session| !session.is_empty())
+        {
+            Some(session) => {
+                labels.insert(SPAWNED_BY_SESSION_LABEL.to_string(), session.to_string());
+            }
+            None => {
+                labels.remove(SPAWNED_BY_SESSION_LABEL);
+                self.console_events
+                    .unregister_identity_label(identity, SPAWNED_BY_SESSION_LABEL)
                     .await;
             }
         }
@@ -256,6 +283,7 @@ pub(crate) fn spawned_by_from_comms_name(comms_name: &str) -> Option<String> {
 /// only the spawn registry may assert these keys.
 pub(crate) fn sanitize_unverified_lineage_labels(labels: &mut BTreeMap<String, String>) {
     labels.remove(SPAWNED_BY_LABEL);
+    labels.remove(SPAWNED_BY_SESSION_LABEL);
     labels.remove(VIA_TOOL_LABEL);
 }
 
@@ -380,6 +408,20 @@ fn collect_outcome_targets(
     }
 }
 
+/// The console identity a spawned member's projection registers: its usable
+/// `agent_identity` label (the console identity override), otherwise its
+/// member id, trimmed as [`ConsoleSpawnSink::project_spawned_member`]
+/// registers it. The runtime-plane member checks evaluate this same value.
+pub(crate) fn spawn_seed_console_identity(
+    member_id: &str,
+    labels: &BTreeMap<String, String>,
+) -> String {
+    crate::member_comms_id::durable_identity_label(labels)
+        .unwrap_or(member_id)
+        .trim()
+        .to_string()
+}
+
 /// Extract the spawned members from a successful spawn-tool dispatch.
 ///
 /// `args` is the tool-call argument object (single-record shape or
@@ -412,9 +454,7 @@ pub(crate) fn console_spawn_seeds(
         let labels = record
             .map(|record| record.labels.clone())
             .unwrap_or_default();
-        let identity = crate::member_comms_id::durable_identity_label(&labels)
-            .map(ToString::to_string)
-            .unwrap_or_else(|| member_id.clone());
+        let identity = spawn_seed_console_identity(&member_id, &labels);
         ConsoleSpawnSeed {
             mob_id: mob_id
                 .or_else(|| record.and_then(|record| record.mob_id.clone()))
@@ -424,6 +464,7 @@ pub(crate) fn console_spawn_seeds(
             initial_message: record.and_then(|record| record.initial_message.clone()),
             labels,
             spawned_by: spawned_by.clone(),
+            spawned_by_session: None,
             via_tool: tool_name.to_string(),
         }
     };
@@ -480,7 +521,7 @@ pub(crate) fn merge_registered_labels(
     registered: &BTreeMap<String, String>,
 ) {
     for (key, value) in registered {
-        if key == SPAWNED_BY_LABEL || key == VIA_TOOL_LABEL {
+        if key == SPAWNED_BY_LABEL || key == SPAWNED_BY_SESSION_LABEL || key == VIA_TOOL_LABEL {
             labels.insert(key.clone(), value.clone());
         } else {
             labels.entry(key.clone()).or_insert_with(|| value.clone());
@@ -518,6 +559,7 @@ mod tests {
             initial_message,
             labels: BTreeMap::from([("group".to_string(), "workers".to_string())]),
             spawned_by: Some("ops-lead".to_string()),
+            spawned_by_session: None,
             via_tool: "mob_spawn_member".to_string(),
         }
     }
@@ -572,6 +614,31 @@ mod tests {
                 .identity_labels_snapshot()
                 .await
                 .contains_key(crate::console_contracts::SYSTEM_EVENT_IDENTITY),
+            "no identity metadata may register under the reserved identity"
+        );
+    }
+
+    /// The backstop covers both runtime-plane identities: a seed carrying
+    /// `__console__` projects nothing either.
+    #[tokio::test]
+    async fn reserved_console_identity_seed_projects_nothing() {
+        let store = ConsoleEventStore::new();
+        let sink = ConsoleSpawnSink::new(store.clone());
+        let mut spoofed = seed("worker-4", Some(json!("Find the person")));
+        spoofed.identity = "__console__".to_string();
+
+        sink.project_spawned_member(&spoofed).await;
+
+        let replay = store.replay_all(None).await.expect("replay");
+        assert!(
+            !replay.iter().any(|event| event.event_type == "user_input"),
+            "no kickoff may project under the reserved identity: {replay:#?}"
+        );
+        assert!(
+            !sink
+                .identity_labels_snapshot()
+                .await
+                .contains_key("__console__"),
             "no identity metadata may register under the reserved identity"
         );
     }
@@ -655,6 +722,52 @@ mod tests {
         );
     }
 
+    /// The spawn registry binds lineage to the spawning incarnation: the
+    /// session that performed the spawn is registered next to `spawned_by`,
+    /// a caller-supplied value never is, and a later spawn of the same
+    /// identity without a known spawning session evicts the earlier binding.
+    #[tokio::test]
+    async fn the_spawning_session_is_registered_only_by_the_spawn_registry() {
+        let store = ConsoleEventStore::new();
+        let sink = ConsoleSpawnSink::new(store.clone());
+        let mut bound = ConsoleSpawnSeed {
+            spawned_by_session: Some("lead-session-1".to_string()),
+            ..seed("worker-3", None)
+        };
+        bound.labels.insert(
+            SPAWNED_BY_SESSION_LABEL.to_string(),
+            "claimed-session".to_string(),
+        );
+        sink.project_spawned_member(&bound).await;
+        let labels = store
+            .identity_labels("worker-3")
+            .await
+            .expect("identity labels registered");
+        assert_eq!(
+            labels.get(SPAWNED_BY_SESSION_LABEL).map(String::as_str),
+            Some("lead-session-1")
+        );
+
+        // Respawned by a spawner whose session is unknown: no stale binding.
+        sink.project_spawned_member(&seed("worker-3", None)).await;
+        let labels = store
+            .identity_labels("worker-3")
+            .await
+            .expect("identity labels registered");
+        assert_eq!(labels.get(SPAWNED_BY_SESSION_LABEL), None);
+
+        // Unverified lineage labels lose the binding along with `spawned_by`.
+        let mut roster_labels = BTreeMap::from([
+            (SPAWNED_BY_LABEL.to_string(), "victim-agent".to_string()),
+            (
+                SPAWNED_BY_SESSION_LABEL.to_string(),
+                "claimed-session".to_string(),
+            ),
+        ]);
+        sanitize_unverified_lineage_labels(&mut roster_labels);
+        assert!(roster_labels.is_empty());
+    }
+
     #[tokio::test]
     async fn caller_labels_cannot_spoof_runtime_derived_lineage() {
         let store = ConsoleEventStore::new();
@@ -685,6 +798,7 @@ mod tests {
 
         let unknown_parent = ConsoleSpawnSeed {
             spawned_by: None,
+            spawned_by_session: None,
             labels: BTreeMap::from([(SPAWNED_BY_LABEL.to_string(), "victim-agent".to_string())]),
             ..seed("worker-9", None)
         };
@@ -782,6 +896,7 @@ mod tests {
 
         let unknown_spawner = ConsoleSpawnSeed {
             spawned_by: None,
+            spawned_by_session: None,
             via_tool: "spawn_member".to_string(),
             ..seed("worker-3", None)
         };

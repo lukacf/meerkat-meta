@@ -229,7 +229,6 @@ impl MobRuntimeDelivery {
             dispatch_taint: None,
             after_create_hook: None,
             runtime_adapter_override: Some(Arc::clone(&runtime)),
-            session_read_absorber: None,
             archived_terminal_authority: None,
         });
         let host = Arc::new(
@@ -1046,8 +1045,13 @@ mod tests {
             mob_id: "foreign-mob".to_string(),
             identity: "foreign-member".to_string(),
         };
-        let address = meerkat::member_delivery_address("foreign-mob", "foreign-member", 1)
-            .expect("foreign address");
+        let address = meerkat::member_delivery_address(
+            "foreign-mob",
+            meerkat_core::service::MobIncarnationId::mint(),
+            "foreign-member",
+            1,
+        )
+        .expect("foreign address");
         let continuations = meerkat::ContinuationOwnerService::new(
             fixture.delivery.inbox(),
             Arc::new(ForeignMemberResolver {

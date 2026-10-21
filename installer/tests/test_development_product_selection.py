@@ -51,7 +51,7 @@ def development(product, meta_version="0.9.0"):
     return target, descriptor, staging
 
 
-@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1"])
+@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1", "0.9.4"])
 def test_development_keeps_actual_prefix_and_source_without_inventing_verifier(product, meta_version):
     target, descriptor, _ = development(product, meta_version)
     (product.final / "gateway-verification.json").unlink()
@@ -69,7 +69,7 @@ def test_development_keeps_actual_prefix_and_source_without_inventing_verifier(p
     assert parse_candidate_selection(json.loads(json.dumps(serialized))) == target
 
 
-@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1"])
+@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1", "0.9.4"])
 @pytest.mark.parametrize("defect", ["claim-final", "invent-qualification", "no-source", "source-bytes",
     "staging-candidate", "failed-build", "wrong-sdk", "selected-sdk-version", "changed-catalog", "changed-prefix"])
 def test_development_cannot_replace_actual_owner_relationships(product, defect, meta_version):
@@ -134,7 +134,7 @@ def test_development_snapshot_cannot_relabel_origin(product):
         candidates.recheck_meta_toolkit_artifacts(observed, target)
 
 
-@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1"])
+@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1", "0.9.4"])
 @pytest.mark.parametrize("defect", [None, "profile-type", "summary-drift"])
 def test_development_catalog_uses_exact_full_meta_profiles(product, meta_version, defect):
     from launchkit.native_models import model_catalog_context
@@ -188,7 +188,7 @@ def guide_product_inputs(product, bundle_source, monkeypatch):
     return root, sdk, gateway, guide
 
 
-@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1"])
+@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1", "0.9.4"])
 def test_development_distribution_keeps_guide_and_application_owners_separate(
         product, bundle_source, tmp_path, monkeypatch, meta_version):
     from launchkit import distribution, product_distribution, guide_sdk

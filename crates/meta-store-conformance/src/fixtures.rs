@@ -1,31 +1,11 @@
 //! Deterministic fixtures shared by the chapters.
-//!
-//! Session fabrication is delegated to the upstream harness's fixtures
-//! (`meerkat_store_conformance::fixtures`) so legacy session documents here
-//! are byte-compatible with the shapes Meerkat's own conformance suite pins:
-//! current-envelope documents whose metadata lacks the typed checkpoint
-//! stamp — exactly what 0.7.x fleets persisted.
 
-use meerkat_core::Session;
 use meerkat_meta::console_aggregator::{
     ConsoleFrameSource, ConsoleFrameSourceKind, ConsoleFrameStatus, NewConsoleFrame,
 };
-use meerkat_meta::identity_first::SessionSnapshot;
 use meerkat_meta::memory::{MemoryKind, NewMemoryRecord};
 use meerkat_meta::types::UnifiedEvent;
 use meerkat_meta::unified_runtime::PersistedEvent;
-use meerkat_store_conformance::ConformanceFailure;
-pub use meerkat_store_conformance::fixtures::{push_text, session_with_texts};
-
-/// Serialize a session into the canonical continuity-snapshot payload: the
-/// Meerkat `Session` JSON document (what `ContinuitySessionStoreAdapter` and
-/// `MobSessionBridge::checkpoint_session` both write).
-pub fn session_snapshot(session: &Session) -> Result<SessionSnapshot, ConformanceFailure> {
-    let data = serde_json::to_vec(session).map_err(|error| {
-        ConformanceFailure::new("fixtures", "session_snapshot", error.to_string())
-    })?;
-    Ok(SessionSnapshot { data })
-}
 
 /// A deterministic console frame keyed by `dedupe_key`.
 pub fn console_frame(dedupe_key: &str, identity: &str, timestamp_ms: u64) -> NewConsoleFrame {
@@ -70,6 +50,7 @@ pub fn console_frame_with_member_provenance() -> NewConsoleFrame {
             runtime_key: frame.runtime_key.clone(),
             runtime_member_id: "private-member".to_string(),
             session_id: frame.session_id.clone(),
+            member_id: None,
             visibility: ConsoleVisibility::Addressable,
             addressable: true,
             health: "ready".to_string(),
@@ -91,6 +72,7 @@ pub fn console_frame_with_member_provenance() -> NewConsoleFrame {
         },
         primary_mob_id: "primary".to_string(),
         source_mob_id: "private-lower-mob".to_string(),
+        lineage: Vec::new(),
     });
     frame
 }

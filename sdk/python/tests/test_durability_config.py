@@ -182,6 +182,40 @@ class TestStorageCensusModel:
         assert isinstance(status.storage, StorageSummary)
         assert status.storage.slot("runtime").backend == "SqliteRuntimeStore"
 
+    def test_status_result_ignores_fields_it_does_not_model(self):
+        status = StatusResult.from_dict(
+            {
+                "contract_version": "0.5.0",
+                "running": True,
+                "loaded_modules": [],
+                "reserved_identity_members": [
+                    {
+                        "member_id": "worker-1",
+                        "runtime_id": "worker-1:0",
+                        "identity": "_system",
+                    }
+                ],
+            }
+        )
+        assert status.contract_version == "0.5.0"
+        assert status.running is True
+        assert status.storage is None
+
+    def test_status_result_ignores_non_expiring_console_principals(self):
+        status = StatusResult.from_dict(
+            {
+                "contract_version": "0.5.0",
+                "running": True,
+                "loaded_modules": [],
+                "non_expiring_console_principals": [
+                    {"principal": "svc:reporter", "non_expiring": True}
+                ],
+            }
+        )
+        assert status.contract_version == "0.5.0"
+        assert status.running is True
+        assert status.storage is None
+
     def test_status_result_without_storage_is_none(self):
         status = StatusResult.from_dict(
             {"contract_version": "0.5.0", "running": True, "loaded_modules": []}

@@ -165,10 +165,12 @@ fn unified_builder_roots_funnel_through_wrapped_stock_constructors() {
         2,
         "builder roots must retain both ephemeral stock constructors"
     );
+    // The persistent root chains its mob storage provenance onto the
+    // wrapped spec, so the call is matched without its statement end.
     assert_eq!(
         occurrences(
             RUNTIME_SOURCE,
-            "Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook());"
+            "Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook())"
         ),
         3,
         "every stock constructor used by the builder must install the common wrapper"

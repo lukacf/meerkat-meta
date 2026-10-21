@@ -21,7 +21,8 @@
 //! so every drive first runs the explicit one-shot adoption verb
 //! (`meta_gateway storage-adopt-predecessor --apply`) over the staged copy:
 //! that verb, a process of the build under test, is the first contact with
-//! the released bytes, and the gateway boots over what it adopted.
+//! the released bytes, and the gateway's boot over what it adopted is
+//! refused until the supported migration has run.
 //!
 //! - `baseline/`      multi-boot clean-shutdown history, 5 turns
 //!   (head: 11 messages, tokens ALPHA..ECHO)
@@ -50,19 +51,19 @@
 //!
 //! # What one drive proves, per realm
 //!
-//! 1. The CURRENT gateway is the first process to open a copy of the released
-//!    bytes (`--persistent`, demo_llm, the shipped identity-first
-//!    composition): boot succeeds, the pre-existing identity resumes ACTIVE
-//!    and bound to the released session (rotation is data loss, not
-//!    recovery), and no member is Broken.
-//! 2. One real turn per pre-existing identity extends the released transcript
-//!    durably; clean shutdown attests runtime cleanup.
-//! 3. The released transcript survives element-for-element as an exact prefix
-//!    (upgrade may not rewrite history), every released marker token is still
-//!    present, and the upgraded runtime store now serves the session from the
-//!    whole-blob authority representation (the 0.8.11 runtime-store schema).
-//! 4. A SECOND cold boot resumes from state written by the NEW build: the
-//!    upgraded bytes read back unchanged, and one more turn extends them.
+//! 1. The committed bytes are the released capture (size pins), and the
+//!    released truth (session, head, marker tokens, identity record) reads
+//!    back from a dedicated inspection copy.
+//! 2. The explicit adoption verb is the build's first contact with the
+//!    released bytes.
+//! 3. The CURRENT gateway's boot over the adopted realm is refused before any
+//!    store opens (STORAGE_RESOLUTION, naming `storage-migrate-native`):
+//!    sessions live in Core's own stores now, and the native migration reads
+//!    only a directory a 0.9.3 start last wrote. The supported route for a
+//!    predecessor realm is one start with published 0.9.3, then
+//!    `storage-migrate-native`; the resume after it is pinned on a
+//!    0.9.3-started capture (released_0_9_3_started_store_migration.rs).
+//! 4. The refused boot leaves the released transcript exactly as adopted.
 //!
 //! Durable assertions are read from disk with plain SQL after the child
 //! exits, never from an in-process handle - the same discipline as
@@ -122,14 +123,7 @@ const IDENTITY: &str = "agent:alice";
 /// away from the shipped configuration.
 const DECODE_MEMO_KILL_SWITCH: &str = "MEERKAT_DISABLE_GRAPH_DECODE_MEMO";
 
-/// Messages one `turn_driven` turn must durably add: the user prompt and the
-/// assistant reply.
-const MESSAGES_PER_TURN: i64 = 2;
-
 const INIT_TIMEOUT: Duration = Duration::from_mins(3);
-const RPC_TIMEOUT: Duration = Duration::from_mins(1);
-const TURN_TIMEOUT: Duration = Duration::from_mins(3);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_mins(3);
 const EXIT_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Everything that is TRUE about one committed released realm, pinned from
@@ -394,10 +388,6 @@ impl Gateway {
         drop(self.stdin.take());
     }
 
-    fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
     fn stderr_tail(&self) -> String {
         let Ok(sink) = self.stderr.lock() else {
             return "[gateway stderr unavailable: poisoned lock]".to_string();
@@ -410,30 +400,6 @@ impl Gateway {
             sink.len(),
             sink[start..].join("\n")
         )
-    }
-
-    /// Task #21 pin: a boot over healthy (or once-healed) durable state must
-    /// classify CLEAN — zero Broken classifications, zero continuity-repair
-    /// activity. A heal that does not persist a clean boundary re-Breaks on
-    /// the NEXT boot (the 2026-07-29 heal/re-Break production loop), and this
-    /// is where that would surface.
-    fn assert_no_repair_activity(&self) {
-        let Ok(sink) = self.stderr.lock() else {
-            panic!("[{}] gateway stderr unavailable: poisoned lock", self.label);
-        };
-        for marker in [
-            "marking identity Broken",
-            "continuity repair",
-            "continuity heal",
-        ] {
-            if let Some(line) = sink.iter().find(|line| line.contains(marker)) {
-                panic!(
-                    "({}) boot must classify clean, but the gateway logged repair \
-                     activity ({marker}): {line}",
-                    self.label
-                );
-            }
-        }
     }
 
     fn wait_for(
@@ -456,58 +422,6 @@ impl Gateway {
             }
             on_other(self, &message);
         }
-    }
-
-    fn call(&mut self, id: &str, method: &str, params: Value, deadline: Duration) -> Value {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        }));
-        let matched = self.wait_for(deadline, answer_host_callback, |message| {
-            is_response_with_id(message, id)
-        });
-        match matched {
-            Some(response) => {
-                assert!(
-                    response.get("error").is_none(),
-                    "[{}] {method} failed: {response}\n{}",
-                    self.label,
-                    self.stderr_tail()
-                );
-                response
-            }
-            None => panic!(
-                "[{}] no response to {method} within {:?}\n{}",
-                self.label,
-                deadline,
-                self.stderr_tail()
-            ),
-        }
-    }
-
-    /// The SDK shutdown handshake, then EOF, then reaping. The result is the
-    /// runtime's cleanup attestation: complete, with the durable child root
-    /// released and every other phase settled; a wedged runtime (drain
-    /// timeout, mob stop failure, unreleased identity authority, orphaned
-    /// module processes, a held child root) fails it.
-    fn shutdown_and_reap(&mut self) {
-        let response = self.call("shutdown", "meta/shutdown", json!({}), SHUTDOWN_TIMEOUT);
-        // A persistent stock gateway stands its durable child mobs down and
-        // releases their root: cleanup is complete.
-        gateway_shutdown::assert_persistent_shutdown_completed(
-            &response,
-            &format!("[{}] shutdown\n{}", self.label, self.stderr_tail()),
-        );
-        self.close_stdin();
-        let status = self.wait_for_exit(EXIT_TIMEOUT);
-        assert!(
-            status.success(),
-            "[{}] rpc_gateway exited with {status}\n{}",
-            self.label,
-            self.stderr_tail()
-        );
     }
 
     fn wait_for_exit(&mut self, deadline: Duration) -> ExitStatus {
@@ -571,119 +485,49 @@ fn answer_host_callback(gateway: &mut Gateway, message: &Value) {
     }
 }
 
-/// Boot the CURRENT gateway over `state` with the same identity-first init
-/// the released capture driver used: the gateway opens its own continuity
-/// substrate in the state dir - the shipped composition whose released-realm
-/// upgrade is under test.
-fn boot(label: &str, state: &Path) -> Gateway {
+/// The `meta/init` params of a boot over `state`: the shipped identity-first
+/// composition (`--persistent`, demo_llm, eager roster materialization).
+fn init_params(state: &Path) -> Value {
+    json!({
+        "persistent_state": state,
+        "mob_config": MOB_CONFIG,
+        "has_roster_provider": true,
+        "runtime_options": {
+            "demo_llm": true,
+            "identity_bootstrap_mode": { "mode": "eager_materialize" }
+        }
+    })
+}
+
+/// Boot the build under test over `state` expecting `meta/init` to be
+/// refused; the error. The gateway is then closed and reaped.
+fn init_refused(label: &str, state: &Path) -> Value {
     let mut gateway = Gateway::start(label);
-    let response = gateway.call(
-        "init",
-        "meta/init",
-        json!({
-            "persistent_state": state,
-            "mob_config": MOB_CONFIG,
-            "has_roster_provider": true,
-            "runtime_options": {
-                "demo_llm": true,
-                "identity_bootstrap_mode": { "mode": "eager_materialize" }
-            }
-        }),
-        INIT_TIMEOUT,
-    );
-    assert!(
-        response["result"]["contract_version"].is_string(),
-        "[{label}] identity-first init returned no contract version: {response}"
-    );
-    gateway
-}
-
-/// Queue one turn for `identity`. `turn_driven` members process it as exactly
-/// one turn. `content` is a bare JSON string (`ContentInput` is untagged).
-fn send_turn(gateway: &mut Gateway, identity: &str, prompt: &str) {
-    let response = gateway.call(
-        "send",
-        "meta/send",
-        json!({ "identity": identity, "content": prompt }),
-        RPC_TIMEOUT,
-    );
-    assert!(
-        response["result"]["fencing_token"].is_number(),
-        "[{}] meta/send did not return a fencing token: {response}",
-        gateway.label
-    );
-}
-
-/// Assert the resumed identity is healthy and still bound to the RELEASED
-/// session: rotation across the version boundary is data loss, not recovery.
-fn assert_identity_bound(gateway: &mut Gateway, identity: &str, session_id: &str) {
-    let response = gateway.call(
-        "status",
-        "meta/status_identity",
-        json!({ "identity": identity }),
-        RPC_TIMEOUT,
-    );
-    let result = &response["result"];
-    // A non-active identity here is almost always a typed restore failure, and
-    // `meta/status_identity` does not carry the reason. Fold the bootstrap
-    // status into the assertion message so the failure names itself, rather
-    // than leaving the next reader to guess from a bare "broken".
-    let boot_diagnostic = if result["state"] == json!("active") {
-        String::new()
-    } else {
-        format!(
-            " bootstrap status: {}",
-            gateway.call(
-                "bootdiag",
-                "meta/status_identity_bootstrap",
-                json!({}),
-                RPC_TIMEOUT,
+    gateway.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "init",
+        "method": "meta/init",
+        "params": init_params(state),
+    }));
+    let response = gateway
+        .wait_for(INIT_TIMEOUT, answer_host_callback, |message| {
+            is_response_with_id(message, "init")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "[{label}] no response to meta/init\n{}",
+                gateway.stderr_tail()
             )
-        )
-    };
-    assert_eq!(
-        result["state"],
-        json!("active"),
-        "[{}] released-realm resume left the identity non-active: {response}{boot_diagnostic}",
-        gateway.label
-    );
-    assert_eq!(
-        result["session_id"],
-        json!(session_id),
-        "[{}] resume rebound the identity away from the released session: {response}",
-        gateway.label
-    );
-    assert_eq!(
-        result["continuity_health"]["store_reachable"],
-        json!(true),
-        "[{}] continuity store unreachable after released-realm resume: {response}",
-        gateway.label
-    );
-}
-
-/// The clean-resume sweep: the roster materialized at least one member and
-/// NONE of them is Broken.
-fn assert_no_broken_members(gateway: &mut Gateway) {
-    let response = gateway.call("members", "meta/list_members", json!({}), RPC_TIMEOUT);
-    let members = response["result"].as_array().unwrap_or_else(|| {
+        });
+    let error = response.get("error").cloned().unwrap_or_else(|| {
         panic!(
-            "[{}] meta/list_members did not return an array: {response}",
-            gateway.label
+            "[{label}] meta/init over the adopted realm must be refused: {response}\n{}",
+            gateway.stderr_tail()
         )
     });
-    assert!(
-        !members.is_empty(),
-        "[{}] released-realm resume produced an empty member roster",
-        gateway.label
-    );
-    for member in members {
-        let state = member["state"].as_str().unwrap_or("<missing>");
-        assert_ne!(
-            state, "broken",
-            "[{}] a member came back Broken from the released realm: {member}",
-            gateway.label
-        );
-    }
+    gateway.close_stdin();
+    gateway.wait_for_exit(EXIT_TIMEOUT);
+    error
 }
 
 // ---------------------------------------------------------------------------
@@ -720,27 +564,6 @@ fn table_exists(conn: &rusqlite::Connection, table: &str) -> bool {
     )
     .unwrap_or(0)
         == 1
-}
-
-/// `(session_id, message_count)` for every durable head. Cheap enough to poll
-/// while the child process is still writing.
-fn head_summaries(db: &Path) -> Vec<(String, i64)> {
-    if !db.exists() {
-        return Vec::new();
-    }
-    let conn = open_durable(db);
-    if !table_exists(&conn, "continuity_session_heads") {
-        return Vec::new();
-    }
-    let mut stmt = conn
-        .prepare("SELECT session_id, message_count FROM continuity_session_heads ORDER BY 1")
-        .expect("prepare head summary");
-    stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })
-    .expect("query head summaries")
-    .collect::<Result<Vec<_>, _>>()
-    .expect("collect head summaries")
 }
 
 /// The durable transcript, reconstructed exactly the way the store's own
@@ -892,27 +715,6 @@ fn state_dir_listing(state: &Path) -> Vec<String> {
     names
 }
 
-/// Turn-boundary barrier: block until the durable head reaches `floor`
-/// messages.
-fn wait_for_durable_messages(state: &Path, floor: i64, what: &str) {
-    let db = continuity_db(state);
-    let start = Instant::now();
-    loop {
-        let heads = head_summaries(&db);
-        if let [(_, count)] = heads.as_slice()
-            && *count >= floor
-        {
-            return;
-        }
-        assert!(
-            start.elapsed() < TURN_TIMEOUT,
-            "timed out waiting for {what}: want one durable head with >= {floor} messages, \
-             observed {heads:?}"
-        );
-        thread::sleep(Duration::from_millis(150));
-    }
-}
-
 /// The exact-survival assertion: `previous` must still be there, unchanged,
 /// in order, as a prefix of `current`.
 /// The ONE sanctioned released-provenance drop, normalized before row
@@ -959,52 +761,6 @@ fn assert_exact_prefix(previous: &DurableTranscript, current: &DurableTranscript
             current.strand
         );
     }
-}
-
-/// Message count of the runtime store's whole-blob snapshot for `session_id`.
-/// meerkat 0.8.11 serves boundary commits from the
-/// `runtime_whole_blob_authority` + `runtime_whole_blob_bodies` pair; the
-/// `runtime_session_snapshots` table the RELEASED binary wrote is the legacy
-/// representation the upgrade must migrate away from.
-fn whole_blob_snapshot_message_count(state: &Path, session_id: &str) -> Option<i64> {
-    let db = runtime_db(state);
-    assert!(
-        db.exists(),
-        "runtime store {} does not exist - cannot verify the upgraded representation",
-        db.display()
-    );
-    let conn = open_durable(&db);
-    assert!(
-        table_exists(&conn, "runtime_whole_blob_authority"),
-        "runtime store {} has no runtime_whole_blob_authority table - the released realm was \
-         never migrated to the current runtime-store schema",
-        db.display()
-    );
-    let mut stmt = conn
-        .prepare(
-            "SELECT bodies.session_snapshot \
-             FROM runtime_whole_blob_authority AS authority \
-             JOIN runtime_whole_blob_bodies AS bodies \
-               ON bodies.blob_sha256 = authority.blob_sha256",
-        )
-        .expect("prepare whole-blob snapshots");
-    let blobs = stmt
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))
-        .expect("query whole-blob snapshots")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect whole-blob snapshots");
-    for blob in blobs {
-        let value: Value = serde_json::from_slice(&blob).expect("parse persisted session envelope");
-        if value.get("id").and_then(Value::as_str) == Some(session_id) {
-            let count = value
-                .get("messages")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .expect("persisted session envelope has a messages array");
-            return Some(i64::try_from(count).expect("message count fits"));
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,128 +853,29 @@ fn drive_released_realm(spec: &RealmSpec) {
     stage_realm_copy(&fixture, &state);
     adopt_predecessor_names(spec.name, &state);
 
-    // --- Boot A: the first gateway boot over the adopted realm -------------
-
-    let label_a = format!("{}/boot-A", spec.name);
-    let mut gateway = boot(&label_a, &state);
-    assert_ne!(
-        gateway.pid(),
-        std::process::id(),
-        "({label_a}) the gateway must run as a separate OS process"
-    );
-    assert_identity_bound(&mut gateway, IDENTITY, spec.session_id);
-    assert_no_broken_members(&mut gateway);
-
-    let marker_a = format!("MARKER-UPGRADE-{}-BOOT-A", spec.name);
-    let mut floor = spec.released_message_count;
-    for identity in &identities {
-        send_turn(
-            &mut gateway,
-            identity,
-            &format!("Please note this token: {marker_a}"),
-        );
-        floor += MESSAGES_PER_TURN;
-        wait_for_durable_messages(&state, floor, &format!("{label_a} turn for {identity}"));
-    }
-    gateway.assert_no_repair_activity();
-    gateway.shutdown_and_reap();
-
-    // --- Post-exit: the upgrade, read from bytes ----------------------------
-    let after_a = read_durable_transcript(&state, &format!("{label_a} post-turn"));
-    eprintln!(
-        "PROBE {label_a}: session={} strand={} messages={}",
-        after_a.session_id, after_a.strand, after_a.message_count
-    );
-    assert_exact_prefix(&released, &after_a, &format!("{label_a} post-turn"));
-    assert!(
-        after_a.message_count >= floor,
-        "({label_a}) the driven turn did not extend the released head: {} < {floor}",
-        after_a.message_count
-    );
-    let joined_a = after_a.joined_json();
-    assert!(
-        joined_a.contains(&marker_a),
-        "({label_a}) the driven turn's marker never became durable"
-    );
-    for token in spec.released_tokens {
-        assert!(
-            joined_a.contains(token),
-            "({label_a}) released marker {token} was lost by the upgrade"
-        );
-    }
-    let blob_count =
-        whole_blob_snapshot_message_count(&state, spec.session_id).unwrap_or_else(|| {
-            panic!(
-                "({label_a}) the upgraded runtime store holds no whole-blob snapshot for the \
-                 released session {}",
-                spec.session_id
-            )
-        });
-    assert!(
-        blob_count >= floor,
-        "({label_a}) the whole-blob snapshot lags the driven boundary: {blob_count} < {floor}"
-    );
-
-    // --- Boot B: reboot into state written by the NEW build ----------------
-    let label_b = format!("{}/boot-B", spec.name);
-    let mut gateway = boot(&label_b, &state);
-    assert_identity_bound(&mut gateway, IDENTITY, spec.session_id);
-    assert_no_broken_members(&mut gateway);
-
-    // What this cold process inherited must be exactly what the new build's
-    // previous process left behind: upgrade once, then continue.
-    let inherited = read_durable_transcript(&state, &format!("{label_b} pre-turn"));
+    // --- This build's boot over the adopted realm --------------------------
+    let label = format!("{}/boot", spec.name);
+    let refusal = init_refused(&label, &state);
     assert_eq!(
-        inherited.message_count, after_a.message_count,
-        "({label_b}) resuming the upgraded realm mutated the durable transcript length before \
-         any turn: {} -> {}",
-        after_a.message_count, inherited.message_count
+        refusal["code"],
+        json!(meerkat_meta::STORAGE_RESOLUTION_CODE),
+        "[{label}] {refusal}"
     );
-    assert_exact_prefix(&after_a, &inherited, &format!("{label_b} pre-turn"));
-
-    let marker_b = format!("MARKER-UPGRADE-{}-BOOT-B", spec.name);
-    for identity in &identities {
-        send_turn(&mut gateway, identity, &format!("Second token: {marker_b}"));
-        floor += MESSAGES_PER_TURN;
-        wait_for_durable_messages(&state, floor, &format!("{label_b} turn for {identity}"));
-    }
-    // Task #21 two-boot property on real released bytes: boot B inherits
-    // state the NEW build wrote (boot A upgraded, drove, and shut down
-    // clean) and must classify CLEAN — zero repairs. On the crash realm this
-    // additionally pins heal-then-clean over SIGKILL residue.
-    gateway.assert_no_repair_activity();
-    gateway.shutdown_and_reap();
-
-    let after_b = read_durable_transcript(&state, &format!("{label_b} post-turn"));
-    eprintln!(
-        "PROBE {label_b}: session={} strand={} messages={}",
-        after_b.session_id, after_b.strand, after_b.message_count
-    );
-    assert_exact_prefix(&after_a, &after_b, &format!("{label_b} post-turn"));
     assert!(
-        after_b.message_count >= floor,
-        "({label_b}) the post-upgrade turn did not extend the durable head: {} < {floor}",
-        after_b.message_count
+        refusal["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("storage-migrate-native")),
+        "[{label}] the refusal must name the migration: {refusal}"
     );
-    let joined_b = after_b.joined_json();
-    for token in spec
-        .released_tokens
-        .iter()
-        .copied()
-        .chain([marker_a.as_str(), marker_b.as_str()])
-    {
-        assert!(
-            joined_b.contains(token),
-            "({label_b}) the durable transcript lost marker {token} after the second reboot"
-        );
-    }
-
-    // One identity, one continuity record, still naming the released session.
+    let after = read_durable_transcript(&state, &format!("{label} after the refused boot"));
+    assert_exact_prefix(
+        &released,
+        &after,
+        &format!("{label} after the refused boot"),
+    );
     assert_eq!(
-        continuity_identity_records(&state),
-        vec![(IDENTITY.to_string(), spec.session_id.to_string())],
-        "({}) the identity binding must survive the upgrade pointing at the released session",
-        spec.name
+        after.message_count, released.message_count,
+        "({label}) a refused boot changed the released transcript"
     );
 }
 
@@ -1227,23 +884,22 @@ fn drive_released_realm(spec: &RealmSpec) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn released_0_8_8_baseline_realm_upgrades_and_drives() {
+fn released_0_8_8_baseline_realm_adopts_and_is_refused_until_migrated() {
     drive_released_realm(&BASELINE);
 }
 
 #[test]
-fn released_0_8_8_burst_drain_realm_upgrades_and_drives() {
+fn released_0_8_8_burst_drain_realm_adopts_and_is_refused_until_migrated() {
     drive_released_realm(&BURST_DRAIN);
 }
 
 /// The SIGKILL realm. Pinned truth first (see the module docs): the kill
 /// landed AT IDLE after the burst drained, so the realm holds consumed
 /// inputs and an in-sync legacy snapshot - the crash residue is the
-/// un-checkpointed WAL byte shape and the missing shutdown attestation.
-/// Recovery must therefore be FULL re-activation; a member parked Broken or
-/// a rotated session over these bytes is a regression, not caution.
+/// un-checkpointed WAL byte shape and the missing shutdown attestation. Its
+/// boot is refused like the others until the supported migration ran.
 #[test]
-fn released_0_8_8_sigkill_crash_realm_recovers_upgrades_and_drives() {
+fn released_0_8_8_sigkill_crash_realm_adopts_and_is_refused_until_migrated() {
     // Pin what the SIGKILL actually froze, on a dedicated inspection copy,
     // so the recovery expectation below stays anchored to evidence.
     let temp = tempfile::TempDir::new().expect("temp dir");
@@ -1322,147 +978,6 @@ fn released_0_8_8_sigkill_crash_realm_recovers_upgrades_and_drives() {
 }
 
 #[test]
-fn released_0_8_8_deploy_cycles_realm_upgrades_and_drives() {
+fn released_0_8_8_deploy_cycles_realm_adopts_and_is_refused_until_migrated() {
     drive_released_realm(&DEPLOY_CYCLES);
-}
-
-/// The downstream app's binding leg, byte-for-byte: a RESET runtime store over a
-/// RELEASED-minted head-canonical continuity store.
-///
-/// The runtime store is deleted whole (the sanctioned reset/loss shape the
-/// facade mint reseeds), so the mint's durable read is the ONLY path back to
-/// the session - and on a released realm that read materializes from HEAD
-/// ROWS carrying v2 session envelopes. Before the head-lane importer, this
-/// leg failed uniformly in the field (a downstream app, 17/17 identities): "durable
-/// session read for runtime-authority mint: failed to restore session from
-/// head row: generated session persistence version authority rejected
-/// SessionEnvelope: expected current 3, got 2" - the blob-lane importer
-/// covered whole-blob rows (the production shape) while head-canonical fleets
-/// refused. The fail-closed side worked as designed (durable rows preserved,
-/// identities degraded pending retry); the lane was missing its importer.
-///
-/// The earlier reset regression
-/// (`reset_runtime_store_reseeds_from_continuity_and_resumes`) resets a
-/// NEW-BUILD-written realm, whose continuity rows are already current (v3);
-/// this test is the missing case: reset over RELEASED v2 continuity.
-#[test]
-fn released_0_8_8_continuity_with_reset_runtime_store_mints_from_head_rows() {
-    let spec = &BASELINE;
-    let fixture = fixture_realm_dir(spec.name);
-    assert!(
-        fixture.is_dir(),
-        "committed released realm missing at {} - restore from git history, never regenerate",
-        fixture.display()
-    );
-    let temp = tempfile::TempDir::new().expect("temp dir");
-
-    // Released truth from a dedicated inspection copy, same discipline as
-    // `drive_released_realm`: the DRIVE copy's first opener must be the
-    // gateway under test.
-    let inspect = temp.path().join("released-inspect");
-    stage_realm_copy(&fixture, &inspect);
-    let released = read_durable_transcript(&inspect, "reset-mint released fixture");
-    assert_eq!(
-        released.session_id, spec.session_id,
-        "the committed realm no longer holds the released session"
-    );
-    assert_eq!(
-        released.message_count, spec.released_message_count,
-        "the committed realm's released head count drifted"
-    );
-
-    // Stage the drive copy, then RESET the runtime store: delete
-    // runtime.sqlite and every sidecar while the released continuity bytes
-    // stay untouched (the downstream app's reset/purge shape).
-    let state = temp.path().join("state");
-    stage_realm_copy(&fixture, &state);
-    let mut removed = Vec::new();
-    for name in [
-        "runtime.sqlite",
-        "runtime.sqlite-wal",
-        "runtime.sqlite-shm",
-        "runtime.sqlite-journal",
-        "runtime.sqlite.mfence",
-    ] {
-        let path = state.join(name);
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .unwrap_or_else(|error| panic!("reset runtime store file {name}: {error}"));
-            removed.push(name);
-        }
-    }
-    assert!(
-        removed.contains(&"runtime.sqlite"),
-        "the released realm carries no runtime store; the reset under test never armed"
-    );
-
-    adopt_predecessor_names(spec.name, &state);
-
-    // Boot over the reset: identity Active, bound to the released session,
-    // nobody Broken. This is exactly where the field failure surfaced.
-    let label = "baseline/reset-mint";
-    let mut gateway = boot(label, &state);
-    assert_identity_bound(&mut gateway, IDENTITY, spec.session_id);
-    assert_no_broken_members(&mut gateway);
-
-    let marker = "MARKER-RESET-MINT-BASELINE";
-    send_turn(
-        &mut gateway,
-        IDENTITY,
-        &format!("Please note this token: {marker}"),
-    );
-    let floor = spec.released_message_count + MESSAGES_PER_TURN;
-    wait_for_durable_messages(&state, floor, &format!("{label} turn"));
-    gateway.shutdown_and_reap();
-
-    // v2 -> v3 from head rows, prefix byte-exact, real turn appended.
-    let after = read_durable_transcript(&state, &format!("{label} post-turn"));
-    eprintln!(
-        "PROBE {label}: session={} strand={} messages={}",
-        after.session_id, after.strand, after.message_count
-    );
-    assert_exact_prefix(&released, &after, &format!("{label} post-turn"));
-    assert!(
-        after.message_count >= floor,
-        "({label}) the post-reset turn did not extend the released head: {} < {floor}",
-        after.message_count
-    );
-    let joined = after.joined_json();
-    assert!(
-        joined.contains(marker),
-        "({label}) the post-reset turn's marker never became durable"
-    );
-    for token in spec.released_tokens {
-        assert!(
-            joined.contains(token),
-            "({label}) released marker {token} was lost by the reset mint"
-        );
-    }
-    // The mint's seed must be store-issued runtime authority: the reset
-    // runtime store holds a whole-blob snapshot at (at least) the driven
-    // boundary.
-    let blob_count =
-        whole_blob_snapshot_message_count(&state, spec.session_id).unwrap_or_else(|| {
-            panic!(
-                "({label}) the reseeded runtime store holds no whole-blob snapshot for the \
-                 released session {}",
-                spec.session_id
-            )
-        });
-    assert!(
-        blob_count >= floor,
-        "({label}) the whole-blob snapshot lags the driven boundary: {blob_count} < {floor}"
-    );
-
-    // Boot B over the minted state: continue, never re-import or rotate.
-    let label_b = "baseline/reset-mint-boot-B";
-    let mut gateway = boot(label_b, &state);
-    assert_identity_bound(&mut gateway, IDENTITY, spec.session_id);
-    assert_no_broken_members(&mut gateway);
-    gateway.shutdown_and_reap();
-    assert_eq!(
-        continuity_identity_records(&state),
-        vec![(IDENTITY.to_string(), spec.session_id.to_string())],
-        "the identity binding must survive the reset mint pointing at the released session"
-    );
 }

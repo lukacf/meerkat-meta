@@ -111,8 +111,9 @@ impl std::error::Error for CouncilStoreError {}
 /// Resolve the council store path for a `store_path`-style root.
 ///
 /// `MetaStorageLayout::standalone_from_store_path` is the ONE place that
-/// interprets the `store_path` escape hatch (a value with an extension names a
-/// database and its parent is the state dir; otherwise it IS the state dir).
+/// interprets the `store_path` escape hatch (an existing directory IS the state
+/// dir; otherwise a value with an extension names a database and its parent is
+/// the state dir; otherwise it IS the state dir).
 /// Re-deriving that rule here would create a second path authority, so this
 /// goes through the layout even though it only reads `state_dir`.
 ///
@@ -210,17 +211,14 @@ mod tests {
              [profiles.worker.tools]\ncomms = true\n",
         )
         .expect("mob definition");
-        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
-            meerkat_store::SqliteSessionStore::open(temp.path().join("sessions.db"))
-                .expect("session store"),
-        );
         let spec = crate::MobBootstrapSpec::persistent(
             definition,
             meerkat_mob::MobStorage::in_memory(),
+            crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
             store_path,
             4,
-            session_store,
         )
+        .await
         .expect("persistent spec")
         .with_options(crate::MobBootstrapOptions {
             allow_ephemeral_sessions: true,

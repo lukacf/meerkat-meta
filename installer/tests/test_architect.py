@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from launchkit.architect import ArchitectService, setup_runtime_root, summarize_changes
+from launchkit.architect import ArchitectService, setup_runtime_root, setup_settings_root, summarize_changes
 from launchkit.blueprint import starter_blueprint
 from launchkit.projects import fingerprint
 
@@ -180,11 +180,63 @@ def test_fresh_meta_runtime_preserves_existing_three_role_store_and_guide_histor
     old.mkdir(parents=True)
     (old / 'event_log.sqlite3').write_bytes(b'preserved native history')
     (tmp_path / 'guide.sqlite3').write_bytes(b'preserved guide history')
-    runtime = setup_runtime_root(tmp_path)
+    runtime = setup_runtime_root(tmp_path, version='0.9.3')
     assert runtime == tmp_path / 'architect-runtime-meta-v1'
     assert not runtime.exists()
     assert (old / 'event_log.sqlite3').read_bytes() == b'preserved native history'
     assert (tmp_path / 'guide.sqlite3').read_bytes() == b'preserved guide history'
+
+
+@pytest.mark.parametrize(('version', 'directory'), [
+    ('0.9.0', 'architect-runtime-meta-v1'), ('0.9.2+meta', 'architect-runtime-meta-v1'),
+    ('0.9.3', 'architect-runtime-meta-v1'), ('0.9.4', 'architect-runtime-meta-v2'),
+    ('0.9.5', 'architect-runtime-meta-v2'), ('0.10.0', 'architect-runtime-meta-v2')])
+def test_native_storage_release_starts_a_fresh_setup_generation(tmp_path, version, directory):
+    # Meta 0.9.4 refuses state an earlier release wrote until it is migrated
+    # offline, so the setup team moves to a fresh generation, never in place.
+    old = tmp_path / 'architect-runtime-meta-v1' / '.mobkit' / 'state'
+    old.mkdir(parents=True)
+    (old / 'event_log.sqlite3').write_bytes(b'preserved native history')
+    assert setup_runtime_root(tmp_path, version=version) == tmp_path / directory
+    assert (old / 'event_log.sqlite3').read_bytes() == b'preserved native history'
+    assert [path.name for path in tmp_path.iterdir()] == ['architect-runtime-meta-v1']
+
+
+def test_setup_generation_follows_the_selected_guide_release(tmp_path, monkeypatch):
+    from launchkit import guide_sdk
+    assert setup_runtime_root(tmp_path) == setup_runtime_root(tmp_path, version=guide_sdk.SELECTED_VERSION)
+    monkeypatch.setattr(guide_sdk, 'SELECTED_VERSION', '0.9.4')
+    assert setup_runtime_root(tmp_path) == tmp_path / 'architect-runtime-meta-v2'
+    for invalid in ('', 'latest', '0.9'):
+        with pytest.raises(ValueError):
+            setup_runtime_root(tmp_path, version=invalid)
+
+
+def test_fresh_setup_generation_carries_saved_tuning_until_its_own_composition(tmp_path):
+    from launchkit.provider_settings import canonical_setup_settings
+    from test_provider_settings import native_spec
+    thresholds = {'architect': 150000, 'connectors': None, 'reviewer': 65000, 'visualizer': 200000}
+    def mutate(value):
+        for name, threshold in thresholds.items():
+            value['definition']['profiles'][name]['auto_compact_threshold'] = threshold
+    previous = tmp_path / 'architect-runtime-meta-v1'
+    fresh = tmp_path / 'architect-runtime-meta-v2'
+    assert setup_settings_root(tmp_path, version='0.9.4') == fresh
+    database = native_spec(previous, mutate=mutate)
+    before = database.read_bytes()
+    assert setup_settings_root(tmp_path, version='0.9.3') == previous
+    assert setup_settings_root(tmp_path, version='0.9.4') == previous
+    assert canonical_setup_settings(setup_settings_root(tmp_path, version='0.9.4')) == {
+        'provider': 'anthropic', 'auto_compact_thresholds': thresholds}
+    # A generation created but not yet composed still borrows the settings.
+    (fresh / '.mobkit' / 'state').mkdir(parents=True)
+    assert setup_settings_root(tmp_path, version='0.9.4') == previous
+    (fresh / '.mobkit' / 'state').rmdir()
+    # Once the fresh generation holds its own definition, that one binds.
+    native_spec(fresh, provider='openai')
+    assert setup_settings_root(tmp_path, version='0.9.4') == fresh
+    assert canonical_setup_settings(fresh)['provider'] == 'openai'
+    assert database.read_bytes() == before
 
 
 @pytest.mark.asyncio

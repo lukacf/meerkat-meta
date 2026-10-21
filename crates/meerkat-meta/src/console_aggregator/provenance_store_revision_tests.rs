@@ -7,6 +7,7 @@ fn revision_frame(key: &str, witness: &str) -> NewConsoleFrame {
         runtime_key: "revision-runtime".into(),
         runtime_member_id: "revision-worker".into(),
         session_id: Some("revision-session".into()),
+        member_id: None,
         visibility: ConsoleVisibility::Addressable,
         addressable: true,
         health: "ready".into(),
@@ -27,6 +28,7 @@ fn revision_frame(key: &str, witness: &str) -> NewConsoleFrame {
         },
         primary_mob_id: "revision-mob".into(),
         source_mob_id: "revision-mob".into(),
+        lineage: Vec::new(),
         identity,
     };
     NewConsoleFrame {

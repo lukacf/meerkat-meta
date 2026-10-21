@@ -62,3 +62,43 @@ def test_saved_provider_conflict_is_exposed_without_rebinding_native_history(sel
     assert public["locked_provider"] == "openai"
     assert "differs from this selected model host" in public["provider_binding_error"]
     assert not environment and not settings.root.exists()
+
+
+def test_previous_setup_generation_lends_settings_without_binding_the_fresh_one(selected, tmp_path, monkeypatch):
+    from launchkit import guide_sdk
+    scope, settings, environment = provider_functions(tmp_path)
+    reads = []
+    def unreadable(root):
+        reads.append(root.name)
+        raise ProviderSettingsUnavailable("fictional unreadable saved definition")
+    scope["canonical_setup_provider"] = unreadable
+    (settings.root / "architect-runtime-meta-v1").mkdir(parents=True)
+    monkeypatch.setattr(guide_sdk, "SELECTED_VERSION", "0.9.4")
+    public = scope["provider_public_status"]()
+    assert reads == ["architect-runtime-meta-v1"]
+    assert public["locked_provider"] == "openai" and public["provider_binding_error"] is None
+    # The fresh generation's own saved definition still binds its provider.
+    (settings.root / "architect-runtime-meta-v2" / ".mobkit" / "state").mkdir(parents=True)
+    (settings.root / "architect-runtime-meta-v2" / ".mobkit" / "state" / "event_log.sqlite3").write_bytes(b"")
+    public = scope["provider_public_status"]()
+    assert reads[-1] == "architect-runtime-meta-v2"
+    assert public["provider_binding_error"] == "fictional unreadable saved definition"
+    assert not environment
+
+
+def test_lent_provider_never_conflicts_with_the_selected_model_host(selected, tmp_path, monkeypatch):
+    from launchkit import guide_sdk
+    scope, settings, environment = provider_functions(tmp_path, locked="anthropic")
+    (settings.root / "architect-runtime-meta-v1").mkdir(parents=True)
+    monkeypatch.setattr(guide_sdk, "SELECTED_VERSION", "0.9.4")
+    public = scope["provider_public_status"]()
+    assert public["provider_binding_error"] is None
+    assert public["locked_provider"] == public["effective_provider"] == "openai"
+    # The fresh generation's own saved definition still reports a real conflict.
+    state = settings.root / "architect-runtime-meta-v2" / ".mobkit" / "state"
+    state.mkdir(parents=True)
+    (state / "event_log.sqlite3").write_bytes(b"")
+    public = scope["provider_public_status"]()
+    assert "differs from this selected model host" in public["provider_binding_error"]
+    assert public["locked_provider"] == "openai"
+    assert not environment

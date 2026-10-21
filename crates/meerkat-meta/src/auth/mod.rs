@@ -1,6 +1,7 @@
 //! JWT validation, JWKS caching, and OIDC discovery for API authentication.
 
 pub mod peer_keys;
+pub mod session_fence;
 
 pub use peer_keys::{
     GatewayPeerKeyError, GatewayPeerKeys, KEY_FILE_NAME as GATEWAY_PEER_KEY_FILE,
@@ -72,6 +73,10 @@ pub struct ValidatedJwt {
     pub audience: Vec<String>,
     pub expires_at_epoch_seconds: Option<u64>,
     pub not_before_epoch_seconds: Option<u64>,
+    /// The `iat` claim when present as a whole number of seconds since the
+    /// epoch: when the issuer says it minted the token. `None` when absent
+    /// or not a whole number.
+    pub issued_at_epoch_seconds: Option<u64>,
     /// The `sid` claim when present as a string: an opaque session or login
     /// identifier within the issuer's namespace, kept exactly as signed.
     /// `None` when absent or not a string.
@@ -413,6 +418,7 @@ fn validate_claims(
         audience: aud,
         expires_at_epoch_seconds: exp,
         not_before_epoch_seconds: nbf,
+        issued_at_epoch_seconds: claims.get("iat").and_then(Value::as_u64),
         session_id: claims
             .get("sid")
             .and_then(Value::as_str)

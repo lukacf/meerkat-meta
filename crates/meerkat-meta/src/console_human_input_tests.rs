@@ -1040,7 +1040,11 @@ async fn console_human_reset_refuses_old_prepared_session_and_old_worker_fence()
         .find(|member| member.agent_identity.as_str() == h.identity.as_str())
         .unwrap();
     let successor = h.identity_runtime.reset(&h.identity).await.unwrap();
-    assert_ne!(successor.session_id, h.session_id);
+    let successor_session = successor
+        .session_id()
+        .cloned()
+        .expect("the successor is bound to a session");
+    assert_ne!(successor_session, h.session_id);
     let replay = h.send(request).await.unwrap();
     assert_eq!(
         replay.session_id.as_deref(),
@@ -1073,7 +1077,7 @@ async fn console_human_reset_refuses_old_prepared_session_and_old_worker_fence()
     let replacement_history = h
         .unified
         .mob_runtime()
-        .read_session_history(&successor.session_id.to_string(), 0, None)
+        .read_session_history(&successor_session.to_string(), 0, None)
         .await
         .unwrap();
     assert!(
@@ -1115,7 +1119,11 @@ async fn console_human_redispatch_into_a_moved_session_fails_and_delivers_nothin
         Some(h.session_id.to_string().as_str())
     );
     let successor = h.identity_runtime.reset(&h.identity).await.unwrap();
-    assert_ne!(successor.session_id, h.session_id);
+    let successor_session = successor
+        .session_id()
+        .cloned()
+        .expect("the successor is bound to a session");
+    assert_ne!(successor_session, h.session_id);
 
     let replay = h.send(request).await.unwrap();
     assert_eq!(replay.input_frame_id, accepted.input_frame_id);
@@ -1164,7 +1172,7 @@ async fn console_human_redispatch_into_a_moved_session_fails_and_delivers_nothin
     let successor_history = h
         .unified
         .mob_runtime()
-        .read_session_history(&successor.session_id.to_string(), 0, None)
+        .read_session_history(&successor_session.to_string(), 0, None)
         .await
         .expect("the successor session's history reads");
     assert!(
@@ -1505,9 +1513,7 @@ async fn console_send_selected_skills_refused_before_reservation_for_external_or
     placed.placement = Some(meerkat_contracts::WireHostRef("remote-host".to_string()));
     for spec in [external, placed] {
         let identity = spec.identity.to_string();
-        h.identity_runtime
-            .register(spec, IdentityLifecycleState::Dormant, None, None)
-            .await;
+        h.identity_runtime.register(spec).await;
         let request = ConsoleSendRequest {
             identity: identity.clone(),
             skill_refs: vec![selected_skill()],
@@ -1928,4 +1934,355 @@ async fn console_human_send_pinned_to_another_original_is_refused_and_not_admitt
         "nothing was admitted to the member's transcript"
     );
     h.stop().await;
+}
+
+// --- image checks against self-hosted models ----------------------------------
+
+/// Two self-hosted models served from one server the members never call
+/// (they run on `TestClient`): the host config declares one `vision = true`
+/// and leaves the other without the flag.
+const SEEING_MODEL: &str = "seeing-fixture-model";
+const BLIND_MODEL: &str = "blind-fixture-model";
+
+/// A 1x1 PNG, base64.
+const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+fn self_hosted_realm_binding(realm: &str) -> String {
+    format!(
+        r#"
+[realm."{realm}"]
+default_binding = "loop"
+
+[realm."{realm}".backend.loop]
+provider = "self_hosted"
+backend_kind = "self_hosted"
+
+[realm."{realm}".auth.loop]
+provider = "self_hosted"
+auth_method = "none"
+source = {{ kind = "platform_default" }}
+
+[realm."{realm}".binding.loop]
+backend_profile = "loop"
+auth_profile = "loop"
+default_model = "{SEEING_MODEL}"
+provider_default = true
+"#
+    )
+}
+
+fn self_hosted_vision_config(mob_id: &str) -> meerkat::Config {
+    let mut text = format!(
+        r#"
+[self_hosted]
+default_model = "{SEEING_MODEL}"
+
+[self_hosted.servers.loop]
+base_url = "http://127.0.0.1:9"
+
+[self_hosted.models."{SEEING_MODEL}"]
+server = "loop"
+remote_model = "{SEEING_MODEL}"
+display_name = "Seeing fixture model"
+family = "{SEEING_MODEL}"
+vision = true
+
+[self_hosted.models."{BLIND_MODEL}"]
+server = "loop"
+remote_model = "{BLIND_MODEL}"
+display_name = "Blind fixture model"
+family = "{BLIND_MODEL}"
+"#
+    );
+    text.push_str(&self_hosted_realm_binding("global"));
+    text.push_str(&self_hosted_realm_binding(&format!("mob.{mob_id}")));
+    toml::from_str(&text).unwrap()
+}
+
+fn self_hosted_vision_definition(mob_id: &str) -> MobDefinition {
+    MobDefinition::from_toml(&format!(
+        r#"
+[mob]
+id = "{mob_id}"
+
+[profiles.seeing]
+model = "{SEEING_MODEL}"
+provider = "self_hosted"
+runtime_mode = "turn_driven"
+external_addressable = true
+
+[profiles.seeing.tools]
+comms = true
+
+[profiles.blind]
+model = "{BLIND_MODEL}"
+provider = "self_hosted"
+runtime_mode = "turn_driven"
+external_addressable = true
+
+[profiles.blind.tools]
+comms = true
+"#
+    ))
+    .unwrap()
+}
+
+fn image_turn() -> ContentInput {
+    ContentInput::Blocks(vec![
+        meerkat_core::ContentBlock::Text {
+            text: "what is in this image?".to_string(),
+        },
+        meerkat_core::ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: meerkat_core::types::ImageData::Inline {
+                data: ONE_PIXEL_PNG.to_string(),
+            },
+        },
+    ])
+}
+
+/// A runtime over the self-hosted host config, with a member-only worker of
+/// each model: `seeing-worker` and `blind-worker`.
+async fn self_hosted_vision_workers(state: &std::path::Path) -> UnifiedRuntime {
+    let mob_id = format!("self-hosted-vision-{}", uuid::Uuid::new_v4());
+    let unified = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(self_hosted_vision_definition(&mob_id))
+            .meerkat_config(self_hosted_vision_config(&mob_id))
+            .persistent_state(state)
+            .comms(true)
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .build(),
+    )
+    .await
+    .unwrap();
+    for (profile, member) in [("seeing", "seeing-worker"), ("blind", "blind-worker")] {
+        unified
+            .mob_handle()
+            .spawn_spec(meerkat_mob::SpawnMemberSpec::from_wire(
+                profile.to_string(),
+                member.to_string(),
+                None,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+    }
+    unified
+}
+
+/// Core admits an image turn for a self-hosted model whose host config
+/// declares `vision = true`. Meta's identity bridge refused it, because its
+/// check asked only the static model catalog, which lists no self-hosted
+/// model. A self-hosted model without the flag stays refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_self_hosted_vision_model_takes_an_image_through_the_identity_bridge() {
+    let state = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let mob_id = format!("self-hosted-vision-{}", uuid::Uuid::new_v4());
+    let spec = |identity: &str, profile: &str| DurableAgentSpec {
+        identity: AgentIdentity::parse(identity).unwrap(),
+        profile: profile.into(),
+        addressability: AgentAddressability::Addressable,
+        display_name: None,
+        labels: BTreeMap::new(),
+        context: None,
+        additional_instructions: Vec::new(),
+        initial_message: None,
+        runtime_mode_override: Some(meerkat_mob::MobRuntimeMode::TurnDriven),
+        backend: None,
+        binding: None,
+        placement: None,
+    };
+    let unified = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(self_hosted_vision_definition(&mob_id))
+            .meerkat_config(self_hosted_vision_config(&mob_id))
+            .persistent_state(state.path())
+            .roster_provider(Arc::new(MutableRosterProvider::new(vec![
+                spec("agent:seeing", "seeing"),
+                spec("agent:blind", "blind"),
+            ])))
+            .identity_runtime_instance_id("self-hosted-vision-bridge")
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .build(),
+    )
+    .await
+    .unwrap();
+    let identity_runtime = unified.identity_runtime().unwrap();
+
+    let blind = identity_runtime
+        .send(&AgentIdentity::parse("agent:blind").unwrap(), &image_turn())
+        .await;
+    let seeing = identity_runtime
+        .send(
+            &AgentIdentity::parse("agent:seeing").unwrap(),
+            &image_turn(),
+        )
+        .await;
+    assert!(
+        blind.as_ref().is_err_and(|error| {
+            format!("{error:?}").contains("target member model cannot accept image input")
+        }),
+        "a self-hosted model without the flag is refused images: {blind:?}"
+    );
+    assert!(
+        seeing.is_ok(),
+        "a vision = true self-hosted model takes the image turn: {seeing:?}"
+    );
+    unified.shutdown().await;
+}
+
+/// The console's member send checks images with the same source: the
+/// `vision = true` self-hosted worker takes the image, the other is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_self_hosted_vision_model_takes_an_image_through_the_console_send() {
+    let state = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let unified = self_hosted_vision_workers(state.path()).await;
+    let aggregator = MetaConsoleAggregator::in_memory();
+    aggregator.register_runtime_handles_with_policy(
+        "vision",
+        "",
+        unified.mob_runtime().clone(),
+        None,
+        ConsoleEventStore::new(),
+        Arc::new(AllowAllConsoleVisibilityPolicy),
+    );
+    let request = |identity: &str| ConsoleSendRequest {
+        identity: identity.to_string(),
+        content: serde_json::to_value(image_turn()).unwrap(),
+        origin: "console".to_string(),
+        idempotency_key: format!("image-to-{identity}"),
+        handling_mode: None,
+        origin_kind: None,
+        skill_refs: Vec::new(),
+    };
+
+    let blind = aggregator.send(request("blind-worker")).await;
+    let seeing = aggregator.send(request("seeing-worker")).await;
+    assert!(
+        matches!(
+            &blind,
+            Err(crate::console_aggregator::ConsoleSendError::InvalidContent(message))
+                if message.contains("target member model cannot accept image input")
+        ),
+        "a self-hosted model without the flag is refused images: {blind:?}"
+    );
+    assert!(
+        seeing.is_ok(),
+        "a vision = true self-hosted model takes the image: {seeing:?}"
+    );
+    let stopped = unified.mob_handle().stop().await;
+    unified.mob_runtime().stop_runtime_delivery();
+    stopped.unwrap();
+}
+
+/// The console's member rows (the snapshot walk and `meta/list_members`)
+/// show image input for the `vision = true` self-hosted model, so the console
+/// offers what the gate admits.
+#[tokio::test(flavor = "multi_thread")]
+async fn console_member_rows_show_a_self_hosted_model_vision_flag() {
+    let state = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let unified = self_hosted_vision_workers(state.path()).await;
+    let expected = BTreeMap::from([
+        ("blind-worker".to_string(), false),
+        ("seeing-worker".to_string(), true),
+    ]);
+
+    let read_model = super::collect_console_snapshot_read_model(
+        unified.mob_runtime(),
+        None,
+        &super::WalkedHook::default(),
+    )
+    .await;
+    let walked = read_model
+        .primary_members
+        .iter()
+        .map(|member| {
+            (
+                member.agent_identity.clone(),
+                member.model_capabilities.image_input,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(walked, expected, "the console snapshot's member rows");
+
+    let listed = Box::pin(super::handle_console_runtime_rpc(
+        unified.mob_runtime(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        crate::rpc::JsonRpcRequest {
+            jsonrpc: crate::rpc::JSONRPC_VERSION.to_string(),
+            id: Some(json!(1)),
+            method: "meta/list_members".to_string(),
+            params: json!({}),
+        },
+        true,
+    ))
+    .await;
+    let listed = listed["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("meta/list_members: {listed:#?}"))
+        .iter()
+        .map(|row| {
+            (
+                row["agent_identity"].as_str().unwrap().to_string(),
+                row["model_capabilities"]["image_input"].as_bool().unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(listed, expected, "the meta/list_members rows");
+    let stopped = unified.mob_handle().stop().await;
+    unified.mob_runtime().stop_runtime_delivery();
+    stopped.unwrap();
+}
+
+/// `meta/send_message` to a member checks images with the same source: the
+/// `vision = true` self-hosted worker takes the image, the other is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_self_hosted_vision_model_takes_an_image_through_meta_send_message() {
+    let state = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let unified = self_hosted_vision_workers(state.path()).await;
+    let send = |member_id: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "meta/send_message",
+            "params": {
+                "member_id": member_id,
+                "content": serde_json::to_value(image_turn()).unwrap(),
+            },
+        })
+        .to_string()
+    };
+
+    let blind: serde_json::Value = serde_json::from_str(
+        &crate::rpc::handle_unified_rpc_json(&unified, &send("blind-worker"), WAIT, None, None)
+            .await,
+    )
+    .unwrap();
+    let seeing: serde_json::Value = serde_json::from_str(
+        &crate::rpc::handle_unified_rpc_json(&unified, &send("seeing-worker"), WAIT, None, None)
+            .await,
+    )
+    .unwrap();
+    assert!(
+        blind["error"]["message"].as_str().is_some_and(
+            |message| message.contains("target member model cannot accept image input")
+        ),
+        "a self-hosted model without the flag is refused images: {blind:#}"
+    );
+    assert!(
+        seeing["error"].is_null() && !seeing["result"].is_null(),
+        "a vision = true self-hosted model takes the image: {seeing:#}"
+    );
+    let stopped = unified.mob_handle().stop().await;
+    unified.mob_runtime().stop_runtime_delivery();
+    stopped.unwrap();
 }

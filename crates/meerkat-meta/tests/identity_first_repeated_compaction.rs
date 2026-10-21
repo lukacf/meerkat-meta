@@ -8,11 +8,12 @@
 //! `rpc_gateway --persistent` composition (#488).
 //!
 //! The composition under test is the one production runs: identity-first
-//! members over a WholeBlob `runtime.sqlite`, Meta's projecting runtime
-//! store, and the head-canonical continuity store. Every committed turn
-//! boundary replays its rewrite commits into the continuity row.
+//! members over Core's head-canonical session and runtime stores, both on
+//! `runtime.sqlite`. Core keeps each session's head and its adopted rewrites;
+//! Meta keeps no copy of its own.
 //!
-//! The defect: record-only rewrites named the adopted strand by the commit's
+//! The defect (in the continuity replay Meta used to run): record-only
+//! rewrites named the adopted strand by the commit's
 //! revision digest alone. The demo LLM summarises every compaction to the
 //! same text, so the second compaction of a member rewrites to the same
 //! transcript revision as the first. The replay then re-targeted the strand
@@ -28,7 +29,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -36,7 +37,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use meerkat_core::session_store::SessionHead;
-use meerkat_meta::storage_layout::MetaStorageLayout;
 use serde_json::{Value, json};
 
 /// A low threshold so the synthesized usage of each 8 KiB prompt pushes the
@@ -232,54 +232,57 @@ fn prompt(identity: &str, turn: usize) -> String {
         .collect()
 }
 
-fn continuity_db(state: &Path) -> PathBuf {
-    MetaStorageLayout::with_injected_roots(state.to_path_buf(), None)
-        .continuity_db()
-        .expect("continuity db path")
-        .path
+/// Each identity's Core head (the typed `SessionHead` Core persists) and the
+/// number of adopted rewrites Core serves for it, read from Core's session
+/// store on `runtime.sqlite`. Read only while no gateway holds the store.
+fn core_heads(
+    state: &Path,
+    sessions: &BTreeMap<String, String>,
+) -> BTreeMap<String, (SessionHead, usize)> {
+    use meerkat_core::session_store::IncrementalSessionStore as _;
+    let store = meerkat_store::SqliteSessionStore::open(state.join("runtime.sqlite"))
+        .expect("open Core's session store");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the store reads");
+    runtime.block_on(async {
+        let mut heads = BTreeMap::new();
+        for (identity, session) in sessions {
+            let id = meerkat_core::types::SessionId::parse(session).expect("a session id");
+            let head = store
+                .load_canonical_head(&id)
+                .await
+                .expect("read Core's head")
+                .unwrap_or_else(|| {
+                    panic!("{identity}: Core holds no canonical head for {session}")
+                });
+            let rewrites = store
+                .load_rewrites(&id)
+                .await
+                .expect("read Core's adopted rewrites")
+                .len();
+            heads.insert(identity.clone(), (head, rewrites));
+        }
+        heads
+    })
 }
 
-/// One durable continuity head (the typed `SessionHead` the store persists)
-/// and its rewrite rows `(rewrite_idx, parent_strand, strand)` in order.
-type DurableChain = (SessionHead, Vec<(i64, String, String)>);
-
-/// Durable heads and rewrite rows keyed by identity. Read only while no
-/// gateway holds the store.
-fn durable_heads(state: &Path) -> BTreeMap<String, DurableChain> {
-    let conn = rusqlite::Connection::open(continuity_db(state)).expect("open continuity db");
-    let mut heads = conn
-        .prepare("SELECT identity, session_id, head_json FROM continuity_session_heads")
-        .unwrap();
-    let heads = heads
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        })
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    let mut rewrites = conn
-        .prepare(
-            "SELECT rewrite_idx, parent_strand, strand FROM continuity_session_rewrites
-             WHERE session_id = ?1 ORDER BY rewrite_idx",
-        )
-        .unwrap();
-    heads
-        .into_iter()
-        .map(|(identity, session_id, head_json)| {
-            let head: SessionHead =
-                serde_json::from_slice(&head_json).expect("typed durable session head");
-            let chain = rewrites
-                .query_map([&session_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            (identity, (head, chain))
+/// The session `meta/status_identity` names for each identity.
+fn identity_sessions(gateway: &mut Gateway) -> BTreeMap<String, String> {
+    IDENTITIES
+        .iter()
+        .map(|identity| {
+            let status = gateway.call(
+                "meta/status_identity",
+                json!({ "identity": identity }),
+                Duration::from_mins(1),
+            );
+            let session = status["session_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{identity} has no session: {status}"))
+                .to_string();
+            ((*identity).to_string(), session)
         })
         .collect()
 }
@@ -296,50 +299,46 @@ fn identity_first_members_survive_repeated_auto_compaction() {
             gateway.send_and_await(identity, &prompt(identity, turn));
         }
     }
+    let sessions = identity_sessions(&mut gateway);
     gateway.shutdown();
 
-    let heads = durable_heads(&state);
+    let heads = core_heads(&state, &sessions);
     for identity in IDENTITIES {
-        let (head, chain) = heads
+        let (head, rewrites) = heads
             .get(identity)
             .unwrap_or_else(|| panic!("no durable head for {identity}: {heads:#?}"));
         assert!(
             head.rewrite_count >= MIN_COMPACTIONS,
-            "{identity} must reach {MIN_COMPACTIONS} adopted compactions: {head:#?} {chain:#?}"
+            "{identity} must reach {MIN_COMPACTIONS} adopted compactions: {head:#?}"
         );
-        // The persisted revision chain continues: one contiguous rewrite row
-        // per adopted generation, the latest on the head's own strand.
-        let adopted = usize::try_from(head.rewrite_count).unwrap();
-        assert!(chain.len() >= adopted, "{identity}: {chain:#?}");
-        for (index, row) in chain[..adopted].iter().enumerate() {
-            assert_eq!(
-                row.0,
-                i64::try_from(index).unwrap(),
-                "{identity}: {chain:#?}"
-            );
-        }
-        assert_eq!(
-            chain[adopted - 1].2,
-            head.strand.as_str(),
-            "{identity}: head is not on its latest rewrite strand: {chain:#?}"
+        // Core serves bodies only for the rewrites its retention keeps: the
+        // newest DEFAULT_RETAINED_REWRITES occurrences. Older ones are retired
+        // to their commits and prefix digests, so five adopted compactions
+        // serve four bodies.
+        let retained = head.rewrite_count.min(
+            u64::try_from(meerkat_core::TranscriptHistoryRetention::DEFAULT_RETAINED_REWRITES)
+                .unwrap(),
         );
-        // A recurring revision still gets its own strand.
-        let strands: std::collections::BTreeSet<_> =
-            chain[..adopted].iter().map(|row| row.2.as_str()).collect();
         assert_eq!(
-            strands.len(),
-            adopted,
-            "{identity}: strand reused: {chain:#?}"
+            u64::try_from(*rewrites).unwrap(),
+            retained,
+            "{identity}: Core retains the {retained} newest of {} adopted rewrites: {head:#?}",
+            head.rewrite_count
         );
     }
 
-    // The chain restores and keeps accepting work after a cold reboot.
+    // The session restores and keeps accepting work after a cold reboot.
     let mut rebooted = Gateway::boot(&state);
     for identity in IDENTITIES {
         rebooted.send_and_await(identity, &prompt(identity, TURNS));
     }
+    assert_eq!(
+        identity_sessions(&mut rebooted),
+        sessions,
+        "a reboot keeps every identity on its session"
+    );
     rebooted.shutdown();
-    let after = durable_heads(&state);
+    let after = core_heads(&state, &sessions);
     for identity in IDENTITIES {
         let (head, _) = &heads[identity];
         let (rebooted_head, _) = after

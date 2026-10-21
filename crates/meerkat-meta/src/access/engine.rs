@@ -282,6 +282,69 @@ pub(crate) fn groups_for_subject(config: &AccessControlConfig, subject: &str) ->
         .collect()
 }
 
+/// The first deny rule that applies to this principal and action and that
+/// the bare `identity` cannot decide: a rule whose resource selectors could
+/// match through attributes a caller does not hold for that agent (its role,
+/// its labels, or a spawn ancestor it names). An admin matches none, as in
+/// [`evaluate_access_lineage`].
+///
+/// A record whose member attributes were never captured is refused under
+/// such a rule (fails closed) instead of being judged as a bare identity,
+/// which no role or label selector can match.
+pub(crate) fn deny_undecidable_by_identity<'c>(
+    config: &'c AccessControlConfig,
+    principal: &AccessPrincipal,
+    action: &str,
+    identity: &str,
+) -> Option<&'c str> {
+    if !config.enabled {
+        return None;
+    }
+    if let Some(subject) = principal.subject.as_deref()
+        && config.admins.iter().any(|admin| admin == subject)
+    {
+        return None;
+    }
+    config
+        .rules
+        .iter()
+        .find(|rule| {
+            matches!(rule.effect, AccessEffect::Deny)
+                && rule
+                    .actions
+                    .iter()
+                    .any(|pattern| action_matches(pattern, action))
+                && subject_matches(rule, principal)
+                && selectors_need_attributes(rule, identity)
+        })
+        .map(|rule| rule.id.as_str())
+}
+
+/// Whether a rule's resource selectors can match an agent through anything
+/// but its bare identity. Every field of [`AccessRule`] is named here, so a
+/// new selector kind does not compile until it is classified: a selector the
+/// identity string alone cannot decide must answer `true`.
+fn selectors_need_attributes(rule: &AccessRule, identity: &str) -> bool {
+    let AccessRule {
+        id: _,
+        description: _,
+        effect: _,
+        subjects: _,
+        groups: _,
+        actions: _,
+        agents,
+        roles,
+        match_labels,
+    } = rule;
+    // Roles and labels are attributes, never part of an identity string.
+    let role_selector = !roles.is_empty();
+    let label_selector = !match_labels.is_empty();
+    // `*` and this identity are decided by the identity itself; any other
+    // name may be a spawn ancestor (lineage) or a runtime id of the member.
+    let lineage_selector = agents.iter().any(|agent| agent != "*" && agent != identity);
+    role_selector || label_selector || lineage_selector
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -563,5 +626,143 @@ mod tests {
         let groups = groups_for_subject(&config, "alice@example.test");
         assert!(groups.contains("ops"));
         assert!(groups_for_subject(&config, "bob@example.test").is_empty());
+    }
+
+    fn view_deny(id: &str) -> AccessRule {
+        AccessRule {
+            id: id.to_string(),
+            effect: AccessEffect::Deny,
+            actions: vec!["agent.view".to_string()],
+            ..AccessRule::default()
+        }
+    }
+
+    fn undecidable(rule: AccessRule, identity: &str) -> Option<String> {
+        let config = config_with_rules(vec![allow_view_all(), rule]);
+        deny_undecidable_by_identity(
+            &config,
+            &principal("bob@example.test", &[]),
+            "agent.view",
+            identity,
+        )
+        .map(ToString::to_string)
+    }
+
+    fn allow_view_all() -> AccessRule {
+        AccessRule {
+            id: "allow-view".to_string(),
+            actions: vec!["agent.view".to_string()],
+            ..AccessRule::default()
+        }
+    }
+
+    // One case per selector kind of `agent.view`: role, label and lineage
+    // (an agent name other than the record's own) cannot be decided from a
+    // bare identity, so an uncaptured record fails closed under them.
+    #[test]
+    fn a_role_selector_deny_is_undecidable_by_identity() {
+        let rule = AccessRule {
+            roles: vec!["scout".to_string()],
+            ..view_deny("deny-role")
+        };
+        assert_eq!(undecidable(rule, "worker").as_deref(), Some("deny-role"));
+    }
+
+    #[test]
+    fn a_label_selector_deny_is_undecidable_by_identity() {
+        let rule = AccessRule {
+            match_labels: BTreeMap::from([("tier".to_string(), "secret".to_string())]),
+            ..view_deny("deny-label")
+        };
+        assert_eq!(undecidable(rule, "worker").as_deref(), Some("deny-label"));
+    }
+
+    #[test]
+    fn a_deny_naming_another_agent_is_undecidable_by_identity() {
+        let rule = AccessRule {
+            agents: vec!["secret-lead".to_string()],
+            ..view_deny("deny-ancestor")
+        };
+        assert_eq!(
+            undecidable(rule, "worker").as_deref(),
+            Some("deny-ancestor")
+        );
+    }
+
+    #[test]
+    fn denies_the_identity_decides_are_not_undecidable() {
+        let own = AccessRule {
+            agents: vec!["worker".to_string()],
+            ..view_deny("deny-own")
+        };
+        assert_eq!(undecidable(own, "worker"), None);
+        let every = AccessRule {
+            agents: vec!["*".to_string()],
+            ..view_deny("deny-every")
+        };
+        assert_eq!(undecidable(every, "worker"), None);
+        // A selector-free deny matches every record, captured or not.
+        assert_eq!(undecidable(view_deny("deny-all"), "worker"), None);
+    }
+
+    #[test]
+    fn undecidable_denies_respect_action_subject_and_admin() {
+        let label = AccessRule {
+            match_labels: BTreeMap::from([("tier".to_string(), "secret".to_string())]),
+            ..view_deny("deny-label")
+        };
+        let config = config_with_rules(vec![label.clone()]);
+        // Another action is not `agent.view`.
+        assert_eq!(
+            deny_undecidable_by_identity(
+                &config,
+                &principal("bob@example.test", &[]),
+                "agent.send",
+                "worker",
+            ),
+            None
+        );
+        // Admins bypass every rule.
+        assert_eq!(
+            deny_undecidable_by_identity(
+                &config,
+                &principal("root@example.test", &[]),
+                "agent.view",
+                "worker",
+            ),
+            None
+        );
+        // A rule scoped to another subject does not apply.
+        let scoped = AccessRule {
+            subjects: vec!["carol@example.test".to_string()],
+            ..label
+        };
+        let config = config_with_rules(vec![scoped]);
+        assert_eq!(
+            deny_undecidable_by_identity(
+                &config,
+                &principal("bob@example.test", &[]),
+                "agent.view",
+                "worker",
+            ),
+            None
+        );
+        // An allow rule with the same selectors is never a deny.
+        let allow = AccessRule {
+            id: "allow-label".to_string(),
+            actions: vec!["agent.view".to_string()],
+            match_labels: BTreeMap::from([("tier".to_string(), "secret".to_string())]),
+            ..AccessRule::default()
+        };
+        let config = config_with_rules(vec![allow]);
+        assert_eq!(
+            deny_undecidable_by_identity(
+                &config,
+                &principal("bob@example.test", &[]),
+                "agent.view",
+                "worker",
+            ),
+            None
+        );
     }
 }

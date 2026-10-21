@@ -120,6 +120,89 @@ fn meta_gateway_bootstraps_persistent_runtime() {
     assert_bootstraps(true);
 }
 
+/// One Meta runtime per state directory: a second `meta_gateway` on a store
+/// a running gateway holds refuses `meta/init` typed (STORAGE_RESOLUTION,
+/// -32014) before it opens any store, and the store boots again once the
+/// first gateway has exited. The refused gateway gets its own workspace and
+/// gateway home, so the store directory is the only thing it shares with the
+/// first. The third reuses the first's workspace: the fallback mob's id
+/// derives from it, and the store pins the first gateway's definition.
+#[test]
+fn meta_gateway_refuses_a_store_another_gateway_holds() {
+    let bin = env!("CARGO_BIN_EXE_meta_gateway");
+    let store = TempDir::new().expect("store tempdir");
+    let first_workspace = TempDir::new().expect("first workspace tempdir");
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "meta/init",
+        "params": {
+            "workspace_root": first_workspace.path().to_string_lossy(),
+            "store_path": store.path().join("store").to_string_lossy(),
+            "persistent_sessions": true,
+        },
+    });
+    let mut first = Command::new(bin)
+        .current_dir(first_workspace.path())
+        .env("ANTHROPIC_API_KEY", "sk-ant-regression-test")
+        .env("OPENAI_API_KEY", "sk-regression-test")
+        .env("XDG_STATE_HOME", first_workspace.path().join("xdg-state"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the first meta_gateway");
+    let mut stdin = first.stdin.take().expect("stdin");
+    writeln!(stdin, "{}", serde_json::to_string(&init).unwrap()).expect("write init");
+    stdin.flush().expect("flush");
+    let stdout = first.stdout.take().expect("stdout");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx
+        .recv_timeout(Duration::from_secs(45))
+        .expect("the first meta_gateway did not answer meta/init within 45s");
+    let ready: Value = serde_json::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("non-JSON init response {:?}: {}", line, e));
+    assert!(
+        ready.get("error").is_none() && ready["result"]["http_base_url"].is_string(),
+        "the first meta_gateway must boot: {ready}"
+    );
+
+    let second_workspace = TempDir::new().expect("second workspace tempdir");
+    let refused = init_once_in(
+        second_workspace.path(),
+        store.path(),
+        json!({ "persistent_sessions": true }),
+        Duration::from_secs(45),
+    );
+    assert_eq!(refused["error"]["code"], -32014, "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("is in use by another Meta runtime"),
+        "{message}"
+    );
+
+    drop(stdin);
+    let _ = first.kill();
+    let _ = first.wait();
+
+    let again = init_once_in(
+        first_workspace.path(),
+        store.path(),
+        json!({ "persistent_sessions": true }),
+        Duration::from_secs(45),
+    );
+    assert!(
+        again.get("error").is_none() && again["result"]["http_base_url"].is_string(),
+        "the store must boot again once the first gateway has exited: {again}"
+    );
+}
+
 /// Keep the actual HTTP host alive through a clean stop. Hard-kill is only an
 /// unwind guard; a successful test must observe graceful cleanup and MobStopped.
 #[cfg(unix)]
@@ -384,6 +467,77 @@ fn persistent_http_restarts_classic_without_voice() {
 #[test]
 fn persistent_http_restarts_identity_without_voice() {
     assert_persistent_http_restart(true, false);
+}
+
+/// A console-gateway state directory `storage-migrate-native` converted:
+/// the identity's session is in Core's session store, Core's mob store is
+/// gone (0.9.3 kept the mob journal in memory), and the first-boot
+/// manifest's `Resume` row names that session. The gateway's first roster
+/// compile carries the row out: the identity resumes the session and the
+/// manifest is removed. A gateway that never reads the manifest wakes the
+/// identity fresh on a new session, and the migrated one stays unbound.
+#[cfg(unix)]
+#[test]
+fn persistent_http_first_boot_carries_out_a_migrated_resume_row() {
+    let workspace = TempDir::new().expect("first-boot workspace");
+    let store = workspace.path().join("store");
+    let alice = json!({"identity": "personal:alice"});
+
+    let gateway = RestartGateway::start(workspace.path(), &store, true, false);
+    let written = gateway.rpc("meta/status_identity", alice.clone());
+    let session = written["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("alice has a session: {written}"))
+        .to_owned();
+    gateway.stop();
+
+    let layout = meerkat_meta::storage_layout::MetaStorageLayout::standalone_from_store_path(
+        &store,
+        workspace.path().join("xdg-state"),
+    );
+    let mob_store = layout
+        .event_log_db()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the mob store has a file name")
+        .to_owned();
+    let mut removed = 0;
+    for entry in std::fs::read_dir(layout.state_dir()).expect("read the state directory") {
+        let entry = entry.expect("a state entry");
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&mob_store))
+        {
+            std::fs::remove_file(entry.path()).expect("remove the mob store");
+            removed += 1;
+        }
+    }
+    assert!(removed > 0, "the persistent launch kept no mob store");
+    meerkat_meta::identity_first::FirstBootManifest::write_new(
+        layout.state_dir(),
+        vec![meerkat_meta::identity_first::FirstBootRow::Resume {
+            identity: meerkat_meta::identity_first::AgentIdentity::parse("personal:alice")
+                .expect("the identity parses"),
+            session: meerkat_core::types::SessionId::parse(&session)
+                .expect("the session id parses"),
+        }],
+    )
+    .expect("storage-migrate-native writes the first-boot manifest");
+
+    let gateway = RestartGateway::start(workspace.path(), &store, true, false);
+    let carried = gateway.rpc("meta/status_identity", alice);
+    assert_eq!(carried["state"], "active", "{carried}");
+    assert_eq!(
+        carried["session_id"],
+        json!(session),
+        "the first boot resumes the session the migration names: {carried}"
+    );
+    assert!(
+        !meerkat_meta::identity_first::FirstBootManifest::path(layout.state_dir()).exists(),
+        "the manifest is removed once its last row is carried out"
+    );
+    gateway.stop();
 }
 
 #[cfg(all(unix, feature = "openai-live"))]
@@ -805,6 +959,11 @@ fn init_once(extra: Value, timeout: Duration) -> Value {
 /// [`init_once`] against caller-owned directories, so a test can inspect what
 /// the boot left (or did not leave) on disk. `store_path` is `<store>/store`.
 fn init_once_in(workspace: &Path, store: &Path, extra: Value, timeout: Duration) -> Value {
+    init_at(workspace, &store.join("store"), extra, timeout)
+}
+
+/// [`init_once_in`] with the `store_path` given exactly.
+fn init_at(workspace: &Path, store_path: &Path, extra: Value, timeout: Duration) -> Value {
     let bin = env!("CARGO_BIN_EXE_meta_gateway");
 
     let mut params = match extra {
@@ -812,10 +971,7 @@ fn init_once_in(workspace: &Path, store: &Path, extra: Value, timeout: Duration)
         other => panic!("init params must be a JSON object, got {other}"),
     };
     params.insert("workspace_root".into(), json!(workspace.to_string_lossy()));
-    params.insert(
-        "store_path".into(),
-        json!(store.join("store").to_string_lossy()),
-    );
+    params.insert("store_path".into(), json!(store_path.to_string_lossy()));
     let init = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -1319,6 +1475,89 @@ fn both_gateways_default_to_a_loopback_bind_with_no_advertised_base() {
     );
 }
 
+/// Names directly under `dir`.
+fn dir_entries(dir: &Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(dir)
+        .expect("read the directory")
+        .map(|entry| {
+            entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+/// `meta_gateway`: a `store_path` naming a separate session database is
+/// refused typed (-32014) before any store opens, whether or not the file
+/// exists. Sessions live in `runtime.sqlite` under the state directory, so
+/// the refusal names the file, the state directory and the remedy steps in
+/// order, and leaves the directory as it found it. Control: the same
+/// directory passed as `store_path` starts.
+#[test]
+fn meta_gateway_refuses_a_session_database_store_path_before_any_store_opens() {
+    for exists in [true, false] {
+        let workspace = TempDir::new().expect("workspace tempdir");
+        let state = TempDir::new().expect("state tempdir");
+        let state_dir = std::fs::canonicalize(state.path()).expect("canonical state dir");
+        let file = state_dir.join("my-sessions.db");
+        if exists {
+            std::fs::write(&file, b"not opened").expect("write the named file");
+        }
+        let before = dir_entries(&state_dir);
+        let refused = init_at(
+            workspace.path(),
+            &file,
+            json!({ "persistent_sessions": true }),
+            Duration::from_secs(45),
+        );
+        assert!(refused.get("result").is_none(), "{refused}");
+        assert_eq!(
+            refused["error"]["code"],
+            json!(meerkat_meta::STORAGE_RESOLUTION_CODE),
+            "{refused}"
+        );
+        let message = refused["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains(&file.display().to_string()), "{message}");
+        assert!(
+            message.contains(&state_dir.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("runtime.sqlite"), "{message}");
+        let import = message
+            .find("meta_gateway storage-migrate --state-dir")
+            .unwrap_or_else(|| panic!("the import step is missing: {message}"));
+        let native = message
+            .find("meta_gateway storage-migrate-native --state-dir")
+            .unwrap_or_else(|| panic!("the native migration step is missing: {message}"));
+        assert!(import < native, "{message}");
+        assert_eq!(
+            dir_entries(&state_dir),
+            before,
+            "the refusal created or removed files (file exists: {exists})"
+        );
+        if exists {
+            assert_eq!(
+                std::fs::read(&file).expect("read the named file"),
+                b"not opened",
+                "the refusal opened the named file"
+            );
+        } else {
+            let started = init_at(
+                workspace.path(),
+                &state_dir,
+                json!({ "persistent_sessions": true }),
+                Duration::from_secs(45),
+            );
+            assert!(
+                started.get("error").is_none() && started["result"]["http_base_url"].is_string(),
+                "the state directory itself must start: {started}"
+            );
+        }
+    }
+}
+
 /// A meta_gateway on its own workspace whose `config/mob.toml` names the mob
 /// `mob_id` and the roster's member `personal:alice`, launched with the
 /// persistent identity-first init plus `overrides` and the flags `args`.
@@ -1642,4 +1881,29 @@ fn meta_gateway_takes_the_member_tools_ceiling_for_child_mobs() {
             );
         }
     }
+}
+
+/// `meta_gateway`: an existing directory is the state directory even with a
+/// dot in its name (`/srv/meta.d`). It is never read as a session-database
+/// override: it starts and holds the runtime store.
+#[test]
+fn meta_gateway_starts_an_existing_dotted_state_directory() {
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let root = TempDir::new().expect("root tempdir");
+    let dotted = root.path().join("meta.d");
+    std::fs::create_dir(&dotted).expect("create the dotted directory");
+    let started = init_at(
+        workspace.path(),
+        &dotted,
+        json!({ "persistent_sessions": true }),
+        Duration::from_secs(45),
+    );
+    assert!(
+        started.get("error").is_none() && started["result"]["http_base_url"].is_string(),
+        "an existing dotted directory must start: {started}"
+    );
+    assert!(
+        dotted.join("runtime.sqlite").is_file(),
+        "the dotted directory is the state directory"
+    );
 }

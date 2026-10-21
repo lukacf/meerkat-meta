@@ -293,7 +293,7 @@ impl ContinuityStore for CompatRollbackContinuityStore {
         Ok(())
     }
     /// `None`, stated: this in-memory compatibility reference keeps whole
-    /// snapshots only; the incremental profile runs against `LocalContinuityStore`.
+    /// snapshots only.
     fn as_incremental_sessions(
         &self,
     ) -> Option<

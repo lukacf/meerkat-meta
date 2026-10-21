@@ -1205,3 +1205,723 @@ fn unix_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+fn mirror_update() -> meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorUpdate {
+    use meerkat_meta::unified_runtime::continuity_mirror::{
+        ContinuityMirrorRecord, ContinuityMirrorSession, ContinuityMirrorUpdate,
+    };
+    ContinuityMirrorUpdate {
+        sequence: MIRROR_SEQUENCE,
+        records: vec![
+            ContinuityMirrorRecord {
+                identity: "agent:alice".to_string(),
+                agent_runtime_id: "rt:agent:alice:0".to_string(),
+                session_id: "s-alice".to_string(),
+                generation: 0,
+                checkpoint_version: 0,
+            },
+            ContinuityMirrorRecord {
+                identity: "agent:bob".to_string(),
+                agent_runtime_id: "rt:agent:bob:2".to_string(),
+                session_id: "s-bob".to_string(),
+                generation: 2,
+                checkpoint_version: 0,
+            },
+        ],
+        changed_sessions: vec![ContinuityMirrorSession {
+            session_id: "s-alice".to_string(),
+            data: "eyJ2IjoxfQ==".to_string(),
+        }],
+        session_ids: std::collections::BTreeSet::from(["s-alice".to_string(), "s-bob".to_string()]),
+    }
+}
+
+fn mirror_sink(
+    server: &MockHttpServer,
+) -> meerkat_meta::unified_runtime::continuity_mirror_bigquery::BigQueryMirrorSink {
+    meerkat_meta::unified_runtime::continuity_mirror_bigquery::BigQueryMirrorSink::new(
+        BigQuerySessionStoreAdapter::new_native("mirror_dataset", "unused_table")
+            .with_project_id("mirror-project")
+            .with_access_token("mirror-token")
+            .with_api_base_url(format!("{}/bigquery/v2", server.base_url())),
+        "continuity",
+    )
+}
+
+const MIRROR_QUERY_PATH: &str = "/bigquery/v2/projects/mirror-project/queries";
+
+/// The sequence of `mirror_update()`: 2026-10-20 in wall-clock milliseconds.
+const MIRROR_SEQUENCE: u64 = 1_792_454_400_000;
+
+fn mirror_table_path(name: &str) -> String {
+    format!("/bigquery/v2/projects/mirror-project/datasets/mirror_dataset/tables/{name}/insertAll")
+}
+
+fn mirror_request_paths(requests: &[bigquery_http_mock::CapturedHttpRequest]) -> Vec<String> {
+    requests
+        .iter()
+        .map(|request| request.path.clone())
+        .collect()
+}
+
+fn mirror_request_rows(request: &bigquery_http_mock::CapturedHttpRequest) -> Vec<Value> {
+    let body: Value = serde_json::from_str(&request.body).expect("insert body");
+    body["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["json"].clone())
+        .collect()
+}
+
+fn mirror_query_text(request: &bigquery_http_mock::CapturedHttpRequest) -> String {
+    let body: Value = serde_json::from_str(&request.body).expect("query body");
+    body["query"].as_str().expect("query text").to_string()
+}
+
+fn mirror_snapshot_ms(row: &Value) -> u64 {
+    row["snapshot_ms"]
+        .as_str()
+        .expect("snapshot_ms")
+        .parse::<u64>()
+        .expect("decimal snapshot_ms")
+}
+
+/// The answer to the newest-snapshot query when `<p>_snapshots` is empty.
+fn mirror_no_snapshot_yet() -> MockHttpResponse {
+    MockHttpResponse::json(json!({"jobComplete": true, "rows": [{"f": [{"v": null}]}]}))
+}
+
+/// The first `put` reads the newest snapshots row, then streams the changed
+/// sessions, then every record, then one snapshots row naming the shared
+/// `snapshot_ms` and the row counts, each into its own table of the dataset;
+/// a session row carries its data as part 0 of 1.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_writes_sessions_records_then_the_snapshot_row() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let server = MockHttpServer::start(vec![
+        mirror_no_snapshot_yet(),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+    ]);
+    mirror_sink(&server)
+        .put(&mirror_update())
+        .await
+        .expect("the snapshot streams into BigQuery");
+
+    let requests = server.captured_requests();
+    assert_eq!(
+        mirror_request_paths(&requests),
+        vec![
+            MIRROR_QUERY_PATH.to_string(),
+            mirror_table_path("continuity_sessions"),
+            mirror_table_path("continuity_records"),
+            mirror_table_path("continuity_snapshots"),
+        ]
+    );
+    assert_eq!(
+        mirror_query_text(&requests[0]),
+        "SELECT MAX(snapshot_ms) FROM `mirror-project.mirror_dataset.continuity_snapshots`"
+    );
+    let sessions = mirror_request_rows(&requests[1]);
+    let records = mirror_request_rows(&requests[2]);
+    let snapshot = mirror_request_rows(&requests[3]);
+    let snapshot_ms = snapshot[0]["snapshot_ms"].clone();
+    assert_eq!(snapshot_ms, json!(MIRROR_SEQUENCE.to_string()));
+    assert_eq!(
+        snapshot,
+        vec![json!({
+            "snapshot_ms": snapshot_ms.clone(),
+            "records": 2,
+            "sessions": 2,
+            "changed_sessions": 1,
+        })]
+    );
+    assert_eq!(
+        sessions,
+        vec![json!({
+            "session_id": "s-alice",
+            "data": "eyJ2IjoxfQ==",
+            "part": 0,
+            "parts": 1,
+            "snapshot_ms": snapshot_ms.clone(),
+        })]
+    );
+    assert_eq!(
+        records,
+        vec![
+            json!({
+                "identity": "agent:alice",
+                "agent_runtime_id": "rt:agent:alice:0",
+                "session_id": "s-alice",
+                "generation": 0,
+                "checkpoint_version": 0,
+                "snapshot_ms": snapshot_ms.clone(),
+            }),
+            json!({
+                "identity": "agent:bob",
+                "agent_runtime_id": "rt:agent:bob:2",
+                "session_id": "s-bob",
+                "generation": 2,
+                "checkpoint_version": 0,
+                "snapshot_ms": snapshot_ms,
+            }),
+        ]
+    );
+    assert!(requests.iter().all(|request| {
+        request.headers.get("authorization").map(String::as_str) == Some("Bearer mirror-token")
+    }));
+}
+
+/// A snapshots row the table already holds above the update's sequence (a
+/// wall clock that stepped back across a restart) numbers the next `put`
+/// above it.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_numbers_puts_above_the_newest_snapshot_it_finds() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let ahead = MIRROR_SEQUENCE + 86_400_000;
+    let server = MockHttpServer::start(vec![
+        MockHttpResponse::json(json!({
+            "jobComplete": true,
+            "rows": [{"f": [{"v": ahead.to_string()}]}],
+        })),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+    ]);
+    mirror_sink(&server)
+        .put(&mirror_update())
+        .await
+        .expect("the snapshot streams into BigQuery");
+
+    let requests = server.captured_requests();
+    assert_eq!(
+        mirror_snapshot_ms(&mirror_request_rows(&requests[3])[0]),
+        ahead + 1
+    );
+}
+
+/// A table insert that BigQuery answers with row errors fails the `put`, and
+/// no snapshots row is written, so a reader never takes the partial rows.
+/// The next `put` of the same update writes its rows again under a newer
+/// `snapshot_ms`, and does not read the newest snapshots row again.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_writes_no_snapshot_row_when_an_insert_fails() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let mut responses = vec![
+        mirror_no_snapshot_yet(),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({
+            "insertErrors": [{"index": 0, "errors": [{"reason": "invalid"}]}]
+        })),
+    ];
+    responses.extend((0..3).map(|_| MockHttpResponse::json(json!({}))));
+    let server = MockHttpServer::start(responses);
+    let sink = mirror_sink(&server);
+    let error = sink
+        .put(&mirror_update())
+        .await
+        .expect_err("row errors fail the put");
+    assert!(error.contains("continuity_records"), "{error}");
+    sink.put(&mirror_update())
+        .await
+        .expect("the next put streams the snapshot again");
+
+    let requests = server.captured_requests();
+    assert_eq!(
+        mirror_request_paths(&requests),
+        vec![
+            MIRROR_QUERY_PATH.to_string(),
+            mirror_table_path("continuity_sessions"),
+            mirror_table_path("continuity_records"),
+            mirror_table_path("continuity_sessions"),
+            mirror_table_path("continuity_records"),
+            mirror_table_path("continuity_snapshots"),
+        ]
+    );
+    let first = mirror_snapshot_ms(&mirror_request_rows(&requests[1])[0]);
+    let second = mirror_snapshot_ms(&mirror_request_rows(&requests[3])[0]);
+    assert!(first < second);
+    assert_eq!(
+        second,
+        mirror_snapshot_ms(&mirror_request_rows(&requests[5])[0])
+    );
+}
+
+/// Session data longer than 4 MiB goes out as rows of at most 4 MiB, numbered
+/// by `part` with the count in `parts`, that join back into the data.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_splits_long_session_data_into_parts_that_rejoin() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    const PART_BYTES: usize = 4 * 1024 * 1024;
+    let server = MockHttpServer::start(vec![
+        mirror_no_snapshot_yet(),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+    ]);
+    let mut update = mirror_update();
+    let data = format!("{}QUJD", "A".repeat(PART_BYTES));
+    update.changed_sessions[0].data = data.clone();
+    mirror_sink(&server)
+        .put(&update)
+        .await
+        .expect("the long session streams into BigQuery");
+
+    let requests = server.captured_requests();
+    assert_eq!(
+        mirror_request_paths(&requests)[1],
+        mirror_table_path("continuity_sessions")
+    );
+    let sessions = mirror_request_rows(&requests[1]);
+    assert_eq!(sessions.len(), 2);
+    for (index, row) in sessions.iter().enumerate() {
+        assert_eq!(row["session_id"], json!("s-alice"));
+        assert_eq!(row["part"], json!(index));
+        assert_eq!(row["parts"], json!(2));
+    }
+    let pieces: Vec<&str> = sessions
+        .iter()
+        .map(|row| row["data"].as_str().expect("data"))
+        .collect();
+    assert_eq!(pieces[0].len(), PART_BYTES);
+    assert_eq!(pieces.concat(), data);
+}
+
+/// A `put` that has not completed within its deadline fails, and writes no
+/// snapshots row.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_fails_a_put_past_its_deadline() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let server = MockHttpServer::start(vec![
+        mirror_no_snapshot_yet().with_delay(Duration::from_secs(2)),
+    ]);
+    let started = Instant::now();
+    let error = mirror_sink(&server)
+        .with_put_deadline(Duration::from_millis(200))
+        .put(&mirror_update())
+        .await
+        .expect_err("the put misses its deadline");
+    assert!(error.contains("did not complete within"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(
+        mirror_request_paths(&server.captured_requests()),
+        vec![MIRROR_QUERY_PATH.to_string()]
+    );
+}
+
+/// A `put` with no changed session writes no session row: only the records
+/// and the snapshots row, which still counts every session the records name.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_writes_only_records_when_no_session_changed() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let server = MockHttpServer::start(vec![
+        mirror_no_snapshot_yet(),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+    ]);
+    let mut update = mirror_update();
+    update.changed_sessions.clear();
+    mirror_sink(&server)
+        .put(&update)
+        .await
+        .expect("the records stream into BigQuery");
+
+    let requests = server.captured_requests();
+    assert_eq!(
+        mirror_request_paths(&requests),
+        vec![
+            MIRROR_QUERY_PATH.to_string(),
+            mirror_table_path("continuity_records"),
+            mirror_table_path("continuity_snapshots"),
+        ]
+    );
+    let snapshot = mirror_request_rows(&requests[2]);
+    assert_eq!(snapshot[0]["sessions"], json!(2));
+    assert_eq!(snapshot[0]["changed_sessions"], json!(0));
+}
+
+/// A token source handing out `token-1`, `token-2`, ... in fetch order, each
+/// valid for `lifetime`, and the count of its fetches.
+fn mirror_counting_token_source(
+    lifetime: Duration,
+) -> (
+    meerkat_meta::BigQueryAccessTokenSource,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let fetches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&fetches);
+    let source = meerkat_meta::BigQueryAccessTokenSource::new(move || {
+        let fetch = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        async move {
+            Ok(meerkat_meta::BigQueryAccessToken {
+                token: format!("token-{fetch}"),
+                expires_at: Some(SystemTime::now() + lifetime),
+            })
+        }
+    });
+    (source, fetches)
+}
+
+fn mirror_sink_with_token_source(
+    server: &MockHttpServer,
+    source: meerkat_meta::BigQueryAccessTokenSource,
+) -> meerkat_meta::unified_runtime::continuity_mirror_bigquery::BigQueryMirrorSink {
+    meerkat_meta::unified_runtime::continuity_mirror_bigquery::BigQueryMirrorSink::new(
+        BigQuerySessionStoreAdapter::new_native("mirror_dataset", "unused_table")
+            .with_project_id("mirror-project")
+            .with_access_token("fixed-token")
+            .with_access_token_source(source)
+            .with_api_base_url(format!("{}/bigquery/v2", server.base_url())),
+        "continuity",
+    )
+}
+
+fn mirror_bearers(server: &MockHttpServer) -> Vec<String> {
+    server
+        .captured_requests()
+        .iter()
+        .map(|request| {
+            request
+                .headers
+                .get("authorization")
+                .cloned()
+                .expect("authorization header")
+        })
+        .collect()
+}
+
+fn mirror_unauthorized() -> MockHttpResponse {
+    MockHttpResponse {
+        status_code: 401,
+        ..MockHttpResponse::json(json!({
+            "error": {"code": 401, "message": "Request had invalid authentication credentials."}
+        }))
+    }
+}
+
+/// A token source's token is cached: one fetch serves every request of a
+/// `put`, and it wins over a fixed token.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_caches_the_token_source_token() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let server = MockHttpServer::start(vec![
+        mirror_no_snapshot_yet(),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+    ]);
+    let (source, fetches) = mirror_counting_token_source(Duration::from_hours(1));
+    mirror_sink_with_token_source(&server, source)
+        .put(&mirror_update())
+        .await
+        .expect("the snapshot streams into BigQuery");
+
+    assert_eq!(
+        mirror_bearers(&server),
+        vec!["Bearer token-1".to_string(); 4]
+    );
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A token that expires while the mirror runs is replaced: the next `put`
+/// completes with the token the source fetches anew.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_puts_with_a_new_token_after_the_old_one_expires() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let mut responses = vec![mirror_no_snapshot_yet()];
+    responses.extend((0..6).map(|_| MockHttpResponse::json(json!({}))));
+    let server = MockHttpServer::start(responses);
+    let (source, fetches) = mirror_counting_token_source(Duration::from_millis(400));
+    let sink = mirror_sink_with_token_source(&server, source.with_refresh_margin(Duration::ZERO));
+    sink.put(&mirror_update())
+        .await
+        .expect("the first put streams with the first token");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut update = mirror_update();
+    update.sequence += 1;
+    sink.put(&update)
+        .await
+        .expect("the next put streams with a new token");
+
+    let requests = server.captured_requests();
+    assert_eq!(
+        mirror_request_paths(&requests)[4..],
+        [
+            mirror_table_path("continuity_sessions"),
+            mirror_table_path("continuity_records"),
+            mirror_table_path("continuity_snapshots"),
+        ]
+    );
+    let mut expected = vec!["Bearer token-1".to_string(); 4];
+    expected.extend(vec!["Bearer token-2".to_string(); 3]);
+    assert_eq!(mirror_bearers(&server), expected);
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(sink.auth_failures(), 0);
+}
+
+/// An insert BigQuery refuses with 401 was not applied, so the adapter
+/// fetches a new token and sends that insert once more; the `put` completes
+/// with its snapshots row last.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_sends_a_refused_insert_again_with_a_new_token() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let server = MockHttpServer::start(vec![
+        mirror_no_snapshot_yet(),
+        mirror_unauthorized(),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+        MockHttpResponse::json(json!({})),
+    ]);
+    let (source, fetches) = mirror_counting_token_source(Duration::from_hours(1));
+    let sink = mirror_sink_with_token_source(&server, source);
+    sink.put(&mirror_update())
+        .await
+        .expect("the put completes with the new token");
+
+    assert_eq!(
+        mirror_request_paths(&server.captured_requests()),
+        vec![
+            MIRROR_QUERY_PATH.to_string(),
+            mirror_table_path("continuity_sessions"),
+            mirror_table_path("continuity_sessions"),
+            mirror_table_path("continuity_records"),
+            mirror_table_path("continuity_snapshots"),
+        ]
+    );
+    assert_eq!(
+        mirror_bearers(&server),
+        vec![
+            "Bearer token-1".to_string(),
+            "Bearer token-1".to_string(),
+            "Bearer token-2".to_string(),
+            "Bearer token-2".to_string(),
+            "Bearer token-2".to_string(),
+        ]
+    );
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(sink.auth_failures(), 0);
+}
+
+/// A 401 that comes back after the refresh fails the `put` as an access token
+/// failure, with no token text in the error, and is counted.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_fails_a_put_when_bigquery_refuses_the_new_token_too() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let server = MockHttpServer::start(vec![mirror_unauthorized(), mirror_unauthorized()]);
+    let (source, _fetches) = mirror_counting_token_source(Duration::from_hours(1));
+    let sink = mirror_sink_with_token_source(&server, source);
+    let error = sink
+        .put(&mirror_update())
+        .await
+        .expect_err("a second 401 fails the put");
+    assert!(
+        error.contains("BigQuery access token refused or unavailable"),
+        "{error}"
+    );
+    assert!(error.contains("again after a refresh"), "{error}");
+    assert!(!error.contains("token-"), "{error}");
+    assert_eq!(server.captured_requests().len(), 2);
+    assert_eq!(sink.auth_failures(), 1);
+}
+
+/// A token source that fails fails the `put` as an access token failure
+/// before any request is sent.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_fails_a_put_when_the_token_source_fails() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let server = MockHttpServer::start(Vec::new());
+    let sink = mirror_sink_with_token_source(
+        &server,
+        meerkat_meta::BigQueryAccessTokenSource::new(|| async {
+            Err("the metadata server did not answer".to_string())
+        }),
+    );
+    let error = sink
+        .put(&mirror_update())
+        .await
+        .expect_err("the token source fails the put");
+    assert!(
+        error.contains("BigQuery access token refused or unavailable"),
+        "{error}"
+    );
+    assert!(
+        error.contains("the metadata server did not answer"),
+        "{error}"
+    );
+    assert!(server.captured_requests().is_empty());
+    assert_eq!(sink.auth_failures(), 1);
+}
+
+/// Only a 401 is sent again: a 500 fails the `put` after one attempt, with no
+/// new token.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_sends_a_failed_request_once() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let server = MockHttpServer::start(vec![MockHttpResponse {
+        status_code: 500,
+        ..MockHttpResponse::json(json!({"error": {"code": 500}}))
+    }]);
+    let (source, fetches) = mirror_counting_token_source(Duration::from_hours(1));
+    let sink = mirror_sink_with_token_source(&server, source);
+    let error = sink
+        .put(&mirror_update())
+        .await
+        .expect_err("a 500 fails the put");
+    assert!(error.contains("status 500"), "{error}");
+    assert_eq!(server.captured_requests().len(), 1);
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(sink.auth_failures(), 0);
+}
+
+fn mirror_blob(
+    blob_id: &str,
+) -> meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorBlob {
+    meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorBlob {
+        blob_id: blob_id.to_string(),
+        media_type: "image/png".to_string(),
+        data: "iVBORw0KGgo=".to_string(),
+    }
+}
+
+fn mirror_blob_id(fill: &str) -> String {
+    format!("sha256:{}", fill.repeat(64))
+}
+
+/// The first `put_blob` reads which blobs the blobs table already holds a
+/// complete copy of; a blob it holds is not written again, a new one is
+/// written once as part rows, and a repeated id makes no request.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_puts_each_blob_once_and_skips_blobs_bigquery_holds() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let held = mirror_blob_id("a");
+    let fresh = mirror_blob_id("b");
+    let server = MockHttpServer::start(vec![
+        MockHttpResponse::json(json!({
+            "jobComplete": true,
+            "rows": [{"f": [{"v": held.clone()}]}, {"f": [{"v": held.clone()}]}],
+        })),
+        MockHttpResponse::json(json!({})),
+    ]);
+    let sink = mirror_sink(&server);
+    sink.put_blob(&mirror_blob(&held))
+        .await
+        .expect("a blob BigQuery holds is kept");
+    sink.put_blob(&mirror_blob(&fresh))
+        .await
+        .expect("a new blob streams into BigQuery");
+    sink.put_blob(&mirror_blob(&fresh))
+        .await
+        .expect("a repeated blob id is kept");
+
+    let requests = server.captured_requests();
+    assert_eq!(
+        mirror_request_paths(&requests),
+        vec![
+            MIRROR_QUERY_PATH.to_string(),
+            mirror_table_path("continuity_blobs"),
+        ]
+    );
+    assert_eq!(
+        mirror_query_text(&requests[0]),
+        "SELECT blob_id FROM `mirror-project.mirror_dataset.continuity_blobs` \
+         GROUP BY blob_id, snapshot_ms HAVING COUNT(*) = ANY_VALUE(parts)"
+    );
+    let rows = mirror_request_rows(&requests[1]);
+    assert_eq!(rows.len(), 1);
+    let snapshot_ms = rows[0]["snapshot_ms"].clone();
+    assert!(
+        snapshot_ms
+            .as_str()
+            .is_some_and(|ms| ms.parse::<u64>().is_ok())
+    );
+    assert_eq!(
+        rows[0],
+        json!({
+            "blob_id": fresh,
+            "media_type": "image/png",
+            "data": "iVBORw0KGgo=",
+            "part": 0,
+            "parts": 1,
+            "snapshot_ms": snapshot_ms,
+        })
+    );
+}
+
+/// The held blob ids query waits for an unfinished job and reads every
+/// result page before the sink decides which blobs to write.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_reads_every_page_of_the_held_blob_ids() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let first = mirror_blob_id("c");
+    let second = mirror_blob_id("d");
+    let job = json!({"projectId": "mirror-project", "jobId": "job-1", "location": "EU"});
+    let server = MockHttpServer::start(vec![
+        MockHttpResponse::json(json!({"jobComplete": false, "jobReference": job.clone()})),
+        MockHttpResponse::json(json!({
+            "jobComplete": true,
+            "jobReference": job.clone(),
+            "rows": [{"f": [{"v": first.clone()}]}],
+            "pageToken": "page-2",
+        })),
+        MockHttpResponse::json(json!({
+            "jobComplete": true,
+            "jobReference": job,
+            "rows": [{"f": [{"v": second.clone()}]}],
+        })),
+    ]);
+    let sink = mirror_sink(&server);
+    sink.put_blob(&mirror_blob(&second))
+        .await
+        .expect("a blob on the last page is kept");
+    sink.put_blob(&mirror_blob(&first))
+        .await
+        .expect("a blob on the first page is kept");
+
+    let requests = server.captured_requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path))
+            .collect::<Vec<_>>(),
+        vec![
+            format!("POST {MIRROR_QUERY_PATH}"),
+            format!("GET {MIRROR_QUERY_PATH}/job-1?maxResults=10000&location=EU"),
+            format!("GET {MIRROR_QUERY_PATH}/job-1?maxResults=10000&location=EU&pageToken=page-2"),
+        ]
+    );
+}
+
+/// A blob whose insert fails is written again by the next `put_blob` of its
+/// id, without reading the held ids again.
+#[tokio::test]
+async fn continuity_mirror_bigquery_sink_writes_a_blob_again_after_its_insert_fails() {
+    use meerkat_meta::unified_runtime::continuity_mirror::ContinuityMirrorSink as _;
+    let blob_id = mirror_blob_id("e");
+    let server = MockHttpServer::start(vec![
+        MockHttpResponse::json(json!({"jobComplete": true})),
+        MockHttpResponse::json(json!({
+            "insertErrors": [{"index": 0, "errors": [{"reason": "invalid"}]}]
+        })),
+        MockHttpResponse::json(json!({})),
+    ]);
+    let sink = mirror_sink(&server);
+    let error = sink
+        .put_blob(&mirror_blob(&blob_id))
+        .await
+        .expect_err("row errors fail the blob put");
+    assert!(error.contains("continuity_blobs"), "{error}");
+    sink.put_blob(&mirror_blob(&blob_id))
+        .await
+        .expect("the next blob put writes the blob");
+
+    assert_eq!(
+        mirror_request_paths(&server.captured_requests()),
+        vec![
+            MIRROR_QUERY_PATH.to_string(),
+            mirror_table_path("continuity_blobs"),
+            mirror_table_path("continuity_blobs"),
+        ]
+    );
+}

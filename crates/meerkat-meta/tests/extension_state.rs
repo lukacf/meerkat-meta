@@ -224,8 +224,6 @@ async fn harness_with_client(
     ToolBundleContext,
     Arc<tokio::sync::Mutex<Vec<(meerkat_core::SessionId, Principal)>>>,
 ) {
-    let sessions =
-        Arc::new(meerkat_store::SqliteSessionStore::open(path.join("sessions.sqlite3")).unwrap());
     let (storage, provenance) =
         meerkat_meta::mob_composition_manifest::persistent_mob_storage(path.join("mob.sqlite3"))
             .unwrap();
@@ -240,18 +238,21 @@ async fn harness_with_client(
         };
         profile.tools.mob = true;
     }
-    let spec = MobBootstrapSpec::persistent(definition, storage, path.to_path_buf(), 16, sessions)
-        .unwrap()
-        .with_mob_storage_provenance(provenance)
-        // Force final child-policy installation so delegate/fork coverage
-        // also proves extension bundles and authority survive replacement
-        // of the preliminary agent mob-tool state.
-        .with_child_application_tool_policy(meerkat_core::ApplicationToolPolicyBinding::Unmanaged)
-        .with_options(MobBootstrapOptions {
-            allow_ephemeral_sessions: false,
-            notify_orchestrator_on_resume: false,
-            default_llm_client: Some(client),
-        });
+    let spec =
+        MobBootstrapSpec::persistent(definition, storage, provenance, path.to_path_buf(), 16)
+            .await
+            .unwrap()
+            // Force final child-policy installation so delegate/fork coverage
+            // also proves extension bundles and authority survive replacement
+            // of the preliminary agent mob-tool state.
+            .with_child_application_tool_policy(
+                meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
+            )
+            .with_options(MobBootstrapOptions {
+                allow_ephemeral_sessions: false,
+                notify_orchestrator_on_resume: false,
+                default_llm_client: Some(client),
+            });
     let captured = Arc::new(Mutex::new(None));
     let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let factory_capture = captured.clone();
@@ -647,8 +648,23 @@ fn extension_native_fresh_process_restart_and_current_revocation() {
     }
 }
 
+/// Upgrade: a member Meta 0.9.3 spawned carries the identity's label but not
+/// Core's durable-identity marker, so its session resolves no principal for
+/// extension documents. The first boot whose roster lists the identity
+/// respawns it onto the same session at a higher Core generation, with the
+/// marker, and from then on that session resolves as the identity's agent.
+/// A marked identity of the same roster keeps its generation: the boot
+/// respawns only unmarked members.
 #[test]
-fn extension_native_fresh_process_unpublished_late_birth_is_unavailable() {
+fn extension_upgraded_unmarked_member_resolves_as_its_agent_after_the_first_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    for phase in ["upgrade-seed", "upgrade-boot"] {
+        subprocess_phase(dir.path(), phase);
+    }
+}
+
+#[test]
+fn extension_native_late_birth_resolves_from_core_member_history() {
     let dir = tempfile::tempdir().unwrap();
     for phase in ["late-create", "late-reopen"] {
         subprocess_phase(dir.path(), phase);
@@ -701,7 +717,11 @@ async fn extension_subprocess_fixture() {
     let phase = std::env::var("META_EXTENSION_RESTART_PHASE").unwrap();
     let evidence_path = path.join("restart-evidence.json");
     if phase.starts_with("late-") {
-        unpublished_late_birth_phase(&path, &phase).await;
+        late_birth_phase(&path, &phase).await;
+        return;
+    }
+    if phase.starts_with("upgrade-") {
+        upgrade_respawn_phase(&path, &phase).await;
         return;
     }
     let (runtime, context, _) = harness(&path, None).await;
@@ -848,6 +868,44 @@ impl meerkat_meta::identity_first::contracts::RosterProvider for StableRoster {
         }])
     }
 }
+/// [`StableRoster`] and one more identity, `durable:upgraded`: the roster
+/// of the upgrade boot.
+struct UpgradeRoster;
+#[async_trait::async_trait]
+impl meerkat_meta::identity_first::contracts::RosterProvider for UpgradeRoster {
+    async fn roster(
+        &self,
+        context: &meerkat_meta::identity_first::RosterContext,
+    ) -> std::result::Result<
+        Vec<meerkat_meta::identity_first::DurableAgentSpec>,
+        meerkat_meta::identity_first::RosterError,
+    > {
+        let mut roster =
+            meerkat_meta::identity_first::contracts::RosterProvider::roster(&StableRoster, context)
+                .await?;
+        roster.push(worker_identity_spec("durable:upgraded"));
+        Ok(roster)
+    }
+}
+
+/// A roster entry for `identity` under the `worker` profile.
+fn worker_identity_spec(identity: &str) -> meerkat_meta::identity_first::DurableAgentSpec {
+    meerkat_meta::identity_first::DurableAgentSpec {
+        identity: meerkat_meta::identity_first::AgentIdentity::parse(identity).unwrap(),
+        profile: meerkat_mob::ProfileName::from("worker"),
+        addressability: meerkat_meta::identity_first::AgentAddressability::Addressable,
+        display_name: None,
+        labels: BTreeMap::new(),
+        context: None,
+        additional_instructions: vec![],
+        initial_message: None,
+        runtime_mode_override: None,
+        backend: None,
+        binding: None,
+        placement: None,
+    }
+}
+
 async fn stable_harness(
     path: &std::path::Path,
     access: meerkat_meta::access::AccessController,
@@ -856,25 +914,40 @@ async fn stable_harness(
     ToolBundleContext,
     Arc<tokio::sync::Mutex<Vec<(meerkat_core::SessionId, Principal)>>>,
 ) {
-    let sessions =
-        Arc::new(meerkat_store::SqliteSessionStore::open(path.join("sessions.sqlite3")).unwrap());
+    stable_harness_with_roster(path, access, Arc::new(StableRoster)).await
+}
+
+async fn stable_harness_with_roster(
+    path: &std::path::Path,
+    access: meerkat_meta::access::AccessController,
+    roster: Arc<dyn meerkat_meta::identity_first::contracts::RosterProvider>,
+) -> (
+    UnifiedRuntime,
+    ToolBundleContext,
+    Arc<tokio::sync::Mutex<Vec<(meerkat_core::SessionId, Principal)>>>,
+) {
     let (storage, provenance) =
         meerkat_meta::mob_composition_manifest::persistent_mob_storage(path.join("mob.sqlite3"))
             .unwrap();
     // Session/continuity persistence alone does not retain the native mob
     // journal. These tests require the original creation facts after reopen.
-    let spec =
-        MobBootstrapSpec::persistent(definition(path), storage, path.to_path_buf(), 16, sessions)
-            .unwrap()
-            .with_mob_storage_provenance(provenance)
-            .with_options(MobBootstrapOptions {
-                allow_ephemeral_sessions: false,
-                notify_orchestrator_on_resume: false,
-                default_llm_client: Some(Arc::new(ScriptClient {
-                    calls: AtomicUsize::new(0),
-                    tool: "documents_apply",
-                })),
-            });
+    let spec = MobBootstrapSpec::persistent(
+        definition(path),
+        storage,
+        provenance,
+        path.to_path_buf(),
+        16,
+    )
+    .await
+    .unwrap()
+    .with_options(MobBootstrapOptions {
+        allow_ephemeral_sessions: false,
+        notify_orchestrator_on_resume: false,
+        default_llm_client: Some(Arc::new(ScriptClient {
+            calls: AtomicUsize::new(0),
+            tool: "documents_apply",
+        })),
+    });
     let captured = Arc::new(Mutex::new(None));
     let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let capture = captured.clone();
@@ -895,7 +968,7 @@ async fn stable_harness(
             .continuity_from_state_dir(path)
             .await
             .unwrap()
-            .roster_provider(Arc::new(StableRoster))
+            .roster_provider(roster)
             .identity_bootstrap_mode(
                 meerkat_meta::identity_first::IdentityBootstrapMode::EagerMaterialize,
             )
@@ -999,9 +1072,13 @@ async fn extension_native_first_turn_creation_has_stable_owner_after_reset_and_r
         .reset(&identity)
         .await
         .unwrap();
+    let successor_session = successor
+        .session_id()
+        .cloned()
+        .expect("the reset successor binds a session");
     let successor_creation = runtime
         .mob_handle()
-        .member_creation_for_session(&successor.session_id)
+        .member_creation_for_session(&successor_session)
         .await
         .unwrap()
         .expect("reset successor has a native creation record");
@@ -1016,7 +1093,7 @@ async fn extension_native_first_turn_creation_has_stable_owner_after_reset_and_r
             ..
         } if *predecessor_session_id == session
     ));
-    let after_reset = caller_at(&context, &successor.session_id, "stable owner after reset").await;
+    let after_reset = caller_at(&context, &successor_session, "stable owner after reset").await;
     assert_eq!(after_reset.principal(), &principal);
     assert!(
         context
@@ -1038,7 +1115,7 @@ async fn extension_native_first_turn_creation_has_stable_owner_after_reset_and_r
         .session_id
         .unwrap();
     assert_eq!(
-        session, successor.session_id,
+        session, successor_session,
         "restore keeps the reset session"
     );
     let restored_creation = runtime
@@ -1073,11 +1150,15 @@ async fn late_birth_step<T>(
     result
 }
 
-async fn unpublished_late_birth_phase(path: &std::path::Path, phase: &str) {
-    use meerkat_meta::identity_first::{
-        AgentIdentity as StableIdentity, AgentRuntimeId, CheckpointVersion, ContinuityGeneration,
-        ContinuityRecord, LeaseAcquireResult,
-    };
+/// A member's principal comes from Core's member binding history alone: a
+/// native spawn that carries Core's durable-identity marker resolves as the
+/// identity it encodes although no materialization caller ever saw it (one
+/// canceled after the spawn was submitted). A live member the identity-first
+/// runtime labelled but Core never marked resolves no principal, in this
+/// process and in a fresh one, and an unrelated worker stays a worker. The
+/// fresh process's boot roster compile retires the late identity (the
+/// roster does not list it), so only the other two are resolved there.
+async fn late_birth_phase(path: &std::path::Path, phase: &str) {
     let (runtime, context, _) = late_birth_step(
         phase,
         "stable host bootstrap",
@@ -1087,108 +1168,87 @@ async fn unpublished_late_birth_phase(path: &std::path::Path, phase: &str) {
         ),
     )
     .await;
-    let identity = StableIdentity::parse("durable:late").unwrap();
-    let target = meerkat_meta::member_comms_id::mob_member_id(identity.as_str());
-    let evidence = path.join("late-session.json");
-    let session = if phase == "late-create" {
-        let identity_runtime = runtime.identity_runtime().unwrap();
-        let mut grants = late_birth_step(
-            phase,
-            "acquire provisional identity lease",
-            identity_runtime
-                .lease_provider()
-                .acquire_leases(std::slice::from_ref(&identity), "late-test"),
-        )
-        .await
-        .unwrap();
-        let LeaseAcquireResult::Acquired(grant) = grants.remove(&identity).unwrap() else {
-            panic!("fresh identity lease");
+    let late_identity = "durable:late";
+    let late = meerkat_meta::member_comms_id::mob_member_id(late_identity);
+    let labelled = meerkat_meta::member_comms_id::mob_member_id("durable:labelled");
+    let evidence = path.join("late-sessions.json");
+    let (late_session, labelled_session) = if phase == "late-create" {
+        // The spawn every identity-first materialization submits, committed
+        // here with no Meta caller around it.
+        let mut late_spec = SpawnMemberSpec::host_root("worker", late.clone());
+        late_spec.continuity_intent = meerkat_mob::SpawnContinuityIntent::DurableIdentity {
+            continuity_key: late_identity.to_string(),
         };
-        let provisional = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse("late-runtime").unwrap(),
-            session_id: meerkat_core::SessionId::new(),
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        late_birth_step(
-            phase,
-            "retain provisional identity intent",
-            identity_runtime
-                .continuity_store()
-                .upsert_continuity_record(&provisional, grant.fencing_token),
-        )
-        .await
-        .unwrap();
-        let publication = identity_runtime
-            .bridge()
-            .unwrap()
-            .begin_extension_identity_publication(&identity)
-            .unwrap()
-            .unwrap();
-        drop(publication);
-        // This is the authoritative outcome of a submitted native spawn that
-        // commits after its materialization caller has been canceled. The
-        // exact actual binding was never published into continuity.
         late_birth_step(
             phase,
             "commit native late birth",
-            runtime
-                .mob_handle()
-                .spawn_spec(SpawnMemberSpec::host_root("worker", target.clone())),
+            runtime.mob_handle().spawn_spec(late_spec),
         )
         .await
         .unwrap();
-        let session = late_birth_step(
-            phase,
-            "read native late birth session",
-            member_session(&runtime, &target),
-        )
-        .await;
-        assert!(
-            identity_runtime
-                .continuity_store()
-                .historical_identity_binding(&session)
-                .await
-                .unwrap()
-                .is_none()
+        // An identity-first label without Core's marker: what a member Meta
+        // 0.9.3 spawned looks like until Meta respawns it.
+        let labelled_spec = SpawnMemberSpec::host_root("worker", labelled.clone()).with_labels(
+            BTreeMap::from([("agent_identity".to_string(), "durable:labelled".to_string())]),
         );
         late_birth_step(
             phase,
-            "delete provisional continuity record",
-            identity_runtime
-                .continuity_store()
-                .delete_continuity_record(&identity, grant.fencing_token),
+            "commit labelled member without the marker",
+            runtime.mob_handle().spawn_spec(labelled_spec),
         )
         .await
         .unwrap();
-        late_birth_step(
-            phase,
-            "release provisional identity lease",
-            identity_runtime.lease_provider().release_leases(&[grant]),
-        )
-        .await
-        .unwrap();
-        std::fs::write(&evidence, serde_json::to_vec(&session).unwrap()).unwrap();
-        session
+        let sessions = (
+            member_session(&runtime, &late).await,
+            member_session(&runtime, &labelled).await,
+        );
+        std::fs::write(&evidence, serde_json::to_vec(&sessions).unwrap()).unwrap();
+        sessions
     } else {
         serde_json::from_slice(&std::fs::read(&evidence).unwrap()).unwrap()
     };
-    assert_eq!(
-        late_birth_step(
-            phase,
-            "verify retained late birth session",
-            member_session(&runtime, &target),
-        )
-        .await,
-        session
-    );
-    eprintln!("{phase}: resolving unpublished late birth");
+    if phase == "late-create" {
+        assert_eq!(
+            caller_at(&context, &late_session, "resolve native late birth")
+                .await
+                .principal(),
+            &Principal::Agent(late_identity.to_string())
+        );
+    }
+    if phase == "late-create" {
+        assert_eq!(
+            late_birth_step(
+                phase,
+                "verify live labelled session",
+                member_session(&runtime, &labelled),
+            )
+            .await,
+            labelled_session
+        );
+    } else {
+        // The fresh process's roster pass retires a live member that
+        // carries the identity-first label for an identity the roster does
+        // not list (StableRoster lists only alice), marker or not.
+        assert!(
+            late_birth_step(
+                phase,
+                "verify the roster pass retired the labelled member",
+                runtime.mob_handle().get_member(&labelled),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "the roster pass retires the labelled member the roster does not list"
+        );
+    }
+    // Live and labelled, or retired: either way its session resolves no
+    // principal.
+    eprintln!("{phase}: resolving the labelled member without the marker");
     assert!(matches!(
         tokio::time::timeout(
             Duration::from_secs(2),
             context.caller_resolver.resolve(
-                &ToolDispatchContext::default().with_runtime_identity(session, None),
+                &ToolDispatchContext::default().with_runtime_identity(labelled_session, None),
                 None,
             )
         )
@@ -1196,7 +1256,6 @@ async fn unpublished_late_birth_phase(path: &std::path::Path, phase: &str) {
         .unwrap(),
         Err(Error::AuthorityUnavailable)
     ));
-    eprintln!("{phase}: refused unpublished late birth");
     // An unrelated worker target still gets a fresh immutable worker identity.
     let worker_member = late_birth_step(
         phase,
@@ -1222,6 +1281,148 @@ async fn unpublished_late_birth_phase(path: &std::path::Path, phase: &str) {
         Principal::Worker { .. }
     ));
     late_birth_step(phase, "shutdown stable host", runtime.shutdown()).await;
+}
+
+/// The upgrade phases of
+/// [`extension_upgraded_unmarked_member_resolves_as_its_agent_after_the_first_boot`]:
+/// `upgrade-seed` leaves a member as Meta 0.9.3 spawned it, beside alice's
+/// marked one; `upgrade-boot` boots with its identity rostered.
+async fn upgrade_respawn_phase(path: &std::path::Path, phase: &str) {
+    let upgraded_identity = "durable:upgraded";
+    let upgraded = meerkat_meta::member_comms_id::mob_member_id(upgraded_identity);
+    let alice = meerkat_meta::member_comms_id::mob_member_id("durable:alice");
+    let evidence = path.join("upgrade-seed.json");
+    let access = meerkat_meta::access::AccessController::new(Default::default()).unwrap();
+    let resolve = |context: &ToolBundleContext, session: &meerkat_core::SessionId| {
+        let context = context.clone();
+        let session = session.clone();
+        async move {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                context.caller_resolver.resolve(
+                    &ToolDispatchContext::default().with_runtime_identity(session, None),
+                    None,
+                ),
+            )
+            .await
+            .unwrap()
+            .map(|caller| caller.principal().clone())
+        }
+    };
+    if phase == "upgrade-seed" {
+        let (runtime, context, _) = late_birth_step(
+            phase,
+            "host bootstrap without the identity rostered",
+            stable_harness(path, access),
+        )
+        .await;
+        // The identity's label without Core's marker: a member Meta 0.9.3
+        // spawned, as Core restores it after the upgrade.
+        let spec = SpawnMemberSpec::host_root("worker", upgraded.clone()).with_labels(
+            BTreeMap::from([("agent_identity".to_string(), upgraded_identity.to_string())]),
+        );
+        late_birth_step(
+            phase,
+            "commit the 0.9.3-era member",
+            runtime.mob_handle().spawn_spec(spec),
+        )
+        .await
+        .unwrap();
+        let session = member_session(&runtime, &upgraded).await;
+        let history = runtime.mob_handle().member_binding_history().await.unwrap();
+        let seeded = history
+            .last_binding(&upgraded)
+            .expect("Core binds the seeded member");
+        assert!(
+            !matches!(
+                seeded.continuity_intent(),
+                meerkat_mob::SpawnContinuityIntent::DurableIdentity { .. }
+            ),
+            "{phase}: the seeded member carries no durable-identity marker"
+        );
+        let alice_binding = history.last_binding(&alice).expect("Core binds alice");
+        assert!(
+            alice_binding.is_live()
+                && matches!(
+                    alice_binding.continuity_intent(),
+                    meerkat_mob::SpawnContinuityIntent::DurableIdentity { .. }
+                ),
+            "{phase}: alice's member is live and marked"
+        );
+        std::fs::write(
+            &evidence,
+            serde_json::to_vec(&serde_json::json!({
+                "session": session,
+                "generation": seeded.generation().get(),
+                "alice_generation": alice_binding.generation().get(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let principal = resolve(&context, &session).await;
+        assert!(
+            matches!(principal, Err(Error::AuthorityUnavailable)),
+            "{phase}: before the upgrade boot the unmarked member resolves no principal: \
+             {principal:?}"
+        );
+        late_birth_step(phase, "shutdown the seeded host", runtime.shutdown()).await;
+        return;
+    }
+    let seed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&evidence).unwrap()).unwrap();
+    let session: meerkat_core::SessionId = serde_json::from_value(seed["session"].clone()).unwrap();
+    let seeded_generation = seed["generation"].as_u64().unwrap();
+    let alice_generation = seed["alice_generation"].as_u64().unwrap();
+    let (runtime, context, _) = late_birth_step(
+        phase,
+        "upgrade boot with the identity rostered",
+        stable_harness_with_roster(path, access, Arc::new(UpgradeRoster)),
+    )
+    .await;
+    // The boot's roster compile ran before the build returned.
+    let history = runtime.mob_handle().member_binding_history().await.unwrap();
+    let respawned = history
+        .last_binding(&upgraded)
+        .expect("Core binds the upgraded member");
+    assert!(
+        respawned.is_live() && respawned.generation().get() > seeded_generation,
+        "{phase}: the boot respawns the unmarked member live under a new Core generation \
+         ({seeded_generation} -> {:?})",
+        respawned.generation()
+    );
+    assert_eq!(
+        respawned.session_id(),
+        Some(&session),
+        "{phase}: the respawn keeps the session"
+    );
+    assert_eq!(
+        respawned.continuity_intent(),
+        &meerkat_mob::SpawnContinuityIntent::DurableIdentity {
+            continuity_key: upgraded_identity.to_string(),
+        },
+        "{phase}: the respawned binding carries the identity's marker"
+    );
+    assert_eq!(
+        history
+            .last_binding(&alice)
+            .expect("Core binds alice")
+            .generation()
+            .get(),
+        alice_generation,
+        "{phase}: the boot does not respawn a marked identity"
+    );
+    let principal = resolve(&context, &session).await;
+    assert!(
+        matches!(&principal, Ok(Principal::Agent(identity)) if identity == upgraded_identity),
+        "{phase}: the upgraded member's session resolves as its agent after the first boot \
+         respawns it: {principal:?}"
+    );
+    assert_eq!(
+        member_session(&runtime, &upgraded).await,
+        session,
+        "{phase}: Core's live member runs the kept session"
+    );
+    late_birth_step(phase, "shutdown the upgraded host", runtime.shutdown()).await;
 }
 
 /// The mob databases, with their WAL and shared-memory sidecars, in the
@@ -2322,26 +2523,27 @@ impl AgentToolDispatcher for UncomposedDocuments {
 /// bundle, no tool bundle factory and no document binding, so the agent
 /// mob-tool state creates mobs without the extension's create check.
 async fn harness_without_extension(path: &std::path::Path) -> UnifiedRuntime {
-    let sessions =
-        Arc::new(meerkat_store::SqliteSessionStore::open(path.join("sessions.sqlite3")).unwrap());
     let (storage, provenance) =
         meerkat_meta::mob_composition_manifest::persistent_mob_storage(path.join("mob.sqlite3"))
             .unwrap();
-    let spec =
-        MobBootstrapSpec::persistent(definition(path), storage, path.to_path_buf(), 16, sessions)
-            .unwrap()
-            .with_mob_storage_provenance(provenance)
-            .with_child_application_tool_policy(
-                meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
-            )
-            .with_options(MobBootstrapOptions {
-                allow_ephemeral_sessions: false,
-                notify_orchestrator_on_resume: false,
-                default_llm_client: Some(Arc::new(ScriptClient {
-                    calls: AtomicUsize::new(0),
-                    tool: "documents_read",
-                })),
-            });
+    let spec = MobBootstrapSpec::persistent(
+        definition(path),
+        storage,
+        provenance,
+        path.to_path_buf(),
+        16,
+    )
+    .await
+    .unwrap()
+    .with_child_application_tool_policy(meerkat_core::ApplicationToolPolicyBinding::Unmanaged)
+    .with_options(MobBootstrapOptions {
+        allow_ephemeral_sessions: false,
+        notify_orchestrator_on_resume: false,
+        default_llm_client: Some(Arc::new(ScriptClient {
+            calls: AtomicUsize::new(0),
+            tool: "documents_read",
+        })),
+    });
     Box::pin(
         UnifiedRuntime::builder()
             .mob_spec(spec)

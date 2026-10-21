@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 
 use meerkat_authorization::publication::{LocalAuthorizationPublication, LocalPublicationGuard};
 use rand_core::RngCore;
+use tokio::sync::watch;
 
 use super::engine::{
     AccessDecision, AccessPrincipal, AccessResource, evaluate_access, groups_for_subject,
@@ -127,6 +128,9 @@ struct AccessControllerInner {
     /// The authorization publication a governed composition joined these
     /// access facts to ([`AccessController::join_authorization_publication`]).
     publication: OnceLock<LocalAuthorizationPublication>,
+    /// The revision of the configuration last committed, sent after the
+    /// commit is visible ([`AccessController::subscribe_revision`]).
+    revision_signal: watch::Sender<u64>,
 }
 
 /// These access facts already joined an authorization publication; they
@@ -192,6 +196,7 @@ impl AccessController {
                 current_runtime_aliases: RwLock::new(BTreeMap::new()),
                 mutation: Mutex::new(()),
                 publication: OnceLock::new(),
+                revision_signal: watch::Sender::new(0),
             }),
         })
     }
@@ -261,6 +266,19 @@ impl AccessController {
     /// made under it, so the change proceeds without a guard.
     fn publish_owner_change(&self) -> Option<LocalPublicationGuard<'_>> {
         self.inner.publication.get()?.begin_owner_change().ok()
+    }
+
+    /// Watch the revision of the committed configuration.
+    ///
+    /// The value changes after each committed change, once the new
+    /// configuration is visible to every reader, so a holder woken by a
+    /// change reads at least that revision through [`Self::snapshot`] or a
+    /// fresh view. A refused edit commits and signals nothing. Changes made
+    /// in quick succession may be observed as one, carrying the latest
+    /// revision. A receiver subscribed after unobserved changes starts at
+    /// the latest revision.
+    pub fn subscribe_revision(&self) -> watch::Receiver<u64> {
+        self.inner.revision_signal.subscribe()
     }
 
     /// Current config and revision.
@@ -431,15 +449,22 @@ impl AccessController {
         // the swap that exposes the new facts, so observations of the old
         // ones stop checking current before the new ones are visible, and
         // nothing is published for a refused edit or across disk I/O.
-        let _published = self.publish_owner_change();
-        let mut state = self
-            .inner
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.config = Arc::new(config);
-        state.revision = next_revision;
-        Ok(state.revision)
+        {
+            let _published = self.publish_owner_change();
+            let mut state = self
+                .inner
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.config = Arc::new(config);
+            state.revision = next_revision;
+        }
+        // Signal only once both the state lock and the publication's change
+        // are released, so a woken holder reads the new configuration. The
+        // caller's mutation lock keeps the signals in commit order, and
+        // `send_replace` stores the revision even while nothing watches.
+        self.inner.revision_signal.send_replace(next_revision);
+        Ok(next_revision)
     }
 
     /// Hold the live configuration and agent attributes read-locked for one
@@ -638,6 +663,16 @@ fn persist_config(path: &Path, config: &AccessControlConfig) -> Result<(), Acces
 struct LineageLink {
     identity: String,
     attributes: Option<Arc<AgentResourceAttributes>>,
+}
+
+/// One link of a member's spawn lineage as the console owner captured it
+/// with a record: the member first, then its ancestors, parent first.
+/// `attributes: None` is an ancestor the record names whose incarnation was
+/// not confirmed when the record was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapturedLineageLink {
+    pub(crate) identity: String,
+    pub(crate) attributes: Option<AgentResourceAttributes>,
 }
 
 /// A principal's access, checked against configuration and agent
@@ -1012,6 +1047,125 @@ impl AccessView {
         self.allows_agent(ACTION_AGENT_VIEW, identity)
     }
 
+    /// `agent.view` on a record a member wrote, decided by the member
+    /// attributes the owner captured with the record, under the most
+    /// restrictive rule:
+    ///
+    /// - the captured lineage (the member, then its spawn ancestors) must
+    ///   allow it;
+    /// - a captured ancestor whose incarnation could not be confirmed
+    ///   (`attributes: None`) refuses it under any applicable deny the bare
+    ///   identity cannot decide (role, label or lineage selectors);
+    /// - while the shared cache knows the member, its current attributes and
+    ///   lineage must allow it too; a member the cache does not know (it
+    ///   left, or nothing has read the roster since a restart) is decided by
+    ///   the captured attributes only;
+    /// - an ancestor the shared cache knows now may only add a deny: its
+    ///   current entry can be a later incarnation under the same identity.
+    ///
+    /// So a relabel never reveals a record its captured attributes hide, and
+    /// a member relabelled into a denied class hides its earlier records.
+    pub(crate) fn can_view_captured_member(&self, lineage: &[CapturedLineageLink]) -> bool {
+        if !self.config.enabled {
+            return true;
+        }
+        let Some(own) = lineage.first() else {
+            return self.is_admin;
+        };
+        let resources = lineage
+            .iter()
+            .enumerate()
+            .map(|(index, link)| match link.attributes.as_ref() {
+                Some(attributes) => AccessResource {
+                    identity: Some(link.identity.as_str()),
+                    agent_id: attributes
+                        .agent_id
+                        .as_deref()
+                        .or((index == 0).then_some(link.identity.as_str())),
+                    role: attributes.role.as_deref(),
+                    labels: Some(&attributes.labels),
+                },
+                None => AccessResource::for_identity(link.identity.as_str()),
+            })
+            .collect::<Vec<_>>();
+        if !super::engine::evaluate_access_lineage(
+            &self.config,
+            &self.principal,
+            ACTION_AGENT_VIEW,
+            &resources,
+        )
+        .is_allow()
+        {
+            return false;
+        }
+        if lineage.iter().any(|link| {
+            link.attributes.is_none()
+                && super::engine::deny_undecidable_by_identity(
+                    &self.config,
+                    &self.principal,
+                    ACTION_AGENT_VIEW,
+                    &link.identity,
+                )
+                .is_some()
+        }) {
+            return false;
+        }
+        if self.knows_agent(&own.identity) && !self.can_view_agent(&own.identity) {
+            return false;
+        }
+        let cache = self
+            .inner
+            .attributes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !lineage.iter().skip(1).any(|link| {
+            let current = cache.get(&link.identity).cloned().or_else(|| {
+                cache
+                    .values()
+                    .find(|attributes| {
+                        attributes.agent_id.as_deref() == Some(link.identity.as_str())
+                    })
+                    .cloned()
+            });
+            current.is_some_and(|current| {
+                super::engine::matching_deny_rule(
+                    &self.config,
+                    &self.principal,
+                    ACTION_AGENT_VIEW,
+                    &AccessResource {
+                        identity: Some(current.identity.as_str()),
+                        agent_id: current.agent_id.as_deref(),
+                        role: current.role.as_deref(),
+                        labels: Some(&current.labels),
+                    },
+                )
+                .is_some()
+            })
+        })
+    }
+
+    /// `agent.view` on a record a member wrote that carries no captured
+    /// member attributes (written before they were captured, or with no
+    /// confirmed incarnation). Any applicable deny the bare identity cannot
+    /// decide refuses it (fails closed); otherwise it is decided as the
+    /// identity, as before, so allow rules keep their behaviour.
+    pub(crate) fn can_view_uncaptured_member(&self, identity: &str) -> bool {
+        if !self.config.enabled {
+            return true;
+        }
+        if super::engine::deny_undecidable_by_identity(
+            &self.config,
+            &self.principal,
+            ACTION_AGENT_VIEW,
+            identity,
+        )
+        .is_some()
+        {
+            return false;
+        }
+        self.can_view_agent(identity)
+    }
+
     /// True when the agent's resource attributes (role/labels) are present in
     /// the shared attribute cache, keyed by identity or projected `agent_id`.
     ///
@@ -1060,6 +1214,76 @@ impl std::fmt::Debug for AccessView {
             .field("is_admin", &self.is_admin)
             .field("enforced", &self.config.enabled)
             .finish()
+    }
+}
+
+impl AccessView {
+    /// This principal's view under the configuration committed now.
+    pub(crate) fn refreshed(&self) -> AccessView {
+        AccessController {
+            inner: Arc::clone(&self.inner),
+        }
+        .view_for_subject(self.subject())
+    }
+}
+
+/// The access view of a long-lived reader, such as an event stream, that
+/// follows the owner's committed changes.
+///
+/// A request's [`AccessView`] holds the configuration taken when the request
+/// started. A stream outlives that configuration, so it holds this instead:
+/// the same principal's view, rebuilt from the current configuration
+/// whenever the owner commits a change, so every frame is decided under the
+/// policy committed before it is sent.
+pub(crate) struct LiveAccessView {
+    view: AccessView,
+    revision: watch::Receiver<u64>,
+}
+
+impl LiveAccessView {
+    pub(crate) fn new(view: AccessView) -> Self {
+        // Subscribe before rebuilding: a change committed after the request
+        // read its configuration is then either in the rebuilt view or still
+        // pending on the receiver.
+        let revision = view.inner.revision_signal.subscribe();
+        Self {
+            view: view.refreshed(),
+            revision,
+        }
+    }
+
+    /// Rebuild the view when the owner committed a change since the last
+    /// call. Returns whether it did.
+    pub(crate) fn refresh(&mut self) -> bool {
+        if !self.revision.has_changed().unwrap_or(false) {
+            return false;
+        }
+        self.revision.borrow_and_update();
+        self.view = self.view.refreshed();
+        true
+    }
+
+    /// The view as of the last [`Self::refresh`].
+    pub(crate) fn view(&self) -> &AccessView {
+        &self.view
+    }
+
+    /// The view as of the last [`Self::refresh`], when it enforces anything.
+    pub(crate) fn enforced(&self) -> Option<&AccessView> {
+        Some(&self.view).filter(|view| view.enforced())
+    }
+
+    /// Wait until the owner commits a change, then rebuild the view, for a
+    /// stream that must act on a change while it has nothing to send.
+    /// Cancellation-safe: dropped before the change, it leaves the change
+    /// pending for the next wait or [`Self::refresh`].
+    pub(crate) async fn changed(&mut self) {
+        // The view holds the owner, and with it the sender, so the sender
+        // outlives this receiver.
+        if self.revision.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        self.view = self.view.refreshed();
     }
 }
 
@@ -1285,6 +1509,66 @@ mod tests {
         let (config, revision) = controller.snapshot();
         assert!(config.rules.is_empty());
         assert_eq!(revision, 1);
+    }
+
+    #[test]
+    fn revision_signal_follows_each_commit() {
+        let controller = AccessController::new(enabled_config()).expect("controller");
+        let mut revision = controller.subscribe_revision();
+        assert_eq!(*revision.borrow_and_update(), 0);
+
+        // A refused edit commits nothing and signals nothing.
+        assert!(controller.delete_rule("missing").is_err());
+        assert!(!revision.has_changed().expect("owner alive"));
+
+        controller.delete_rule("ops-view-all").expect("delete");
+        assert!(revision.has_changed().expect("owner alive"));
+        let signalled = *revision.borrow_and_update();
+        assert_eq!(signalled, 1);
+        let (config, visible) = controller.snapshot();
+        assert_eq!(visible, signalled);
+        assert!(config.rules.is_empty());
+    }
+
+    #[test]
+    fn a_late_subscriber_starts_at_the_latest_revision() {
+        let controller = AccessController::new(enabled_config()).expect("controller");
+        controller.set_enabled(false).expect("disable");
+        controller.set_enabled(true).expect("enable");
+        // Nothing watched those commits; a receiver subscribed afterwards
+        // still starts at the latest revision, not the initial one.
+        assert_eq!(*controller.subscribe_revision().borrow(), 2);
+    }
+
+    #[test]
+    fn the_revision_signal_follows_the_visible_swap() {
+        let controller = AccessController::new(enabled_config()).expect("controller");
+        let mut revision = controller.subscribe_revision();
+        revision.borrow_and_update();
+        // Hold the state read-locked: the commit below persists and then
+        // waits for the write lock, so its new configuration is not visible.
+        let held = controller
+            .inner
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let committing = {
+            let controller = controller.clone();
+            std::thread::spawn(move || controller.set_enabled(false))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                !revision.has_changed().expect("owner alive"),
+                "the revision was signalled before its configuration was visible"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(held);
+        assert_eq!(committing.join().expect("commit thread"), Ok(1));
+        assert!(revision.has_changed().expect("owner alive"));
+        assert_eq!(*revision.borrow_and_update(), 1);
+        assert_eq!(controller.snapshot().1, 1);
     }
 
     #[test]
@@ -1582,6 +1866,171 @@ mod tests {
         assert!(
             !bob.can_view_agent("covert-worker"),
             "a deny on the spawning parent must propagate to its descendants"
+        );
+    }
+
+    /// Broad `agent.view` for bob plus a deny on `tier=secret` members.
+    fn secret_label_deny_controller() -> AccessController {
+        let mut config = enabled_config();
+        config.rules.push(AccessRule {
+            id: "bob-view-all".to_string(),
+            subjects: vec!["bob@example.test".to_string()],
+            actions: vec!["agent.view".to_string()],
+            agents: vec!["*".to_string()],
+            ..AccessRule::default()
+        });
+        config.rules.push(AccessRule {
+            id: "hide-secret".to_string(),
+            effect: AccessEffect::Deny,
+            actions: vec!["agent.view".to_string()],
+            match_labels: BTreeMap::from([("tier".to_string(), "secret".to_string())]),
+            ..AccessRule::default()
+        });
+        AccessController::new(config).expect("controller")
+    }
+
+    fn captured(identity: &str, tier: &str) -> CapturedLineageLink {
+        CapturedLineageLink {
+            identity: identity.to_string(),
+            attributes: Some(attributes(identity, tier)),
+        }
+    }
+
+    fn attributes(identity: &str, tier: &str) -> AgentResourceAttributes {
+        AgentResourceAttributes {
+            identity: identity.to_string(),
+            agent_id: Some(identity.to_string()),
+            role: Some("worker".to_string()),
+            labels: BTreeMap::from([("tier".to_string(), tier.to_string())]),
+        }
+    }
+
+    /// Q-a, retired member: nothing in the shared cache, so the captured
+    /// attributes alone decide, in both directions.
+    #[test]
+    fn a_retired_member_is_decided_by_its_captured_attributes_only() {
+        let controller = secret_label_deny_controller();
+        let bob = controller.view_for_subject(Some("bob@example.test"));
+        assert!(!bob.knows_agent("gone"));
+        assert!(!bob.can_view_captured_member(&[captured("gone", "secret")]));
+        assert!(bob.can_view_captured_member(&[captured("gone", "public")]));
+        // The bare identity of the same retired member is not hidden by the
+        // label deny: that is the gap captured attributes close.
+        assert!(bob.can_view_agent("gone"));
+        // An admin sees it either way.
+        let root = controller.view_for_subject(Some("root@example.test"));
+        assert!(root.can_view_captured_member(&[captured("gone", "secret")]));
+    }
+
+    /// Q-a, relabel into the denied class: the current attributes hide the
+    /// member's earlier records that were captured as public.
+    #[test]
+    fn a_member_relabelled_into_a_denied_class_hides_its_earlier_records() {
+        let controller = secret_label_deny_controller();
+        controller.record_agent_attributes(attributes("moved", "secret"));
+        let bob = controller.view_for_subject(Some("bob@example.test"));
+        assert!(!bob.can_view_captured_member(&[captured("moved", "public")]));
+    }
+
+    /// Q-a, relabel out of the denied class: the captured attributes keep
+    /// the member's earlier secret records hidden.
+    #[test]
+    fn a_member_relabelled_out_of_a_denied_class_keeps_its_earlier_records_hidden() {
+        let controller = secret_label_deny_controller();
+        controller.record_agent_attributes(attributes("moved", "public"));
+        let bob = controller.view_for_subject(Some("bob@example.test"));
+        assert!(!bob.can_view_captured_member(&[captured("moved", "secret")]));
+        // Its records captured as public stay visible.
+        assert!(bob.can_view_captured_member(&[captured("moved", "public")]));
+    }
+
+    /// A captured denied ancestor hides its descendant's records although
+    /// neither is in the shared cache any more.
+    #[test]
+    fn a_captured_ancestor_in_a_denied_class_hides_the_descendant() {
+        let controller = secret_label_deny_controller();
+        let bob = controller.view_for_subject(Some("bob@example.test"));
+        assert!(!bob.can_view_captured_member(&[
+            captured("child", "public"),
+            captured("parent", "secret")
+        ]));
+        assert!(bob.can_view_captured_member(&[
+            captured("child", "public"),
+            captured("parent", "public")
+        ]));
+    }
+
+    /// C3 (2), no restart: the child is live and in the shared cache, its
+    /// denied parent left and is not. The captured parent still decides,
+    /// and the child's current entry cannot reveal the record.
+    #[test]
+    fn a_live_child_of_a_departed_denied_parent_stays_hidden() {
+        let controller = secret_label_deny_controller();
+        let mut child = attributes("child", "public");
+        child
+            .labels
+            .insert("spawned_by".to_string(), "parent".to_string());
+        controller.record_agent_attributes(child);
+        let bob = controller.view_for_subject(Some("bob@example.test"));
+        assert!(bob.knows_agent("child"));
+        assert!(!bob.knows_agent("parent"));
+        // The current lineage alone no longer reaches the parent's labels.
+        assert!(bob.can_view_agent("child"));
+        assert!(!bob.can_view_captured_member(&[
+            captured("child", "public"),
+            captured("parent", "secret"),
+        ]));
+    }
+
+    /// An ancestor whose incarnation was not confirmed at capture fails
+    /// closed under a deny the bare identity cannot decide, and a later
+    /// neutral incarnation of the same identity in the cache cannot reveal
+    /// it: a current ancestor entry may only add a deny.
+    #[test]
+    fn an_unconfirmed_ancestor_fails_closed_and_a_current_namesake_only_adds_denies() {
+        let controller = secret_label_deny_controller();
+        controller.record_agent_attributes(attributes("parent", "public"));
+        let bob = controller.view_for_subject(Some("bob@example.test"));
+        let unconfirmed = CapturedLineageLink {
+            identity: "parent".to_string(),
+            attributes: None,
+        };
+        assert!(!bob.can_view_captured_member(&[captured("child", "public"), unconfirmed.clone()]));
+        // Without an applicable attribute deny the unconfirmed link is
+        // decided by its identity, as before.
+        let allow_only = AccessController::new(enabled_config()).expect("controller");
+        let alice = allow_only.view_for_subject(Some("alice@example.test"));
+        assert!(alice.can_view_captured_member(&[captured("child", "public"), unconfirmed]));
+        // A current secret namesake of a captured public ancestor adds a deny.
+        let controller = secret_label_deny_controller();
+        controller.record_agent_attributes(attributes("parent", "secret"));
+        let bob = controller.view_for_subject(Some("bob@example.test"));
+        assert!(!bob.can_view_captured_member(&[
+            captured("child", "public"),
+            captured("parent", "public")
+        ]));
+    }
+
+    /// A record without captured attributes fails closed under a label deny
+    /// and keeps today's decision under an allow-only view.
+    #[test]
+    fn an_uncaptured_record_fails_closed_only_under_undecidable_denies() {
+        let controller = secret_label_deny_controller();
+        let bob = controller.view_for_subject(Some("bob@example.test"));
+        assert!(!bob.can_view_uncaptured_member("anyone"));
+        let root = controller.view_for_subject(Some("root@example.test"));
+        assert!(root.can_view_uncaptured_member("anyone"));
+        let allow_only = AccessController::new(enabled_config()).expect("controller");
+        assert!(
+            allow_only
+                .view_for_subject(Some("alice@example.test"))
+                .can_view_uncaptured_member("anyone")
+        );
+        assert!(
+            !allow_only
+                .view_for_subject(Some("bob@example.test"))
+                .can_view_uncaptured_member("anyone"),
+            "no allow for bob: the identity decision denies as before"
         );
     }
 

@@ -73,7 +73,6 @@ function createMockRuntime(): {
   const config = {
     mobConfigPath: null,
     sessionBuilder: null,
-    sessionStore: null,
     errorCallback: null,
     eventLog: null,
     consoleConfigPath: null,
@@ -92,9 +91,6 @@ function createMockRuntime(): {
     gatewayBin: null,
     modules: [],
     persistentState: null,
-    continuityStore: null,
-    leaseProvider: null,
-    scratchDir: null,
     rosterProvider: null,
     agentCustomizer: null,
     topologyProvider: null,

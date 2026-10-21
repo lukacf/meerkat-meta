@@ -212,6 +212,38 @@ describe("storage census model", () => {
     );
   });
 
+  it("ignores StatusResult fields it does not model", () => {
+    const status = parseStatusResult({
+      contract_version: "0.5.0",
+      running: true,
+      loaded_modules: [],
+      reserved_identity_members: [
+        { member_id: "worker-1", runtime_id: "worker-1:0", identity: "_system" },
+      ],
+    });
+    assert.deepEqual(status, {
+      contractVersion: "0.5.0",
+      running: true,
+      loadedModules: [],
+    });
+  });
+
+  it("ignores the non-expiring console principals StatusResult does not model", () => {
+    const status = parseStatusResult({
+      contract_version: "0.5.0",
+      running: true,
+      loaded_modules: [],
+      non_expiring_console_principals: [
+        { principal: "svc:reporter", non_expiring: true },
+      ],
+    });
+    assert.deepEqual(status, {
+      contractVersion: "0.5.0",
+      running: true,
+      loadedModules: [],
+    });
+  });
+
   it("is absent from StatusResult when the wire has none", () => {
     const status = parseStatusResult({
       contract_version: "0.5.0",

@@ -480,6 +480,13 @@ impl FiringHostGatedScheduleTools {
 
 #[async_trait]
 impl meerkat_core::AgentToolDispatcher for FiringHostGatedScheduleTools {
+    fn bind_session_mob_tool_authority(
+        &self,
+        authority: Option<Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>>,
+    ) {
+        self.inner.bind_session_mob_tool_authority(authority);
+    }
+
     fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
         self.inner.tools()
     }
@@ -595,6 +602,13 @@ impl MobIdentityScheduleToolDispatcher {
 
 #[async_trait]
 impl meerkat_core::AgentToolDispatcher for MobIdentityScheduleToolDispatcher {
+    fn bind_session_mob_tool_authority(
+        &self,
+        authority: Option<Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>>,
+    ) {
+        self.inner.bind_session_mob_tool_authority(authority);
+    }
+
     fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
         self.inner.tools()
     }
@@ -1815,6 +1829,28 @@ pub fn spawn_schedule_claim_watchdog(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// Both schedule wrappers pass the session's mob operator authority to
+    /// the tools they wrap.
+    #[test]
+    fn the_schedule_wrappers_bind_the_session_mob_authority_on_their_inner_tools() {
+        use crate::tool_application_test_support::{MobAuthorityBindProbe, session_mob_authority};
+        let inner = Arc::new(MobAuthorityBindProbe::default());
+        let identity_tools =
+            MobIdentityScheduleToolDispatcher::new_for_test(inner.clone(), |_| async { None });
+        let gated = FiringHostGatedScheduleTools {
+            inner: Arc::new(identity_tools),
+            binding: ScheduleFiringHostBinding::external_driver(),
+        };
+        let authority = session_mob_authority();
+        meerkat_core::AgentToolDispatcher::bind_session_mob_tool_authority(
+            &gated,
+            Some(Arc::clone(&authority)),
+        );
+        assert!(inner.last_bound_is(Some(&authority)));
+        meerkat_core::AgentToolDispatcher::bind_session_mob_tool_authority(&gated, None);
+        assert!(inner.last_bound_is(None));
+    }
 
     use meerkat::{
         AgentFactory, MemoryScheduleStore, MobTargetBinding,
@@ -3184,55 +3220,19 @@ comms = true
             .await
             .expect("identity-first member kickoff should settle");
         let baseline_llm_calls = llm_calls.load(Ordering::SeqCst);
-        let member_session = handle
-            .resolve_bridge_session_id_observation(&meerkat_mob::ids::AgentIdentity::from(
-                roster_id.clone(),
-            ))
-            .await
-            .expect("member session id");
 
         // Durable identity authority over that member, bridged to the mob by
-        // the PRODUCTION MobSessionBridge (the gateway wiring).
-        // The decoded roster id IS the durable identity now; it used to be a
-        // generated `rt:{identity}:{generation}` alias that the identity was
-        // derived back out of.
+        // the PRODUCTION MobSessionBridge (the gateway wiring). The decoded
+        // roster id IS the durable identity, and Core's journal binds the
+        // member spawned above: the identity runtime reads it from there.
         let public_member_alias =
             crate::member_comms_id::runtime_alias_str(&roster_id).into_owned();
         let identity = crate::identity_first::AgentIdentity::parse(&public_member_alias)
             .expect("roster id must decode to a durable identity");
-        // The roster row and the incarnation are distinct: the row is the
-        // durable identity's encoding, the binding is a generated alias.
-        let runtime_alias = format!("rt:{}:0", identity.as_str());
         let continuity_store = Arc::new(
             crate::identity_first::LocalContinuityStore::in_memory().expect("identity store"),
         );
         let lease_provider = Arc::new(crate::identity_first::LocalLeaseProvider::new());
-        let lease_results = crate::identity_first::LeaseProvider::acquire_leases(
-            lease_provider.as_ref(),
-            std::slice::from_ref(&identity),
-            "schedule-dedup-identity",
-        )
-        .await
-        .expect("acquire identity lease");
-        let lease = match lease_results.get(&identity) {
-            Some(crate::identity_first::LeaseAcquireResult::Acquired(lease)) => lease.clone(),
-            other => panic!("expected acquired identity lease, got {other:?}"),
-        };
-        let record = crate::identity_first::ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(&runtime_alias)
-                .expect("runtime alias"),
-            session_id: member_session,
-            generation: crate::identity_first::ContinuityGeneration::new(0),
-            checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-        };
-        crate::identity_first::ContinuityStore::upsert_continuity_record(
-            continuity_store.as_ref(),
-            &record,
-            lease.fencing_token,
-        )
-        .await
-        .expect("persist identity continuity");
         let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store,
@@ -3247,25 +3247,20 @@ comms = true
             },
         ));
         identity_runtime
-            .register(
-                crate::identity_first::DurableAgentSpec {
-                    identity,
-                    profile: meerkat_mob::ProfileName::from("general"),
-                    addressability: crate::identity_first::AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                crate::identity_first::IdentityLifecycleState::Active,
-                Some(record),
-                Some(lease),
-            )
+            .register(crate::identity_first::DurableAgentSpec {
+                identity,
+                profile: meerkat_mob::ProfileName::from("general"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            })
             .await;
 
         let schedule = Schedule::new(CreateScheduleRequest {
@@ -3437,25 +3432,8 @@ external_addressable = true
             crate::identity_first::AgentIdentity::parse("domain:scheduled").expect("identity");
         let alias = "rt:domain:scheduled:0";
         let lease_provider = Arc::new(crate::identity_first::LocalLeaseProvider::new());
-        let lease_results = crate::identity_first::LeaseProvider::acquire_leases(
-            lease_provider.as_ref(),
-            std::slice::from_ref(&identity),
-            "schedule-none",
-        )
-        .await
-        .expect("acquire identity lease");
-        let lease = match lease_results.get(&identity) {
-            Some(crate::identity_first::LeaseAcquireResult::Acquired(lease)) => lease.clone(),
-            other => panic!("expected acquired identity lease, got {other:?}"),
-        };
-        let record = crate::identity_first::ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(alias)
-                .expect("runtime alias"),
-            session_id: SessionId::new(),
-            generation: crate::identity_first::ContinuityGeneration::new(0),
-            checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-        };
+        // No session bridge: the registered identity has no Core to read, so
+        // it is Dormant and its scheduled delivery has nothing to wake.
         let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
             crate::identity_first::IdentityRuntimeConfig {
                 continuity_store: Arc::new(
@@ -3471,25 +3449,20 @@ external_addressable = true
             },
         ));
         identity_runtime
-            .register(
-                crate::identity_first::DurableAgentSpec {
-                    identity,
-                    profile: meerkat_mob::ProfileName::from("general"),
-                    addressability: crate::identity_first::AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                crate::identity_first::IdentityLifecycleState::Active,
-                Some(record),
-                Some(lease),
-            )
+            .register(crate::identity_first::DurableAgentSpec {
+                identity,
+                profile: meerkat_mob::ProfileName::from("general"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            })
             .await;
 
         let schedule = Schedule::new(CreateScheduleRequest {
@@ -3546,11 +3519,17 @@ external_addressable = true
             terminal.delivery_failure_reason,
             Some(meerkat::DeliveryFailureReason::RuntimeRejected)
         );
+        // Without a session bridge Core holds no member for the identity, so
+        // the generated alias the delivery names is not current: the identity
+        // runtime refuses it as a stale alias, typed, before anything is
+        // delivered, and the occurrence records that refusal as its detail.
         assert!(
-            terminal
-                .detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains("no bound session bridge"))
+            terminal.detail.as_deref().is_some_and(|detail| {
+                detail.contains("identity schedule delivery failed (member rt:domain:scheduled:0)")
+                    && detail.contains("stale runtime alias for domain:scheduled")
+            }),
+            "{:?}",
+            terminal.detail
         );
 
         runtime.shutdown().await;
@@ -3718,36 +3697,6 @@ schedule = true
                         .expect("identity continuity store"),
                 );
                 let lease_provider = Arc::new(crate::identity_first::LocalLeaseProvider::new());
-                let lease_results = crate::identity_first::LeaseProvider::acquire_leases(
-                    lease_provider.as_ref(),
-                    std::slice::from_ref(&identity),
-                    "delivery-e2e",
-                )
-                .await
-                .expect("identity lease");
-                let lease = match lease_results.get(&identity) {
-                    Some(crate::identity_first::LeaseAcquireResult::Acquired(grant)) => {
-                        grant.clone()
-                    }
-                    other => panic!("expected acquired identity lease, got {other:?}"),
-                };
-                let record = crate::identity_first::ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(
-                        &public_member_alias,
-                    )
-                    .expect("runtime alias"),
-                    session_id: owner_session.clone(),
-                    generation: crate::identity_first::ContinuityGeneration::new(0),
-                    checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
-                };
-                crate::identity_first::ContinuityStore::upsert_continuity_record(
-                    continuity_store.as_ref(),
-                    &record,
-                    lease.fencing_token,
-                )
-                .await
-                .expect("persist identity continuity");
                 let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
                     crate::identity_first::IdentityRuntimeConfig {
                         continuity_store,
@@ -3763,25 +3712,20 @@ schedule = true
                     },
                 ));
                 identity_runtime
-                    .register(
-                        crate::identity_first::DurableAgentSpec {
-                            identity,
-                            profile: meerkat_mob::ProfileName::from("general"),
-                            addressability: crate::identity_first::AgentAddressability::Addressable,
-                            display_name: None,
-                            labels: std::collections::BTreeMap::new(),
-                            context: None,
-                            additional_instructions: Vec::new(),
-                            initial_message: None,
-                            runtime_mode_override: None,
-                            backend: None,
-                            binding: None,
-                            placement: None,
-                        },
-                        crate::identity_first::IdentityLifecycleState::Active,
-                        Some(record),
-                        Some(lease),
-                    )
+                    .register(crate::identity_first::DurableAgentSpec {
+                        identity,
+                        profile: meerkat_mob::ProfileName::from("general"),
+                        addressability: crate::identity_first::AgentAddressability::Addressable,
+                        display_name: None,
+                        labels: std::collections::BTreeMap::new(),
+                        context: None,
+                        additional_instructions: Vec::new(),
+                        initial_message: None,
+                        runtime_mode_override: None,
+                        backend: None,
+                        binding: None,
+                        placement: None,
+                    })
                     .await;
                 Some(identity_runtime)
             } else {

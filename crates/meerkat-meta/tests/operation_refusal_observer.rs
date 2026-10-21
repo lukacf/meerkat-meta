@@ -6,11 +6,18 @@
 //! makes, and the observer receives exactly that refusal as the call's tool
 //! result.
 //!
+//! A member can run more than one turn (an autonomous startup or a spawn
+//! kickoff, then the test's own input), and Core reports the refused call of
+//! each run. So the test model calls the refused tool only once the test
+//! arms its probe, right before the input it reads, and answers every other
+//! request with text: each launch makes exactly one refused call.
+//!
 //! Each test reads the observations once the model is asked again with
 //! the refused call's result, a typed watch the test client sets, bounded
 //! only by a named failure timeout. Core reports a call's refusal before
-//! that result returns to the model, so the read sees every observation of
-//! the call, and a duplicate fails the exact comparison.
+//! that result returns to the model, and no later request calls the tool,
+//! so the read sees every observation there will be, and a duplicate fails
+//! the exact comparison.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::BTreeMap;
@@ -289,7 +296,7 @@ async fn a_temp_dir_member_reports_its_refused_call_to_the_host_observer() {
 
 /// The scratch launch: a scratch directory selects the identity-first
 /// composition over the runtime-backed ephemeral spec. The roster member's
-/// turn runs through the mob's host input.
+/// armed turn runs through the mob's host input.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_scratch_member_reports_its_refused_call_to_the_host_observer() {
     let scratch = tempfile::tempdir().unwrap();
@@ -317,6 +324,7 @@ async fn a_scratch_member_reports_its_refused_call_to_the_host_observer() {
             .lease_provider(Arc::new(LocalLeaseProvider::new()))
             .roster_provider(roster)
             .scratch_dir(scratch.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("refusal-observer-scratch")
             .default_llm_client(client.clone())
             .register_tool_bundle("refusing", Arc::new(RefusingBundle))

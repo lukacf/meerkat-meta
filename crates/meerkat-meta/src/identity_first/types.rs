@@ -218,7 +218,9 @@ monotonic_u64_newtype!(
 );
 
 monotonic_u64_newtype!(
-    /// Monotonic ownership token issued by `LeaseProvider`.
+    /// Monotonic fence token. The identity runtime fills it with Core's
+    /// fence of an identity's member incarnation; the `LeaseProvider`
+    /// that also mints it is no longer read.
     FencingToken
 );
 
@@ -236,28 +238,29 @@ monotonic_u64_newtype!(
 /// content, a content hash, a wall-clock timestamp, or a uuid regenerated per
 /// poll.
 ///
-/// `epoch` is the identity's lease [`FencingToken`] — the runtime-incarnation
-/// atom the `LeaseProvider` already issues, and which the bundled provider
-/// resumes strictly above the continuity store's persisted high-water mark so
-/// it keeps advancing across process restarts. `turns` counts turns observed
-/// as completed within that incarnation.
+/// `epoch` is Core's fence of the identity's member incarnation, as a
+/// [`FencingToken`]. Core restores it across a process restart while this
+/// process counts turns from zero, so [`Self::progress_since`] reads a
+/// baseline that counts more turns than the cursor under the same epoch as
+/// another incarnation. `turns` counts turns observed as completed within
+/// that incarnation.
 ///
-/// Ordering is lexicographic (`epoch`, then `turns`), so the pair never
-/// regresses: a fresh incarnation always sorts above every cursor the previous
-/// one published. Turn counts are NOT comparable across incarnations, which is
-/// why callers classify with [`Self::progress_since`] rather than a bare `>`
-/// — an incarnation change is reported, not silently read as progress.
+/// Ordering is lexicographic (`epoch`, then `turns`). Turn counts are NOT
+/// comparable across incarnations, which is why callers classify with
+/// [`Self::progress_since`] rather than a bare `>`: an incarnation change is
+/// reported, not silently read as progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CompletionCursor {
-    /// Lease incarnation this count belongs to.
+    /// Core's fence of the member incarnation this count belongs to
+    /// (`0` while Core holds no session-backed member).
     pub epoch: FencingToken,
     /// Turns observed as completed within `epoch`.
     pub turns: u64,
 }
 
 impl Default for CompletionCursor {
-    /// The pre-lease cursor: epoch 0, no completed turns. Every real lease
-    /// incarnation starts at token 1 or above, so this sorts below all of them.
+    /// The cursor while Core holds no session-backed member: epoch 0, no
+    /// completed turns.
     fn default() -> Self {
         Self::start(FencingToken::new(0))
     }
@@ -284,7 +287,7 @@ impl CompletionCursor {
         }
     }
 
-    /// Re-anchor onto `epoch` when the identity's lease incarnation moved on.
+    /// Re-anchor onto `epoch` when the identity's member incarnation moved on.
     ///
     /// A stale or equal epoch leaves the cursor untouched, so a caller
     /// presenting an older token can never rewind what has been published.
@@ -298,9 +301,14 @@ impl CompletionCursor {
     }
 
     /// Classify this cursor against a `baseline` captured before a delivery.
+    ///
+    /// A baseline under this epoch that counts MORE turns than this cursor
+    /// came from an earlier process (Core restores a member's fence across a
+    /// restart while this process counts turns from zero) or is forged: it is
+    /// `IncarnationChanged`, never `Pending`.
     #[must_use]
     pub const fn progress_since(self, baseline: Self) -> CompletionProgress {
-        if self.epoch.get() != baseline.epoch.get() {
+        if self.epoch.get() != baseline.epoch.get() || baseline.turns > self.turns {
             CompletionProgress::IncarnationChanged
         } else if self.turns > baseline.turns {
             CompletionProgress::Completed
@@ -325,10 +333,11 @@ pub enum CompletionProgress {
     Pending,
     /// Same incarnation, at least one turn completed since the baseline.
     Completed,
-    /// The identity's runtime incarnation changed (lease rotation, destructive
-    /// reset, or a process restart). Turn counts do not carry across
-    /// incarnations, so the caller must re-establish a baseline rather than
-    /// infer either completion or continued waiting.
+    /// The identity's member incarnation changed (Core moved its fence on a
+    /// respawn, reset or fresh spawn), or a process restart lost this
+    /// process's count. Turn counts do not carry across incarnations, so the
+    /// caller must re-establish a baseline rather than infer either
+    /// completion or continued waiting.
     IncarnationChanged,
 }
 
@@ -954,26 +963,6 @@ pub struct ContinuityUnrecoverable {
     pub reason: String,
 }
 
-/// Typed park for a build the HOST deterministically rejected (the
-/// candidate-mode effect gate class).
-///
-/// The app-side `callback/build_agent` round trip COMPLETED and the host
-/// answered with an error, so retrying the SAME spec re-asks the same gate
-/// the same question — each attempt burning a full member build plus a
-/// callback round trip (the herd-investigation churn: Broken with continuous
-/// repair at 30s→10min forever). While parked, materialization fails fast
-/// with a typed error (no bridge call) and the continuity repair supervisor
-/// skips the identity. The park clears when the identity's roster spec
-/// CHANGES (digest mismatch) or via operator clear; it is in-memory, so a
-/// gateway restart re-attempts once and re-parks if the gate still rejects.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostRejectedBuildPark {
-    /// The host's rejection, verbatim, for operators.
-    pub reason: String,
-    /// Digest of the exact [`DurableAgentSpec`] whose build was rejected.
-    pub spec_digest: u64,
-}
-
 // ---------------------------------------------------------------------------
 // ContinuityResolveState
 // ---------------------------------------------------------------------------
@@ -1447,16 +1436,22 @@ pub enum IdentityBootstrapState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "stage", rename_all = "snake_case")]
 pub enum IdentityRestoreProgress {
-    /// The roster metadata is registered; embodiment has not started.
+    /// The roster metadata is registered; the wake has not started.
     Registered,
-    /// The identity's embodiment (a resume, or a fresh mint) is running.
+    /// The identity's wake (a resume, or a fresh spawn) is running.
     Resuming,
-    /// A fresh identity's durable continuity record and session were minted.
+    /// Core spawned the identity fresh.
     Minted,
-    /// The identity resumed its durable session.
+    /// Core resumed the identity onto its committed session.
     Resumed,
-    /// The identity is parked Broken with this typed cause.
-    Broken { kind: ContinuityFailureKind },
+    /// The wake was refused: `code` is the refusal's JSON-RPC
+    /// code and `kind` its structured kind, when it has one. Nothing is
+    /// parked: the next wake asks Core again.
+    Refused {
+        code: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+    },
 }
 
 /// Bootstrap progress for one durable identity.
@@ -1495,6 +1490,33 @@ pub struct IdentityBootstrapStatus {
     pub error: Option<String>,
     pub counts: IdentityBootstrapCounts,
     pub identities: std::collections::BTreeMap<AgentIdentity, IdentityBootstrapEntry>,
+    /// The first-boot manifest rows `storage-migrate-native` left that are
+    /// not carried out yet, in identity order. Absent when none is
+    /// pending.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub first_boot_pending: Vec<FirstBootPendingRow>,
+}
+
+/// A first-boot manifest row that is not carried out yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirstBootPendingRow {
+    pub identity: AgentIdentity,
+    pub kind: super::first_boot_manifest::FirstBootRowKind,
+    pub waiting_for: FirstBootWait,
+}
+
+/// What a pending first-boot row waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FirstBootWait {
+    /// The roster does not list the identity. The roster compile that lists
+    /// it carries the row out before anything wakes the identity.
+    Roster,
+    /// The roster lists the identity, but carrying the row out failed or
+    /// was refused; the identity's next wake, or the next roster compile,
+    /// tries again. Its wake answers why.
+    CarryOut,
 }
 
 impl IdentityBootstrapStatus {
@@ -1506,6 +1528,7 @@ impl IdentityBootstrapStatus {
             error: None,
             counts: IdentityBootstrapCounts::default(),
             identities: std::collections::BTreeMap::new(),
+            first_boot_pending: Vec::new(),
         }
     }
 
@@ -1535,20 +1558,24 @@ impl IdentityBootstrapStatus {
     }
 }
 
-/// Lifecycle state of an identity.
+/// Lifecycle state of an identity, as a view of Core's facts.
+///
+/// Meta keeps no lifecycle state of its own: every read derives this
+/// from Core. An identity is `Active` while MobMachine holds a member for it,
+/// `Dormant` while it holds none (the identity was retired, or never
+/// spawned), and `Broken` while it holds none and the last wake was refused
+/// for good ([`IdentityRuntimeError::IdentityUnresumable`](super::IdentityRuntimeError::IdentityUnresumable)):
+/// its last session cannot be resumed, and only `delete_identity` starts it
+/// again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityLifecycleState {
-    /// Identity metadata is registered and addressable, but no concrete mob
-    /// member/session has been spawned or resumed in this runtime yet.
+    /// Registered and addressable; Core holds no member for the identity.
     Dormant,
-    /// Identity has a concrete mob member/session in this runtime.
+    /// Core holds a member for the identity.
     Active,
-    Retiring,
-    Suspended,
-    /// Continuity exists but cannot currently be materialized safely.
+    /// Core holds no member and the last wake was refused for good.
     Broken,
-    Uninitialized,
 }
 
 impl IdentityLifecycleState {
@@ -1556,7 +1583,7 @@ impl IdentityLifecycleState {
     ///
     /// meerkat 0.7 moved the member rows (`meta/get_member`,
     /// `list_members`, `ensure_member`, `find_members`) to lowercase state
-    /// strings — matching the published SDK constants
+    /// strings, matching the published SDK constants
     /// (`MEMBER_STATE_ACTIVE = "active"`) and the console vocabulary. The
     /// identity-first status/inspect surfaces must speak the same casing so
     /// the two member-state surfaces never disagree on the same wire.
@@ -1564,24 +1591,9 @@ impl IdentityLifecycleState {
         match self {
             Self::Dormant => "dormant",
             Self::Active => "active",
-            Self::Retiring => "retiring",
-            Self::Suspended => "suspended",
             Self::Broken => "broken",
-            Self::Uninitialized => "uninitialized",
         }
     }
-}
-
-/// Information about a held lease.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LeaseInfo {
-    pub fencing_token: FencingToken,
-    #[serde(
-        serialize_with = "serde_duration_ms::serialize",
-        deserialize_with = "serde_duration_ms::deserialize"
-    )]
-    pub ttl_remaining: std::time::Duration,
-    pub healthy: bool,
 }
 
 /// Durability policy declared by the continuity store.
@@ -1593,42 +1605,53 @@ pub enum DurabilityPolicy {
     BufferedExport { max_loss_window_ms: u64 },
 }
 
-/// Health of the continuity store for an identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContinuityHealth {
-    pub store_reachable: bool,
-    pub durability_policy: DurabilityPolicy,
-    pub last_checkpoint_version: Option<CheckpointVersion>,
-}
-
 /// Full status response for an identity.
+///
+/// Every Core fact here (state, runtime id, session, generation) is read
+/// from Core when the status is built; Meta caches none of them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityStatus {
     pub identity: AgentIdentity,
     pub state: IdentityLifecycleState,
+    /// Core's runtime id of the identity's member, while Core holds one.
     pub agent_runtime_id: Option<AgentRuntimeId>,
+    /// The session Core binds the identity to: the live member's, or the
+    /// last binding of a retired identity. `None` when the identity has no
+    /// binding.
     pub session_id: Option<meerkat_core::types::SessionId>,
+    /// Core's mob member id of the binding `session_id` comes from: the
+    /// roster member Core's member tokens name. `None` when the identity has
+    /// no binding. Additive and optional on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_id: Option<String>,
     pub profile: Option<meerkat_mob::ProfileName>,
     pub runtime_mode: Option<meerkat_mob::MobRuntimeMode>,
     pub addressability: AgentAddressability,
     pub display_name: Option<DisplayName>,
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
-    pub generation: Option<ContinuityGeneration>,
-    pub checkpoint_version: Option<CheckpointVersion>,
-    pub lease: Option<LeaseInfo>,
-    pub continuity_health: Option<ContinuityHealth>,
-    /// Terminal heal verdict for a Broken identity (2026-07-29 incident):
-    /// present when the heal authority proved the durable head unrecoverable
-    /// and the continuity repair supervisor has parked the identity. Additive
-    /// and optional on the wire; SDK parsers ignore unknown keys.
+    /// Core's generation of the binding `session_id` comes from.
+    pub generation: Option<meerkat_mob::Generation>,
+    /// Whether Core holds an identity intent row for the identity: a host
+    /// adopted it, and Meta's lifecycle verbs refuse it.
+    #[serde(default)]
+    pub intent_managed: bool,
+    /// Core's convergence diagnostics for an intent-managed identity, when
+    /// Core holds a readable status row (`agent_identity` names the Meta
+    /// identity).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuity_unrecoverable: Option<ContinuityUnrecoverable>,
-    /// Typed "session needs repair" hold for a Broken identity whose durable
-    /// session fails meerkat's audited-endpoint guard: present with the exact
-    /// `rkat session repair-wholeblob` commands until the operator repairs the
-    /// document and `meta/reload_member` resumes it. Additive and optional
-    /// on the wire.
+    pub convergence: Option<meerkat_contracts::wire::WireIdentityConvergenceStatus>,
+    /// The last refused wake, until the next successful one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_refusal: Option<WakeRefusal>,
+    /// The session the last wake replaced with a fresh one because Core
+    /// holds no durable session for it, until the next wake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_session: Option<ReplacedSession>,
+    /// The exact `rkat session repair-wholeblob` commands while the last
+    /// wake is held for audited-endpoint repair (`wake_refusal` remedy
+    /// `repair_session`), scoped to this runtime's store. Derived from
+    /// `wake_refusal` on every read. Additive and optional on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_repair_required: Option<SessionRepairRequired>,
     /// Present while a restored member's customizer tools are unpublished
@@ -1636,6 +1659,82 @@ pub struct IdentityStatus {
     /// and optional on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub customizer_tools_pending: Option<CustomizerToolsPending>,
+}
+
+/// A refused wake an operator has to act on, as
+/// `meta/status_identity` and `meta/member_health` show it until the next
+/// successful wake.
+///
+/// Recorded for the two refusals no retry changes: the last session cannot be
+/// resumed (final; the identity's view is `broken`), and Core held the resume
+/// for the operator (the durable copy is kept; the view stays `dormant`).
+/// Transient refusals are not recorded: the next wake retries them.
+/// Process-local: it records what this process's last wake answered and is
+/// never read back as truth; every wake asks Core again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeRefusal {
+    /// The JSON-RPC code the refused wake answered with.
+    pub code: i64,
+    /// The session the refused wake tried to resume.
+    pub session_id: meerkat_core::types::SessionId,
+    /// What the operator does next.
+    pub remedy: WakeRefusalRemedy,
+}
+
+/// A wake that spawned the identity fresh in place of its last session
+///: Core answered that no durable session exists for that id, so
+/// there was nothing to resume or to lose. Shown on the identity's status
+/// until the next wake. Process-local; never read as truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacedSession {
+    /// The last session Core could not find.
+    pub session_id: meerkat_core::types::SessionId,
+    /// Why it was replaced.
+    pub reason: ReplacedSessionReason,
+}
+
+/// Why a wake replaced the identity's last session with a fresh one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReplacedSessionReason {
+    /// Core holds no durable session for the id
+    /// (`SessionResumeUnavailableReason::Absent`).
+    Absent,
+}
+
+impl WakeRefusal {
+    /// The identity's last session cannot be resumed: only `delete_identity`
+    /// starts it again.
+    #[must_use]
+    pub fn is_final(&self) -> bool {
+        self.remedy == WakeRefusalRemedy::DeleteIdentity
+    }
+}
+
+/// The operator's next step after a refused wake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WakeRefusalRemedy {
+    /// Core cannot resume the last session (archived beyond revival, or its
+    /// durable authority contradicts its body): `delete_identity` starts a
+    /// fresh life.
+    DeleteIdentity,
+    /// The session's committed document fails its audited-endpoint guard:
+    /// repair it (`rkat session repair-wholeblob`), then
+    /// `meta/reload_member`.
+    RepairSession,
+    /// The roster profile moved off the member's durable role: declare the
+    /// migration for this activation (`role_migrations`), or restore the
+    /// profile.
+    ResolveRoleMigration,
+    /// Core holds the session's tail or evidence for reconciliation. Core
+    /// re-runs its recovery on every wake and has no command that clears the
+    /// hold; it stays until the durable evidence changes. The content is
+    /// retained; `delete_identity` starts a fresh life and leaves the held
+    /// session in Core.
+    OperatorReview,
 }
 
 // ---------------------------------------------------------------------------
@@ -1783,7 +1882,7 @@ pub struct DeliveryErrorRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberHealthReport {
     pub identity: AgentIdentity,
-    /// The generated runtime alias of the current incarnation, when bound.
+    /// Core's runtime id of the live member, when Core holds one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_id: Option<AgentRuntimeId>,
     pub state: IdentityLifecycleState,
@@ -1795,8 +1894,9 @@ pub struct MemberHealthReport {
     pub materialization_in_flight: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<meerkat_core::types::SessionId>,
+    /// Core's generation of the live member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<ContinuityGeneration>,
+    pub generation: Option<meerkat_mob::Generation>,
     /// The most recent delivery failure, cleared by the next successful
     /// delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1817,8 +1917,9 @@ pub struct MemberHealthReport {
     /// exposes it (0.8.34).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durability: Option<MemberDurability>,
+    /// The last refused wake (see [`IdentityStatus::wake_refusal`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuity_unrecoverable: Option<ContinuityUnrecoverable>,
+    pub wake_refusal: Option<WakeRefusal>,
     /// Typed "session needs repair" hold (see
     /// [`IdentityStatus::session_repair_required`]): the exact repair
     /// commands for this member's durable session, present until the
@@ -2275,3 +2376,35 @@ impl fmt::Display for CustomizerError {
 }
 
 impl std::error::Error for CustomizerError {}
+
+#[cfg(test)]
+mod completion_cursor_tests {
+    use super::*;
+
+    /// The cursor's epoch is Core's fence, which a restart keeps,
+    /// while this process counts turns from zero. A baseline under the
+    /// current epoch that counts more turns than the cursor came from an
+    /// earlier process (or is forged): it reads `IncarnationChanged`, never
+    /// `Pending`. A baseline at or below the count behaves as before.
+    #[test]
+    fn a_baseline_ahead_of_the_count_under_the_same_fence_is_another_incarnation() {
+        let fence = FencingToken::new(7);
+        let restarted = CompletionCursor::new(fence, 1);
+        assert_eq!(
+            restarted.progress_since(CompletionCursor::new(fence, 3)),
+            CompletionProgress::IncarnationChanged
+        );
+        assert_eq!(
+            restarted.progress_since(restarted),
+            CompletionProgress::Pending
+        );
+        assert_eq!(
+            restarted.advanced().progress_since(restarted),
+            CompletionProgress::Completed
+        );
+        assert_eq!(
+            restarted.progress_since(CompletionCursor::new(FencingToken::new(6), 0)),
+            CompletionProgress::IncarnationChanged
+        );
+    }
+}

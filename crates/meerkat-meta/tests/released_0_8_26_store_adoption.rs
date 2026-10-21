@@ -20,25 +20,27 @@
 //!    changes nothing;
 //! 2. `--apply` completes, and the manifest differs from the released bytes
 //!    in the creator field's name only;
-//! 3. the build under test boots over the adopted store with the definition
-//!    the store was created with, byte for byte (and again with the
-//!    `tools.mob_tasks` key 0.9 ignores removed): composition verification
-//!    passes, the identity resumes bound to the released session, memory
-//!    recall returns the released memories, and the event log, the ledger
-//!    and the transcript read back.
+//! 3. a boot of the build under test over the adopted store is refused
+//!    before any store opens (STORAGE_RESOLUTION, -32014, naming
+//!    `storage-migrate-native`), for an authoritative and a candidate launch,
+//!    with the definition the store was created with byte for byte and
+//!    without the `tools.mob_tasks` key 0.9 ignores. Sessions now live in
+//!    Core's own stores, and the native migration reads only a directory a
+//!    0.9.3 start last wrote: the supported route for a predecessor store is
+//!    one start with published 0.9.3, then `storage-migrate-native`. That
+//!    route, and the resume after it, are pinned on a 0.9.3-started capture.
 //!
 //! A store adopted before the manifest step existed (as Meta 0.9.0 left it:
-//! adoption complete, manifest still predecessor-spelled) resumes too, on
-//! the exact path 0.9.0 refused with -32019 `malformed` (persistent mob
-//! storage, non-empty event log, authoritative launch) and as a candidate
-//! launch, whose released-representation allowance reads the manifest; and
-//! `meta_repair --composition-manifests` detects and repairs its manifest.
+//! adoption complete, manifest still predecessor-spelled) is refused alike,
+//! and the refusal leaves its manifest as it was; `meta_repair
+//! --composition-manifests` detects and repairs its manifest.
 //!
 //! Keys 0.8.26 ignored in the definition, and Meta 0.9 applies, never change
 //! the store's behaviour silently: adoption given the definition
 //! (`--mob-config`) names those the store's current definition does not
 //! record and refuses before any change until they are removed or
-//! acknowledged, and a resume that keeps them refuses as divergent. A key a
+//! acknowledged (a resume that keeps them refuses as divergent once the store
+//! runs on a release that can open it). A key a
 //! later definition update recorded is in force and is not named.
 
 #![allow(
@@ -86,34 +88,12 @@ mob_tasks = true
 
 /// The durable identity the released roster declared.
 const IDENTITY: &str = "learner:fixture-0001";
-/// Its member id in the released event log.
-const MEMBER_ID: &str = "mk--learner_cfixture-0001";
-/// The member session the released gateway bound the identity to.
-const SESSION_ID: &str = "01a13aaa-4918-71e2-b44c-366e9b2d4de3";
-/// The two agent memories the released gateway stored for the identity.
-const MEMORIES: [(&str, &str); 2] = [
-    (
-        "mem-1791985601402882094-222c50-0-18395066da7f0be3",
-        "FIXTURE-0826-MEMORY-ONE: the synthetic learner prefers short lessons.",
-    ),
-    (
-        "mem-1791985601407345168-222c50-1-6e92bf82a622ec38",
-        "FIXTURE-0826-MEMORY-TWO: the synthetic learner finished unit one.",
-    ),
-];
-/// The marker of the one turn the released gateway drove.
-const TURN_TOKEN: &str = "FIXTURE-0826-TOKEN-ALPHA";
-/// The memory ledger assertion the released gateway indexed.
-const LEDGER_ENTITY: &str = "fixture-curriculum";
-const LEDGER_ASSERTION_ID: &str = "memory-assert-000000";
 
 const MANIFEST_FILE: &str = "event_log.sqlite3.composition.json";
 const PREDECESSOR_CREATOR_KEY: &str = "\"created_by_mobkit\"";
 const CREATOR_KEY: &str = "\"created_by_meta\"";
 
 const INIT_TIMEOUT: Duration = Duration::from_mins(3);
-const RPC_TIMEOUT: Duration = Duration::from_mins(1);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_mins(3);
 const EXIT_TIMEOUT: Duration = Duration::from_mins(1);
 
 fn roster_spec() -> Value {
@@ -495,18 +475,6 @@ impl Gateway {
         }
     }
 
-    /// One request that must succeed; its result.
-    fn call(&mut self, id: &str, method: &str, params: Value) -> Value {
-        let response = self.request(id, method, params, RPC_TIMEOUT);
-        assert!(
-            response.get("error").is_none(),
-            "[{}] {method} failed: {response}\n{}",
-            self.label,
-            self.stderr_tail()
-        );
-        response["result"].clone()
-    }
-
     fn answer_callback(&mut self, method: &str, message: &Value) {
         let Some(id) = message.get("id").cloned() else {
             return;
@@ -520,34 +488,6 @@ impl Gateway {
             "[{}] unexpected host callback {method}: this host provides only the roster",
             self.label
         );
-    }
-
-    fn shutdown_and_reap(mut self) {
-        let response = self.request("shutdown", "meta/shutdown", json!({}), SHUTDOWN_TIMEOUT);
-        gateway_shutdown::assert_persistent_shutdown_completed(
-            &response,
-            &format!("[{}] shutdown\n{}", self.label, self.stderr_tail()),
-        );
-        drop(self.stdin.take());
-        let start = Instant::now();
-        loop {
-            if let Some(status) = self.child.try_wait().expect("poll gateway exit") {
-                assert!(
-                    status.success(),
-                    "[{}] rpc_gateway exited with {status}\n{}",
-                    self.label,
-                    self.stderr_tail()
-                );
-                return;
-            }
-            assert!(
-                start.elapsed() < EXIT_TIMEOUT,
-                "[{}] rpc_gateway did not exit\n{}",
-                self.label,
-                self.stderr_tail()
-            );
-            thread::sleep(Duration::from_millis(25));
-        }
     }
 }
 
@@ -571,30 +511,6 @@ enum Launch {
     Candidate,
 }
 
-/// Boot the build under test over `state` the way the released deployment
-/// ran: same persistent state (so persistent mob storage over the released,
-/// non-empty event log), same roster, same agent-memory and memory ledger
-/// configuration, and the supplied definition.
-fn boot(label: &str, state: &Path, home: &Path, mob_config: &str, launch: Launch) -> Gateway {
-    let mut gateway = Gateway::start(label, home);
-    let response = gateway.request(
-        "init",
-        "meta/init",
-        init_params(state, mob_config, launch),
-        INIT_TIMEOUT,
-    );
-    assert!(
-        response.get("error").is_none(),
-        "[{label}] meta/init over the adopted released store was refused: {response}\n{}",
-        gateway.stderr_tail()
-    );
-    assert!(
-        response["result"]["contract_version"].is_string(),
-        "[{label}] init returned no contract version: {response}"
-    );
-    gateway
-}
-
 /// The `meta/init` params of a boot of the released deployment with
 /// `mob_config`.
 fn init_params(state: &Path, mob_config: &str, launch: Launch) -> Value {
@@ -615,15 +531,21 @@ fn init_params(state: &Path, mob_config: &str, launch: Launch) -> Value {
     })
 }
 
-/// Boot the build under test over `state` with `mob_config`, as an
-/// authoritative launch that must be refused; the `meta/init` error. The
-/// gateway is then closed and reaped.
-fn boot_refused(label: &str, state: &Path, home: &Path, mob_config: &str) -> Value {
+/// Boot the build under test over `state` with `mob_config` as a `launch`
+/// that must be refused; the `meta/init` error. The gateway is then closed
+/// and reaped.
+fn boot_refused_as(
+    label: &str,
+    state: &Path,
+    home: &Path,
+    mob_config: &str,
+    launch: Launch,
+) -> Value {
     let mut gateway = Gateway::start(label, home);
     let response = gateway.request(
         "init",
         "meta/init",
-        init_params(state, mob_config, Launch::Authoritative),
+        init_params(state, mob_config, launch),
         INIT_TIMEOUT,
     );
     let Some(error) = response.get("error").cloned() else {
@@ -650,110 +572,27 @@ fn boot_refused(label: &str, state: &Path, home: &Path, mob_config: &str) -> Val
     error
 }
 
-/// The identity resumed active and bound to the released session, its
-/// released memories recall, and the event log and memory ledger read back.
-fn assert_released_state_resumed(gateway: &mut Gateway) {
-    let label = gateway.label.clone();
-    let status = gateway.call(
-        "status",
-        "meta/status_identity",
-        json!({ "identity": IDENTITY }),
-    );
-    assert_eq!(status["state"], "active", "[{label}] {status}");
+/// A boot of the adopted store is refused before any store opens:
+/// STORAGE_RESOLUTION (-32014), naming the native migration. Both launch
+/// authorities refuse alike, whatever definition they carry.
+fn assert_unmigrated_boot_refused(
+    label: &str,
+    state: &Path,
+    home: &Path,
+    mob_config: &str,
+    launch: Launch,
+) {
+    let refusal = boot_refused_as(label, state, home, mob_config, launch);
     assert_eq!(
-        status["session_id"], SESSION_ID,
-        "[{label}] the identity was rebound away from its released session: {status}"
-    );
-
-    let recalled = gateway.call(
-        "recall",
-        "meta/agent_memory/recall",
-        json!({ "identity": IDENTITY, "selection": "always", "max_entries": 8 }),
-    );
-    let mut records: Vec<(String, String)> = recalled["records"]
-        .as_array()
-        .unwrap_or_else(|| panic!("[{label}] recall returned no records array: {recalled}"))
-        .iter()
-        .map(|record| {
-            (
-                record["memory_id"].as_str().unwrap_or_default().to_string(),
-                record["body"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect();
-    records.sort();
-    let expected: Vec<(String, String)> = MEMORIES
-        .iter()
-        .map(|(id, body)| ((*id).to_string(), (*body).to_string()))
-        .collect();
-    assert_eq!(
-        records, expected,
-        "[{label}] recall must return exactly the released memories"
-    );
-
-    let events = gateway.call("events", "meta/mob_events/query", json!({}));
-    let events_list = events["events"]
-        .as_array()
-        .unwrap_or_else(|| panic!("[{label}] no events array: {events}"));
-    assert!(
-        !events_list.is_empty(),
-        "[{label}] the event log reads back empty"
+        refusal["code"],
+        json!(meerkat_meta::STORAGE_RESOLUTION_CODE),
+        "[{label}] {refusal}"
     );
     assert!(
-        events.to_string().contains(MEMBER_ID),
-        "[{label}] the released member's events are missing from the event log: {events}"
-    );
-
-    let ledger = gateway.call(
-        "ledger",
-        "meta/memory/query",
-        json!({ "entity": LEDGER_ENTITY }),
-    );
-    let assertion_ids: Vec<&str> = ledger["assertions"]
-        .as_array()
-        .unwrap_or_else(|| panic!("[{label}] no assertions array: {ledger}"))
-        .iter()
-        .filter_map(|assertion| assertion["assertion_id"].as_str())
-        .collect();
-    assert_eq!(
-        assertion_ids,
-        vec![LEDGER_ASSERTION_ID],
-        "[{label}] the released memory ledger assertion must read back: {ledger}"
-    );
-}
-
-/// Durable truth after the gateway exited: the identity's one continuity
-/// record still names the released session, and its transcript still holds
-/// the released turn.
-fn assert_released_transcript_survived(state: &Path) {
-    let conn =
-        rusqlite::Connection::open(state.join("continuity.sqlite3")).expect("open continuity");
-    let records: Vec<(String, String)> = conn
-        .prepare("SELECT identity, session_id FROM continuity_records ORDER BY 1")
-        .expect("prepare records")
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .expect("query records")
-        .collect::<Result<_, _>>()
-        .expect("collect records");
-    assert_eq!(
-        records,
-        vec![(IDENTITY.to_string(), SESSION_ID.to_string())],
-        "one identity, still bound to its released session"
-    );
-    let transcript: Vec<Vec<u8>> = conn
-        .prepare("SELECT message_json FROM continuity_strand_messages WHERE session_id = ?1")
-        .expect("prepare transcript")
-        .query_map([SESSION_ID], |row| row.get::<_, Vec<u8>>(0))
-        .expect("query transcript")
-        .collect::<Result<_, _>>()
-        .expect("collect transcript");
-    assert!(
-        transcript
-            .iter()
-            .any(|row| String::from_utf8_lossy(row).contains(TURN_TOKEN)),
-        "the released turn is missing from the session's durable transcript"
+        refusal["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("storage-migrate-native")),
+        "[{label}] the refusal must name the migration: {refusal}"
     );
 }
 
@@ -768,11 +607,12 @@ fn journal(state: &Path) -> Value {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// The acceptance flow: dry run, apply, then resume on 0.9 with the released
-/// definition byte for byte, and again with the ignored `tools.mob_tasks`
-/// key removed.
+/// The adoption flow: dry run and apply; then a boot of the build under test
+/// is refused before any store opens, for an authoritative and a candidate
+/// launch, with the released definition byte for byte and without the ignored
+/// `tools.mob_tasks` key.
 #[test]
-fn released_0_8_26_store_adopts_and_resumes_with_its_definition() {
+fn released_0_8_26_store_adopts_and_is_refused_until_its_supported_migration() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
@@ -845,30 +685,32 @@ fn released_0_8_26_store_adopts_and_resumes_with_its_definition() {
     assert_eq!(again["actions"], json!([]), "{again:#}");
     assert_eq!(again["complete"], true, "{again:#}");
 
-    // 3a. The released definition, byte for byte: the exact failing path
-    // (persistent mob storage, non-empty event log, authoritative launch).
-    let mut gateway = boot(
-        "0.8.26/same-definition",
-        &state,
-        &home,
-        MOB_CONFIG,
-        Launch::Authoritative,
+    // 3. Refused before any store opens, whatever the launch and the
+    // definition, and the refusal rewrites nothing.
+    for (label, mob_config, launch) in [
+        (
+            "0.8.26/same-definition",
+            MOB_CONFIG.to_string(),
+            Launch::Authoritative,
+        ),
+        (
+            "0.8.26/ignored-key-removed",
+            mob_config_without_ignored_key(),
+            Launch::Authoritative,
+        ),
+        (
+            "0.8.26/candidate",
+            MOB_CONFIG.to_string(),
+            Launch::Candidate,
+        ),
+    ] {
+        assert_unmigrated_boot_refused(label, &state, &home, &mob_config, launch);
+    }
+    assert_eq!(
+        manifest_text(&state),
+        adopted_manifest(),
+        "a refused boot never rewrites the manifest"
     );
-    assert_released_state_resumed(&mut gateway);
-    gateway.shutdown_and_reap();
-    assert_released_transcript_survived(&state);
-
-    // 3b. The same definition without the key 0.9 ignores.
-    let mut gateway = boot(
-        "0.8.26/ignored-key-removed",
-        &state,
-        &home,
-        &mob_config_without_ignored_key(),
-        Launch::Authoritative,
-    );
-    assert_released_state_resumed(&mut gateway);
-    gateway.shutdown_and_reap();
-    assert_released_transcript_survived(&state);
 }
 
 /// Keys the released 0.8.26 dropped without a diagnostic, and Meta 0.9
@@ -974,42 +816,30 @@ fn released_0_8_26_store_adoption_names_and_holds_keys_the_release_ignored() {
     assert_eq!(applied["complete"], true, "{applied:#}");
     assert_eq!(manifest_text(&state), adopted_manifest());
 
-    // Resuming still applies none of them: the store's definition lacks
-    // them, so a boot that keeps them refuses as divergent, naming each.
-    let refusal = boot_refused(
+    // A boot is refused before the composition is judged, with the keys and
+    // without them.
+    assert_unmigrated_boot_refused(
         "0.8.26/predecessor-ignored-keys",
         &state,
         &home,
         &mob_config_with_predecessor_ignored_keys(),
+        Launch::Authoritative,
     );
-    assert_eq!(refusal["code"], -32019, "{refusal}");
-    assert_eq!(refusal["data"]["kind"], "divergent", "{refusal}");
-    assert_eq!(
-        refusal["data"]["fields"],
-        json!(PREDECESSOR_IGNORED_KEYS),
-        "{refusal}"
-    );
-
-    // The released definition resumes the store exactly as before.
-    let mut gateway = boot(
+    assert_unmigrated_boot_refused(
         "0.8.26/released-definition",
         &state,
         &home,
         MOB_CONFIG,
         Launch::Authoritative,
     );
-    assert_released_state_resumed(&mut gateway);
-    gateway.shutdown_and_reap();
-    assert_released_transcript_survived(&state);
 }
 
 /// A store 0.8.26 created whose definition a later release advanced with a
 /// tool deny list runs with that list, although its creation manifest does
 /// not record it. Adoption compares the definition the store holds, so it
-/// names only the keys that definition lacks (here the model fallbacks),
-/// adopts with the deny list kept, and a boot that keeps the list resumes.
-/// Removing it, as the creation manifest alone would suggest, would drop a
-/// list in force: that boot refuses as divergent.
+/// names only the keys that definition lacks (here the model fallbacks) and
+/// adopts with the deny list kept. A boot of the build under test is then
+/// refused before the composition is judged, whether it keeps the list or not.
 #[test]
 fn released_0_8_26_store_with_an_advanced_definition_keeps_the_deny_list_it_holds() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1076,24 +906,21 @@ fn released_0_8_26_store_with_an_advanced_definition_keeps_the_deny_list_it_hold
     assert_eq!(report["errors"], json!([]), "{report:#}");
     assert_eq!(report["complete"], true, "{report:#}");
 
-    let mut gateway = boot(
+    // A boot is refused before the composition is judged, with the deny list
+    // kept and removed alike.
+    assert_unmigrated_boot_refused(
         "0.8.26/advanced-deny-kept",
         &state,
         &home,
         &mob_config_with_deny(),
         Launch::Authoritative,
     );
-    assert_released_state_resumed(&mut gateway);
-    gateway.shutdown_and_reap();
-    assert_released_transcript_survived(&state);
-
-    let refusal = boot_refused("0.8.26/advanced-deny-removed", &state, &home, MOB_CONFIG);
-    assert_eq!(refusal["code"], -32019, "{refusal}");
-    assert_eq!(refusal["data"]["kind"], "divergent", "{refusal}");
-    assert_eq!(
-        refusal["data"]["fields"],
-        json!(["profiles.planner.tools.deny"]),
-        "{refusal}"
+    assert_unmigrated_boot_refused(
+        "0.8.26/advanced-deny-removed",
+        &state,
+        &home,
+        MOB_CONFIG,
+        Launch::Authoritative,
     );
 }
 
@@ -1108,54 +935,52 @@ fn stage_store_adopted_without_the_manifest_step(temp: &Path, home: &Path) -> Pa
     state
 }
 
-/// A store an earlier 0.9 adoption completed without the manifest step opens
-/// as it lies, on the exact path 0.9.0 refused (-32019 malformed: persistent
-/// mob storage, non-empty event log, authoritative launch).
+/// A store an earlier 0.9 adoption completed without the manifest step is
+/// refused before any store opens on the exact path 0.9.0 refused (-32019
+/// malformed: persistent mob storage, non-empty event log, authoritative
+/// launch), now with STORAGE_RESOLUTION, and the refusal leaves the
+/// predecessor-spelled manifest as it was.
 #[test]
-fn released_0_8_26_store_adopted_before_the_manifest_step_resumes() {
+fn released_0_8_26_store_adopted_before_the_manifest_step_is_refused_alike() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
     let state = stage_store_adopted_without_the_manifest_step(temp.path(), &home);
-
-    let mut gateway = boot(
+    assert_unmigrated_boot_refused(
         "0.8.26/predecessor-manifest",
         &state,
         &home,
         MOB_CONFIG,
         Launch::Authoritative,
     );
-    assert_released_state_resumed(&mut gateway);
-    gateway.shutdown_and_reap();
     assert_eq!(
         manifest_text(&state),
         released_manifest(),
-        "resuming never rewrites the manifest; adoption and repair do"
+        "a refused boot never rewrites the manifest; adoption and repair do"
     );
 }
 
-/// A candidate launch over the same store with the unchanged definition
-/// boots: the 0.8.9-0.8.28 released-representation allowance reads the
-/// predecessor manifest's creator version, so the stored definition's
-/// synthesized profile fields (provider, resume_overrides) are not a
-/// candidate divergence.
+/// A candidate launch over the same store with the unchanged definition is
+/// refused alike, before the released-representation allowance (which reads
+/// the predecessor manifest's creator version) could judge it.
 #[test]
-fn released_0_8_26_store_resumes_as_a_candidate_with_its_definition() {
+fn released_0_8_26_store_candidate_launch_is_refused_alike() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
     let state = stage_store_adopted_without_the_manifest_step(temp.path(), &home);
-
-    let mut gateway = boot(
+    assert_unmigrated_boot_refused(
         "0.8.26/candidate",
         &state,
         &home,
         MOB_CONFIG,
         Launch::Candidate,
     );
-    assert_released_state_resumed(&mut gateway);
-    gateway.shutdown_and_reap();
-    assert_released_transcript_survived(&state);
+    assert_eq!(
+        manifest_text(&state),
+        released_manifest(),
+        "a refused boot never rewrites the manifest"
+    );
 }
 
 /// `meta_repair --composition-manifests` detects a predecessor manifest,

@@ -142,6 +142,32 @@ impl AgentCustomizer for ToolCustomizer {
     }
 }
 
+/// A host customizer that declares [`TOOL`] only when its build context
+/// carries the mob handle, as a host whose tools act on the mob does.
+#[derive(Default)]
+struct HandleToolCustomizer {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl AgentCustomizer for HandleToolCustomizer {
+    async fn customize_build(
+        &self,
+        context: &AgentBuildContext,
+        _spec: &DurableAgentSpec,
+        draft: &mut AgentBuildDraft,
+    ) -> Result<(), CustomizerError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if context.runtime_services.mob_handle().is_none() {
+            return Err(CustomizerError::Io(
+                "mob handle missing for the host's tools".to_string(),
+            ));
+        }
+        draft.local_external_tools = LocalExternalToolOverlay::new(Arc::new(HostTools));
+        Ok(())
+    }
+}
+
 #[derive(Clone, Default)]
 struct CaptureClient {
     requests: Arc<std::sync::Mutex<Vec<String>>>,
@@ -197,7 +223,7 @@ async fn boot(
     mob_id: &str,
     state: &Path,
     capture: CaptureClient,
-    customizer: Arc<ToolCustomizer>,
+    customizer: Arc<dyn AgentCustomizer>,
     mode: IdentityBootstrapMode,
 ) -> meerkat_meta::UnifiedRuntime {
     Box::pin(
@@ -234,6 +260,28 @@ async fn resolved_tools(runtime: &meerkat_meta::UnifiedRuntime) -> Vec<String> {
     .await
     .expect("resolved tools")
     .tools
+}
+
+/// The visible names of the member's tool scope, as its last model-call
+/// boundary left them.
+async fn scope_visible_tools(runtime: &meerkat_meta::UnifiedRuntime) -> Vec<String> {
+    let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+    let status = identity_runtime.status(&id(MEMBER)).await.expect("status");
+    let session_id = status.session_id.expect("member has a session");
+    let mut names = runtime
+        .mob_runtime()
+        .session_service()
+        .expect("session service")
+        .tool_scope_snapshot(&session_id)
+        .await
+        .expect("read the tool scope")
+        .expect("the member's tool scope")
+        .visible_names
+        .into_iter()
+        .map(meerkat_core::types::ToolName::into_string)
+        .collect::<Vec<_>>();
+    names.sort();
+    names
 }
 
 /// Whether meerkat holds the member's run starts, read from its runtime
@@ -340,12 +388,13 @@ async fn a_failed_early_customize_is_pending_until_the_materialization_publishes
     let state = temp.path().join("state");
     first_boot("customizer-tools-restart-b", &state).await;
 
-    // Lazy bootstrap keeps the member unmaterialized after the restore, so
-    // the pending state is observable; the early (first) call fails.
+    // Both publications before the lift fail (the mob build's early one and
+    // the bootstrap's), so the pending state is observable after the restore;
+    // so does the first send's.
     let capture = CaptureClient::default();
     let customizer = Arc::new(ToolCustomizer {
         calls: AtomicUsize::new(0),
-        fail_calls: BTreeSet::from([1]),
+        fail_calls: BTreeSet::from([1, 2, 3]),
     });
     let runtime = boot(
         "customizer-tools-restart-b",
@@ -364,14 +413,42 @@ async fn a_failed_early_customize_is_pending_until_the_materialization_publishes
         pending
             .reason
             .contains("pre-activation customize_build failed")
-            && pending.reason.contains("host refused build 1"),
+            && pending.reason.contains("host refused build 2"),
         "{pending:?}"
     );
-    // Lazy: nothing has registered the restored member's runtime yet, and
-    // the materialization publishes (releasing the hold) before it registers.
-    assert_eq!(member_run_starts_held(&runtime).await, None);
+    // Core restores the member live at activation (it ran at the last stop),
+    // and it registers with its run starts held until its tools are
+    // published.
+    assert_eq!(member_run_starts_held(&runtime).await, Some(true));
 
-    // Materialization (here driven by a send) publishes and clears it.
+    // A send whose publication fails (the third build) is refused as
+    // retryable: nothing is queued behind the hold.
+    let refused = identity_runtime
+        .send(
+            &id(MEMBER),
+            &meerkat_core::ContentInput::Text("refused".to_string()),
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(meerkat_meta::identity_first::IdentityRuntimeError::IdentityWakeRetryable { .. })
+        ),
+        "{refused:?}"
+    );
+    let status = identity_runtime.status(&id(MEMBER)).await.expect("status");
+    let pending = status
+        .customizer_tools_pending
+        .expect("the failed publication stays recorded");
+    assert!(
+        pending.reason.contains("host refused build 3"),
+        "{pending:?}"
+    );
+    assert_eq!(member_run_starts_held(&runtime).await, Some(true));
+    assert_eq!(capture.count(), 0, "nothing ran behind the hold");
+
+    // The next send's delivery publishes them (the fourth build), which
+    // clears the pending state and releases the hold.
     identity_runtime
         .send(
             &id(MEMBER),
@@ -389,5 +466,167 @@ async fn a_failed_early_customize_is_pending_until_the_materialization_publishes
     );
     assert!(resolved_tools(&runtime).await.contains(&TOOL.to_string()));
     assert!(capture.last().expect("captured request").contains(TOOL));
+    runtime.shutdown().await;
+}
+
+/// The mob build's early publication fails, so meerkat stages a run-start
+/// hold for the restored member, and the bootstrap's own publication before
+/// the lift succeeds. The hold is released once the mob is live: the member
+/// runs with its tools, and nothing stays pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publication_before_the_lift_releases_the_hold_the_mob_build_staged() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    first_boot("customizer-tools-restart-c", &state).await;
+
+    let capture = CaptureClient::default();
+    let customizer = Arc::new(ToolCustomizer {
+        calls: AtomicUsize::new(0),
+        fail_calls: BTreeSet::from([1]),
+    });
+    let runtime = boot(
+        "customizer-tools-restart-c",
+        &state,
+        capture.clone(),
+        customizer.clone(),
+        IdentityBootstrapMode::LazyMaterialize,
+    )
+    .await;
+    assert_eq!(
+        customizer.calls.load(Ordering::SeqCst),
+        2,
+        "the mob build's early publication and the bootstrap's"
+    );
+    let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+    let status = identity_runtime.status(&id(MEMBER)).await.expect("status");
+    assert!(status.customizer_tools_pending.is_none(), "{status:?}");
+    assert_eq!(
+        member_run_starts_held(&runtime).await,
+        Some(false),
+        "the hold the mob build staged is released once the mob is live"
+    );
+    assert!(resolved_tools(&runtime).await.contains(&TOOL.to_string()));
+
+    identity_runtime
+        .send(
+            &id(MEMBER),
+            &meerkat_core::ContentInput::Text("after the restart".to_string()),
+        )
+        .await
+        .expect("send boot-2 turn");
+    wait_for_turn(&capture, 1, "boot 2's first turn").await;
+    assert!(capture.last().expect("captured request").contains(TOOL));
+    runtime.shutdown().await;
+}
+
+/// Set in the child process of
+/// [`a_member_restored_after_an_unclean_stop_lists_its_customizer_tools_before_the_first_turn`]:
+/// the state directory its first boot runs in.
+const UNCLEAN_STOP_CHILD_STATE: &str = "META_CUSTOMIZER_TOOLS_UNCLEAN_STOP_CHILD_STATE";
+
+/// After an unclean stop (a kill: no Stop is recorded, so the mob log stays
+/// Running) meerkat's own resume revives the member while the mob is built,
+/// and no lift is staged. The mob build's early publication runs before the
+/// mob handle exists, so a customizer whose tools need it fails there and the
+/// member is held; the bootstrap must still publish its tools, with the
+/// runtime's services (which carry the handle), and release the hold, as it
+/// does after a clean stop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_restored_after_an_unclean_stop_lists_its_customizer_tools_before_the_first_turn()
+{
+    const MOB_ID: &str = "customizer-tools-restart-d";
+    if let Some(state) = std::env::var_os(UNCLEAN_STOP_CHILD_STATE) {
+        // The child: the first boot, a turn, then an exit without shutdown.
+        let capture = CaptureClient::default();
+        let runtime = boot(
+            MOB_ID,
+            Path::new(&state),
+            capture.clone(),
+            Arc::new(ToolCustomizer::default()),
+            IdentityBootstrapMode::EagerMaterialize,
+        )
+        .await;
+        runtime
+            .identity_runtime()
+            .expect("identity runtime")
+            .send(
+                &id(MEMBER),
+                &meerkat_core::ContentInput::Text("hello".to_string()),
+            )
+            .await
+            .expect("send boot-1 turn");
+        wait_for_turn(&capture, 1, "boot 1's turn").await;
+        sleep(Duration::from_millis(500)).await;
+        std::process::exit(0);
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "a_member_restored_after_an_unclean_stop_lists_its_customizer_tools_before_the_first_turn",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(UNCLEAN_STOP_CHILD_STATE, &state)
+        .status()
+        .expect("run the first boot in a child process");
+    assert!(child.success(), "the child's first boot failed: {child}");
+
+    let capture = CaptureClient::default();
+    let customizer = Arc::new(HandleToolCustomizer::default());
+    let runtime = boot(
+        MOB_ID,
+        &state,
+        capture.clone(),
+        customizer.clone(),
+        IdentityBootstrapMode::LazyMaterialize,
+    )
+    .await;
+    let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+    // Before any turn: the tools are published and the hold is released, so
+    // a run Core starts on its own (a restored queued input, a keep-alive
+    // turn, a peer message) is not held and carries them.
+    let status = identity_runtime.status(&id(MEMBER)).await.expect("status");
+    assert!(
+        status.customizer_tools_pending.is_none(),
+        "the restored member's customizer tools are published before any turn: {status:?}"
+    );
+    assert_eq!(
+        member_run_starts_held(&runtime).await,
+        Some(false),
+        "the hold the mob build staged is released after the unclean stop too"
+    );
+    assert_eq!(
+        customizer.calls.load(Ordering::SeqCst),
+        2,
+        "the mob build's early publication (no handle yet) and the bootstrap's"
+    );
+    assert_eq!(capture.count(), 0, "no turn has run yet");
+    // Meerkat's resume built the member before the publication, so its tool
+    // scope still holds the base set it was built with; the resolved tools
+    // are those its next model request carries, which include the published
+    // tools.
+    assert!(
+        resolved_tools(&runtime).await.contains(&TOOL.to_string()),
+        "the restored member's resolved tools list its customizer tools before any turn"
+    );
+
+    identity_runtime
+        .send(
+            &id(MEMBER),
+            &meerkat_core::ContentInput::Text("after the unclean stop".to_string()),
+        )
+        .await
+        .expect("send boot-2 turn");
+    wait_for_turn(&capture, 1, "boot 2's first turn").await;
+    assert!(capture.last().expect("captured request").contains(TOOL));
+    assert!(resolved_tools(&runtime).await.contains(&TOOL.to_string()));
+    // Once the member has run, its tool scope holds the same tools.
+    assert_eq!(
+        resolved_tools(&runtime).await,
+        scope_visible_tools(&runtime).await
+    );
     runtime.shutdown().await;
 }

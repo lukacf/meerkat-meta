@@ -1562,7 +1562,7 @@ async function runBrowser(url, facts, directory, gate) {
       }
       const witness = JSON.stringify(rows.map(row => ({
         identity: row.identity, session: row.identityStatus.session_id,
-        checkpoint: row.identityStatus.checkpoint_version, progress: row.member.progress,
+        generation: row.identityStatus.generation, progress: row.member.progress,
         tokens: row.member.tokens_used, output: row.member.output_preview, kickoff: row.member.kickoff,
       })));
       stableReads = witness === lastWitness ? stableReads + 1 : 1;

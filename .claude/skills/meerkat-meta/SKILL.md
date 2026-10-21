@@ -5,7 +5,7 @@ description: "Meerkat Meta (meerkat-meta) architecture, SDK patterns, console/ru
 
 # Meerkat Meta
 
-Meta is the companion composition and product layer around the Meerkat multi-agent runtime. Meerkat owns agent and mob construction, member identity and lifecycle, spawning, wiring, comms, sessions, tools, and the core agent loop. Meta composes that authority with module supervision, routing and delivery, identity continuity bridges, REST/JSON-RPC/SSE gateways, console projections, operational policy, SDKs, and examples.
+Meta is the companion composition and product layer around the Meerkat multi-agent runtime. Meerkat owns agent and mob construction, member identity and lifecycle, spawning, wiring, comms, sessions, tools, and the core agent loop. Meta composes that authority with module supervision, routing and delivery, the identity-first runtime, REST/JSON-RPC/SSE gateways, console projections, operational policy, SDKs, and examples.
 
 Apps own desired roster and product policy. Meerkat machines admit member and session transitions. Meta translates app intent into those authorities, supervises its own operational modules, and owns product-facing projection, streaming, inspection, and console composition.
 
@@ -21,7 +21,7 @@ Repository: `lukacf/meerkat-meta`. One workspace version covers every artifact:
 | TypeScript SDK | npm `@rkat/meta-sdk` |
 | Console/admin gateway | `meta_gateway` (release archive `meta-gateway`) |
 | SDK stdin JSON-RPC gateway | `rpc_gateway` (release archive `meta-rpc-gateway`) |
-| Operator repair of member transcripts | `meta_repair` (release archive `meta-repair`) |
+| Operator repair of predecessor composition manifests | `meta_repair` (release archive `meta-repair`) |
 
 `crates/meta-store-conformance` is a workspace-only conformance crate
 (`publish = false`). `meta_flow_editor` is a development binary that CI builds;
@@ -120,6 +120,70 @@ Other 0.9 contract changes to keep in mind:
   and validates an explicitly configured access file, and a missing or invalid
   file is a typed `AccessConfigError`.
 
+## 0.9.4 Upgrade Notes
+
+0.9.4 keeps sessions and identities only in Meerkat's own stores: Meerkat's
+session store holds every transcript, and its mob store holds every identity's
+binding. Meta keeps no continuity copy of a transcript and holds no identity
+leases. The operator checklist, with each refusal and its remedy, is
+`docs/guides/upgrading-to-0-9-4.mdx`; point to its sections instead of restating
+them.
+
+- Every 0.9.3 state directory needs one offline, one-way migration with 0.9.4's
+  `meta_gateway storage-migrate-native --state-dir <dir>` (a read-only census),
+  then `--apply`. 0.9.4 refuses to start on a directory that was not migrated
+  (`NativeStorageMigrationRequired`, STORAGE_RESOLUTION `-32014`), and 0.9.3
+  refuses a migrated one. The way back is a copy of the stopped directory taken
+  before `--apply`.
+- SDK-hosted continuity is removed: the builder options `continuity_store`,
+  `lease_provider` and `scratch_dir` (TypeScript `continuityStore()`,
+  `leaseProvider()`, `scratchDir()`), the lease-lost error, and
+  `request_continuity_repair` with its `meta/request_continuity_repair` method
+  (now `-32601`). A host that passed a continuity provider exports it with 0.9.3
+  still installed (`docs/guides/continuity-export.mdx`, scripts in
+  `tools/continuity-export/`) and imports the file with `storage-migrate-native
+  --continuity-export <file>`.
+- One runtime per state directory: a runtime takes an exclusive lock on
+  `<state>/meta-runtime.lock` before it opens any store, and a second runtime on
+  the same directory is refused (`StorageLayoutError::StateDirInUse`, `-32014` on
+  the gateways).
+- The first 0.9.4 boot finishes the migration from
+  `<state>/storage-migrate-native.first-boot.json`. The bootstrap status lists
+  pending rows as `first_boot_pending`. `reset`, `delete_identity` and the
+  delivery verbs of a pending identity are refused (`first_boot_row_pending`,
+  retryable); the refusal's `remedy` is `add_to_roster` when no roster lists
+  the identity, or `wake_identity` when it is listed and its row waits to be
+  carried out.
+- `persistent_state` keeps durable mob storage at `<state>/event_log.sqlite3` by
+  default, and the builder has no `session_store()`.
+- A persistent composition refuses in-memory stores that its state directory
+  would outlive: a declared in-memory runtime store (`rpc_gateway`
+  `runtime_options.runtime_store` under `persistent_state`, `-32014`; the
+  builder's `ephemeral_runtime_store(true)` with `persistent_state`,
+  `ConflictingConfiguration`), and in-memory mob storage while a roster
+  provider is registered. A test that wants process-local sessions omits
+  `persistent_state`.
+- `meta_repair` keeps only `--composition-manifests`. Its session transcript
+  modes (`--db`, `--session`, `--all-sessions`, `--keep-newest`,
+  `--truncate-tool-results`, `--drop-tool-results-older-than`) refuse with a
+  pointer to `meta_gateway storage-migrate-native`: Meta keeps no transcript
+  copy to repair, and Meerkat compaction manages the size of the transcript a
+  member reads.
+- `delete_identity` starts the identity over on a fresh session and keeps the
+  old session archived in Meerkat, where a history read by its session id still
+  serves it. The result does not name the old session: read the identity's
+  status first to keep it.
+- A per-agent event stream of an identity follows its session: a retire no
+  longer ends it; a reset, a delete, a respawn that mints a session, a roster
+  removal, or a mob reset or destroy does.
+- Rust `SessionBridge` implementations change shape: `create_session` and
+  `resume_session` take no runtime id (and `resume_session` no
+  `SessionSnapshot`), `create_session` and `reset_member_to_successor` return
+  `MemberRuntimeBinding { agent_runtime_id, session_id }`, the live-member
+  reads default to `BridgeError::Unsupported`, and `BridgeError` and
+  `ResumeRejectionKind` are `#[non_exhaustive]`. The CHANGELOG's Breaking list
+  has each signature.
+
 ## Repo Map
 
 | Path | Purpose |
@@ -134,7 +198,9 @@ Other 0.9 contract changes to keep in mind:
 | `crates/meerkat-meta/src/http_console.rs` | Embedded console, REST console JSON, JSON-RPC, multipart upload/send, timeline stream, blob serving. |
 | `crates/meerkat-meta/src/http_sse.rs` | Agent events, mob events, structural mob-events SSE. |
 | `crates/meerkat-meta/src/rpc.rs` and `src/rpc/` | JSON-RPC dispatcher and method groups for console ingress, mob ops/events, routing/delivery, gating, memory, scheduling, session store, subscriptions. |
-| `crates/meerkat-meta/src/identity_first/` | Identity-first continuity, local store/lease, bridge, orchestrator, gateway bridges, contracts. |
+| `crates/meerkat-meta/src/identity_first/` | The identity-first runtime on Meerkat's member verbs: bridge, orchestrator, gateway bridges, contracts. |
+| `crates/meerkat-meta/src/storage_migrate_native/` | The one-way 0.9.3 to 0.9.4 state migration behind `meta_gateway storage-migrate-native`. |
+| `tools/continuity-export/` | Standalone scripts that export SDK-hosted continuity from a 0.9.3 host before the upgrade. |
 | `crates/meerkat-meta/src/mob_announcements/` | Mob announcements: owner, SQLite store, batch delivery as Meerkat host continuations, member tools, delivery to members on peer gateways, RPC. |
 | `crates/meerkat-meta/src/runtime/keyed_inject.rs` | The keyed inject plane that serves the signed `inject_keyed` / `inject_status` control verbs. |
 | `crates/meerkat-meta/src/contact_directory.rs`, `src/auth/peer_keys.rs` | Cross-mob contacts and signed peer-key handling. |
@@ -357,11 +423,18 @@ Mob announcements carry developments to subscribed members (`crates/meerkat-meta
 - Members on peer gateways are reached through keyed inject (above).
 - Every public enum of the Rust surface is `#[non_exhaustive]`.
 
-## Identity-First Continuity
+## Identity-First Runtime
 
-**Doctrine (DECIDED 2026-07-06, `docs/design/identity-first-doctrine.md`): Meta is dual-plane.** Durable members live on the identity plane (`IdentityRuntime`: continuity records, lease-fenced embodiment, tolerant disposal, reconcile from a roster). Ephemeral workers live on the mob plane (`MobHandle`: `spawn`/`mob_spawn_member`/`delegate`, idle-retire reaping). The mob plane is NOT legacy - it is the worker plane and the substrate the identity bridge is built on. What is wrong is building DURABLE populations on the mob plane (member-per-user, long-lived coordinators via `ensure_member`): use an identity roster instead. Never route worker churn through identities (per-worker continuity records are pure overhead - production-scale deployments pay for every dead identity at reconcile).
+**Doctrine (DECIDED 2026-07-06, `docs/design/identity-first-doctrine.md`): Meta is dual-plane.** Durable members live on the identity plane (`IdentityRuntime`: identities reconciled from a roster, each embodied as one Meerkat member). Ephemeral workers live on the mob plane (`MobHandle`: `spawn`/`mob_spawn_member`/`delegate`, idle-retire reaping). The mob plane is NOT legacy - it is the worker plane and the substrate the identity bridge is built on. What is wrong is building DURABLE populations on the mob plane (member-per-user, long-lived coordinators via `ensure_member`): use an identity roster instead. Never route worker churn through identities: each identity is durable state (a binding in Meerkat's mob store) that every reconcile pays for.
 
 Identity-first makes stable `AgentIdentity` strings the control-plane key and treats runtime member IDs as generated bindings. Prefer identity-scoped APIs for durable agents and member-scoped APIs for ephemeral workers at the mob layer.
+
+Since 0.9.4 the identity runtime runs on Meerkat's member verbs, and Meerkat holds each identity's binding (runtime id, session, member generation):
+
+- View states are `active`, `dormant` and `broken`; tolerate unknown values. The status and the inspection carry Meerkat's facts: `generation`, `session_id` and `agent_runtime_id`, and when set `convergence`, `wake_refusal` (with its remedy) and `replaced_session`.
+- When Meerkat reports an identity's session gone, the identity wakes on a fresh session and the status names the session it replaced.
+- Refusals are typed: an identity Meerkat cannot resume, history it cannot read yet, an identity a host adopted, and a wake held for an operator. The lease codes `-32003` and `-32005` are no longer answered.
+- A saved `DeliveryScope` carries Meerkat's member generation and fence token. A scope saved by 0.9.3, or captured before a respawn, is refused as stale (`-32007`): capture a new one.
 
 Gateway note: on an identity-first gateway (`meta_gateway` init
 `identity_first: true`, or any runtime with the `console_identity_roster` slot
@@ -384,7 +457,7 @@ Key files:
 - `sdk/typescript/src/runtime.ts`
 - `sdk/typescript/src/models.ts`
 
-Avoid manual runtime ID extraction for ordinary identity-scoped work. Do not assume a continuity record means an active mob member; retired/stale records can exist.
+Avoid manual runtime ID extraction for ordinary identity-scoped work. Do not assume a registered identity is an active member: read its status, because `dormant` and `broken` identities exist.
 
 ## Embedding Hooks
 

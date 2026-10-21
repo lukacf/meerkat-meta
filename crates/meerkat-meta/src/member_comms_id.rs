@@ -477,6 +477,7 @@ pub(crate) async fn validate_raw_member_target(
             "member id '{member_id}' uses an identity-runtime reserved namespace"
         ));
     }
+    refuse_runtime_plane_member(&mob_member_id_str(&alias), None)?;
     if let Some(identity_runtime) = identity_runtime
         && let Some(identity) = identity_runtime.identity_for_member_mutation(&alias).await
     {
@@ -485,6 +486,288 @@ pub(crate) async fn validate_raw_member_target(
         ));
     }
     Ok(alias)
+}
+
+/// The single creation check for the console's runtime-plane identities.
+///
+/// The console treats frames under `_system` and `__console__` as the
+/// runtime's own events and exempts them from member visibility, so no member
+/// may have its events attributed to either. The check evaluates the
+/// identities console attribution itself computes for a new member with this
+/// roster id and these labels ([`runtime_plane_console_identity`]), never a
+/// spelling normalized beside them.
+pub(crate) fn refuse_runtime_plane_member(
+    roster_member_id: &str,
+    labels: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<(), String> {
+    let runtime_id = meerkat_mob::ids::AgentRuntimeId::initial(
+        meerkat_mob::ids::AgentIdentity::from(roster_member_id),
+    );
+    match runtime_plane_console_identity(roster_member_id, &runtime_id, labels) {
+        Some(identity) => Err(format!(
+            "member id '{}' is reserved: the console attributes its events to the runtime-plane identity '{identity}'",
+            runtime_alias_str(roster_member_id.trim())
+        )),
+        None => Ok(()),
+    }
+}
+
+/// [`refuse_runtime_plane_member`] for the member an identity-first identity
+/// materializes as: its roster id encodes the durable identity and its
+/// `agent_identity` label names it.
+pub(crate) fn refuse_runtime_plane_identity(
+    identity: &crate::identity_first::AgentIdentity,
+) -> Result<(), String> {
+    let labels = std::collections::BTreeMap::from([(
+        "agent_identity".to_string(),
+        identity.as_str().to_string(),
+    )]);
+    refuse_runtime_plane_member(&mob_member_id_str(identity.as_str()), Some(&labels))
+}
+
+/// The runtime-plane identity, if any, that console attribution gives a
+/// member with this roster id, runtime id and labels: the identity its spawn
+/// projection registers
+/// ([`crate::console_spawn::spawn_seed_console_identity`]) or the one its
+/// agent events derive from the runtime id
+/// ([`crate::unified_runtime::console_events::attributed_identity_for_runtime`]).
+pub(crate) fn runtime_plane_console_identity(
+    roster_member_id: &str,
+    runtime_id: &meerkat_mob::ids::AgentRuntimeId,
+    labels: Option<&std::collections::BTreeMap<String, String>>,
+) -> Option<String> {
+    let no_labels = std::collections::BTreeMap::new();
+    let registered = crate::console_spawn::spawn_seed_console_identity(
+        roster_member_id,
+        labels.unwrap_or(&no_labels),
+    );
+    let derived =
+        crate::unified_runtime::console_events::attributed_identity_for_runtime(runtime_id);
+    std::iter::once(registered)
+        .chain(derived)
+        .find(|identity| crate::console_contracts::is_runtime_plane_identity(identity))
+}
+
+/// The spawn sources [`RuntimePlaneIdentityGuard`] admits without the
+/// reserved-name check: the ones that rebuild or replay a member that already
+/// exists. Every other source, including any a later Core adds, is checked.
+const SOURCES_THAT_NAME_NO_NEW_MEMBER: [meerkat_mob::SpawnSource; 2] = [
+    // Core's rebuild of an existing durable member: restart restore,
+    // explicit resume, and a fork child's own-identity overlay. A host spawn
+    // with a resume launch mode is reported as one too; every Meta route
+    // checks the name before Core sees it, so only host code that calls a mob
+    // handle directly passes here.
+    meerkat_mob::SpawnSource::Resume,
+    // Replays a spec sealed in an identity intent when the intent was
+    // created, where this guard already ran. Core asks no customizer for it;
+    // a refusal could stop a legacy member's reconcile if a later Core asks.
+    meerkat_mob::SpawnSource::IdentityReconcile,
+];
+
+/// The guard's decision for one spawn reaching it from `source`: admitted when
+/// the source names no new member, else refused when console attribution
+/// would give the member one of its runtime-plane identities.
+pub(crate) fn runtime_plane_spawn_check(
+    source: meerkat_mob::SpawnSource,
+    spec: &meerkat_mob::SpawnMemberSpec,
+) -> Result<(), meerkat_mob::MobError> {
+    if SOURCES_THAT_NAME_NO_NEW_MEMBER.contains(&source) {
+        return Ok(());
+    }
+    refuse_runtime_plane_member(spec.identity.as_str(), spec.labels.as_ref())
+        .map_err(meerkat_mob::MobError::WiringError)
+}
+
+/// Refuses every spawn whose member the console would attribute to a
+/// runtime-plane identity (`_system`, `__console__`), judged as the spawn
+/// reaches it. Compose it last in a mob's spawn customizer chain, after every
+/// customizer that may rename or relabel a spawn; every mob a
+/// [`crate::MobBootstrapSpec`] builds, and every child mob its agents create,
+/// already has it so. A runtime adopted from a bare handle
+/// ([`crate::RealMobRuntime::from_handle`]) does not, unless the handle's
+/// builder composed it.
+///
+/// It checks every spawn source but the two in its allowlist, which rebuild
+/// or replay a member that already exists (see
+/// [`runtime_plane_spawn_check`]): fresh spawns, helpers, batch items, flow
+/// and policy members, fork launches, council seats and respawns are all
+/// checked. Core asks no spawn customizer when it seats a durable fork's
+/// child; Meta's session service refuses that fork instead
+/// ([`refuse_runtime_plane_fork_target`]). The resume it admits is how Core
+/// rebuilds an existing durable member on restart or explicit resume, so a
+/// member created under such a name before this check existed still comes
+/// up; the console attributes none of its events to such a name, and the
+/// runtime names it at startup and in `meta/status`.
+///
+/// Three host-only paths pass it. Core reports a host spawn with a resume
+/// launch mode as a resume. Core asks no spawn customizer when it auto-spawns
+/// a member the definition's spawn policy maps, for external work submitted
+/// to a member the roster does not hold. Nor does it ask one when it seats a
+/// council participant built with its source's fork build inheritance (the
+/// seat's spec carries a fork source), so the seat keeps the target identity
+/// its builder chose. Every Meta creation surface checks the name before Core
+/// sees it, no Meta surface submits work to a member the roster does not
+/// hold, and the agent council tool names its seats itself
+/// (`council-p{order}`), so only host code that calls a mob handle or builds
+/// a council request directly reaches these paths; the console drops that
+/// member's events all the same, and `meta/status` names it.
+pub struct RuntimePlaneIdentityGuard {
+    _private: (),
+}
+
+impl RuntimePlaneIdentityGuard {
+    /// The guard, as a spawn customizer to append last to a chain.
+    pub fn customizer() -> std::sync::Arc<dyn meerkat_mob::SpawnMemberCustomizer> {
+        std::sync::Arc::new(Self { _private: () })
+    }
+}
+
+impl meerkat_mob::SpawnMemberCustomizer for RuntimePlaneIdentityGuard {
+    fn customize_spawn(
+        &self,
+        ctx: &meerkat_mob::SpawnCustomizationContext,
+        spec: &mut meerkat_mob::SpawnMemberSpec,
+    ) -> Result<(), meerkat_mob::MobError> {
+        runtime_plane_spawn_check(ctx.spawn_source, spec)
+    }
+
+    fn customize_resume(
+        &self,
+        _ctx: &meerkat_mob::SpawnCustomizationContext,
+        _durable: &meerkat_mob::ResumedMemberView,
+        _spec: &mut meerkat_mob::SpawnMemberSpec,
+    ) -> Result<(), meerkat_mob::MobError> {
+        // Core asks this only to rebuild an existing durable member.
+        Ok(())
+    }
+}
+
+/// The spawn customizer of a mob built under `mob_id`: `customizer` followed
+/// by [`RuntimePlaneIdentityGuard`], through the crate's one composer. The
+/// guard runs last, so it judges each spawn as every earlier customizer
+/// leaves it, and each customizer still gets its own resume hook.
+pub(crate) fn runtime_plane_guarded_customizer(
+    mob_id: &meerkat_mob::MobId,
+    customizer: Option<std::sync::Arc<dyn meerkat_mob::SpawnMemberCustomizer>>,
+) -> Option<std::sync::Arc<dyn meerkat_mob::SpawnMemberCustomizer>> {
+    #[cfg(test)]
+    if pre_check_mob_for_test(mob_id.as_str()) {
+        return customizer;
+    }
+    #[cfg(not(test))]
+    let _ = mob_id;
+    Some(crate::identity_first::ComposedSpawnMemberCustomizer::over(
+        customizer,
+        RuntimePlaneIdentityGuard::customizer(),
+    ))
+}
+
+/// Refuses a durable fork whose child would take one of the console's
+/// runtime-plane identities. Core seats a durable fork's child (an agent's
+/// `fork_off`, [`meerkat_mob::MobHandle::fork_member`]) without asking any
+/// spawn customizer, so [`RuntimePlaneIdentityGuard`] never sees it; the
+/// session service checks the fork's target member before it forks the
+/// transcript.
+pub(crate) fn refuse_runtime_plane_fork_target(
+    target: &meerkat_core::DurableSessionForkTarget,
+) -> Result<(), String> {
+    #[cfg(test)]
+    if pre_check_mob_for_test(&target.member_binding.mob_id) {
+        return Ok(());
+    }
+    refuse_runtime_plane_member(&target.member_binding.member, None)
+}
+
+#[cfg(test)]
+static PRE_CHECK_MOBS_FOR_TEST: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Test seam: while set for `mob_id`, a mob built under it gets no
+/// runtime-plane guard and its session service forks any child, as a mob
+/// built before these checks existed did, so a test can create the members
+/// such a build left behind.
+#[cfg(test)]
+pub(crate) fn set_pre_check_mob_for_test(mob_id: &str, pre_check: bool) {
+    let mut mobs = PRE_CHECK_MOBS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    mobs.retain(|id| id != mob_id);
+    if pre_check {
+        mobs.push(mob_id.to_string());
+    }
+}
+
+#[cfg(test)]
+fn pre_check_mob_for_test(mob_id: &str) -> bool {
+    PRE_CHECK_MOBS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|id| id == mob_id)
+}
+
+/// A roster member the console attributes to a runtime-plane identity: one
+/// created under such a name before every creation path refused them. It
+/// keeps running, but the console records none of its events.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ReservedIdentityMember {
+    /// The member's public id.
+    pub(crate) member_id: String,
+    /// The runtime id its events carry.
+    pub(crate) runtime_id: String,
+    /// The runtime-plane identity console attribution gives it.
+    pub(crate) identity: String,
+}
+
+/// Every member of `handle`'s roster that console attribution gives a
+/// runtime-plane identity.
+pub(crate) async fn reserved_identity_members(
+    handle: &meerkat_mob::MobHandle,
+) -> Vec<ReservedIdentityMember> {
+    handle
+        .roster()
+        .await
+        .list()
+        .filter_map(|entry| {
+            runtime_plane_console_identity(
+                entry.agent_identity.as_str(),
+                &entry.agent_runtime_id,
+                Some(&entry.labels),
+            )
+            .map(|identity| ReservedIdentityMember {
+                member_id: runtime_alias_str(entry.agent_identity.as_str()).into_owned(),
+                runtime_id: runtime_event_alias(&entry.agent_runtime_id),
+                identity,
+            })
+        })
+        .collect()
+}
+
+/// The `reserved_identity_members` field of `meta/status`: each member
+/// [`reserved_identity_members`] names, or `None` (the field is omitted) when
+/// the mob has none.
+pub(crate) async fn reserved_identity_members_status(
+    handle: &meerkat_mob::MobHandle,
+) -> Option<serde_json::Value> {
+    let reserved = reserved_identity_members(handle).await;
+    if reserved.is_empty() {
+        return None;
+    }
+    serde_json::to_value(reserved).ok()
+}
+
+/// Warn once per member of `handle`'s roster that holds a runtime-plane
+/// identity.
+pub(crate) async fn warn_reserved_identity_members(handle: &meerkat_mob::MobHandle) {
+    for member in reserved_identity_members(handle).await {
+        tracing::warn!(
+            member_id = %member.member_id,
+            runtime_id = %member.runtime_id,
+            identity = %member.identity,
+            "a member holds an identity the console reserves for its own events; it keeps \
+             running, but the console records none of its events (meta/status lists it). \
+             Retire it and recreate it under another name"
+        );
+    }
 }
 
 /// Reservation for one or more caller-chosen raw member aliases.
@@ -818,25 +1101,20 @@ mod tests {
         ));
         let identity = crate::identity_first::AgentIdentity::parse("lead")?;
         identity_runtime
-            .register(
-                crate::identity_first::DurableAgentSpec {
-                    identity,
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: crate::identity_first::AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: std::collections::BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                crate::identity_first::IdentityLifecycleState::Dormant,
-                None,
-                None,
-            )
+            .register(crate::identity_first::DurableAgentSpec {
+                identity,
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: crate::identity_first::AgentAddressability::Addressable,
+                display_name: None,
+                labels: std::collections::BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            })
             .await;
 
         for target in [
@@ -1452,6 +1730,116 @@ mod tests {
         // Fixed point: normalizing a logical identity changes nothing.
         for id in ["identity:lead-1", "review:singleton", "helper"] {
             assert_eq!(logical_memory_identity(id), id);
+        }
+    }
+
+    /// The creation check refuses exactly the members the console would
+    /// attribute to a runtime-plane identity: through the identity the spawn
+    /// projection registers (trimmed, label override first) or the one agent
+    /// events derive from the runtime id (decoded, one `rt:` stripped). Every
+    /// other spelling stays an ordinary member name.
+    #[test]
+    fn the_creation_check_refuses_every_spelling_console_attribution_resolves_to_the_runtime_plane()
+    {
+        let encoded = |alias: &str| mob_member_id_str(alias).into_owned();
+        let cases: Vec<(String, Option<&str>, bool)> = vec![
+            ("_system".to_string(), None, true),
+            ("__console__".to_string(), None, true),
+            // The spawn projection trims the member id it registers.
+            (" _system".to_string(), None, true),
+            ("_system\u{2003}".to_string(), None, true),
+            // Agent events decode the comms-safe roster spelling.
+            ("mk--__system".to_string(), None, true),
+            (encoded("__console__"), None, true),
+            // ... and strip one generated-alias prefix.
+            ("rt:_system".to_string(), None, true),
+            (encoded("rt:_system"), None, true),
+            (encoded("rt:rt:_system"), None, false),
+            // The identity override label wins, trimmed.
+            ("worker".to_string(), Some("_system"), true),
+            ("worker".to_string(), Some(" __console__ "), true),
+            ("worker".to_string(), Some("\u{3000}_system"), true),
+            // A runtime-plane roster id is refused whatever the label says.
+            ("_system".to_string(), Some("worker-label"), true),
+            // An empty or generated-alias override falls back to the member id.
+            ("worker".to_string(), Some(""), false),
+            ("worker".to_string(), Some("rt:_system"), false),
+            ("worker".to_string(), Some("mk--__system"), false),
+            // Near misses are ordinary names.
+            ("_SYSTEM".to_string(), None, false),
+            ("__CONSOLE__".to_string(), None, false),
+            ("__system".to_string(), None, false),
+            ("_system_".to_string(), None, false),
+            ("worker".to_string(), Some("_System"), false),
+            ("worker".to_string(), None, false),
+        ];
+        for (roster_member_id, label, refused) in cases {
+            let labels = label.map(|label| {
+                std::collections::BTreeMap::from([(
+                    "agent_identity".to_string(),
+                    label.to_string(),
+                )])
+            });
+            let outcome = refuse_runtime_plane_member(&roster_member_id, labels.as_ref());
+            assert_eq!(
+                outcome.is_err(),
+                refused,
+                "roster id {roster_member_id:?}, agent_identity label {label:?}: {outcome:?}"
+            );
+            if let Err(message) = outcome {
+                assert!(message.contains("is reserved"), "{message}");
+            }
+        }
+    }
+
+    /// The guard checks every spawn source but the two that rebuild or
+    /// replay an existing member, each with a reserved id, a plain id that a
+    /// label points at a reserved identity, and a plain id.
+    #[test]
+    fn the_guard_admits_only_the_sources_that_rebuild_an_existing_member() {
+        use meerkat_mob::{AgentIdentity, ProfileName, SpawnMemberSpec, SpawnSource};
+        let rows = [
+            (SpawnSource::Consumer, false),
+            (SpawnSource::AgentSpawnMember, false),
+            (SpawnSource::HelperSpawn, false),
+            (SpawnSource::BatchItem, false),
+            (SpawnSource::FlowProvisioning, false),
+            (SpawnSource::PolicySpawn, false),
+            (SpawnSource::Respawn, false),
+            (SpawnSource::Resume, true),
+            (SpawnSource::Fork, false),
+            (SpawnSource::PersistedForkResume, false),
+            (SpawnSource::IdentityReconcile, true),
+            (SpawnSource::AttachedForkedParticipant, false),
+        ];
+        let spec = |member: &str| {
+            SpawnMemberSpec::new(ProfileName::from("worker"), AgentIdentity::from(member))
+        };
+        for (source, admitted) in rows {
+            let reserved = runtime_plane_spawn_check(source, &spec("_system"));
+            assert_eq!(
+                reserved.is_ok(),
+                admitted,
+                "{source:?}, `_system`: {reserved:?}"
+            );
+            if let Err(error) = reserved {
+                assert!(
+                    error.to_string().contains("reserved"),
+                    "{source:?}: {error}"
+                );
+            }
+            let labelled = spec("worker-a").with_labels(std::collections::BTreeMap::from([(
+                "agent_identity".to_string(),
+                "__console__".to_string(),
+            )]));
+            let labelled = runtime_plane_spawn_check(source, &labelled);
+            assert_eq!(
+                labelled.is_ok(),
+                admitted,
+                "{source:?}, labelled `__console__`: {labelled:?}"
+            );
+            let plain = runtime_plane_spawn_check(source, &spec("worker-a"));
+            assert!(plain.is_ok(), "{source:?} admits a plain id: {plain:?}");
         }
     }
 }

@@ -1213,6 +1213,30 @@ Unverifiable support or service definitions remain preview-only.
 unsupported without changing the installation. Service-definition and cloud
 migrations remain separate work.
 
+Moving an installed application to Meta 0.9.4 changes its saved state for good.
+Meta 0.9.4 keeps sessions and agent identities in Meerkat Core's own stores, so a
+state directory that an earlier Meta release wrote needs one offline, one-way
+migration (`meta_gateway storage-migrate-native`) before 0.9.4 starts on it.
+Meta 0.9.4 refuses a directory that was not migrated
+(`NativeStorageMigrationRequired`), and Meta 0.9.3 refuses a migrated one. Keep
+the application stopped and back up the complete stopped installation first:
+that backup is the only way back.
+[Upgrading to Meta 0.9.4](https://docs.rkat.ai/meta/guides/upgrading-to-0-9-4)
+lists the earlier releases the migration accepts, each refusal with its remedy,
+and how to go back. Check that it lists your installation's release before you
+update.
+
+Forge does not run that migration. Each installed application keeps the Meta
+release it was installed with. An update that would move it from an earlier
+release to Meta 0.9.4 or later is staged as blocked and cannot be applied: the
+update review names the migration it needs, and nothing in the installation
+changes. A Forge copy that selects another Meta release does not reconnect an
+installation made by a different one, so keep the Forge copy and state directory
+that installed it. An application's native state is its project folder's
+`.mobkit/state`; the agents' comms identity keys are under `.mobkit/home`. Back
+up the complete stopped project folder, including `.mobkit/`, before any
+migration.
+
 Private setup names the required fields that are still missing and links to their
 inputs. Rejected input does not claim a folder or select a queued installation.
 Concurrent design/build changes are checked before admission; interrupted candidate
@@ -1408,9 +1432,28 @@ timeline retains native frame versions and replay semantics across reloads;
 the optional detailed editor uses the console workbench components. The backend
 is a durable four-agent MobKit team: deployment architect, integration specialist,
 systems reviewer, and visualization programmer. Open its native console to inspect real identities,
-conversations, tools, and memory. The four-role setup runtime uses
-`architect-runtime-v2`; existing native runtime history remains in
-`architect-runtime`. Saved wizard conversations and proposals keep their existing store.
+conversations, tools, and memory. The four-role setup runtime keeps its native
+state in the Forge state directory: `architect-runtime-meta-v1` for a guide on a
+Meta release before 0.9.4, and `architect-runtime-meta-v2` from Meta 0.9.4 on.
+Meta 0.9.4 refuses native state that an earlier release wrote until a one-time,
+offline migration has converted it, so Forge starts the setup team in that fresh
+generation instead of opening the previous one. Earlier generations, including
+`architect-runtime-v2` and `architect-runtime`, stay in place unchanged, and a
+previous Forge copy that shares the state directory keeps using its own. The new
+generation takes over the saved provider and compaction settings. Saved wizard
+conversations and proposals keep their existing store.
+
+The fresh setup team does not recall the earlier team's native conversations or
+memory. To carry them over, stop Forge before its first start on Meta 0.9.4, copy
+the complete `architect-runtime-meta-v1` folder to `architect-runtime-meta-v2` in
+the same state directory, and run Meta 0.9.4's
+`meta_gateway storage-migrate-native --state-dir architect-runtime-meta-v2/.mobkit/state`
+there. If the census is clean, run the same command with `--apply`, then start
+Forge. Run it on the same computer as the same user: the agents' comms identity
+keys are kept in that user's home directory, not in the state directory. If the
+census refuses, remove only the copied `architect-runtime-meta-v2` folder; Forge
+then starts a fresh generation. See
+[Upgrading to Meta 0.9.4](https://docs.rkat.ai/meta/guides/upgrading-to-0-9-4).
 
 The team can inspect the current blueprint/schema, search the live registry,
 read a maintained MobKit design reference grounded in a home-automation host and a
@@ -1493,6 +1536,11 @@ connected tools according to class grants.
 A new project initializes durable storage through MobKit's own offline maintenance
 tool. Imported legacy state requires explicit migration after backup. The complete
 `.mobkit/` directory belongs in stopped-deployment backups.
+A deployment that moves to Meta 0.9.4 migrates that state once, offline and
+one-way, with `meta_gateway storage-migrate-native` while it is stopped and after
+such a backup; Meta 0.9.4 refuses state that was not migrated
+(`NativeStorageMigrationRequired`). See
+[Upgrading to Meta 0.9.4](https://docs.rkat.ai/meta/guides/upgrading-to-0-9-4).
 
 For Google Cloud, review `bash deploy/deploy-gcp.sh --dry-run`, then run the script.
 It requests the exact project ID before provisioning billable resources. Enter

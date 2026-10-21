@@ -38,6 +38,22 @@ test("sidebar configured links reuse console href allowlist", () => {
   assert.equal(__sidebarTest.safeConsoleHref("data:text/plain,hello"), null);
 });
 
+test("sidebar marks a member degraded from its identity view state alone", () => {
+  const member: ConsoleAgent = {
+    agent_id: "worker-1",
+    member_id: "worker-1",
+    identity: "worker-1",
+    label: "worker-1",
+    kind: "mob_agent",
+  };
+  assert.equal(__sidebarTest.deriveStateAttr({ ...member, state: "broken" }), "degraded");
+  assert.equal(__sidebarTest.deriveStateAttr({ ...member, state: "active" }), "active");
+  assert.notEqual(__sidebarTest.deriveStateAttr({ ...member, state: "dormant" }), "degraded");
+  // A 0.9.3 gateway still sends lease_healthy; the sidebar no longer reads it.
+  const leaseLost = { ...member, state: "active", lease_healthy: false } as ConsoleAgent;
+  assert.equal(__sidebarTest.deriveStateAttr(leaseLost), "active");
+});
+
 test("sidebar resolves worker-spawned workers under their worker host", () => {
   const commander: ConsoleAgent = {
     agent_id: "incident-commander",

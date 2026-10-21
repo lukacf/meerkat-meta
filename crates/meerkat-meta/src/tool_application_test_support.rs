@@ -192,3 +192,60 @@ pub(crate) fn resolution() -> meerkat_core::ToolExecutionResolutionContext {
         .unwrap(),
     )
 }
+
+/// Records each session mob operator authority bound on it, in order.
+#[derive(Default)]
+pub(crate) struct MobAuthorityBindProbe {
+    bound: std::sync::Mutex<
+        Vec<Option<Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>>>,
+    >,
+}
+
+impl MobAuthorityBindProbe {
+    /// How many bindings reached the probe.
+    pub(crate) fn bind_count(&self) -> usize {
+        self.bound.lock().unwrap().len()
+    }
+
+    /// Whether the last binding is `expected`: the same handle, or none.
+    pub(crate) fn last_bound_is(
+        &self,
+        expected: Option<&Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>>,
+    ) -> bool {
+        match (self.bound.lock().unwrap().last(), expected) {
+            (Some(Some(bound)), Some(expected)) => Arc::ptr_eq(bound, expected),
+            (Some(None), None) => true,
+            _ => false,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentToolDispatcher for MobAuthorityBindProbe {
+    fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+        Arc::from(Vec::<Arc<ToolDef>>::new())
+    }
+
+    async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
+        Err(ToolError::not_found(call.name))
+    }
+
+    fn bind_session_mob_tool_authority(
+        &self,
+        authority: Option<Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>>,
+    ) {
+        self.bound.lock().unwrap().push(authority);
+    }
+}
+
+/// A session mob operator authority handle for forwarding rows. Its content
+/// does not matter: the rows check that the same handle arrives.
+pub(crate) fn session_mob_authority()
+-> Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>> {
+    let context = serde_json::from_value(json!({
+        "principal_token": "forwarding-row",
+        "can_create_mobs": false,
+    }))
+    .expect("a mob operator authority context");
+    Arc::new(std::sync::RwLock::new(context))
+}

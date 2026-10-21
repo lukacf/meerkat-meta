@@ -32,12 +32,16 @@ use meerkat_core::types::HandlingMode;
 use meerkat_meta::identity_first::contracts::{ContinuityStore, LeaseProvider};
 use meerkat_meta::identity_first::{
     AgentAddressability, AgentBuildDraft, AgentIdentity, AgentRuntimeId, BridgeAdmissionError,
-    BridgeDelivery, BridgeError, BridgeTurnReceipt, CheckpointVersion, ContinuityGeneration,
-    ContinuityRecord, DurabilityPolicy, DurableAgentSpec, FencingToken, IdentityLifecycleState,
-    IdentityRuntime, IdentityRuntimeConfig, IdentityRuntimeError, LeaseGrant, MemberInspection,
-    ResumeSessionOutcome, SessionBridge, SessionSnapshot,
+    BridgeDelivery, BridgeError, BridgeTurnReceipt, DurabilityPolicy, DurableAgentSpec,
+    FencingToken, IdentityRuntime, IdentityRuntimeConfig, IdentityRuntimeError, MemberInspection,
+    MemberRuntimeBinding, ResumeSessionOutcome, SessionBridge, SessionSnapshot,
 };
 use meerkat_meta::identity_first::{LocalContinuityStore, LocalLeaseProvider};
+
+#[path = "support/core_members.rs"]
+mod core_members;
+
+use core_members::CoreMembers;
 
 // ===========================================================================
 // Fixtures
@@ -61,24 +65,6 @@ fn make_spec(name: &str) -> DurableAgentSpec {
         backend: None,
         binding: None,
         placement: None,
-    }
-}
-
-fn make_record(name: &str) -> ContinuityRecord {
-    ContinuityRecord {
-        identity: make_identity(name),
-        agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{name}")).unwrap(),
-        session_id: meerkat_core::types::SessionId::new(),
-        generation: ContinuityGeneration::new(0),
-        checkpoint_version: CheckpointVersion::new(0),
-    }
-}
-
-fn make_grant(name: &str, token: u64) -> LeaseGrant {
-    LeaseGrant {
-        identity: make_identity(name),
-        fencing_token: FencingToken::new(token),
-        ttl: Duration::from_mins(5),
     }
 }
 
@@ -132,10 +118,12 @@ struct PhaseScriptedBridge {
     ingress_calls: AtomicUsize,
     completion_calls: AtomicUsize,
     receipt_waits_entered: Arc<AtomicUsize>,
-    session_runtime_registrations: AtomicUsize,
     /// One release flag per completion call, in call order.
     gates: std::sync::Mutex<Vec<Arc<tokio::sync::Notify>>>,
     released: std::sync::Mutex<Vec<Arc<std::sync::atomic::AtomicBool>>>,
+    /// The members Core holds: every Core read the runtime makes answers
+    /// from here.
+    core: CoreMembers,
 }
 
 impl PhaseScriptedBridge {
@@ -154,9 +142,9 @@ impl PhaseScriptedBridge {
             ingress_calls: AtomicUsize::new(0),
             completion_calls: AtomicUsize::new(0),
             receipt_waits_entered: Arc::new(AtomicUsize::new(0)),
-            session_runtime_registrations: AtomicUsize::new(0),
             gates: std::sync::Mutex::new(Vec::new()),
             released: std::sync::Mutex::new(Vec::new()),
+            core: CoreMembers::default(),
         })
     }
 
@@ -170,10 +158,6 @@ impl PhaseScriptedBridge {
 
     fn receipt_waits_entered(&self) -> usize {
         self.receipt_waits_entered.load(Ordering::SeqCst)
-    }
-
-    fn session_runtime_registrations(&self) -> usize {
-        self.session_runtime_registrations.load(Ordering::SeqCst)
     }
 
     /// Release the Nth completion call (0-indexed, in call order).
@@ -195,27 +179,105 @@ impl PhaseScriptedBridge {
 impl SessionBridge for PhaseScriptedBridge {
     async fn create_session(
         &self,
-        _identity: &AgentIdentity,
-        _runtime_id: &AgentRuntimeId,
-        _spec: &DurableAgentSpec,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
-        session_id: &meerkat_core::types::SessionId,
-    ) -> Result<meerkat_core::types::SessionId, BridgeError> {
-        Ok(session_id.clone())
+    ) -> Result<MemberRuntimeBinding, BridgeError> {
+        let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+            .map_err(|error| BridgeError::Mob(error.to_string()))?;
+        let binding = MemberRuntimeBinding {
+            agent_runtime_id,
+            session_id: Some(meerkat_core::types::SessionId::new()),
+        };
+        self.core.bind(identity, &binding, &spec.profile);
+        Ok(binding)
     }
 
     async fn resume_session(
         &self,
-        _identity: &AgentIdentity,
-        _runtime_id: &AgentRuntimeId,
-        _spec: &DurableAgentSpec,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
         session_id: &meerkat_core::types::SessionId,
-        _snapshot: &SessionSnapshot,
+        _resume_from_role: Option<&meerkat_mob::ProfileName>,
     ) -> Result<ResumeSessionOutcome, BridgeError> {
+        let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+            .map_err(|error| BridgeError::Mob(error.to_string()))?;
+        self.core.bind(
+            identity,
+            &MemberRuntimeBinding {
+                agent_runtime_id: agent_runtime_id.clone(),
+                session_id: Some(session_id.clone()),
+            },
+            &spec.profile,
+        );
         Ok(ResumeSessionOutcome::Resumed {
             session_id: session_id.clone(),
+            agent_runtime_id,
         })
+    }
+
+    /// Core's successor respawn (reset, delete): the identity's member at
+    /// the next generation, on a fresh session, under the next fence.
+    async fn reset_member_to_successor(
+        &self,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
+        _draft: &AgentBuildDraft,
+    ) -> Result<MemberRuntimeBinding, BridgeError> {
+        let generation = self
+            .core
+            .last_member_binding(identity)?
+            .map_or(0, |binding| binding.generation().get() + 1);
+        let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:{generation}"))
+            .map_err(|error| BridgeError::Mob(error.to_string()))?;
+        let binding = MemberRuntimeBinding {
+            agent_runtime_id,
+            session_id: Some(meerkat_core::types::SessionId::new()),
+        };
+        self.core.bind(identity, &binding, &spec.profile);
+        Ok(binding)
+    }
+
+    async fn live_member(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
+        self.core.live_member(identity)
+    }
+
+    async fn live_member_scope(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+        self.core.live_member_scope(identity)
+    }
+
+    async fn ensure_member_live(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
+        self.core.live_member(identity)
+    }
+
+    async fn member_binding_history(
+        &self,
+    ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+        self.core.history()
+    }
+
+    async fn last_member_binding(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+        self.core.last_member_binding(identity)
+    }
+
+    async fn identity_management(
+        &self,
+        _identity: &AgentIdentity,
+    ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+        Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
     }
 
     /// The INGRESS lane. Counted so a silent fallback cannot hide.
@@ -301,7 +363,8 @@ impl SessionBridge for PhaseScriptedBridge {
         Ok(SessionSnapshot { data: Vec::new() })
     }
 
-    async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+    async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+        self.core.retire(runtime_id);
         Ok(())
     }
 
@@ -315,19 +378,6 @@ impl SessionBridge for PhaseScriptedBridge {
             is_final: false,
             peer_reachable_count: 0,
         })
-    }
-
-    async fn register_session_runtime_state(
-        &self,
-        _session_id: &meerkat_core::types::SessionId,
-        _identity: &AgentIdentity,
-        _generation: ContinuityGeneration,
-        checkpoint_version: CheckpointVersion,
-        _fencing_token: FencingToken,
-    ) -> Result<CheckpointVersion, BridgeError> {
-        self.session_runtime_registrations
-            .fetch_add(1, Ordering::SeqCst);
-        Ok(checkpoint_version)
     }
 }
 
@@ -345,43 +395,43 @@ fn make_runtime(bridge: Option<Arc<dyn SessionBridge>>) -> Arc<IdentityRuntime> 
     }))
 }
 
-/// Register an Active identity WITH a continuity record, i.e. with a bound
-/// runtime id.
-async fn register_bound(runtime: &IdentityRuntime, name: &str, token: u64) -> AgentIdentity {
-    register_bound_with(runtime, name, token, make_record(name)).await
-}
-
-/// Register with an EXACT continuity record, so a test can pin the session id
-/// the identity is currently bound to.
-async fn register_bound_with(
+/// Register an identity Core holds live (generation 0, fence `token`) on a
+/// fresh session.
+async fn register_bound(
     runtime: &IdentityRuntime,
+    bridge: &PhaseScriptedBridge,
     name: &str,
     token: u64,
-    record: ContinuityRecord,
 ) -> AgentIdentity {
-    runtime
-        .register(
-            make_spec(name),
-            IdentityLifecycleState::Active,
-            Some(record),
-            Some(make_grant(name, token)),
-        )
-        .await;
-    make_identity(name)
+    register_bound_on(
+        runtime,
+        bridge,
+        name,
+        token,
+        meerkat_core::types::SessionId::new(),
+    )
+    .await
 }
 
-/// Register an Active identity with NO continuity record, i.e. no bound
-/// runtime id.
-async fn register_unbound(runtime: &IdentityRuntime, name: &str, token: u64) -> AgentIdentity {
-    runtime
-        .register(
-            make_spec(name),
-            IdentityLifecycleState::Active,
-            None,
-            Some(make_grant(name, token)),
-        )
-        .await;
-    make_identity(name)
+/// Register with Core holding the member on an EXACT session, so a test can
+/// pin the session the identity is currently bound to.
+async fn register_bound_on(
+    runtime: &IdentityRuntime,
+    bridge: &PhaseScriptedBridge,
+    name: &str,
+    token: u64,
+    session: meerkat_core::types::SessionId,
+) -> AgentIdentity {
+    let identity = make_identity(name);
+    bridge.core.bind_live_at_fence(
+        &identity,
+        &meerkat_mob::ProfileName::from("default"),
+        0,
+        Some(session),
+        token,
+    );
+    runtime.register(make_spec(name)).await;
+    identity
 }
 
 // ===========================================================================
@@ -404,8 +454,7 @@ async fn a_successful_completion_bearing_send_submits_once_and_waits_for_its_own
         delivered_session.clone(),
     );
     let runtime = make_runtime(Some(Arc::clone(&bridge) as Arc<dyn SessionBridge>));
-    let alice = register_bound(&runtime, "alice", 1).await;
-    let registrations_before = bridge.session_runtime_registrations();
+    let alice = register_bound_on(&runtime, &bridge, "alice", 1, delivered_session.clone()).await;
 
     let turn = content("turn one");
     let send = runtime.send_awaiting_commit(&alice, &turn);
@@ -459,14 +508,9 @@ async fn a_successful_completion_bearing_send_submits_once_and_waits_for_its_own
     let status = runtime.status(&alice).await.expect("alice status");
     assert_eq!(status.session_id, Some(delivered_session));
     assert_eq!(
-        status.lease.as_ref().map(|lease| lease.fencing_token),
-        Some(token),
-        "the returned token must be the authoritative post-reconcile lease fence"
-    );
-    assert_eq!(
-        bridge.session_runtime_registrations() - registrations_before,
-        1,
-        "one delivered-session rotation must perform exactly one bridge runtime-state rebind"
+        token,
+        FencingToken::new(1),
+        "the returned token must be the fence Core holds the member under"
     );
 }
 
@@ -474,17 +518,21 @@ async fn a_successful_completion_bearing_send_submits_once_and_waits_for_its_own
 // T0b - fail closed on local absence
 // ===========================================================================
 
-/// No bridge installed: typed `CompletionUnavailable`, nothing submitted.
+/// No bridge installed: the send fails closed, naming the missing bridge,
+/// and nothing is submitted.
 #[tokio::test]
 async fn no_bridge_fails_closed_and_submits_nothing() {
     let runtime = make_runtime(None);
-    let alice = register_bound(&runtime, "alice", 1).await;
+    runtime.register(make_spec("alice")).await;
+    let alice = make_identity("alice");
 
     match runtime.send_awaiting_commit(&alice, &content("turn")).await {
-        Err(IdentityRuntimeError::CompletionUnavailable { reason, .. }) => {
+        // Without a bridge Core's mob cannot even wake the identity, so the
+        // send refuses before any lane is chosen.
+        Err(error) => {
             assert!(
-                reason.contains("no session bridge"),
-                "the reason must name which precondition failed: {reason}"
+                error.to_string().contains("no session bridge"),
+                "the error must name which precondition failed: {error}"
             );
         }
         other => panic!(
@@ -493,35 +541,6 @@ async fn no_bridge_fails_closed_and_submits_nothing() {
              Got: {other:?}"
         ),
     }
-}
-
-/// Identity with no bound runtime id: typed `CompletionUnavailable`, and the
-/// bridge is never called at all.
-#[tokio::test]
-async fn no_bound_runtime_id_fails_closed_and_never_touches_the_bridge() {
-    let bridge = PhaseScriptedBridge::new(CompletionScript::GateThenSucceed);
-    let runtime = make_runtime(Some(Arc::clone(&bridge) as Arc<dyn SessionBridge>));
-    let alice = register_unbound(&runtime, "alice", 1).await;
-
-    match runtime.send_awaiting_commit(&alice, &content("turn")).await {
-        Err(IdentityRuntimeError::CompletionUnavailable { reason, .. }) => {
-            assert!(
-                reason.contains("runtime id"),
-                "the reason must name which precondition failed: {reason}"
-            );
-        }
-        other => panic!("expected CompletionUnavailable, got {other:?}"),
-    }
-    assert_eq!(
-        bridge.completion_calls(),
-        0,
-        "nothing may be submitted when completion cannot be observed"
-    );
-    assert_eq!(
-        bridge.ingress_calls(),
-        0,
-        "and it must not fall back to the ingress lane either"
-    );
 }
 
 // ===========================================================================
@@ -538,7 +557,7 @@ async fn an_ingress_only_bridge_is_unavailable_not_failed_and_never_falls_back()
         )
     }));
     let runtime = make_runtime(Some(Arc::clone(&bridge) as Arc<dyn SessionBridge>));
-    let alice = register_bound(&runtime, "alice", 1).await;
+    let alice = register_bound(&runtime, &bridge, "alice", 1).await;
 
     match runtime.send_awaiting_commit(&alice, &content("turn")).await {
         Err(IdentityRuntimeError::CompletionUnavailable { reason, .. }) => assert!(
@@ -570,7 +589,7 @@ async fn an_admission_failure_is_typed_as_admission_and_not_as_completion() {
         }
     }));
     let runtime = make_runtime(Some(Arc::clone(&bridge) as Arc<dyn SessionBridge>));
-    let alice = register_bound(&runtime, "alice", 1).await;
+    let alice = register_bound(&runtime, &bridge, "alice", 1).await;
 
     match runtime.send_awaiting_commit(&alice, &content("turn")).await {
         Err(error @ IdentityRuntimeError::ActorAdmissionTimeout { .. }) => assert!(
@@ -592,7 +611,7 @@ async fn completion_lane_preserves_both_actor_deadline_stages_without_retry() {
     for stage in ["actor_command_admission", "actor_command_reply"] {
         let bridge = PhaseScriptedBridge::new(CompletionScript::ActorTimeout(stage));
         let runtime = make_runtime(Some(Arc::clone(&bridge) as Arc<dyn SessionBridge>));
-        let alice = register_bound(&runtime, "alice", 1).await;
+        let alice = register_bound(&runtime, &bridge, "alice", 1).await;
         let error = runtime
             .send_awaiting_commit(&alice, &content("turn"))
             .await
@@ -618,13 +637,13 @@ async fn a_turn_that_ran_and_failed_is_completion_failed_and_is_submitted_exactl
     // BEFORE a receipt exists, so nothing is ever admitted and the completion
     // phase is never reached - the test would pass without exercising the
     // behaviour it names.
-    let record = make_record("alice");
+    let bound_session = meerkat_core::types::SessionId::new();
     let bridge = PhaseScriptedBridge::returning(
         CompletionScript::GateThenFail(|| "model provider returned a terminal error".to_string()),
-        record.session_id.clone(),
+        bound_session.clone(),
     );
     let runtime = make_runtime(Some(Arc::clone(&bridge) as Arc<dyn SessionBridge>));
-    let alice = register_bound_with(&runtime, "alice", 1, record).await;
+    let alice = register_bound_on(&runtime, &bridge, "alice", 1, bound_session).await;
 
     let turn = content("turn");
     let mut send = Box::pin(runtime.send_awaiting_commit(&alice, &turn));
@@ -656,15 +675,15 @@ async fn a_post_admission_projection_failure_keeps_its_own_phase_and_is_submitte
     // unresolved session. `Fail` would return before a receipt exists, which is
     // a different phase entirely - "nothing was submitted", not "the turn ran
     // and only its projection failed".
-    let record = make_record("alice");
+    let bound_session = meerkat_core::types::SessionId::new();
     let bridge = PhaseScriptedBridge::returning(
         CompletionScript::GateThenSucceedUnresolved(|| {
             "member has no bridge session after deliver".to_string()
         }),
-        record.session_id.clone(),
+        bound_session.clone(),
     );
     let runtime = make_runtime(Some(Arc::clone(&bridge) as Arc<dyn SessionBridge>));
-    let alice = register_bound_with(&runtime, "alice", 1, record).await;
+    let alice = register_bound_on(&runtime, &bridge, "alice", 1, bound_session).await;
 
     let turn = content("turn");
     let mut send = Box::pin(runtime.send_awaiting_commit(&alice, &turn));
@@ -717,12 +736,11 @@ async fn a_post_admission_projection_failure_keeps_its_own_phase_and_is_submitte
 /// indistinguishable.
 #[tokio::test(flavor = "current_thread")]
 async fn a_sibling_turn_on_the_same_identity_cannot_release_this_delivery() {
-    let record = make_record("alice");
-    let bound_session = record.session_id.clone();
+    let bound_session = meerkat_core::types::SessionId::new();
     let bridge =
         PhaseScriptedBridge::returning(CompletionScript::GateThenSucceed, bound_session.clone());
     let runtime = make_runtime(Some(Arc::clone(&bridge) as Arc<dyn SessionBridge>));
-    let alice = register_bound_with(&runtime, "alice", 1, record).await;
+    let alice = register_bound_on(&runtime, &bridge, "alice", 1, bound_session).await;
 
     let first_turn = content("first turn");
     let second_turn = content("second turn");
@@ -789,28 +807,24 @@ async fn a_sibling_turn_on_the_same_identity_cannot_release_this_delivery() {
 // identity mid-flight, because the send held the lifecycle lock for the whole
 // turn. Each of these tests would deadlock rather than fail.
 
-/// Replace the identity's embodiment while its turn is in flight.
+/// Replace the identity's embodiment while its turn is in flight: Core now
+/// holds the member at the next generation, on a fresh session, under fence
+/// `token`. Returns the replacement's runtime id.
 ///
-/// A fresh `runtime_id` is exactly what a reset or respawn produces, and it is
+/// A fresh runtime id is exactly what a reset or respawn produces, and it is
 /// one of the three captured fields, so the SUPERSEDE this drives is the real
 /// path rather than a simulated one.
 ///
-/// It is NOT evidence that the lifecycle lock is free: `register` does not take
-/// that lock. The lock is proven separately by
-/// `a_lifecycle_operation_can_take_the_lock_while_a_turn_is_pending` (via
-/// `set_state`) and by the delete case.
-async fn supersede_while_running(runtime: &IdentityRuntime, name: &str, token: u64) {
-    let mut replacement = make_record(name);
-    replacement.agent_runtime_id =
-        AgentRuntimeId::parse(&format!("rt:{name}-respawned")).expect("replacement runtime id");
-    runtime
-        .register(
-            make_spec(name),
-            IdentityLifecycleState::Active,
-            Some(replacement),
-            Some(make_grant(name, token)),
-        )
-        .await;
+/// It is NOT evidence that the lifecycle lock is free: it takes no lock. The
+/// delete case proves the lock.
+fn supersede_while_running(bridge: &PhaseScriptedBridge, name: &str, token: u64) -> AgentRuntimeId {
+    bridge.core.bind_live_at_fence(
+        &make_identity(name),
+        &meerkat_mob::ProfileName::from("default"),
+        1,
+        Some(meerkat_core::types::SessionId::new()),
+        token,
+    )
 }
 
 /// Drive a send until the bridge has admitted it and the turn is parked.
@@ -841,12 +855,11 @@ fn drive_until_admitted<F: std::future::Future>(
 /// the DEAD turn's session. Losing the attribution is the lesser harm.
 #[tokio::test(flavor = "current_thread")]
 async fn a_successful_turn_against_a_superseded_identity_is_typed_and_never_rebinds() {
-    let record = make_record("alice");
-    let bound_session = record.session_id.clone();
+    let bound_session = meerkat_core::types::SessionId::new();
     let bridge =
         PhaseScriptedBridge::returning(CompletionScript::GateThenSucceed, bound_session.clone());
     let runtime = make_runtime(Some(Arc::clone(&bridge) as Arc<dyn SessionBridge>));
-    let alice = register_bound_with(&runtime, "alice", 1, record).await;
+    let alice = register_bound_on(&runtime, &bridge, "alice", 1, bound_session).await;
 
     let turn = content("turn");
     let mut send = Box::pin(runtime.send_awaiting_commit(&alice, &turn));
@@ -854,7 +867,7 @@ async fn a_successful_turn_against_a_superseded_identity_is_typed_and_never_rebi
     drive_until_admitted(&mut send, &bridge, &mut cx);
 
     // The turn is running and the lock is free - so this can happen at all.
-    supersede_while_running(&runtime, "alice", 2).await;
+    let replacement = supersede_while_running(&bridge, "alice", 2);
     bridge.release(0);
 
     match send.await {
@@ -872,7 +885,7 @@ async fn a_successful_turn_against_a_superseded_identity_is_typed_and_never_rebi
     let status = runtime.status(&alice).await.expect("alice status");
     assert_eq!(
         status.agent_runtime_id,
-        Some(AgentRuntimeId::parse("rt:alice-respawned").expect("id")),
+        Some(replacement),
         "the live incarnation must be the replacement, untouched by the dead turn"
     );
 }
@@ -885,21 +898,20 @@ async fn a_successful_turn_against_a_superseded_identity_is_typed_and_never_rebi
 /// the two demand different responses.
 #[tokio::test(flavor = "current_thread")]
 async fn a_failed_turn_leads_and_carries_the_supersede_as_secondary_detail() {
-    let record = make_record("alice");
-    let bound_session = record.session_id.clone();
+    let bound_session = meerkat_core::types::SessionId::new();
     let bridge = PhaseScriptedBridge::returning(
         CompletionScript::GateThenFail(|| "model provider returned a terminal error".to_string()),
-        bound_session,
+        bound_session.clone(),
     );
     let runtime = make_runtime(Some(Arc::clone(&bridge) as Arc<dyn SessionBridge>));
-    let alice = register_bound_with(&runtime, "alice", 1, record).await;
+    let alice = register_bound_on(&runtime, &bridge, "alice", 1, bound_session).await;
 
     let turn = content("turn");
     let mut send = Box::pin(runtime.send_awaiting_commit(&alice, &turn));
     let mut cx = Context::from_waker(Waker::noop());
     drive_until_admitted(&mut send, &bridge, &mut cx);
 
-    supersede_while_running(&runtime, "alice", 2).await;
+    supersede_while_running(&bridge, "alice", 2);
     bridge.release(0);
 
     match send.await {
@@ -991,22 +1003,22 @@ async fn begin_returns_a_receipt_while_its_terminal_is_still_pending() {
 /// because both are true and dropping either loses information an operator needs.
 #[tokio::test(flavor = "current_thread")]
 async fn a_projection_failure_plus_supersede_leads_with_the_supersede_and_keeps_both() {
-    let record = make_record("alice");
+    let bound_session = meerkat_core::types::SessionId::new();
     let bridge = PhaseScriptedBridge::returning(
         CompletionScript::GateThenSucceedUnresolved(|| {
             "member has no bridge session after deliver".to_string()
         }),
-        record.session_id.clone(),
+        bound_session.clone(),
     );
     let runtime = make_runtime(Some(Arc::clone(&bridge) as Arc<dyn SessionBridge>));
-    let alice = register_bound_with(&runtime, "alice", 1, record).await;
+    let alice = register_bound_on(&runtime, &bridge, "alice", 1, bound_session).await;
 
     let turn = content("turn");
     let mut send = Box::pin(runtime.send_awaiting_commit(&alice, &turn));
     let mut cx = Context::from_waker(Waker::noop());
     drive_until_admitted(&mut send, &bridge, &mut cx);
 
-    supersede_while_running(&runtime, "alice", 2).await;
+    supersede_while_running(&bridge, "alice", 2);
     bridge.release(0);
 
     match send.await {
@@ -1029,42 +1041,44 @@ async fn a_projection_failure_plus_supersede_leads_with_the_supersede_and_keeps_
     }
 }
 
-/// An explicit DELETE after admission - not a re-register - maps to superseded
-/// and never rebinds. ALSO the lock-freedom proof.
+/// An explicit DELETE after admission maps to superseded and never rebinds.
+/// ALSO the lock-freedom proof.
 ///
-/// Distinct from the rebind case: there the identity still exists with a new
-/// embodiment, here it is gone entirely. The post-relock read fails, and that
-/// failure must become supersede detail rather than a pre-admission-shaped
-/// `UnknownIdentity`, which would claim the send never started.
+/// Delete starts the identity's fresh life: Core respawns its member at the
+/// next generation on a fresh session. The post-relock read sees the new
+/// incarnation, and that must become supersede detail rather than a
+/// reconcile onto the fresh life.
 ///
 /// LOCK FREEDOM. `delete_identity` delegates to
 /// `delete_identity_with_expected_member_alias`, whose FIRST statement is
 /// `let lifecycle_lock = self.lifecycle_lock_for(identity).await;` - verified by
 /// reading that body, not by a grep hit inside a line range, which is how two
 /// earlier versions of a separate lock test ended up vacuous. After taking the
-/// lock, delete changes the authoritative lifecycle state to `Retiring` before
-/// its first blocking store operation. The test direct-polls to that exact
-/// marker, then releases the turn and drives both operations to their typed
-/// terminals.
+/// lock, delete has Core respawn the member, so the status read moves past the
+/// admitted generation. The test direct-polls to that exact marker, then
+/// releases the turn and drives both operations to their typed terminals.
 #[tokio::test(flavor = "current_thread")]
 async fn an_identity_deleted_after_admission_is_superseded_not_unknown() {
-    let record = make_record("alice");
-    let bridge = PhaseScriptedBridge::returning(
-        CompletionScript::GateThenSucceed,
-        record.session_id.clone(),
-    );
+    let bound_session = meerkat_core::types::SessionId::new();
+    let bridge =
+        PhaseScriptedBridge::returning(CompletionScript::GateThenSucceed, bound_session.clone());
     let runtime = make_runtime(Some(Arc::clone(&bridge) as Arc<dyn SessionBridge>));
-    let alice = register_bound_with(&runtime, "alice", 1, record).await;
+    let alice = register_bound_on(&runtime, &bridge, "alice", 1, bound_session).await;
 
     let turn = content("turn");
     let mut send = Box::pin(runtime.send_awaiting_commit(&alice, &turn));
     let mut cx = Context::from_waker(Waker::noop());
     drive_until_admitted(&mut send, &bridge, &mut cx);
+    let admitted_generation = runtime
+        .status(&alice)
+        .await
+        .expect("alice status")
+        .generation;
 
     // Takes lifecycle_lock_for(&alice) - the SAME lock the send holds during
-    // admission. Drive it without a clock until the authoritative lifecycle
-    // state proves the delete acquired that lock and crossed its pre-store
-    // transition.
+    // admission. Drive it without a clock until Core's member moved past the
+    // admitted generation, which proves the delete acquired that lock and
+    // crossed its respawn.
     let mut delete = Box::pin(runtime.delete_identity(&alice));
     let mut delete_terminal = None;
     let mut delete_transition_observed = false;
@@ -1075,11 +1089,7 @@ async fn an_identity_deleted_after_admission_is_superseded_not_unknown() {
             break;
         }
         match runtime.status(&alice).await {
-            Ok(status) if status.state == IdentityLifecycleState::Retiring => {
-                delete_transition_observed = true;
-                break;
-            }
-            Err(IdentityRuntimeError::UnknownIdentity(_)) => {
+            Ok(status) if status.generation != admitted_generation => {
                 delete_transition_observed = true;
                 break;
             }
@@ -1106,13 +1116,12 @@ async fn an_identity_deleted_after_admission_is_superseded_not_unknown() {
 
     match send_result {
         Err(IdentityRuntimeError::PostAdmissionSuperseded { detail, .. }) => assert!(
-            detail.contains("no longer exists"),
-            "the detail must say the identity is gone: {detail}"
+            detail.contains("admitted onto"),
+            "the detail must name the embodiment the turn ran against: {detail}"
         ),
         other => panic!(
-            "a deleted identity AFTER a completed turn must be superseded. \
-             UnknownIdentity would say nothing was delivered, and a turn ran. \
-             Got: {other:?}"
+            "a turn that completed against an identity deleted while it ran must be \
+             superseded, never reconciled onto the fresh life. Got: {other:?}"
         ),
     }
 }

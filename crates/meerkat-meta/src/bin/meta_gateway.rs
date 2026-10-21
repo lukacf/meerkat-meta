@@ -22,7 +22,6 @@ use meerkat_meta::{
 };
 use meerkat_mob::ids::AgentIdentity;
 use meerkat_mob::{MobDefinition, MobStorage, ProfileName, SpawnMemberSpec};
-use meerkat_store::SqliteSessionStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -64,7 +63,6 @@ type PersistentSessionServiceParts = (
     Option<ScheduleHostInputs>,
     Option<WorkGraphParts>,
     meerkat_meta::storage_health::ResolvedStorageSummary,
-    meerkat_meta::mob_handle_runtime::SessionWriteEpochsHandle,
     Arc<dyn meerkat_meta::identity_first::CommittedBoundaryRecoverer>,
     Arc<dyn meerkat_runtime::RuntimeStore>,
     ConsoleLiveInputs,
@@ -622,16 +620,23 @@ fn build_persistent_session_service(
     let store_dir = layout.state_dir().to_path_buf();
     fs::create_dir_all(&store_dir)
         .with_context(|| format!("failed to create {}", store_dir.display()))?;
-    let sqlite_path = layout.session_db().map_err(|e| anyhow!("{e}"))?.path;
-    let session_store = Arc::new(
-        SqliteSessionStore::open(sqlite_path.clone())
-            .with_context(|| format!("failed to open {}", sqlite_path.display()))?,
-    );
+    // Core's HeadCanonical pair on `runtime.sqlite`: the session store and
+    // the runtime store share the one database, as Core's realm composes
+    // them. Fail-closed (M4): an open failure is a startup error; this
+    // surface's ephemeral launch mode (persistent_sessions = false) is the
+    // declared in-memory path.
+    let meerkat_realm = layout
+        .meerkat_level_realm()
+        .map_err(|e| anyhow!("{e}"))?
+        .clone();
+    let (session_store, runtime_store) =
+        meerkat_meta::mob_handle_runtime::open_native_session_pair(&store_dir, &meerkat_realm)
+            .map_err(|error| anyhow!("{error}"))?;
     // H2: probe the incremental capability on the same store the session
     // service receives below, so whole-blob degradation is loud and
     // health-visible.
     let session_store_incremental = meerkat_meta::storage_health::probe_session_store_incremental(
-        &(session_store.clone() as Arc<dyn meerkat::SessionStore>),
+        &session_store,
         "SqliteSessionStore",
     );
 
@@ -639,41 +644,6 @@ fn build_persistent_session_service(
         Arc::new(ObjectStoreBlobStore::local(layout.blob_root())?);
     let blob_store: Arc<dyn meerkat_core::BlobStore> =
         Arc::new(Base64BlobStoreAdapter::new(binary_blob_store.clone()));
-    // Persistent runtime store — same path chosen by
-    // `MobBootstrapSpec::persistent_inner`, so a gateway and a library-mode
-    // runtime pointed at the same dir share state.
-    //
-    // Fail-closed (M4): an open failure is a startup error — the former
-    // silent `InMemoryRuntimeStore` fallback left resume and archive broken
-    // long after boot. This surface has no ephemeral-runtime-store
-    // declaration; its ephemeral launch mode (persistent_sessions = false)
-    // is the declared in-memory path.
-    let runtime_db_path = layout.runtime_db();
-    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
-        meerkat_runtime::store::SqliteRuntimeStore::new(&runtime_db_path).map_err(|err| {
-            anyhow!(
-                "{}",
-                meerkat_meta::storage_health::RuntimeStoreResolutionError {
-                    path: runtime_db_path.clone(),
-                    message: err.to_string(),
-                }
-            )
-        })?,
-    );
-    // Wrap in the write-epoch facade BEFORE the machine and session service
-    // capture the store; the witness threads to the bootstrap spec so the
-    // console session-history epoch gate works on this externally-composed
-    // path (mirrors rpc_gateway.rs — without it the 5s discovery loop
-    // re-reads whole session documents forever). The facade also owns the
-    // durable session projection at meerkat 0.8.11 (the session service no
-    // longer writes the SessionStore itself) and every-boot authority
-    // re-minting - a reset/lost runtime.sqlite reseeds from the durable
-    // session rows instead of refusing resume.
-    let (runtime_store, session_write_epochs) =
-        meerkat_meta::mob_handle_runtime::epoch_tracking_runtime_store_with_durable_projection(
-            runtime_store,
-            session_store.clone() as Arc<dyn meerkat::SessionStore>,
-        );
     let adapter = Arc::new(
         meerkat_runtime::MeerkatMachine::persistent(
             Arc::clone(&runtime_store),
@@ -709,10 +679,6 @@ fn build_persistent_session_service(
     let mut builder = FactoryAgentBuilder::new(factory, config);
     let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
     builder.default_blob_store = Some(blob_store.clone());
-    let meerkat_realm = layout
-        .meerkat_level_realm()
-        .map_err(|e| anyhow!("{e}"))?
-        .clone();
     let jobs_path =
         meerkat_store::realm_paths_in(layout.state_dir(), meerkat_realm.as_str()).jobs_sqlite_path;
     let jobs: Arc<dyn meerkat::DetachedJobStore> = Arc::new(
@@ -870,7 +836,6 @@ fn build_persistent_session_service(
                 path: layout.runtime_db(),
             },
         )),
-        session_write_epochs,
         committed_boundary_recoverer,
         runtime_store,
         voice_inputs,
@@ -1099,13 +1064,17 @@ fn init_error(request_id: Value, code: i64, message: String) -> Value {
 }
 
 const STORAGE_MIGRATE_USAGE: &str = "usage: meta_gateway storage-migrate --state-dir <dir> \
-     [--apply] [--adopt <path>] [--json]\n\
+     [--apply] [--adopt <path>] [--session-db <file>] [--json]\n\
      Fenced offline migration of one Meta state directory \
      (storage-unification M6): ledger baseline, legacy-spelling renames, \
      twin reconciliation, leftover census.\n\
      Dry-run by default; --apply mutates under the exclusive maintenance \
      fence. --adopt <path> resolves a divergent file-name twin by adopting \
      that copy and archiving the rest read-only (requires --apply).\n\
+     --session-db <file> takes the session database a 0.9.3 meta_gateway's \
+     store_path named into the layout as sessions.sqlite3 (a twin of any other \
+     sessions copy), then leaves a retired stamp at its old path that a 0.9.3 \
+     gateway refuses. Stop every process using the directory first.\n\
      --acknowledge-skipped <SESSION_ID> (repeatable) authorises the ledger \
      bump to proceed despite a blob row that cannot be parsed as a session. \
      Acknowledgement is BY ROW ID, never by count: a row you did not name \
@@ -1120,6 +1089,7 @@ const STORAGE_MIGRATE_USAGE: &str = "usage: meta_gateway storage-migrate --state
 fn run_storage_migrate(args: &[String]) -> i32 {
     let mut state_dir: Option<PathBuf> = None;
     let mut adopt: Option<PathBuf> = None;
+    let mut session_db: Option<PathBuf> = None;
     let mut apply = false;
     let mut json = false;
     let mut acknowledged_rows: std::collections::BTreeSet<String> =
@@ -1138,6 +1108,13 @@ fn run_storage_migrate(args: &[String]) -> i32 {
                 Some(value) => adopt = Some(PathBuf::from(value)),
                 None => {
                     eprintln!("--adopt requires a path\n{STORAGE_MIGRATE_USAGE}");
+                    return 2;
+                }
+            },
+            "--session-db" => match iter.next() {
+                Some(value) => session_db = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("--session-db requires a file\n{STORAGE_MIGRATE_USAGE}");
                     return 2;
                 }
             },
@@ -1177,11 +1154,12 @@ fn run_storage_migrate(args: &[String]) -> i32 {
     } else {
         meerkat_meta::MigrateMode::DryRun
     };
-    let report = meerkat_meta::migrate_state_dir_acknowledging_skipped(
+    let report = meerkat_meta::migrate_state_dir_with_session_db(
         &state_dir,
         mode,
         adopt.as_deref(),
         &acknowledged_rows,
+        session_db.as_deref(),
     );
     if json {
         match serde_json::to_string_pretty(&report) {
@@ -1207,6 +1185,32 @@ fn print_migrate_report_text(report: &meerkat_meta::MetaMigrateReport) {
         report.state_dir.display(),
         report.fenced_databases.len()
     );
+    if let Some(session_db) = &report.session_db {
+        let path = session_db.path.display();
+        match &session_db.outcome {
+            meerkat_meta::SessionDbOutcome::WouldMove => {
+                println!("session database {path}: joins the sessions slot (see renames/twins)");
+            }
+            meerkat_meta::SessionDbOutcome::Moved { tripwire } => println!(
+                "session database {path}: moved into the layout; retired stamp left at {}",
+                tripwire.display()
+            ),
+            meerkat_meta::SessionDbOutcome::AlreadyMoved => {
+                println!("session database {path}: already moved (it holds the retired stamp)");
+            }
+            meerkat_meta::SessionDbOutcome::AlreadyInLayout => {
+                println!("session database {path}: already in the layout");
+            }
+            meerkat_meta::SessionDbOutcome::TripwireOwed => println!(
+                "session database {path}: an earlier run moved it and did not write its retired \
+                 stamp; --apply writes it"
+            ),
+            meerkat_meta::SessionDbOutcome::Refused { refusal } => {
+                println!("session database {path}: REFUSED: {refusal}");
+            }
+            _ => println!("session database {path}: {:?}", session_db.outcome),
+        }
+    }
     if let Some(backfill) = &report.head_canonical_backfill {
         // The head-canonical crossing is the one irreversible thing this verb
         // does, so its outcome is printed before anything else and states
@@ -1624,6 +1628,669 @@ fn load_adoption_mob_config(path: &Path) -> Result<MobDefinition, String> {
     Ok(definition)
 }
 
+const IDENTITY_CENSUS_USAGE: &str = "usage: meta_gateway identity-census --state-dir <dir> \
+     [--scratch-dir <dir>] [--json]\n\
+     Offline, read-only census of the identities a native (0.9.4) state \
+     directory holds. Per identity: the session, generation and mob member \
+     id of Core's last binding, whether the member is live and its runtime \
+     id while it is, the runtime id under which runtime.sqlite holds the \
+     session's authority, whether Core's catalog marks the session \
+     lifecycle-terminal, whether a held completion is owed, and the pending \
+     first-boot row. The bindings are read from the directory's mob store \
+     the way the gateway's identity views read them; in-memory mob storage \
+     keeps none across a restart, so those facts are null there. Run it on \
+     a directory no gateway uses (a copy is fine): a directory a runtime \
+     holds is refused, and so is one that is not in the native layout \
+     (migrate it with storage-migrate-native first). It writes nothing in \
+     the directory: it reads copies of its top-level files, taken into a \
+     temporary directory (or under --scratch-dir) and removed when the run \
+     ends. That location needs free space for those files, runtime.sqlite \
+     included; the registered backups, the quarantined files and the -shm \
+     indexes are not copied.\n\
+     --json prints the report as JSON (format meerkat-meta.identity-census, \
+     version 1).\n\
+     Exit codes: 0 read, 1 refused, 2 usage error.";
+
+/// Maintenance verb: `meta_gateway identity-census`.
+fn run_identity_census(args: &[String]) -> i32 {
+    let mut state_dir: Option<PathBuf> = None;
+    let mut scratch_dir: Option<PathBuf> = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--state-dir" => match iter.next() {
+                Some(value) => state_dir = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("--state-dir requires a directory\n{IDENTITY_CENSUS_USAGE}");
+                    return 2;
+                }
+            },
+            "--scratch-dir" => match iter.next() {
+                Some(value) => scratch_dir = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("--scratch-dir requires a directory\n{IDENTITY_CENSUS_USAGE}");
+                    return 2;
+                }
+            },
+            "--json" => json = true,
+            "--help" | "-h" => {
+                println!("{IDENTITY_CENSUS_USAGE}");
+                return 0;
+            }
+            other => {
+                eprintln!("unknown argument {other:?}\n{IDENTITY_CENSUS_USAGE}");
+                return 2;
+            }
+        }
+    }
+    let Some(state_dir) = state_dir else {
+        eprintln!("--state-dir is required\n{IDENTITY_CENSUS_USAGE}");
+        return 2;
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("failed to start the census runtime: {error}");
+            return 1;
+        }
+    };
+    let report = runtime.block_on(
+        meerkat_meta::storage_migrate_native::identity_census_offline(
+            &state_dir,
+            scratch_dir.as_deref(),
+        ),
+    );
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(error) => {
+                eprintln!("failed to serialize the identity census: {error}");
+                return 1;
+            }
+        }
+    } else {
+        print!("{}", identity_census_text(&report));
+    }
+    i32::from(report.refusal.is_some())
+}
+
+fn identity_census_text(
+    report: &meerkat_meta::storage_migrate_native::IdentityCensusReport,
+) -> String {
+    use meerkat_meta::storage_migrate_native::{IdentityCensusRefusal, PendingFirstBootRow};
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "Identity census of {}:", report.state_dir.display());
+    if let Some(refusal) = &report.refusal {
+        let _ = writeln!(out, "Refused: {refusal:?}");
+        if let IdentityCensusRefusal::NeedsMigration { remedy, .. }
+        | IdentityCensusRefusal::MigrationIncomplete { remedy, .. } = refusal
+        {
+            let _ = writeln!(out, "  {remedy}");
+        }
+        return out;
+    }
+    match &report.mob_store {
+        Some(mob_store) => {
+            let _ = writeln!(out, "  mob store: {}", mob_store.display());
+        }
+        None => {
+            let _ = writeln!(out, "  mob store: none");
+        }
+    }
+    if let Some(note) = report.mob_store_note {
+        let _ = writeln!(out, "  note: {note}");
+    }
+    for entry in &report.identities {
+        let mut line = format!(
+            "  {}: session {}, generation {}, member {}, {}",
+            entry.identity,
+            entry.session_id.as_deref().unwrap_or("-"),
+            entry
+                .generation
+                .map_or_else(|| "-".to_owned(), |generation| generation.to_string()),
+            entry.member_id.as_deref().unwrap_or("-"),
+            if entry.live { "live" } else { "not live" },
+        );
+        if let Some(agent_runtime_id) = &entry.agent_runtime_id {
+            let _ = write!(line, ", agent runtime {agent_runtime_id}");
+        }
+        let _ = write!(
+            line,
+            ", runtime {}",
+            entry.runtime_id.as_deref().unwrap_or("-")
+        );
+        if entry.retired {
+            line.push_str(", retired");
+        }
+        if entry.held_completion_owed {
+            line.push_str(", held completion owed");
+        }
+        match &entry.pending_first_boot_row {
+            Some(PendingFirstBootRow::Resume { session, .. }) => {
+                let _ = write!(line, ", first-boot resume row pending (session {session})");
+            }
+            Some(PendingFirstBootRow::Fresh {
+                retired_session, ..
+            }) => {
+                let _ = write!(
+                    line,
+                    ", first-boot fresh row pending (retired session {retired_session})"
+                );
+            }
+            Some(_) => line.push_str(", first-boot row pending"),
+            None => {}
+        }
+        let _ = writeln!(out, "{line}");
+    }
+    out
+}
+
+const IDENTITY_RESET_USAGE: &str = "usage: meta_gateway identity-reset \
+     --state-dir <dir> --identity <identity> [--mob-store <path>] [--apply] [--json]\n\
+     Give one identity of a stopped state directory a fresh life at its next \
+     start. Nothing in Core is written now: the reset is a row in the \
+     directory's first-boot manifest, naming the session of Core's last \
+     binding of the identity, and the next roster compile that lists the \
+     identity carries it out. A live member is replaced by its successor on a \
+     fresh session and stays live; a retired one gets a fresh session and \
+     stays dormant. The old session stays in Core's store, bound to nothing. \
+     Unlike the online reset, this offline reset distills nothing of the old \
+     session into agent memory.\n\
+     Stop every process that uses the directory first: a process hosting a \
+     runtime is refused, and the directory is held as storage-migrate-native \
+     holds it. The directory must be in the native layout (run \
+     storage-migrate-native first), and Core's member history must bind the \
+     identity to a session. An identity a host adopted (Core holds an identity \
+     intent row for it) is refused: change it through the host that declared \
+     it. A manifest that already holds another row for the identity is \
+     refused: start the runtime once so it is carried out. An identity that \
+     owes its host a held completion (a held-completion mark, and no binding \
+     in Core) is refused: run the host's held bootstrap. Beside a binding the \
+     mark is stale: the next start drops it, and the report says so.\n\
+     A dry run (the default) checks everything and reports the session it \
+     would retire and whether its binding is live or retired; --apply writes \
+     the row, replacing the manifest atomically; identity-reset keeps no copy \
+     of the manifest it rewrites. If the manifest becomes unreadable, move it \
+     aside. If no runtime has started since storage-migrate-native --apply, \
+     restore the copy that run kept and run identity-reset again for every \
+     reset made since; otherwise restore no older copy, start with no \
+     manifest, and run identity-reset again for each reset made since the \
+     last start. Removing the manifest also drops a migration row still \
+     pending for an identity the roster does not list: that identity starts \
+     fresh when it is added back, and nothing reports it, so compare against \
+     the last identity-census output before removing it.\n\
+     The mob store is <dir>/event_log.sqlite3 when present; name another with \
+     --mob-store, as for storage-migrate-native.\n\
+     Exit codes: 0 done, 1 refused, 2 usage error.";
+
+/// Maintenance verb: `meta_gateway identity-reset`.
+fn run_identity_reset(args: &[String]) -> i32 {
+    let mut state_dir: Option<PathBuf> = None;
+    let mut identity: Option<String> = None;
+    let mut mob_store: Option<PathBuf> = None;
+    let mut apply = false;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--state-dir" => match iter.next() {
+                Some(value) => state_dir = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("--state-dir requires a directory\n{IDENTITY_RESET_USAGE}");
+                    return 2;
+                }
+            },
+            "--identity" => match iter.next() {
+                Some(value) => identity = Some(value.clone()),
+                None => {
+                    eprintln!("--identity requires an identity\n{IDENTITY_RESET_USAGE}");
+                    return 2;
+                }
+            },
+            "--mob-store" => match iter.next() {
+                Some(value) => mob_store = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("--mob-store requires a path\n{IDENTITY_RESET_USAGE}");
+                    return 2;
+                }
+            },
+            "--apply" => apply = true,
+            "--json" => json = true,
+            "--help" | "-h" => {
+                println!("{IDENTITY_RESET_USAGE}");
+                return 0;
+            }
+            other => {
+                eprintln!("unknown argument {other:?}\n{IDENTITY_RESET_USAGE}");
+                return 2;
+            }
+        }
+    }
+    let (Some(state_dir), Some(identity)) = (state_dir, identity) else {
+        eprintln!("--state-dir and --identity are required\n{IDENTITY_RESET_USAGE}");
+        return 2;
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("failed to start the reset runtime: {error}");
+            return 1;
+        }
+    };
+    let mut request =
+        meerkat_meta::storage_migrate_native::IdentityResetRequest::new(&state_dir, identity);
+    if let Some(mob_store) = mob_store {
+        request = request.with_mob_store(mob_store);
+    }
+    if apply {
+        request = request.with_apply();
+    }
+    let report = runtime.block_on(meerkat_meta::storage_migrate_native::reset_identity(
+        &request,
+    ));
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(error) => {
+                eprintln!("failed to serialize the reset report: {error}");
+                return 1;
+            }
+        }
+    } else {
+        let mode = if apply { "apply" } else { "dry-run" };
+        println!(
+            "Identity reset ({mode}) of {} in {}:",
+            report.identity,
+            report.state_dir.display()
+        );
+        if let Some(session) = &report.retired_session {
+            let state = report.binding_state.unwrap_or("unknown");
+            println!("  retired session: {session} (binding {state})");
+        }
+        let next_start = if report.binding_state == Some("live") {
+            "the next start replaces the live member by its successor on a fresh session; the \
+             identity stays live"
+        } else {
+            "the next start gives the identity a fresh session; it stays dormant"
+        };
+        if report.stale_held_completion_mark {
+            println!("  a stale held-completion mark names the identity; the next start drops it");
+        }
+        match &report.refusal {
+            Some(refusal) => println!("  REFUSED: {refusal}"),
+            None if report.already_pending => {
+                println!("  the same reset row is already pending; nothing to write");
+            }
+            None if report.written => println!("  wrote the reset row: {next_start}"),
+            None => println!("  clean: --apply writes the reset row, and {next_start}"),
+        }
+    }
+    i32::from(report.refused())
+}
+
+const STORAGE_MIGRATE_NATIVE_USAGE: &str = "usage: meta_gateway storage-migrate-native \
+     --state-dir <dir> [--apply] [--scratch-dir <dir>] [--mob-store <path>] \
+     [--continuity-export <file>] [--discard-bodyless <session id>]... [--json]\n\
+     One-way migration of a 0.9.3 state directory (a gateway's, or an \
+     application's that embeds the runtime builder) onto Meerkat's \
+     native session and identity stores. Stop every process that uses the \
+     directory first: a process hosting a runtime is refused, and while the \
+     census copies the databases every store operation of any other process \
+     fails.\n\
+     A directory already in the native layout has nothing to migrate.\n\
+     A dry run (the default) runs the census: it classifies every session by \
+     comparing runtime.sqlite with the session projection, on scratch \
+     copies, and changes no database in the state directory (a read-only \
+     open of a WAL database may leave its empty -wal and -shm files, and the \
+     maintenance fence empty *.mpresence lock files beside the databases).\n\
+     --apply carries out a clean census: it backs up runtime.sqlite and each \
+     projection database beside them (registered *.pre-* backups the storage \
+     doctor lists), converts runtime.sqlite in place onto Meerkat's native \
+     session store, imports each session only the projection holds, writes \
+     the first-boot manifest of the identities (with a registered copy \
+     beside it), and retires the projection: sessions.sqlite3 becomes a \
+     retired stamp that 0.9.3 refuses, and continuity.sqlite3 keeps its \
+     identity records without session rows. Every step is journaled: a run \
+     that stopped part way leaves its journal, a 0.9.4 runtime refuses to \
+     start on the directory, and running --apply again finishes it once \
+     Core has claimed runtime.sqlite for the conversion, or starts over with \
+     a new census before that.\n\
+     The scratch copies go in a temporary directory beside the state \
+     directory (in its parent), or under --scratch-dir, and are removed \
+     when the run ends.\n\
+     The mob store is <dir>/event_log.sqlite3 when present. An application \
+     that kept its durable mob store under another name or elsewhere names it \
+     with --mob-store; a directory holding another store's composition \
+     manifest is refused until --mob-store names that store.\n\
+     A host whose sessions a continuity provider held passes the file the \
+     continuity export scripts wrote with --continuity-export, and as \
+     --state-dir either a new directory or the host's own state directory \
+     (which holds its runtime.sqlite and no local projection). The census \
+     then compares the export with Core's sessions and each listed identity \
+     with the mob storage.\n\
+     A session whose WholeBlob authority in runtime.sqlite references a \
+     missing body cannot be loaded by any release and refuses the census; \
+     --discard-bodyless <session id> (repeatable) lets --apply discard that \
+     authority after its backup.\n\
+     Exit codes: 0 clean, 1 refusals, 2 usage error.";
+
+/// Maintenance verb: `meta_gateway storage-migrate-native`.
+fn run_storage_migrate_native(args: &[String]) -> i32 {
+    let mut state_dir: Option<PathBuf> = None;
+    let mut scratch_dir: Option<PathBuf> = None;
+    let mut mob_store: Option<PathBuf> = None;
+    let mut continuity_export: Option<PathBuf> = None;
+    let mut discard_bodyless: Vec<String> = Vec::new();
+    let mut apply = false;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--state-dir" => match iter.next() {
+                Some(value) => state_dir = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("--state-dir requires a directory\n{STORAGE_MIGRATE_NATIVE_USAGE}");
+                    return 2;
+                }
+            },
+            "--scratch-dir" => match iter.next() {
+                Some(value) => scratch_dir = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("--scratch-dir requires a directory\n{STORAGE_MIGRATE_NATIVE_USAGE}");
+                    return 2;
+                }
+            },
+            "--mob-store" => match iter.next() {
+                Some(value) => mob_store = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("--mob-store requires a path\n{STORAGE_MIGRATE_NATIVE_USAGE}");
+                    return 2;
+                }
+            },
+            "--continuity-export" => match iter.next() {
+                Some(value) => continuity_export = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!(
+                        "--continuity-export requires a file\n{STORAGE_MIGRATE_NATIVE_USAGE}"
+                    );
+                    return 2;
+                }
+            },
+            "--discard-bodyless" => match iter.next() {
+                Some(value) => discard_bodyless.push(value.clone()),
+                None => {
+                    eprintln!(
+                        "--discard-bodyless requires a session id\n{STORAGE_MIGRATE_NATIVE_USAGE}"
+                    );
+                    return 2;
+                }
+            },
+            "--apply" => apply = true,
+            "--json" => json = true,
+            "--help" | "-h" => {
+                println!("{STORAGE_MIGRATE_NATIVE_USAGE}");
+                return 0;
+            }
+            other => {
+                eprintln!("unknown argument {other:?}\n{STORAGE_MIGRATE_NATIVE_USAGE}");
+                return 2;
+            }
+        }
+    }
+    let Some(state_dir) = state_dir else {
+        eprintln!("--state-dir is required\n{STORAGE_MIGRATE_NATIVE_USAGE}");
+        return 2;
+    };
+    let mode = if apply {
+        meerkat_meta::MigrateMode::Apply
+    } else {
+        meerkat_meta::MigrateMode::DryRun
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("failed to start the migration runtime: {error}");
+            return 1;
+        }
+    };
+    let mut request =
+        meerkat_meta::storage_migrate_native::NativeMigrateRequest::new(&state_dir, mode);
+    if let Some(scratch_dir) = scratch_dir {
+        request = request.with_scratch_dir(scratch_dir);
+    }
+    if let Some(mob_store) = mob_store {
+        request = request.with_mob_store(mob_store);
+    }
+    if let Some(continuity_export) = continuity_export {
+        request = request.with_continuity_export(continuity_export);
+    }
+    for session_id in discard_bodyless {
+        request = request.with_discard_bodyless(session_id);
+    }
+    let report =
+        runtime.block_on(meerkat_meta::storage_migrate_native::migrate_state_dir_native(&request));
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(error) => {
+                eprintln!("failed to serialize the migration report: {error}");
+                return 1;
+            }
+        }
+    } else {
+        print!("{}", native_migrate_report_text(&report));
+    }
+    i32::from(report.has_refusals())
+}
+
+fn native_migrate_report_text(
+    report: &meerkat_meta::storage_migrate_native::NativeMigrateReport,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mode = match report.mode {
+        meerkat_meta::MigrateMode::Apply => "apply",
+        _ => "dry-run",
+    };
+    let shape = report
+        .shape
+        .map(|shape| format!("{shape:?}"))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let _ = writeln!(
+        out,
+        "Native storage migration ({mode}) of {} (shape: {shape}):",
+        report.state_dir.display()
+    );
+    if let Some(layout) = &report.layout {
+        let _ = writeln!(out, "  layout: {layout}");
+    }
+    if let Some(mob_storage) = &report.mob_storage {
+        let _ = writeln!(out, "  mob storage: {mob_storage}");
+    }
+    if let Some(export) = &report.continuity_export {
+        let _ = writeln!(
+            out,
+            "  continuity export: {} ({:?}; written by {}; {} entries, {} ready; entries_sha256 {})",
+            export.path.display(),
+            export.mode,
+            export.writer,
+            export.entries,
+            export.ready,
+            export.entries_sha256
+        );
+    }
+    for row in &report.sessions {
+        let verdict = if row.admitted { "ok" } else { "REFUSED" };
+        let identities = if row.identities.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", row.identities.join(", "))
+        };
+        let _ = writeln!(
+            out,
+            "  {verdict} {:?} {}{identities}: {}",
+            row.class, row.session_id, row.detail
+        );
+        if let Some(effect) = &row.apply_effect {
+            let _ = writeln!(out, "      on --apply: {effect}");
+        }
+        if let Some(action) = &row.action {
+            let _ = writeln!(out, "      action: {action}");
+        }
+    }
+    for (class, count) in report.class_counts() {
+        let _ = writeln!(out, "  {class}: {count}");
+    }
+    let _ = writeln!(out, "  identity census: {:?}", report.identity_census);
+    for row in &report.identities {
+        let verdict = if row.admitted { "ok" } else { "REFUSED" };
+        let _ = writeln!(
+            out,
+            "  {verdict} {:?} {}: {}",
+            row.class, row.identity, row.detail
+        );
+        if let Some(action) = &row.action {
+            let _ = writeln!(out, "      action: {action}");
+        }
+    }
+    for row in &report.first_boot {
+        let _ = writeln!(out, "  first boot: {row:?}");
+    }
+    if let Some(applied) = &report.applied {
+        let _ = writeln!(
+            out,
+            "  applied{}: {} runtime(s) seeded from their committed bodies, {} converted from \
+             session rows",
+            if applied.resumed {
+                " (finished an interrupted run)"
+            } else if applied.restarted {
+                " (started over: an interrupted run had not started converting runtime.sqlite)"
+            } else {
+                ""
+            },
+            applied.runtimes_seeded,
+            applied.runtimes_derived
+        );
+        for imported in &applied.imported {
+            let _ = writeln!(
+                out,
+                "  imported: {} (row {:?}, crossing {:?}, activation {:?})",
+                imported.session_id, imported.row, imported.crossing, imported.activation
+            );
+        }
+        if let Some(digest) = &applied.first_boot_manifest_sha256 {
+            let _ = writeln!(out, "  first-boot manifest written: rows_sha256 {digest}");
+        }
+        for retired in &applied.retired {
+            let _ = writeln!(out, "  retired: {retired}");
+        }
+        for discarded in &applied.discarded {
+            let leftovers = discarded
+                .leftover_rows
+                .iter()
+                .map(|(table, rows)| format!("{table}: {rows}"))
+                .collect::<Vec<_>>();
+            let _ = writeln!(
+                out,
+                "  discarded the body-less WholeBlob authority of session {} (runtime {}); rows \
+                 Core keeps for it: {}",
+                discarded.session_id,
+                discarded.runtime_id,
+                if leftovers.is_empty() {
+                    "none".to_owned()
+                } else {
+                    leftovers.join(", ")
+                }
+            );
+        }
+        for backup in &applied.backups {
+            let _ = writeln!(out, "  backup: {}", backup.display());
+        }
+    }
+    if matches!(
+        report.layout,
+        Some(meerkat_meta::storage_migrate_native::NativeLayoutStatus::Native)
+    ) {
+        let _ = writeln!(out, "Nothing to migrate.");
+    } else if report.applied.is_some() && report.refusals.is_empty() {
+        let _ = writeln!(out, "Applied: the directory is in the native layout.");
+    } else if report.refusals.is_empty() {
+        let _ = writeln!(out, "Clean: every session is admitted.");
+    } else {
+        let _ = writeln!(out, "Refused:");
+        for refusal in &report.refusals {
+            let _ = writeln!(out, "  {refusal:?}");
+            for remedy in native_refusal_remedies(&report.state_dir, refusal) {
+                let _ = writeln!(out, "      remedy: {remedy}");
+            }
+        }
+    }
+    out
+}
+
+/// The step the text report names under a refusal the operator answers
+/// with a flag or a file.
+fn native_refusal_remedies(
+    state_dir: &Path,
+    refusal: &meerkat_meta::storage_migrate_native::NativeMigrateRefusal,
+) -> Vec<String> {
+    use meerkat_meta::storage_migrate_native::NativeMigrateRefusal;
+    match refusal {
+        NativeMigrateRefusal::MobStoreUnnamed { manifests } => manifests
+            .iter()
+            .map(|manifest| {
+                let store = manifest
+                    .strip_suffix(".composition.json")
+                    .unwrap_or(manifest);
+                format!("pass --mob-store {}", state_dir.join(store).display())
+            })
+            .collect(),
+        NativeMigrateRefusal::MobStoreManifestWithoutStore { store, .. } => vec![format!(
+            "restore {}, or pass --mob-store <path> naming where that store is now",
+            store.display()
+        )],
+        NativeMigrateRefusal::SpellingTwins { files, .. } => vec![format!(
+            "two spellings of one database ({}): run `meta_gateway storage-migrate --state-dir {} \
+             --apply` first, which resolves them",
+            files.join(", "),
+            state_dir.display()
+        )],
+        NativeMigrateRefusal::UnrecognizedSessionDatabase { file } => vec![format!(
+            "run `meta_gateway storage-migrate --state-dir {dir} --session-db {dir}/{file} \
+             --apply` before anything else; if a 0.9.4 runtime has already used the directory, \
+             that step refuses and the file has to be moved out of the state directory",
+            dir = state_dir.display()
+        )],
+        NativeMigrateRefusal::DiscardNotBodiless { session_id } => vec![format!(
+            "the census found no body-less WholeBlob authority for session {session_id}: drop \
+             it from --discard-bodyless"
+        )],
+        NativeMigrateRefusal::NoProjection => vec![format!(
+            "if 0.9.3 ever ran with store_path naming a file, run `meta_gateway storage-migrate \
+             --state-dir {} --session-db <file> --apply` first",
+            state_dir.display()
+        )],
+        NativeMigrateRefusal::MigrationJournalUnreadable { .. } => vec![format!(
+            "restore runtime.sqlite and each projection file in {} from their \
+             *.pre-*.native-migration backups, then remove the journal; removing the journal \
+             alone leaves a directory neither release reads",
+            state_dir.display()
+        )],
+        _ => Vec::new(),
+    }
+}
+
 const STORAGE_PRUNE_USAGE: &str = "usage: meta_gateway storage-prune --state-dir <dir> \
      [--apply] [--older-than-days N] [--json]\n\
      Lifecycle of registered maintenance artifacts (`*.pre-*` backups, \
@@ -1771,6 +2438,15 @@ fn main() {
     }
     if args.first().map(String::as_str) == Some("storage-adopt-predecessor") {
         std::process::exit(run_storage_adopt_predecessor(&args[1..]));
+    }
+    if args.first().map(String::as_str) == Some("storage-migrate-native") {
+        std::process::exit(run_storage_migrate_native(&args[1..]));
+    }
+    if args.first().map(String::as_str) == Some("identity-reset") {
+        std::process::exit(run_identity_reset(&args[1..]));
+    }
+    if args.first().map(String::as_str) == Some("identity-census") {
+        std::process::exit(run_identity_census(&args[1..]));
     }
     // Predecessor environment variables would be silently ignored by this
     // build; refuse instead (the maintenance verbs above stay usable).
@@ -1935,6 +2611,13 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         )
     })?;
     let layout = MetaStorageLayout::standalone_from_store_path(&store_path, gateway_home.clone());
+    meerkat_meta::native_startup::refuse_session_database_override(&layout).map_err(|error| {
+        refuse_init(
+            &request_id,
+            meerkat_meta::STORAGE_RESOLUTION_CODE,
+            error.to_string(),
+        )
+    })?;
     let persistent_sessions = params.persistent_sessions.unwrap_or(false);
     // Host-level compaction policy: validated once here so a typo or a zero
     // threshold is an init error, not a dead knob or a compaction storm.
@@ -2141,6 +2824,43 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             )
         })?
         .with_advertised_base_url(declared_public_base_url);
+    // One Meta runtime per state directory: a launch that opens stores in it
+    // (persistent sessions, or the identity substrate) claims it first. The
+    // claim is held for the rest of this run; the kernel releases it when
+    // the gateway exits.
+    let _state_dir_claim = if persistent_sessions || identity_first {
+        Some(
+            meerkat_meta::state_dir_claim::StateDirClaim::acquire(layout.state_dir()).map_err(
+                |error| {
+                    refuse_init(
+                        &request_id,
+                        meerkat_meta::STORAGE_RESOLUTION_CODE,
+                        error.to_string(),
+                    )
+                },
+            )?,
+        )
+    } else {
+        None
+    };
+    // The persistent launch opens Core's stores in the state directory:
+    // before any of them opens, no other process hosts runtimes there, the
+    // layout is native, and identity bindings still have their runtime store.
+    // Its mob storage is always the durable event log.
+    if persistent_sessions {
+        meerkat_meta::native_startup::refuse_unready_state_dir(
+            layout.state_dir(),
+            Some(&layout.event_log_db()),
+        )
+        .await
+        .map_err(|error| {
+            refuse_init(
+                &request_id,
+                meerkat_meta::STORAGE_RESOLUTION_CODE,
+                error.to_string(),
+            )
+        })?;
+    }
     let http_base_url = http_binding.http_base_url();
     let http_public_base_url = http_binding.advertised_base_url().map(str::to_string);
 
@@ -2181,7 +2901,6 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             schedule_host_inputs,
             workgraph,
             resolved_storage,
-            session_write_epochs,
             committed_boundary_recoverer,
             runtime_store,
             voice_inputs,
@@ -2220,16 +2939,19 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         let (mob_storage, mob_storage_provenance) =
             meerkat_meta::mob_composition_manifest::persistent_mob_storage(layout.event_log_db())?;
         let mut spec = MobBootstrapSpec::new(definition, mob_storage, service)
+            // The config `build_persistent_session_service` gave the member
+            // builder: the same producer over the same inputs.
+            .with_member_model_config(Arc::new(gateway_agent_config(
+                host_config.as_ref(),
+                compaction_policy.as_ref(),
+            )?))
             .with_member_mcp_custody(Arc::clone(&member_mcp_custody))
             .with_host_default_agent_llm_client_decorator(host_default_decorator)
             .with_mob_storage_provenance(mob_storage_provenance)
             // Agent-created child mobs default to durable under this layout.
             .with_meta_storage_layout(layout.clone())
-            .with_session_write_epochs(&session_write_epochs)
-            // The SAME facade handed to MeerkatMachine::persistent above.
-            // The durable-authority convergence memo is per-facade, so a
-            // different instance here would warm nothing.
-            .with_runtime_authority_prewarm(&runtime_store)
+            // The SAME store handed to MeerkatMachine::persistent above.
+            .with_durable_runtime_store(&runtime_store)
             // Resume-seam reads must carry the runtime store's archived
             // terminal (at 0.8.11 archive stamps the catalog/lifecycle row,
             // never the session body).
@@ -2286,11 +3008,6 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             Arc::new(Base64BlobStoreAdapter::new(binary_blob_store.clone()));
         let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
-        // Same write-epoch facade as the persistent path: the console
-        // discovery gate is composition-independent, and the witness is
-        // sound for any store as long as every write goes through it.
-        let (runtime_store, session_write_epochs) =
-            meerkat_meta::mob_handle_runtime::epoch_tracking_runtime_store(runtime_store);
         let adapter = Arc::new(
             meerkat_runtime::MeerkatMachine::persistent(
                 Arc::clone(&runtime_store),
@@ -2321,6 +3038,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         // Same producer as the persistent arm: host config first, the
         // compaction declaration on top.
         let config = gateway_agent_config(host_config.as_ref(), compaction_policy.as_ref())?;
+        let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
         builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
@@ -2359,13 +3077,11 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             .acquire_canonical_runtime_adapter(Some(Arc::clone(&adapter)))
             .context("failed to acquire the process-local gateway session runtime owner")?;
         let mut spec = MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
+            .with_member_model_config(member_model_config)
             .with_member_mcp_custody(Arc::clone(&member_mcp_custody))
             .with_host_default_agent_llm_client_decorator(host_default_decorator)
-            .with_session_write_epochs(&session_write_epochs)
-            // The SAME facade handed to MeerkatMachine::persistent above.
-            // The durable-authority convergence memo is per-facade, so a
-            // different instance here would warm nothing.
-            .with_runtime_authority_prewarm(&runtime_store)
+            // The SAME store handed to MeerkatMachine::persistent above.
+            .with_durable_runtime_store(&runtime_store)
             .with_session_runtime_adapter(adapter.clone())
             .context("failed to acquire the gateway session runtime owner")?
             .with_workgraph_service(workgraph_service.clone())
@@ -2501,6 +3217,15 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             .map_err(|error| anyhow!("failed to load {}: {error}", access_path.display()))?;
         runtime.set_access_controller(controller);
     }
+    // The Console's session fence record (revoked sessions, principals whose
+    // tokens never expire) lives in the state directory, in a file of its
+    // own. A declared-ephemeral state root keeps none: a revocation there is
+    // refused rather than lost at the next start.
+    if !layout.is_declared_ephemeral() {
+        let fences = meerkat_meta::ConsoleSessionFences::open_in_state_dir(layout.state_dir())
+            .map_err(|error| anyhow!("failed to open the console session fence record: {error}"))?;
+        runtime.set_console_session_fences(fences);
+    }
     // Without an enforced access controller the Flow Editor refuses host
     // deploys unless the launch opted in.
     if flow_editor_host_deploy {
@@ -2560,6 +3285,11 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         if let Some(recoverer) = runtime.mob_runtime().committed_boundary_recoverer() {
             bridge = bridge.with_committed_boundary_recoverer(recoverer);
         }
+        // Image deliveries are judged with the member builder's host config,
+        // so a self-hosted model's `vision` flag counts.
+        if let Some(config) = runtime.mob_runtime().member_model_config() {
+            bridge = bridge.with_member_model_config(config);
+        }
         // Governed binding pins the member session actor's actual controller
         // through the concrete session owner.
         if let Some(source) = runtime.mob_runtime().controller_pin_source() {
@@ -2606,6 +3336,13 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
                 .as_ref()
                 .and_then(meerkat_meta::identity_first::SessionRepairScope::from_resolved_storage),
         );
+        // `storage-migrate-native` leaves the first-boot manifest of a
+        // migrated state directory there; the first roster compile carries
+        // it out. The ephemeral launch has no state directory to migrate.
+        irt.set_first_boot_state_dir(persistent_sessions.then(|| store_dir.to_path_buf()));
+        // The held-completion marks a held bootstrap left in the same
+        // directory refuse an ordinary wake of their members here too.
+        irt.set_held_completion_state_dir(persistent_sessions.then(|| store_dir.to_path_buf()));
 
         let roster = Arc::new(MutableRosterProvider::new(identity_roster_seed));
         let mob_definition = mob_handle.definition().clone();
@@ -3796,6 +4533,130 @@ mod tests {
         assert_ne!(
             pinned_key, lower_key,
             "two different thresholds must not share a runtime"
+        );
+        Ok(())
+    }
+
+    /// The text report says "Nothing to migrate." for a directory the
+    /// predicate reads as native, and only then.
+    #[test]
+    fn the_native_report_says_nothing_to_migrate_only_for_a_native_directory() -> anyhow::Result<()>
+    {
+        use meerkat_meta::storage_migrate_native::{
+            NATIVE_MIGRATION_JOURNAL_FILE_NAME, NativeLayoutStatus, NativeMigrateRequest,
+            migrate_state_dir_native,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let census = |dir: &Path| {
+            runtime.block_on(migrate_state_dir_native(&NativeMigrateRequest::new(
+                dir,
+                meerkat_meta::MigrateMode::DryRun,
+            )))
+        };
+
+        let native = tempfile::tempdir()?;
+        let report = census(native.path());
+        assert!(
+            matches!(report.layout, Some(NativeLayoutStatus::Native)),
+            "{report:?}"
+        );
+        let text = native_migrate_report_text(&report);
+        assert!(text.ends_with("Nothing to migrate.\n"), "{text}");
+
+        let unfinished = tempfile::tempdir()?;
+        std::fs::write(
+            unfinished.path().join(NATIVE_MIGRATION_JOURNAL_FILE_NAME),
+            b"{}",
+        )?;
+        let report = census(unfinished.path());
+        let text = native_migrate_report_text(&report);
+        assert!(!text.contains("Nothing to migrate."), "{text}");
+        assert!(text.contains("MigrationIncomplete"), "{text}");
+        Ok(())
+    }
+
+    /// The text report names the remedy under each mob-store refusal: the
+    /// --mob-store a foreign store's manifest asks for, and what to do when
+    /// the directory's own store's manifest is there without the store.
+    #[test]
+    fn the_native_report_names_the_mob_store_remedies() -> anyhow::Result<()> {
+        use meerkat_meta::storage_migrate_native::{
+            NativeMigrateRequest, migrate_state_dir_native,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let parent = tempfile::tempdir()?;
+        let state = parent.path().join("state");
+        std::fs::create_dir(&state)?;
+        for file in ["runtime.sqlite", "sessions.sqlite3"] {
+            std::fs::write(state.join(file), b"")?;
+        }
+        let census = || {
+            runtime.block_on(migrate_state_dir_native(&NativeMigrateRequest::new(
+                &state,
+                meerkat_meta::MigrateMode::DryRun,
+            )))
+        };
+
+        std::fs::write(state.join("mob.sqlite3.composition.json"), b"{}")?;
+        let text = native_migrate_report_text(&census());
+        assert!(
+            text.contains(&format!(
+                "\n      remedy: pass --mob-store {}\n",
+                state.join("mob.sqlite3").display()
+            )),
+            "{text}"
+        );
+
+        std::fs::remove_file(state.join("mob.sqlite3.composition.json"))?;
+        std::fs::write(state.join("event_log.sqlite3.composition.json"), b"{}")?;
+        let text = native_migrate_report_text(&census());
+        assert!(text.contains("MobStoreManifestWithoutStore"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "\n      remedy: restore {}, or pass --mob-store <path> naming where that \
+                 store is now\n",
+                state.join("event_log.sqlite3").display()
+            )),
+            "{text}"
+        );
+        Ok(())
+    }
+
+    /// The text report names the mob storage the census read: in memory
+    /// when the directory holds no mob store, else the store's path.
+    #[test]
+    fn the_native_report_names_the_mob_storage_it_read() -> anyhow::Result<()> {
+        use meerkat_meta::storage_migrate_native::{
+            NativeMigrateRequest, migrate_state_dir_native,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let parent = tempfile::tempdir()?;
+        let state = parent.path().join("state");
+        std::fs::create_dir(&state)?;
+        for file in ["runtime.sqlite", "sessions.sqlite3"] {
+            std::fs::write(state.join(file), b"")?;
+        }
+        let census = || {
+            runtime.block_on(migrate_state_dir_native(&NativeMigrateRequest::new(
+                &state,
+                meerkat_meta::MigrateMode::DryRun,
+            )))
+        };
+        let text = native_migrate_report_text(&census());
+        assert!(text.contains("\n  mob storage: in memory\n"), "{text}");
+
+        let store = state.join("event_log.sqlite3");
+        std::fs::write(&store, b"")?;
+        let text = native_migrate_report_text(&census());
+        assert!(
+            text.contains(&format!("\n  mob storage: {}\n", store.display())),
+            "{text}"
         );
         Ok(())
     }

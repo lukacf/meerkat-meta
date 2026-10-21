@@ -465,10 +465,10 @@ def compare_installed_meta_toolkit_wheels(meta, toolkit, *, deployment_root,
     """
     if __package__ == "launchkit.templates":
         from ..sdk_wheel_integrity import (WheelIntegrityFacts, MAX_WHEEL_FILES, MAX_WHEEL_TOTAL,
-            SUPPORTED_META_VERSIONS)
+            SUPPORTED_META_VERSIONS, SUPPORTED_TOOLKIT_VERSIONS)
     else:
         from sdk_wheel_integrity import (WheelIntegrityFacts, MAX_WHEEL_FILES, MAX_WHEEL_TOTAL,
-            SUPPORTED_META_VERSIONS)
+            SUPPORTED_META_VERSIONS, SUPPORTED_TOOLKIT_VERSIONS)
     facts = (meta, toolkit)
     require(execute_command is None or callable(execute_command),
         "Installed SDK comparison needs its original selected interpreter executor.")
@@ -476,7 +476,8 @@ def compare_installed_meta_toolkit_wheels(meta, toolkit, *, deployment_root,
     required = ({"meerkat_meta/builder.py", "meerkat_meta/runtime.py", "meerkat_meta/_transport.py"},
                 {"meerkat_toolkit/application_runtime.py", "meerkat_toolkit/host_control.py"})
     for item, (distribution, versions), modules in zip(facts,
-            (("meerkat-meta", SUPPORTED_META_VERSIONS), ("meerkat-toolkit", {"0.9.0"})), required):
+            (("meerkat-meta", SUPPORTED_META_VERSIONS),
+             ("meerkat-toolkit", SUPPORTED_TOOLKIT_VERSIONS)), required):
         require(type(item) is WheelIntegrityFacts and item.distribution == distribution
             and type(item.version) is str and item.version in versions and isinstance(item.sha256, str)
             and re.fullmatch(r"[a-f0-9]{64}", item.sha256)

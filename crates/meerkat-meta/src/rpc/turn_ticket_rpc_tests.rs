@@ -18,14 +18,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::identity_first::contracts::{ContinuityStore, LeaseProvider};
+use crate::identity_first::core_test_bridge::{bind_live, register_live};
+use crate::identity_first::core_test_members::CoreTestMembers;
 use crate::identity_first::{
     AgentAddressability, AgentBuildDraft, AgentIdentity, AgentRuntimeId, BridgeAdmissionError,
-    BridgeDelivery, BridgeError, BridgeTurnReceipt, CheckpointVersion, ContinuityGeneration,
-    ContinuityRecord, DurabilityPolicy, DurableAgentSpec, FencingToken, GovernedDelivery,
-    GovernedDeliveryCustody, GovernedInputError, IdentityLifecycleState, IdentityRuntime,
-    IdentityRuntimeConfig, LeaseGrant, LocalContinuityStore, LocalLeaseProvider, MemberInspection,
-    MutableRosterProvider, ResumeSessionOutcome, SessionBridge, SessionSnapshot, TurnOutcome,
-    TurnOutput, TurnTicket, TurnTracking,
+    BridgeDelivery, BridgeError, BridgeTurnReceipt, DurabilityPolicy, DurableAgentSpec,
+    GovernedDelivery, GovernedDeliveryCustody, GovernedInputError, IdentityRuntime,
+    IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider, MemberInspection,
+    MutableRosterProvider, ResumeRejectionKind, ResumeSessionOutcome, SessionBridge,
+    SessionSnapshot, TurnOutcome, TurnOutput, TurnTicket, TurnTracking,
 };
 use async_trait::async_trait;
 use meerkat_client::{LlmError, LlmEvent, LlmRequest};
@@ -102,6 +103,12 @@ struct TicketBridge {
     external_governed: AtomicUsize,
     /// Every governed delivery through the trusted host's internal door.
     internal_governed: AtomicUsize,
+    /// The members Core holds behind this bridge: the identity runtime reads
+    /// each identity's status, runtime id and session from them.
+    core: CoreTestMembers,
+    /// When set, Core refuses every resume for good (the session is
+    /// archived, not revivable): a wake ends as a final refusal.
+    refuses_resume: std::sync::atomic::AtomicBool,
 }
 
 impl TicketBridge {
@@ -130,6 +137,8 @@ impl TicketBridge {
             governed_controller_reads: AtomicUsize::new(0),
             external_governed: AtomicUsize::new(0),
             internal_governed: AtomicUsize::new(0),
+            core: CoreTestMembers::default(),
+            refuses_resume: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -195,29 +204,117 @@ impl TicketBridge {
 
 #[async_trait]
 impl SessionBridge for TicketBridge {
+    /// Core's successor transition (reset, `delete_identity`): the live
+    /// member is replaced by its successor on a fresh session, one
+    /// generation up.
+    async fn reset_member_to_successor(
+        &self,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
+        _draft: &AgentBuildDraft,
+    ) -> Result<crate::identity_first::MemberRuntimeBinding, BridgeError> {
+        let generation = self
+            .core
+            .last_member_binding(identity)?
+            .map_or(0, |binding| binding.generation().get() + 1);
+        let binding = crate::identity_first::MemberRuntimeBinding {
+            agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{identity}:{generation}"))
+                .map_err(|error| BridgeError::Mob(error.to_string()))?,
+            session_id: Some(meerkat_core::types::SessionId::new()),
+        };
+        self.core.bind(identity, &binding, &spec.profile);
+        Ok(binding)
+    }
     async fn create_session(
         &self,
-        _identity: &AgentIdentity,
-        _runtime_id: &AgentRuntimeId,
-        _spec: &DurableAgentSpec,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
-        session_id: &meerkat_core::types::SessionId,
-    ) -> Result<meerkat_core::types::SessionId, BridgeError> {
-        Ok(session_id.clone())
+    ) -> Result<crate::identity_first::MemberRuntimeBinding, BridgeError> {
+        let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+            .map_err(|error| BridgeError::Mob(error.to_string()))?;
+        let session_id = &meerkat_core::types::SessionId::new();
+        let binding = crate::identity_first::MemberRuntimeBinding {
+            agent_runtime_id,
+            session_id: Some(session_id.clone()),
+        };
+        self.core.bind(identity, &binding, &spec.profile);
+        Ok(binding)
     }
 
     async fn resume_session(
         &self,
-        _identity: &AgentIdentity,
-        _runtime_id: &AgentRuntimeId,
-        _spec: &DurableAgentSpec,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
         session_id: &meerkat_core::types::SessionId,
-        _snapshot: &SessionSnapshot,
+        _resume_from_role: Option<&meerkat_mob::ProfileName>,
     ) -> Result<ResumeSessionOutcome, BridgeError> {
+        if self.refuses_resume.load(Ordering::SeqCst) {
+            return Err(BridgeError::ResumeRejected {
+                kind: ResumeRejectionKind::Unavailable {
+                    reason:
+                        meerkat_mob::error::SessionResumeUnavailableReason::ArchivedNotRevivable,
+                },
+                session_id: session_id.clone(),
+                detail: "the session is archived and cannot be revived".to_string(),
+            });
+        }
+        let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+            .map_err(|error| BridgeError::Mob(error.to_string()))?;
+        self.core.bind(
+            identity,
+            &crate::identity_first::MemberRuntimeBinding {
+                agent_runtime_id: agent_runtime_id.clone(),
+                session_id: Some(session_id.clone()),
+            },
+            &spec.profile,
+        );
         Ok(ResumeSessionOutcome::Resumed {
             session_id: session_id.clone(),
+            agent_runtime_id,
         })
+    }
+
+    async fn live_member(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+        self.core.live_member(identity)
+    }
+
+    async fn live_member_scope(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+        self.core.live_member_scope(identity)
+    }
+
+    async fn ensure_member_live(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+        self.core.live_member(identity)
+    }
+
+    async fn member_binding_history(
+        &self,
+    ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+        self.core.history()
+    }
+
+    async fn last_member_binding(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+        self.core.last_member_binding(identity)
+    }
+
+    async fn identity_management(
+        &self,
+        _identity: &AgentIdentity,
+    ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+        Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
     }
 
     async fn deliver_admitted(
@@ -322,7 +419,9 @@ impl SessionBridge for TicketBridge {
         Ok(SessionSnapshot { data: Vec::new() })
     }
 
-    async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+    async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+        // Core retires the member; its history keeps the binding retired.
+        self.core.retire(runtime_id);
         Ok(())
     }
 
@@ -354,41 +453,29 @@ fn make_runtime(bridge: Option<Arc<dyn SessionBridge>>) -> Arc<IdentityRuntime> 
     }))
 }
 
-/// Register an Active identity bound to `session`, the session the bridge
-/// resolves every turn onto (so no delivery looks like a rotation).
+/// Register an identity Core holds live at generation 0, bound to
+/// `session`: the session the bridge resolves every turn onto (so no
+/// delivery looks like a rotation). Core's fence of that member is 1.
 async fn register_spec(
     runtime: &IdentityRuntime,
+    bridge: &TicketBridge,
     spec: DurableAgentSpec,
     session: &meerkat_core::types::SessionId,
 ) -> AgentIdentity {
     let identity = spec.identity.clone();
-    runtime
-        .register(
-            spec,
-            IdentityLifecycleState::Active,
-            Some(ContinuityRecord {
-                identity: identity.clone(),
-                agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{identity}")).unwrap(),
-                session_id: session.clone(),
-                generation: ContinuityGeneration::new(0),
-                checkpoint_version: CheckpointVersion::new(0),
-            }),
-            Some(LeaseGrant {
-                identity: identity.clone(),
-                fencing_token: FencingToken::new(1),
-                ttl: Duration::from_mins(5),
-            }),
-        )
-        .await;
+    register_live(runtime, &bridge.core, spec, 0, session.clone())
+        .await
+        .unwrap();
     identity
 }
 
 async fn register_bound(
     runtime: &IdentityRuntime,
+    bridge: &TicketBridge,
     name: &str,
     session: &meerkat_core::types::SessionId,
 ) -> AgentIdentity {
-    register_spec(runtime, make_spec(name), session).await
+    register_spec(runtime, bridge, make_spec(name), session).await
 }
 
 fn tracked(turn: &TurnTracking) -> TurnTicket {
@@ -612,6 +699,7 @@ async fn live_runtime_with(
         .lease_provider(Arc::new(LocalLeaseProvider::new()))
         .roster_provider(roster.clone())
         .scratch_dir(scratch.path())
+        .ephemeral_runtime_store(true)
         .identity_runtime_instance_id("turn-tickets-live")
         .default_llm_client(Arc::new(client.clone()))
         .build()
@@ -656,7 +744,7 @@ async fn completion_cursor_rpc_never_inspects_the_member() {
     let session = meerkat_core::types::SessionId::new();
     let bridge = TicketBridge::new(true, session.clone());
     let identity_runtime = make_runtime(Some(bridge.clone()));
-    let watcher = register_bound(&identity_runtime, "watcher", &session).await;
+    let watcher = register_bound(&identity_runtime, &bridge, "watcher", &session).await;
     let ctx = crate::rpc::IdentityFirstContext {
         runtime: crate::identity_first::PublicIdentityRuntime::new(
             identity_runtime.clone(),
@@ -795,7 +883,7 @@ async fn rpc_reply(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_for_completion_rpc_resolves_on_the_completion_signal() {
     let (live, bridge, identity_runtime, ctx, session) = ticket_bridge_rpc().await;
-    let watcher = register_bound(&identity_runtime, "watcher", &session).await;
+    let watcher = register_bound(&identity_runtime, &bridge, "watcher", &session).await;
     let baseline = identity_runtime.completion_cursor(&watcher).await;
 
     let wait = rpc(
@@ -845,8 +933,8 @@ async fn wait_for_completion_rpc_resolves_on_the_completion_signal() {
 /// the wait as `incarnation_changed`, never as progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_for_completion_rpc_reports_deadline_and_incarnation_change() {
-    let (live, _bridge, identity_runtime, ctx, session) = ticket_bridge_rpc().await;
-    let watcher = register_bound(&identity_runtime, "watcher", &session).await;
+    let (live, bridge, identity_runtime, ctx, session) = ticket_bridge_rpc().await;
+    let watcher = register_bound(&identity_runtime, &bridge, "watcher", &session).await;
     let baseline = identity_runtime.completion_cursor(&watcher).await;
     let after = json!({"epoch": baseline.epoch.get(), "turns": baseline.turns});
 
@@ -867,25 +955,17 @@ async fn wait_for_completion_rpc_reports_deadline_and_incarnation_change() {
     );
     let rotate = async {
         tokio::task::yield_now().await;
-        // A new lease grant is a new runtime incarnation.
-        identity_runtime
-            .register(
-                make_spec("watcher"),
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: watcher.clone(),
-                    agent_runtime_id: AgentRuntimeId::parse("rt:watcher").unwrap(),
-                    session_id: session.clone(),
-                    generation: ContinuityGeneration::new(0),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                Some(LeaseGrant {
-                    identity: watcher.clone(),
-                    fencing_token: FencingToken::new(2),
-                    ttl: Duration::from_mins(5),
-                }),
-            )
-            .await;
+        // A new runtime incarnation: Core respawned the member at
+        // generation 1 (fence 2). The re-registration wakes the wait.
+        bind_live(
+            &bridge.core,
+            &watcher,
+            &make_spec("watcher").profile,
+            1,
+            Some(session.clone()),
+        )
+        .unwrap();
+        identity_runtime.register(make_spec("watcher")).await;
     };
     let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(wait, rotate)
@@ -911,7 +991,7 @@ async fn wait_for_completion_rpc_reports_deadline_and_incarnation_change() {
 /// registered: it resolves on the identity's first recorded completion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_for_completion_rpc_readiness_waits_for_the_first_completion() {
-    let (live, _bridge, identity_runtime, ctx, session) = ticket_bridge_rpc().await;
+    let (live, bridge, identity_runtime, ctx, session) = ticket_bridge_rpc().await;
     let wait = rpc(
         &live.runtime,
         &ctx,
@@ -920,7 +1000,7 @@ async fn wait_for_completion_rpc_readiness_waits_for_the_first_completion() {
     );
     let materialize = async {
         tokio::task::yield_now().await;
-        let latecomer = register_bound(&identity_runtime, "latecomer", &session).await;
+        let latecomer = register_bound(&identity_runtime, &bridge, "latecomer", &session).await;
         tokio::task::yield_now().await;
         identity_runtime.record_turn_completed(&latecomer).await;
     };
@@ -940,7 +1020,7 @@ async fn wait_for_completion_rpc_readiness_waits_for_the_first_completion() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_for_turn_rpc_resolves_when_the_ticket_settles() {
     let (live, bridge, identity_runtime, ctx, session) = ticket_bridge_rpc().await;
-    let keeper = register_bound(&identity_runtime, "keeper", &session).await;
+    let keeper = register_bound(&identity_runtime, &bridge, "keeper", &session).await;
     let sent = identity_runtime
         .send_with_turn_ticket(&keeper, None, &content("alpha"), HandlingMode::Queue, None)
         .await
@@ -1023,7 +1103,7 @@ async fn wait_racing<F: std::future::Future<Output = ()>>(
 /// wait with its typed outcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_for_completion_ends_typed_on_failure_broken_retire_and_delete() {
-    let (live, _bridge, identity_runtime, ctx, session) = ticket_bridge_rpc().await;
+    let (live, bridge, identity_runtime, ctx, session) = ticket_bridge_rpc().await;
     let params = |name: &str, baseline: crate::identity_first::CompletionCursor| {
         json!({
             "identity": name,
@@ -1033,7 +1113,7 @@ async fn wait_for_completion_ends_typed_on_failure_broken_retire_and_delete() {
     };
 
     // A failed (or cancelled) run.
-    let failing = register_bound(&identity_runtime, "failing", &session).await;
+    let failing = register_bound(&identity_runtime, &bridge, "failing", &session).await;
     let baseline = identity_runtime.completion_cursor(&failing).await;
     let result = wait_racing(&live, &ctx, params("failing", baseline), async {
         identity_runtime.record_turn_failed(&failing).await;
@@ -1041,24 +1121,24 @@ async fn wait_for_completion_ends_typed_on_failure_broken_retire_and_delete() {
     .await;
     assert_eq!(result["outcome"], "run_failed", "{result}");
 
-    // Parked Broken.
-    let breaking = register_bound(&identity_runtime, "breaking", &session).await;
+    // Broken: Core let the member go and refuses its resume for good, so
+    // the wake that follows ends as a final refusal.
+    let breaking = register_bound(&identity_runtime, &bridge, "breaking", &session).await;
     let baseline = identity_runtime.completion_cursor(&breaking).await;
     let result = wait_racing(&live, &ctx, params("breaking", baseline), async {
-        identity_runtime
-            .register(
-                make_spec("breaking"),
-                IdentityLifecycleState::Broken,
-                None,
-                None,
-            )
-            .await;
+        bridge.refuses_resume.store(true, Ordering::SeqCst);
+        bridge
+            .core
+            .retire(&AgentRuntimeId::parse(&format!("rt:{breaking}:0")).unwrap());
+        let refused = identity_runtime.materialize(&breaking).await;
+        assert!(refused.is_err(), "the wake must be refused");
     })
     .await;
     assert_eq!(result["outcome"], "broken", "{result}");
+    bridge.refuses_resume.store(false, Ordering::SeqCst);
 
     // Retired.
-    let retiree = register_bound(&identity_runtime, "retiree", &session).await;
+    let retiree = register_bound(&identity_runtime, &bridge, "retiree", &session).await;
     let baseline = identity_runtime.completion_cursor(&retiree).await;
     let result = wait_racing(&live, &ctx, params("retiree", baseline), async {
         identity_runtime.retire(&retiree).await.expect("retire");
@@ -1066,10 +1146,10 @@ async fn wait_for_completion_ends_typed_on_failure_broken_retire_and_delete() {
     .await;
     assert_eq!(result["outcome"], "retiring", "{result}");
 
-    // Deleted. Deletion marks the identity Retiring before it leaves the
-    // table; a waiter woken at that step ends `retiring`, one woken after the
-    // removal ends `identity_gone`. Both are typed ends of a delete.
-    let doomed = register_bound(&identity_runtime, "doomed", &session).await;
+    // Deleted. A delete starts the identity's fresh life at once: Core
+    // replaces the live member by its successor, so the wait ends typed
+    // `incarnation_changed`.
+    let doomed = register_bound(&identity_runtime, &bridge, "doomed", &session).await;
     let baseline = identity_runtime.completion_cursor(&doomed).await;
     let result = wait_racing(&live, &ctx, params("doomed", baseline), async {
         identity_runtime
@@ -1078,82 +1158,39 @@ async fn wait_for_completion_ends_typed_on_failure_broken_retire_and_delete() {
             .expect("delete identity");
     })
     .await;
-    assert!(
-        matches!(
-            result["outcome"].as_str(),
-            Some("retiring" | "identity_gone")
-        ),
-        "{result}"
-    );
+    assert_eq!(result["outcome"], "incarnation_changed", "{result}");
     live.runtime.shutdown().await;
 }
 
-/// #468 review (item 1c): `meta/request_continuity_repair` reports,
-/// typed, what the trigger reached, and `meta/reconcile_identity` reports
-/// the supervisor pass its settled pass triggered.
+/// #306: Meta runs no continuity repair supervisor, so its explicit trigger
+/// `meta/request_continuity_repair` is gone. A caller that still sends it
+/// gets the typed JSON-RPC method-not-found refusal, never an empty answer,
+/// and `meta/capabilities` no longer lists it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn continuity_repair_request_reports_what_it_reached() {
-    let (live, _bridge, identity_runtime, ctx, session) = ticket_bridge_rpc().await;
-    let request = || {
-        rpc(
-            &live.runtime,
-            &ctx,
-            "meta/request_continuity_repair",
-            json!({}),
-        )
-    };
-    assert_eq!(request().await["continuity_repair"], "nothing_to_repair");
+async fn continuity_repair_request_method_is_gone() {
+    let (live, _bridge, _identity_runtime, ctx, _session) = ticket_bridge_rpc().await;
+    let reply = rpc_reply(
+        &live.runtime,
+        &ctx,
+        "meta/request_continuity_repair",
+        json!({}),
+    )
+    .await;
+    assert_eq!(reply["error"]["code"], json!(-32601), "{reply}");
+    assert!(reply.get("result").is_none(), "{reply}");
 
-    let broken = register_bound(&identity_runtime, "broken", &session).await;
-    identity_runtime
-        .register(
-            make_spec("broken"),
-            IdentityLifecycleState::Broken,
-            Some(ContinuityRecord {
-                identity: broken.clone(),
-                agent_runtime_id: AgentRuntimeId::parse("rt:broken").unwrap(),
-                session_id: session.clone(),
-                generation: ContinuityGeneration::new(0),
-                checkpoint_version: CheckpointVersion::new(0),
-            }),
-            None,
-        )
-        .await;
-    assert_eq!(
-        request().await["continuity_repair"],
-        "no_supervisor",
-        "nothing in this embedding would act on the trigger"
-    );
-
-    let context = Arc::new(crate::identity_first::IdentityFirstRuntimeContext::new(
-        identity_runtime.clone(),
-        Arc::new(MutableRosterProvider::new(vec![make_spec("broken")])),
-        None,
-        None,
-        None,
-    ));
-    let supervisor =
-        context.clone().spawn_broken_identity_repair_task(
-            crate::identity_first::ContinuityRepairPolicy::default(),
-        );
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let outcome = request().await;
-            if outcome["continuity_repair"] != "no_supervisor" {
-                return outcome;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the supervisor starts");
-
-    let reconciled = rpc(&live.runtime, &ctx, "meta/reconcile_identity", json!({})).await;
+    let capabilities = rpc(&live.runtime, &ctx, "meta/capabilities", json!({})).await;
+    let methods = capabilities["methods"]
+        .as_array()
+        .expect("capabilities list their methods");
     assert!(
-        reconciled["continuity_repair"].is_string(),
-        "reconcile reports the repair trigger it fired: {reconciled}"
+        methods.contains(&json!("meta/status_identity")),
+        "{methods:?}"
     );
-    supervisor.abort();
+    assert!(
+        !methods.contains(&json!("meta/request_continuity_repair")),
+        "{methods:?}"
+    );
     live.runtime.shutdown().await;
 }
 
@@ -1179,12 +1216,13 @@ fn door_and_origin_fields(params: Value) -> Value {
 /// An `InternalOnly` identity on the ticket bridge.
 async fn register_internal_only(
     runtime: &IdentityRuntime,
+    bridge: &TicketBridge,
     name: &str,
     session: &meerkat_core::types::SessionId,
 ) -> AgentIdentity {
     let mut spec = make_spec(name);
     spec.addressability = AgentAddressability::InternalOnly;
-    register_spec(runtime, spec, session).await
+    register_spec(runtime, bridge, spec, session).await
 }
 
 /// The public send request handler (`meta/send`) to an internal-only
@@ -1195,7 +1233,7 @@ async fn register_internal_only(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_public_send_naming_the_dispatch_door_or_internal_work_is_refused_not_addressable() {
     let (live, bridge, identity_runtime, ctx, session) = ticket_bridge_rpc().await;
-    register_internal_only(&identity_runtime, "helper", &session).await;
+    register_internal_only(&identity_runtime, &bridge, "helper", &session).await;
 
     let plain = json!({"identity": "helper", "content": "hello"});
     let tracked_plain = json!({"identity": "helper", "content": "hello", "track_turn": true});
@@ -1278,7 +1316,7 @@ impl crate::identity_first::GovernedInputBinder for CountingBinder {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ordinary_dispatch_naming_a_governed_door_keeps_its_ordinary_path() {
     let (live, bridge, identity_runtime, ctx, session) = ticket_bridge_rpc().await;
-    register_internal_only(&identity_runtime, "helper", &session).await;
+    register_internal_only(&identity_runtime, &bridge, "helper", &session).await;
 
     let plain =
         json!({"identity": "helper", "track_turn": true, "dispatch_input": {"content": "one"}});

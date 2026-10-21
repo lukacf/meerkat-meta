@@ -81,6 +81,142 @@ pub(crate) fn shared_bigquery_http_client() -> reqwest::Client {
         .clone()
 }
 
+/// The start of the error a request gets when BigQuery answers 401, whatever
+/// supplied the token.
+const ACCESS_TOKEN_REFUSED: &str = "BigQuery API request failed (status 401)";
+/// The start of the error when BigQuery refuses a token a source had just
+/// refreshed.
+const ACCESS_TOKEN_REFUSED_AFTER_REFRESH: &str =
+    "BigQuery refused the access token (401) again after a refresh";
+/// The start of the error when an access token source fails.
+const ACCESS_TOKEN_SOURCE_FAILED: &str = "the BigQuery access token source failed";
+
+impl BigQuerySessionStoreError {
+    /// Whether BigQuery refused the access token (HTTP 401) or an access
+    /// token source failed: an expired, revoked or unavailable credential
+    /// rather than a table or network problem.
+    pub fn is_access_token_refusal(&self) -> bool {
+        match self {
+            Self::Api(message) => {
+                message.starts_with(ACCESS_TOKEN_REFUSED)
+                    || message.starts_with(ACCESS_TOKEN_REFUSED_AFTER_REFRESH)
+            }
+            Self::Configuration(message) => message.starts_with(ACCESS_TOKEN_SOURCE_FAILED),
+            _ => false,
+        }
+    }
+}
+
+/// A BigQuery access token and when it stops being valid.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BigQueryAccessToken {
+    pub token: String,
+    /// When BigQuery stops accepting the token; `None` when unknown, and the
+    /// token is then used until BigQuery refuses it.
+    pub expires_at: Option<SystemTime>,
+}
+
+impl std::fmt::Debug for BigQueryAccessToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BigQueryAccessToken")
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl BigQueryAccessToken {
+    /// Whether the token expires within `margin` from now.
+    fn expires_within(&self, margin: Duration) -> bool {
+        self.expires_at.is_some_and(|expires_at| {
+            !expires_at
+                .duration_since(SystemTime::now())
+                .is_ok_and(|left| left > margin)
+        })
+    }
+}
+
+type FetchBigQueryAccessToken = dyn Fn() -> futures::future::BoxFuture<'static, Result<BigQueryAccessToken, String>>
+    + Send
+    + Sync;
+
+/// Supplies the access tokens of an adapter's requests, so a long-lived
+/// adapter can use short-lived tokens: a Google access token lives about an
+/// hour. The adapter keeps the last token behind one lock, and fetches a new
+/// one when there is none, when the cached one is within the refresh margin
+/// of its expiry, or when BigQuery refuses it with 401; it then sends that
+/// one request once more with the new token. Concurrent requests share one
+/// fetch, and clones share the cache. See
+/// [`BigQuerySessionStoreAdapter::with_access_token_source`].
+#[derive(Clone)]
+pub struct BigQueryAccessTokenSource {
+    fetch: Arc<FetchBigQueryAccessToken>,
+    cached: Arc<tokio::sync::Mutex<Option<BigQueryAccessToken>>>,
+    refresh_margin: Duration,
+}
+
+impl std::fmt::Debug for BigQueryAccessTokenSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BigQueryAccessTokenSource")
+            .field("refresh_margin", &self.refresh_margin)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BigQueryAccessTokenSource {
+    /// How long before its expiry a cached token is replaced unless
+    /// [`Self::with_refresh_margin`] sets another margin.
+    pub const DEFAULT_REFRESH_MARGIN: Duration = Duration::from_mins(5);
+
+    /// A source that awaits `fetch()` whenever it needs a new token.
+    pub fn new<F, Fut>(fetch: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<BigQueryAccessToken, String>> + Send + 'static,
+    {
+        Self {
+            fetch: Arc::new(move || Box::pin(fetch())),
+            cached: Arc::new(tokio::sync::Mutex::new(None)),
+            refresh_margin: Self::DEFAULT_REFRESH_MARGIN,
+        }
+    }
+
+    /// Replace a cached token once it is within `margin` of its expiry.
+    pub fn with_refresh_margin(mut self, margin: Duration) -> Self {
+        self.refresh_margin = margin;
+        self
+    }
+
+    /// The cached token, or a new one when there is none, when the cached one
+    /// is within the refresh margin of its expiry, or when it is `refused`.
+    async fn token(&self, refused: Option<&str>) -> Result<String, BigQuerySessionStoreError> {
+        let mut cached = self.cached.lock().await;
+        if let Some(token) = cached.as_ref()
+            && refused != Some(token.token.as_str())
+            && !token.expires_within(self.refresh_margin)
+        {
+            return Ok(token.token.clone());
+        }
+        *cached = None;
+        let fresh = (self.fetch)().await.map_err(|err| {
+            BigQuerySessionStoreError::Configuration(format!("{ACCESS_TOKEN_SOURCE_FAILED}: {err}"))
+        })?;
+        let token = fresh.token.trim().to_string();
+        if token.is_empty() {
+            return Err(BigQuerySessionStoreError::Configuration(format!(
+                "{ACCESS_TOKEN_SOURCE_FAILED}: it returned an empty token"
+            )));
+        }
+        *cached = Some(BigQueryAccessToken {
+            token: token.clone(),
+            expires_at: fresh.expires_at,
+        });
+        Ok(token)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BigQuerySessionStoreAdapter {
     dataset: String,
@@ -88,6 +224,7 @@ pub struct BigQuerySessionStoreAdapter {
     project_id: Option<String>,
     api_base_url: String,
     access_token: Option<String>,
+    access_token_source: Option<BigQueryAccessTokenSource>,
     http_timeout: Duration,
     client: reqwest::Client,
 }
@@ -330,6 +467,7 @@ impl BigQuerySessionStoreAdapter {
             project_id: None,
             api_base_url: Self::DEFAULT_API_BASE_URL.to_string(),
             access_token: None,
+            access_token_source: None,
             client: shared_bigquery_http_client(),
             http_timeout: Duration::from_secs(30),
         }
@@ -347,6 +485,17 @@ impl BigQuerySessionStoreAdapter {
 
     pub fn with_access_token(mut self, access_token: impl Into<String>) -> Self {
         self.access_token = Some(access_token.into());
+        self
+    }
+
+    /// Take the access token of every request from `source`, ahead of
+    /// [`Self::with_access_token`] and the token environment variables. A
+    /// request BigQuery refuses with 401 is sent once more with a token the
+    /// source fetches anew; a source that fails, or a second 401, fails the
+    /// request ([`BigQuerySessionStoreError::is_access_token_refusal`]). No
+    /// other failure is retried.
+    pub fn with_access_token_source(mut self, source: BigQueryAccessTokenSource) -> Self {
+        self.access_token_source = Some(source);
         self
     }
 
@@ -377,15 +526,6 @@ impl BigQuerySessionStoreAdapter {
             return Ok(());
         }
 
-        let project_id = self.resolve_project_id()?;
-        let access_token = self.resolve_access_token()?;
-        let endpoint = format!(
-            "{}/projects/{project_id}/datasets/{}/tables/{}/insertAll",
-            self.api_base_url(),
-            self.dataset,
-            self.table
-        );
-
         let mut request_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let payload_json = serde_json::to_string(&row.payload)
@@ -401,8 +541,32 @@ impl BigQuerySessionStoreAdapter {
                     .map_err(|err| BigQuerySessionStoreError::Serialize(err.to_string()))?;
                 row_json["labels_json"] = serde_json::Value::String(labels_json);
             }
-            request_rows.push(serde_json::json!({ "json": row_json }));
+            request_rows.push(row_json);
         }
+        self.insert_json_rows(&self.table, request_rows).await
+    }
+
+    /// Streams `rows`, each a JSON object in the schema of `table`, into that
+    /// table of this adapter's dataset with one `insertAll` request. Any row
+    /// error fails the call.
+    pub(crate) async fn insert_json_rows(
+        &self,
+        table: &str,
+        rows: Vec<Value>,
+    ) -> Result<(), BigQuerySessionStoreError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let project_id = self.resolve_project_id()?;
+        let endpoint = format!(
+            "{}/projects/{project_id}/datasets/{}/tables/{table}/insertAll",
+            self.api_base_url(),
+            self.dataset
+        );
+        let request_rows: Vec<Value> = rows
+            .into_iter()
+            .map(|row| serde_json::json!({ "json": row }))
+            .collect();
         let request = serde_json::json!({
             "ignoreUnknownValues": false,
             "skipInvalidRows": false,
@@ -410,12 +574,7 @@ impl BigQuerySessionStoreAdapter {
         });
 
         let response = self
-            .send_json_request(
-                reqwest::Method::POST,
-                &endpoint,
-                &access_token,
-                Some(&request),
-            )
+            .send_authorized(reqwest::Method::POST, &endpoint, Some(&request))
             .await?;
         if let Some(errors) = response.get("insertErrors").and_then(Value::as_array)
             && !errors.is_empty()
@@ -428,6 +587,82 @@ impl BigQuerySessionStoreAdapter {
         }
 
         Ok(())
+    }
+
+    /// `table` of this adapter's dataset as standard SQL names it:
+    /// `project.dataset.table`.
+    pub(crate) fn qualified_table_name(
+        &self,
+        table: &str,
+    ) -> Result<String, BigQuerySessionStoreError> {
+        let project_id = self.resolve_project_id()?;
+        Ok(format!("{project_id}.{}.{table}", self.dataset))
+    }
+
+    /// Runs `query` (standard SQL) and returns the first column of every
+    /// result row as text, waiting for the job to complete and following the
+    /// result pages. A null cell is skipped.
+    pub(crate) async fn query_first_column(
+        &self,
+        query: &str,
+    ) -> Result<Vec<String>, BigQuerySessionStoreError> {
+        let project_id = self.resolve_project_id()?;
+        let endpoint = format!("{}/projects/{project_id}/queries", self.api_base_url());
+        let request = serde_json::json!({
+            "query": query,
+            "useLegacySql": false,
+            "maxResults": 10000,
+        });
+        let mut response = self
+            .send_authorized(reqwest::Method::POST, &endpoint, Some(&request))
+            .await?;
+        let mut values = Vec::new();
+        loop {
+            let complete = response
+                .get("jobComplete")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if complete {
+                let rows = response.get("rows").and_then(Value::as_array);
+                for row in rows.into_iter().flatten() {
+                    if let Some(value) = row.pointer("/f/0/v").and_then(Value::as_str) {
+                        values.push(value.to_string());
+                    }
+                }
+            }
+            let page_token = response.get("pageToken").and_then(Value::as_str);
+            if complete && page_token.is_none() {
+                return Ok(values);
+            }
+            let job_id = response
+                .pointer("/jobReference/jobId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    BigQuerySessionStoreError::InvalidQueryResponse(
+                        "an unfinished or paged query response names no jobReference.jobId"
+                            .to_string(),
+                    )
+                })?;
+            let mut params = vec![("maxResults", "10000".to_string())];
+            if let Some(location) = response
+                .pointer("/jobReference/location")
+                .and_then(Value::as_str)
+            {
+                params.push(("location", location.to_string()));
+            }
+            if complete && let Some(token) = page_token {
+                params.push(("pageToken", token.to_string()));
+            }
+            let results = reqwest::Url::parse_with_params(&format!("{endpoint}/{job_id}"), &params)
+                .map_err(|err| {
+                    BigQuerySessionStoreError::Configuration(format!(
+                        "BigQuery query results endpoint: {err}"
+                    ))
+                })?;
+            response = self
+                .send_authorized(reqwest::Method::GET, results.as_str(), None)
+                .await?;
+        }
     }
 
     pub async fn read_rows(&self) -> Result<Vec<SessionPersistenceRow>, BigQuerySessionStoreError> {
@@ -474,7 +709,6 @@ impl BigQuerySessionStoreAdapter {
         query: &str,
     ) -> Result<Vec<SessionPersistenceRow>, BigQuerySessionStoreError> {
         let project_id = self.resolve_project_id()?;
-        let access_token = self.resolve_access_token()?;
         let endpoint = format!("{}/projects/{project_id}/queries", self.api_base_url());
         let request = serde_json::json!({
             "query": query,
@@ -482,19 +716,13 @@ impl BigQuerySessionStoreAdapter {
             "maxResults": 10000,
         });
         let response = self
-            .send_json_request(
-                reqwest::Method::POST,
-                &endpoint,
-                &access_token,
-                Some(&request),
-            )
+            .send_authorized(reqwest::Method::POST, &endpoint, Some(&request))
             .await?;
         parse_bigquery_query_rows(&response)
     }
 
     pub async fn gc_superseded_rows(&self) -> Result<u64, BigQuerySessionStoreError> {
         let project_id = self.resolve_project_id()?;
-        let access_token = self.resolve_access_token()?;
         let table_ref = self.table_ref();
         let endpoint = format!("{}/projects/{project_id}/queries", self.api_base_url());
         let query = format!(
@@ -507,12 +735,7 @@ impl BigQuerySessionStoreAdapter {
         );
         let request = serde_json::json!({ "query": query, "useLegacySql": false });
         let response = self
-            .send_json_request(
-                reqwest::Method::POST,
-                &endpoint,
-                &access_token,
-                Some(&request),
-            )
+            .send_authorized(reqwest::Method::POST, &endpoint, Some(&request))
             .await?;
         let affected = response
             .get("numDmlAffectedRows")
@@ -524,18 +747,12 @@ impl BigQuerySessionStoreAdapter {
 
     pub async fn truncate_sessions(&self) -> Result<(), BigQuerySessionStoreError> {
         let project_id = self.resolve_project_id()?;
-        let access_token = self.resolve_access_token()?;
         let table_ref = self.table_ref();
         let endpoint = format!("{}/projects/{project_id}/queries", self.api_base_url());
         let query = format!("TRUNCATE TABLE `{project_id}.{table_ref}`");
         let request = serde_json::json!({ "query": query, "useLegacySql": false });
-        self.send_json_request(
-            reqwest::Method::POST,
-            &endpoint,
-            &access_token,
-            Some(&request),
-        )
-        .await?;
+        self.send_authorized(reqwest::Method::POST, &endpoint, Some(&request))
+            .await?;
         Ok(())
     }
 
@@ -591,6 +808,41 @@ impl BigQuerySessionStoreAdapter {
         ))
     }
 
+    /// Sends one request with the access token. When a token source supplies
+    /// it and BigQuery refuses it with 401, the request was not applied, so it
+    /// is sent once more with a token the source fetches anew. No other
+    /// failure is retried.
+    async fn send_authorized(
+        &self,
+        method: reqwest::Method,
+        endpoint: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, BigQuerySessionStoreError> {
+        let Some(source) = &self.access_token_source else {
+            let access_token = self.resolve_access_token()?;
+            return self
+                .send_json_request(method, endpoint, &access_token, body)
+                .await;
+        };
+        let access_token = source.token(None).await?;
+        let (status, text) = self
+            .send_request(method.clone(), endpoint, &access_token, body)
+            .await?;
+        if status != reqwest::StatusCode::UNAUTHORIZED {
+            return json_response(status, &text);
+        }
+        let access_token = source.token(Some(&access_token)).await?;
+        let (status, text) = self
+            .send_request(method, endpoint, &access_token, body)
+            .await?;
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(BigQuerySessionStoreError::Api(format!(
+                "{ACCESS_TOKEN_REFUSED_AFTER_REFRESH}: {text}"
+            )));
+        }
+        json_response(status, &text)
+    }
+
     async fn send_json_request(
         &self,
         method: reqwest::Method,
@@ -598,6 +850,19 @@ impl BigQuerySessionStoreAdapter {
         access_token: &str,
         body: Option<&Value>,
     ) -> Result<Value, BigQuerySessionStoreError> {
+        let (status, text) = self
+            .send_request(method, endpoint, access_token, body)
+            .await?;
+        json_response(status, &text)
+    }
+
+    async fn send_request(
+        &self,
+        method: reqwest::Method,
+        endpoint: &str,
+        access_token: &str,
+        body: Option<&Value>,
+    ) -> Result<(reqwest::StatusCode, String), BigQuerySessionStoreError> {
         let mut request = self
             .client
             .request(method, endpoint)
@@ -619,22 +884,29 @@ impl BigQuerySessionStoreAdapter {
             .text()
             .await
             .map_err(|err| BigQuerySessionStoreError::Http(format!("{err:?}")))?;
-
-        if !status.is_success() {
-            return Err(BigQuerySessionStoreError::Api(format!(
-                "BigQuery API request failed (status {}): {}",
-                status.as_u16(),
-                text
-            )));
-        }
-
-        if text.trim().is_empty() {
-            return Ok(serde_json::json!({}));
-        }
-
-        serde_json::from_str::<Value>(&text)
-            .map_err(|err| BigQuerySessionStoreError::InvalidQueryResponse(err.to_string()))
+        Ok((status, text))
     }
+}
+
+/// A BigQuery answer's JSON, or the error its status names.
+fn json_response(
+    status: reqwest::StatusCode,
+    text: &str,
+) -> Result<Value, BigQuerySessionStoreError> {
+    if !status.is_success() {
+        return Err(BigQuerySessionStoreError::Api(format!(
+            "BigQuery API request failed (status {}): {}",
+            status.as_u16(),
+            text
+        )));
+    }
+
+    if text.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+
+    serde_json::from_str::<Value>(text)
+        .map_err(|err| BigQuerySessionStoreError::InvalidQueryResponse(err.to_string()))
 }
 
 #[derive(Debug, Clone)]

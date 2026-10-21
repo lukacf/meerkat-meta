@@ -382,8 +382,11 @@ pub(crate) mod tests {
     use std::sync::atomic::AtomicUsize;
     use tower::ServiceExt as _;
 
-    // These real hosts share upstream process-wide projection budgets.
-    static SHARED_HOST_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+    // These real hosts share upstream process-wide projection budgets: Core
+    // admits one live open projection per process at a time and refuses a
+    // concurrent one. Every test in this crate that opens a real live channel
+    // takes this lock (the unified runtime's builder tests too).
+    pub(crate) static SHARED_HOST_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     /// Console voice puts Meerkat's barge-in hint on the call's caption
     /// stream for the channel the hint names; the newest hint wins.
@@ -2953,6 +2956,74 @@ pub(crate) mod tests {
         runtime.shutdown().await;
     }
 
+    /// A console voice open made while another open on the gateway holds
+    /// the process-wide realtime open reservation is refused as the typed,
+    /// retryable `voice_open_busy`, never as a host failure. Once that open
+    /// lets the reservation go, opening again succeeds.
+    #[tokio::test]
+    async fn console_voice_open_while_another_open_holds_the_reservation_is_busy() {
+        // The open reservation is process-wide.
+        if !crate::test_process_isolation::run_body_in_isolated_process_within(
+            module_path!(),
+            "console_voice_open_while_another_open_holds_the_reservation_is_busy",
+            VOICE_CHILD_DEADLINE,
+        )
+        .await
+        {
+            return;
+        }
+        let _guard = SHARED_HOST_TEST_LOCK.lock().await;
+        let RealRuntime {
+            _directory,
+            provider,
+            runtime,
+            service,
+            machine,
+            factory,
+            config,
+            ..
+        } = RealRuntime::start("reservation-busy").await;
+        let controller = real_console_host(
+            &runtime,
+            &service,
+            &machine,
+            &factory,
+            &config,
+            &provider.url,
+        );
+        let (app, token) = console_app(&runtime, &controller);
+        // Another open on this gateway is being prepared: it holds the
+        // reservation.
+        let other_open = released_open_reservation("before the open").await;
+        let refused = rpc(
+            &app,
+            &token,
+            "meta/console/voice/open",
+            json!({"identity":"agent-a","request_id":"voice-busy"}),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["data"]["kind"], "voice_open_busy",
+            "{refused}"
+        );
+        drop(other_open);
+        let opened = open_pending_voice(&app, &token, "voice-busy-again").await;
+        assert!(opened["channel_id"].as_str().is_some(), "{opened}");
+        let closed = rpc(
+            &app,
+            &token,
+            "meta/console/voice/close",
+            json!({"identity":"agent-a","request_id":"voice-busy-again"}),
+        )
+        .await;
+        assert_eq!(closed["result"], json!({"phase":"closed"}), "{closed}");
+        tokio::time::timeout(VOICE_TEARDOWN_BOUND, controller.shutdown())
+            .await
+            .expect("voice shutdown answers within its bound")
+            .expect("voice shutdown");
+        runtime.shutdown().await;
+    }
+
     /// Shutting the console host down cancels an open that has its open
     /// result but no provider answer yet, and releases the reservation
     /// without ending the process or its runtime.
@@ -3520,14 +3591,12 @@ impl SharedHost {
                 // Meerkat's open admission refuses an unavailable target,
                 // credential, binding, or member with the capability code;
                 // that is the same answer the readiness probe gave.
-                let unavailable = response
-                    .error
-                    .as_ref()
-                    .is_some_and(|error| error.code == crate::rpc::CAPABILITY_UNAVAILABLE_CODE);
-                return Err(if unavailable {
-                    VoiceError::Unavailable
-                } else {
-                    VoiceError::HostFailed
+                // Another open on this gateway still holds the process-wide
+                // open reservation: busy, and a new open succeeds later.
+                return Err(match response.error.as_ref().map(|error| error.code) {
+                    Some(crate::rpc::CAPABILITY_UNAVAILABLE_CODE) => VoiceError::Unavailable,
+                    Some(crate::live_wiring::LIVE_OPEN_BUSY_CODE) => VoiceError::OpenBusy,
+                    _ => VoiceError::HostFailed,
                 });
             }
         };

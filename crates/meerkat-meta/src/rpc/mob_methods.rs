@@ -10,9 +10,9 @@ use serde_json::Value;
 
 use crate::blob_store::is_valid_blob_id_value;
 use crate::mob_handle_runtime::{
-    assert_member_accepts_images, is_recoverable_lifecycle_cleanup_error, member_entry_to_json,
-    model_routing_status_for_member, model_routing_status_for_session, resolved_tools_for_member,
-    resolved_tools_for_session, send_message_on_mob_with_interaction,
+    assert_member_accepts_images_with_config, is_recoverable_lifecycle_cleanup_error,
+    member_entry_to_json, model_routing_status_for_member, model_routing_status_for_session,
+    resolved_tools_for_member, resolved_tools_for_session, send_message_on_mob_with_interaction,
     topology_restore_failed_peer_ids, topology_restore_warning_json,
 };
 use crate::unified_runtime::UnifiedRuntime;
@@ -429,9 +429,10 @@ pub(super) async fn handle_send_message(
                 SendMessageTarget::Identity { .. } => None,
             };
             if let Some(guard_member_id) = image_guard_member_id
-                && let Err(err) = assert_member_accepts_images(
+                && let Err(err) = assert_member_accepts_images_with_config(
                     &runtime.mob_handle(),
                     runtime.mob_runtime().session_service(),
+                    runtime.mob_runtime().member_model_config().as_deref(),
                     guard_member_id,
                     &content,
                 )
@@ -994,7 +995,9 @@ pub(super) async fn handle_ensure_member(
                     // upstream; reconcile after every ensure so the crew
                     // topology converges regardless of the order hosts
                     // materialize members in. Inert without an edge policy;
-                    // idempotent otherwise.
+                    // idempotent otherwise. An incomplete reconcile pages and
+                    // logs each failed edge operation inside
+                    // `reconcile_edges`, so the report needs nothing here.
                     let _ = runtime.reconcile_edges().await;
                     let entries = handle.list_members_including_retiring().await;
                     let entry = entries.into_iter().find(|e| e.agent_identity == mid);
@@ -1141,13 +1144,12 @@ pub(super) async fn handle_retire_member(
                     .retire_member_alias_tracked(&durable, &mid)
                     .await
                 {
-                    Ok(token) => JsonRpcResponse {
+                    Ok(()) => JsonRpcResponse {
                         jsonrpc: JSONRPC_VERSION.to_string(),
                         id: response_id,
                         result: Some(serde_json::json!({
                             "accepted": true,
                             "identity_first": true,
-                            "fencing_token": token.get(),
                         })),
                         error: None,
                     },
@@ -1403,14 +1405,14 @@ pub(super) async fn handle_respawn_member(
                     .reset_member_alias_tracked(&durable, &mid)
                     .await
                 {
-                    Ok(record) => JsonRpcResponse {
+                    Ok(binding) => JsonRpcResponse {
                         jsonrpc: JSONRPC_VERSION.to_string(),
                         id: response_id,
                         result: Some(serde_json::json!({
                             "accepted": true,
                             "identity_first": true,
-                            "session_id": record.session_id.to_string(),
-                            "generation": record.generation.get(),
+                            "session_id": binding.session_id().map(ToString::to_string),
+                            "generation": binding.generation().get(),
                         })),
                         error: None,
                     },

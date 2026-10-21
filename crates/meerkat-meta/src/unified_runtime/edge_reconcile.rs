@@ -136,6 +136,15 @@ impl UnifiedRuntime {
                     )),
                 ));
             }
+            crate::member_comms_id::refuse_runtime_plane_member(
+                &crate::member_comms_id::mob_member_id_str(&alias),
+                spec.labels.as_ref(),
+            )
+            .map_err(|message| {
+                UnifiedRuntimeReconcileError::Mob(
+                    crate::mob_handle_runtime::MobRuntimeError::InvalidConfig(message),
+                )
+            })?;
             spec.identity = meerkat_mob::AgentIdentity::from(alias.as_str());
             decoded_specs.push(spec);
         }
@@ -217,6 +226,7 @@ impl UnifiedRuntime {
         let report = self.topology_runtime_handle().reconcile().await;
         if let Some(alert) = reconcile_incomplete_alert(&report) {
             self.fire_error(alert);
+            log_reconcile_failures(&report.failures);
         } else if !report.skipped_missing_members.is_empty() {
             // INFO, not WARN: lazy identity bootstrap leaves an edge pending
             // until both endpoints are members, so a boot skips such edges by
@@ -679,6 +689,37 @@ fn reconcile_incomplete_alert(report: &UnifiedRuntimeReconcileEdgesReport) -> Op
     })
 }
 
+/// How many failed edge operations an incomplete reconcile logs a line each
+/// for; one more line counts the rest.
+const LOGGED_RECONCILE_FAILURES: usize = 5;
+
+/// Log the failed edge operations behind a `ReconcileIncomplete` alert, which
+/// carries only the counts: one ERROR line per failure with its operation,
+/// edge endpoints and error, for the first [`LOGGED_RECONCILE_FAILURES`], then
+/// one line counting the rest. They use the alert line's target, so a filter
+/// that shows the alert shows them too.
+fn log_reconcile_failures(failures: &[EdgeReconcileFailure]) {
+    for failure in failures.iter().take(LOGGED_RECONCILE_FAILURES) {
+        let (edge_a, edge_b) = failure.edge.endpoints();
+        tracing::error!(
+            target: "meerkat_meta::unified_runtime",
+            operation = failure.operation.as_str(),
+            edge_a,
+            edge_b,
+            error = failure.error.as_str(),
+            "edge reconcile operation failed"
+        );
+    }
+    let more = failures.len().saturating_sub(LOGGED_RECONCILE_FAILURES);
+    if more != 0 {
+        tracing::error!(
+            target: "meerkat_meta::unified_runtime",
+            more,
+            "edge reconcile operation failed: +{more} more"
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod reconcile_incomplete_alert_tests {
@@ -719,6 +760,63 @@ mod reconcile_incomplete_alert_tests {
         assert_eq!(
             reconcile_incomplete_alert(&UnifiedRuntimeReconcileEdgesReport::default()),
             None
+        );
+    }
+
+    /// An early return replaces the whole report with one synthetic failure
+    /// (here the recovery preparation's), and the alert carries only the
+    /// counts: the failure's own line names its operation, edge and error.
+    #[test]
+    fn a_synthetic_early_return_logs_its_operation_edge_and_error() {
+        let report = crate::topology_control::recovery_failure_report(
+            crate::topology_control::TopologyControlError::InvalidRequest(
+                "invalid persisted topology identity".to_string(),
+            ),
+        );
+        assert_eq!(report.failures.len(), 1, "one synthetic failure");
+        let ((), logged) =
+            super::super::tests::capture_tracing(|| log_reconcile_failures(&report.failures));
+        let lines: Vec<&str> = logged.lines().collect();
+        assert_eq!(lines.len(), 1, "one line for the one failure: {logged}");
+        for expected in [
+            "ERROR meerkat_meta::unified_runtime: edge reconcile operation failed",
+            "operation=\"prepare_recovery\"",
+            "edge_a=\"recovery-journal\"",
+            "edge_b=\"topology-control\"",
+            "error=\"invalid topology request: invalid persisted topology identity\"",
+        ] {
+            assert!(
+                lines[0].contains(expected),
+                "{expected} is missing: {logged}"
+            );
+        }
+    }
+
+    /// A line each for the first five failures and one line counting the
+    /// rest: a reconcile whose every edge failed does not flood the log.
+    #[test]
+    fn failures_past_the_first_five_are_counted_on_one_line() {
+        let failures: Vec<EdgeReconcileFailure> = (0..7)
+            .map(|index| EdgeReconcileFailure {
+                edge: edge("lead", &format!("worker-{index}")),
+                operation: "wire".to_string(),
+                error: "refused".to_string(),
+            })
+            .collect();
+        let ((), logged) =
+            super::super::tests::capture_tracing(|| log_reconcile_failures(&failures));
+        let lines: Vec<&str> = logged.lines().collect();
+        assert_eq!(lines.len(), 6, "five failures and the count: {logged}");
+        for (index, line) in lines[..5].iter().enumerate() {
+            assert!(
+                line.contains(&format!("edge_b=\"worker-{index}\"")),
+                "failure {index} is logged in order: {logged}"
+            );
+        }
+        assert!(
+            lines[5].contains("edge reconcile operation failed: +2 more")
+                && lines[5].contains("more=2"),
+            "the rest are counted: {logged}"
         );
     }
 }

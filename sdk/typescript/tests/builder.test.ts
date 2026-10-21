@@ -44,22 +44,12 @@ describe("MetaBuilder chainable methods", () => {
     assert.equal(builder._config.gatewayBin, "/usr/bin/gateway");
   });
 
-  it("sessionService() sets sessionBuilder and sessionStore", () => {
+  it("sessionService() sets sessionBuilder", () => {
     const builder = Meta.builder();
     const mockBuilder = { buildAgent: async () => {} };
-    const mockStore = { type: "json" };
-    const result = builder.sessionService(mockBuilder, mockStore);
+    const result = builder.sessionService(mockBuilder);
     assert.equal(result, builder);
     assert.equal(builder._config.sessionBuilder, mockBuilder);
-    assert.equal(builder._config.sessionStore, mockStore);
-  });
-
-  it("sessionService() defaults store to null", () => {
-    const builder = Meta.builder();
-    const mockBuilder = { buildAgent: async () => {} };
-    builder.sessionService(mockBuilder);
-    assert.equal(builder._config.sessionBuilder, mockBuilder);
-    assert.equal(builder._config.sessionStore, null);
   });
 
   it("onError() sets errorCallback and returns this", () => {
@@ -265,6 +255,18 @@ describe("MetaBuilder chainable methods", () => {
     assert.equal(builder._config.workgraphEnabled, false);
   });
 
+  it("forkInstructionPolicy() records the policy and returns this", () => {
+    const builder = Meta.builder();
+    const result = builder.forkInstructionPolicy("reactivate_inherited");
+    assert.equal(result, builder);
+    assert.equal(builder._config.forkInstructionPolicy, "reactivate_inherited");
+  });
+
+  it("forkInstructionPolicy() rejects an unknown name", () => {
+    const builder = Meta.builder();
+    assert.throws(() => builder.forkInstructionPolicy("inherit" as never), RangeError);
+  });
+
   it("memory() sets memoryConfig with config object and returns this", () => {
     const builder = Meta.builder();
     const cfg = { backend: "local_json" };
@@ -328,7 +330,6 @@ describe("MetaBuilder default config", () => {
     const cfg = builder._config;
     assert.equal(cfg.mobConfigPath, null);
     assert.equal(cfg.sessionBuilder, null);
-    assert.equal(cfg.sessionStore, null);
     assert.equal(cfg.errorCallback, null);
     assert.equal(cfg.eventLog, null);
     assert.equal(cfg.consoleConfigPath, null);
@@ -344,6 +345,7 @@ describe("MetaBuilder default config", () => {
     assert.equal(cfg.gatingConfigPath, null);
     assert.equal(cfg.routingConfigPath, null);
     assert.equal(cfg.workgraphEnabled, null);
+    assert.equal(cfg.forkInstructionPolicy, null);
     assert.equal(cfg.memoryConfig, null);
     assert.equal(cfg.authConfig, null);
     assert.equal(cfg.implicitDelegateIdleRetireSecs, undefined);

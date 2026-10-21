@@ -440,6 +440,7 @@ describe("AgentBuildContext + AgentBuildDraft (REQ-49a)", () => {
       output_preview: "ACK",
       is_final: false,
       peer_reachable_count: 2,
+      intent_managed: false,
       completion_cursor: { epoch: 7, turns: 3 },
     };
 
@@ -747,10 +748,10 @@ describe("tool-content helpers", () => {
 });
 
 // ---------------------------------------------------------------------------
-// REQ-49b: IdentityStatus, ContinuityHealth, DurabilityPolicy, LeaseInfo
+// REQ-49b: IdentityStatus
 // ---------------------------------------------------------------------------
 
-describe("IdentityStatus + ContinuityHealth (REQ-49b)", () => {
+describe("IdentityStatus (REQ-49b)", () => {
   it("full IdentityStatus parses from wire", async () => {
     const { parseIdentityStatus } = await import("../src/types.js");
     const status = parseIdentityStatus({
@@ -763,17 +764,8 @@ describe("IdentityStatus + ContinuityHealth (REQ-49b)", () => {
       display_name: "Triage Lead",
       labels: { tier: "1" },
       generation: 2,
-      checkpoint_version: 5,
-      lease: {
-        fencing_token: 42,
-        ttl_remaining_ms: 30000,
-        healthy: true,
-      },
-      continuity_health: {
-        store_reachable: true,
-        durability_policy: { kind: "sync_write_through" },
-        last_checkpoint_version: 5,
-      },
+      intent_managed: false,
+      wake_refusal: null,
     });
     assert.equal(status.identity, "triage:main");
     assert.equal(status.lifecycleState, "active");
@@ -784,216 +776,8 @@ describe("IdentityStatus + ContinuityHealth (REQ-49b)", () => {
     assert.equal(status.addressability, "addressable");
     assert.deepEqual(status.labels, { tier: "1" });
     assert.equal(status.generation, 2);
-    assert.equal(status.checkpointVersion, 5);
-    assert.ok(status.lease !== null);
-    assert.equal(status.lease!.fencingToken, 42);
-    assert.equal(status.lease!.ttlRemainingMs, 30000);
-    assert.equal(status.lease!.healthy, true);
-    assert.ok(status.continuityHealth !== null);
-    assert.equal(status.continuityHealth!.storeReachable, true);
-    assert.equal(status.continuityHealth!.durabilityPolicy.kind, "syncWriteThrough");
-    assert.equal(status.continuityHealth!.lastCheckpointVersion, 5);
-  });
-
-  it("DurabilityPolicy bufferedExport has maxLossWindowMs", async () => {
-    const { parseIdentityStatus } = await import("../src/types.js");
-    const status = parseIdentityStatus({
-      identity: "x:1",
-      state: "active",
-      continuity_health: {
-        store_reachable: true,
-        durability_policy: {
-          kind: "buffered_export",
-          max_loss_window_ms: 5000,
-        },
-        last_checkpoint_version: null,
-      },
-    });
-    assert.ok(status.continuityHealth !== null);
-    assert.equal(status.continuityHealth!.durabilityPolicy.kind, "bufferedExport");
-    assert.equal(status.continuityHealth!.durabilityPolicy.maxLossWindowMs, 5000);
-  });
-
-  it("null lease and continuity_health", async () => {
-    const { parseIdentityStatus } = await import("../src/types.js");
-    const status = parseIdentityStatus({
-      identity: "x:1",
-      state: "initializing",
-    });
-    assert.equal(status.lease, null);
-    assert.equal(status.continuityHealth, null);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// REQ-49c: Provider result types (discriminated unions)
-// ---------------------------------------------------------------------------
-
-describe("Provider result types (REQ-49c)", () => {
-  it("ContinuityResolveState: uninitialized", async () => {
-    const { parseContinuityResolveState } = await import("../src/types.js");
-    const state = parseContinuityResolveState({ state: "uninitialized" });
-    assert.equal(state.state, "uninitialized");
-    assert.equal(state.record, undefined);
-    assert.equal(state.failure, undefined);
-  });
-
-  it("ContinuityResolveState: ready with record", async () => {
-    const { parseContinuityResolveState } = await import("../src/types.js");
-    const state = parseContinuityResolveState({
-      state: "ready",
-      record: {
-        identity: "lead:main",
-        agent_runtime_id: "rt-1",
-        session_id: "sess-1",
-        generation: 0,
-        checkpoint_version: 3,
-      },
-    });
-    assert.equal(state.state, "ready");
-    assert.ok(state.record);
-    assert.equal(state.record!.identity, "lead:main");
-    assert.equal(state.record!.agentRuntimeId, "rt-1");
-    assert.equal(state.record!.sessionId, "sess-1");
-    assert.equal(state.record!.generation, 0);
-    assert.equal(state.record!.checkpointVersion, 3);
-  });
-
-  it("ContinuityResolveState: broken with failure", async () => {
-    const { parseContinuityResolveState } = await import("../src/types.js");
-    const state = parseContinuityResolveState({
-      state: "broken",
-      failure: {
-        identity: "lead:main",
-        kind: "snapshot_missing",
-        detail: "no snapshot found",
-      },
-    });
-    assert.equal(state.state, "broken");
-    assert.ok(state.failure);
-    assert.equal(state.failure!.identity, "lead:main");
-    assert.equal(state.failure!.kind, "snapshot_missing");
-    assert.equal(state.failure!.detail, "no snapshot found");
-  });
-
-  it("ContinuityRecord round-trip", async () => {
-    const { parseContinuityRecord, continuityRecordToDict } = await import("../src/types.js");
-    const record = parseContinuityRecord({
-      identity: "worker:1",
-      agent_runtime_id: "rt-w1",
-      session_id: "sess-w1",
-      generation: 1,
-      checkpoint_version: 7,
-    });
-    assert.equal(record.identity, "worker:1");
-    assert.equal(record.agentRuntimeId, "rt-w1");
-    assert.equal(record.generation, 1);
-    assert.equal(record.checkpointVersion, 7);
-
-    const wire = continuityRecordToDict(record);
-    assert.equal(wire.agent_runtime_id, "rt-w1");
-    assert.equal(wire.session_id, "sess-w1");
-  });
-
-  it("ContinuityFailure with optional record", async () => {
-    const { parseContinuityFailure } = await import("../src/types.js");
-    const fail = parseContinuityFailure({
-      identity: "x:1",
-      kind: "snapshot_corrupted",
-      detail: "checksum mismatch",
-      record: {
-        identity: "x:1",
-        agent_runtime_id: "rt-x1",
-        session_id: "sess-x1",
-        generation: 0,
-        checkpoint_version: 2,
-      },
-    });
-    assert.equal(fail.kind, "snapshot_corrupted");
-    assert.equal(fail.detail, "checksum mismatch");
-    assert.ok(fail.record);
-    assert.equal(fail.record!.agentRuntimeId, "rt-x1");
-  });
-
-  it("SessionSnapshot wraps Uint8Array", async () => {
-    const { parseSessionSnapshot, sessionSnapshotToDict } = await import("../src/types.js");
-    // Wire format: base64 string
-    const snap = parseSessionSnapshot({ data: "SGVsbG8=" });
-    assert.ok(snap.data instanceof Uint8Array);
-    assert.equal(new TextDecoder().decode(snap.data), "Hello");
-
-    const wire = sessionSnapshotToDict(snap);
-    assert.equal(wire.data, "SGVsbG8=");
-  });
-
-  it("LeaseGrant round-trip", async () => {
-    const { parseLeaseGrant, leaseGrantToDict } = await import("../src/types.js");
-    const grant = parseLeaseGrant({
-      identity: "lead:main",
-      fencing_token: 99,
-      ttl_ms: 30000,
-    });
-    assert.equal(grant.identity, "lead:main");
-    assert.equal(grant.fencingToken, 99);
-    assert.equal(grant.ttlMs, 30000);
-
-    const wire = leaseGrantToDict(grant);
-    assert.equal(wire.fencing_token, 99);
-    assert.equal(wire.ttl, 30000);
-  });
-
-  it("LeaseAcquireResult: acquired", async () => {
-    const { parseLeaseAcquireResult, leaseAcquireResultToDict } = await import("../src/types.js");
-    const result = parseLeaseAcquireResult({
-      result: "acquired",
-      identity: "lead:main",
-      fencing_token: 1,
-      ttl: 30000,
-    });
-    assert.equal(result.status, "acquired");
-    assert.ok(result.grant);
-    assert.equal(result.grant!.fencingToken, 1);
-    assert.deepEqual(leaseAcquireResultToDict(result), {
-      result: "acquired",
-      identity: "lead:main",
-      fencing_token: 1,
-      ttl: 30000,
-    });
-  });
-
-  it("LeaseAcquireResult: already_held", async () => {
-    const { parseLeaseAcquireResult } = await import("../src/types.js");
-    const result = parseLeaseAcquireResult({
-      status: "already_held",
-      holder: "other-runtime",
-    });
-    assert.equal(result.status, "alreadyHeld");
-    assert.equal(result.holder, "other-runtime");
-  });
-
-  it("LeaseRenewResult: renewed", async () => {
-    const { parseLeaseRenewResult, leaseRenewResultToDict } = await import("../src/types.js");
-    const result = parseLeaseRenewResult({
-      result: "renewed",
-      identity: "x:1",
-      fencing_token: 2,
-      ttl: 30000,
-    });
-    assert.equal(result.status, "renewed");
-    assert.ok(result.grant);
-    assert.deepEqual(leaseRenewResultToDict(result), {
-      result: "renewed",
-      identity: "x:1",
-      fencing_token: 2,
-      ttl: 30000,
-    });
-  });
-
-  it("LeaseRenewResult: lost", async () => {
-    const { parseLeaseRenewResult } = await import("../src/types.js");
-    const result = parseLeaseRenewResult({ status: "lost" });
-    assert.equal(result.status, "lost");
-    assert.equal(result.grant, undefined);
+    assert.equal(status.intentManaged, false);
+    assert.equal(status.wakeRefusal, null);
   });
 });
 
@@ -1015,7 +799,6 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
     const rt = new MetaRuntime({
       mobConfigPath: null,
       sessionBuilder: null,
-      sessionStore: null,
       errorCallback: null,
       eventLog: null,
       consoleConfigPath: null,
@@ -1031,9 +814,6 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
       gatewayBin: null,
       modules: [],
       persistentState: null,
-      continuityStore: null,
-      leaseProvider: null,
-      scratchDir: null,
       rosterProvider: null,
       agentCustomizer: null,
       topologyProvider: null,
@@ -1056,9 +836,8 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
           addressability: "addressable",
           labels: {},
           generation: 0,
-          checkpoint_version: 0,
-          lease: null,
-          continuity_health: null,
+          intent_managed: false,
+          wake_refusal: null,
         };
       }
       return { accepted: true };
@@ -1206,44 +985,6 @@ describe("Provider interfaces (REQ-48)", () => {
   // Structural compile-time tests: prove the interfaces exist and have
   // the right shape by constructing mock implementations.
 
-  it("ContinuityStore interface is implementable", async () => {
-    const types = await import("../src/types.js");
-    // Type-level test: construct an object satisfying the interface
-    const store: import("../src/types.js").ContinuityStore = {
-      async resolveMany(identities: string[]) {
-        const result: Record<string, import("../src/types.js").ContinuityResolveState> = {};
-        for (const id of identities) {
-          result[id] = { state: "uninitialized" };
-        }
-        return result;
-      },
-      async loadSessionSnapshot(_sessionId: string) {
-        return null;
-      },
-      async saveSessionSnapshot(_identity, _sessionId, _generation, _version, _fencingToken, _snapshot) {},
-      async upsertContinuityRecord(_record, _fencingToken) {},
-      async deleteContinuityRecord(_identity, _fencingToken) {},
-    };
-    const result = await store.resolveMany(["x:1"]);
-    assert.equal(result["x:1"].state, "uninitialized");
-  });
-
-  it("LeaseProvider interface is implementable", async () => {
-    const store: import("../src/types.js").LeaseProvider = {
-      async acquireLeases(_identities: string[], _runtimeInstance: string) {
-        return {
-          "x:1": { status: "acquired" as const, grant: { identity: "x:1", fencingToken: 1, ttlMs: 30000 } },
-        };
-      },
-      async renewLeases(_grants) {
-        return {};
-      },
-      async releaseLeases(_grants) {},
-    };
-    const result = await store.acquireLeases(["x:1"], "rt-1");
-    assert.equal(result["x:1"].status, "acquired");
-  });
-
   it("RosterProvider interface is implementable", async () => {
     const provider: import("../src/types.js").RosterProvider = {
       async roster(_context) {
@@ -1320,135 +1061,18 @@ describe("Provider interfaces (REQ-48)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// REQ-50: Builder continuityStore / leaseProvider / scratchDir
+// REQ-50: Builder identity-first providers
 // ---------------------------------------------------------------------------
 
 describe("Builder identity-first extensions (REQ-50)", () => {
-  it("continuityStore() is chainable", async () => {
-    const { Meta } = await import("../src/builder.js");
-    const builder = Meta.builder();
-    const store: import("../src/types.js").ContinuityStore = {
-      async resolveMany() { return {}; },
-      async loadSessionSnapshot() { return null; },
-      async saveSessionSnapshot() {},
-      async upsertContinuityRecord() {},
-      async deleteContinuityRecord() {},
-    };
-    const result = builder.continuityStore(store);
-    assert.equal(result, builder);
-  });
-
-  it("leaseProvider() is chainable", async () => {
-    const { Meta } = await import("../src/builder.js");
-    const builder = Meta.builder();
-    const provider: import("../src/types.js").LeaseProvider = {
-      async acquireLeases() { return {}; },
-      async renewLeases() { return {}; },
-      async releaseLeases() {},
-    };
-    const result = builder.leaseProvider(provider);
-    assert.equal(result, builder);
-  });
-
-  it("scratchDir() is chainable", async () => {
-    const { Meta } = await import("../src/builder.js");
-    const builder = Meta.builder();
-    const result = builder.scratchDir("/tmp/scratch");
-    assert.equal(result, builder);
-  });
-
-  it("persistentState + continuityStore fails at build time", async () => {
-    const { Meta } = await import("../src/builder.js");
-    const builder = Meta.builder();
-    builder.persistentState("/tmp/state");
-    builder.continuityStore({
-      async resolveMany() { return {}; },
-      async loadSessionSnapshot() { return null; },
-      async saveSessionSnapshot() {},
-      async upsertContinuityRecord() {},
-      async deleteContinuityRecord() {},
-    });
-    await assert.rejects(builder.build(), (err: Error) => {
-      assert.ok(err.message.includes("mutually exclusive"));
-      return true;
-    });
-  });
-
-  it("persistentState + leaseProvider fails at build time", async () => {
-    const { Meta } = await import("../src/builder.js");
-    const builder = Meta.builder();
-    builder.persistentState("/tmp/state");
-    builder.leaseProvider({
-      async acquireLeases() { return {}; },
-      async renewLeases() { return {}; },
-      async releaseLeases() {},
-    });
-    await assert.rejects(builder.build(), (err: Error) => {
-      assert.ok(err.message.includes("mutually exclusive"));
-      return true;
-    });
-  });
-
-  it("external-authoritative path requires store, lease provider, and scratchDir", async () => {
-    const { Meta } = await import("../src/builder.js");
-    const builder = Meta.builder();
-    builder.continuityStore({
-      async resolveMany() { return {}; },
-      async loadSessionSnapshot() { return null; },
-      async saveSessionSnapshot() {},
-      async upsertContinuityRecord() {},
-      async deleteContinuityRecord() {},
-    });
-
-    await assert.rejects(builder.build(), (err: Error) => {
-      assert.ok(err.message.includes("leaseProvider"));
-      assert.ok(err.message.includes("scratchDir"));
-      return true;
-    });
-  });
-
-  it("stores config fields correctly", async () => {
-    const { Meta } = await import("../src/builder.js");
-    const builder = Meta.builder();
-    const store = {
-      async resolveMany() { return {}; },
-      async loadSessionSnapshot() { return null; },
-      async saveSessionSnapshot() {},
-      async upsertContinuityRecord() {},
-      async deleteContinuityRecord() {},
-    };
-    const lease = {
-      async acquireLeases() { return {}; },
-      async renewLeases() { return {}; },
-      async releaseLeases() {},
-    };
-    builder.continuityStore(store).leaseProvider(lease).scratchDir("/tmp/scratch");
-    assert.equal(builder._config.continuityStore, store);
-    assert.equal(builder._config.leaseProvider, lease);
-    assert.equal(builder._config.scratchDir, "/tmp/scratch");
-  });
-
   it("runtime init params advertise identity-first provider callbacks", async () => {
     const { MetaRuntime } = await import("../src/runtime.js");
-    const continuityStore = {
-      async resolveMany() { return {}; },
-      async loadSessionSnapshot() { return null; },
-      async saveSessionSnapshot() {},
-      async upsertContinuityRecord() {},
-      async deleteContinuityRecord() {},
-    };
-    const leaseProvider = {
-      async acquireLeases() { return {}; },
-      async renewLeases() { return {}; },
-      async releaseLeases() {},
-    };
     const rosterProvider = { async roster() { return []; } };
     const topologyProvider = { async computeEdges() { return []; } };
     const agentCustomizer = { async customizeBuild() {} };
     const rt = new MetaRuntime({
       mobConfigPath: null,
       sessionBuilder: null,
-      sessionStore: null,
       errorCallback: null,
       eventLog: null,
       consoleConfigPath: null,
@@ -1466,9 +1090,6 @@ describe("Builder identity-first extensions (REQ-50)", () => {
       gatewayBin: "/bin/rpc_gateway",
       modules: [],
       persistentState: null,
-      continuityStore,
-      leaseProvider,
-      scratchDir: "/tmp/scratch",
       rosterProvider,
       agentCustomizer,
       topologyProvider,
@@ -1479,9 +1100,6 @@ describe("Builder identity-first extensions (REQ-50)", () => {
     assert.equal(params.has_roster_provider, true);
     assert.equal(params.has_topology_provider, true);
     assert.equal(params.has_agent_customizer, true);
-    assert.equal(params.has_continuity_store, true);
-    assert.equal(params.has_lease_provider, true);
-    assert.equal(params.scratch_dir, "/tmp/scratch");
   });
 });
 
@@ -1490,291 +1108,6 @@ describe("Builder identity-first extensions (REQ-50)", () => {
 // ---------------------------------------------------------------------------
 
 describe("CallbackDispatcher provider routing (REQ-51)", () => {
-  it("routes callback/continuity_store/resolve_many to ContinuityStore", async () => {
-    const { CallbackDispatcher } = await import("../src/agent-builder.js");
-    const dispatcher = new CallbackDispatcher();
-    const resolveCalls: string[][] = [];
-
-    dispatcher.registerContinuityStore({
-      async resolveMany(identities: string[]) {
-        resolveCalls.push(identities);
-        const result: Record<string, { state: string }> = {};
-        for (const id of identities) {
-          result[id] = { state: "uninitialized" };
-        }
-        return result;
-      },
-      async loadSessionSnapshot() { return null; },
-      async saveSessionSnapshot() {},
-      async upsertContinuityRecord() {},
-      async deleteContinuityRecord() {},
-    });
-
-    const result = await dispatcher.handleCallback("callback/continuity_store/resolve_many", {
-      identities: ["lead:main", "worker:1"],
-    });
-    assert.equal(resolveCalls.length, 1);
-    assert.deepEqual(resolveCalls[0], ["lead:main", "worker:1"]);
-    assert.ok(result !== null);
-  });
-
-  it("routes callback/continuity_store/load_session_snapshot", async () => {
-    const { CallbackDispatcher } = await import("../src/agent-builder.js");
-    const dispatcher = new CallbackDispatcher();
-    let loadedSessionId: string | null = null;
-
-    dispatcher.registerContinuityStore({
-      async resolveMany() { return {}; },
-      async loadSessionSnapshot(sessionId: string) {
-        loadedSessionId = sessionId;
-        return { data: new Uint8Array([72, 101, 108, 108, 111]) };
-      },
-      async saveSessionSnapshot() {},
-      async upsertContinuityRecord() {},
-      async deleteContinuityRecord() {},
-    });
-
-    const result = await dispatcher.handleCallback("callback/continuity_store/load_session_snapshot", {
-      session_id: "sess-1",
-    });
-    assert.equal(loadedSessionId, "sess-1");
-    assert.ok(result !== null);
-  });
-
-  it("routes callback/continuity_store/save_session_snapshot", async () => {
-    const { CallbackDispatcher } = await import("../src/agent-builder.js");
-    const dispatcher = new CallbackDispatcher();
-    let savedArgs: Record<string, unknown> | null = null;
-
-    dispatcher.registerContinuityStore({
-      async resolveMany() { return {}; },
-      async loadSessionSnapshot() { return null; },
-      async saveSessionSnapshot(identity, sessionId, generation, version, fencingToken, snapshot) {
-        savedArgs = { identity, sessionId, generation, version, fencingToken, hasData: snapshot.data.length > 0 };
-      },
-      async upsertContinuityRecord() {},
-      async deleteContinuityRecord() {},
-    });
-
-    await dispatcher.handleCallback("callback/continuity_store/save_session_snapshot", {
-      identity: "lead:main",
-      session_id: "sess-1",
-      generation: 0,
-      checkpoint_version: 1,
-      fencing_token: 42,
-      snapshot: "SGVsbG8=", // base64 "Hello"
-    });
-    assert.ok(savedArgs !== null);
-    assert.equal(savedArgs!.identity, "lead:main");
-    assert.equal(savedArgs!.fencingToken, 42);
-    assert.equal(savedArgs!.hasData, true);
-  });
-
-  it("routes callback/continuity_store/upsert_continuity_record", async () => {
-    const { CallbackDispatcher } = await import("../src/agent-builder.js");
-    const dispatcher = new CallbackDispatcher();
-    let upsertedRecord: Record<string, unknown> | null = null;
-
-    dispatcher.registerContinuityStore({
-      async resolveMany() { return {}; },
-      async loadSessionSnapshot() { return null; },
-      async saveSessionSnapshot() {},
-      async upsertContinuityRecord(record, fencingToken) {
-        upsertedRecord = { ...record, fencingToken };
-      },
-      async deleteContinuityRecord() {},
-    });
-
-    await dispatcher.handleCallback("callback/continuity_store/upsert_continuity_record", {
-      record: {
-        identity: "lead:main",
-        agent_runtime_id: "rt-1",
-        session_id: "sess-1",
-        generation: 0,
-        checkpoint_version: 0,
-      },
-      fencing_token: 42,
-    });
-    assert.ok(upsertedRecord !== null);
-    assert.equal(upsertedRecord!.identity, "lead:main");
-    assert.equal(upsertedRecord!.fencingToken, 42);
-  });
-
-  it("routes callback/continuity_store/delete_continuity_record", async () => {
-    const { CallbackDispatcher } = await import("../src/agent-builder.js");
-    const dispatcher = new CallbackDispatcher();
-    let deleted: Record<string, unknown> | null = null;
-
-    dispatcher.registerContinuityStore({
-      async resolveMany() { return {}; },
-      async loadSessionSnapshot() { return null; },
-      async saveSessionSnapshot() {},
-      async upsertContinuityRecord() {},
-      async deleteContinuityRecord(identity, fencingToken) {
-        deleted = { identity, fencingToken };
-      },
-    });
-
-    await dispatcher.handleCallback("callback/continuity_store/delete_continuity_record", {
-      identity: "lead:main",
-      fencing_token: 42,
-    });
-    assert.deepEqual(deleted, { identity: "lead:main", fencingToken: 42 });
-  });
-
-  it("routes optional callback/continuity_store/delete_session_snapshot_if_current_revision", async () => {
-    const { CallbackDispatcher } = await import("../src/agent-builder.js");
-    const dispatcher = new CallbackDispatcher();
-    let deleted: Record<string, unknown> | null = null;
-
-    dispatcher.registerContinuityStore({
-      async resolveMany() { return {}; },
-      async loadSessionSnapshot() { return null; },
-      async saveSessionSnapshot() {},
-      async upsertContinuityRecord() {},
-      async deleteContinuityRecord() {},
-      async deleteSessionSnapshotIfCurrentRevision(sessionId, expectedCurrentRevision) {
-        deleted = { sessionId, expectedCurrentRevision };
-        return true;
-      },
-    });
-
-    const result = await dispatcher.handleCallback(
-      "callback/continuity_store/delete_session_snapshot_if_current_revision",
-      {
-        session_id: "sess-1",
-        expected_current_revision: "row-sha256:abc",
-      },
-    );
-    assert.equal(result, true);
-    assert.deepEqual(deleted, {
-      sessionId: "sess-1",
-      expectedCurrentRevision: "row-sha256:abc",
-    });
-  });
-
-  it("returns false for optional snapshot CAS delete when provider lacks support", async () => {
-    const { CallbackDispatcher } = await import("../src/agent-builder.js");
-    const dispatcher = new CallbackDispatcher();
-
-    dispatcher.registerContinuityStore({
-      async resolveMany() { return {}; },
-      async loadSessionSnapshot() { return null; },
-      async saveSessionSnapshot() {},
-      async upsertContinuityRecord() {},
-      async deleteContinuityRecord() {},
-    });
-
-    const result = await dispatcher.handleCallback(
-      "callback/continuity_store/delete_session_snapshot_if_current_revision",
-      {
-        session_id: "sess-1",
-        expected_current_revision: "row-sha256:abc",
-      },
-    );
-    assert.equal(result, false);
-  });
-
-  it("routes callback/lease_provider/acquire_leases to LeaseProvider", async () => {
-    const { CallbackDispatcher } = await import("../src/agent-builder.js");
-    const dispatcher = new CallbackDispatcher();
-
-    dispatcher.registerLeaseProvider({
-      async acquireLeases(identities, runtimeInstance) {
-        const result: Record<string, { status: string; grant?: Record<string, unknown> }> = {};
-        for (const id of identities) {
-          result[id] = { status: "acquired", grant: { identity: id, fencingToken: 1, ttlMs: 30000 } };
-        }
-        return result;
-      },
-      async renewLeases() { return {}; },
-      async releaseLeases() {},
-    });
-
-    const result = await dispatcher.handleCallback("callback/lease_provider/acquire_leases", {
-      identities: ["x:1"],
-      runtime_instance: "rt-1",
-    });
-    assert.deepEqual(result, {
-      "x:1": {
-        result: "acquired",
-        identity: "x:1",
-        fencing_token: 1,
-        ttl: 30000,
-      },
-    });
-  });
-
-  it("routes callback/lease_provider/renew_leases to LeaseProvider", async () => {
-    const { CallbackDispatcher } = await import("../src/agent-builder.js");
-    const dispatcher = new CallbackDispatcher();
-
-    dispatcher.registerLeaseProvider({
-      async acquireLeases() { return {}; },
-      async renewLeases(grants) {
-        const result: Record<string, { status: string }> = {};
-        for (const g of grants) {
-          result[g.identity] = { status: "renewed", grant: g };
-        }
-        return result;
-      },
-      async releaseLeases() {},
-    });
-
-    const result = await dispatcher.handleCallback("callback/lease_provider/renew_leases", {
-      grants: [{ identity: "x:1", fencing_token: 1, ttl: 30000 }],
-    });
-    assert.deepEqual(result, {
-      "x:1": {
-        result: "renewed",
-        identity: "x:1",
-        fencing_token: 1,
-        ttl: 30000,
-      },
-    });
-  });
-
-  it("passes callback cancellation to authority-mutating lease providers", async () => {
-    const { CallbackDispatcher } = await import("../src/agent-builder.js");
-    const dispatcher = new CallbackDispatcher();
-    const controller = new AbortController();
-    let observedSignal: AbortSignal | null = null;
-
-    dispatcher.registerLeaseProvider({
-      async acquireLeases() { return {}; },
-      async renewLeases(_grants, context) {
-        observedSignal = context?.signal ?? null;
-        return {};
-      },
-      async releaseLeases() {},
-    });
-
-    await dispatcher.handleCallback(
-      "callback/lease_provider/renew_leases",
-      { grants: [] },
-      { signal: controller.signal, deadlineMs: Date.now() + 125_000 },
-    );
-
-    assert.equal(observedSignal, controller.signal);
-  });
-
-  it("routes callback/lease_provider/release_leases to LeaseProvider", async () => {
-    const { CallbackDispatcher } = await import("../src/agent-builder.js");
-    const dispatcher = new CallbackDispatcher();
-    let releasedCount = 0;
-
-    dispatcher.registerLeaseProvider({
-      async acquireLeases() { return {}; },
-      async renewLeases() { return {}; },
-      async releaseLeases(grants) { releasedCount = grants.length; },
-    });
-
-    await dispatcher.handleCallback("callback/lease_provider/release_leases", {
-      grants: [{ identity: "x:1", fencing_token: 1, ttl: 30000 }],
-    });
-    assert.equal(releasedCount, 1);
-  });
-
   it("routes callback/roster_provider/roster to RosterProvider", async () => {
     const { CallbackDispatcher } = await import("../src/agent-builder.js");
     const dispatcher = new CallbackDispatcher();

@@ -9,12 +9,14 @@ use std::time::{Duration, Instant};
 
 use futures::{StreamExt, stream};
 
+use std::sync::Arc;
+
+use super::bridge::MemberRuntimeBinding;
 use super::contracts::{AgentCustomizer, TopologyProvider};
 use super::runtime::{EmbodimentOverrides, IdentityRuntime, IdentityRuntimeError};
 use super::types::{
-    AgentBuildDraft, AgentIdentity, ContinuityFailure, ContinuityFailureKind, ContinuityRecord,
-    ContinuityResolveState, DurableAgentSpec, IdentityLifecycleState, IdentityRestoreProgress,
-    ManagedPeerEdge, TopologyContext,
+    AgentBuildDraft, AgentIdentity, DurableAgentSpec, IdentityRestoreProgress, ManagedPeerEdge,
+    TopologyContext,
 };
 
 pub(crate) const IDENTITY_RESTORE_CONCURRENCY: usize = 4;
@@ -69,8 +71,8 @@ mod restore_concurrency_tests {
 
     // The former `should_load_resume_snapshot` / `RestoreSnapshotPolicy` unit
     // tests are gone with the policy twin they described. The surviving rule
-    // ("load the continuity payload unless a live bridge declares it resumes
-    // by session id") is guarded end to end where it can actually regress:
+    // ("load the continuity payload only when no bridge is composed") is
+    // guarded end to end where it can actually regress:
     // `identity_first_public_eager_refresh_elides_snapshot_load` counts real
     // store calls, and the bridge-less `restore_flow` tests in
     // identity_first_runtime / identity_first_choke / identity_first_e2e pin
@@ -101,28 +103,30 @@ fn trace_identity_restore_completed(identity: &AgentIdentity, started_at: Instan
 /// Result of the restore flow for a single identity.
 #[derive(Debug, Clone)]
 pub enum RestoreOutcome {
-    /// Lazy bootstrap registered identity metadata without materializing a
-    /// concrete mob member/session.
-    Dormant {
-        record: Option<ContinuityRecord>,
-        draft: AgentBuildDraft,
-    },
-    /// Fresh-created: new AgentRuntimeId, new SessionId.
+    /// Registered without a wake: a lazy bootstrap, or a runtime with no
+    /// session bridge (validation only).
+    Dormant { draft: AgentBuildDraft },
+    /// Core spawned the identity fresh. `replaced_session` names the last
+    /// session it replaced because Core holds no durable session for it
+    ///; `None` for an identity Core never spawned.
     Created {
-        record: ContinuityRecord,
+        binding: MemberRuntimeBinding,
         draft: AgentBuildDraft,
+        replaced_session: Option<meerkat_core::types::SessionId>,
     },
-    /// Resumed: the identity kept its AgentRuntimeId and SessionId.
-    ///
-    /// The durable record is the public resume authority. Snapshot bytes are
-    /// internal bridge input and are deliberately not copied into this result.
+    /// Core resumed the identity onto its committed session (or revived the
+    /// member it already held). `draft` is what this wake built: for a member
+    /// Core already held live nothing is built, so it is the spec's base
+    /// draft, and the member keeps the system prompt it was built with.
     Resumed {
-        record: ContinuityRecord,
+        binding: MemberRuntimeBinding,
         draft: AgentBuildDraft,
     },
-    /// Broken continuity or a member-scoped embodiment failure, surfaced with
-    /// its exact typed cause while unrelated members continue restoring.
-    Broken(ContinuityFailure),
+    /// The wake was refused, typed: a host-adopted identity, a
+    /// session Core cannot resume, a held resume, or a transient fault.
+    /// Nothing is parked: the next wake asks Core again, and unrelated
+    /// members keep restoring.
+    Refused(Arc<IdentityRuntimeError>),
 }
 
 impl RestoreOutcome {
@@ -132,8 +136,13 @@ impl RestoreOutcome {
             Self::Dormant { .. } => IdentityRestoreProgress::Registered,
             Self::Created { .. } => IdentityRestoreProgress::Minted,
             Self::Resumed { .. } => IdentityRestoreProgress::Resumed,
-            Self::Broken(failure) => IdentityRestoreProgress::Broken {
-                kind: failure.kind.clone(),
+            Self::Refused(error) => IdentityRestoreProgress::Refused {
+                code: crate::rpc::identity_error_code(error),
+                kind: error.structured_data().and_then(|data| {
+                    data.get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                }),
             },
         }
     }
@@ -153,7 +162,7 @@ pub struct RestoreFlowResult {
 /// Actions produced by reconciliation (REQ-33).
 #[derive(Debug, Clone)]
 pub enum ReconcileAction {
-    /// New identity: resolve + lease + activate.
+    /// New identity: register and wake.
     Activate(DurableAgentSpec),
     /// Removed identity: retire.
     Retire(AgentIdentity),
@@ -224,7 +233,7 @@ type RosterAuthorityGuards = (
 );
 
 /// Reserve every identity and its public alias in one stable order before a
-/// roster-wide continuity/lease decision. Keeping the guards owned lets the
+/// roster-wide registration. Keeping the guards owned lets the
 /// restore work remain concurrent after the all-or-nothing authority gate,
 /// while reset, delete, materialize, and raw-member creation cannot invalidate
 /// any member's freshly resolved generation.
@@ -282,76 +291,152 @@ async fn acquire_roster_authority_guards(
 // Restore flow orchestration — REQ-12
 // ---------------------------------------------------------------------------
 
+/// Wake one registered roster member in a restore pass: wait for a
+/// construction slot of the held pass covering it, if any, wake it through
+/// the one wake door, and account for the outcome (the pass's held
+/// bookkeeping, the bootstrap progress). Without a session bridge
+/// (`wakes` false) a Dormant member stays Dormant.
+async fn restore_registered_member(
+    runtime: &IdentityRuntime,
+    spec: DurableAgentSpec,
+    initial: Option<RestoreOutcome>,
+    held_pass: Option<Arc<super::held_bootstrap::HeldCreatePass>>,
+    customizer: Option<&dyn AgentCustomizer>,
+    wakes: bool,
+) -> RestoreOutcome {
+    let identity = spec.identity.clone();
+    // A held member waits for a construction slot only within the setup's
+    // bound: once the pass's terminal decision is `Abort`, it is never
+    // constructed.
+    let construction_refused = match held_pass.as_ref() {
+        Some(pass) => !pass.take_construction_slot(&identity).await,
+        None => false,
+    };
+    let member_started_at = Instant::now();
+
+    let outcome = match initial {
+        _ if construction_refused => {
+            RestoreOutcome::Refused(Arc::new(IdentityRuntimeError::Internal(format!(
+                "the held identity bootstrap ended before {identity}'s construction started"
+            ))))
+        }
+        Some(RestoreOutcome::Refused(error)) => RestoreOutcome::Refused(error),
+        Some(dormant @ RestoreOutcome::Dormant { .. }) if !wakes => dormant,
+        Some(
+            RestoreOutcome::Dormant { .. }
+            | RestoreOutcome::Created { .. }
+            | RestoreOutcome::Resumed { .. },
+        ) => {
+            runtime.publish_restore_progress(&identity, IdentityRestoreProgress::Resuming, None);
+            let mut bound_bootstrap_generation = None;
+            match runtime
+                .embody_identity(
+                    &identity,
+                    None,
+                    None,
+                    None,
+                    &mut bound_bootstrap_generation,
+                    EmbodimentOverrides {
+                        spec: Some(&spec),
+                        customizer,
+                        expected_spec_digest: None,
+                    },
+                )
+                .await
+            {
+                Ok(wake) if wake.resumed => RestoreOutcome::Resumed {
+                    binding: wake.binding,
+                    draft: wake.draft,
+                },
+                Ok(wake) => RestoreOutcome::Created {
+                    binding: wake.binding,
+                    draft: wake.draft,
+                    replaced_session: wake.replaced_session,
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        %identity,
+                        %error,
+                        "identity wake refused; the fleet restore continues"
+                    );
+                    RestoreOutcome::Refused(Arc::new(error))
+                }
+            }
+        }
+        None => {
+            // register_identity_metadata proves one result for every
+            // registered identity. A violated internal correspondence is this
+            // member's visible failure, never the fleet's.
+            RestoreOutcome::Refused(Arc::new(IdentityRuntimeError::Internal(format!(
+                "validated registration outcome disappeared for {identity}"
+            ))))
+        }
+    };
+
+    // A held pass settles what its host's completion covers: a published
+    // member owes nothing, and a refused one owes its host a fresh held
+    // completion before it is created again.
+    if held_pass.is_some() {
+        match &outcome {
+            RestoreOutcome::Created { .. } => {
+                runtime.record_held_completion(&identity, true);
+                runtime.clear_held_completion_mark(&identity).await;
+            }
+            RestoreOutcome::Refused(_) => {
+                runtime.record_held_completion(&identity, false);
+            }
+            RestoreOutcome::Dormant { .. } | RestoreOutcome::Resumed { .. } => {}
+        }
+    }
+    let error = match &outcome {
+        RestoreOutcome::Refused(error) => Some(error.to_string()),
+        _ => None,
+    };
+    runtime.publish_restore_progress(&identity, outcome.restore_progress(), error);
+    trace_identity_restore_completed(&identity, member_started_at);
+    if let Some(pass) = held_pass.as_ref() {
+        pass.settle(&identity);
+    }
+    outcome
+}
+
 /// Execute the full restore flow per REQ-12 sequencing.
 ///
 /// Steps:
-/// 1. Validate the roster and compute topology.
-/// 2. Resolve continuity for the complete roster and publish metadata.
-/// 3. For each non-Broken identity, independently acquire its lease, build,
-///    and create or resume through `IdentityRuntime::embody_identity`.
-/// 4. Park a member-attributable failure as a typed Broken outcome and keep
-///    restoring the remaining identities.
+/// 1. Validate the roster, compute topology, and register every roster spec
+///    (a host-adopted identity is a typed refusal in the report).
+/// 2. Wake each identity through `IdentityRuntime::embody_identity`, the one
+///    wake door: Core resumes it onto its committed session, or spawns it
+///    fresh when Core never spawned it.
+/// 3. A refused wake is a typed `Refused` outcome for that identity only;
+///    the remaining identities keep restoring.
 ///
-/// When `bridge` is `Some`, Uninitialized identities call `bridge.create_session()`
-/// and Ready identities call `bridge.resume_session()` to actually spawn/resume
-/// mob members. When `None`, the flow runs validation-only (for tests).
-///
-/// # Snapshot payloads are read on need, not on principle
-///
-/// There is ONE restore flow and ONE snapshot rule (there used to be two of
-/// each - `RestoreSnapshotPolicy` and a bootstrap-only twin - which is why
-/// console add-member and every reconcile pass paid a full session-blob read
-/// per Ready member: 14MB/60s to 94MB/180s in production). Restore now reads
-/// the continuity payload only where something consumes it:
-///
-/// - already-converged identity: never (metadata convergence, no embodiment);
-/// - live bridge that declares `requires_resume_snapshot() == false`: never
-///   (it resumes by session id and must not inspect the argument);
-/// - otherwise (no bridge, or a bridge that consumes the payload): always.
-///
-/// The no-bridge case is load-bearing, not conservatism: with no bridge
-/// verdict to key on, snapshot presence is the only signal that distinguishes
-/// a resumed identity from a fresh-created one.
-///
-/// Snapshot bytes remain internal to the embodiment transaction. The public
-/// `Resumed` outcome reports the durable identity/session record instead of a
-/// second, non-authoritative copy of bridge input.
+/// Without a session bridge the flow is validation-only: every outcome is
+/// `Dormant` and nothing is woken.
 pub async fn restore_flow(
     runtime: &IdentityRuntime,
     roster: &[DurableAgentSpec],
     topology_provider: Option<&dyn TopologyProvider>,
     customizer: Option<&dyn AgentCustomizer>,
 ) -> Result<RestoreFlowResult, IdentityRuntimeError> {
-    // The pass is one embodiment burst: the repair supervisor defers until
-    // all of it settled, then runs one pass for every settle it raised.
-    let _burst = runtime.enter_embodiment_burst();
-    // Fleet-level declaration and continuity resolution remain fail-closed:
-    // without a valid unique roster, topology, or complete batch-store answer
-    // there is no truthful set of identities to materialize. The lazy
-    // registration phase publishes that validated metadata without creating a
-    // member or taking an embodiment lease.
+    // Fleet-level declaration and topology remain fail-closed: without a
+    // valid unique roster there is no truthful set of identities to wake.
     let registered = register_roster_metadata(runtime, roster, topology_provider, false).await?;
     let managed_edges = registered.managed_edges;
     let registered_outcomes = registered.outcomes;
     // Typed per-member progress on the bootstrap status, so a host follows
     // each member instead of waiting on the whole pass.
     for (identity, outcome) in &registered_outcomes {
-        let error = match outcome {
-            RestoreOutcome::Broken(failure) => Some(failure.detail.clone()),
-            _ => None,
-        };
-        let progress = match outcome {
-            RestoreOutcome::Broken(_) => outcome.restore_progress(),
-            _ => IdentityRestoreProgress::Registered,
+        let (progress, error) = match outcome {
+            RestoreOutcome::Refused(error) => (outcome.restore_progress(), Some(error.to_string())),
+            _ => (IdentityRestoreProgress::Registered, None),
         };
         runtime.publish_restore_progress(identity, progress, error);
     }
+    let wakes = runtime.has_session_bridge();
 
-    // Concrete embodiment is deliberately per identity. Eager restore, lazy
-    // foreground materialization, and background warming now use the same
-    // lifecycle-locked transaction in IdentityRuntime::embody_identity. A
-    // member-attributable failure parks only that identity as a typed Broken
-    // outcome; it can never abort an unrelated member's boot.
+    // Each identity wakes on its own. A refused wake is that identity's
+    // typed outcome; it never aborts an unrelated member's boot.
     // A held pass decides its members only once every one of them is held
     // or settled. Its members wait on the pass's construction slots (the
     // ordinary restore concurrency) and give a slot back when they report
@@ -374,113 +459,9 @@ pub async fn restore_flow(
             let held_pass = held_pass.clone();
             async move {
                 let identity = spec.identity.clone();
-                // A held member waits for a construction slot only within
-                // the setup's bound: once the pass's terminal decision is
-                // `Abort`, it is never constructed.
-                let construction_refused = match held_pass.as_ref() {
-                    Some(pass) => !pass.take_construction_slot(&identity).await,
-                    None => false,
-                };
-                let member_started_at = Instant::now();
-
-                let outcome = match initial {
-                    _ if construction_refused => {
-                        let error = IdentityRuntimeError::Internal(format!(
-                            "the held identity bootstrap ended before {identity}'s construction started"
-                        ));
-                        RestoreOutcome::Broken(
-                            runtime.park_embodiment_failure(&identity, &error).await,
-                        )
-                    }
-                    Some(RestoreOutcome::Broken(failure)) => {
-                        RestoreOutcome::Broken(failure)
-                    }
-                    Some(
-                        RestoreOutcome::Dormant { .. }
-                        | RestoreOutcome::Created { .. }
-                        | RestoreOutcome::Resumed { .. },
-                    ) => {
-                        runtime.publish_restore_progress(
-                            &identity,
-                            IdentityRestoreProgress::Resuming,
-                            None,
-                        );
-                        let mut bound_bootstrap_generation = None;
-                        match runtime
-                            .embody_identity(
-                                &identity,
-                                None,
-                                None,
-                                None,
-                                &mut bound_bootstrap_generation,
-                                EmbodimentOverrides {
-                                    spec: Some(&spec),
-                                    customizer,
-                                    expected_spec_digest: None,
-                                },
-                            )
-                            .await
-                        {
-                            Ok(embodiment) if embodiment.resumed => RestoreOutcome::Resumed {
-                                record: embodiment.record,
-                                draft: embodiment.draft,
-                            },
-                            Ok(embodiment) => RestoreOutcome::Created {
-                                record: embodiment.record,
-                                draft: embodiment.draft,
-                            },
-                            Err(error) => {
-                                let failure = runtime
-                                    .park_embodiment_failure(&identity, &error)
-                                    .await;
-                                tracing::warn!(
-                                    %identity,
-                                    kind = ?failure.kind,
-                                    detail = %failure.detail,
-                                    "identity embodiment failed; parked Broken while fleet restore continues"
-                                );
-                                RestoreOutcome::Broken(failure)
-                            }
-                        }
-                    }
-                    None => {
-                        // lazy_register_flow proves one result for every roster
-                        // identity. Treat a violated internal correspondence as
-                        // this member's visible failure rather than borrowing
-                        // the cause for the rest of the fleet.
-                        let error = IdentityRuntimeError::Internal(format!(
-                            "validated registration outcome disappeared for {identity}"
-                        ));
-                        let failure = runtime
-                            .park_embodiment_failure(&identity, &error)
-                            .await;
-                        RestoreOutcome::Broken(failure)
-                    }
-                };
-
-                // A held pass settles what its host's completion covers: a
-                // published member owes nothing, and a Broken one owes its
-                // host a fresh held completion before it is created again.
-                if held_pass.is_some() {
-                    match &outcome {
-                        RestoreOutcome::Created { .. } => {
-                            runtime.record_held_completion(&identity, true);
-                        }
-                        RestoreOutcome::Broken(_) => {
-                            runtime.record_held_completion(&identity, false);
-                        }
-                        RestoreOutcome::Dormant { .. } | RestoreOutcome::Resumed { .. } => {}
-                    }
-                }
-                let error = match &outcome {
-                    RestoreOutcome::Broken(failure) => Some(failure.detail.clone()),
-                    _ => None,
-                };
-                runtime.publish_restore_progress(&identity, outcome.restore_progress(), error);
-                trace_identity_restore_completed(&identity, member_started_at);
-                if let Some(pass) = held_pass.as_ref() {
-                    pass.settle(&identity);
-                }
+                let outcome =
+                    restore_registered_member(runtime, spec, initial, held_pass, customizer, wakes)
+                        .await;
                 (index, identity, outcome)
             }
         })
@@ -499,10 +480,10 @@ pub async fn restore_flow(
         "identity restore completed"
     );
 
-    // Topology is a fleet-level projection over the successfully embodied
-    // set. Member failures have already become typed outcomes, but an invalid
-    // fleet projection remains a pass failure rather than being attributed to
-    // any one identity.
+    // Topology is a fleet-level projection over the woken set. Member
+    // refusals are typed outcomes already, but an invalid fleet projection
+    // remains a pass failure rather than being attributed to any one
+    // identity.
     runtime.set_desired_peer_edges(managed_edges.clone()).await;
     runtime.reconcile_managed_peer_edges(&managed_edges).await?;
 
@@ -511,12 +492,13 @@ pub async fn restore_flow(
         managed_edges,
     })
 }
-/// Register the roster/topology metadata without materializing members.
+
+/// Register the roster/topology metadata without waking members.
 ///
 /// This is the identity-first lazy bootstrap path: it validates the roster,
-/// resolves cheap continuity metadata, records desired topology, and exposes
-/// status/inspection surfaces. It deliberately does not acquire leases, call
-/// customizers, load session snapshots, create sessions, or resume sessions.
+/// registers each spec, records desired topology, and exposes status and
+/// inspection surfaces (which read Core). It calls no customizer and asks
+/// Core for no session.
 pub async fn lazy_register_flow(
     runtime: &IdentityRuntime,
     roster: &[DurableAgentSpec],
@@ -525,18 +507,34 @@ pub async fn lazy_register_flow(
     register_roster_metadata(runtime, roster, topology_provider, true).await
 }
 
-/// Validate and publish roster metadata without opening a concrete embodiment
-/// transaction. Eager restore defers an Active member's spec mutation until
-/// the shared embodiment door has revalidated its external lease; a genuinely
-/// lazy reconcile has no embodiment transaction and publishes the metadata in
-/// this phase.
+/// Validate the roster and topology and register every roster spec, without
+/// waking anything. Meta keeps no Core fact: the registration is the
+/// roster's policy only, and every Core fact is read per call. A roster
+/// entry naming a host-adopted identity (Core holds its identity intent
+/// row) is registered for the views but reported as a typed refusal: no
+/// Meta verb acts on it. A lazy reconcile (`reconcile_edges`) also
+/// reconciles the managed topology, since no wake pass follows it.
+///
+/// The first-boot manifest is read first. A manifest the reader
+/// refuses refuses every identity of the compile, typed, and nothing wakes:
+/// which identities it covers is unknown. The compile itself goes on, so the
+/// gateway stays up and its status names the file and the refusal. The
+/// pending row of each identity the roster lists is carried out right after
+/// its registration, before anything wakes the identity; a row that fails
+/// or is refused makes that identity's outcome a typed refusal, and the rest
+/// of the roster goes on. A row whose identity the roster does not list
+/// stays pending. Then each listed identity whose live Core member lacks
+/// the durable-identity marker (Meta 0.9.3 spawned it) is respawned onto the
+/// same session ([`IdentityRuntime::respawn_unmarked_identities`]); a failed
+/// respawn is that identity's typed refusal.
 async fn register_roster_metadata(
     runtime: &IdentityRuntime,
     roster: &[DurableAgentSpec],
     topology_provider: Option<&dyn TopologyProvider>,
-    update_active_specs: bool,
+    reconcile_edges: bool,
 ) -> Result<RestoreFlowResult, IdentityRuntimeError> {
     IdentityRuntime::validate_roster_uniqueness(roster)?;
+    let first_boot_unreadable = runtime.load_first_boot_manifest().await.err().map(Arc::new);
 
     let identities: Vec<AgentIdentity> = roster.iter().map(|s| s.identity.clone()).collect();
 
@@ -555,253 +553,10 @@ async fn register_roster_metadata(
     );
     runtime.set_desired_peer_edges(managed_edges.clone()).await;
 
-    // Reserve the full roster before the one fleet-wide metadata read. Each
-    // identity's guard remains held until its dormant/active projection is
-    // published, so a queued reset/delete cannot invalidate the batch result
-    // while preserving O(1) store round trips for large lazy rosters.
-    let mut authority_guards = acquire_roster_authority_guards(runtime, &identities).await?;
-    // Restore/materialization can fail before an IdentityEntry exists. Exact
-    // grants from that phase live in the runtime-owned orphan ledger; both
-    // eager and lazy reconcile must drain it before publishing a repair or
-    // allowing later on-demand materialization to reacquire authority.
-    runtime.release_parked_unactivated_leases().await?;
-    let resolved = runtime
-        .continuity_store()
-        .resolve_many(&identities)
-        .await
-        .map_err(IdentityRuntimeError::Store)?;
-    for identity in &identities {
-        if !resolved.contains_key(identity) {
-            return Err(IdentityRuntimeError::Internal(format!(
-                "resolve_many did not return state for {identity}"
-            )));
-        }
-    }
+    let outcomes =
+        register_identity_metadata(runtime, roster, first_boot_unreadable.as_ref()).await?;
 
-    let mut outcomes = BTreeMap::new();
-    for spec in roster {
-        let identity = &spec.identity;
-        let _authority_guards = authority_guards.remove(identity).ok_or_else(|| {
-            IdentityRuntimeError::Internal(format!(
-                "validated lazy authority reservation disappeared for {identity}"
-            ))
-        })?;
-        let resolve_state = resolved.get(identity).cloned().ok_or_else(|| {
-            IdentityRuntimeError::Internal(format!(
-                "validated lazy resolve state disappeared for {identity}"
-            ))
-        })?;
-        let current_state = runtime
-            .status(identity)
-            .await
-            .ok()
-            .map(|status| status.state);
-        let currently_active = current_state == Some(IdentityLifecycleState::Active);
-        // A terminal continuity verdict owns this Broken projection. It must
-        // preserve the durable lower-plane binding for operator repair rather
-        // than entering ordinary failed-embodiment cleanup.
-        // Two typed projections own a Broken entry against reconcile: the
-        // heal authority's unprovable verdict (CheckpointUnrecoverable) and
-        // the audited-endpoint repair hold (RepairRequired), whose exit is the
-        // operator's `rkat session repair-wholeblob` plus `reload_member`.
-        // A refused declared role migration owns it too: the refusal kept the
-        // restored member, and retiring that member for the ordinary cleanup
-        // is the destructive step the refusal exists to prevent. It is checked
-        // against the spec this pass restores, so a changed spec never
-        // inherits it.
-        let terminal_verdict: Option<(ContinuityFailureKind, String)> = if currently_active {
-            None
-        } else if let Some(verdict) = runtime.continuity_unrecoverable(identity).await {
-            Some((
-                ContinuityFailureKind::CheckpointUnrecoverable,
-                verdict.reason,
-            ))
-        } else if let Some(reason) = runtime.role_migration_refusal(identity, Some(spec)).await {
-            Some((ContinuityFailureKind::RoleMigrationNotApplied, reason))
-        } else {
-            runtime.session_repair_required(identity).await.map(|hold| {
-                (
-                    ContinuityFailureKind::RepairRequired,
-                    hold.operator_reason(),
-                )
-            })
-        };
-        if current_state == Some(IdentityLifecycleState::Broken)
-            && terminal_verdict.is_none()
-            && let Err(error) = runtime
-                .prepare_broken_identity_for_registration(identity)
-                .await
-        {
-            let failure = runtime.park_embodiment_failure(identity, &error).await;
-            tracing::warn!(
-                %identity,
-                kind = ?failure.kind,
-                detail = %failure.detail,
-                "Broken identity cleanup failed; retained exact authority and continued roster registration"
-            );
-            outcomes.insert(identity.clone(), RestoreOutcome::Broken(failure));
-            continue;
-        }
-        // Terminal heal verdict (2026-07-29 incident): while it stands, lazy
-        // reconcile must not soften this identity's Broken projection to
-        // Dormant - that cosmetic "heal" is what materialization re-Breaks.
-        let draft = AgentBuildDraft {
-            model: None,
-            system_prompt: None,
-            additional_instructions: spec.additional_instructions.clone(),
-            labels: spec.labels.clone(),
-            app_context: spec.context.clone(),
-            external_tools: Vec::new(),
-            local_external_tools: Default::default(),
-            provider_params: None,
-            compaction_curator: Default::default(),
-        };
-        match resolve_state {
-            ContinuityResolveState::Uninitialized => {
-                if currently_active {
-                    if update_active_specs {
-                        runtime.update_spec_locked(spec.clone()).await?;
-                    }
-                } else {
-                    runtime
-                        .register_locked(spec.clone(), IdentityLifecycleState::Dormant, None, None)
-                        .await;
-                }
-                outcomes.insert(
-                    identity.clone(),
-                    RestoreOutcome::Dormant {
-                        record: None,
-                        draft,
-                    },
-                );
-            }
-            ContinuityResolveState::Ready { record } => {
-                if currently_active {
-                    if update_active_specs {
-                        runtime.update_spec_locked(spec.clone()).await?;
-                    }
-                } else if let Some((kind, reason)) = terminal_verdict {
-                    // 2026-07-29 incident: re-registering a heal-unprovable
-                    // identity as Dormant is the cosmetic "heal" that the
-                    // next on-demand materialization immediately re-Breaks.
-                    // Keep the Broken projection and its typed terminal
-                    // reason; delivery keeps refusing loudly (REQ-13) until
-                    // an operator intervenes. The repair hold is the same
-                    // shape with the operator's repair as its exit.
-                    runtime.update_spec_locked(spec.clone()).await?;
-                    outcomes.insert(
-                        identity.clone(),
-                        RestoreOutcome::Broken(ContinuityFailure {
-                            identity: identity.clone(),
-                            kind,
-                            record: Some(record),
-                            detail: reason,
-                        }),
-                    );
-                    continue;
-                } else {
-                    runtime
-                        .register_locked(
-                            spec.clone(),
-                            IdentityLifecycleState::Dormant,
-                            Some(record.clone()),
-                            None,
-                        )
-                        .await;
-                }
-                outcomes.insert(
-                    identity.clone(),
-                    RestoreOutcome::Dormant {
-                        record: Some(record),
-                        draft,
-                    },
-                );
-            }
-            ContinuityResolveState::Broken { failure } => {
-                if currently_active {
-                    // A store projection cannot revoke a live embodiment's
-                    // exact local authority. Preserve the Active entry and
-                    // let the shared embodiment door validate its lease
-                    // before applying an eager desired spec. Lazy metadata
-                    // refreshes may update the spec directly because they do
-                    // not embody in this pass.
-                    if update_active_specs {
-                        runtime.update_spec_locked(spec.clone()).await?;
-                    }
-                    outcomes.insert(
-                        identity.clone(),
-                        RestoreOutcome::Dormant {
-                            record: failure.record,
-                            draft,
-                        },
-                    );
-                } else if let Some((kind, reason)) = terminal_verdict
-                    && matches!(failure.kind, ContinuityFailureKind::SnapshotMissing)
-                    && failure.record.is_some()
-                {
-                    // Same guard as the Ready arm above: a store-visible
-                    // Broken shape must not be softened to Dormant while the
-                    // heal authority's terminal verdict stands.
-                    runtime.update_spec_locked(spec.clone()).await?;
-                    outcomes.insert(
-                        identity.clone(),
-                        RestoreOutcome::Broken(ContinuityFailure {
-                            identity: identity.clone(),
-                            kind,
-                            record: failure.record.clone(),
-                            detail: reason,
-                        }),
-                    );
-                } else if matches!(failure.kind, ContinuityFailureKind::SnapshotMissing)
-                    && let Some(record) = failure.record.clone()
-                {
-                    if currently_active {
-                        if update_active_specs {
-                            runtime.update_spec_locked(spec.clone()).await?;
-                        }
-                    } else {
-                        runtime
-                            .register_locked(
-                                spec.clone(),
-                                IdentityLifecycleState::Dormant,
-                                Some(record.clone()),
-                                None,
-                            )
-                            .await;
-                    }
-                    outcomes.insert(
-                        identity.clone(),
-                        RestoreOutcome::Dormant {
-                            record: Some(record),
-                            draft,
-                        },
-                    );
-                } else {
-                    // Same warn-baseline visibility rule as the resolve-time
-                    // Broken registration above: the typed reason must not
-                    // ride only the roster.
-                    tracing::warn!(
-                        %identity,
-                        kind = ?failure.kind,
-                        detail = %failure.detail,
-                        "restore failure registers the identity Broken pending reconcile"
-                    );
-                    runtime
-                        .register_locked(
-                            spec.clone(),
-                            IdentityLifecycleState::Broken,
-                            failure.record.clone(),
-                            None,
-                        )
-                        .await;
-                    outcomes.insert(identity.clone(), RestoreOutcome::Broken(failure));
-                }
-            }
-        }
-    }
-
-    if update_active_specs
-        && let Err(err) = runtime.reconcile_managed_peer_edges(&managed_edges).await
+    if reconcile_edges && let Err(err) = runtime.reconcile_managed_peer_edges(&managed_edges).await
     {
         tracing::warn!(
             error = %err,
@@ -812,5 +567,118 @@ async fn register_roster_metadata(
     Ok(RestoreFlowResult {
         outcomes,
         managed_edges,
+    })
+}
+
+/// Register exactly `specs`' identities: each one's spec, its typed
+/// refusal when Core holds its identity intent row or the first-boot
+/// manifest is unreadable, and its pending first-boot row carried out
+/// before anything wakes it. The roster-wide half (uniqueness, topology,
+/// desired edges, the manifest read) stays with the caller.
+async fn register_identity_metadata(
+    runtime: &IdentityRuntime,
+    specs: &[DurableAgentSpec],
+    first_boot_unreadable: Option<&Arc<IdentityRuntimeError>>,
+) -> Result<BTreeMap<AgentIdentity, RestoreOutcome>, IdentityRuntimeError> {
+    let roster = specs;
+    let identities: Vec<AgentIdentity> = roster.iter().map(|s| s.identity.clone()).collect();
+    // Reserve the full roster in one stable order, so a queued reset, delete
+    // or raw-member creation cannot interleave with the registration.
+    let mut authority_guards = acquire_roster_authority_guards(runtime, &identities).await?;
+
+    let mut outcomes = BTreeMap::new();
+    let mut first_boot = Vec::new();
+    let mut listed = Vec::new();
+    for spec in roster {
+        let identity = &spec.identity;
+        let (lifecycle_guard, alias_guard) =
+            authority_guards.remove(identity).ok_or_else(|| {
+                IdentityRuntimeError::Internal(format!(
+                    "validated roster reservation disappeared for {identity}"
+                ))
+            })?;
+        runtime.register_locked(spec.clone()).await;
+        if let Err(error) = runtime.refuse_host_adopted(identity).await {
+            tracing::warn!(
+                %identity,
+                %error,
+                "roster entry names an identity Meta may not act on; it is registered for the \
+                 views and reported refused"
+            );
+            outcomes.insert(identity.clone(), RestoreOutcome::Refused(Arc::new(error)));
+            continue;
+        }
+        if let Some(error) = first_boot_unreadable {
+            outcomes.insert(identity.clone(), RestoreOutcome::Refused(Arc::clone(error)));
+            continue;
+        }
+        outcomes.insert(
+            identity.clone(),
+            RestoreOutcome::Dormant {
+                draft: IdentityRuntime::base_build_draft(spec),
+            },
+        );
+        listed.push(spec.clone());
+        // The identity's first-boot row is carried out below, before
+        // anything wakes it: its lifecycle reservation is kept until then
+        // (the wake that carries a `Resume` row out takes the alias lock
+        // itself).
+        if runtime.has_pending_first_boot_row(identity) {
+            drop(alias_guard);
+            first_boot.push((spec.clone(), lifecycle_guard));
+        }
+    }
+    for (identity, error) in runtime.carry_out_first_boot_rows(first_boot).await {
+        tracing::warn!(
+            %identity,
+            %error,
+            "the identity's first-boot row was not carried out; it stays pending and the \
+             identity does not wake until it is"
+        );
+        outcomes.insert(identity, RestoreOutcome::Refused(Arc::new(error)));
+    }
+    for (identity, error) in runtime.respawn_unmarked_identities(&listed).await {
+        tracing::warn!(
+            %identity,
+            %error,
+            "the identity's live member lacks the durable-identity marker and its respawn \
+             failed; the next roster compile tries it again"
+        );
+        outcomes.insert(identity, RestoreOutcome::Refused(Arc::new(error)));
+    }
+
+    Ok(outcomes)
+}
+
+/// Register and wake one fresh member while the rest of the roster keeps
+/// running: the per-identity half of [`restore_flow`] for exactly `spec`,
+/// under the held pass that covers it. Nothing else is reconciled and the
+/// managed peer edges are not touched, so the result carries this member's
+/// outcome and no edges.
+pub(crate) async fn add_member_flow(
+    runtime: &IdentityRuntime,
+    spec: &DurableAgentSpec,
+    customizer: Option<&dyn AgentCustomizer>,
+) -> Result<RestoreFlowResult, IdentityRuntimeError> {
+    let first_boot_unreadable = runtime.load_first_boot_manifest().await.err().map(Arc::new);
+    let mut registered = register_identity_metadata(
+        runtime,
+        std::slice::from_ref(spec),
+        first_boot_unreadable.as_ref(),
+    )
+    .await?;
+    let initial = registered.remove(&spec.identity);
+    let outcome = restore_registered_member(
+        runtime,
+        spec.clone(),
+        initial,
+        runtime.held_create_pass(),
+        customizer,
+        runtime.has_session_bridge(),
+    )
+    .await;
+    Ok(RestoreFlowResult {
+        outcomes: BTreeMap::from([(spec.identity.clone(), outcome)]),
+        managed_edges: Vec::new(),
     })
 }

@@ -4,8 +4,13 @@ pub mod adapters;
 pub mod agent_memory;
 pub mod bridge;
 pub mod contracts;
+#[cfg(test)]
+pub(crate) mod core_test_bridge;
+#[cfg(test)]
+pub(crate) mod core_test_members;
 pub mod customizer_tools;
 mod delivery_scope;
+pub mod first_boot_manifest;
 pub mod gateway_bridges;
 pub(crate) mod held_bootstrap;
 pub mod local_lease;
@@ -33,9 +38,9 @@ pub use bridge::{
     ControllerPinSource, GovernedAdmission, GovernedAdmissionRecord, GovernedBindContext,
     GovernedDelivery, GovernedDeliveryCustody, GovernedEntryFence, GovernedEntryOutcome,
     GovernedEntryPermit, GovernedEntryRefusal, GovernedInputBinder, GovernedInputError,
-    GovernedSettlement, MemberInspection, MobSessionBridge, NativeInputAdmissionSettlement,
-    ResetSuccessorBinding, ResumeFallbackReason, ResumeRejectionKind, ResumeSessionOutcome,
-    SessionBridge,
+    GovernedSettlement, MemberInspection, MemberRuntimeBinding, MobSessionBridge,
+    NativeInputAdmissionSettlement, QueuedMemberInputs, ResumeFallbackReason, ResumeRejectionKind,
+    ResumeSessionOutcome, SessionBridge,
 };
 pub use contracts::*;
 pub use customizer_tools::{
@@ -44,15 +49,20 @@ pub use customizer_tools::{
 };
 pub use delivery_scope::{
     DELIVERY_SCOPE_VERSION, DeliveryScope, DeliveryScopeError, ScopeMismatch, ScopedDeliveryError,
-    ScopedDispatchReceipt, ScopedRecovery, ScopedRecoveryUnresolved,
+    ScopedDispatchReceipt, ScopedRecovery, ScopedRecoveryUnresolved, ScopedRetireError,
+};
+pub use first_boot_manifest::{
+    FIRST_BOOT_MANIFEST_FILE, FIRST_BOOT_MANIFEST_FORMAT, FIRST_BOOT_MANIFEST_VERSION,
+    FirstBootManifest, FirstBootManifestError, FirstBootManifestLocation, FirstBootManifestRefusal,
+    FirstBootManifestRemoval, FirstBootRow, FirstBootRowKind, FirstBootRowState,
 };
 pub use gateway_bridges::{
     CallbackBridge, GatewayAgentCustomizer, GatewayContinuityStore, GatewayLeaseProvider,
     GatewayRosterProvider, GatewayTopologyProvider,
 };
 pub use held_bootstrap::{
-    HeldBootstrapRefusal, HeldBootstrapSettlement, HeldBootstrapStart, HeldCompletion,
-    HeldCompletionOutcome, HeldCreatePass, HeldIdentityMember,
+    HELD_COMPLETION_OWED_DIR, HeldBootstrapRefusal, HeldBootstrapSettlement, HeldBootstrapStart,
+    HeldCompletion, HeldCompletionOutcome, HeldCreatePass, HeldIdentityMember,
 };
 pub use local_lease::LocalLeaseProvider;
 pub use local_store::{
@@ -63,10 +73,10 @@ pub use orchestrator::{
     lazy_register_flow, restore_flow,
 };
 pub(crate) use runtime::NotServedHere;
+pub use runtime::live_binding_runtime_id;
 pub use runtime::{
-    ContinuityRepairPolicy, ContinuityRepairRequestOutcome, ContinuityRepairTrigger,
     GovernedSendOutcome, IdentityFirstRuntimeContext, IdentityRuntime, IdentityRuntimeConfig,
-    IdentityRuntimeError, wire_cross_mob_by_identity,
+    IdentityRuntimeError, UnresumableReason, WakeHold, wire_cross_mob_by_identity,
 };
 pub use types::*;
 

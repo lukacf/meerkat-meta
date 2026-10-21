@@ -812,9 +812,24 @@ fn live_error(rpc_id: Value, code: i64, message: impl Into<String>) -> JsonRpcRe
     }
 }
 
+/// A live open refused because another live open on this gateway is still
+/// being prepared: Meerkat admits one live open projection per process at a
+/// time and queues none. Nothing was opened, and a new open succeeds once
+/// that open is prepared, so callers treat it as busy, not as a host failure.
+#[cfg(feature = "openai-live")]
+pub(crate) const LIVE_OPEN_BUSY_CODE: i64 = -32054;
+
+/// The `data.kind` of a [`LIVE_OPEN_BUSY_CODE`] refusal, which also carries
+/// `data.retryable = true`.
+#[cfg(feature = "openai-live")]
+pub(crate) const LIVE_OPEN_BUSY_KIND: &str = "live_open_busy";
+
 #[cfg(feature = "openai-live")]
 fn live_open_error_response(rpc_id: Value, error: LiveOpenError) -> JsonRpcResponse {
     let code = match &error {
+        LiveOpenError::OpenConfig(RealtimeSessionOpenProjectionError::Backpressured) => {
+            LIVE_OPEN_BUSY_CODE
+        }
         LiveOpenError::SessionNotFound { .. }
         | LiveOpenError::OpenConfig(RealtimeSessionOpenProjectionError::Session(
             meerkat_core::SessionError::NotFound { .. },
@@ -851,6 +866,18 @@ fn live_open_error_response(rpc_id: Value, error: LiveOpenError) -> JsonRpcRespo
         | LiveOpenError::WebrtcTokenMint(_)
         | LiveOpenError::UnsupportedTransport => INTERNAL_ERROR_CODE,
     };
+    if code == LIVE_OPEN_BUSY_CODE {
+        return JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: rpc_id,
+            result: None,
+            error: Some(
+                JsonRpcError::new(code, error.to_string()).with_data(
+                    serde_json::json!({ "kind": LIVE_OPEN_BUSY_KIND, "retryable": true }),
+                ),
+            ),
+        };
+    }
     live_error(rpc_id, code, error.to_string())
 }
 
@@ -5304,6 +5331,24 @@ mod tests {
 
     #[cfg(feature = "openai-live-test")]
     use meerkat::experimental_gpt_live::ExperimentalLiveBoundChannelActivator as _;
+
+    /// A live open refused because another live open holds Meerkat's
+    /// one-at-a-time open admission answers `-32054` with the typed,
+    /// retryable `live_open_busy` payload, not an internal error.
+    #[cfg(feature = "openai-live")]
+    #[test]
+    fn a_backpressured_live_open_answers_the_retryable_live_open_busy_payload() {
+        let response = live_open_error_response(
+            serde_json::json!(7),
+            LiveOpenError::OpenConfig(RealtimeSessionOpenProjectionError::Backpressured),
+        );
+        let error = response.error.expect("a busy open is refused");
+        assert_eq!(error.code, LIVE_OPEN_BUSY_CODE);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"kind": LIVE_OPEN_BUSY_KIND, "retryable": true}))
+        );
+    }
 
     #[test]
     fn ordinary_live_instruction_overlay_preserves_legacy_normalization() {

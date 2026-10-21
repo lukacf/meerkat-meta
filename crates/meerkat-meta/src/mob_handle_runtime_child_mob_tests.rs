@@ -294,17 +294,6 @@ async fn lifetime(
     host: &Host,
     configure: impl FnOnce(MobBootstrapSpec) -> MobBootstrapSpec,
 ) -> Result<MobRuntime, MobRuntimeError> {
-    let session_store: Arc<dyn SessionStore> = Arc::new(
-        // The layout's canonical locator, so the storage-migrate pass has
-        // nothing to rename underneath a later lifetime.
-        meerkat_store::SqliteSessionStore::open(
-            MetaStorageLayout::with_injected_roots(dir.to_path_buf(), None)
-                .session_db()
-                .expect("session locator")
-                .path,
-        )
-        .expect("session store"),
-    );
     let (storage, provenance) =
         crate::mob_composition_manifest::persistent_mob_storage(dir.join("mob.sqlite3"))
             .expect("root mob storage");
@@ -313,12 +302,12 @@ async fn lifetime(
     let mut spec = MobBootstrapSpec::persistent(
         root_definition(mob_id),
         storage,
+        provenance,
         dir.to_path_buf(),
         8,
-        session_store,
     )
+    .await
     .expect("persistent spec")
-    .with_mob_storage_provenance(provenance)
     .register_tool_bundle_with_availability(
         "host",
         tools,

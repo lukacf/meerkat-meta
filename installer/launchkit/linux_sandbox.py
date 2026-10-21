@@ -94,8 +94,17 @@ def _filter():
         if library.seccomp_export_bpf(context, fd):
             raise LinuxSandboxError("Required Linux seccomp policy could not be compiled.")
         os.lseek(fd, 0, os.SEEK_SET)
-        fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
-                    fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE)
+        # Linux UAPI values remain usable when Python's build headers omit
+        # these names. The kernel must still apply and report every seal.
+        add_seals = getattr(fcntl, "F_ADD_SEALS", 1033)
+        get_seals = getattr(fcntl, "F_GET_SEALS", 1034)
+        seals = (getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+                 | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+                 | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+                 | getattr(fcntl, "F_SEAL_WRITE", 0x0008))
+        fcntl.fcntl(fd, add_seals, seals)
+        if fcntl.fcntl(fd, get_seals) & seals != seals:
+            raise LinuxSandboxError("Required Linux seccomp policy could not be sealed.")
         return fd
     except LinuxSandboxError:
         if fd is not None:

@@ -2,24 +2,25 @@
 //! held at their producer hold point until the host has completed its
 //! application from their finished surfaces.
 //!
-//! Each member is still created by its own identity embodiment transaction,
-//! under the identity's materialize lease and tentative continuity record:
-//! the transaction's create step spawns the member held
+//! Each member is still created by its identity's own embodiment, whose
+//! create step spawns the member held
 //! ([`meerkat_mob::MobHandle::spawn_held_until`]) and waits there for the
-//! pass's one decision. The pass decides once, after every roster identity
-//! is held; a member that settles without being held refuses the pass. The
-//! restore pass keeps its ordinary concurrency for constructions, and a
-//! member gives its construction slot back when it reports held, so no
-//! member's hold waits on a member that has not been constructed yet.
-//! `Activate` asks Core to activate each held member: a member whose
-//! activation Core accepts is published and its transaction continues exactly
-//! as an ordinary create. `Abort` aborts each one, and the transaction of a
-//! member that is not published (aborted, or expired below) runs its existing
-//! uninstalled cleanup (runtime-state registration, tentative continuity
-//! record, lease) once Core has settled the member, so the identity can be
-//! created again. Activation is per member and never atomic across members,
-//! and a held member may already have an actor and session document before it
-//! is published.
+//! pass's one decision. Meta takes no lease and writes no continuity record
+//! for the member: Core's mob is its only authority, before and after the
+//! hold. The pass decides once, after every roster identity is held; a member
+//! that settles without being held refuses the pass. The restore pass keeps
+//! its ordinary concurrency for constructions, and a member gives its
+//! construction slot back when it reports held, so no member's hold waits on
+//! a member that has not been constructed yet. `Activate` asks Core to
+//! activate each held member: a member whose activation Core accepts is
+//! published and its embodiment continues exactly as an ordinary create.
+//! `Abort` aborts each one, and the create of a member that is not published
+//! (aborted, or expired below) fails once Core has settled the member. Core
+//! never publishes such a member, so its member history gains no binding for
+//! the identity, which stays fresh: a later held pass can hold it again.
+//! Activation is per member and never atomic across members, and a held
+//! member may already have an actor and session document before it is
+//! published.
 //!
 //! # One terminal decision, deadline first
 //!
@@ -46,30 +47,45 @@
 //! outcome, so a held bootstrap reports neither a blanket success nor a
 //! blanket cleanup.
 //!
-//! The public start ([`HeldBootstrapStart`]) returns at a terminal `Abort`
-//! with the pass's pending [`HeldBootstrapSettlement`]: the identity
-//! runtime's tracked operation keeps owning the members' aborts, the host
-//! callback's join and the identities' cleanup. After an `Activate` it waits
-//! for the roster pass, through each member's actual activation or expiry. A
-//! member waiting for a construction slot at a terminal `Abort` is never
-//! constructed. The deadline bounds the whole setup entry: the start's
+//! The public start ([`HeldBootstrapStart`]) returns at a terminal `Abort` with
+//! the pass's pending [`HeldBootstrapSettlement`]: the identity runtime's
+//! tracked operation keeps owning the members' aborts (each until Core has
+//! settled it), the host callback's join and the marking of each member the
+//! pass did not publish as owing a fresh held completion. After an `Activate`
+//! it waits for the roster pass, through each member's actual activation or
+//! expiry. A member waiting for a construction slot at a terminal `Abort` is
+//! never constructed. The deadline bounds the whole setup entry: the start's
 //! admission into the tracked operation (which also ends at once when the
-//! runtime's foreground operations close, never queueing behind a
-//! shutdown's join) and a prepared mob's activation, which runs first in the
-//! same tracked operation in its ruled order; an entered step runs to its
-//! end, and no later step starts after an `Abort`. The caller's loss before
-//! the start returns is recorded as that terminal `Abort` too.
+//! runtime's foreground operations close, never queueing behind a shutdown's
+//! join) and a prepared mob's activation, which runs first in the same tracked
+//! operation in its ruled order; an entered step runs to its end, and no later
+//! step starts after an `Abort`. The caller's loss before the start returns is
+//! recorded as that terminal `Abort` too.
 //!
 //! A member the pass did not publish (it ended Broken in the pass: aborted,
 //! never held, expired at its activation, or failed after it) owes its host a
 //! fresh held completion. Nothing outside a held pass that covers it embodies
-//! it meanwhile: the ordinary repair skips it, and any other embodiment is
-//! refused ([`super::IdentityRuntimeError::HeldCompletionOwed`]), so a fresh
-//! session its host's completion never saw is never published around the
-//! configured hold. Its siblings and the pass's choice are untouched. The host's callback settlement is recorded apart
-//! ([`HeldCompletionOutcome`]): it is not native activation, not the host's
-//! own close, and says nothing about publication outside this runtime, which
-//! a native abort cannot undo.
+//! it meanwhile: every other wake of the identity is refused
+//! ([`super::IdentityRuntimeError::HeldCompletionOwed`]), so a fresh session
+//! its host's completion never saw is never published around the configured
+//! hold. Its siblings and the pass's choice are untouched. The host's
+//! callback settlement is recorded apart ([`HeldCompletionOutcome`]): it is
+//! not native activation, not the host's own close, and says nothing about
+//! publication outside this runtime, which a native abort cannot undo.
+//!
+//! # The owed marks survive a restart
+//!
+//! Core keeps nothing for a held member before its activation, so after a
+//! restart its member history says nothing about a member that was held.
+//! The pass therefore marks every roster identity durably in the runtime's
+//! state directory before it creates any member, one file per identity under
+//! [`HELD_COMPLETION_OWED_DIR`] (named by the SHA-256 of the identity it
+//! holds), and removes the mark of each member it publishes. A restart reads the marks back, also those of a process that
+//! stopped while its members were held: an ordinary wake still refuses those
+//! identities until a held pass that covers them publishes them. A mark
+//! whose identity Core's member history binds is dropped when it is read,
+//! since the pass published that member. A runtime without a state directory
+//! keeps the marks in memory only, so a restart forgets them.
 //!
 //! # Unsupported inventory (deferred)
 //!
@@ -77,11 +93,12 @@
 //! other inventory with a typed [`HeldBootstrapRefusal`] instead of
 //! publishing part of it unheld:
 //!
-//! - Trigger: a roster member with existing continuity (it would resume or
-//!   recover, not be created: `ExistingContinuity`, or `NotHeld` when it is
-//!   embodied outside the pass after the freshness read), a placed or
-//!   externally bound member, a member with an initial message, or the lazy
-//!   bootstrap mode.
+//! - Trigger: a roster member that is not fresh (Core's member history binds
+//!   it since the latest mob reset, or a first-boot row is still to carry
+//!   out for it, so it would resume rather than be created:
+//!   `ExistingContinuity`, or `NotHeld` when it is embodied outside the pass
+//!   after the freshness read), a placed or externally bound member, a
+//!   member with an initial message, or the lazy bootstrap mode.
 //! - Impact: a NEW application bundle whose selected inventory mixes
 //!   restored and fresh members cannot be completed through a held
 //!   bootstrap: no finished surface is captured for a restored member
@@ -91,8 +108,17 @@
 //!   held pass) is unchanged.
 //! - Owner: Meta identity runtime (held producer); exposing a restored
 //!   member's retained surface for a mixed inventory is a separate proposal.
+//!
+//! # One fresh member into a running roster
+//!
+//! [`super::IdentityFirstRuntimeContext::add_member_held`] holds one fresh
+//! member the same way while the rest of the roster keeps running: a pass
+//! over that member alone, under the same bootstrap controller and terminal
+//! decision, with no roster reconcile and no change to the managed peer
+//! edges.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -126,7 +152,10 @@ pub enum HeldBootstrapRefusal {
     ExternallyBound { identity: AgentIdentity },
     /// The member has an initial message, so its first turn is not deferred.
     InitialMessage { identity: AgentIdentity },
-    /// The member already has continuity: it would resume, not be created.
+    /// The member is not fresh, so it would resume rather than be created:
+    /// Core's member history binds it since the latest mob reset, or a
+    /// first-boot row is still to carry out for it. The name is kept for
+    /// compatibility.
     ExistingContinuity { identity: AgentIdentity },
     /// The member's embodiment settled without being held (it was embodied
     /// outside the pass, or its construction failed), so the bundle's
@@ -155,7 +184,8 @@ impl std::fmt::Display for HeldBootstrapRefusal {
             ),
             Self::ExistingContinuity { identity } => write!(
                 f,
-                "{identity} already has continuity; only fresh members can be held"
+                "{identity} is not fresh (Core already spawned it, or a first-boot row is still \
+                 to carry out for it); only fresh members can be held"
             ),
             Self::NotHeld { identity } => write!(
                 f,
@@ -490,10 +520,11 @@ pub enum HeldBootstrapStart {
     /// (deadline first, then the caller's loss, a host refusal, a member not
     /// held or the pass ending) and it is returned at that decision, while
     /// the identity runtime's tracked operation still owns whatever setup it
-    /// entered (a prepared mob's activation, the members' aborts, the host
-    /// callback's join and the identities' cleanup); or the setup was refused
-    /// or failed first, and its settlement is already resolved. The
-    /// settlement says which.
+    /// entered (a prepared mob's activation, the members' aborts until Core
+    /// has settled each, the host callback's join and the marking of each
+    /// member the pass did not publish as owing a fresh held completion); or
+    /// the setup was refused or failed first, and its settlement is already
+    /// resolved. The settlement says which.
     Unsettled(HeldBootstrapSettlement),
 }
 
@@ -527,9 +558,10 @@ impl HeldBootstrapSettlement {
     }
 
     /// Await the tracked operation's settlement: not bounded, it lasts as
-    /// long as the members' aborts, the host callback's join and the
-    /// identities' cleanup. Dropping or cancelling it changes nothing: the
-    /// operation still settles and keeps each identity owned until then.
+    /// long as the members' aborts (until Core has settled each) and the host
+    /// callback's join. Dropping or cancelling it changes nothing: the
+    /// operation still settles, and Core keeps each member's custody until
+    /// then.
     pub async fn settled(self) -> Result<RestoreFlowResult, IdentityRuntimeError> {
         self.result.await.map_err(|_| {
             IdentityRuntimeError::Internal(
@@ -550,8 +582,10 @@ struct PassState {
     slots: BTreeMap<AgentIdentity, OwnedSemaphorePermit>,
 }
 
-/// One held bootstrap pass over a roster. Created only by
-/// [`super::IdentityFirstRuntimeContext::bootstrap_roster_held`]; a
+/// One held bootstrap pass over a roster, or over the one member a held
+/// add creates. Created only by
+/// [`super::IdentityFirstRuntimeContext::bootstrap_roster_held`] and
+/// [`super::IdentityFirstRuntimeContext::add_member_held`]; a
 /// [`super::SessionBridge`] receives it in `create_session_held`.
 pub struct HeldCreatePass {
     terminal: Arc<HeldTerminal>,
@@ -729,6 +763,146 @@ impl HeldCreatePass {
     }
 }
 
+/// The directory, inside a runtime's state directory, that holds the durable
+/// marks of the identities owing their host a fresh held completion.
+pub const HELD_COMPLETION_OWED_DIR: &str = "held-completion-owed";
+
+/// The durable marks of the identities that owe their host a fresh held
+/// completion: one file per identity under `<state_dir>/held-completion-owed/`,
+/// named by the lowercase hex SHA-256 of the identity and holding the
+/// identity itself, so an identity of any length makes a short file name.
+///
+/// Core keeps nothing for a held member before its activation, so these
+/// marks are the only record that an identity was held. A held pass marks
+/// every roster identity before it creates any member, so a process that
+/// stops while a member is held keeps the mark, and it removes the mark of
+/// each member it publishes. The identity runtime reads the marks back after
+/// a restart, so an ordinary wake still refuses the member
+/// ([`super::IdentityRuntimeError::HeldCompletionOwed`]) until a held pass
+/// that covers it publishes it. Every writer assumes the caller holds the
+/// state directory exclusively (the realm lock).
+#[derive(Debug, Clone)]
+pub(crate) struct HeldCompletionMarks {
+    dir: PathBuf,
+}
+
+impl HeldCompletionMarks {
+    pub(crate) fn in_state_dir(state_dir: &Path) -> Self {
+        Self {
+            dir: state_dir.join(HELD_COMPLETION_OWED_DIR),
+        }
+    }
+
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Mark `identities` durably. Each mark is written under a dot-name,
+    /// synced and renamed into place, so an interrupted write leaves only a
+    /// dot-file, which [`Self::read`] skips. The directory and its entry in
+    /// the state directory are synced before this returns.
+    pub(crate) fn mark(&self, identities: &[AgentIdentity]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        if identities.is_empty() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        for identity in identities {
+            let name = held_mark_name(identity);
+            let staged = self.dir.join(format!(".{name}.tmp"));
+            {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&staged)?;
+                file.write_all(identity.as_str().as_bytes())?;
+                file.sync_all()?;
+            }
+            std::fs::rename(&staged, self.dir.join(name))?;
+        }
+        sync_dir(&self.dir)?;
+        match self.dir.parent() {
+            Some(state_dir) => sync_dir(state_dir),
+            None => Ok(()),
+        }
+    }
+
+    /// Remove `identity`'s mark durably. An absent mark is already removed.
+    pub(crate) fn clear(&self, identity: &AgentIdentity) -> std::io::Result<()> {
+        match std::fs::remove_file(self.dir.join(held_mark_name(identity))) {
+            Ok(()) => sync_dir(&self.dir),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The identities marked now; none while the directory is absent.
+    /// Dot-files are skipped: a mark's name is lowercase hex, so they are an
+    /// interrupted write's staging file or another program's. Any other entry
+    /// that is not a valid identity's mark is refused, naming its remedy:
+    /// which identity it would guard is unknown.
+    pub(crate) fn read(&self) -> std::io::Result<BTreeSet<AgentIdentity>> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeSet::new());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut marked = BTreeSet::new();
+        for entry in entries {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            if file_name.to_str().is_some_and(|name| name.starts_with('.')) {
+                continue;
+            }
+            let identity = if entry.file_type()?.is_file() {
+                let content = std::fs::read(entry.path())?;
+                std::str::from_utf8(&content)
+                    .ok()
+                    .and_then(|text| AgentIdentity::parse(text).ok())
+                    .filter(|identity| {
+                        file_name.to_str() == Some(held_mark_name(identity).as_str())
+                    })
+            } else {
+                None
+            };
+            let identity = identity.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{} is not a held-completion mark (a file named by the SHA-256 of the \
+                         identity it holds); remove it",
+                        entry.path().display()
+                    ),
+                )
+            })?;
+            marked.insert(identity);
+        }
+        Ok(marked)
+    }
+}
+
+/// The mark file name of `identity`: the lowercase hex SHA-256 of its UTF-8
+/// bytes.
+fn held_mark_name(identity: &AgentIdentity) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(identity.as_str().as_bytes()))
+}
+
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir).and_then(|handle| handle.sync_all())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 /// Test seam: where a held member's activation can be parked after the
 /// pass's `Activate`, so a test can move a member's first `activate()` poll
 /// past the setup deadline, or delay its Meta publication (after Core's
@@ -741,8 +915,9 @@ pub(crate) enum HeldActivationPark {
     /// polled.
     BeforeFirstPoll,
     /// After Core's `activate()` returned, before the member's create goes
-    /// on with its Meta publication (its session resolution and continuity
-    /// commit): delayed Meta publication, not a delay inside Core.
+    /// on with its Meta publication (resolving the member's session and
+    /// recording the outcome): delayed Meta publication, not a delay inside
+    /// Core.
     AfterNativeActivation,
 }
 
@@ -823,6 +998,85 @@ mod tests {
 
     fn in_a_minute() -> HeldSpawnDeadline {
         tokio::time::Instant::now() + std::time::Duration::from_mins(1)
+    }
+
+    #[test]
+    fn held_completion_marks_are_read_back_and_cleared_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let marks = HeldCompletionMarks::in_state_dir(dir.path());
+        let (a, b) = (identity("held-mark-a"), identity("held-mark-b"));
+        assert!(
+            marks.read().unwrap().is_empty(),
+            "an absent directory marks none"
+        );
+        marks.mark(&[a.clone(), b.clone()]).unwrap();
+        marks.mark(std::slice::from_ref(&a)).unwrap();
+        assert_eq!(
+            HeldCompletionMarks::in_state_dir(dir.path())
+                .read()
+                .unwrap(),
+            BTreeSet::from([a.clone(), b.clone()]),
+            "the marks are read back from the state directory"
+        );
+        marks.clear(&a).unwrap();
+        marks.clear(&a).unwrap();
+        assert_eq!(
+            HeldCompletionMarks::in_state_dir(dir.path())
+                .read()
+                .unwrap(),
+            BTreeSet::from([b])
+        );
+    }
+
+    #[test]
+    fn a_held_completion_mark_is_named_by_the_sha256_of_the_identity_it_holds() {
+        use sha2::Digest as _;
+        let dir = tempfile::tempdir().unwrap();
+        let marks = HeldCompletionMarks::in_state_dir(dir.path());
+        // Longer than a hex-of-bytes name could be on a 255-byte file system.
+        let long = identity(&"held-".repeat(60));
+        marks
+            .mark(&[identity("held-mark-a"), long.clone()])
+            .unwrap();
+        let name = format!("{:x}", sha2::Sha256::digest(b"held-mark-a"));
+        assert_eq!(
+            std::fs::read(marks.dir().join(&name)).unwrap(),
+            b"held-mark-a",
+            "the mark holds its identity"
+        );
+        assert!(
+            marks.read().unwrap().contains(&long),
+            "an identity of any length is marked"
+        );
+    }
+
+    #[test]
+    fn a_dot_file_is_skipped_and_any_other_stray_entry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let marks = HeldCompletionMarks::in_state_dir(dir.path());
+        let held = identity("held-mark-a");
+        marks.mark(std::slice::from_ref(&held)).unwrap();
+        std::fs::write(marks.dir().join(".DS_Store"), b"").unwrap();
+        assert_eq!(
+            marks.read().unwrap(),
+            BTreeSet::from([held]),
+            "a dot-file is never a mark"
+        );
+        // A mark whose name does not match the identity it holds.
+        std::fs::write(
+            marks.dir().join(held_mark_name(&identity("held-mark-b"))),
+            b"held-mark-a",
+        )
+        .unwrap();
+        let refused = marks.read().unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+        assert!(refused.to_string().contains("remove it"), "{refused}");
+        std::fs::remove_file(marks.dir().join(held_mark_name(&identity("held-mark-b")))).unwrap();
+        std::fs::write(marks.dir().join("not-a-mark"), b"").unwrap();
+        assert_eq!(
+            marks.read().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     /// One construction slot: the second member is constructed only after

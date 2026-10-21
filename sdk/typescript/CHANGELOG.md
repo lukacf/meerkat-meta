@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.4
+
 - `GatewayChildEndedError` (extends `TransportReaderFailedError`, with
   `exitCode` and `signal`): a request waiting on a gateway process that
   exits while a process it started still holds the gateway's stdout fails

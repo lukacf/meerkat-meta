@@ -27,7 +27,6 @@ from .agent_builder import CallbackDispatcher, SessionAgentBuilder
 from .errors import (
     CAPABILITY_UNAVAILABLE_CODE,
     CompletionCursorUnavailableError,
-    LEASE_LOST_CODE,
     REGISTERED_SPEC_CHANGED_CODE,
     MEMORY_BACKEND_UNAVAILABLE_CODE,
     MOB_EVENTS_STALE_CURSOR_CODE,
@@ -39,12 +38,15 @@ from .errors import (
     MEMBER_RELOAD_REQUIRED_KIND,
     WORKGRAPH_CONFLICT_CODE,
     WORKGRAPH_UNAVAILABLE_CODE,
+    IDENTITY_HISTORY_UNAVAILABLE_CODE,
+    IDENTITY_HOST_ADOPTED_CODE,
+    IDENTITY_UNRESUMABLE_CODE,
+    IDENTITY_WAKE_HELD_KINDS,
     CapabilityUnavailableError,
     CompositionProvenanceError,
     MemberReloadRequiredError,
     CONSOLE_TIMELINE_REPLAY_UNAVAILABLE_CODE,
     ConsoleTimelineReplayUnavailableError,
-    LeaseLostError,
     RegisteredSpecChangedError,
     InitInProgressError,
     InitOutcomeUnknownError,
@@ -58,6 +60,10 @@ from .errors import (
     TransportReaderFailedError,
     GatewayChildEndedError,
     GatewayStartupCleanupError,
+    IdentityHistoryUnavailableError,
+    IdentityHostAdoptedError,
+    IdentityUnresumableError,
+    IdentityWakeHeldError,
     WorkGraphConflictError,
     WorkGraphUnavailableError,
 )
@@ -210,13 +216,6 @@ def _rpc_error_from_payload(
             method=method,
             data=data,
         )
-    if code == LEASE_LOST_CODE:
-        return LeaseLostError(
-            message,
-            request_id=request_id,
-            method=method,
-            data=data,
-        )
     if code == REGISTERED_SPEC_CHANGED_CODE:
         return RegisteredSpecChangedError(
             message,
@@ -277,6 +276,38 @@ def _rpc_error_from_payload(
         )
     if code == COMPOSITION_PROVENANCE_CODE:
         return CompositionProvenanceError(
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+    if code == IDENTITY_UNRESUMABLE_CODE:
+        return IdentityUnresumableError(
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+    if code == IDENTITY_HISTORY_UNAVAILABLE_CODE:
+        return IdentityHistoryUnavailableError(
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+    if code == IDENTITY_HOST_ADOPTED_CODE:
+        return IdentityHostAdoptedError(
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+    if (
+        code == -32603
+        and isinstance(data, dict)
+        and data.get("kind") in IDENTITY_WAKE_HELD_KINDS
+    ):
+        return IdentityWakeHeldError(
             message,
             request_id=request_id,
             method=method,
@@ -707,12 +738,6 @@ class MetaRuntime:
                     self._dispatcher.register_error_callback(self._config.error_callback)
                 # Register identity-first providers before transport start —
                 # restore_flow during init may trigger provider callbacks.
-                if self._config.continuity_store is not None:
-                    self._dispatcher.register_continuity_store(
-                        self._config.continuity_store
-                    )
-                if self._config.lease_provider is not None:
-                    self._dispatcher.register_lease_provider(self._config.lease_provider)
                 if self._config.roster_provider is not None:
                     self._dispatcher.register_roster_provider(self._config.roster_provider)
                 if self._config.topology_provider is not None:
@@ -901,6 +926,8 @@ class MetaRuntime:
             runtime_options["meerkat_config_path"] = self._config.meerkat_config_path
         if self._config.workgraph_enabled is not None:
             runtime_options["workgraph"] = self._config.workgraph_enabled
+        if self._config.fork_instruction_policy is not None:
+            runtime_options["fork_instruction_policy"] = self._config.fork_instruction_policy
         if self._config.routing_config_path:
             runtime_options["routing_config_path"] = self._config.routing_config_path
         if self._config.host_runnables:
@@ -983,12 +1010,6 @@ class MetaRuntime:
             params["child_application_tool_policy"] = dict(
                 self._config.child_application_tool_policy
             )
-        if self._config.continuity_store is not None:
-            params["has_continuity_store"] = True
-        if self._config.lease_provider is not None:
-            params["has_lease_provider"] = True
-        if self._config.scratch_dir is not None:
-            params["scratch_dir"] = self._config.scratch_dir
         if self._config.topology_provider is not None:
             params["has_topology_provider"] = True
         if self._config.agent_customizer is not None:
@@ -1242,7 +1263,7 @@ class MetaRuntime:
         :class:`~meerkat_meta.identity_first_models.ConsoleIdentityRecord`:
         ``identity``, current ``session_id`` binding, ``labels``,
         addressability and health. This is the supported identity -> session
-        map; hosts must not read the continuity store directly for it.
+        map.
 
         ``labels`` are display data. ``labels["role"]`` keeps whatever the
         roster provider supplied (often human role prose) and falls back to
@@ -1361,20 +1382,6 @@ class MetaRuntime:
             return None
         return _completion_cursor_from(raw, "completion_cursor")
 
-    async def request_continuity_repair(self) -> str:
-        """Ask the continuity repair supervisor for a pass now
-        (``meta/request_continuity_repair``).
-
-        The supervisor retries Broken identities on typed triggers (another
-        member's embodiment settling, a settled restore or reconcile pass, a
-        refused delivery to the Broken identity); this is the explicit one.
-        Returns what the request reached: ``"scheduled"``,
-        ``"nothing_to_repair"`` or ``"no_supervisor"`` (tolerate future
-        values).
-        """
-        raw = await self._rpc("meta/request_continuity_repair", {})
-        return str((raw or {}).get("continuity_repair", ""))
-
     async def _server_wait(
         self, method: str, params: dict[str, Any], timeout: float
     ) -> dict[str, Any] | None:
@@ -1407,7 +1414,7 @@ class MetaRuntime:
         return await self._rpc("meta/retire", {"identity": identity})
 
     async def reset(self, identity: str) -> Any:
-        """Destructive continuity reset for an identity."""
+        """Destructive reset: the identity continues on a fresh session."""
         return await self._rpc("meta/reset", {"identity": identity})
 
     async def activate_member_instruction(
@@ -1535,7 +1542,16 @@ class MetaRuntime:
         return IdentityBootstrapStatus.from_dict(raw)
 
     async def delete_identity(self, identity: str) -> Any:
-        """Remove continuity for an identity."""
+        """Start the identity over: its earlier session is no longer resumed,
+        and its next session starts empty.
+
+        A live identity moves to a fresh session at once, without a wake. A
+        retired identity stays retired and starts on a fresh session at its
+        next wake. An identity with no history is left as it is, and an
+        unlisted or retired identity is never made live. An identity a host
+        intent declaration manages is refused with
+        :class:`~meerkat_meta.errors.IdentityHostAdoptedError` (-32053).
+        """
         return await self._rpc("meta/delete_identity", {"identity": identity})
 
     async def wait_until_ready(
@@ -3515,7 +3531,7 @@ class MobHandle:
     async def respawn_member(self, member_id: str) -> None:
         """Respawn a member (replace with fresh instance).
 
-        On an identity-first gateway this is a DESTRUCTIVE continuity reset:
+        On an identity-first gateway this is DESTRUCTIVE: the member starts
         a fresh session under an advanced generation. To clear a
         durability-degraded member without losing its transcript use
         :meth:`reload_member`.
@@ -3525,7 +3541,7 @@ class MobHandle:
     async def reload_member(self, member_id: str) -> MemberReloadResult:
         """Non-destructive cold reload of an identity's live member.
 
-        Same identity, same durable session id, same continuity generation:
+        Same identity, same durable session id, same generation:
         the live runtime registration is discarded and the same session is
         re-materialized from durable truth. This is the repair for a member
         whose sends fail with the reload-required class (meerkat's

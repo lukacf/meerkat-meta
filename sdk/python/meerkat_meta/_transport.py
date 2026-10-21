@@ -1237,10 +1237,10 @@ class PersistentTransport:
             native_shutdown = "not_negotiated"
         shutdown_started = time.monotonic()
         try:
-            # The gateway may need to round-trip lease/continuity provider
-            # callbacks while UnifiedRuntime shuts down. Keep stdin open until
-            # a capable gateway acknowledges that cleanup is complete. Older
-            # or custom gateways stay on the EOF protocol below.
+            # The gateway may need to round-trip host callbacks while
+            # UnifiedRuntime shuts down. Keep stdin open until a capable
+            # gateway acknowledges that cleanup is complete. Older or custom
+            # gateways stay on the EOF protocol below.
             if native_shutdown is None:
                 native_shutdown = "unanswered"
                 try:

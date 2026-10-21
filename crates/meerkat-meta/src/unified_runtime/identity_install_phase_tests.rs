@@ -87,19 +87,8 @@ pub(super) fn context(runtime: &UnifiedRuntime) -> Arc<IdentityFirstRuntimeConte
     ))
 }
 
-async fn supervisors_started(runtime: &UnifiedRuntime) -> (bool, bool) {
-    (
-        runtime.identity_lease_renewal_task.lock().await.is_some(),
-        runtime
-            .identity_continuity_repair_task
-            .lock()
-            .await
-            .is_some(),
-    )
-}
-
-/// The installed context is the public identity view a host binds, with no
-/// supervisor started; bootstrapping it afterwards starts them.
+/// The installed context is the public identity view a host binds before
+/// bootstrap; bootstrapping it afterwards completes and shuts down clean.
 #[tokio::test]
 async fn an_installed_context_is_visible_before_bootstrap_starts_anything() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -116,27 +105,18 @@ async fn an_installed_context_is_visible_before_bootstrap_starts_anything() {
         "the installed runtime"
     );
     drop(view);
-    assert_eq!(
-        supervisors_started(&runtime).await,
-        (false, false),
-        "installing starts no supervisor"
-    );
 
     runtime
         .bootstrap_installed_identity_first_context(&[])
         .await
         .expect("bootstrap the installed context");
-    assert_eq!(supervisors_started(&runtime).await, (true, true));
-    runtime.shutdown().await;
-    assert_eq!(
-        supervisors_started(&runtime).await,
-        (false, false),
-        "shutdown joins the supervisors"
-    );
+    tokio::time::timeout(Duration::from_secs(30), runtime.shutdown())
+        .await
+        .expect("the bootstrapped context shuts down");
 }
 
 /// A host refusal between the phases leaves the ordinary shutdown to clean
-/// the installed context up; no identity supervisor was started to leave behind.
+/// the installed context up.
 #[tokio::test]
 async fn an_installed_context_refused_before_bootstrap_shuts_down_clean() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -145,7 +125,6 @@ async fn an_installed_context_refused_before_bootstrap_shuts_down_clean() {
     tokio::time::timeout(Duration::from_secs(30), runtime.shutdown())
         .await
         .expect("the installed context shuts down");
-    assert_eq!(supervisors_started(&runtime).await, (false, false));
 }
 
 /// Bootstrap has nothing to complete without an installed context.
@@ -159,6 +138,5 @@ async fn bootstrap_without_an_installed_context_is_refused() {
             .await
             .is_err()
     );
-    assert_eq!(supervisors_started(&runtime).await, (false, false));
     runtime.shutdown().await;
 }

@@ -16,27 +16,19 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use meerkat_meta::blob_store::BinaryBlobStore;
 use meerkat_meta::console_aggregator::ConsoleLogStore;
-use meerkat_meta::identity_first::{AgentMemoryProvider, ContinuityStore};
+use meerkat_meta::identity_first::AgentMemoryProvider;
 use meerkat_meta::unified_runtime::EventLogStore;
 use meerkat_store_conformance::ConformanceFailure;
 use meta_extension_state::ExtensionDocumentStore;
 
-/// Produces handles to one underlying continuity-store storage.
-#[async_trait]
-pub trait ContinuityStoreFactory: Send + Sync {
-    /// Open a store handle over this factory's underlying storage.
-    ///
-    /// The first call opens (and may initialize) the storage; each subsequent
-    /// call must return a NEW handle over the SAME storage — this is how the
-    /// restart-survival steps model a process restart.
-    async fn open(&self) -> Result<Arc<dyn ContinuityStore>, ConformanceFailure>;
-}
-
 /// Produces handles to one underlying console-log storage.
 #[async_trait]
 pub trait ConsoleLogStoreFactory: Send + Sync {
-    /// Open a console-log handle. Same reopen contract as
-    /// [`ContinuityStoreFactory::open`].
+    /// Open a console-log handle over this factory's underlying storage.
+    ///
+    /// The first call opens (and may initialize) the storage; each subsequent
+    /// call must return a NEW handle over the SAME storage. This is how the
+    /// restart-survival steps model a process restart.
     async fn open(&self) -> Result<Arc<dyn ConsoleLogStore>, ConformanceFailure>;
 }
 
@@ -44,7 +36,7 @@ pub trait ConsoleLogStoreFactory: Send + Sync {
 #[async_trait]
 pub trait EventLogStoreFactory: Send + Sync {
     /// Open an event-log handle. Same reopen contract as
-    /// [`ContinuityStoreFactory::open`].
+    /// [`ConsoleLogStoreFactory::open`].
     async fn open(&self) -> Result<Arc<dyn EventLogStore>, ConformanceFailure>;
 }
 
@@ -52,7 +44,7 @@ pub trait EventLogStoreFactory: Send + Sync {
 #[async_trait]
 pub trait BinaryBlobStoreFactory: Send + Sync {
     /// Open a blob-store handle. Same reopen contract as
-    /// [`ContinuityStoreFactory::open`].
+    /// [`ConsoleLogStoreFactory::open`].
     async fn open(&self) -> Result<Arc<dyn BinaryBlobStore>, ConformanceFailure>;
 }
 
@@ -60,7 +52,7 @@ pub trait BinaryBlobStoreFactory: Send + Sync {
 #[async_trait]
 pub trait AgentMemoryProviderFactory: Send + Sync {
     /// Open an agent-memory provider handle. Same reopen contract as
-    /// [`ContinuityStoreFactory::open`].
+    /// [`ConsoleLogStoreFactory::open`].
     async fn open(&self) -> Result<Arc<dyn AgentMemoryProvider>, ConformanceFailure>;
 }
 
@@ -68,6 +60,6 @@ pub trait AgentMemoryProviderFactory: Send + Sync {
 #[async_trait]
 pub trait ExtensionDocumentStoreFactory: Send + Sync {
     /// Open a document store handle. Same reopen contract as
-    /// [`ContinuityStoreFactory::open`].
+    /// [`ConsoleLogStoreFactory::open`].
     async fn open(&self) -> Result<Arc<dyn ExtensionDocumentStore>, ConformanceFailure>;
 }

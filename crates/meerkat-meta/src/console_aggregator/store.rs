@@ -1728,6 +1728,7 @@ mod tests {
                 runtime_key: "runtime-a".to_string(),
                 runtime_member_id: "private".to_string(),
                 session_id: Some("session-private".to_string()),
+                member_id: None,
                 visibility: crate::ConsoleVisibility::Addressable,
                 addressable: true,
                 health: "ready".to_string(),
@@ -1747,6 +1748,7 @@ mod tests {
             },
             primary_mob_id: "primary".to_string(),
             source_mob_id: "lower".to_string(),
+            lineage: Vec::new(),
         };
         frame.source.member_provenance = Some(provenance.clone());
         let appended = store

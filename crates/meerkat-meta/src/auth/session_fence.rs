@@ -1,0 +1,644 @@
+//! The Console's session fence record: per principal, the instant before
+//! which the Console refuses every token issued to that principal.
+//!
+//! The record belongs to the Console's authentication, not to access
+//! control. It exists whether or not an access controller is installed, and
+//! it lives in a file of its own in the gateway's state directory
+//! ([`CONSOLE_SESSION_FENCES_FILE`]), never inside the access configuration.
+//! A binary that predates the record neither reads nor rewrites the file, so
+//! a downgrade and a later upgrade keep every fence. A record of a later
+//! format version is refused, never rewritten.
+//!
+//! The record also lists each principal the Console accepted a token without
+//! `exp` for: such a token never expires, and only a fence ends it.
+//!
+//! Fences are kept for as long as the record exists. A fence could only be
+//! dropped once no token issued before it can still be accepted, and a token
+//! without `exp` can be accepted for ever.
+//!
+//! The Console's verifier decides with the record: it reads the fence of the
+//! principal a token names on every acceptance, and a change to the record
+//! wakes every open stream so it asks the verifier again.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::watch;
+
+/// The file name of the session fence record in a gateway state directory.
+pub const CONSOLE_SESSION_FENCES_FILE: &str = "console-session-fences.json";
+
+/// The record's format marker.
+const RECORD_FORMAT: &str = "meerkat-meta.console-session-fences";
+/// The record format version this binary reads and writes.
+const RECORD_VERSION: u32 = 1;
+
+/// The record as stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FenceRecordFile {
+    format: String,
+    version: u32,
+    /// Per principal, the fence its sessions were revoked at.
+    #[serde(default)]
+    fences: BTreeMap<String, PrincipalFence>,
+    /// Principals the Console accepted a token without `exp` for.
+    #[serde(default)]
+    non_expiring_principals: BTreeSet<String>,
+    /// Fields this binary does not know, kept as read so a rewrite never
+    /// drops them.
+    #[serde(flatten)]
+    other: BTreeMap<String, Value>,
+}
+
+impl Default for FenceRecordFile {
+    fn default() -> Self {
+        Self {
+            format: RECORD_FORMAT.to_string(),
+            version: RECORD_VERSION,
+            fences: BTreeMap::new(),
+            non_expiring_principals: BTreeSet::new(),
+            other: BTreeMap::new(),
+        }
+    }
+}
+
+/// One principal's fence as stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PrincipalFence {
+    /// Seconds since the epoch: tokens issued before this instant (and up to
+    /// the verifier's clock leeway after it) are refused.
+    not_before_epoch_seconds: u64,
+    #[serde(flatten)]
+    other: BTreeMap<String, Value>,
+}
+
+/// Why the session fence record could not be read or changed.
+#[derive(Debug)]
+pub enum ConsoleSessionFencesError {
+    /// The record could not be read or written.
+    Io {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+    /// The file at the record's path is not a session fence record.
+    Invalid { path: PathBuf, reason: String },
+    /// The record was written by a later format version; this binary
+    /// neither reads nor rewrites it.
+    NewerVersion { path: PathBuf, version: u32 },
+    /// The record has no file: a fence set now would not survive a restart,
+    /// so none is set.
+    NotDurable,
+    /// The principal is empty.
+    InvalidPrincipal,
+}
+
+impl std::fmt::Display for ConsoleSessionFencesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { path, error } => write!(
+                f,
+                "console session fence record {}: {error}",
+                path.display()
+            ),
+            Self::Invalid { path, reason } => write!(
+                f,
+                "{} is not a console session fence record: {reason}",
+                path.display()
+            ),
+            Self::NewerVersion { path, version } => write!(
+                f,
+                "console session fence record {} has format version {version}, newer than \
+                 version {RECORD_VERSION} this binary reads; it is left unchanged",
+                path.display()
+            ),
+            Self::NotDurable => f.write_str(
+                "this console has no durable session fence record, so a revocation would not \
+                 survive a restart; configure the gateway's state directory",
+            ),
+            Self::InvalidPrincipal => f.write_str("the principal is empty"),
+        }
+    }
+}
+
+impl std::error::Error for ConsoleSessionFencesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// A fence the record holds for one principal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleSessionFence {
+    /// The principal the fence applies to: the email (or subject) the
+    /// Console's access policy keys.
+    pub principal: String,
+    /// Seconds since the epoch: the Console refuses every token of the
+    /// principal issued before this instant plus the verifier's clock leeway.
+    pub not_before_epoch_seconds: u64,
+}
+
+/// What the record lists, read without a live Console (the storage doctor).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConsoleSessionRecordSummary {
+    /// Principals that have a fence.
+    pub fenced_principals: Vec<String>,
+    /// Principals the Console accepted a token without `exp` for.
+    pub non_expiring_principals: Vec<String>,
+}
+
+/// The Console's session fence record, shared by every route and stream
+/// that verifies Console tokens. Cloning shares the record.
+#[derive(Clone)]
+pub struct ConsoleSessionFences {
+    inner: Arc<FencesInner>,
+}
+
+struct FencesInner {
+    /// The record's file; `None` for a record that is not durable.
+    path: Option<PathBuf>,
+    record: RwLock<FenceRecordFile>,
+    /// Serializes writers, so each write carries every change before it.
+    writer: Mutex<()>,
+    /// Bumped after each committed fence change.
+    revision: watch::Sender<u64>,
+}
+
+impl Default for ConsoleSessionFences {
+    fn default() -> Self {
+        Self::detached()
+    }
+}
+
+impl std::fmt::Debug for ConsoleSessionFences {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsoleSessionFences")
+            .field("path", &self.inner.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConsoleSessionFences {
+    fn with_record(path: Option<PathBuf>, record: FenceRecordFile) -> Self {
+        Self {
+            inner: Arc::new(FencesInner {
+                path,
+                record: RwLock::new(record),
+                writer: Mutex::new(()),
+                revision: watch::Sender::new(0),
+            }),
+        }
+    }
+
+    /// An empty record with no file. It holds no fence and refuses to set
+    /// one ([`ConsoleSessionFencesError::NotDurable`]); it still lists the
+    /// principals whose tokens have no `exp`, for this process only.
+    pub fn detached() -> Self {
+        Self::with_record(None, FenceRecordFile::default())
+    }
+
+    /// Open the record at `path`. A missing file is an empty record, written
+    /// on its first change; anything else that cannot be read as a record of
+    /// this or an earlier format version is refused.
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, ConsoleSessionFencesError> {
+        let path = path.into();
+        let record = read_record(&path)?.unwrap_or_default();
+        Ok(Self::with_record(Some(path), record))
+    }
+
+    /// Open the record in a gateway state directory
+    /// ([`CONSOLE_SESSION_FENCES_FILE`]).
+    pub fn open_in_state_dir(state_dir: &Path) -> Result<Self, ConsoleSessionFencesError> {
+        Self::open(state_dir.join(CONSOLE_SESSION_FENCES_FILE))
+    }
+
+    /// The record's file, when it has one.
+    pub fn path(&self) -> Option<&Path> {
+        self.inner.path.as_deref()
+    }
+
+    /// Whether a fence set on this record survives a restart.
+    pub fn is_durable(&self) -> bool {
+        self.inner.path.is_some()
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, FenceRecordFile> {
+        self.inner
+            .record
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The fence of `principal`, read now: seconds since the epoch, or
+    /// `None` when its sessions were never revoked.
+    pub fn not_before(&self, principal: &str) -> Option<u64> {
+        self.read()
+            .fences
+            .get(principal)
+            .map(|fence| fence.not_before_epoch_seconds)
+    }
+
+    /// Every fence the record holds.
+    pub fn fences(&self) -> Vec<ConsoleSessionFence> {
+        self.read()
+            .fences
+            .iter()
+            .map(|(principal, fence)| ConsoleSessionFence {
+                principal: principal.clone(),
+                not_before_epoch_seconds: fence.not_before_epoch_seconds,
+            })
+            .collect()
+    }
+
+    /// Revoke every session of `principal` as of `at`: from then on the
+    /// Console refuses each token of the principal issued before `at` plus
+    /// the verifier's clock leeway, or carrying no `iat`, on every route,
+    /// and ends every open stream and voice session such a token opened. A
+    /// later fence replaces an earlier one; an earlier one never moves a
+    /// fence back. The fence is written to the record's file before it
+    /// takes effect, and refused when the record has no file.
+    pub fn revoke_sessions(
+        &self,
+        principal: &str,
+        at: SystemTime,
+    ) -> Result<ConsoleSessionFence, ConsoleSessionFencesError> {
+        let principal = principal.trim();
+        if principal.is_empty() {
+            return Err(ConsoleSessionFencesError::InvalidPrincipal);
+        }
+        let path = self
+            .inner
+            .path
+            .as_deref()
+            .ok_or(ConsoleSessionFencesError::NotDurable)?;
+        let at = at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let _writer = self
+            .inner
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut next = self.read().clone();
+        let fence = next
+            .fences
+            .entry(principal.to_string())
+            .or_insert_with(|| PrincipalFence {
+                not_before_epoch_seconds: at,
+                other: BTreeMap::new(),
+            });
+        fence.not_before_epoch_seconds = fence.not_before_epoch_seconds.max(at);
+        let not_before_epoch_seconds = fence.not_before_epoch_seconds;
+        write_record(path, &next)?;
+        *self
+            .inner
+            .record
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = next;
+        self.inner
+            .revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        tracing::info!(
+            principal,
+            not_before_epoch_seconds,
+            "console sessions revoked"
+        );
+        Ok(ConsoleSessionFence {
+            principal: principal.to_string(),
+            not_before_epoch_seconds,
+        })
+    }
+
+    /// The principals the Console accepted a token without `exp` for.
+    pub fn non_expiring_principals(&self) -> Vec<String> {
+        self.read()
+            .non_expiring_principals
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Record that the Console accepted a token without `exp` for
+    /// `principal`: once per principal, never the token. A record that
+    /// cannot be written keeps the principal for this process and logs it.
+    pub(crate) fn note_non_expiring(&self, principal: &str) {
+        if self.read().non_expiring_principals.contains(principal) {
+            return;
+        }
+        let _writer = self
+            .inner
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut next = self.read().clone();
+        if !next.non_expiring_principals.insert(principal.to_string()) {
+            return;
+        }
+        if let Some(path) = self.inner.path.as_deref()
+            && let Err(error) = write_record(path, &next)
+        {
+            tracing::warn!(
+                %error,
+                "could not record a console principal whose token has no exp"
+            );
+        }
+        *self
+            .inner
+            .record
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = next;
+    }
+
+    /// A receiver that changes after each committed fence change.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.inner.revision.subscribe()
+    }
+
+    /// The record's revision now. A fence is visible to every reader before
+    /// the revision that announces it, so a reader that takes the revision
+    /// before it reads a fence misses no change: one it did not read moves
+    /// the revision past the value it took.
+    pub(crate) fn revision(&self) -> u64 {
+        *self.inner.revision.borrow()
+    }
+}
+
+/// Read the record at `path` without creating or changing anything: `None`
+/// when there is no file. For the storage doctor.
+pub fn read_console_session_record(
+    path: &Path,
+) -> Result<Option<ConsoleSessionRecordSummary>, ConsoleSessionFencesError> {
+    Ok(
+        read_record(path)?.map(|record| ConsoleSessionRecordSummary {
+            fenced_principals: record.fences.keys().cloned().collect(),
+            non_expiring_principals: record.non_expiring_principals.into_iter().collect(),
+        }),
+    )
+}
+
+fn read_record(path: &Path) -> Result<Option<FenceRecordFile>, ConsoleSessionFencesError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ConsoleSessionFencesError::Io {
+                path: path.to_path_buf(),
+                error,
+            });
+        }
+    };
+    let invalid = |reason: String| ConsoleSessionFencesError::Invalid {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
+    if value.get("format").and_then(Value::as_str) != Some(RECORD_FORMAT) {
+        return Err(invalid("missing or unknown format marker".to_string()));
+    }
+    let version = value
+        .get("version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or_else(|| invalid("missing or invalid format version".to_string()))?;
+    if version > RECORD_VERSION {
+        return Err(ConsoleSessionFencesError::NewerVersion {
+            path: path.to_path_buf(),
+            version,
+        });
+    }
+    if version == 0 {
+        return Err(invalid("format version 0".to_string()));
+    }
+    let mut record: FenceRecordFile =
+        serde_json::from_value(value).map_err(|error| invalid(error.to_string()))?;
+    record.version = RECORD_VERSION;
+    Ok(Some(record))
+}
+
+/// Write `bytes` to `staged`, sync it, and rename it over `path`.
+fn write_staged_then_rename(staged: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(staged)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(staged, path)
+}
+
+/// Write the record durably: a sibling file is written and synced, then
+/// renamed over the record, and the directory is synced.
+fn write_record(path: &Path, record: &FenceRecordFile) -> Result<(), ConsoleSessionFencesError> {
+    let io = |error: std::io::Error| ConsoleSessionFencesError::Io {
+        path: path.to_path_buf(),
+        error,
+    };
+    let bytes = serde_json::to_vec_pretty(record).map_err(|error| io(error.into()))?;
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(directory) = directory {
+        std::fs::create_dir_all(directory).map_err(io)?;
+    }
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(format!(".{}.tmp", std::process::id()));
+    let staged = PathBuf::from(staged);
+    if let Err(error) = write_staged_then_rename(&staged, path, &bytes) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(io(error));
+    }
+    if let Some(directory) = directory
+        && let Ok(directory) = std::fs::File::open(directory)
+    {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn at(seconds: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn a_revocation_is_written_before_it_takes_effect_and_survives_a_reopen() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fences = ConsoleSessionFences::open_in_state_dir(dir.path()).expect("open");
+        assert!(fences.is_durable());
+        assert_eq!(fences.not_before("alice@example.test"), None);
+        let mut changes = fences.subscribe();
+        let fence = fences
+            .revoke_sessions(" alice@example.test ", at(2_000_000_000))
+            .expect("revoke");
+        assert_eq!(fence.principal, "alice@example.test");
+        assert_eq!(fence.not_before_epoch_seconds, 2_000_000_000);
+        assert!(changes.has_changed().expect("sender alive"));
+        changes.mark_unchanged();
+        // An earlier instant never moves the fence back.
+        let kept = fences
+            .revoke_sessions("alice@example.test", at(1_999_999_000))
+            .expect("revoke again");
+        assert_eq!(kept.not_before_epoch_seconds, 2_000_000_000);
+
+        let reopened = ConsoleSessionFences::open(dir.path().join(CONSOLE_SESSION_FENCES_FILE))
+            .expect("reopen");
+        assert_eq!(
+            reopened.not_before("alice@example.test"),
+            Some(2_000_000_000)
+        );
+        assert_eq!(reopened.not_before("bob@example.test"), None);
+    }
+
+    #[test]
+    fn a_record_without_a_file_refuses_to_revoke() {
+        let fences = ConsoleSessionFences::detached();
+        assert!(!fences.is_durable());
+        assert!(matches!(
+            fences.revoke_sessions("alice@example.test", at(2_000_000_000)),
+            Err(ConsoleSessionFencesError::NotDurable)
+        ));
+        assert_eq!(fences.not_before("alice@example.test"), None);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let durable = ConsoleSessionFences::open_in_state_dir(dir.path()).expect("open");
+        assert!(matches!(
+            durable.revoke_sessions("  ", at(2_000_000_000)),
+            Err(ConsoleSessionFencesError::InvalidPrincipal)
+        ));
+        assert!(
+            !dir.path().join(CONSOLE_SESSION_FENCES_FILE).exists(),
+            "a refused revocation writes nothing"
+        );
+    }
+
+    /// A binary that predates the record rewrites the access configuration
+    /// on its own admin edits; the fences live in their own file, which it
+    /// neither reads nor rewrites, so they survive its writes and a later
+    /// upgrade sees every one.
+    #[test]
+    fn an_access_file_rewrite_of_an_older_binary_keeps_every_fence() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let access_path = dir.path().join("access.toml");
+        std::fs::write(
+            &access_path,
+            "enabled = true\nadmins = [\"root@example.test\"]\n",
+        )
+        .expect("write access file");
+        let fences = ConsoleSessionFences::open_in_state_dir(dir.path()).expect("open");
+        fences
+            .revoke_sessions("alice@example.test", at(2_000_000_000))
+            .expect("revoke");
+
+        // The older binary's admin edit: load the access file and write it
+        // back from its own configuration, which knows nothing of fences.
+        let controller = crate::access::AccessController::load(&access_path).expect("load");
+        let (config, _) = controller.snapshot();
+        let rewritten = toml::to_string(&*config).expect("serialize access config");
+        std::fs::write(&access_path, rewritten).expect("rewrite access file");
+        // A configuration written without the record's file name at all.
+        assert!(
+            !std::fs::read_to_string(&access_path)
+                .expect("read access file")
+                .contains("alice@example.test"),
+            "the access file carries no fence"
+        );
+
+        let reopened = ConsoleSessionFences::open_in_state_dir(dir.path()).expect("reopen");
+        assert_eq!(
+            reopened.not_before("alice@example.test"),
+            Some(2_000_000_000)
+        );
+    }
+
+    #[test]
+    fn a_record_of_a_later_version_is_refused_and_left_unchanged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(CONSOLE_SESSION_FENCES_FILE);
+        let later = format!(
+            "{{\"format\":\"{RECORD_FORMAT}\",\"version\":{},\"fences\":{{}}}}",
+            RECORD_VERSION + 1
+        );
+        std::fs::write(&path, &later).expect("write later record");
+        assert!(matches!(
+            ConsoleSessionFences::open(&path),
+            Err(ConsoleSessionFencesError::NewerVersion { .. })
+        ));
+        assert!(matches!(
+            read_console_session_record(&path),
+            Err(ConsoleSessionFencesError::NewerVersion { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), later);
+
+        std::fs::write(&path, "{\"fences\":{}}").expect("write foreign file");
+        assert!(matches!(
+            ConsoleSessionFences::open(&path),
+            Err(ConsoleSessionFencesError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn a_rewrite_keeps_fields_it_does_not_know() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(CONSOLE_SESSION_FENCES_FILE);
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"format\":\"{RECORD_FORMAT}\",\"version\":1,\"note\":\"kept\",\
+                 \"fences\":{{\"bob@example.test\":{{\"not_before_epoch_seconds\":5,\"by\":\"root\"}}}}}}"
+            ),
+        )
+        .expect("write record");
+        let fences = ConsoleSessionFences::open(&path).expect("open");
+        fences
+            .revoke_sessions("alice@example.test", at(2_000_000_000))
+            .expect("revoke");
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+        assert_eq!(stored["note"], "kept");
+        assert_eq!(stored["fences"]["bob@example.test"]["by"], "root");
+        assert_eq!(
+            stored["fences"]["alice@example.test"]["not_before_epoch_seconds"],
+            2_000_000_000
+        );
+    }
+
+    /// The listing is per principal, never per token, and the storage
+    /// doctor reads it without creating anything.
+    #[test]
+    fn principals_with_tokens_without_exp_are_recorded_once_each() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(CONSOLE_SESSION_FENCES_FILE);
+        assert_eq!(read_console_session_record(&path).expect("read"), None);
+        assert!(!path.exists(), "reading creates nothing");
+        let fences = ConsoleSessionFences::open(&path).expect("open");
+        fences.note_non_expiring("svc:reporter");
+        fences.note_non_expiring("svc:reporter");
+        fences.note_non_expiring("carol@example.test");
+        assert_eq!(
+            fences.non_expiring_principals(),
+            vec!["carol@example.test".to_string(), "svc:reporter".to_string()]
+        );
+        let summary = read_console_session_record(&path)
+            .expect("read")
+            .expect("record written");
+        assert_eq!(
+            summary.non_expiring_principals,
+            vec!["carol@example.test".to_string(), "svc:reporter".to_string()]
+        );
+        assert!(summary.fenced_principals.is_empty());
+    }
+}

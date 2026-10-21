@@ -386,30 +386,16 @@ delegation floors belong to the tracked native authority work; this package
 does not persist a private policy snapshot or claim original-requester proof.
 
 Without an enabled host access controller, ABAC adds no further restriction;
-private document ACLs and native tool policy still apply. SDK-hosted
-`GatewayContinuityStore` does not yet provide the retained identity-history
-contract and explicitly refuses extension activation with
-`ExtensionAuthorityUnavailable(UnsupportedAuthority { .. })` before opening
-the extension store or constructing its dispatchers. This version supports
-the bundled local continuity authority and custom providers implementing the
-full retained-history contract.
+private document ACLs and native tool policy still apply.
 
-Enabling local history explicitly migrates the owning `meta-continuity`
-domain to schema version 3. History tables, coverage, retention triggers and
-backfill commit together; conflicting exact bindings roll the migration back.
-The version 3 stamp deliberately refuses older binaries that cannot retain
-identity history. Ordinary opens and head-only migrations remain at versions
-1 and 2 until this explicit opt-in.
-
-Turning the extension feature or its factory off in a current binary does not
-remove retention triggers or identity facts. Continued history is necessary
-to preserve the original coverage proof when extensions are enabled again;
-a host must not treat a disabled interval as evidence that sessions were
-Workers. Current binaries verify and support an opted-in database even when
-the extension feature is compiled out. No extension store or dispatcher is
-opened while disabled, but the continuity database continues retaining exact
-bindings from records, snapshots and head rows. The v3 lockout prevents an
-older writer from silently creating a gap in this history.
+Since Meta 0.9.4 the identity history comes from Core's member history, which
+keeps every binding Core committed for an identity whether or not the
+extension is enabled; Meta keeps no history tables of its own. A history Core
+cannot read refuses activation with `ExtensionAuthorityUnavailable` before the
+extension store opens or its dispatchers are built, and an unreadable history
+is never treated as evidence that sessions were Workers. Turning the
+extension feature or its factory off opens no extension store or dispatcher
+and leaves the stored documents in place.
 
 Document durability does not widen native member lifetime. The current
 Meta composition gives implicit delegate child mobs in-memory journals;

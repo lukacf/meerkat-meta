@@ -19,7 +19,6 @@ use meerkat_core::image_generation::{
     SwitchTurnRequestId,
 };
 use meerkat_core::lifecycle::RunId;
-use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
 use meerkat_core::lifecycle::run_primitive::ModelId;
 use meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord;
 use meerkat_core::{SessionLlmIdentity, SessionStore};
@@ -49,8 +48,6 @@ use meerkat_mob::{
     MobBuilder, MobDefinition, MobDefinitionProjectionHealth, MobDefinitionProjectionMismatchKind,
     MobStorage, SpawnMemberSpec,
 };
-use meerkat_runtime::store::{PreparedWholeBlobSnapshotCas, WholeBlobSnapshotCasOutcome};
-use meerkat_runtime::{LogicalRuntimeId, RuntimeStore};
 
 fn definition_with(profiles: &str) -> MobDefinition {
     MobDefinition::from_toml(profiles).expect("parse mob definition")
@@ -172,21 +169,17 @@ async fn boot_unified(
     definition: MobDefinition,
 ) -> (UnifiedRuntime, Arc<IdentityRuntime>) {
     std::fs::create_dir_all(state_root).expect("state root");
-    let session_store = Arc::new(
-        meerkat_store::SqliteSessionStore::open(state_root.join("sessions.sqlite3"))
-            .expect("open session store"),
-    );
     let (storage, provenance) =
         persistent_mob_storage(mob_path.to_path_buf()).expect("open persistent mob storage");
     let spec = MobBootstrapSpec::persistent(
         definition,
         storage,
+        provenance,
         state_root.to_path_buf(),
         16,
-        session_store,
     )
+    .await
     .expect("compose persistent Meta stores")
-    .with_mob_storage_provenance(provenance)
     // Creates no agent child mob. It restarts in this process, which the
     // durable child-mob default refuses as a duplicate owner; explicit
     // ProcessBound keeps this test's cold-recovery oracle.
@@ -326,16 +319,23 @@ async fn install_realized_routing_fixture(
     session_id: &meerkat_core::SessionId,
     target_model: &str,
 ) -> RealizedRoutingFixture {
-    let runtime_store =
-        meerkat_runtime::store::SqliteRuntimeStore::new(state_root.join("runtime.sqlite"))
-            .expect("open authoritative runtime store for routing fixture");
-    let runtime_id = LogicalRuntimeId::for_session(session_id);
-    let committed = runtime_store
-        .load_committed_whole_blob_snapshot(&runtime_id)
+    use meerkat_runtime::RuntimeStore as _;
+
+    // Sessions live in Core's pair on runtime.sqlite, where the runtime
+    // store's head-canonical authority is the session's only authority: a
+    // session-store save would move the physical head past it, and the next
+    // boot could not resume the member. Commit the fixture as one boundary on
+    // the runtime store instead, extending the head it last issued.
+    let runtime_db = state_root.join("runtime.sqlite");
+    let runtime_store = meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(&runtime_db)
+        .expect("open the runtime store for the routing fixture");
+    let session_store = meerkat_store::SqliteSessionStore::open(runtime_db)
+        .expect("open the session store for the routing fixture");
+    let mut session = session_store
+        .load(session_id)
         .await
-        .expect("load authoritative session for routing fixture")
-        .expect("routing fixture authority exists");
-    let mut session = committed.session().clone();
+        .expect("load the session for the routing fixture")
+        .expect("routing fixture session exists");
     let mut metadata = session
         .try_session_metadata()
         .expect("decode session metadata")
@@ -377,27 +377,35 @@ async fn install_realized_routing_fixture(
         .set_session_metadata(metadata)
         .expect("persist applied routing identity");
 
-    let prepared = PreparedWholeBlobSnapshotCas::prepare(
-        committed.authority().clone(),
-        BoundSessionCommit::sealed(Arc::new(session.clone()))
-            .expect("seal routing fixture session"),
-    )
-    .expect("prepare routing fixture authority CAS");
-    assert!(matches!(
-        runtime_store
-            .commit_prepared_whole_blob_snapshot_cas(&runtime_id, prepared)
-            .await
-            .expect("commit routing fixture authority CAS"),
-        WholeBlobSnapshotCasOutcome::Committed(_)
-    ));
-
-    let session_store =
-        meerkat_store::SqliteSessionStore::open(state_root.join("sessions.sqlite3"))
-            .expect("open session projection for routing fixture");
-    session_store
-        .save(&session)
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(session_id);
+    let observed = runtime_store
+        .load_session_boundary_authority(&runtime_id)
         .await
-        .expect("project realized routing fixture");
+        .expect("read the session's runtime authority")
+        .expect("the session has a runtime authority")
+        .head_canonical()
+        .expect("the native pair's authority is head-canonical")
+        .boundary_head()
+        .clone();
+    let mutation = meerkat_core::session_store::PreparedHeadCanonicalMutation::prepare(
+        &session,
+        Some(observed),
+    )
+    .expect("prepare the realized routing fixture");
+    runtime_store
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            meerkat_runtime::PreparedRuntimeSessionCommit::snapshot_only(
+                meerkat_core::lifecycle::core_executor::BoundSessionCommit::head_canonical_from_session(
+                    &session, mutation,
+                )
+                .expect("bind the realized routing fixture"),
+            ),
+        )
+        .await
+        .expect("commit the realized routing fixture");
+    // The next boot takes the runtime store's execution custody.
+    drop(runtime_store);
 
     RealizedRoutingFixture {
         request_id,
@@ -411,7 +419,7 @@ async fn assert_realized_routing_history(
     fixture: &RealizedRoutingFixture,
     target_model: &str,
 ) {
-    let store = meerkat_store::SqliteSessionStore::open(state_root.join("sessions.sqlite3"))
+    let store = meerkat_store::SqliteSessionStore::open(state_root.join("runtime.sqlite"))
         .expect("open session store for routing assertion");
     let session = store
         .load(session_id)
@@ -2431,13 +2439,9 @@ comms = true
     ));
     let (storage, provenance) =
         persistent_mob_storage(root.join("mob.sqlite3")).expect("persistent ledger");
-    let sessions = Arc::new(
-        meerkat_store::SqliteSessionStore::open(root.join("sessions.sqlite3"))
-            .expect("persistent session store"),
-    );
-    let spec = MobBootstrapSpec::persistent(definition, storage, root.to_path_buf(), 8, sessions)
+    let spec = MobBootstrapSpec::persistent(definition, storage, provenance, root.to_path_buf(), 8)
+        .await
         .expect("persistent fixture with the agent-tool identity slot")
-        .with_mob_storage_provenance(provenance)
         // Creates no agent child mob. Explicit ProcessBound keeps its in-process
         // restart and complete-cleanup oracle, so this fixture does NOT test the
         // default-persistent shutdown (child-root retention until process exit).
@@ -2701,9 +2705,20 @@ async fn eager_identity_restore_reports_edges_after_persisted_members_attach() {
         &roster,
         IdentityBootstrapMode::EagerMaterialize,
     );
+    // Before the identities attach, a fresh bridge has recorded no binding,
+    // and it names the persisted wire through the incarnations Core committed
+    // for both identity members: the read the binding epoch makes.
+    let before_attachment = bridge
+        .current_member_wires()
+        .await
+        .expect("a fresh bridge names the persisted wire before member attachment");
+    assert_eq!(before_attachment.len(), 1, "{before_attachment:?}");
+    let (runtime_a, runtime_b) = &before_attachment[0];
+    let mut named = [runtime_a.as_str(), runtime_b.as_str()];
+    named.sort_unstable();
     assert!(
-        bridge.current_member_wires().await.is_err(),
-        "a fresh bridge cannot name the persisted wire before member attachment"
+        named[0].contains("lead-1") && named[1].contains("worker-1"),
+        "the wire is the persisted lead-worker wire: {before_attachment:?}"
     );
     let restored = second
         .install_and_bootstrap_identity_first_context(context.clone(), &roster)
@@ -2733,9 +2748,9 @@ async fn eager_identity_restore_reports_edges_after_persisted_members_attach() {
         bridge
             .current_member_wires()
             .await
-            .expect("restored physical wire")
-            .len(),
-        1
+            .expect("restored physical wire"),
+        before_attachment,
+        "attachment keeps the incarnations the fresh bridge named"
     );
     let report = second
         .bootstrap_edges_report()

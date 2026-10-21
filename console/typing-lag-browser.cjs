@@ -645,10 +645,21 @@ function differingPixels(left, right) {
 
 async function openFilled(browser, baseUrl, turns, windowed) {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: DPR });
-  // The console's web fonts come from the network, and each page swapped
-  // them in (or kept the fallback) on its own timing; every compared page
-  // renders the same local fonts instead.
+  // Every compared page renders the same local fonts, not the console's web
+  // fonts: pages swapped those in (or kept the fallback) on their own timing,
+  // and their fractional text heights put rounded borders at fractional
+  // offsets, which the windowed and unwindowed layer trees anti-alias up to
+  // two levels apart although every box sits at the same position. Fonts
+  // imported from the network (a --src tree from before the console carried
+  // its own) are aborted; the console's own fonts are inline data: URLs, so
+  // the stylesheet these pages load drops its @font-face rules.
   await context.route(/^https:\/\/fonts\.(googleapis|gstatic)\.com\//, (route) => route.abort());
+  await context.route((url) => url.pathname === "/harness.css", async (route) => {
+    const response = await route.fetch();
+    const css = (await response.text()).replace(/@font-face\s*\{[^}]*\}/g, "");
+    // Fresh headers: the fetched ones describe the original body (chunked).
+    await route.fulfill({ status: response.status(), headers: { "content-type": "text/css" }, body: css });
+  });
   const page = await context.newPage();
   if (!windowed) await page.addInitScript(() => { globalThis.__consoleTranscriptWindowing = false; });
   // The same wall clock on every page: time labels ("Today", clock times)
@@ -656,6 +667,12 @@ async function openFilled(browser, baseUrl, turns, windowed) {
   await page.clock.setFixedTime(new Date("2026-09-22T12:00:00Z"));
   await page.goto(`${baseUrl}/?turns=${turns}`);
   await page.waitForFunction(() => document.querySelectorAll("[data-chat-turn-index]").length > 0, null, { timeout: 120_000 });
+  // Font-free must not mean unstyled: two pages without the stylesheet also
+  // compare equal. The transcript scroller's layout comes from it alone.
+  const scroller = await page.evaluate(() => { const style = getComputedStyle(document.querySelector(".conv__body")); return `${style.display} ${style.overflowY}`; });
+  if (scroller !== "flex auto") throw new Error(`compared pages must load the harness stylesheet, but the transcript scroller is "${scroller}", not "flex auto"`);
+  const webFonts = await page.evaluate(() => [...document.fonts].map((face) => face.family));
+  if (webFonts.length) throw new Error(`compared pages must render local fonts, but ${webFonts.length} web font faces remain (${[...new Set(webFonts)].join(", ")})`);
   await fillHistory(page);
   await page.evaluate(() => { const body = document.querySelector(".conv__body"); body.scrollTop = body.scrollHeight; });
   await page.waitForTimeout(1500);

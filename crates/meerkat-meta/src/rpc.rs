@@ -64,6 +64,10 @@ pub const JSONRPC_VERSION: &str = "2.0";
 pub const META_CONTRACT_VERSION: &str = "0.5.0";
 /// JSON-RPC code for a known feature that is unavailable on this host.
 pub const CAPABILITY_UNAVAILABLE_CODE: i64 = -32004;
+/// Revoke every Console session of one principal as of now: the Console's
+/// verifier refuses each token of the principal issued before then, on
+/// every route, and ends the streams and voice sessions such tokens opened.
+pub const CONSOLE_REVOKE_SESSIONS_METHOD: &str = "meta/console/revoke_sessions";
 pub(crate) const MOBPACK_AUTHORING_METHODS: &[&str] = &[
     "meta/mobpacks/schema",
     "meta/mobpacks/catalogs",
@@ -497,6 +501,43 @@ pub const WORKGRAPH_ERROR_CODE: i64 = -32000;
 /// `gate_pending`, `successor_conflict`, `secret_detected`, `stale_update`)
 /// with its fields.
 pub const MEMORY_QUARANTINE_REVIEW_REFUSED_CODE: i64 = -32043;
+
+/// The answer to [`CONSOLE_REVOKE_SESSIONS_METHOD`]: the principal, the fence
+/// (seconds since the epoch) and the earliest `iat` a token of the principal
+/// is accepted with from now on. That is the fence plus the verifier's clock
+/// leeway, so a sign-in within that window after the revocation is refused
+/// too.
+pub(crate) fn console_session_fence_json(
+    fence: &crate::auth::session_fence::ConsoleSessionFence,
+) -> Value {
+    serde_json::json!({
+        "principal": fence.principal,
+        "not_before": fence.not_before_epoch_seconds,
+        "accepts_tokens_issued_from": crate::runtime::session_fence_first_accepted_iat(
+            fence.not_before_epoch_seconds,
+        ),
+    })
+}
+
+/// The `non_expiring_console_principals` field of `meta/status`: each
+/// principal the Console accepted a token without `exp` for, as the
+/// principal and its flag, or `None` (the field is omitted) when there is
+/// none.
+pub(crate) fn non_expiring_console_principals_status(
+    fences: &crate::auth::session_fence::ConsoleSessionFences,
+) -> Option<Value> {
+    let principals = fences.non_expiring_principals();
+    (!principals.is_empty()).then(|| {
+        Value::Array(
+            principals
+                .into_iter()
+                .map(
+                    |principal| serde_json::json!({ "principal": principal, "non_expiring": true }),
+                )
+                .collect(),
+        )
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
@@ -2049,11 +2090,68 @@ async fn handle_unified_rpc_json_inner(
                     .cloned()
                     .unwrap_or(Value::Null);
             }
+            // Members created under one of the console's runtime-plane
+            // identities before every creation path refused them.
+            if let Some(reserved) =
+                crate::member_comms_id::reserved_identity_members_status(&runtime.mob_handle())
+                    .await
+            {
+                result["reserved_identity_members"] = reserved;
+            }
+            // Principals the Console accepted a token without `exp` for:
+            // the principal and the flag, never a token.
+            if let Some(non_expiring) =
+                non_expiring_console_principals_status(runtime.console_session_fences())
+            {
+                result["non_expiring_console_principals"] = non_expiring;
+            }
             JsonRpcResponse {
                 jsonrpc: JSONRPC_VERSION.to_string(),
                 id: response_id,
                 result: Some(result),
                 error: None,
+            }
+        }
+        CONSOLE_REVOKE_SESSIONS_METHOD => {
+            let refusal = |code: i64, message: String| JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: response_id.clone(),
+                result: None,
+                error: Some(JsonRpcError {
+                    code,
+                    message,
+                    data: None,
+                }),
+            };
+            match request.params.get("principal").and_then(Value::as_str) {
+                None => refusal(
+                    -32602,
+                    "Invalid params: principal must be a string".to_string(),
+                ),
+                Some(principal) => match runtime
+                    .console_session_fences()
+                    .revoke_sessions(principal, std::time::SystemTime::now())
+                {
+                    Ok(fence) => JsonRpcResponse {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: response_id.clone(),
+                        result: Some(console_session_fence_json(&fence)),
+                        error: None,
+                    },
+                    Err(
+                        crate::auth::session_fence::ConsoleSessionFencesError::InvalidPrincipal,
+                    ) => refusal(
+                        -32602,
+                        "Invalid params: principal must not be empty".to_string(),
+                    ),
+                    Err(
+                        error @ crate::auth::session_fence::ConsoleSessionFencesError::NotDurable,
+                    ) => refusal(CAPABILITY_UNAVAILABLE_CODE, error.to_string()),
+                    Err(error) => refusal(
+                        -32603,
+                        format!("console session revocation failed: {error}"),
+                    ),
+                },
             }
         }
         "meta/capabilities" => {
@@ -2123,6 +2221,7 @@ async fn handle_unified_rpc_json_inner(
                 "meta/run_labels/get",
                 "meta/run_labels/delete",
                 storage_methods::STORAGE_DOCTOR_METHOD,
+                CONSOLE_REVOKE_SESSIONS_METHOD,
             ];
             methods.extend_from_slice(MOBPACK_AUTHORING_METHODS);
             // DERIVED from the canonical registry, never listed. #343 listed these
@@ -2197,7 +2296,6 @@ async fn handle_unified_rpc_json_inner(
                     "meta/member_activate_instruction",
                     "meta/member_instruction_activations",
                     "meta/reconcile_identity",
-                    "meta/request_continuity_repair",
                     "meta/status_identity_bootstrap",
                     "meta/wait_identity_bootstrap",
                 ]);
@@ -2442,10 +2540,8 @@ async fn handle_unified_rpc_json_inner(
                     }
                 }
             } else if let (Some(profile), Some(meerkat_id)) = (profile, meerkat_id) {
-                // The system identity is reserved for runtime-plane console
-                // events (memory.* sinks, bootstrap): the aggregator exempts
-                // it from the roster-visibility gate and namespacing, so a
-                // member bearing the name would bypass both. Reject loudly.
+                // The raw-target check refuses the reserved namespaces, the
+                // console's runtime-plane identities among them.
                 let target_identity_runtime = identity_ctx
                     .map(|ctx| ctx.runtime.runtime())
                     .or_else(|| runtime.identity_runtime_ref());
@@ -2454,18 +2550,7 @@ async fn handle_unified_rpc_json_inner(
                     meerkat_id,
                 )
                 .await;
-                if meerkat_id == crate::console_contracts::SYSTEM_EVENT_IDENTITY {
-                    JsonRpcResponse {
-                        jsonrpc: JSONRPC_VERSION.to_string(),
-                        id: response_id,
-                        result: None,
-                        error: Some(JsonRpcError {
-                            code: -32602,
-                            message: format!("Invalid params: '{meerkat_id}' is reserved"),
-                            data: None,
-                        }),
-                    }
-                } else if let Err(message) = raw_target_validation.as_ref() {
+                if let Err(message) = raw_target_validation.as_ref() {
                     JsonRpcResponse {
                         jsonrpc: JSONRPC_VERSION.to_string(),
                         id: response_id,
@@ -4578,27 +4663,7 @@ async fn handle_unified_rpc_json_inner(
             }
             match identity_rt.status(&identity).await {
                 Ok(status) => {
-                    let continuity_health =
-                        serde_json::to_value(&status.continuity_health).unwrap_or(Value::Null);
-                    let mut result = serde_json::json!({
-                        "state": identity_lifecycle_state_json(status.state),
-                        "identity": status.identity.as_str(),
-                        "agent_runtime_id": status.agent_runtime_id.as_ref().map(super::identity_first::AgentRuntimeId::as_str),
-                        "session_id": status.session_id.as_ref().map(ToString::to_string),
-                        "profile": status.profile.as_ref().map(meerkat_mob::ProfileName::as_str),
-                        "addressability": addressability_json(status.addressability),
-                        "display_name": status.display_name.as_ref().map(super::identity_first::DisplayName::as_str),
-                        "labels": status.labels,
-                        "generation": status.generation.map(super::identity_first::ContinuityGeneration::get),
-                        "checkpoint_version": status.checkpoint_version.map(super::identity_first::CheckpointVersion::get),
-                        "continuity_health": continuity_health,
-                        "lease_healthy": status.lease.as_ref().map(|lease| lease.healthy),
-                        "lease": status.lease.as_ref().map(|lease| serde_json::json!({
-                            "fencing_token": lease.fencing_token.get(),
-                            "ttl_remaining_ms": lease.ttl_remaining.as_millis() as u64,
-                            "healthy": lease.healthy,
-                        })),
-                    });
+                    let mut result = identity_status_wire(&status);
                     insert_delivery_scope(
                         &mut result,
                         identity_rt.capture_delivery_scope(&identity).await,
@@ -4661,21 +4726,22 @@ async fn handle_unified_rpc_json_inner(
                 .respawn_identity_in_place_tracked(&identity, expected_alias)
                 .await;
             match respawn_result {
-                Ok(record) => {
-                    // A durable identity recovers its authoritative session
-                    // in place. Raw-member respawn remains available only to
-                    // unregistered/classic members because it rotates the
-                    // session. Keep the legacy warning fields for wire
-                    // compatibility.
+                Ok(scope) => {
+                    // A durable identity is retired and woken onto its same
+                    // session at a new Core generation. Raw-member
+                    // respawn remains available only to unregistered/classic
+                    // members because it rotates the session. Keep the legacy
+                    // warning fields for wire compatibility. A peer-only
+                    // member has no Core scope: its atoms are null.
                     let live_respawn_warning: Option<Value> = None;
                     let cleanup_warning: Option<Value> = None;
+                    let generation = scope.as_ref().map(|scope| scope.generation().get());
                     runtime
                         .record_console_lifecycle(
                             identity.as_str(),
                             "identity_respawned",
                             serde_json::json!({
-                                "generation": record.generation.get(),
-                                "checkpoint_version": record.checkpoint_version.get(),
+                                "generation": generation,
                                 "live_respawn_warning": live_respawn_warning.clone(),
                                 "cleanup_warning": cleanup_warning.clone(),
                             }),
@@ -4685,11 +4751,12 @@ async fn handle_unified_rpc_json_inner(
                         jsonrpc: JSONRPC_VERSION.to_string(),
                         id: response_id,
                         result: Some(serde_json::json!({
-                            "identity": record.identity.as_str(),
-                            "agent_runtime_id": record.agent_runtime_id.as_str(),
-                            "session_id": record.session_id.to_string(),
-                            "generation": record.generation.get(),
-                            "checkpoint_version": record.checkpoint_version.get(),
+                            "identity": identity.as_str(),
+                            "agent_runtime_id": scope.as_ref().map(|scope| {
+                                crate::member_comms_id::public_runtime_alias(scope.runtime_id())
+                            }),
+                            "session_id": scope.as_ref().map(|scope| scope.session_id().to_string()),
+                            "generation": generation,
                             "live_respawn_warning": live_respawn_warning,
                             "cleanup_warning": cleanup_warning,
                         })),
@@ -4795,13 +4862,14 @@ async fn handle_unified_rpc_json_inner(
                 )
                 .await;
             match retire_result {
-                Ok((token, cleanup_warning)) => {
+                Ok(cleanup_warning) => {
+                    // Core retired the member; Meta holds no fence of
+                    // its own to report.
                     runtime
                         .record_console_lifecycle(
                             identity.as_str(),
                             "identity_retired",
                             serde_json::json!({
-                                "fencing_token": token.get(),
                                 "cleanup_warning": cleanup_warning.clone(),
                             }),
                         )
@@ -4810,7 +4878,7 @@ async fn handle_unified_rpc_json_inner(
                         jsonrpc: JSONRPC_VERSION.to_string(),
                         id: response_id,
                         result: Some(serde_json::json!({
-                            "fencing_token": token.get(),
+                            "identity": identity.as_str(),
                             "cleanup_warning": cleanup_warning,
                         })),
                         error: None,
@@ -4964,7 +5032,11 @@ async fn handle_unified_rpc_json_inner(
                 identity_rt.reset_tracked(&identity).await
             };
             match reset_result {
-                Ok(record) => {
+                Ok(binding) => {
+                    // Core's binding of the fresh life: a live identity
+                    // runs it now; a dormant one wakes onto it later.
+                    let agent_runtime_id = crate::identity_first::live_binding_runtime_id(&binding)
+                        .map(|runtime_id| runtime_id.as_str().to_string());
                     // The reset's successor transition retired the previous
                     // live member, so there is no cleanup to report (as for
                     // reset_all). Keep the legacy warning field, always null,
@@ -4975,8 +5047,7 @@ async fn handle_unified_rpc_json_inner(
                             identity.as_str(),
                             "identity_reset",
                             serde_json::json!({
-                                "generation": record.generation.get(),
-                                "checkpoint_version": record.checkpoint_version.get(),
+                                "generation": binding.generation().get(),
                                 "cleanup_warning": cleanup_warning.clone(),
                             }),
                         )
@@ -4985,11 +5056,10 @@ async fn handle_unified_rpc_json_inner(
                         jsonrpc: JSONRPC_VERSION.to_string(),
                         id: response_id,
                         result: Some(serde_json::json!({
-                            "identity": record.identity.as_str(),
-                            "agent_runtime_id": record.agent_runtime_id.as_str(),
-                            "session_id": record.session_id.to_string(),
-                            "generation": record.generation.get(),
-                            "checkpoint_version": record.checkpoint_version.get(),
+                            "identity": identity.as_str(),
+                            "agent_runtime_id": agent_runtime_id,
+                            "session_id": binding.session_id().map(ToString::to_string),
+                            "generation": binding.generation().get(),
                             "cleanup_warning": cleanup_warning,
                         })),
                         error: None,
@@ -5366,31 +5436,17 @@ async fn handle_unified_rpc_json_inner(
             match identity_rt.inspect(&identity).await {
                 Ok(inspection) => {
                     let status = status.ok();
-                    JsonRpcResponse {
-                        jsonrpc: JSONRPC_VERSION.to_string(),
-                        id: response_id,
-                        result: Some(serde_json::json!({
+                    let mut result = serde_json::json!({
                             "identity": identity.as_str(),
                             "state": status.as_ref().map(|status| identity_lifecycle_state_json(status.state)),
                             "profile": status.as_ref().and_then(|status| status.profile.as_ref().map(meerkat_mob::ProfileName::as_str)),
                             "addressability": status.as_ref().map(|status| addressability_json(status.addressability)),
                             "display_name": status.as_ref().and_then(|status| status.display_name.as_ref().map(super::identity_first::DisplayName::as_str)),
                             "labels": status.as_ref().map(|status| status.labels.clone()).unwrap_or_default(),
-                            "generation": status.as_ref().and_then(|status| status.generation.map(super::identity_first::ContinuityGeneration::get)),
-                            "checkpoint_version": status.as_ref().and_then(|status| status.checkpoint_version.map(super::identity_first::CheckpointVersion::get)),
-                            "continuity_health": status.as_ref().and_then(|status| serde_json::to_value(&status.continuity_health).ok()).unwrap_or(Value::Null),
-                            "lease_healthy": status.as_ref().and_then(|status| status.lease.as_ref().map(|lease| lease.healthy)),
-                            "continuity": status.as_ref().map(|status| serde_json::json!({
-                                "generation": status.generation.map(super::identity_first::ContinuityGeneration::get),
-                                "checkpoint_version": status.checkpoint_version.map(super::identity_first::CheckpointVersion::get),
-                                "session_id": status.session_id.as_ref().map(ToString::to_string),
-                                "agent_runtime_id": status.agent_runtime_id.as_ref().map(super::identity_first::AgentRuntimeId::as_str),
-                            })).unwrap_or_else(|| serde_json::json!({})),
-                            "lease": status.as_ref().and_then(|status| status.lease.as_ref().map(|lease| serde_json::json!({
-                                "fencing_token": lease.fencing_token.get(),
-                                "ttl_remaining_ms": lease.ttl_remaining.as_millis() as u64,
-                                "healthy": lease.healthy,
-                            }))),
+                            "agent_runtime_id": status.as_ref().and_then(|status| status.agent_runtime_id.as_ref().map(super::identity_first::AgentRuntimeId::as_str)),
+                            "session_id": status.as_ref().and_then(|status| status.session_id.as_ref().map(ToString::to_string)),
+                            "generation": status.as_ref().and_then(|status| status.generation.map(meerkat_mob::Generation::get)),
+                            "intent_managed": status.as_ref().is_some_and(|status| status.intent_managed),
                             "output_preview": inspection.output_preview,
                             // Typed (meerkat 0.8.45): why `output_preview`
                             // is not an observation. Null when it is one.
@@ -5403,7 +5459,14 @@ async fn handle_unified_rpc_json_inner(
                             // against the baseline their send/dispatch
                             // returned.
                             "completion_cursor": completion_cursor_json(completion_cursor),
-                        })),
+                    });
+                    if let Some(status) = status.as_ref() {
+                        insert_identity_status_extras(&mut result, status);
+                    }
+                    JsonRpcResponse {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: response_id,
+                        result: Some(result),
                         error: None,
                     }
                 }
@@ -5474,25 +5537,6 @@ async fn handle_unified_rpc_json_inner(
             ))
             .await
         }
-        "meta/request_continuity_repair" => {
-            // Explicit continuity repair trigger: the supervisor retries its
-            // repairable Broken identities. The answer says, typed, whether a
-            // running supervisor will act on it.
-            let ctx = match identity_ctx {
-                Some(ctx) => ctx,
-                None => return maybe_identity_not_configured(is_notification, response_id),
-            };
-            ctx.runtime.trigger_continuity_repair(
-                crate::identity_first::ContinuityRepairTrigger::Requested,
-            );
-            let outcome = ctx.runtime.continuity_repair_request_outcome().await;
-            JsonRpcResponse {
-                jsonrpc: JSONRPC_VERSION.to_string(),
-                id: response_id,
-                result: Some(serde_json::json!({ "continuity_repair": outcome })),
-                error: None,
-            }
-        }
         "meta/reconcile_identity" => {
             let ctx = match identity_ctx {
                 Some(ctx) => ctx,
@@ -5523,21 +5567,14 @@ async fn handle_unified_rpc_json_inner(
                             );
                         }
                     };
-                    let result = ctx
-                        .runtime
+                    ctx.runtime
                         .runtime()
                         .restore_flow_tracked(
                             roster_specs,
                             ctx.topology_provider.clone(),
                             ctx.customizer.clone(),
                         )
-                        .await;
-                    // The attached context fires this itself when its pass
-                    // settles; the unattached pass reports it here.
-                    ctx.runtime.trigger_continuity_repair(
-                        crate::identity_first::ContinuityRepairTrigger::RestorePassSettled,
-                    );
-                    result
+                        .await
                 }
                 Err(error) => Err(error),
             };
@@ -5549,60 +5586,55 @@ async fn handle_unified_rpc_json_inner(
                         .map(|(id, outcome)| {
                             let val = match outcome {
                                 crate::identity_first::RestoreOutcome::Created {
-                                    record, ..
+                                    binding,
+                                    replaced_session,
+                                    ..
                                 } => {
                                     serde_json::json!({
                                         "outcome": "created",
-                                        "identity": record.identity.as_str(),
-                                        "agent_runtime_id": record.agent_runtime_id.as_str(),
-                                        "session_id": record.session_id.to_string(),
-                                        "generation": record.generation.get(),
+                                        "identity": id.as_str(),
+                                        "agent_runtime_id": binding.agent_runtime_id.as_str(),
+                                        "session_id": binding.session_id.as_ref().map(ToString::to_string),
+                                        "replaced_session_id": replaced_session.as_ref().map(ToString::to_string),
                                     })
                                 }
-                                crate::identity_first::RestoreOutcome::Dormant {
-                                    record, ..
-                                } => {
+                                crate::identity_first::RestoreOutcome::Dormant { .. } => {
                                     serde_json::json!({
                                         "outcome": "dormant",
                                         "identity": id.as_str(),
-                                        "agent_runtime_id": record.as_ref().map(|record| record.agent_runtime_id.as_str()),
-                                        "session_id": record.as_ref().map(|record| record.session_id.to_string()),
-                                        "generation": record.as_ref().map(|record| record.generation.get()),
                                     })
                                 }
                                 crate::identity_first::RestoreOutcome::Resumed {
-                                    record, ..
+                                    binding, ..
                                 } => {
                                     serde_json::json!({
                                         "outcome": "resumed",
-                                        "identity": record.identity.as_str(),
-                                        "agent_runtime_id": record.agent_runtime_id.as_str(),
-                                        "session_id": record.session_id.to_string(),
-                                        "generation": record.generation.get(),
+                                        "identity": id.as_str(),
+                                        "agent_runtime_id": binding.agent_runtime_id.as_str(),
+                                        "session_id": binding.session_id.as_ref().map(ToString::to_string),
                                     })
                                 }
-                                crate::identity_first::RestoreOutcome::Broken(failure) => {
+                                crate::identity_first::RestoreOutcome::Refused(error) => {
                                     serde_json::json!({
-                                        "outcome": "broken",
-                                        "identity": failure.identity.as_str(),
-                                        "kind": failure.kind,
-                                        "detail": failure.detail,
+                                        "outcome": "refused",
+                                        "identity": id.as_str(),
+                                        "error": {
+                                            "code": identity_error_code(error),
+                                            "message": error.to_string(),
+                                            "data": error.structured_data(),
+                                        },
                                     })
                                 }
                             };
                             (id.to_string(), val)
                         })
                         .collect();
-                    // The settled pass triggered the continuity repair
-                    // supervisor; report what that trigger reached, typed.
-                    let continuity_repair = ctx.runtime.continuity_repair_request_outcome().await;
                     JsonRpcResponse {
                         jsonrpc: JSONRPC_VERSION.to_string(),
                         id: response_id,
                         result: Some(serde_json::json!({
                             "outcomes": outcomes,
                             "managed_edges": result.managed_edges.len(),
-                            "continuity_repair": continuity_repair,
                         })),
                         error: None,
                     }
@@ -6207,10 +6239,7 @@ fn rpc_live_identity_status_json(alias: &RpcLiveIdentityAlias) -> Value {
         "display_name": alias.member.labels.get("display_name"),
         "labels": alias.member.labels,
         "generation": Value::Null,
-        "checkpoint_version": Value::Null,
-        "continuity_health": Value::Null,
-        "lease_healthy": Value::Null,
-        "lease": Value::Null,
+        "intent_managed": false,
     })
 }
 
@@ -6232,17 +6261,10 @@ async fn rpc_live_identity_inspect_json(
         "addressability": if rpc_member_is_addressable(&alias.member) { "addressable" } else { "internal_only" },
         "display_name": alias.member.labels.get("display_name"),
         "labels": alias.member.labels,
+        "agent_runtime_id": alias.runtime_member_id,
+        "session_id": alias.session_id,
         "generation": Value::Null,
-        "checkpoint_version": Value::Null,
-        "continuity_health": Value::Null,
-        "lease_healthy": Value::Null,
-        "continuity": {
-            "generation": Value::Null,
-            "checkpoint_version": Value::Null,
-            "session_id": alias.session_id,
-            "agent_runtime_id": alias.runtime_member_id,
-        },
-        "lease": Value::Null,
+        "intent_managed": false,
         "output_preview": snapshot.as_ref().and_then(|snapshot| snapshot.output_preview.clone()),
         "preview_unavailable": snapshot.as_ref().and_then(|snapshot| snapshot.preview_unavailable),
         "is_final": snapshot.as_ref().map(|snapshot| snapshot.is_final).unwrap_or(false),
@@ -6442,7 +6464,6 @@ async fn respawn_rpc_runtime_member_id_with_handle(
         "agent_runtime_id": runtime_member_id,
         "session_id": session_id,
         "generation": Value::Null,
-        "checkpoint_version": Value::Null,
         "topology_restore_warning": topology_restore_warning,
     }))
 }
@@ -6505,6 +6526,58 @@ fn identity_lifecycle_state_json(
     state: crate::identity_first::IdentityLifecycleState,
 ) -> &'static str {
     state.wire_str()
+}
+
+/// The `meta/status_identity` answer of a registered identity: its
+/// roster policy and Core's facts, read per call. `agent_runtime_id`,
+/// `session_id` and `generation` are always present (null when Core holds
+/// no binding); `convergence`, `wake_refusal` and `replaced_session` only
+/// when set.
+fn identity_status_wire(status: &crate::identity_first::IdentityStatus) -> Value {
+    let mut result = serde_json::json!({
+        "state": identity_lifecycle_state_json(status.state),
+        "identity": status.identity.as_str(),
+        "agent_runtime_id": status.agent_runtime_id.as_ref().map(super::identity_first::AgentRuntimeId::as_str),
+        "session_id": status.session_id.as_ref().map(ToString::to_string),
+        "profile": status.profile.as_ref().map(meerkat_mob::ProfileName::as_str),
+        "addressability": addressability_json(status.addressability),
+        "display_name": status.display_name.as_ref().map(super::identity_first::DisplayName::as_str),
+        "labels": status.labels,
+        "generation": status.generation.map(meerkat_mob::Generation::get),
+        "intent_managed": status.intent_managed,
+    });
+    insert_identity_status_extras(&mut result, status);
+    result
+}
+
+/// The optional status fields: Core's mob member id of the identity's
+/// binding, Core's convergence of a host-adopted identity, the last refused
+/// wake, and the session the last wake replaced.
+fn insert_identity_status_extras(
+    result: &mut Value,
+    status: &crate::identity_first::IdentityStatus,
+) {
+    let Value::Object(fields) = result else {
+        return;
+    };
+    if let Some(member_id) = status.member_id.as_ref() {
+        fields.insert("member_id".to_string(), Value::String(member_id.clone()));
+    }
+    if let Some(convergence) = status.convergence.as_ref()
+        && let Ok(value) = serde_json::to_value(convergence)
+    {
+        fields.insert("convergence".to_string(), value);
+    }
+    if let Some(wake_refusal) = status.wake_refusal.as_ref()
+        && let Ok(value) = serde_json::to_value(wake_refusal)
+    {
+        fields.insert("wake_refusal".to_string(), value);
+    }
+    if let Some(replaced_session) = status.replaced_session.as_ref()
+        && let Ok(value) = serde_json::to_value(replaced_session)
+    {
+        fields.insert("replaced_session".to_string(), value);
+    }
 }
 
 /// `track_turn: true` on `meta/send`, `meta/interact` or
@@ -6571,6 +6644,20 @@ fn turn_outcome_json(outcome: &crate::identity_first::TurnOutcome) -> Value {
 /// JSON-RPC code for a delivery scope that no longer matches the identity's
 /// binding (`StaleScopeError` in the SDKs). Nothing was submitted.
 pub const STALE_DELIVERY_SCOPE_CODE: i64 = -32007;
+
+/// JSON-RPC code of a wake Core refused for good: Core cannot
+/// resume the identity's last session (archived beyond revival, or its
+/// durable authority contradicts its body). Nothing was spawned;
+/// `delete_identity` starts a fresh life.
+pub const IDENTITY_UNRESUMABLE_CODE: i64 = -32051;
+
+/// JSON-RPC code of a retryable wake: Core's member history could
+/// not be read, or the wake failed transiently. Nothing was spawned; retry.
+pub const IDENTITY_HISTORY_UNAVAILABLE_CODE: i64 = -32052;
+
+/// JSON-RPC code of a Meta lifecycle verb on a host-adopted identity:
+/// Core holds its identity intent row and drives it.
+pub const IDENTITY_HOST_ADOPTED_CODE: i64 = -32053;
 
 /// A scoped dispatch or recovery error: a stale scope has its own code, an
 /// unsupported bridge is a capability gap, and every class carries `data.kind`
@@ -6794,27 +6881,41 @@ mod scoped_delivery_json_tests {
     }
 }
 
+/// The JSON-RPC code of an identity runtime error. -32003 and -32005 (the
+/// retired lease codes) are never answered again.
+pub(crate) fn identity_error_code(err: &crate::identity_first::IdentityRuntimeError) -> i64 {
+    use crate::identity_first::IdentityRuntimeError;
+    match err {
+        IdentityRuntimeError::UnknownIdentity(_) => -32001,
+        IdentityRuntimeError::NotAddressable(_) => -32002,
+        // The send's expected registered row is no longer the identity's
+        // registered row; nothing was submitted.
+        IdentityRuntimeError::RegisteredSpecChanged { .. } => -32006,
+        IdentityRuntimeError::IdentityUnresumable { .. } => IDENTITY_UNRESUMABLE_CODE,
+        IdentityRuntimeError::IdentityHistoryUnavailable { .. }
+        | IdentityRuntimeError::MemberHistoryUnavailable { .. }
+        | IdentityRuntimeError::IdentityWakeRetryable { .. }
+        | IdentityRuntimeError::IdentitySessionAbsent { .. } => IDENTITY_HISTORY_UNAVAILABLE_CODE,
+        IdentityRuntimeError::IdentityHostAdopted { .. } => IDENTITY_HOST_ADOPTED_CODE,
+        // The first-boot manifest: the migrated state directory and
+        // Core's stores disagree, the storage-resolution class.
+        IdentityRuntimeError::FirstBootManifestUnreadable { .. }
+        | IdentityRuntimeError::FirstBootRowRefused { .. }
+        | IdentityRuntimeError::FirstBootRowPending { .. } => STORAGE_RESOLUTION_CODE,
+        _ => -32603,
+    }
+}
+
 fn identity_error_response(
     response_id: Value,
     err: &crate::identity_first::IdentityRuntimeError,
 ) -> JsonRpcResponse {
     use crate::identity_first::IdentityRuntimeError;
-    let (code, message) = match err {
-        IdentityRuntimeError::UnknownIdentity(id) => (-32001, format!("unknown identity: {id}")),
-        IdentityRuntimeError::NotAddressable(na) => {
-            (-32002, format!("not addressable: {}", na.identity))
-        }
-        IdentityRuntimeError::NoActiveLease(id) => (-32003, format!("no active lease: {id}")),
-        // -32005, NOT -32004: -32004 is the SDKs' reserved
-        // `CAPABILITY_UNAVAILABLE_CODE`, which both SDKs reify into a
-        // permanent-capability-gap error type. `LeaseLost` is a transient,
-        // recoverable lease-renewal failure on the identity send/dispatch path,
-        // so it gets its own identity-plane code (sibling to -32001..-32003).
-        IdentityRuntimeError::LeaseLost(id) => (-32005, format!("lease lost: {id}")),
-        // The send's expected registered row is no longer the identity's
-        // registered row; nothing was submitted.
-        IdentityRuntimeError::RegisteredSpecChanged { .. } => (-32006, format!("{err}")),
-        _ => (-32603, format!("{err}")),
+    let code = identity_error_code(err);
+    let message = match err {
+        IdentityRuntimeError::UnknownIdentity(id) => format!("unknown identity: {id}"),
+        IdentityRuntimeError::NotAddressable(na) => format!("not addressable: {}", na.identity),
+        _ => format!("{err}"),
     };
     JsonRpcResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
@@ -7183,15 +7284,15 @@ mod tests {
         rpc_member_id_matches_durable_identity, rpc_runtime_alias_generation,
         wait_identity_startup_ready, with_read_deadline,
     };
-    use crate::identity_first::contracts::{ContinuityStore, LeaseProvider, RosterProvider};
+    use crate::identity_first::contracts::RosterProvider;
+    use crate::identity_first::core_test_bridge::{CoreReadsBridge, bind_live, register_live};
+    use crate::identity_first::core_test_members::CoreTestMembers;
     use crate::identity_first::{
         AgentAddressability, AgentBuildDraft, AgentIdentity, AgentMemoryProvider,
         AgentMemoryRecallRequest, AgentMemorySelection, AgentRuntimeId, BridgeError,
-        CheckpointVersion, ContinuityGeneration, ContinuityRecord, DurabilityPolicy,
-        DurableAgentSpec, FencingToken, IdentityLifecycleState, IdentityRuntime,
-        IdentityRuntimeConfig, LeaseAcquireResult, LeaseGrant, LocalContinuityStore,
-        LocalLeaseProvider, ResumeSessionOutcome, RosterContext, RosterError, SessionBridge,
-        SessionSnapshot,
+        DurabilityPolicy, DurableAgentSpec, IdentityLifecycleState, IdentityRuntime,
+        IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider, ResumeSessionOutcome,
+        RosterContext, RosterError, SessionBridge, SessionSnapshot,
     };
     use crate::memory::SqliteAgentMemoryStore;
     use crate::{
@@ -7517,10 +7618,12 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Default)]
     struct RpcResetTestBridge {
         create_calls: std::sync::atomic::AtomicUsize,
         last_create_spec: tokio::sync::Mutex<Option<DurableAgentSpec>>,
+        /// The members Core holds: a create or reset commits its binding here.
+        core: CoreTestMembers,
     }
 
     impl RpcResetTestBridge {
@@ -7545,7 +7648,7 @@ mod tests {
             identity: &AgentIdentity,
             spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
-        ) -> Result<crate::identity_first::ResetSuccessorBinding, BridgeError> {
+        ) -> Result<crate::identity_first::MemberRuntimeBinding, BridgeError> {
             self.create_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.last_create_spec.lock().await = Some(spec.clone());
@@ -7555,38 +7658,89 @@ mod tests {
                 crate::identity_first::AgentRuntimeId::parse(&alias).map_err(|error| {
                     BridgeError::Mob(format!("test double minted an unusable successor: {error}"))
                 })?;
-            Ok(crate::identity_first::ResetSuccessorBinding {
+            let binding = crate::identity_first::MemberRuntimeBinding {
                 agent_runtime_id,
-                session_id: meerkat_core::types::SessionId::new(),
-            })
+                session_id: Some(meerkat_core::types::SessionId::new()),
+            };
+            self.core.bind(identity, &binding, &spec.profile);
+            Ok(binding)
         }
 
         async fn create_session(
             &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
+            identity: &AgentIdentity,
             spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
-            session_id: &meerkat_core::types::SessionId,
-        ) -> Result<meerkat_core::types::SessionId, BridgeError> {
+        ) -> Result<crate::identity_first::MemberRuntimeBinding, BridgeError> {
+            let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
+            let session_id = &meerkat_core::types::SessionId::new();
             self.create_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.last_create_spec.lock().await = Some(spec.clone());
-            Ok(session_id.clone())
+            let binding = crate::identity_first::MemberRuntimeBinding {
+                agent_runtime_id,
+                session_id: Some(session_id.clone()),
+            };
+            self.core.bind(identity, &binding, &spec.profile);
+            Ok(binding)
         }
 
         async fn resume_session(
             &self,
-            _identity: &AgentIdentity,
-            _runtime_id: &AgentRuntimeId,
+            identity: &AgentIdentity,
             _spec: &DurableAgentSpec,
             _draft: &AgentBuildDraft,
             session_id: &meerkat_core::types::SessionId,
-            _snapshot: &SessionSnapshot,
+            _resume_from_role: Option<&meerkat_mob::ProfileName>,
         ) -> Result<ResumeSessionOutcome, BridgeError> {
+            let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
             Ok(ResumeSessionOutcome::Resumed {
                 session_id: session_id.clone(),
+                agent_runtime_id,
             })
+        }
+
+        async fn live_member(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn live_member_scope(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+            self.core.live_member_scope(identity)
+        }
+
+        async fn ensure_member_live(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<crate::identity_first::MemberRuntimeBinding>, BridgeError> {
+            self.core.live_member(identity)
+        }
+
+        async fn member_binding_history(
+            &self,
+        ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+            self.core.history()
+        }
+
+        async fn last_member_binding(
+            &self,
+            identity: &AgentIdentity,
+        ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+            self.core.last_member_binding(identity)
+        }
+
+        async fn identity_management(
+            &self,
+            _identity: &AgentIdentity,
+        ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+            Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
         }
 
         async fn deliver_admitted(
@@ -7605,7 +7759,8 @@ mod tests {
             Ok(SessionSnapshot { data: Vec::new() })
         }
 
-        async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+        async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+            self.core.retire(runtime_id);
             Ok(())
         }
     }
@@ -7880,6 +8035,186 @@ shell = true
                 .as_str()
                 .is_some_and(|message| message.contains("reserved")),
             "rejection must name the reservation: {response:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
+    async fn reservation_test_runtime(
+        temp_dir: &tempfile::TempDir,
+        namespace: &str,
+    ) -> Result<UnifiedRuntime, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Box::pin(
+            UnifiedRuntime::builder()
+                .mob_spec(rpc_test_mob_spec(temp_dir)?)
+                .module_config(MetaConfig {
+                    modules: Vec::new(),
+                    discovery: DiscoverySpec {
+                        namespace: namespace.to_string(),
+                        modules: Vec::new(),
+                    },
+                    pre_spawn: Vec::new(),
+                })
+                .timeout(Duration::from_secs(1))
+                .build(),
+        )
+        .await?)
+    }
+
+    /// The console treats frames under `_system` and `__console__` as the
+    /// runtime's own events, so no member may take either. The RPC spawn
+    /// refuses both, including spellings that become one once trimmed.
+    #[tokio::test]
+    async fn unified_rpc_spawn_refuses_every_runtime_plane_member_id()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = reservation_test_runtime(&temp_dir, "rpc-runtime-plane-spawn").await?;
+        for (request_id, meerkat_id) in
+            [(1, "__console__"), (2, " _system"), (3, "_system\u{2003}")]
+        {
+            let response: Value = serde_json::from_str(
+                &handle_unified_rpc_json(
+                    &runtime,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "meta/spawn_member",
+                        "params": { "profile": "worker", "meerkat_id": meerkat_id },
+                    })
+                    .to_string(),
+                    Duration::from_secs(1),
+                    None,
+                    None,
+                )
+                .await,
+            )?;
+            assert_eq!(
+                response["error"]["code"],
+                json!(-32602),
+                "{meerkat_id:?}: {response:#?}"
+            );
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("reserved")),
+                "{meerkat_id:?}: the refusal names the reservation: {response:#?}"
+            );
+        }
+        assert!(
+            runtime.mob_handle().list_members().await.is_empty(),
+            "no member took a runtime-plane identity"
+        );
+        let status: Value = serde_json::from_str(
+            &handle_unified_rpc_json(
+                &runtime,
+                &json!({"jsonrpc": "2.0", "id": 9, "method": "meta/status"}).to_string(),
+                Duration::from_secs(1),
+                None,
+                None,
+            )
+            .await,
+        )?;
+        assert!(status["result"].is_object(), "{status:#?}");
+        assert!(
+            status["result"].get("reserved_identity_members").is_none(),
+            "meta/status omits the field when no member holds a reserved identity: {status:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
+    /// `meta/ensure_member` with a `resume_session_id` reaches Core as a
+    /// resume, which the spawn customizer guard admits, so the method's own
+    /// check is what refuses a runtime-plane identity there.
+    #[tokio::test]
+    async fn unified_rpc_ensure_with_a_resume_session_refuses_runtime_plane_identities()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = reservation_test_runtime(&temp_dir, "rpc-runtime-plane-resume").await?;
+        let ensure = |request_id: u64, params: Value| {
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "meta/ensure_member",
+                "params": params,
+            })
+            .to_string();
+            let runtime = &runtime;
+            async move {
+                handle_unified_rpc_json(runtime, &request, Duration::from_secs(5), None, None).await
+            }
+        };
+        let seated: Value = serde_json::from_str(
+            &ensure(1, json!({ "role": "worker", "agent_identity": "alice" })).await,
+        )?;
+        assert!(seated["error"].is_null(), "alice is seated: {seated:#?}");
+        let session = runtime
+            .mob_handle()
+            .resolve_bridge_session_id(&meerkat_mob::AgentIdentity::from("alice"))
+            .await
+            .ok_or("alice has a session")?;
+        for (request_id, agent_identity) in [(2, "__console__"), (3, "_system")] {
+            let ensured: Value = serde_json::from_str(
+                &ensure(
+                    request_id,
+                    json!({
+                        "role": "worker",
+                        "agent_identity": agent_identity,
+                        "resume_session_id": session.to_string(),
+                    }),
+                )
+                .await,
+            )?;
+            assert_eq!(
+                ensured["error"]["code"],
+                json!(-32602),
+                "{agent_identity}: {ensured:#?}"
+            );
+            assert!(
+                ensured["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("reserved")),
+                "{agent_identity}: the refusal names the reservation: {ensured:#?}"
+            );
+        }
+        let members = runtime.mob_handle().list_members().await;
+        assert!(
+            members
+                .iter()
+                .all(|member| member.agent_identity.as_str() == "alice"),
+            "no member took a runtime-plane identity: {members:?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
+    /// The Rust spawn API, its batch form and the declarative roster
+    /// reconcile refuse the runtime-plane identities before any member exists.
+    #[tokio::test]
+    async fn unified_runtime_spawn_and_reconcile_refuse_runtime_plane_member_ids()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = reservation_test_runtime(&temp_dir, "rust-runtime-plane-spawn").await?;
+        let spawned = Box::pin(runtime.spawn(SpawnMemberSpec::new("worker", "__console__"))).await;
+        assert!(spawned.is_err(), "spawn refuses `__console__`");
+        let batch = Box::pin(runtime.spawn_many(vec![
+            SpawnMemberSpec::new("worker", "batch-ok"),
+            SpawnMemberSpec::new("worker", "_system"),
+        ]))
+        .await;
+        assert!(
+            batch.is_err(),
+            "spawn_many refuses a batch naming `_system`"
+        );
+        let reconciled =
+            Box::pin(runtime.reconcile(vec![SpawnMemberSpec::new("worker", "__console__")])).await;
+        assert!(
+            reconciled.is_err(),
+            "reconcile refuses a desired `__console__` member"
+        );
+        assert!(
+            runtime.mob_handle().list_members().await.is_empty(),
+            "no member took a runtime-plane identity"
         );
         let _ = runtime.mob_handle().stop().await;
         Ok(())
@@ -8805,12 +9140,10 @@ shell = true
         )
         .await?;
 
-        let continuity_store = Arc::new(LocalContinuityStore::in_memory()?);
-        let lease_provider = Arc::new(LocalLeaseProvider::new());
         let bridge = Arc::new(RpcResetTestBridge::default());
         let identity_rt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: continuity_store.clone(),
-            lease_provider: lease_provider.clone(),
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-reset-roster-context-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
@@ -8819,34 +9152,15 @@ shell = true
         }));
 
         let identity = AgentIdentity::parse("domain:security")?;
-        let initial_grants = lease_provider
-            .acquire_leases(
-                std::slice::from_ref(&identity),
-                "rpc-reset-roster-context-test",
-            )
-            .await?;
-        let initial_grant = match initial_grants.get(&identity) {
-            Some(LeaseAcquireResult::Acquired(grant)) => grant.clone(),
-            other => return Err(format!("expected acquired lease, got {other:?}").into()),
-        };
-        let initial_record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse("rt:domain:security:0")?,
-            session_id: meerkat_core::types::SessionId::new(),
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        continuity_store
-            .upsert_continuity_record(&initial_record, initial_grant.fencing_token)
-            .await?;
-        identity_rt
-            .register(
-                rpc_durable_spec(identity.as_str(), "domain"),
-                IdentityLifecycleState::Active,
-                Some(initial_record),
-                Some(initial_grant),
-            )
-            .await;
+        // Core holds the identity's member at generation 0 under its old role.
+        register_live(
+            &identity_rt,
+            &bridge.core,
+            rpc_durable_spec(identity.as_str(), "domain"),
+            0,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
 
         let roster_provider = Arc::new(ContextRequiredStaticRosterProvider::new(vec![
             rpc_durable_spec(identity.as_str(), "security"),
@@ -8890,6 +9204,8 @@ shell = true
         );
         // The reset's successor transition retired the previous live member:
         // the reset reports no cleanup warning. The field stays, always null.
+        // The result carries no `checkpoint_version`: Meta keeps no
+        // continuity record, and Core's binding has none.
         let mut fields = response["result"]
             .as_object()
             .expect("reset result")
@@ -8901,7 +9217,6 @@ shell = true
             fields,
             [
                 "agent_runtime_id",
-                "checkpoint_version",
                 "cleanup_warning",
                 "generation",
                 "identity",
@@ -8928,7 +9243,6 @@ shell = true
             frame.data,
             json!({
                 "generation": response["result"]["generation"],
-                "checkpoint_version": response["result"]["checkpoint_version"],
                 "cleanup_warning": null,
             }),
             "{lifecycle:#?}"
@@ -9101,25 +9415,20 @@ shell = true
             .await;
         let memory_identity = AgentIdentity::parse("identity:luka")?;
         identity_rt
-            .register(
-                DurableAgentSpec {
-                    identity: memory_identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: Default::default(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                IdentityLifecycleState::Active,
-                None,
-                None,
-            )
+            .register(DurableAgentSpec {
+                identity: memory_identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: Default::default(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            })
             .await;
         let identity_ctx = IdentityFirstContext {
             runtime: crate::identity_first::PublicIdentityRuntime::new(
@@ -9441,25 +9750,20 @@ shell = true
             .await;
         let memory_identity = AgentIdentity::parse("identity:luka")?;
         identity_rt
-            .register(
-                DurableAgentSpec {
-                    identity: memory_identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: Default::default(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                IdentityLifecycleState::Active,
-                None,
-                None,
-            )
+            .register(DurableAgentSpec {
+                identity: memory_identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: Default::default(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            })
             .await;
         let identity_ctx = IdentityFirstContext {
             runtime: crate::identity_first::PublicIdentityRuntime::new(
@@ -9729,28 +10033,6 @@ shell = true
         assert!(!methods.contains(&json!("meta/agent_memory/remember")));
         assert!(!methods.contains(&json!("meta/agent_memory/forget")));
         Ok(())
-    }
-
-    #[test]
-    fn identity_lease_lost_maps_off_capability_unavailable_code() {
-        // -32004 is the SDKs' CAPABILITY_UNAVAILABLE_CODE, which both SDKs
-        // reify into a permanent-capability-gap error type. LeaseLost is a
-        // transient/recoverable lease-renewal failure and MUST NOT collide
-        // with that code, or a recoverable lease loss is mis-typed as a
-        // permanent capability gap. Regression for the -32004 collision.
-        let identity = AgentIdentity::parse("review:singleton").expect("valid identity");
-        let err = crate::identity_first::IdentityRuntimeError::LeaseLost(identity);
-        let response = identity_error_response(json!("req-1"), &err);
-        let error = response.error.expect("lease-lost must surface an error");
-        assert_ne!(
-            error.code, -32004,
-            "LeaseLost must not use the capability code"
-        );
-        assert_eq!(
-            error.code, -32005,
-            "LeaseLost has its own identity-plane code"
-        );
-        assert!(error.message.contains("lease lost"));
     }
 
     #[test]
@@ -10198,77 +10480,63 @@ shell = true
                 .build(),
         )
         .await?;
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-stale-runtime-id-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         }));
         // An implicit delegate member the stdio surface hides, bound at
         // generation 1 like the singleton.
         let hidden_identity = AgentIdentity::parse("review:delegate")?;
-        identity_runtime
-            .register(
-                DurableAgentSpec {
-                    identity: hidden_identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("delegate"),
-                    addressability: AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::from([(
-                        "source_mob_id".to_string(),
-                        "child-mob".to_string(),
-                    )]),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: hidden_identity.clone(),
-                    agent_runtime_id: AgentRuntimeId::parse("rt:review:delegate:1")?,
-                    session_id: meerkat_core::types::SessionId::new(),
-                    generation: ContinuityGeneration::new(1),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                None,
-            )
-            .await;
+        register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            DurableAgentSpec {
+                identity: hidden_identity.clone(),
+                profile: meerkat_mob::ProfileName::from("delegate"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::from([("source_mob_id".to_string(), "child-mob".to_string())]),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            1,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
         let identity = AgentIdentity::parse("review:singleton")?;
         let session_id = meerkat_core::types::SessionId::new();
-        identity_runtime
-            .register(
-                DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: AgentRuntimeId::parse("rt:review:singleton:1")?,
-                    session_id: session_id.clone(),
-                    generation: ContinuityGeneration::new(1),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                None,
-            )
-            .await;
+        register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            1,
+            session_id.clone(),
+        )
+        .await?;
         let identity_ctx = IdentityFirstContext {
             runtime: crate::identity_first::PublicIdentityRuntime::new(
                 identity_runtime.clone(),
@@ -10472,44 +10740,38 @@ shell = true
             )
             .await?;
         }
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_rt = IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-identity-alias-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         });
         let identity = AgentIdentity::parse("review:singleton")?;
-        let record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse("rt:review:singleton:1")?,
-            session_id: meerkat_core::types::SessionId::new(),
-            generation: ContinuityGeneration::new(1),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        identity_rt
-            .register(
-                DurableAgentSpec {
-                    identity,
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                IdentityLifecycleState::Active,
-                Some(record),
-                None,
-            )
-            .await;
+        register_live(
+            &identity_rt,
+            &core_bridge.core,
+            DurableAgentSpec {
+                identity,
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            1,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
 
         let target =
             resolve_rpc_identity_control_target(&runtime, &identity_rt, "review:singleton").await?;
@@ -10620,13 +10882,14 @@ shell = true
         )
         .await?;
 
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-current-generation-target-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         }));
         let identity = AgentIdentity::parse(durable_identity)?;
@@ -10639,22 +10902,17 @@ shell = true
             .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(durable_identity))
             .await
             .ok_or("the stable roster row must have a bridge session")?;
-        let successor_binding = |session_id: meerkat_core::types::SessionId| ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse(successor_alias)
-                .expect("successor alias parses"),
-            session_id,
-            generation: ContinuityGeneration::new(1),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        identity_runtime
-            .register(
-                rpc_durable_spec(durable_identity, "worker"),
-                IdentityLifecycleState::Active,
-                Some(successor_binding(expected_session.clone())),
-                None,
-            )
-            .await;
+        // Core holds the identity's successor at generation 1, bound to the
+        // row's session.
+        let core_runtime_id = register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            rpc_durable_spec(durable_identity, "worker"),
+            1,
+            expected_session.clone(),
+        )
+        .await?;
+        assert_eq!(core_runtime_id.as_str(), successor_alias);
         let params = json!({"identity": durable_identity});
         let target = identity_runtime
             .member_alias_lifecycle_target(durable_identity)
@@ -10671,19 +10929,18 @@ shell = true
         .await?;
         assert_eq!(resolved_session, Some(expected_session.clone()));
 
-        // A STALE BINDING PROJECTION must not be adopted. Re-register the same
-        // identity with a binding that names a session the row is not bound to -
+        // A STALE BINDING PROJECTION must not be adopted. Core's history now
+        // binds the identity to a session the row is not bound to -
         // the shape a resolver would see if it read a projection left behind by a
         // superseded incarnation - and require the resolver to refuse rather than
         // hand back a session that does not belong to the live member.
-        identity_runtime
-            .register(
-                rpc_durable_spec(durable_identity, "worker"),
-                IdentityLifecycleState::Active,
-                Some(successor_binding(meerkat_core::types::SessionId::new())),
-                None,
-            )
-            .await;
+        bind_live(
+            &core_bridge.core,
+            &identity,
+            &meerkat_mob::ProfileName::from("worker"),
+            1,
+            Some(meerkat_core::types::SessionId::new()),
+        )?;
         let stale_target = identity_runtime
             .member_alias_lifecycle_target(durable_identity)
             .await?
@@ -10706,14 +10963,13 @@ shell = true
         );
 
         // Restore the truthful binding for the remainder of the test.
-        identity_runtime
-            .register(
-                rpc_durable_spec(durable_identity, "worker"),
-                IdentityLifecycleState::Active,
-                Some(successor_binding(expected_session)),
-                None,
-            )
-            .await;
+        bind_live(
+            &core_bridge.core,
+            &identity,
+            &meerkat_mob::ProfileName::from("worker"),
+            1,
+            Some(expected_session),
+        )?;
 
         runtime.attach_identity_first_context(Arc::new(
             crate::identity_first::IdentityFirstRuntimeContext::new(
@@ -10812,43 +11068,38 @@ shell = true
             ])),
         )
         .await?;
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_rt = IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-hidden-bound-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         });
         let identity = AgentIdentity::parse("review:singleton")?;
-        identity_rt
-            .register(
-                DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity,
-                    agent_runtime_id: AgentRuntimeId::parse("rt:review:singleton:0")?,
-                    session_id: meerkat_core::types::SessionId::new(),
-                    generation: ContinuityGeneration::new(0),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                None,
-            )
-            .await;
+        register_live(
+            &identity_rt,
+            &core_bridge.core,
+            DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
 
         for requested_identity in ["review:singleton", "rt:review:singleton:0"] {
             let err =
@@ -10994,48 +11245,38 @@ shell = true
         )
         .await?;
 
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_rt = IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-identity-alias-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         });
         let identity = AgentIdentity::parse("review:singleton")?;
-        let record = ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse("rt:review:singleton:0")?,
-            session_id: meerkat_core::types::SessionId::new(),
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: CheckpointVersion::new(0),
-        };
-        identity_rt
-            .register(
-                DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                IdentityLifecycleState::Active,
-                Some(record),
-                Some(LeaseGrant {
-                    identity,
-                    fencing_token: FencingToken::new(1),
-                    ttl: Duration::from_mins(1),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_rt,
+            &core_bridge.core,
+            DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
 
         let err = resolve_rpc_identity_control_target(&runtime, &identity_rt, "other:singleton")
             .await
@@ -11142,46 +11383,25 @@ shell = true
         .with_runtime_services(crate::identity_first::AgentRuntimeServices::new(
             runtime.mob_handle(),
         ));
-        for (durable, runtime_id) in [
-            ("atlas-base-001", "rt:atlas-base-001:0"),
-            ("draco-base-001", "rt:draco-base-001:0"),
-        ] {
+        // Core holds both identities' members (the rows above), so each
+        // registered identity is Active at Core's generation 0.
+        for durable in ["atlas-base-001", "draco-base-001"] {
             let identity = AgentIdentity::parse(durable)?;
-            let session_id = runtime
-                .mob_handle()
-                .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(runtime_id))
-                .await
-                .unwrap_or_else(meerkat_core::types::SessionId::new);
             identity_rt
-                .register(
-                    DurableAgentSpec {
-                        identity: identity.clone(),
-                        profile: meerkat_mob::ProfileName::from("worker"),
-                        addressability: AgentAddressability::Addressable,
-                        display_name: None,
-                        labels: BTreeMap::new(),
-                        context: None,
-                        additional_instructions: Vec::new(),
-                        initial_message: None,
-                        runtime_mode_override: None,
-                        backend: None,
-                        binding: None,
-                        placement: None,
-                    },
-                    IdentityLifecycleState::Active,
-                    Some(ContinuityRecord {
-                        identity: identity.clone(),
-                        agent_runtime_id: AgentRuntimeId::parse(runtime_id)?,
-                        session_id,
-                        generation: ContinuityGeneration::new(0),
-                        checkpoint_version: CheckpointVersion::new(0),
-                    }),
-                    Some(LeaseGrant {
-                        identity,
-                        fencing_token: FencingToken::new(1),
-                        ttl: Duration::from_mins(1),
-                    }),
-                )
+                .register(DurableAgentSpec {
+                    identity: identity.clone(),
+                    profile: meerkat_mob::ProfileName::from("worker"),
+                    addressability: AgentAddressability::Addressable,
+                    display_name: None,
+                    labels: BTreeMap::new(),
+                    context: None,
+                    additional_instructions: Vec::new(),
+                    initial_message: None,
+                    runtime_mode_override: None,
+                    backend: None,
+                    binding: None,
+                    placement: None,
+                })
                 .await;
         }
         let identity_ctx = IdentityFirstContext {
@@ -11362,6 +11582,7 @@ comms = true
             .lease_provider(Arc::new(LocalLeaseProvider::new()))
             .roster_provider(roster)
             .scratch_dir(scratch.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("send-message-reservation-settlement-test")
             .default_llm_client(Arc::new(TestClient::for_provider(
                 meerkat_core::Provider::OpenAI,
@@ -11583,6 +11804,7 @@ comms = true
             .lease_provider(Arc::new(LocalLeaseProvider::new()))
             .roster_provider(roster)
             .scratch_dir(scratch.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("send-message-memory-preparation-test")
             .agent_memory(
                 memory.clone(),
@@ -11738,47 +11960,38 @@ comms = true
         );
 
         // Surface 2: identity-first status RPC.
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_rt = IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-state-vocabulary-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         });
         let identity = AgentIdentity::parse("review:singleton")?;
-        identity_rt
-            .register(
-                DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: AgentRuntimeId::parse("rt:review:singleton:0")?,
-                    session_id: meerkat_core::types::SessionId::new(),
-                    generation: ContinuityGeneration::new(0),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                Some(LeaseGrant {
-                    identity,
-                    fencing_token: FencingToken::new(1),
-                    ttl: Duration::from_mins(1),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_rt,
+            &core_bridge.core,
+            DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
         let identity_ctx = IdentityFirstContext {
             runtime: crate::identity_first::PublicIdentityRuntime::new(
                 Arc::new(identity_rt),
@@ -11874,47 +12087,38 @@ comms = true
             )
             .await?;
 
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_rt = IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-send-message-baseline-pin-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         });
         let identity = AgentIdentity::parse("draco-base-001")?;
-        identity_rt
-            .register(
-                DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: AgentRuntimeId::parse("rt:draco-base-001:0")?,
-                    session_id: meerkat_core::types::SessionId::new(),
-                    generation: ContinuityGeneration::new(0),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                Some(LeaseGrant {
-                    identity,
-                    fencing_token: FencingToken::new(1),
-                    ttl: Duration::from_mins(1),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_rt,
+            &core_bridge.core,
+            DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
         let identity_ctx = IdentityFirstContext {
             runtime: crate::identity_first::PublicIdentityRuntime::new(
                 Arc::new(identity_rt),
@@ -12018,34 +12222,26 @@ comms = true
         )
         .await?;
 
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_rt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-separate-identity-context-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         }));
         let identity = AgentIdentity::parse("review:separate")?;
-        identity_rt
-            .register(
-                rpc_durable_spec(identity.as_str(), "worker"),
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: AgentRuntimeId::parse(current_alias)?,
-                    session_id: meerkat_core::types::SessionId::new(),
-                    generation: ContinuityGeneration::new(1),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                Some(LeaseGrant {
-                    identity,
-                    fencing_token: FencingToken::new(1),
-                    ttl: Duration::from_mins(1),
-                }),
-            )
-            .await;
+        let core_runtime_id = register_live(
+            &identity_rt,
+            &core_bridge.core,
+            rpc_durable_spec(identity.as_str(), "worker"),
+            1,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
+        assert_eq!(core_runtime_id.as_str(), current_alias);
         let identity_ctx = IdentityFirstContext {
             runtime: crate::identity_first::PublicIdentityRuntime::new(
                 identity_rt,
@@ -12162,30 +12358,26 @@ comms = true
         )
         .await?;
 
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-owned-identity-context-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         }));
         let identity = AgentIdentity::parse("review:owned-context")?;
-        identity_runtime
-            .register(
-                rpc_durable_spec(identity.as_str(), "worker"),
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: AgentRuntimeId::parse(current_alias)?,
-                    session_id: meerkat_core::types::SessionId::new(),
-                    generation: ContinuityGeneration::new(1),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                None,
-            )
-            .await;
+        let core_runtime_id = register_live(
+            &identity_runtime,
+            &core_bridge.core,
+            rpc_durable_spec(identity.as_str(), "worker"),
+            1,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
+        assert_eq!(core_runtime_id.as_str(), current_alias);
         runtime.attach_identity_first_context(Arc::new(
             crate::identity_first::IdentityFirstRuntimeContext::new(
                 identity_runtime,
@@ -12393,34 +12585,25 @@ comms = true
             SpawnMemberSpec::from_wire("worker".to_string(), DURABLE.to_string(), None, None, None),
         )
         .await?;
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_rt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-fork-current-alias-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         }));
         let identity = AgentIdentity::parse(DURABLE)?;
-        identity_rt
-            .register(
-                rpc_durable_spec(identity.as_str(), "worker"),
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: AgentRuntimeId::parse(current_alias)?,
-                    session_id: meerkat_core::types::SessionId::new(),
-                    generation: ContinuityGeneration::new(1),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                Some(LeaseGrant {
-                    identity,
-                    fencing_token: FencingToken::new(1),
-                    ttl: Duration::from_mins(1),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_rt,
+            &core_bridge.core,
+            rpc_durable_spec(identity.as_str(), "worker"),
+            1,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
         let identity_ctx = IdentityFirstContext {
             runtime: crate::identity_first::PublicIdentityRuntime::new(
                 identity_rt,
@@ -12780,34 +12963,25 @@ comms = true
             ),
         )
         .await?;
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_rt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-fork-api-alias-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         }));
         let identity = AgentIdentity::parse(DURABLE)?;
-        identity_rt
-            .register(
-                rpc_durable_spec(identity.as_str(), "worker"),
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: AgentRuntimeId::parse(current_alias)?,
-                    session_id: meerkat_core::types::SessionId::new(),
-                    generation: ContinuityGeneration::new(1),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                Some(LeaseGrant {
-                    identity,
-                    fencing_token: FencingToken::new(1),
-                    ttl: Duration::from_mins(1),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_rt,
+            &core_bridge.core,
+            rpc_durable_spec(identity.as_str(), "worker"),
+            1,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
         let child = |identity: &str| {
             SpawnMemberSpec::from_wire("worker".to_string(), identity.to_string(), None, None, None)
         };
@@ -12885,38 +13059,20 @@ comms = true
                 )])),
             )
             .await?;
-            let session_id = runtime
-                .mob_handle()
-                .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(durable))
-                .await
-                .ok_or("the spawned member must have a bridge session")?;
             let identity_rt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
                 continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
                 lease_provider: Arc::new(LocalLeaseProvider::new()),
                 runtime_instance_id: namespace.to_string(),
                 has_runtime_store: true,
                 durability_policy: DurabilityPolicy::SyncWriteThrough,
-                bridge: None,
+                bridge: Some(Arc::new(crate::identity_first::MobSessionBridge::new(
+                    runtime.mob_handle(),
+                ))),
                 default_timeout: None,
             }));
             let identity = AgentIdentity::parse(durable)?;
             identity_rt
-                .register(
-                    rpc_durable_spec(identity.as_str(), "worker"),
-                    IdentityLifecycleState::Active,
-                    Some(ContinuityRecord {
-                        identity: identity.clone(),
-                        agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{durable}:0"))?,
-                        session_id,
-                        generation: ContinuityGeneration::new(0),
-                        checkpoint_version: CheckpointVersion::new(0),
-                    }),
-                    Some(LeaseGrant {
-                        identity,
-                        fencing_token: FencingToken::new(1),
-                        ttl: Duration::from_mins(1),
-                    }),
-                )
+                .register(rpc_durable_spec(identity.as_str(), "worker"))
                 .await;
             runtime.attach_identity_first_context(Arc::new(
                 crate::identity_first::IdentityFirstRuntimeContext::new(
@@ -13003,34 +13159,25 @@ comms = true
         )
         .await?;
 
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_rt = IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-durable-delete-race-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         });
         let identity = AgentIdentity::parse(durable_identity)?;
-        identity_rt
-            .register(
-                rpc_durable_spec(durable_identity, "worker"),
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: AgentRuntimeId::parse(runtime_alias)?,
-                    session_id: meerkat_core::types::SessionId::new(),
-                    generation: ContinuityGeneration::new(0),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                Some(LeaseGrant {
-                    identity: identity.clone(),
-                    fencing_token: FencingToken::new(1),
-                    ttl: Duration::from_mins(1),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_rt,
+            &core_bridge.core,
+            rpc_durable_spec(durable_identity, "worker"),
+            0,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
 
         let target =
             resolve_rpc_identity_control_target(&runtime, &identity_rt, durable_identity).await?;
@@ -13099,50 +13246,45 @@ comms = true
                 .build(),
         )
         .await?;
-        let runtime_alias = "rt:review:reload:0";
+        let runtime_alias = "rt:review:reload:3";
         let continuity_store = Arc::new(LocalContinuityStore::in_memory()?);
+        // Core reloads the member's registration in place (`discarded`): the
+        // member keeps its session and its generation.
+        let core_bridge = Arc::new(CoreReadsBridge::with_registration_reload(
+            crate::identity_first::MemberReloadDisposition::Discarded,
+        ));
         let identity_rt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store,
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-reload-member-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         }));
         let identity = AgentIdentity::parse("review:reload")?;
         let session_id = meerkat_core::types::SessionId::new();
-        identity_rt
-            .register(
-                DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: AgentRuntimeId::parse(runtime_alias)?,
-                    session_id: session_id.clone(),
-                    generation: ContinuityGeneration::new(3),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                Some(LeaseGrant {
-                    identity: identity.clone(),
-                    fencing_token: FencingToken::new(1),
-                    ttl: Duration::from_mins(1),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_rt,
+            &core_bridge.core,
+            DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            3,
+            session_id.clone(),
+        )
+        .await?;
         let identity_ctx = IdentityFirstContext {
             runtime: crate::identity_first::PublicIdentityRuntime::new(
                 Arc::clone(&identity_rt),
@@ -13227,7 +13369,7 @@ comms = true
         let status = identity_rt.status(&identity).await?;
         assert_eq!(status.state, IdentityLifecycleState::Active);
         assert_eq!(status.session_id, Some(session_id));
-        assert_eq!(status.generation, Some(ContinuityGeneration::new(3)));
+        assert_eq!(status.generation, Some(meerkat_mob::Generation::new(3)));
 
         // A stale generated alias is rejected, exactly like the other member
         // verbs.
@@ -13283,47 +13425,38 @@ comms = true
         .await?;
 
         let continuity_store = Arc::new(LocalContinuityStore::in_memory()?);
+        let core_bridge = Arc::new(CoreReadsBridge::default());
         let identity_rt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
             continuity_store,
             lease_provider: Arc::new(LocalLeaseProvider::new()),
             runtime_instance_id: "rpc-owned-retire-test".to_string(),
             has_runtime_store: true,
             durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
+            bridge: Some(core_bridge.clone()),
             default_timeout: None,
         }));
         let identity = AgentIdentity::parse("review:owned")?;
-        identity_rt
-            .register(
-                DurableAgentSpec {
-                    identity: identity.clone(),
-                    profile: meerkat_mob::ProfileName::from("worker"),
-                    addressability: AgentAddressability::Addressable,
-                    display_name: None,
-                    labels: BTreeMap::new(),
-                    context: None,
-                    additional_instructions: Vec::new(),
-                    initial_message: None,
-                    runtime_mode_override: None,
-                    backend: None,
-                    binding: None,
-                    placement: None,
-                },
-                IdentityLifecycleState::Active,
-                Some(ContinuityRecord {
-                    identity: identity.clone(),
-                    agent_runtime_id: AgentRuntimeId::parse(runtime_alias)?,
-                    session_id: meerkat_core::types::SessionId::new(),
-                    generation: ContinuityGeneration::new(0),
-                    checkpoint_version: CheckpointVersion::new(0),
-                }),
-                Some(LeaseGrant {
-                    identity: identity.clone(),
-                    fencing_token: FencingToken::new(1),
-                    ttl: Duration::from_mins(1),
-                }),
-            )
-            .await;
+        register_live(
+            &identity_rt,
+            &core_bridge.core,
+            DurableAgentSpec {
+                identity: identity.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+            0,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await?;
         let identity_ctx = IdentityFirstContext {
             runtime: crate::identity_first::PublicIdentityRuntime::new(
                 Arc::clone(&identity_rt),
@@ -13360,7 +13493,7 @@ comms = true
         assert_eq!(response["result"]["identity_first"], json!(true));
         assert_eq!(
             identity_rt.status(&identity).await?.state,
-            IdentityLifecycleState::Retiring,
+            IdentityLifecycleState::Dormant,
             "the durable authority, not only the Mob projection, must observe retirement"
         );
         assert!(
@@ -13373,7 +13506,8 @@ comms = true
                     crate::member_comms_id::runtime_alias_str(entry.agent_identity.as_str())
                         == runtime_alias
                 }),
-            "a bridge-less identity test proves the raw Mob fallback was not invoked"
+            "the test bridge retires only in Core's history, so the row proves the raw Mob \
+             fallback was not invoked"
         );
 
         Ok(())

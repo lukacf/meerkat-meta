@@ -115,7 +115,7 @@
 //! activation. This is the checked seam list, not a closed census:
 //! `set_contact_directory`,
 //! `set_access_controller`, `set_gateway_peer_keys`,
-//! `start_control_listener`, `with_session_write_epochs`,
+//! `start_control_listener`, `with_durable_runtime_store`,
 //! `with_session_runtime_adapter`, `with_workgraph_service`,
 //! `with_workgraph_admission_slot`, `with_workgraph_admission_sidecar`,
 //! `with_runtime_archived_terminal_authority`,

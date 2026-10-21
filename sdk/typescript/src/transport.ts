@@ -942,8 +942,8 @@ export class PersistentTransport {
     let stopping: Promise<void>;
     stopping = (async () => {
       let shutdownError: Error | null = asked === null ? null : this._nativeShutdownError;
-      // Keep stdin open while the gateway shuts its runtime down: external
-      // lease/continuity providers may still need callback round-trips.
+      // Keep stdin open while the gateway shuts its runtime down: host
+      // callbacks may still need round-trips.
       // Capability negotiation keeps older/custom gateways on their EOF
       // protocol instead of assuming method-not-found behavior.
       if (asked === null && this._supportsShutdownHandshake) {

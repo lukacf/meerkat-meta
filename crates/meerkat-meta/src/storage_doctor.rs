@@ -66,6 +66,7 @@ use rusqlite::Connection;
 
 use crate::auth::GATEWAY_PEER_KEY_FILE;
 use crate::blob_store::is_valid_blob_id_value;
+use crate::identity_first::{FirstBootManifest, FirstBootRowState};
 use crate::schedule_wiring::SCHEDULE_STORE_FILE;
 use crate::storage_health::ResolvedStorageSummary;
 use crate::workgraph_admission::WORKGRAPH_ADMISSION_SIDECAR_FILE;
@@ -143,8 +144,16 @@ pub const FINDING_PEER_KEY_FILE: &str = "peer-key-file";
 pub const FINDING_RUNTIME_REGISTRY: &str = "runtime-registry";
 /// The workgraph admission sidecar lock database is present.
 pub const FINDING_WORKGRAPH_ADMISSION_SIDECAR: &str = "workgraph-admission-sidecar";
-/// A `*.mfence` maintenance-fence lock file.
+/// A `*.mfence` maintenance-fence lock file, or its `*.mpresence`
+/// presence-lock sibling (created by connections kept open between
+/// operations and by maintenance at every database it fences).
 pub const FINDING_MAINTENANCE_FENCE_LOCK: &str = "maintenance-fence-lock";
+/// The state directory's runtime lock file ([`STATE_DIR_LOCK_FILE_NAME`]),
+/// through which one Meta runtime holds the directory. Inventory, never a
+/// leftover: it stays in place between runs.
+///
+/// [`STATE_DIR_LOCK_FILE_NAME`]: crate::storage_layout::STATE_DIR_LOCK_FILE_NAME
+pub const FINDING_STATE_DIR_LOCK: &str = "state-dir-lock";
 /// A `*.pre-<version>-<timestamp>` migration backup artifact.
 pub const FINDING_BACKUP_ARTIFACT: &str = "backup-artifact";
 /// A `*.corrupt-<timestamp>` quarantined corrupt file.
@@ -160,6 +169,20 @@ pub const FINDING_DURABILITY_CENSUS_UNAVAILABLE: &str = "durability-census-unava
 /// A scoped state root does not exist (explicit roots make a typo worth
 /// telling the operator about, unlike Meerkat's ambient candidate roots).
 pub const FINDING_STATE_ROOT_MISSING: &str = "state-root-missing";
+/// The first-boot manifest `storage-migrate-native` left in the state
+/// directory cannot be used: the gateway wakes no identity until it
+/// reads.
+pub const FINDING_FIRST_BOOT_MANIFEST_UNREADABLE: &str = "first-boot-manifest-unreadable";
+/// A first-boot manifest row the gateway has not carried out yet, with
+/// Core's verdict on it.
+pub const FINDING_FIRST_BOOT_ROW_PENDING: &str = "first-boot-row-pending";
+/// A principal the Console accepted a token without `exp` for: such a token
+/// never expires, and only a session revocation
+/// (`meta/console/revoke_sessions`) ends it. One finding per principal,
+/// naming the principal only, never a token.
+pub const FINDING_CONSOLE_NON_EXPIRING_PRINCIPAL: &str = "console-non-expiring-principal";
+/// The Console's session fence record exists but cannot be read.
+pub const FINDING_CONSOLE_SESSION_RECORD_UNREADABLE: &str = "console-session-record-unreadable";
 /// Internal doctor failure (the sweep task itself failed).
 pub const FINDING_DOCTOR_INTERNAL: &str = "doctor-internal";
 
@@ -450,6 +473,40 @@ fn attach_live_durability(diagnosis: &mut StorageDiagnosis, summary: ResolvedSto
     ));
 }
 
+/// The Console's session fence record in `state_dir`, read without creating
+/// or changing anything: one finding per principal whose token has no `exp`
+/// (the principal and the flag only), or one for a record that cannot be
+/// read.
+fn report_console_session_record(state_dir: &Path, out: &mut StorageDiagnosis) {
+    let path = state_dir.join(crate::auth::session_fence::CONSOLE_SESSION_FENCES_FILE);
+    match crate::auth::session_fence::read_console_session_record(&path) {
+        Ok(None) => {}
+        Ok(Some(summary)) => {
+            for principal in summary.non_expiring_principals {
+                out.findings.push(
+                    StorageFinding::new(
+                        FindingSeverity::Warning,
+                        FINDING_CONSOLE_NON_EXPIRING_PRINCIPAL,
+                        format!(
+                            "console principal {principal} signed in with a token that has no \
+                             exp (non-expiring); only a session revocation ends it"
+                        ),
+                    )
+                    .with_path(path.clone()),
+                );
+            }
+        }
+        Err(error) => out.findings.push(
+            StorageFinding::new(
+                FindingSeverity::Error,
+                FINDING_CONSOLE_SESSION_RECORD_UNREADABLE,
+                error.to_string(),
+            )
+            .with_path(path),
+        ),
+    }
+}
+
 fn sweep_state_dir(
     state_dir: &Path,
     identity_filter: Option<&str>,
@@ -468,6 +525,8 @@ fn sweep_state_dir(
         return;
     }
 
+    report_console_session_record(state_dir, out);
+
     let label = state_dir
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -483,7 +542,19 @@ fn sweep_state_dir(
             .map(|spelling| state_dir.join(spelling))
             .filter(|path| path.is_file())
             .collect();
-        report_twins(family.name, &present, out);
+        if family.name == "sessions" {
+            // A sessions spelling holding the session-store retired stamp is
+            // the tripwire `storage-migrate --session-db` leaves at a moved
+            // file's old path, not a second copy.
+            let copies: Vec<PathBuf> = present
+                .iter()
+                .filter(|path| !crate::storage_migrate::is_session_store_tripwire(path))
+                .cloned()
+                .collect();
+            report_twins(family.name, &copies, out);
+        } else {
+            report_twins(family.name, &present, out);
+        }
         for db_path in &present {
             entry
                 .databases
@@ -563,6 +634,8 @@ fn sweep_state_dir(
     }
 
     sweep_blob_root(state_dir, out);
+
+    sweep_first_boot_manifest(state_dir, out);
 
     // Gateway-home artifacts, reported when materialized inside a scoped
     // root (the meta_gateway XDG home is itself a valid root to pass).
@@ -1869,7 +1942,8 @@ fn sweep_memory_root(
     }
 }
 
-/// Filesystem artifact sweep: `*.mfence` fence locks, `*.pre-*` migration
+/// Filesystem artifact sweep: `*.mfence` fence locks and their `*.mpresence`
+/// presence locks, the state-directory runtime lock, `*.pre-*` migration
 /// backups, `*.corrupt-*` quarantines (all inventory-grade).
 fn sweep_artifacts(dir: &Path, out: &mut StorageDiagnosis) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1892,6 +1966,27 @@ fn sweep_artifacts(dir: &Path, out: &mut StorageDiagnosis) {
                     FINDING_MAINTENANCE_FENCE_LOCK,
                     "maintenance-fence lock file (created by normal per-operation guards; held \
                      exclusively only during offline maintenance)",
+                )
+                .with_path(file.clone()),
+            );
+        } else if name.ends_with(".mpresence") {
+            out.findings.push(
+                StorageFinding::new(
+                    FindingSeverity::Info,
+                    FINDING_MAINTENANCE_FENCE_LOCK,
+                    "presence lock file (held shared by connections kept open across \
+                     operations; maintenance creates it next to every database it fences \
+                     and holds it exclusively after the fence lock)",
+                )
+                .with_path(file.clone()),
+            );
+        } else if name == crate::storage_layout::STATE_DIR_LOCK_FILE_NAME {
+            out.findings.push(
+                StorageFinding::new(
+                    FindingSeverity::Info,
+                    FINDING_STATE_DIR_LOCK,
+                    "state-directory runtime lock file (held while a Meta runtime uses this \
+                     directory; it stays in place between runs)",
                 )
                 .with_path(file.clone()),
             );
@@ -1920,6 +2015,117 @@ fn sweep_artifacts(dir: &Path, out: &mut StorageDiagnosis) {
     }
 }
 
+/// The first-boot manifest: one finding per row
+/// `storage-migrate-native` left for the gateway to carry out, with Core's
+/// verdict on it from the state directory's mob store
+/// ([`crate::identity_first::FirstBootRow::state_in`]). A row Core shows done
+/// leaves the file at the gateway's next roster compile; a row Core
+/// contradicts blocks that identity's wake. A manifest the reader refuses
+/// blocks every wake until it reads.
+fn sweep_first_boot_manifest(state_dir: &Path, out: &mut StorageDiagnosis) {
+    let manifest = match FirstBootManifest::read(state_dir) {
+        Ok(None) => return,
+        Ok(Some(manifest)) => manifest,
+        Err(error) => {
+            out.findings.push(
+                StorageFinding::new(
+                    FindingSeverity::Error,
+                    FINDING_FIRST_BOOT_MANIFEST_UNREADABLE,
+                    format!(
+                        "first-boot manifest refused ({}); the gateway wakes no identity until \
+                         it reads. Restore the manifest storage-migrate-native wrote",
+                        error.refusal()
+                    ),
+                )
+                .with_path(error.path().to_path_buf()),
+            );
+            return;
+        }
+    };
+    let manifest_path = FirstBootManifest::path(state_dir);
+    // The mob store the directory's mob lives in, found as the migration's
+    // census finds it: the gateways' event_log.sqlite3, or an embedded
+    // application's store under the name its composition manifest gives.
+    let history = match crate::storage_migrate_native::census::state_dir_mob_store(state_dir) {
+        Ok(Some(mob_store)) => read_member_binding_history_blocking(&mob_store),
+        Ok(None) => Err(
+            "the state directory holds no durable mob store, so Core keeps no binding to \
+             compare (in-memory mob storage)"
+                .to_owned(),
+        ),
+        Err(detail) => Err(detail),
+    };
+    for row in manifest.rows() {
+        let (severity, verdict) = match &history {
+            Ok(history) => match row.state_in(history) {
+                FirstBootRowState::Done => (
+                    FindingSeverity::Info,
+                    "Core's history shows it carried out; the gateway's next roster compile \
+                     removes it"
+                        .to_string(),
+                ),
+                FirstBootRowState::ToDo => (
+                    FindingSeverity::Info,
+                    "to carry out by the roster compile that lists the identity, before \
+                     anything wakes it"
+                        .to_string(),
+                ),
+                FirstBootRowState::Contradicted { detail, .. } => (
+                    FindingSeverity::Error,
+                    format!(
+                        "Core's history contradicts it ({detail}); the identity's wake is \
+                         refused until an operator reviews the mob store"
+                    ),
+                ),
+            },
+            Err(detail) => (
+                FindingSeverity::Warning,
+                format!("Core's verdict is unavailable: {detail}"),
+            ),
+        };
+        out.findings.push(
+            StorageFinding::new(
+                severity,
+                FINDING_FIRST_BOOT_ROW_PENDING,
+                format!(
+                    "first-boot {} row for identity {} (session {}): {verdict}",
+                    row.kind(),
+                    row.identity(),
+                    row.session()
+                ),
+            )
+            .with_path(manifest_path.clone()),
+        );
+    }
+}
+
+/// Core's member history of the mob store at `mob_store`, read on a thread
+/// of its own: Core's reader is async, this sweep is synchronous, and its
+/// caller may already run inside a runtime. The reader opens the store
+/// read-only and never creates it.
+fn read_member_binding_history_blocking(
+    mob_store: &Path,
+) -> Result<meerkat_mob::MemberBindingHistory, String> {
+    let mob_store = mob_store.to_path_buf();
+    let reader = std::thread::Builder::new()
+        .name("storage-doctor-member-history".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("starting the member history reader failed: {error}"))?;
+            runtime
+                .block_on(meerkat_mob::MobStorage::read_member_binding_history(
+                    &mob_store,
+                ))
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|error| format!("starting the member history reader failed: {error}"))?;
+    reader
+        .join()
+        .unwrap_or_else(|_| Err("the member history reader panicked".to_string()))
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -1933,6 +2139,50 @@ mod tests {
 
     fn codes(diagnosis: &StorageDiagnosis) -> Vec<&str> {
         diagnosis.findings.iter().map(|f| f.code.as_str()).collect()
+    }
+
+    /// A gateway-shaped directory keeps its mob in event_log.sqlite3: the
+    /// first-boot sweep reads Core's verdict for each pending row from that
+    /// store, here a released 0.9.3 gateway's, whose last bindings name the
+    /// rows' sessions.
+    #[test]
+    fn first_boot_rows_read_the_gateway_mob_store() {
+        use crate::identity_first::{AgentIdentity, FirstBootManifest, FirstBootRow};
+        let dir = tempfile::tempdir().unwrap();
+        let archive = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/meta_093_gateway_states/s1-roster.tar.gz");
+        tar::Archive::new(flate2::read::GzDecoder::new(
+            std::fs::File::open(archive).unwrap(),
+        ))
+        .unpack(dir.path())
+        .unwrap();
+        assert!(dir.path().join("event_log.sqlite3").is_file());
+        let row = |identity: &str, session: &str| FirstBootRow::Resume {
+            identity: AgentIdentity::parse(identity).unwrap(),
+            session: meerkat_core::types::SessionId::parse(session).unwrap(),
+        };
+        FirstBootManifest::write_new(
+            dir.path(),
+            vec![
+                row("agent:k1-alpha", "01a15366-b8d9-7213-970f-da32f39f4b42"),
+                row("agent:k1-beta", "01a15366-b8dc-7880-a832-447425bcc038"),
+            ],
+        )
+        .unwrap();
+
+        let diagnosis = diagnose_state_dir_blocking(&scope(&[dir.path()]), None);
+        let rows: Vec<&StorageFinding> = diagnosis
+            .findings
+            .iter()
+            .filter(|finding| finding.code == FINDING_FIRST_BOOT_ROW_PENDING)
+            .collect();
+        assert_eq!(rows.len(), 2, "{:#?}", diagnosis.findings);
+        for finding in rows {
+            assert!(
+                finding.message.contains("carried out"),
+                "Core's verdict from event_log.sqlite3: {finding:#?}"
+            );
+        }
     }
 
     fn create_db_with_table(path: &Path, ddl: &str) {
@@ -2300,6 +2550,12 @@ mod tests {
             "CREATE TABLE admission_lock (id INTEGER PRIMARY KEY)",
         );
         std::fs::write(state.join("sessions.db.mfence"), b"").unwrap();
+        std::fs::write(state.join("sessions.db.mpresence"), b"").unwrap();
+        std::fs::write(
+            state.join(crate::storage_layout::STATE_DIR_LOCK_FILE_NAME),
+            b"",
+        )
+        .unwrap();
         std::fs::write(state.join("sessions.db.pre-0.0.1-1700000000"), b"backup").unwrap();
         std::fs::write(state.join("continuity.db.corrupt-123"), b"x").unwrap();
         // Lookalikes outside the registered full shape are never reported
@@ -2315,6 +2571,7 @@ mod tests {
         for expected in [
             FINDING_WORKGRAPH_ADMISSION_SIDECAR,
             FINDING_MAINTENANCE_FENCE_LOCK,
+            FINDING_STATE_DIR_LOCK,
             FINDING_BACKUP_ARTIFACT,
             FINDING_QUARANTINE_ARTIFACT,
             FINDING_LEGACY_FS_BLOBS,
@@ -2326,6 +2583,18 @@ mod tests {
         let count_of = |code: &str| found.iter().filter(|found| **found == code).count();
         assert_eq!(count_of(FINDING_BACKUP_ARTIFACT), 1, "{found:?}");
         assert_eq!(count_of(FINDING_QUARANTINE_ARTIFACT), 1, "{found:?}");
+        // A fence lock's presence-lock sibling is inventoried as well.
+        assert!(
+            diagnosis.findings.iter().any(|finding| {
+                finding.code == FINDING_MAINTENANCE_FENCE_LOCK
+                    && finding.message.starts_with("presence lock file")
+                    && finding
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| path.ends_with("sessions.db.mpresence"))
+            }),
+            "{diagnosis:?}"
+        );
         assert!(!diagnosis.has_errors(), "{diagnosis:?}");
     }
 
@@ -2964,5 +3233,114 @@ mod tests {
                 .iter()
                 .any(|(domain, version)| domain == "jobs" && version.is_some())
         );
+    }
+
+    #[tokio::test]
+    async fn first_boot_manifest_rows_are_listed_with_core_verdict() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        let identity = crate::identity_first::AgentIdentity::parse("agent-a").unwrap();
+        let session =
+            meerkat_core::types::SessionId::parse("0192f0a0-0000-7000-8000-000000000001").unwrap();
+        crate::identity_first::FirstBootManifest::write_new(
+            state,
+            vec![crate::identity_first::FirstBootRow::Resume {
+                identity,
+                session: session.clone(),
+            }],
+        )
+        .unwrap();
+
+        let diagnosis = diagnose_state_dir(&scope(&[state])).await;
+
+        let rows: Vec<_> = diagnosis
+            .findings
+            .iter()
+            .filter(|finding| finding.code == FINDING_FIRST_BOOT_ROW_PENDING)
+            .collect();
+        assert_eq!(rows.len(), 1, "{:?}", diagnosis.findings);
+        let row = rows[0];
+        assert!(
+            row.message.contains("resume row for identity agent-a"),
+            "{}",
+            row.message
+        );
+        assert!(
+            row.message.contains(&session.to_string()),
+            "{}",
+            row.message
+        );
+        // No mob store in the directory: Core's verdict cannot be read.
+        assert_eq!(row.severity, FindingSeverity::Warning, "{}", row.message);
+        assert!(row.message.contains("unavailable"), "{}", row.message);
+        assert!(!codes(&diagnosis).contains(&FINDING_FIRST_BOOT_MANIFEST_UNREADABLE));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_first_boot_manifest_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        let path = crate::identity_first::FirstBootManifest::path(state);
+        std::fs::write(&path, b"{\"format\":\"something else\"}").unwrap();
+
+        let diagnosis = diagnose_state_dir(&scope(&[state])).await;
+
+        let finding = diagnosis
+            .findings
+            .iter()
+            .find(|finding| finding.code == FINDING_FIRST_BOOT_MANIFEST_UNREADABLE)
+            .unwrap_or_else(|| panic!("no unreadable-manifest finding: {:?}", diagnosis.findings));
+        assert_eq!(finding.severity, FindingSeverity::Error);
+        assert_eq!(finding.path.as_deref(), Some(path.as_path()));
+        assert!(!codes(&diagnosis).contains(&FINDING_FIRST_BOOT_ROW_PENDING));
+    }
+
+    #[tokio::test]
+    async fn a_state_dir_without_a_first_boot_manifest_reports_none() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let diagnosis = diagnose_state_dir(&scope(&[temp.path()])).await;
+
+        let codes = codes(&diagnosis);
+        assert!(!codes.contains(&FINDING_FIRST_BOOT_MANIFEST_UNREADABLE));
+        assert!(!codes.contains(&FINDING_FIRST_BOOT_ROW_PENDING));
+    }
+
+    /// The doctor lists each principal the Console accepted a token without
+    /// `exp` for, by the principal and its flag only, reading the Console's
+    /// session fence record without creating it.
+    #[test]
+    fn doctor_lists_console_principals_whose_tokens_never_expire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = tmp
+            .path()
+            .join(crate::auth::session_fence::CONSOLE_SESSION_FENCES_FILE);
+        let empty = diagnose_state_dir_blocking(&scope(&[tmp.path()]), None);
+        assert!(!codes(&empty).contains(&FINDING_CONSOLE_NON_EXPIRING_PRINCIPAL));
+        assert!(!record.exists(), "the doctor creates no record");
+
+        let fences =
+            crate::auth::session_fence::ConsoleSessionFences::open_in_state_dir(tmp.path())
+                .unwrap();
+        fences.note_non_expiring("svc:reporter");
+        fences.note_non_expiring("carol@example.test");
+        let diagnosis = diagnose_state_dir_blocking(&scope(&[tmp.path()]), None);
+        let listed: Vec<&StorageFinding> = diagnosis
+            .findings
+            .iter()
+            .filter(|finding| finding.code == FINDING_CONSOLE_NON_EXPIRING_PRINCIPAL)
+            .collect();
+        assert_eq!(listed.len(), 2, "{:#?}", diagnosis.findings);
+        assert!(listed[0].message.contains("carol@example.test"));
+        assert!(listed[1].message.contains("svc:reporter"));
+        assert!(
+            listed
+                .iter()
+                .all(|finding| finding.message.contains("non-expiring"))
+        );
+
+        std::fs::write(&record, "not a record").unwrap();
+        let unreadable = diagnose_state_dir_blocking(&scope(&[tmp.path()]), None);
+        assert!(codes(&unreadable).contains(&FINDING_CONSOLE_SESSION_RECORD_UNREADABLE));
     }
 }

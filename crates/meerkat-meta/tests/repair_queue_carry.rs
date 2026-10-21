@@ -31,8 +31,7 @@ use meerkat_client::{LlmClient, LlmError, LlmEvent, LlmRequest};
 use meerkat_meta::identity_first::{
     AgentAddressability, AgentBuildDraft, AgentRuntimeServices, BridgeError, DurabilityPolicy,
     DurableAgentSpec, IdentityRuntime, IdentityRuntimeConfig, LocalContinuityStore,
-    LocalLeaseProvider, MobSessionBridge, RestoreOutcome, SessionBridge, SessionSnapshot,
-    restore_flow,
+    LocalLeaseProvider, MobSessionBridge, RestoreOutcome, SessionBridge, restore_flow,
 };
 use meerkat_meta::{
     DiscoverySpec, MetaConfig, MobBootstrapOptions, MobBootstrapSpec, UnifiedRuntime,
@@ -287,8 +286,8 @@ comms = true
     let result = restore_flow(&irt, std::slice::from_ref(&spec), None, None)
         .await
         .expect("restore_flow");
-    let record = match result.outcomes.get(&identity) {
-        Some(RestoreOutcome::Created { record, .. }) => record.clone(),
+    let binding = match result.outcomes.get(&identity) {
+        Some(RestoreOutcome::Created { binding, .. }) => binding.clone(),
         other => panic!("worker must fresh-create, got {other:?}"),
     };
 
@@ -300,8 +299,10 @@ comms = true
         bridge,
         identity,
         spec,
-        runtime_id: record.agent_runtime_id,
-        session_id: record.session_id,
+        runtime_id: binding.agent_runtime_id,
+        session_id: binding
+            .session_id
+            .expect("Core binds a fresh member to a session"),
         prompts,
     }
 }
@@ -431,11 +432,10 @@ async fn repair_carries_queued_inputs_to_the_healed_successor() {
         .bridge
         .resume_session(
             &harness.identity,
-            &harness.runtime_id,
             &harness.spec,
             &empty_draft(&harness.spec),
             &harness.session_id,
-            &SessionSnapshot { data: Vec::new() },
+            None,
         )
         .await
         .expect("collision repair resumes");
@@ -515,29 +515,6 @@ async fn repair_carries_queued_inputs_to_the_healed_successor() {
     // FlowStep is moved into the carry arm.
 }
 
-// STILL UNCOVERED: genuinely-indeterminate custody. Two obstacles found, in
-// order, and the second is the one that stops it.
-//
-// 1. Adoption could not resolve a system prompt at all: it needs inline skills
-//    or an explicit prompt override, and failing both a SpawnBasePromptSource,
-//    which Meta wires nowhere. Solved by giving the profile a minimal inline
-//    skill - and note this is not test-only trivia: a downstream app confirmed 9 of
-//    their 17 production members declare neither.
-//
-// 2. The resume target cannot be a fresh SessionId. Resuming a never-persisted
-//    session races the fresh-spawn fallback against the collision arm, so the
-//    call returns FreshSpawned { NeverPersisted } instead of reaching custody -
-//    intermittently, which is why a first attempt at this test was flaky rather
-//    than simply wrong. Reaching custody deterministically needs a resume target
-//    that IS persisted but bound to a different member, which this harness does
-//    not produce today.
-//
-// So the Present-A/resume-B fixture is valid in principle - a Present intent
-// naming a different session than the one being resumed does map to
-// Indeterminate (bridge.rs:2664) - but not reachable deterministically here. A
-// Valid Absent seam would NOT help: the custody map classifies Valid Absent as
-// IdentityFirstOwns. Left uncovered and reported rather than shipped flaky.
-
 /// Preconditions-first (task #48 (a)): when the session the resume retry
 /// would need is CONFIRMED absent from the composition's authoritative read
 /// view (a continuity record pointing at a vanished session — the external-
@@ -546,8 +523,7 @@ async fn repair_carries_queued_inputs_to_the_healed_successor() {
 /// its state, queue included) survives untouched.
 ///
 /// Renamed: this pins the SOURCE-AVAILABILITY refusal, which owns the case
-/// where custody is proven ours. Genuinely indeterminate custody is its
-/// sibling above, and used to carry this name.
+/// where custody is proven ours.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repair_refuses_disposal_when_the_resume_source_is_absent() {
     // Gate closed: the member's queued work must stay pending through the
@@ -580,27 +556,19 @@ async fn repair_refuses_disposal_when_the_resume_source_is_absent() {
         .bridge
         .resume_session(
             &harness.identity,
-            &harness.runtime_id,
             &harness.spec,
             &empty_draft(&harness.spec),
             &vanished_session,
-            &SessionSnapshot { data: Vec::new() },
+            None,
         )
         .await
         .expect_err("repair must refuse disposal without a resume source");
     match &error {
         BridgeError::ResumeRejected { detail, .. } => {
-            // This fixture writes no identity intent, so custody is
-            // INDETERMINATE and the refusal lands at the custody gate, before
-            // the resume-source precondition is ever consulted. That ordering
-            // is deliberate: an intent that cannot be read is not permission to
-            // destroy an occupant, so the gate has to refuse first.
-            //
-            // The precondition itself is only reachable with a Valid Absent
-            // intent (the one state that grants identity-first the destructive
-            // path), and this harness has no public way to seed one: the
-            // MobIdentityStore trait's only intent writer is
-            // adopt_member_identity_declaration, which writes Present.
+            // This fixture writes no identity intent row, so the legacy path
+            // runs: the occupant is ours and bound to another session, and
+            // the resume-source precondition refuses before any destructive
+            // step.
             // BOTH halves: which precondition failed, and what destroying the
             // occupant would cost. Either alone leaves the refusal unactionable.
             assert!(

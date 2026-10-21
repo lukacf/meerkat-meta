@@ -226,6 +226,7 @@ comms = true
             .lease_provider(Arc::new(LocalLeaseProvider::new()))
             .roster_provider(roster)
             .scratch_dir(scratch.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("native-events-test")
             .default_llm_client(Arc::new(NativeToolClient))
             .build()
@@ -388,7 +389,9 @@ async fn identity_first_reset_closes_old_http_streams_and_rejects_stale_alias() 
         .reset(&fixture.identity)
         .await
         .unwrap();
-    assert_ne!(successor.agent_runtime_id.as_str(), fixture.alias);
+    let successor_runtime_id = meerkat_meta::identity_first::live_binding_runtime_id(&successor)
+        .expect("Core holds the reset successor live");
+    assert_ne!(successor_runtime_id.as_str(), fixture.alias);
     for response in [logical, alias] {
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -402,7 +405,7 @@ async fn identity_first_reset_closes_old_http_streams_and_rejects_stale_alias() 
         !fixture.response(&fixture.alias).await.status().is_success(),
         "the old runtime alias must be rejected, not retargeted onto the successor"
     );
-    let current = fixture.response(successor.agent_runtime_id.as_str()).await;
+    let current = fixture.response(successor_runtime_id.as_str()).await;
     assert_eq!(current.status(), StatusCode::OK);
     fixture.run_native_tool_turn().await;
     assert_native_tool_and_text(current).await;

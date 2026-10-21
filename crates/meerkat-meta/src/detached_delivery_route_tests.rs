@@ -86,14 +86,12 @@ async fn gateway_persistent_composition_delivers_detached() {
     let temp = tempfile::tempdir().expect("temp dir");
     let state = temp.path().join("state");
     std::fs::create_dir_all(&state).expect("state dir");
-    let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
-        meerkat_store::SqliteSessionStore::open(state.join("session-store.sqlite3"))
-            .expect("session store"),
-    );
-    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
-        meerkat_runtime::store::SqliteRuntimeStore::new(state.join("runtime-store.sqlite3"))
-            .expect("runtime store"),
-    );
+    // Both gateways open Core's native pair on runtime.sqlite.
+    let (session_store, runtime_store) = crate::mob_handle_runtime::open_native_session_pair(
+        &state,
+        &crate::storage_provider::default_meerkat_level_realm(),
+    )
+    .expect("native session pair");
     let blob_store: Arc<dyn meerkat_core::BlobStore> =
         Arc::new(meerkat_store::MemoryBlobStore::new());
     let factory = meerkat::AgentFactory::new(&state).comms(true);
@@ -187,17 +185,14 @@ async fn gateway_ephemeral_session_composition_delivers_detached() {
 #[tokio::test]
 async fn library_persistent_constructor_delivers_detached() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
-        meerkat_store::SqliteSessionStore::open(temp.path().join("session-store.sqlite3"))
-            .expect("session store"),
-    );
     let spec = MobBootstrapSpec::persistent(
         definition("route-library-persistent"),
         meerkat_mob::MobStorage::in_memory(),
+        crate::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
         temp.path().join("state"),
         16,
-        session_store,
     )
+    .await
     .expect("persistent spec");
     assert_detached_route_on_runtime_machine(&spec, "library persistent constructor");
 }
@@ -212,8 +207,6 @@ async fn library_runtime_backed_ephemeral_constructor_delivers_detached() {
         meerkat_mob::MobStorage::in_memory(),
         temp.path().to_path_buf(),
         16,
-        None,
-        "test session store",
         None,
         None,
         None,
@@ -611,7 +604,7 @@ mod completion_delivery {
                 meerkat_runtime::mob_operator_authority::grant_manage_mob(
                     &authority,
                     handle.mob_id().as_str(),
-                    handle.incarnation(),
+                    handle.live_incarnation(),
                 )
                 .expect("council may use the source mob")
             } else {
@@ -622,7 +615,7 @@ mod completion_delivery {
                 meerkat_runtime::mob_operator_authority::grant_spawn_profile_in_mob(
                     &authority,
                     handle.mob_id().as_str(),
-                    handle.incarnation(),
+                    handle.live_incarnation(),
                     "general",
                 )
                 .expect("fork may spawn only its source profile")
@@ -658,8 +651,13 @@ mod completion_delivery {
                 .expect("seated completion owner")
                 .generation
                 .get();
-            meerkat::member_delivery_address(handle.mob_id().as_str(), member, generation)
-                .expect("native member address")
+            meerkat::member_delivery_address(
+                handle.mob_id().as_str(),
+                handle.incarnation(),
+                member,
+                generation,
+            )
+            .expect("native member address")
         }
 
         async fn wait_for_council_participant(
@@ -867,8 +865,13 @@ mod completion_delivery {
         async fn pass_after_a_stranded_row(&self) -> meerkat::RuntimeDeliveryPass {
             let published = self.delivery.last_pass().map_or(0, |pass| pass.generation);
             let mob_id = format!("foreign-{}", uuid::Uuid::new_v4().simple());
-            let address = meerkat::member_delivery_address(&mob_id, "absent", 1)
-                .expect("foreign member address");
+            let address = meerkat::member_delivery_address(
+                &mob_id,
+                meerkat_core::service::MobIncarnationId::mint(),
+                "absent",
+                1,
+            )
+            .expect("foreign member address");
             let owner = meerkat::ContinuationOwner::Member {
                 mob_id: mob_id.clone(),
                 identity: "absent".to_string(),

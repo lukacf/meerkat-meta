@@ -17,6 +17,9 @@
 //!
 //! Test naming convention: `identity_first_completion_<scenario>`.
 
+#[path = "support/core_members.rs"]
+mod core_members;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,14 +27,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use meerkat_core::types::HandlingMode;
 use meerkat_meta::identity_first::contracts::{ContinuityStore, LeaseProvider};
-use meerkat_meta::identity_first::orchestrator::restore_flow;
 use meerkat_meta::identity_first::{
     AgentAddressability, AgentBuildDraft, AgentIdentity, AgentRuntimeId, BridgeDelivery,
-    BridgeError, CheckpointVersion, CompletionCursor, CompletionProgress, ContinuityGeneration,
-    ContinuityRecord, DispatchInput, DispatchOrigin, DurabilityPolicy, DurableAgentSpec,
-    FencingToken, IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig,
-    IdentityRuntimeError, LeaseGrant, MemberInspection, ResumeSessionOutcome, SessionBridge,
-    SessionSnapshot,
+    BridgeError, CompletionCursor, CompletionProgress, DispatchInput, DispatchOrigin,
+    DurabilityPolicy, DurableAgentSpec, FencingToken, IdentityRuntime, IdentityRuntimeConfig,
+    IdentityRuntimeError, MemberInspection, ResumeSessionOutcome, SessionBridge, SessionSnapshot,
 };
 use meerkat_meta::identity_first::{LocalContinuityStore, LocalLeaseProvider};
 
@@ -60,24 +60,6 @@ fn make_spec(name: &str) -> DurableAgentSpec {
     }
 }
 
-fn make_record(name: &str) -> ContinuityRecord {
-    ContinuityRecord {
-        identity: make_identity(name),
-        agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{name}")).unwrap(),
-        session_id: meerkat_core::types::SessionId::new(),
-        generation: ContinuityGeneration::new(0),
-        checkpoint_version: CheckpointVersion::new(0),
-    }
-}
-
-fn make_grant(name: &str, token: u64) -> LeaseGrant {
-    LeaseGrant {
-        identity: make_identity(name),
-        fencing_token: FencingToken::new(token),
-        ttl: Duration::from_mins(5),
-    }
-}
-
 fn make_content() -> meerkat_core::ContentInput {
     meerkat_core::ContentInput::Text("ping".to_string())
 }
@@ -97,6 +79,9 @@ fn make_dispatch_input() -> DispatchInput {
 #[derive(Default)]
 struct ScriptedPreviewBridge {
     preview: tokio::sync::Mutex<Option<String>>,
+    /// The members Core holds, as the tests bind them and this double's
+    /// creates, resumes, successors and retires leave them.
+    core: core_members::CoreMembers,
 }
 
 impl ScriptedPreviewBridge {
@@ -109,27 +94,106 @@ impl ScriptedPreviewBridge {
 impl SessionBridge for ScriptedPreviewBridge {
     async fn create_session(
         &self,
-        _identity: &AgentIdentity,
-        _runtime_id: &AgentRuntimeId,
-        _spec: &DurableAgentSpec,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
-        session_id: &meerkat_core::types::SessionId,
-    ) -> Result<meerkat_core::types::SessionId, BridgeError> {
-        Ok(session_id.clone())
+    ) -> Result<meerkat_meta::identity_first::MemberRuntimeBinding, BridgeError> {
+        let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+            .map_err(|error| BridgeError::Mob(error.to_string()))?;
+        let session_id = &meerkat_core::types::SessionId::new();
+        let binding = meerkat_meta::identity_first::MemberRuntimeBinding {
+            agent_runtime_id,
+            session_id: Some(session_id.clone()),
+        };
+        self.core.bind(identity, &binding, &spec.profile);
+        Ok(binding)
     }
 
     async fn resume_session(
         &self,
-        _identity: &AgentIdentity,
-        _runtime_id: &AgentRuntimeId,
-        _spec: &DurableAgentSpec,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
         _draft: &AgentBuildDraft,
         session_id: &meerkat_core::types::SessionId,
-        _snapshot: &SessionSnapshot,
+        _resume_from_role: Option<&meerkat_mob::ProfileName>,
     ) -> Result<ResumeSessionOutcome, BridgeError> {
+        let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:0"))
+            .map_err(|error| BridgeError::Mob(error.to_string()))?;
+        self.core.bind(
+            identity,
+            &meerkat_meta::identity_first::MemberRuntimeBinding {
+                agent_runtime_id: agent_runtime_id.clone(),
+                session_id: Some(session_id.clone()),
+            },
+            &spec.profile,
+        );
         Ok(ResumeSessionOutcome::Resumed {
             session_id: session_id.clone(),
+            agent_runtime_id,
         })
+    }
+
+    /// One Core transition: the successor is a fresh session one generation
+    /// up, and Core's fence for the member advances with it.
+    async fn reset_member_to_successor(
+        &self,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
+        _draft: &AgentBuildDraft,
+    ) -> Result<meerkat_meta::identity_first::MemberRuntimeBinding, BridgeError> {
+        let generation = self
+            .core
+            .last_member_binding(identity)?
+            .map_or(0, |binding| binding.generation().get() + 1);
+        let agent_runtime_id = AgentRuntimeId::parse(&format!("rt:{identity}:{generation}"))
+            .map_err(|error| BridgeError::Mob(error.to_string()))?;
+        let binding = meerkat_meta::identity_first::MemberRuntimeBinding {
+            agent_runtime_id,
+            session_id: Some(meerkat_core::types::SessionId::new()),
+        };
+        self.core.bind(identity, &binding, &spec.profile);
+        Ok(binding)
+    }
+
+    async fn live_member(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_meta::identity_first::MemberRuntimeBinding>, BridgeError> {
+        self.core.live_member(identity)
+    }
+
+    async fn live_member_scope(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+        self.core.live_member_scope(identity)
+    }
+
+    async fn ensure_member_live(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_meta::identity_first::MemberRuntimeBinding>, BridgeError> {
+        self.core.live_member(identity)
+    }
+
+    async fn member_binding_history(
+        &self,
+    ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+        self.core.history()
+    }
+
+    async fn last_member_binding(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+        self.core.last_member_binding(identity)
+    }
+
+    async fn identity_management(
+        &self,
+        _identity: &AgentIdentity,
+    ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+        Ok(meerkat_mob::MemberIdentityManagement::CommandDriven)
     }
 
     async fn deliver_admitted(
@@ -149,7 +213,8 @@ impl SessionBridge for ScriptedPreviewBridge {
         Ok(SessionSnapshot { data: Vec::new() })
     }
 
-    async fn retire_member(&self, _runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+    async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+        self.core.retire(runtime_id);
         Ok(())
     }
 
@@ -180,16 +245,24 @@ fn make_runtime(bridge: Arc<dyn SessionBridge>) -> Arc<IdentityRuntime> {
     }))
 }
 
-async fn register_active(runtime: &IdentityRuntime, name: &str, token: u64) -> AgentIdentity {
-    runtime
-        .register(
-            make_spec(name),
-            IdentityLifecycleState::Active,
-            Some(make_record(name)),
-            Some(make_grant(name, token)),
-        )
-        .await;
-    make_identity(name)
+/// Register `name` with Core holding its member live at generation 0 under
+/// fence `token`: the completion cursor's epoch is Core's fence.
+async fn register_active(
+    runtime: &IdentityRuntime,
+    bridge: &ScriptedPreviewBridge,
+    name: &str,
+    token: u64,
+) -> AgentIdentity {
+    let identity = make_identity(name);
+    bridge.core.bind_live_at_fence(
+        &identity,
+        &meerkat_mob::ProfileName::from("default"),
+        0,
+        Some(meerkat_core::types::SessionId::new()),
+        token,
+    );
+    runtime.register(make_spec(name)).await;
+    identity
 }
 
 /// The OLD completion detector, reproduced exactly: capture the previous
@@ -231,7 +304,7 @@ async fn old_text_baseline_detector(
 async fn identity_first_completion_old_text_baseline_misses_identical_turn() {
     let bridge = Arc::new(ScriptedPreviewBridge::default());
     let runtime = make_runtime(bridge.clone());
-    let identity = register_active(&runtime, "triage:main", 7).await;
+    let identity = register_active(&runtime, &bridge, "triage:main", 7).await;
 
     // Turn 1 answers `ACK`; the consumer captures that as its baseline.
     bridge.set_preview("ACK").await;
@@ -275,7 +348,7 @@ async fn identity_first_completion_old_text_baseline_misses_identical_turn() {
 async fn identity_first_completion_two_identical_ack_turns_are_two_completions() {
     let bridge = Arc::new(ScriptedPreviewBridge::default());
     let runtime = make_runtime(bridge.clone());
-    let identity = register_active(&runtime, "triage:main", 7).await;
+    let identity = register_active(&runtime, &bridge, "triage:main", 7).await;
 
     // Turn 1.
     let first = runtime
@@ -345,7 +418,7 @@ async fn identity_first_completion_two_identical_ack_turns_are_two_completions()
 async fn identity_first_completion_wait_returns_for_identical_second_turn() {
     let bridge = Arc::new(ScriptedPreviewBridge::default());
     let runtime = make_runtime(bridge.clone());
-    let identity = register_active(&runtime, "triage:main", 3).await;
+    let identity = register_active(&runtime, &bridge, "triage:main", 3).await;
 
     bridge.set_preview("ACK").await;
     let first = runtime
@@ -391,7 +464,7 @@ async fn identity_first_completion_wait_returns_for_identical_second_turn() {
 async fn identity_first_completion_cursor_increases_strictly_across_turns() {
     let bridge = Arc::new(ScriptedPreviewBridge::default());
     let runtime = make_runtime(bridge.clone());
-    let identity = register_active(&runtime, "triage:main", 11).await;
+    let identity = register_active(&runtime, &bridge, "triage:main", 11).await;
 
     // Every turn answers the same thing, so nothing here is distinguishable
     // by content.
@@ -417,8 +490,8 @@ async fn identity_first_completion_cursor_increases_strictly_across_turns() {
 async fn identity_first_completion_other_identity_completion_does_not_satisfy_wait() {
     let bridge = Arc::new(ScriptedPreviewBridge::default());
     let runtime = make_runtime(bridge.clone());
-    let waiting = register_active(&runtime, "triage:main", 4).await;
-    let other = register_active(&runtime, "worker:alpha", 5).await;
+    let waiting = register_active(&runtime, &bridge, "triage:main", 4).await;
+    let other = register_active(&runtime, &bridge, "worker:alpha", 5).await;
 
     let admission = runtime
         .send_admission_tracked(&waiting, None, &make_content(), HandlingMode::Queue, None)
@@ -460,7 +533,7 @@ async fn identity_first_completion_other_identity_completion_does_not_satisfy_wa
 async fn identity_first_completion_stalled_turn_times_out() {
     let bridge = Arc::new(ScriptedPreviewBridge::default());
     let runtime = make_runtime(bridge.clone());
-    let identity = register_active(&runtime, "triage:main", 2).await;
+    let identity = register_active(&runtime, &bridge, "triage:main", 2).await;
 
     // Stale output from a previous turn is present the whole time — exactly
     // the state in which a "wait for any output" probe returns instantly.
@@ -489,7 +562,7 @@ async fn identity_first_completion_stalled_turn_times_out() {
 async fn identity_first_completion_dispatch_admission_carries_baseline() {
     let bridge = Arc::new(ScriptedPreviewBridge::default());
     let runtime = make_runtime(bridge.clone());
-    let identity = register_active(&runtime, "internal:main", 6).await;
+    let identity = register_active(&runtime, &bridge, "internal:main", 6).await;
 
     let first = runtime
         .dispatch_admission_tracked(&identity, None, &make_dispatch_input())
@@ -533,7 +606,7 @@ async fn identity_first_completion_dispatch_admission_carries_baseline() {
 async fn identity_first_completion_cursor_never_regresses_across_incarnations() {
     let bridge = Arc::new(ScriptedPreviewBridge::default());
     let runtime = make_runtime(bridge.clone());
-    let identity = register_active(&runtime, "triage:main", 4).await;
+    let identity = register_active(&runtime, &bridge, "triage:main", 4).await;
 
     for _ in 0..3 {
         runtime.record_turn_completed(&identity).await;
@@ -541,17 +614,15 @@ async fn identity_first_completion_cursor_never_regresses_across_incarnations() 
     let before = runtime.completion_cursor(&identity).await;
     assert_eq!(before, CompletionCursor::new(FencingToken::new(4), 3));
 
-    // A new incarnation: the lease provider issues a strictly higher token
-    // (after a restart it resumes above the store's persisted high-water
-    // mark, which is what makes this ordering hold across processes).
-    runtime
-        .register(
-            make_spec("triage:main"),
-            IdentityLifecycleState::Active,
-            Some(make_record("triage:main")),
-            Some(make_grant("triage:main", 9)),
-        )
-        .await;
+    // A new incarnation: Core binds a successor under a strictly higher
+    // fence.
+    bridge.core.bind_live_at_fence(
+        &identity,
+        &meerkat_mob::ProfileName::from("default"),
+        1,
+        Some(meerkat_core::types::SessionId::new()),
+        9,
+    );
 
     let after = runtime.completion_cursor(&identity).await;
     assert_eq!(after, CompletionCursor::new(FencingToken::new(9), 0));
@@ -578,101 +649,18 @@ async fn identity_first_completion_cursor_never_regresses_across_incarnations() 
     );
 }
 
-/// Restart guarantee, end to end through the real durable path: a cold
-/// runtime over the SAME continuity file publishes a cursor strictly above
-/// everything the previous process published.
-///
-/// This is the durable half of the monotonicity claim. It holds because the
-/// bundled lease provider resumes its counter strictly above the store's
-/// persisted fencing high-water mark, so the new incarnation's epoch outranks
-/// the old one no matter how many turns the old one counted. The turn COUNT
-/// itself is not durable — it restarts at 0 under the higher epoch, which is
-/// why a pre-restart baseline reports `IncarnationChanged` rather than a
-/// completion.
-#[tokio::test]
-async fn identity_first_completion_cursor_survives_a_cold_restart() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("continuity.sqlite3");
-
-    let (before, floor_after_first_process) = {
-        let store = Arc::new(LocalContinuityStore::open(&db).unwrap());
-        let floor = store.max_fencing_token().unwrap();
-        let lease = Arc::new(LocalLeaseProvider::with_floor(floor));
-        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-            continuity_store: store.clone(),
-            lease_provider: lease,
-            runtime_instance_id: "process-1".to_string(),
-            has_runtime_store: false,
-            durability_policy: DurabilityPolicy::SyncWriteThrough,
-            bridge: None,
-            default_timeout: None,
-        }));
-        let roster = vec![make_spec("triage:main")];
-        restore_flow(&runtime, &roster, None, None).await.unwrap();
-
-        let identity = make_identity("triage:main");
-        for _ in 0..3 {
-            runtime.record_turn_completed(&identity).await;
-        }
-        let before = runtime.completion_cursor(&identity).await;
-        assert_eq!(before.turns, 3);
-        // The lease token this process used reached disk, so it becomes the
-        // next process's floor.
-        (before, store.max_fencing_token().unwrap())
-    };
-    assert_eq!(
-        floor_after_first_process,
-        before.epoch.get(),
-        "the epoch the cursor published must be the one persisted"
-    );
-
-    // Cold restart: a brand new runtime and lease provider over the same file.
-    // Nothing in-memory carries over — the ledger map starts empty.
-    let store = Arc::new(LocalContinuityStore::open(&db).unwrap());
-    let floor = store.max_fencing_token().unwrap();
-    let lease = Arc::new(LocalLeaseProvider::with_floor(floor));
-    let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
-        continuity_store: store,
-        lease_provider: lease,
-        runtime_instance_id: "process-2".to_string(),
-        has_runtime_store: false,
-        durability_policy: DurabilityPolicy::SyncWriteThrough,
-        bridge: None,
-        default_timeout: None,
-    }));
-    let roster = vec![make_spec("triage:main")];
-    restore_flow(&runtime, &roster, None, None).await.unwrap();
-
-    let identity = make_identity("triage:main");
-    let after = runtime.completion_cursor(&identity).await;
-    assert_eq!(after.turns, 0, "the turn count is per-incarnation");
-    assert!(
-        after.epoch > before.epoch,
-        "the restarted lease must resume above the persisted high-water mark: \
-         {after} is not above {before}"
-    );
-    assert!(
-        after > before,
-        "the cursor must not regress across a restart: {after} is not above {before}"
-    );
-    assert_eq!(
-        after.progress_since(before),
-        CompletionProgress::IncarnationChanged,
-        "a pre-restart baseline is reported as unusable, not silently satisfied"
-    );
-}
-
 /// The retention guard: a cursor value is never re-published.
 ///
-/// The ledger is deliberately NOT pruned when an identity goes away, so an
-/// identity that is deleted and re-created cannot hand a second caller a
-/// cursor a first caller already saw. This is the runtime-level counterpart
-/// to `..._stale_epoch_cannot_rewind_cursor`, which covers the pure value.
+/// Delete starts the identity's fresh life on Core: a successor one
+/// generation up under a higher fence. The ledger is deliberately NOT pruned
+/// across it, so the identity cannot hand a second caller a cursor a first
+/// caller already saw. This is the runtime-level counterpart to
+/// `..._stale_epoch_cannot_rewind_cursor`, which covers the pure value.
 #[tokio::test]
 async fn identity_first_completion_cursor_is_never_republished_after_delete() {
     let bridge = Arc::new(ScriptedPreviewBridge::default());
     let runtime = make_runtime(bridge.clone());
-    let identity = register_active(&runtime, "triage:main", 5).await;
+    let identity = register_active(&runtime, &bridge, "triage:main", 5).await;
 
     let mut published = Vec::new();
     for _ in 0..3 {
@@ -680,25 +668,18 @@ async fn identity_first_completion_cursor_is_never_republished_after_delete() {
         published.push(runtime.completion_cursor(&identity).await);
     }
 
-    // The identity goes away entirely.
+    // The identity's life ends: delete starts a fresh one on Core.
     runtime.delete_identity(&identity).await.unwrap();
     let after_delete = runtime.completion_cursor(&identity).await;
-    assert_eq!(
-        after_delete,
-        *published.last().unwrap(),
-        "a deleted identity reports its last published cursor, not a reset one \
-         — the ledger entry is retained precisely so this read cannot rewind"
+    assert!(
+        after_delete > *published.last().unwrap(),
+        "the fresh life's cursor must sort above everything the old life \
+         published: {after_delete} is not above {}",
+        published.last().unwrap()
     );
+    assert_eq!(after_delete.turns, 0, "the turn count is per-incarnation");
+    published.push(after_delete);
 
-    // ...and comes back on a fresh lease incarnation.
-    runtime
-        .register(
-            make_spec("triage:main"),
-            IdentityLifecycleState::Active,
-            Some(make_record("triage:main")),
-            Some(make_grant("triage:main", 12)),
-        )
-        .await;
     for _ in 0..3 {
         runtime.record_turn_completed(&identity).await;
         published.push(runtime.completion_cursor(&identity).await);

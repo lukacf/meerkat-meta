@@ -16,6 +16,7 @@ test("normalizeAgents preserves identity-status summary fields without invention
               state: " running ",
               addressability: "addressable",
               generation: 4,
+            // A 0.9.3 gateway still sends these; 0.9.4 has no such fields.
             checkpoint_version: 8,
             lease_healthy: true,
             progress: {
@@ -44,8 +45,7 @@ test("normalizeAgents preserves identity-status summary fields without invention
   assert.equal(agent?.state, "running");
   assert.equal(agent?.addressability, "addressable");
   assert.equal(agent?.generation, 4);
-  assert.equal(agent?.checkpoint_version, 8);
-  assert.equal(agent?.lease_healthy, true);
+  assert.ok(agent && !("checkpoint_version" in agent) && !("lease_healthy" in agent));
   assert.equal(agent?.progress?.health, "wedged");
   assert.equal(agent?.progress?.run_state, "run_open");
   assert.deepEqual(agent?.labels, { team: "console" });
@@ -66,8 +66,9 @@ test("normalizeAgents falls back to identity_status rows when sidebar snapshot i
             addressability: "addressable",
             labels: { team: " console " },
             generation: 4,
-            checkpoint_version: 8,
-            lease_healthy: true,
+            // 0.9.4 first sends the removed fields as null.
+            checkpoint_version: null,
+            lease_healthy: null,
             model_capabilities: { image_input: true },
           },
         ],
@@ -86,8 +87,7 @@ test("normalizeAgents falls back to identity_status rows when sidebar snapshot i
   assert.equal(agent?.addressability, "addressable");
   assert.equal(agent?.addressable, false);
   assert.equal(agent?.generation, 4);
-  assert.equal(agent?.checkpoint_version, 8);
-  assert.equal(agent?.lease_healthy, true);
+  assert.ok(agent && !("checkpoint_version" in agent) && !("lease_healthy" in agent));
   assert.deepEqual(agent?.labels, { team: "console" });
   assert.deepEqual(agent?.model_capabilities, { image_input: true });
   assert.deepEqual(agent?.affordances, { can_send_message: false });
@@ -122,8 +122,6 @@ test("normalizeAgents enriches sidebar snapshot rows with identity_status when b
             addressability: "addressable",
             labels: { team: "finance" },
             generation: 2,
-            checkpoint_version: 3,
-            lease_healthy: true,
             model_capabilities: { image_input: true },
           },
         ],
@@ -139,8 +137,7 @@ test("normalizeAgents enriches sidebar snapshot rows with identity_status when b
   assert.equal(agent?.addressability, "addressable");
   assert.equal(agent?.addressable, true);
   assert.equal(agent?.generation, 2);
-  assert.equal(agent?.checkpoint_version, 3);
-  assert.equal(agent?.lease_healthy, true);
+  assert.ok(agent && !("checkpoint_version" in agent) && !("lease_healthy" in agent));
   assert.deepEqual(agent?.labels, { team: "finance" });
   assert.deepEqual(agent?.model_capabilities, { image_input: true });
 });

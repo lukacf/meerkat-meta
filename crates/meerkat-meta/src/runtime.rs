@@ -59,18 +59,25 @@ mod session_store;
 mod supervisor;
 
 pub use bootstrap::{start_meta_runtime, start_meta_runtime_with_options};
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`validate_console_token_under_session_fences`]).
+pub use console_ingress::handle_console_rest_json_route_with_snapshot_access_and_memory;
+#[cfg(test)]
+pub(crate) use console_ingress::resolve_authorized_console_caller_from_token_at;
 pub use console_ingress::{
     AuthenticatedConsoleHuman, CONSOLE_HUMAN_TRUST_DOMAIN_PREFIX, ConsoleAgentLiveSnapshot,
     ConsoleHumanNotCurrent, ConsoleLiveSnapshot, ConsoleMember, ConsoleModelCapabilities,
     ConsoleRestJsonRequest, ConsoleRestJsonResponse, extract_bearer_token_from_header,
     handle_console_rest_json_route, handle_console_rest_json_route_with_snapshot,
-    handle_console_rest_json_route_with_snapshot_access_and_memory,
     handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph,
     handle_console_rest_json_route_with_snapshot_and_access, validate_console_token,
+    validate_console_token_under_session_fences,
 };
 pub(crate) use console_ingress::{
-    ResolvedConsoleCaller, handle_console_rest_json_route_with_pending_rows,
-    resolve_authorized_console_auth_from_token, resolve_authorized_console_caller_from_token,
+    ConsoleCallerVerification, ResolvedConsoleCaller, console_member_access_attributes,
+    fold_console_member_attributes, handle_console_rest_json_route_with_pending_rows,
+    resolve_authorized_console_caller_from_token, session_fence_first_accepted_iat,
 };
 pub use event_transport::normalize_event_line;
 pub(crate) use gating::is_legacy_sequential_pending_id;
@@ -89,11 +96,11 @@ pub use rpc::{
     run_rpc_capabilities_boundary_once,
 };
 pub use session_store::{
-    BigQueryGcConfig, BigQuerySessionStoreAdapter, BigQuerySessionStoreError, GcErrorCallback,
-    JsonFileSessionStore, JsonFileSessionStoreError, JsonStoreLockRecord, SessionPersistenceRow,
-    SessionStoreContract, SessionStoreKind, materialize_latest_session_rows,
-    materialize_live_session_rows, run_periodic_gc, run_periodic_gc_with_error_callback,
-    session_store_contracts,
+    BigQueryAccessToken, BigQueryAccessTokenSource, BigQueryGcConfig, BigQuerySessionStoreAdapter,
+    BigQuerySessionStoreError, GcErrorCallback, JsonFileSessionStore, JsonFileSessionStoreError,
+    JsonStoreLockRecord, SessionPersistenceRow, SessionStoreContract, SessionStoreKind,
+    materialize_latest_session_rows, materialize_live_session_rows, run_periodic_gc,
+    run_periodic_gc_with_error_callback, session_store_contracts,
 };
 pub use supervisor::{run_discovered_module_once, run_module_boundary_once};
 

@@ -90,16 +90,18 @@ def test_exact_selected_pair_preserves_source_and_license_facts_without_import(p
         assert not hasattr(observed, "admitted") and not hasattr(observed, "gateway")
 
 
-@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1"])
-def test_selected_meta_version_is_bound_to_exact_toolkit_native_host_metadata(meta_version):
+@pytest.mark.parametrize(("meta_version", "toolkit_version"), [
+    ("0.9.0", "0.9.0"), ("0.9.1", "0.9.0"), ("0.9.4", "0.9.0"), ("0.9.4", "0.9.4")])
+def test_selected_meta_version_is_bound_to_exact_toolkit_native_host_metadata(meta_version, toolkit_version):
     pair = (InertWheel("meerkat-meta", version=meta_version),
-            InertWheel("meerkat-toolkit", meta_version=meta_version))
+            InertWheel("meerkat-toolkit", version=toolkit_version, meta_version=meta_version))
     facts = check_pair(pair)
-    assert (facts[0].version, facts[1].version) == (meta_version, "0.9.0")
+    assert (facts[0].version, facts[1].version) == (meta_version, toolkit_version)
     assert all(observed.sha256 == wheel.selected()[1].sha256 for wheel, observed in zip(pair, facts))
 
 
-@pytest.mark.parametrize(("meta_version", "required_version"), [("0.9.0", "0.9.1"), ("0.9.1", "0.9.0")])
+@pytest.mark.parametrize(("meta_version", "required_version"), [("0.9.0", "0.9.1"), ("0.9.1", "0.9.0"),
+    ("0.9.1", "0.9.4"), ("0.9.4", "0.9.1")])
 def test_selected_meta_cross_pair_mismatch_refuses(meta_version, required_version):
     pair = (InertWheel("meerkat-meta", version=meta_version),
             InertWheel("meerkat-toolkit", meta_version=required_version))
@@ -107,7 +109,7 @@ def test_selected_meta_cross_pair_mismatch_refuses(meta_version, required_versio
         check_pair(pair)
 
 
-@pytest.mark.parametrize("version", ["0.8.48", "0.9.2", "1.0.0"])
+@pytest.mark.parametrize("version", ["0.8.48", "0.9.2", "0.9.3", "1.0.0"])
 def test_other_meta_versions_refuse_even_when_wheel_and_dependency_are_exact(version):
     pair = (InertWheel("meerkat-meta", version=version),
             InertWheel("meerkat-toolkit", meta_version=version))
@@ -121,6 +123,23 @@ def test_meta_091_cannot_relabel_selected_090_bytes():
     content, expectation = meta.selected()
     with pytest.raises(integrity.WheelIntegrityError):
         check_pair((meta, toolkit), meta=(content, replace(expectation, version="0.9.1")))
+
+
+@pytest.mark.parametrize("defect", ["selected-version", "metadata-version", "native-host-version", "record"])
+def test_toolkit_094_requires_exact_selected_bytes_metadata_and_meta_constraint(defect):
+    meta = InertWheel("meerkat-meta", version="0.9.4")
+    toolkit = InertWheel("meerkat-toolkit", version="0.9.4", meta_version="0.9.4")
+    if defect == "metadata-version":
+        toolkit.metadata["METADATA"] = toolkit.metadata["METADATA"].replace(
+            b"Version: 0.9.4", b"Version: 0.9.0")
+    elif defect == "native-host-version":
+        toolkit.metadata["METADATA"] = toolkit.metadata["METADATA"].replace(
+            b"meerkat-meta==0.9.4", b"meerkat-meta==0.9.0")
+    content, expectation = toolkit.selected(**({"record": b""} if defect == "record" else {}))
+    if defect == "selected-version":
+        expectation = replace(expectation, version="0.9.0")
+    with pytest.raises(integrity.WheelIntegrityError):
+        check_pair((meta, toolkit), toolkit=(content, expectation))
 
 
 @pytest.mark.parametrize("version", ["0.1.0", "0.9.1"])

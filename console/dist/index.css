@@ -9000,7 +9000,7 @@ svg[data-svg=fit],
 }
 .roster__row {
   display: grid;
-  grid-template-columns: 2fr 1.1fr 1fr 1fr 0.7fr 0.8fr 0.8fr;
+  grid-template-columns: 2fr 1.1fr 1fr 1fr 0.7fr;
   gap: 12px;
   padding: 10px 16px;
   align-items: center;

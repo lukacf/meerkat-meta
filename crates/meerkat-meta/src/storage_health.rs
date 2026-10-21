@@ -448,10 +448,11 @@ impl std::error::Error for BlobStoreResolutionError {}
 
 /// Fail-closed runtime-store resolution failure (M4, the "fifth fallback").
 ///
-/// Formerly a `tracing::warn!` plus a silent `InMemoryRuntimeStore` twin —
-/// a degraded mode in which resume across restart and archive operations
-/// fail long after boot. Now a startup error; an in-memory runtime store
-/// remains constructible only as an explicit declaration
+/// Formerly a `tracing::warn!` plus a silent `InMemoryRuntimeStore` twin, a
+/// degraded mode in which resume across restart and archive operations fail
+/// long after boot. Now a startup error. A persistent composition never
+/// substitutes an in-memory runtime store; one is constructible only without
+/// persistent state, as an explicit declaration
 /// (`UnifiedRuntimeBuilder::ephemeral_runtime_store(true)`, or the gateway's
 /// `runtime_options.runtime_store = {"storage": "memory"}`).
 #[derive(Debug)]
@@ -466,9 +467,8 @@ impl std::fmt::Display for RuntimeStoreResolutionError {
             f,
             "failed to open the persistent runtime store at {}: {} \
              (sessions would not survive restart and archive operations would \
-             fail; fix the database file, or declare an in-memory runtime \
-             store explicitly via ephemeral_runtime_store(true) / \
-             runtime_options.runtime_store = {{\"storage\": \"memory\"}})",
+             fail; fix the database file. A composition with persistent state \
+             never substitutes an in-memory runtime store)",
             self.path.display(),
             self.message
         )
@@ -580,8 +580,7 @@ pub fn probe_session_store_incremental(store: &Arc<dyn SessionStore>, store_kind
              (incremental capability absent). Fix: implement \
              ContinuityStore::as_incremental_sessions on the continuity store \
              (Meta's ContinuityIncrementalSessions channel), or forward it \
-             from the store your wrapper wraps; check wrappers with \
-             meta_store_conformance::chapters::continuity_wrapper_preserves_incremental_channel"
+             from the store your wrapper wraps"
         );
     }
     incremental
@@ -879,7 +878,10 @@ mod tests {
         };
         let text = error.to_string();
         assert!(text.contains("/state/runtime.sqlite"));
-        assert!(text.contains("ephemeral_runtime_store(true)"));
-        assert!(text.contains("runtime_options.runtime_store"));
+        assert!(text.contains("fix the database file"));
+        // Persistent state refuses an in-memory runtime store, so the text
+        // must not recommend declaring one.
+        assert!(!text.contains("ephemeral_runtime_store(true)"));
+        assert!(!text.contains("runtime_options.runtime_store"));
     }
 }

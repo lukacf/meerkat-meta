@@ -17,11 +17,10 @@ use meerkat_client::{LlmError, LlmEvent, LlmRequest};
 use meerkat_core::types::StopReason;
 use meerkat_meta::identity_first::orchestrator::{RestoreFlowResult, RestoreOutcome};
 use meerkat_meta::identity_first::{
-    AgentAddressability, AgentIdentity, AgentRuntimeServices, ContinuityFailureKind,
-    ContinuityRepairRequestOutcome, ContinuityStore, DurabilityPolicy, DurableAgentSpec,
-    IdentityFirstRuntimeContext, IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig,
-    LocalContinuityStore, LocalLeaseProvider, MobSessionBridge, MutableRosterProvider,
-    RoleMigrationDeclaration,
+    AgentAddressability, AgentIdentity, AgentRuntimeServices, ContinuityStore, DurabilityPolicy,
+    DurableAgentSpec, IdentityFirstRuntimeContext, IdentityRuntime, IdentityRuntimeConfig,
+    IdentityRuntimeError, LocalContinuityStore, LocalLeaseProvider, MobSessionBridge,
+    MutableRosterProvider, RoleMigrationDeclaration, WakeHold,
 };
 use meerkat_meta::mob_composition_manifest::persistent_mob_storage;
 use meerkat_meta::{DiscoverySpec, MetaConfig, MobBootstrapOptions, MobBootstrapSpec};
@@ -134,21 +133,17 @@ async fn boot(
     role_migrations: Vec<RoleMigrationDeclaration>,
 ) -> Booted {
     std::fs::create_dir_all(state_path).expect("state root");
-    let session_store = Arc::new(
-        meerkat_store::SqliteSessionStore::open(state_path.join("sessions.sqlite3"))
-            .expect("open the session store"),
-    );
     let (storage, provenance) = persistent_mob_storage(state_path.join("mob.sqlite3"))
         .expect("open persistent mob storage");
     let spec = MobBootstrapSpec::persistent(
         definition(mob_id),
         storage,
+        provenance,
         state_path.to_path_buf(),
         16,
-        session_store,
     )
+    .await
     .expect("compose persistent Meta stores")
-    .with_mob_storage_provenance(provenance)
     // Creates no agent child mob. It restarts in this process, which the
     // durable child-mob default refuses as a duplicate owner; explicit
     // ProcessBound keeps this test's cold-recovery oracle.
@@ -217,8 +212,11 @@ async fn boot(
 fn materialized_session(result: &RestoreFlowResult) -> meerkat_core::types::SessionId {
     let identity = AgentIdentity::parse(IDENTITY).unwrap();
     match result.outcomes.get(&identity) {
-        Some(RestoreOutcome::Created { record, .. } | RestoreOutcome::Resumed { record, .. }) => {
-            record.session_id.clone()
+        Some(RestoreOutcome::Created { binding, .. } | RestoreOutcome::Resumed { binding, .. }) => {
+            binding
+                .session_id
+                .clone()
+                .expect("a materialized member is bound to a session")
         }
         other => panic!("{IDENTITY} did not materialize: {other:?}"),
     }
@@ -357,23 +355,25 @@ async fn a_declared_role_migration_from_the_wrong_role_is_refused_before_any_ret
         .outcomes
         .get(&AgentIdentity::parse(IDENTITY).unwrap())
     {
-        Some(RestoreOutcome::Broken(failure)) => {
-            assert_eq!(failure.kind, ContinuityFailureKind::RoleMigrationNotApplied);
-            assert!(
-                failure.detail.contains(&format!(
+        Some(RestoreOutcome::Refused(error)) => match error.as_ref() {
+            IdentityRuntimeError::WakeHeld {
+                hold: WakeHold::RoleMigrationNotApplied,
+                detail,
+                ..
+            } => assert!(
+                detail.contains(&format!(
                     "declared role migration of {IDENTITY} from 'predecessor' to '{TO_ROLE}' \
                      was not applied"
-                )) && failure.detail.contains("not the declared predecessor role"),
-                "the refusal names the migration and why it was not applied: {}",
-                failure.detail
-            );
-        }
+                )) && detail.contains("not the declared predecessor role"),
+                "the refusal names the migration and why it was not applied: {detail}"
+            ),
+            other => panic!("the refusal must be the held role migration: {other:?}"),
+        },
         other => panic!("the mismatched declaration must be refused: {other:?}"),
     }
     // The host sees it on the activation result: `meta/init` returns this
     // bootstrap status as `identity_bootstrap`. Read it once it is terminal:
-    // the settled pass wakes the continuity repair supervisor, and any pass
-    // that runs is in flight until it settles.
+    // any pass that runs is in flight until it settles.
     let (status, timed_out) = booted
         .unified
         .identity_runtime()
@@ -390,7 +390,7 @@ async fn a_declared_role_migration_from_the_wrong_role_is_refused_before_any_ret
     let entry = &wire["identities"][IDENTITY];
     assert_eq!(entry["state"], "broken", "{wire}");
     assert_eq!(
-        entry["restore"]["kind"], "role_migration_not_applied",
+        entry["restore"]["kind"], "identity_role_migration_refused",
         "the activation result carries the typed refusal: {wire}"
     );
     let members = booted.unified.mob_handle().list_members().await;
@@ -411,10 +411,9 @@ async fn a_declared_role_migration_from_the_wrong_role_is_refused_before_any_ret
 }
 
 /// A refused declaration is a terminal verdict for the spec it was refused
-/// against. A later pass over the same roster (a host refresh here; the
-/// continuity repair supervisor runs the same pass) keeps the member the
-/// refusal preserved instead of retiring it for the ordinary Broken cleanup,
-/// and the supervisor has nothing to retry (main CI run 38596087789).
+/// against. A later pass over the same roster (a host refresh here) keeps
+/// the member the refusal preserved instead of retiring it, and holds the
+/// same typed refusal (main CI run 38596087789).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_role_migration_is_not_retired_by_a_later_pass() {
     let temp = tempfile::TempDir::new().expect("temp dir");
@@ -444,9 +443,16 @@ async fn a_refused_role_migration_is_not_retired_by_a_later_pass() {
         .outcomes
         .get(&identity)
     {
-        Some(RestoreOutcome::Broken(failure)) => {
-            assert_eq!(failure.kind, ContinuityFailureKind::RoleMigrationNotApplied);
-        }
+        Some(RestoreOutcome::Refused(error)) => assert!(
+            matches!(
+                error.as_ref(),
+                IdentityRuntimeError::WakeHeld {
+                    hold: WakeHold::RoleMigrationNotApplied,
+                    ..
+                }
+            ),
+            "the mismatched declaration must be held: {error:?}"
+        ),
         other => panic!("the mismatched declaration must be refused: {other:?}"),
     }
     let context = booted
@@ -458,14 +464,16 @@ async fn a_refused_role_migration_is_not_retired_by_a_later_pass() {
         .await
         .expect("a later pass over the same roster runs");
     match refreshed.outcomes.get(&identity) {
-        Some(RestoreOutcome::Broken(failure)) => {
-            assert_eq!(
-                failure.kind,
-                ContinuityFailureKind::RoleMigrationNotApplied,
-                "the later pass keeps the typed refusal: {}",
-                failure.detail
-            );
-        }
+        Some(RestoreOutcome::Refused(error)) => assert!(
+            matches!(
+                error.as_ref(),
+                IdentityRuntimeError::WakeHeld {
+                    hold: WakeHold::RoleMigrationNotApplied,
+                    ..
+                }
+            ),
+            "the later pass keeps the typed refusal: {error:?}"
+        ),
         other => panic!("the later pass must keep the refusal: {other:?}"),
     }
     let members = booted.unified.mob_handle().list_members().await;
@@ -482,11 +490,6 @@ async fn a_refused_role_migration_is_not_retired_by_a_later_pass() {
         Some(session_id),
         "the kept member still runs its own session"
     );
-    assert_eq!(
-        context.request_continuity_repair().await,
-        ContinuityRepairRequestOutcome::NothingToRepair,
-        "the repair supervisor does not retry a refused migration"
-    );
     let (status, timed_out) = booted
         .unified
         .identity_runtime()
@@ -497,81 +500,8 @@ async fn a_refused_role_migration_is_not_retired_by_a_later_pass() {
     assert_eq!(status.counts.broken, 1);
     let wire = serde_json::to_value(&status).expect("serialize the bootstrap status");
     assert_eq!(
-        wire["identities"][IDENTITY]["restore"]["kind"], "role_migration_not_applied",
+        wire["identities"][IDENTITY]["restore"]["kind"], "identity_role_migration_refused",
         "the status keeps the typed refusal: {wire}"
-    );
-    booted.unified.shutdown().await;
-}
-
-/// The park belongs to the embodiment it was refused for. A successful reset
-/// replaces that embodiment, so a later, unrelated failure of the new session
-/// is an ordinary Broken identity the repair supervisor retries, not one the
-/// old same-spec refusal keeps parked.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_reset_supersedes_a_refused_role_migration() {
-    let temp = tempfile::TempDir::new().expect("temp dir");
-    let state_path = temp.path().join("state");
-    let mob_id = "role-migration-refused-then-reset";
-    let identity = AgentIdentity::parse(IDENTITY).unwrap();
-
-    let booted = boot(&state_path, mob_id, &[spec(FROM_ROLE)], Vec::new()).await;
-    let refused_session = materialized_session(booted.result.as_ref().expect("boot 1 restores"));
-    booted.unified.shutdown().await;
-    drop(booted);
-
-    let booted = boot(
-        &state_path,
-        mob_id,
-        &[spec(TO_ROLE)],
-        vec![RoleMigrationDeclaration {
-            identity: identity.clone(),
-            from_role: ProfileName::from("predecessor"),
-        }],
-    )
-    .await;
-    match booted
-        .result
-        .as_ref()
-        .expect("boot 2 runs its restore")
-        .outcomes
-        .get(&identity)
-    {
-        Some(RestoreOutcome::Broken(failure)) => {
-            assert_eq!(failure.kind, ContinuityFailureKind::RoleMigrationNotApplied);
-        }
-        other => panic!("the mismatched declaration must be refused: {other:?}"),
-    }
-    let runtime = booted
-        .unified
-        .identity_runtime()
-        .expect("identity-first runtime");
-    let context = booted
-        .unified
-        .identity_first_context()
-        .expect("identity-first context");
-    assert_eq!(
-        context.request_continuity_repair().await,
-        ContinuityRepairRequestOutcome::NothingToRepair,
-        "the refusal is parked before the reset"
-    );
-
-    let reset = runtime
-        .reset(&identity)
-        .await
-        .expect("a same-spec reset succeeds");
-    assert_ne!(
-        reset.session_id, refused_session,
-        "the reset installs a new embodiment"
-    );
-    // An unrelated failure of the new session.
-    runtime
-        .set_state(&identity, IdentityLifecycleState::Broken)
-        .await
-        .expect("mark the new embodiment Broken");
-    assert_ne!(
-        context.request_continuity_repair().await,
-        ContinuityRepairRequestOutcome::NothingToRepair,
-        "the new embodiment's failure is repairable: the old refusal no longer parks it"
     );
     booted.unified.shutdown().await;
 }

@@ -33,7 +33,7 @@ use meerkat_meta::identity_first::{
     AgentAddressability, AgentBuildDraft, AgentRuntimeServices, BridgeError, DurabilityPolicy,
     DurableAgentSpec, IdentityRuntime, IdentityRuntimeConfig, LocalContinuityStore,
     LocalLeaseProvider, MobSessionBridge, RestoreOutcome, ResumeSessionOutcome, SessionBridge,
-    SessionSnapshot, restore_flow,
+    restore_flow,
 };
 use meerkat_meta::{
     DiscoverySpec, MetaConfig, MobBootstrapOptions, MobBootstrapSpec, UnifiedRuntime,
@@ -249,10 +249,18 @@ struct Raced {
     _temp: tempfile::TempDir,
     boot: Boot,
     bridge: Arc<MobSessionBridge>,
-    record: meerkat_meta::identity_first::ContinuityRecord,
+    record: SeededMember,
     spec: DurableAgentSpec,
     identity: meerkat_meta::identity_first::AgentIdentity,
     gate_tx: watch::Sender<bool>,
+}
+
+/// The member boot 1 created: Core's incarnation and the session it is
+/// bound to.
+#[derive(Clone)]
+struct SeededMember {
+    agent_runtime_id: meerkat_meta::identity_first::AgentRuntimeId,
+    session_id: meerkat_core::types::SessionId,
 }
 
 async fn restart_with_durable_member() -> Raced {
@@ -299,7 +307,13 @@ async fn restart_with_durable_member() -> Raced {
             .await
             .expect("restore_flow");
         let record = match result.outcomes.get(&identity) {
-            Some(RestoreOutcome::Created { record, .. }) => record.clone(),
+            Some(RestoreOutcome::Created { binding, .. }) => SeededMember {
+                agent_runtime_id: binding.agent_runtime_id.clone(),
+                session_id: binding
+                    .session_id
+                    .clone()
+                    .expect("Core binds a fresh member to a session"),
+            },
             other => panic!("boot 1 must fresh-create, got {other:?}"),
         };
         bridge
@@ -363,11 +377,10 @@ fn spawn_resume(
         bridge
             .resume_session(
                 &identity,
-                &record.agent_runtime_id,
                 &spec,
                 &empty_draft(&spec),
                 &record.session_id,
-                &SessionSnapshot { data: Vec::new() },
+                None,
             )
             .await
     })

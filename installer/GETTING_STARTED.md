@@ -619,6 +619,13 @@ folder. Keep the same private state directory: retain your `META_FORGE_HOME`
 value, or your existing `MOBKIT_LAUNCH_HOME` alias. The script reuses its prepared
 Python environment; keep both the wizard state and installed project folder.
 
+A Forge whose guide runs on Meta 0.9.4 or later starts a fresh setup team in the
+same state directory. Your saved setups, proposals, provider settings and
+installed applications stay, and the previous setup team's state is kept
+unchanged, but the new team does not recall earlier conversations. To carry them
+over, follow [Work with the setup team](README.md#work-with-the-setup-team)
+before the first start.
+
 On the opening screen, **Pick up where you left off** may show a saved setup
 once the list has loaded. Check its name and choose **Continue** to open that
 conversation. To choose another saved setup, open **Your setups**, select it and
@@ -644,6 +651,20 @@ agent history. The application stays stopped. Complete this before staging an
 application update. If the connection is interrupted, Forge checks the saved
 command; choose **Resume this update** only when offered to continue that same
 update. The **Technical details** disclosure holds its saved identifiers.
+
+Moving an installed application to Meta 0.9.4 changes its saved state for good.
+Meta 0.9.4 keeps conversations and agent identities in Meerkat Core's own stores,
+so the application's saved state must be migrated once, while it is stopped,
+before 0.9.4 can start it. Back up the stopped installation first: that backup
+is the only way back to the earlier release.
+[Upgrading to Meta 0.9.4](https://docs.rkat.ai/meta/guides/upgrading-to-0-9-4)
+describes the migration and lists the earlier releases it accepts; check that
+your installation's release is listed before you update. Forge itself does not
+run this migration: it keeps each installed application on its Meta release, and
+an update that would cross to Meta 0.9.4 is staged as blocked and cannot be
+applied, without changing anything.
+Keep using the Forge copy that installed the application to start, stop and
+update it.
 
 If **Retry installation** is offered, use it to finish installing the saved checked
 package in the same folder. Ordinary Start and private settings remain unavailable

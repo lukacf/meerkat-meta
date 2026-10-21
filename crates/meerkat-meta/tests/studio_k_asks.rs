@@ -504,8 +504,9 @@ comms = true
     let retired_status = rpc(&app, "meta/status_identity", json!({"identity": "builder"})).await;
     assert_eq!(
         retired_status["result"]["state"],
-        json!("retiring"),
-        "runtime-alias retirement must advance durable lifecycle state: {retired_status}"
+        json!("dormant"),
+        "runtime-alias retirement must leave the identity dormant (Core retired its member): \
+         {retired_status}"
     );
     let respawn = rpc(
         &app,

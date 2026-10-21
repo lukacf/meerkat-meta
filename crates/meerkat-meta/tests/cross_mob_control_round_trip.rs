@@ -201,6 +201,7 @@ fn peer_message(to: &meerkat_core::comms::PeerDirectoryEntry, body: &str) -> Com
         content_taint: None,
         handling_mode: HandlingMode::Queue,
         objective_id: None,
+        in_reply_to: None,
     }
 }
 

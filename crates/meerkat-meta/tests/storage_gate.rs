@@ -120,7 +120,7 @@ const AMBIENT_ALLOWLIST: [AllowlistEntry; 3] = [
 ];
 
 /// Rule 2 allowlist: canonical locator literals outside the layout.
-const LOCATOR_ALLOWLIST: [AllowlistEntry; 4] = [
+const LOCATOR_ALLOWLIST: [AllowlistEntry; 7] = [
     entry(
         "storage_layout.rs",
         "",
@@ -138,6 +138,27 @@ const LOCATOR_ALLOWLIST: [AllowlistEntry; 4] = [
         "pub const WORKGRAPH_STORE_FILE",
         1,
         "feature-owned canonical constant; the layout composes it (DatabaseSlot::Workgraph)",
+    ),
+    entry(
+        "bin/meta_gateway.rs",
+        "runtime.sqlite",
+        2,
+        "the native migration command's resume and restore texts name the runtime database \
+         the operator acts on; they compose no path",
+    ),
+    entry(
+        "storage_migrate_native/census.rs",
+        "runtime.sqlite",
+        13,
+        "the native migration census's refusal and remedy texts name the runtime database \
+         the operator converts or restores; they compose no path",
+    ),
+    entry(
+        "storage_migrate_native/export_census.rs",
+        "runtime.sqlite",
+        2,
+        "the continuity export census's texts name the runtime database a directory holds; \
+         they compose no path",
     ),
     AllowlistEntry {
         file: "storage_doctor.rs",

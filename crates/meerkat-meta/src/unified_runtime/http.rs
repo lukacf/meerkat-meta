@@ -20,7 +20,8 @@ use crate::http_console::{
 use crate::http_flow_editor::protected_flow_editor_router_with_runtime_catalog;
 use crate::http_sse::{
     agent_events_sse_router_with_access_and_priming, mob_events_sse_router_with_access_and_priming,
-    mob_structural_events_sse_router_with_access_and_priming, workgraph_facts_sse_router,
+    mob_structural_events_sse_router_with_access_and_priming,
+    workgraph_facts_sse_router_under_session_fences,
 };
 use crate::runtime::RuntimeDecisionState;
 use tokio::sync::Semaphore;
@@ -166,26 +167,32 @@ async fn resolve_agent_event_member_id(
         .unwrap_or(direct)
 }
 
-async fn identity_event_alias_is_current(
+/// Whether a per-agent event subscription still belongs to the identity life
+/// it was opened on: Meta still lists the identity, and Core's last binding of
+/// it still names the session the subscription was opened on.
+///
+/// A retire keeps the binding (the next wake resumes the same session), so it
+/// ends nothing. A reset, a delete or a respawn that mints a session moves the
+/// binding to another session; a roster removal unregisters the identity; a
+/// mob reset or destroy leaves no binding. Each of those ends the
+/// subscription, and so does a read Core cannot answer.
+async fn identity_event_session_is_current(
     identity_runtime: &crate::identity_first::IdentityRuntime,
     identity: &crate::identity_first::AgentIdentity,
-    expected_alias: &str,
+    session: &meerkat_core::SessionId,
 ) -> bool {
-    identity_runtime.status(identity).await.is_ok_and(|status| {
-        status.state == crate::identity_first::IdentityLifecycleState::Active
-            && status
-                .agent_runtime_id
-                .as_ref()
-                .is_some_and(|runtime_id| runtime_id.as_str() == expected_alias)
-    })
+    identity_runtime
+        .status(identity)
+        .await
+        .is_ok_and(|status| status.session_id.as_ref() == Some(session))
 }
 
-/// Keep a per-agent event subscription bound to the exact identity generation
-/// that was current when the HTTP request was admitted. A reset replaces that
-/// generation while the lower-plane event stream can remain alive long enough
-/// to emit late output; forwarding it through the durable/current alias would
-/// make a stale owner appear authoritative.
-fn generation_authoritative_agent_event_stream(
+/// Keep a per-agent event subscription bound to the identity life that was
+/// current when the HTTP request was admitted: the session Core bound the
+/// identity to ([`identity_event_session_is_current`]). Output from another
+/// session, which the lower-plane stream can still deliver after a reset,
+/// never reaches the subscriber under the identity's name.
+fn session_authoritative_agent_event_stream(
     mut event_stream: EventStream,
     mut identity_events: tokio::sync::broadcast::Receiver<
         crate::identity_first::runtime::IdentityEvent,
@@ -193,27 +200,30 @@ fn generation_authoritative_agent_event_stream(
     // The stream is handed to the HTTP client: it holds the owning view.
     identity_runtime: crate::identity_first::PublicIdentityRuntime,
     identity: crate::identity_first::AgentIdentity,
-    expected_alias: String,
+    session: meerkat_core::SessionId,
 ) -> EventStream {
     Box::pin(async_stream::stream! {
-        // Reset currently updates the continuity entry without guaranteeing a
-        // state-change notification on the pre-reset identity channel. Poll
-        // the cheap in-memory status snapshot as a liveness backstop so an
-        // otherwise-idle SSE connection still closes promptly.
-        let mut authority_check = tokio::time::interval(Duration::from_millis(250));
+        // Every check reads and folds Core's whole member journal, so it runs
+        // on the identity's lifecycle events and on this backstop tick, not
+        // per payload: the tick also catches a change no verb of this
+        // runtime announces (Core's reconciler, a mob reset), and it closes
+        // an otherwise idle connection. Once a second is enough for that:
+        // the per-payload session check below already stops another
+        // session's output before it is forwarded.
+        let mut authority_check = tokio::time::interval(Duration::from_secs(1));
         authority_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                // Prefer lifecycle invalidation when both it and a stale
-                // lower-plane event are ready in the same scheduler turn.
+                // Prefer lifecycle invalidation and the due backstop over a
+                // lower-plane event ready in the same scheduler turn.
                 biased;
                 lifecycle = identity_events.recv() => {
                     match lifecycle {
                         Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            if !identity_event_alias_is_current(
+                            if !identity_event_session_is_current(
                                 &identity_runtime,
                                 &identity,
-                                &expected_alias,
+                                &session,
                             )
                             .await
                             {
@@ -224,10 +234,10 @@ fn generation_authoritative_agent_event_stream(
                     }
                 }
                 _ = authority_check.tick() => {
-                    if !identity_event_alias_is_current(
+                    if !identity_event_session_is_current(
                         &identity_runtime,
                         &identity,
-                        &expected_alias,
+                        &session,
                     )
                     .await
                     {
@@ -238,16 +248,11 @@ fn generation_authoritative_agent_event_stream(
                     let Some(event) = event else {
                         break;
                     };
-                    // Reset marks the identity non-Active before publishing
-                    // the replacement generation. Recheck on every payload so
-                    // output racing that transition is dropped immediately,
-                    // even before the eventual Active lifecycle event arrives.
-                    if !identity_event_alias_is_current(
-                        &identity_runtime,
-                        &identity,
-                        &expected_alias,
-                    )
-                    .await
+                    // A payload another session emitted belongs to another
+                    // life of the identity: the subscription ends before it.
+                    if let meerkat_core::event::EventSourceIdentity::Session { session_id } =
+                        &event.source
+                        && *session_id != session
                     {
                         break;
                     }
@@ -369,6 +374,7 @@ impl UnifiedRuntime {
             Some(Arc::clone(&self.job_health_projection)),
             Some(view),
             self.console_governed_ingress.clone(),
+            self.console_session_fences().clone(),
             self.mob_announcements_slot(),
         )
     }
@@ -384,6 +390,7 @@ impl UnifiedRuntime {
             decisions.clone(),
             self.access_controller().cloned(),
         )
+        .with_session_fences(self.console_session_fences().clone())
     }
 
     /// The Console's stock send gate for a host route that prepares a
@@ -520,6 +527,7 @@ impl UnifiedRuntime {
                 flow_editor_runtime_catalog,
                 access.clone(),
                 flow_editor_host_deploy,
+                self.console_session_fences().clone(),
             ))
             .merge(self.build_console_json_router_with_policy(decisions, visibility_policy))
             .merge(agent_events_sse_router_with_access_and_priming(
@@ -557,19 +565,22 @@ impl UnifiedRuntime {
                             return crate::identity_first::IdentityRuntime::run_member_alias_targets_operation_tracked(
                                 vec![target],
                                 move || async move {
-                                    // The lifecycle guard pins both the authorized identity
-                                    // and its current alias. The core roster identity is not
-                                    // the runtime alias used to fence this subscription.
-                                    let expected_alias = authority_runtime
+                                    // The lifecycle guard pins the authorized identity while
+                                    // the subscription opens: it belongs to the session Core
+                                    // binds the live identity to now.
+                                    let status = authority_runtime
                                         .status(&authority_identity)
                                         .await
-                                        .map_err(|error| error.to_string())?
-                                        .agent_runtime_id
-                                        .ok_or_else(|| {
+                                        .map_err(|error| error.to_string())?;
+                                    if status.agent_runtime_id.is_none() {
+                                        return Err(
                                             "identity event target has no current runtime alias"
-                                                .to_string()
-                                        })?
-                                        .to_string();
+                                                .to_string(),
+                                        );
+                                    }
+                                    let session = status.session_id.ok_or_else(|| {
+                                        "identity event target has no current session".to_string()
+                                    })?;
                                     let identity_events = authority_runtime
                                         .subscribe(&authority_identity)
                                         .await
@@ -585,12 +596,12 @@ impl UnifiedRuntime {
                                             .map_err(|error| error.to_string())?;
                                     Ok(crate::http_sse::AgentEventReplay {
                                         epoch: subscription.epoch,
-                                        stream: generation_authoritative_agent_event_stream(
+                                        stream: session_authoritative_agent_event_stream(
                                             subscription.stream,
                                             identity_events,
                                             authority_runtime,
                                             authority_identity,
-                                            expected_alias,
+                                            session,
                                         ),
                                     })
                                 },
@@ -615,6 +626,7 @@ impl UnifiedRuntime {
                 Some(self.mob_runtime().clone()),
                 self.identity_runtime_ref().cloned(),
                 agent_sse_visibility_policy,
+                self.console_session_fences().clone(),
             ))
             .merge(mob_events_sse_router_with_access_and_priming(
                 Arc::new(move || {
@@ -625,6 +637,7 @@ impl UnifiedRuntime {
                 access.clone(),
                 Some(self.mob_runtime().clone()),
                 mob_sse_visibility_policy,
+                self.console_session_fences().clone(),
             ))
             .merge(mob_structural_events_sse_router_with_access_and_priming(
                 self.mob_handle(),
@@ -633,9 +646,15 @@ impl UnifiedRuntime {
                 access.clone(),
                 Some(self.mob_runtime().clone()),
                 structural_sse_visibility_policy,
+                self.console_session_fences().clone(),
             ))
             .merge(self.workgraph_fact_hub().map_or_else(Router::new, |hub| {
-                workgraph_facts_sse_router(hub, Some(sse_decisions_d), access)
+                workgraph_facts_sse_router_under_session_fences(
+                    hub,
+                    Some(sse_decisions_d),
+                    access,
+                    self.console_session_fences().clone(),
+                )
             }))
     }
 }
@@ -804,8 +823,8 @@ mod tests {
     use meerkat_mob::{MobDefinition, MobRuntimeMode, ProfileName};
 
     use super::{
-        DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS, generation_authoritative_agent_event_stream,
-        healthz_response,
+        DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS, healthz_response,
+        session_authoritative_agent_event_stream,
     };
     use crate::identity_first::{
         AgentAddressability, AgentIdentity, DurableAgentSpec, LocalContinuityStore,
@@ -870,11 +889,10 @@ mod tests {
                 .store()
         ));
         let mut stream = runtime.console_projection.get().expect("owner").subscribe();
+        // A runtime-plane event: no member's event takes the system identity.
         let source = runtime
             .console_events()
-            .append(
-                "_system",
-                None,
+            .append_runtime_plane_event(
                 "text_delta",
                 serde_json::json!({"delta":"host-private-token"}),
             )
@@ -1108,12 +1126,20 @@ model = "gpt-5.5"
         assert_eq!(body["detached_jobs"]["running"], 2);
     }
 
-    #[tokio::test]
-    async fn durable_agent_event_stream_terminates_when_reset_replaces_generation() {
-        let definition = MobDefinition::from_toml(
+    /// An identity-first runtime over the in-memory test client with one
+    /// roster identity, `lead`, and the roster it reads.
+    async fn identity_event_fixture(
+        mob_id: &str,
+    ) -> (
+        crate::unified_runtime::UnifiedRuntime,
+        Arc<MutableRosterProvider>,
+        AgentIdentity,
+        tempfile::TempDir,
+    ) {
+        let definition = MobDefinition::from_toml(&format!(
             r#"
 [mob]
-id = "generation-authoritative-agent-events"
+id = "{mob_id}"
 
 [profiles.worker]
 model = "gpt-5.5"
@@ -1121,8 +1147,8 @@ runtime_mode = "turn_driven"
 
 [profiles.worker.tools]
 comms = true
-"#,
-        )
+"#
+        ))
         .expect("definition parses");
         let identity = AgentIdentity::parse("lead").expect("identity parses");
         let roster = Arc::new(MutableRosterProvider::new(vec![DurableAgentSpec {
@@ -1146,53 +1172,237 @@ comms = true
                 LocalContinuityStore::in_memory().expect("continuity store"),
             ))
             .lease_provider(Arc::new(LocalLeaseProvider::new()))
-            .roster_provider(roster)
+            .roster_provider(Arc::<MutableRosterProvider>::clone(&roster))
             .scratch_dir(scratch.path())
-            .identity_runtime_instance_id("generation-authoritative-agent-events")
+            .ephemeral_runtime_store(true)
+            .identity_runtime_instance_id(mob_id)
             .default_llm_client(Arc::new(TestClient::default()))
             .build()
             .await
             .expect("identity-first runtime builds");
+        (runtime, roster, identity, scratch)
+    }
 
+    /// The gated per-agent stream over a lower plane that never ends, opened
+    /// on the session Core binds `identity` to now: only the gate can end it.
+    async fn session_gated_stream(
+        runtime: &crate::unified_runtime::UnifiedRuntime,
+        identity: &AgentIdentity,
+    ) -> EventStream {
         let identity_runtime = runtime
             .identity_runtime()
             .expect("identity runtime installed");
-        let expected_alias = identity_runtime
-            .status(&identity)
+        let session = identity_runtime
+            .status(identity)
             .await
-            .expect("identity active")
-            .agent_runtime_id
-            .expect("active runtime alias")
-            .as_str()
-            .to_string();
+            .expect("identity status")
+            .session_id
+            .expect("the live identity has a session");
         let identity_events = identity_runtime
-            .subscribe(&identity)
+            .subscribe(identity)
             .await
             .expect("identity event subscription");
         // A pending lower-plane stream proves termination comes from the
-        // identity generation gate, not from old-member channel teardown.
+        // session gate, not from old-member channel teardown.
         let lower_plane: EventStream = Box::pin(futures::stream::pending());
-        let mut guarded = generation_authoritative_agent_event_stream(
+        session_authoritative_agent_event_stream(
             lower_plane,
             identity_events,
             identity_runtime.clone(),
             identity.clone(),
-            expected_alias,
-        );
+            session,
+        )
+    }
 
-        let replacement = identity_runtime
+    #[tokio::test]
+    async fn durable_agent_event_stream_terminates_when_reset_replaces_the_session() {
+        let (runtime, _roster, identity, _scratch) =
+            identity_event_fixture("session-authoritative-agent-events").await;
+        let mut guarded = session_gated_stream(&runtime, &identity).await;
+
+        let replacement = runtime
+            .identity_runtime()
+            .expect("identity runtime installed")
             .reset(&identity)
             .await
             .expect("identity reset succeeds");
-        assert_eq!(replacement.generation.get(), 1);
+        assert_eq!(replacement.generation().get(), 1);
         let next = tokio::time::timeout(Duration::from_secs(5), guarded.next())
             .await
-            .expect("generation gate terminates promptly");
+            .expect("session gate terminates promptly");
         assert!(
             next.is_none(),
-            "stream opened on the prior generation must terminate after reset"
+            "stream opened on the prior session must terminate after reset"
         );
 
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    /// A retire ends nothing: the identity keeps its session, which its next
+    /// wake resumes. The gate keeps the stream open past two backstop checks
+    /// and the retire's own lifecycle event; a reset then ends it.
+    #[tokio::test]
+    async fn durable_agent_event_stream_survives_a_retire_of_its_session() {
+        let (runtime, _roster, identity, _scratch) =
+            identity_event_fixture("session-gate-survives-retire").await;
+        let mut guarded = session_gated_stream(&runtime, &identity).await;
+        let identity_runtime = runtime
+            .identity_runtime()
+            .expect("identity runtime installed");
+
+        identity_runtime
+            .retire(&identity)
+            .await
+            .expect("identity retire succeeds");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(2500), guarded.next())
+                .await
+                .is_err(),
+            "a retire keeps the session, so the stream stays open"
+        );
+
+        identity_runtime
+            .reset(&identity)
+            .await
+            .expect("identity reset succeeds");
+        let next = tokio::time::timeout(Duration::from_secs(5), guarded.next())
+            .await
+            .expect("session gate terminates promptly");
+        assert!(
+            next.is_none(),
+            "a reset moves the identity to a fresh session and ends the stream"
+        );
+
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    #[tokio::test]
+    async fn durable_agent_event_stream_terminates_when_the_roster_drops_the_identity() {
+        let (runtime, roster, identity, _scratch) =
+            identity_event_fixture("session-gate-roster-removal").await;
+        let mut guarded = session_gated_stream(&runtime, &identity).await;
+
+        assert!(roster.remove(&identity), "the roster listed the identity");
+        runtime
+            .refresh_desired_topology()
+            .await
+            .expect("roster compile succeeds");
+        let next = tokio::time::timeout(Duration::from_secs(5), guarded.next())
+            .await
+            .expect("session gate terminates promptly");
+        assert!(
+            next.is_none(),
+            "an identity the roster dropped ends its subscriptions"
+        );
+
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    /// Identity-first materialization creates no member under a runtime-plane
+    /// identity: the console treats `_system` frames as the runtime's own. The
+    /// refusal is typed on every attempt, and a later materialization builds
+    /// nothing.
+    #[tokio::test]
+    async fn identity_first_materialization_refuses_runtime_plane_identities() {
+        let definition = MobDefinition::from_toml(
+            r#"
+[mob]
+id = "runtime-plane-identity-first"
+
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+
+[profiles.worker.tools]
+comms = true
+"#,
+        )
+        .expect("definition parses");
+        let identity = AgentIdentity::parse("_system").expect("identity parses");
+        let roster = Arc::new(MutableRosterProvider::new(vec![DurableAgentSpec {
+            identity: identity.clone(),
+            profile: ProfileName::from("worker"),
+            addressability: AgentAddressability::Addressable,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: Some(MobRuntimeMode::TurnDriven),
+            backend: None,
+            binding: None,
+            placement: None,
+        }]));
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let built = UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .continuity_store(Arc::new(
+                LocalContinuityStore::in_memory().expect("continuity store"),
+            ))
+            .lease_provider(Arc::new(LocalLeaseProvider::new()))
+            .roster_provider(roster)
+            .scratch_dir(scratch.path())
+            .ephemeral_runtime_store(true)
+            .identity_runtime_instance_id("runtime-plane-identity-first")
+            .default_llm_client(Arc::new(TestClient::default()))
+            .build()
+            .await;
+        let runtime = built.expect("the refusal parks one identity; the runtime comes up");
+        assert!(
+            runtime
+                .mob_handle()
+                .list_members()
+                .await
+                .iter()
+                .all(|member| member.agent_identity.as_str() != "_system"),
+            "no member took `_system`"
+        );
+
+        // The refusal surfaces typed: the identity's bootstrap entry is
+        // Broken with a reason that names the reservation.
+        let identities = runtime
+            .identity_runtime_ref()
+            .expect("identity-first runtime")
+            .clone();
+        let bootstrap = identities.identity_bootstrap_status();
+        let entry = bootstrap
+            .identities
+            .get(&identity)
+            .expect("the identity is tracked");
+        assert_eq!(
+            entry.state,
+            crate::identity_first::IdentityBootstrapState::Broken,
+            "{entry:?}"
+        );
+        assert!(
+            entry
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("reserved")),
+            "{entry:?}"
+        );
+
+        // No build is retried: another materialization is refused typed with
+        // the reservation before anything is built, and creates no member.
+        let again = identities.materialize(&identity).await;
+        assert!(
+            matches!(
+                &again,
+                Err(crate::identity_first::IdentityRuntimeError::HostRejectedBuild {
+                    reason, ..
+                }) if reason.contains("reserved")
+            ),
+            "the reserved identity is refused typed: {again:?}"
+        );
+        assert!(
+            runtime
+                .mob_handle()
+                .list_members()
+                .await
+                .iter()
+                .all(|member| member.agent_identity.as_str() != "_system"),
+            "a retry creates no `_system` member"
+        );
         let _ = runtime.mob_handle().stop().await;
     }
 
@@ -1243,6 +1453,7 @@ comms = true
             .lease_provider(Arc::new(LocalLeaseProvider::new()))
             .roster_provider(roster)
             .scratch_dir(scratch.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("stale-alias-agent-events")
             .default_llm_client(Arc::new(TestClient::default()))
             .build()

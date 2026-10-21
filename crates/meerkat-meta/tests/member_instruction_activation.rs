@@ -117,21 +117,17 @@ struct Booted {
 /// `install_and_bootstrap_identity_first_context`.
 async fn boot(state_path: &std::path::Path) -> Booted {
     std::fs::create_dir_all(state_path).expect("state root");
-    let session_store = Arc::new(
-        meerkat_store::SqliteSessionStore::open(state_path.join("sessions.sqlite3"))
-            .expect("open the session store"),
-    );
     let (storage, provenance) = persistent_mob_storage(state_path.join("mob.sqlite3"))
         .expect("open persistent mob storage");
     let spec_bootstrap = MobBootstrapSpec::persistent(
         definition(),
         storage,
+        provenance,
         state_path.to_path_buf(),
         16,
-        session_store,
     )
+    .await
     .expect("compose persistent Meta stores")
-    .with_mob_storage_provenance(provenance)
     // Creates no agent child mob. It restarts in this process, which the
     // durable child-mob default refuses as a duplicate owner; explicit
     // ProcessBound keeps this test's cold-recovery oracle.
@@ -195,8 +191,11 @@ async fn boot(state_path: &std::path::Path) -> Booted {
         .outcomes
         .get(&AgentIdentity::parse(IDENTITY).unwrap())
     {
-        Some(RestoreOutcome::Created { record, .. } | RestoreOutcome::Resumed { record, .. }) => {
-            record.session_id.clone()
+        Some(RestoreOutcome::Created { binding, .. } | RestoreOutcome::Resumed { binding, .. }) => {
+            binding
+                .session_id
+                .clone()
+                .expect("Core binds the identity's member to a session")
         }
         other => panic!("{IDENTITY} did not materialize: {other:?}"),
     };

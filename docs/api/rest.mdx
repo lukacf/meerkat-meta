@@ -136,7 +136,12 @@ Without a console aggregator, this route returns `404` with
 
 **Response:** `{identities: ConsoleIdentityRecord[]}`. Each record carries
 `identity`, `display_name`, `runtime_key`, `runtime_member_id`, optional
-`session_id`, `visibility`, `addressable`, `health`, `labels`, and
+`session_id`, optional `member_id` (Core's mob member id of the identity's
+last binding, live or retired: the identity's roster member id, as Core's
+member tokens name it, which is Meta's comms-safe encoding of the identity and
+starts with `mk--` when the identity has a `:`; absent when Core holds no
+binding of the identity and on records of raw runtime members),
+`visibility`, `addressable`, `health`, `labels`, and
 `topology_peers` when non-empty. Use
 [`meta/console/inspect_identity`](/api/rpc#meta%2Fconsole%2Finspect_identity)
 for identity/peer inspection and `/console/experience` for affordances;

@@ -173,22 +173,18 @@ async fn runtime(mob_id: &str, state: &Path, client: &CaptureClient) -> UnifiedR
 /// through `MobBuilder::resume` (the builder's `persistent_state` path keeps
 /// only sessions durable). The bundle is registered on the spec.
 async fn durable_runtime(state: &Path, client: &CaptureClient) -> UnifiedRuntime {
-    let session_store = Arc::new(
-        meerkat_store::SqliteSessionStore::open(state.join("sessions.sqlite3"))
-            .expect("open session store"),
-    );
     let (storage, provenance) =
         meerkat_meta::mob_composition_manifest::persistent_mob_storage(state.join("mob.sqlite3"))
             .expect("open persistent mob storage");
     let spec = meerkat_meta::MobBootstrapSpec::persistent(
         definition("bundle-resume"),
         storage,
+        provenance,
         state.to_path_buf(),
         16,
-        session_store,
     )
+    .await
     .expect("compose persistent stores")
-    .with_mob_storage_provenance(provenance)
     .with_options(meerkat_meta::MobBootstrapOptions {
         allow_ephemeral_sessions: true,
         notify_orchestrator_on_resume: true,

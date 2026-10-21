@@ -43,11 +43,11 @@ export class TransportError extends MetaError {
  * Thrown when the init request was written but no settlement arrived: the
  * acceptance was lost, the reader failed, the gateway exited, or the
  * caller's init deadline ran out. The gateway may have changed native state
- * (owner publication, identities, leases, continuity, schedules) before it
- * stopped, so this is never reported as a refusal and never retried
- * automatically. `initId` correlates with the gateway's progress
- * notifications; `lastPhase` is the last `meta/init_progress` phase seen
- * (`null` when none arrived); `reason` names what ended the wait.
+ * (owner publication, identities, schedules) before it stopped, so this is
+ * never reported as a refusal and never retried automatically. `initId`
+ * correlates with the gateway's progress notifications; `lastPhase` is the
+ * last `meta/init_progress` phase seen (`null` when none arrived); `reason`
+ * names what ended the wait.
  */
 export class InitOutcomeUnknownError extends MetaError {
   constructor(
@@ -179,12 +179,6 @@ export class RpcError extends MetaError {
 export const MOB_EVENTS_STALE_CURSOR_CODE = -32010 as const;
 export const CAPABILITY_UNAVAILABLE_CODE = -32004 as const;
 /**
- * Transient/recoverable identity-plane lease loss on a send/dispatch. Distinct
- * from {@link CAPABILITY_UNAVAILABLE_CODE} (-32004) so a lease that merely needs
- * re-acquisition is not mis-typed as a permanent capability gap.
- */
-export const LEASE_LOST_CODE = -32005 as const;
-/**
  * A send named the registered row its input was authored from
  * (`expectedSpecDigest`) and the identity's registered row is no longer that
  * row. Checked before delivery: nothing was submitted.
@@ -232,6 +226,32 @@ export const WORKGRAPH_UNAVAILABLE_CODE = -32041 as const;
 export const STALE_DELIVERY_SCOPE_CODE = -32007 as const;
 /** WorkGraph CAS/revision conflict — refetch the item/binding's current revision and retry. */
 export const WORKGRAPH_CONFLICT_CODE = -32042 as const;
+/**
+ * The identity's durable session cannot be resumed: Core reports it archived
+ * and not revivable, or its durable authority contradictory. Final; nothing
+ * was spawned. Core's mob machine and journal hold an identity's session and
+ * generation, and the identity codes carry Core's typed answers.
+ */
+export const IDENTITY_UNRESUMABLE_CODE = -32051 as const;
+/**
+ * Core's member history, or the session resume, could not be read right now.
+ * Retryable; nothing was spawned.
+ */
+export const IDENTITY_HISTORY_UNAVAILABLE_CODE = -32052 as const;
+/**
+ * The identity is managed by a host intent declaration in Core, so Meta's
+ * lifecycle verbs refuse it.
+ */
+export const IDENTITY_HOST_ADOPTED_CODE = -32053 as const;
+/**
+ * A wake Core holds until an operator acts rides JSON-RPC's internal-error
+ * code with structured data; the data `kind` names the hold.
+ */
+export const IDENTITY_WAKE_HELD_KINDS: ReadonlySet<string> = new Set([
+  "mob_member_session_repair_required",
+  "mob_member_session_resume_held",
+  "identity_role_migration_refused",
+]);
 
 /**
  * Raised when the caller passes an `after_seq` past the current ledger
@@ -290,24 +310,6 @@ export class CapabilityUnavailableError extends RpcError {
 }
 
 /**
- * Raised when an identity's lease was lost mid send/dispatch. Transient and
- * recoverable — the identity simply needs to re-acquire its lease. Distinct
- * from {@link CapabilityUnavailableError} so callers do not treat a recoverable
- * lease loss as a permanent capability gap.
- */
-export class LeaseLostError extends RpcError {
-  constructor(
-    message: string,
-    requestId = "",
-    method = "",
-    data?: unknown,
-  ) {
-    super(LEASE_LOST_CODE, message, requestId, method, data);
-    this.name = "LeaseLostError";
-  }
-}
-
-/**
  * A send's `expectedSpecDigest` no longer names the identity's registered
  * row. The gateway checks it under the identity's lifecycle lock before
  * delivery, so nothing was submitted.
@@ -329,9 +331,9 @@ export class RegisteredSpecChangedError extends RpcError {
  * Nothing was submitted and the delivery was not retargeted to the
  * identity's current binding. `mismatch` names the atom that moved:
  * `runtime_id`, `generation`, `lease_fencing_token`, `member` or
- * `member_binding` (the member's session, incarnation or fence). Recover an
- * earlier attempt under the same scope with `recoverDelivery`, never by
- * redispatching to a fresh scope.
+ * `member_binding` (the member's session, incarnation or fence, or the
+ * mob's incarnation). Recover an earlier attempt under the same scope with
+ * `recoverDelivery`, never by redispatching to a fresh scope.
  */
 export class StaleScopeError extends RpcError {
   readonly mismatch: string | null;
@@ -377,18 +379,46 @@ export class ConsoleTimelineReplayUnavailableError extends RpcError {
 }
 
 /**
- * Raised when the gateway refuses to start over a storage resolution gap.
+ * The gateway's storage cannot serve this call.
  *
- * The refusals are deliberate (storage-unification fail-closed posture):
- * file-name twins (e.g. `sessions.sqlite3` beside `sessions.db`) the layout
- * will not pick between, a session/runtime/blob/metadata/console store that
- * failed to open where older gateways silently fell back to in-memory, or
- * an uncreatable state root. The message names the remediation — run the
- * storage doctor (`meta/storage/doctor`) for twins, fix the database
- * file, or declare the ephemeral choice explicitly (e.g.
+ * At start the refusals are deliberate (storage-unification fail-closed
+ * posture): file-name twins (e.g. `sessions.sqlite3` beside `sessions.db`)
+ * the layout will not pick between, a session/runtime/blob/metadata/console
+ * store that failed to open where older gateways silently fell back to
+ * in-memory, or an uncreatable state root. The message names the
+ * remediation: run the storage doctor (`meta/storage/doctor`) for twins, fix
+ * the database file, or declare the ephemeral choice explicitly (e.g.
  * `runtimeStore.memory()`).
+ *
+ * After `storage-migrate-native`, the gateway's first boot carries out the
+ * migration's first-boot manifest, and `kind` names its refusals:
+ * - `"first_boot_manifest_unreadable"`: the manifest at `path` cannot be
+ *   read, so no identity wakes;
+ * - `"first_boot_row_refused"`: Core contradicts the manifest row for
+ *   `identity` (`rowKind`, `manifestSession` and `coreSession` say how), so
+ *   that identity's wakes and sends are refused;
+ * - `"first_boot_row_pending"`: `operation` (`"reset"`, `"delete_identity"`
+ *   or a delivery verb) waits until the row for `identity` is carried out.
+ *   `waitingFor` says what it waits for, and `remedy` what to do:
+ *   `"add_to_roster"` (no roster lists the identity) or `"wake_identity"`
+ *   (the roster lists it and its row waits to be carried out). Retryable.
+ *
+ * `retryable` is `true` only when the gateway says so. The other fields are
+ * `null` when the gateway did not send them; the full refusal stays
+ * available as `data`.
  */
 export class StorageResolutionError extends RpcError {
+  readonly kind: string | null;
+  readonly identity: string | null;
+  readonly rowKind: string | null;
+  readonly manifestSession: string | null;
+  readonly coreSession: string | null;
+  readonly operation: string | null;
+  readonly path: string | null;
+  readonly waitingFor: string | null;
+  readonly remedy: string | null;
+  readonly retryable: boolean;
+
   constructor(
     message: string,
     requestId = "",
@@ -397,6 +427,19 @@ export class StorageResolutionError extends RpcError {
   ) {
     super(STORAGE_RESOLUTION_CODE, message, requestId, method, data);
     this.name = "StorageResolutionError";
+    this.kind = dataString(data, "kind");
+    this.identity = dataString(data, "identity");
+    this.rowKind = dataString(data, "row_kind");
+    this.manifestSession = dataString(data, "manifest_session");
+    this.coreSession = dataString(data, "core_session");
+    this.operation = dataString(data, "operation");
+    this.path = dataString(data, "path");
+    this.waitingFor = dataString(data, "waiting_for");
+    this.remedy = dataString(data, "remedy");
+    this.retryable =
+      typeof data === "object" &&
+      data !== null &&
+      (data as Record<string, unknown>).retryable === true;
   }
 }
 
@@ -551,6 +594,157 @@ export class WorkGraphConflictError extends RpcError {
   ) {
     super(WORKGRAPH_CONFLICT_CODE, message, requestId, method, data);
     this.name = "WorkGraphConflictError";
+  }
+}
+
+function dataString(data: unknown, key: string): string | null {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
+  const value = (data as Record<string, unknown>)[key];
+  return typeof value === "string" ? value : null;
+}
+
+/**
+ * The identity's durable session cannot be resumed. The refusal is final.
+ *
+ * Core still holds the identity's history, but cannot resume the session it
+ * names (`reason` is `"archived_not_revivable"` or
+ * `"contradictory_durable_authority"`; a newer reason is kept as sent).
+ * Nothing was spawned, and a retry ends the same way. The remedy (`remedy`,
+ * `"delete_identity"`) starts the identity on a fresh session. `identity`,
+ * `sessionId`, `reason` and `remedy` are `null` when the gateway sent no
+ * refusal data; the full refusal stays available as `data`.
+ */
+export class IdentityUnresumableError extends RpcError {
+  readonly retryable = false;
+  readonly identity: string | null;
+  readonly sessionId: string | null;
+  readonly reason:
+    | "archived_not_revivable"
+    | "contradictory_durable_authority"
+    | (string & {})
+    | null;
+  readonly remedy: string | null;
+
+  constructor(
+    message: string,
+    requestId = "",
+    method = "",
+    data?: unknown,
+  ) {
+    super(IDENTITY_UNRESUMABLE_CODE, message, requestId, method, data);
+    this.name = "IdentityUnresumableError";
+    this.identity = dataString(data, "identity");
+    this.sessionId = dataString(data, "session_id");
+    this.reason = dataString(data, "reason");
+    this.remedy = dataString(data, "remedy");
+  }
+}
+
+/**
+ * Core's member history or the session resume could not be read right now.
+ *
+ * Retryable: nothing was spawned and the identity's history is untouched, so
+ * the same call can be retried. `kind` is `"identity_history_unavailable"`
+ * when Core's history read failed, `"identity_wake_retryable"` when the
+ * wake failed transiently (resuming `sessionId`, or starting fresh when
+ * `sessionId` is `null`), or `"identity_session_absent"` when a delivery
+ * reached a member whose session `sessionId` Core holds no durable copy of:
+ * nothing was delivered, and the next delivery starts the identity's fresh
+ * session. A failed read of the whole roster's history names no `identity`.
+ * `kind`, `identity` and `sessionId` are `null` when the gateway did not send
+ * them.
+ */
+export class IdentityHistoryUnavailableError extends RpcError {
+  readonly retryable = true;
+  readonly kind: string | null;
+  readonly identity: string | null;
+  readonly sessionId: string | null;
+
+  constructor(
+    message: string,
+    requestId = "",
+    method = "",
+    data?: unknown,
+  ) {
+    super(IDENTITY_HISTORY_UNAVAILABLE_CODE, message, requestId, method, data);
+    this.name = "IdentityHistoryUnavailableError";
+    this.kind = dataString(data, "kind");
+    this.identity = dataString(data, "identity");
+    this.sessionId = dataString(data, "session_id");
+  }
+}
+
+/**
+ * The identity is managed by a host intent declaration in Core.
+ *
+ * Core holds intent for the identity (the host adopted it), so Meta's
+ * lifecycle verbs refuse to act on it; the host's reconciler owns it.
+ * `identity` is `null` when the gateway did not send it.
+ */
+export class IdentityHostAdoptedError extends RpcError {
+  readonly retryable = false;
+  readonly identity: string | null;
+
+  constructor(
+    message: string,
+    requestId = "",
+    method = "",
+    data?: unknown,
+  ) {
+    super(IDENTITY_HOST_ADOPTED_CODE, message, requestId, method, data);
+    this.name = "IdentityHostAdoptedError";
+    this.identity = dataString(data, "identity");
+  }
+}
+
+/**
+ * The identity's wake is held until an operator acts.
+ *
+ * Core kept the identity's session and its content but will not resume it on
+ * its own, and a retry ends the same way. The identity reads `dormant` and
+ * its status carries the refusal. `kind` names the hold:
+ *
+ * - `"mob_member_session_repair_required"`: the session's committed document
+ *   fails Core's audited-endpoint check; `operatorPath` lists the repair, then
+ *   `meta/reload_member`;
+ * - `"mob_member_session_resume_held"`: Core holds the session's resume;
+ *   `durableResumeHold` or `resumeUnavailableReason` names why;
+ * - `"identity_role_migration_refused"`: the roster changed the identity's
+ *   profile without a declared role migration.
+ *
+ * `kind`, `identity`, `sessionId`, `durableResumeHold` and
+ * `resumeUnavailableReason` are `null` when the gateway did not send them; the
+ * full refusal stays available as `data`.
+ */
+export class IdentityWakeHeldError extends RpcError {
+  readonly retryable = false;
+  readonly kind: string | null;
+  readonly identity: string | null;
+  readonly sessionId: string | null;
+  readonly durableResumeHold: string | null;
+  readonly resumeUnavailableReason: string | null;
+  readonly operatorPath: readonly string[];
+
+  constructor(
+    message: string,
+    requestId = "",
+    method = "",
+    data?: unknown,
+  ) {
+    super(-32603, message, requestId, method, data);
+    this.name = "IdentityWakeHeldError";
+    this.kind = dataString(data, "kind");
+    this.identity = dataString(data, "identity");
+    this.sessionId = dataString(data, "session_id");
+    this.durableResumeHold = dataString(data, "durable_resume_hold");
+    this.resumeUnavailableReason = dataString(data, "resume_unavailable_reason");
+    const operatorPath =
+      typeof data === "object" && data !== null && !Array.isArray(data)
+        ? (data as Record<string, unknown>).operator_path
+        : undefined;
+    this.operatorPath = Array.isArray(operatorPath)
+      ? operatorPath.filter((step): step is string => typeof step === "string")
+      : [];
   }
 }
 

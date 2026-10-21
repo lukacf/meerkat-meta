@@ -763,6 +763,43 @@ class CiWorkflowTests(unittest.TestCase):
             block,
         )
 
+    def test_the_continuity_export_scripts_run_their_tests_in_ci(self):
+        """The standalone continuity export scripts ship to hosts that run
+        them once, before they upgrade, with no other check behind them;
+        so does the blob restore beside them, which a restore from a
+        continuity mirror runs once.
+        fmt-lint runs on every pull request and push; ci-changes.py lets
+        their changes reach no lane on that promise. Each suite runs twice:
+        on the runner's own Python and Node.js, and again, last in the job,
+        on the oldest runtimes a 0.9.3 host may run them on, the 0.9.3 SDKs'
+        floors (Python 3.10 and Node.js 18)."""
+        python_suite = "- run: python3 tools/continuity-export/test_continuity_export.py\n"
+        restore_suite = "- run: python3 tools/continuity-export/test_restore_blobs.py\n"
+        node_suite = "- run: node --test tools/continuity-export/continuity-export.test.mjs\n"
+        lines = job_block("fmt-lint").splitlines()
+        # job_block ends at the next job's header, below the comment above it.
+        while lines and (not lines[-1].strip() or lines[-1].startswith("  #")):
+            lines.pop()
+        steps = "\n".join(lines) + "\n"
+        floor_rows = re.search(
+            "      - uses: actions/setup-python@[0-9a-f]{40} # v5\n"
+            "        with:\n"
+            '          python-version: "3\\.10"\n'
+            f"      {re.escape(python_suite)}"
+            f"      {re.escape(restore_suite)}"
+            "      - uses: actions/setup-node@[0-9a-f]{40} # v4\n"
+            "        with:\n"
+            '          node-version: "18"\n'
+            f"      {re.escape(node_suite)}"
+            r"\Z", steps)
+        self.assertIsNotNone(floor_rows, "fmt-lint must end with the suites on the floor runtimes")
+        before = steps[:floor_rows.start()]
+        for suite in (python_suite, restore_suite, node_suite):
+            self.assertEqual(before.count(suite), 1, suite)
+        # The first runs use the runner's own runtimes.
+        self.assertNotIn("actions/setup-python@", before)
+        self.assertNotIn("actions/setup-node@", before)
+
     def test_the_workspace_lint_runs_in_its_own_rust_lane_job(self):
         """fmt-lint runs on every pull request and compiles nothing; the
         workspace clippy runs once, in the clippy job, when a Rust change

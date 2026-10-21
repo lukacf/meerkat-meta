@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_stream::stream;
 use axum::extract::{Path, Query, State};
@@ -24,13 +24,16 @@ use tokio::sync::broadcast;
 
 use crate::access::{
     ACTION_AGENT_VIEW, ACTION_MOB_OBSERVE, ACTION_WORKGRAPH_VIEW, AccessController, AccessView,
-    AgentResourceAttributes,
+    AgentResourceAttributes, LiveAccessView,
 };
+use crate::auth::session_fence::ConsoleSessionFences;
 use crate::console_aggregator::{
     AllowAllConsoleVisibilityPolicy, ConsoleCursor, ConsoleFrame, ConsoleFrameSource,
     ConsoleFrameSourceKind, ConsoleFrameStatus, ConsoleVisibilityPolicy, NewConsoleFrame,
 };
-use crate::runtime::{RuntimeDecisionState, extract_bearer_token_from_header};
+use crate::runtime::{
+    ConsoleCallerVerification, RuntimeDecisionState, extract_bearer_token_from_header,
+};
 use crate::unified_runtime::EventQuery;
 use crate::unified_runtime::mob_events::{
     MOB_EVENTS_STREAM_PATH, MobEventsStore, ProjectedMobEvent,
@@ -50,6 +53,220 @@ pub(crate) use crate::mob_handle_runtime::console_agent_event_payload;
 /// Lossy WorkGraph wake stream. Durable WorkGraph pull methods remain the
 /// only state and replay authority.
 pub const WORKGRAPH_FACTS_STREAM_PATH: &str = "/meta/workgraph/facts/stream";
+
+/// What woke a stream that follows the access policy and its caller's
+/// authentication.
+pub(crate) enum StreamWake<T> {
+    /// The verifier no longer accepts the token the stream's caller opened
+    /// it with; the stream ends.
+    AuthenticationLapsed,
+    /// The access owner committed a change; the stream's view is rebuilt.
+    PolicyChanged,
+    /// The stream's source produced this.
+    Item(T),
+}
+
+/// Wait for the stream's next item, or, while there is none, for a
+/// committed access change or the lapse of the caller's authentication.
+/// Each is watched whether or not the other exists. `next` must be
+/// cancellation-safe: a change or a lapse drops it.
+pub(crate) async fn wake_or_policy_change<F: Future>(
+    live_view: Option<&mut LiveAccessView>,
+    authentication: Option<&mut StreamAuthentication>,
+    next: F,
+) -> StreamWake<F::Output> {
+    let policy_changed = async {
+        match live_view {
+            Some(live_view) => live_view.changed().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        () = authentication_lapsed(authentication) => StreamWake::AuthenticationLapsed,
+        () = policy_changed => StreamWake::PolicyChanged,
+        item = next => StreamWake::Item(item),
+    }
+}
+
+/// Completes once the caller's authentication lapsed; never for a stream
+/// whose caller no token identified.
+pub(crate) async fn authentication_lapsed(authentication: Option<&mut StreamAuthentication>) {
+    match authentication {
+        Some(authentication) => authentication.lapsed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether the stream's caller is still authenticated. A stream checks it
+/// after the last await of a frame's processing, before it decides the
+/// frame. A caller no token identified always is.
+pub(crate) fn still_authenticated(authentication: Option<&mut StreamAuthentication>) -> bool {
+    authentication.is_none_or(StreamAuthentication::still_current)
+}
+
+/// The wall clock a stream reads its caller's token deadline against.
+pub(crate) type WallClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
+
+/// The authentication of a stream's caller, held for as long as the stream
+/// stays open. A stream whose caller a token identified ends once the
+/// Console's verifier no longer accepts that token: the moment a request
+/// with the token is refused, on its expiry or on a session fence set for
+/// its principal. It is built from the verifier's retained verification and
+/// asks the verifier itself, never reads the token, and does not depend on
+/// an access controller.
+pub(crate) struct StreamAuthentication {
+    verification: ConsoleCallerVerification,
+    /// The first instant the verifier refuses the token, from its latest
+    /// answer; `None` when the token has no `exp`.
+    refused_from: Option<SystemTime>,
+    /// Changes after each change to the Console's session fence record;
+    /// `None` once the record is gone and can change no more.
+    fence_changes: Option<tokio::sync::watch::Receiver<u64>>,
+    lapsed: bool,
+    clock: WallClock,
+}
+
+impl StreamAuthentication {
+    pub(crate) fn new(verification: ConsoleCallerVerification) -> Self {
+        Self::with_clock(verification, Arc::new(SystemTime::now))
+    }
+
+    /// [`Self::new`] reading the wall clock through `clock`.
+    pub(crate) fn with_clock(verification: ConsoleCallerVerification, clock: WallClock) -> Self {
+        Self {
+            refused_from: verification.refused_from(),
+            fence_changes: Some(verification.session_fence_changes()),
+            verification,
+            lapsed: false,
+            clock,
+        }
+    }
+
+    /// Whether the caller is still authenticated now. After a change to the
+    /// session fence record the verifier decides at once. Otherwise, before
+    /// the verifier's deadline this only reads the clock; from the deadline
+    /// on, the verifier decides, with the acceptance a request goes through.
+    pub(crate) fn still_current(&mut self) -> bool {
+        if self.lapsed {
+            return false;
+        }
+        let now = (self.clock)();
+        if self.take_fence_change() {
+            return self.verify(now);
+        }
+        let Some(refused_from) = self.refused_from else {
+            return true;
+        };
+        now < refused_from || self.verify(now)
+    }
+
+    /// Whether the session fence record changed since the verifier last
+    /// answered; marks the change seen.
+    fn take_fence_change(&mut self) -> bool {
+        let Some(fence_changes) = self.fence_changes.as_mut() else {
+            return false;
+        };
+        match fence_changes.has_changed() {
+            Ok(true) => {
+                fence_changes.mark_unchanged();
+                true
+            }
+            Ok(false) => false,
+            Err(_) => {
+                self.fence_changes = None;
+                false
+            }
+        }
+    }
+
+    /// Completes once the verifier no longer accepts the caller's token. It
+    /// sleeps until the verifier's deadline (never, for a token without
+    /// `exp`) or until the session fence record changes, whichever comes
+    /// first, then asks the verifier. A wake the verifier still accepts
+    /// (another principal's fence, or a wall clock set back while the stream
+    /// slept) waits again, for the deadline of the verifier's fresh answer
+    /// and the next fence change. Cancellation-safe: dropped while it waits,
+    /// it changes nothing.
+    pub(crate) async fn lapsed(&mut self) {
+        let mut woken_at_deadline = false;
+        while !self.lapsed {
+            let wait = self.refused_from.map(|refused_from| {
+                let wait = refused_from
+                    .duration_since((self.clock)())
+                    .unwrap_or_default();
+                if woken_at_deadline && wait.is_zero() {
+                    // The verifier accepted the token at an instant it names
+                    // as refused: ask again a second later, never in a busy
+                    // loop.
+                    Duration::from_secs(1)
+                } else {
+                    wait
+                }
+            });
+            let deadline = async {
+                match wait {
+                    Some(wait) if !wait.is_zero() => tokio::time::sleep(wait).await,
+                    Some(_) => {}
+                    None => std::future::pending().await,
+                }
+            };
+            let fence_changed = async {
+                match self.fence_changes.as_mut() {
+                    Some(fence_changes) => fence_changes.changed().await.is_ok(),
+                    None => std::future::pending().await,
+                }
+            };
+            let woken_by_fence = tokio::select! {
+                biased;
+                changed = fence_changed => Some(changed),
+                () = deadline => None,
+            };
+            match woken_by_fence {
+                Some(true) => {
+                    if let Some(fence_changes) = self.fence_changes.as_mut() {
+                        fence_changes.mark_unchanged();
+                    }
+                }
+                // The record is gone and can change no more.
+                Some(false) => {
+                    self.fence_changes = None;
+                    continue;
+                }
+                None => woken_at_deadline = true,
+            }
+            self.verify((self.clock)());
+        }
+    }
+
+    /// Ask the verifier at `now` and keep its answer: a fresh deadline, or
+    /// the lapse.
+    fn verify(&mut self, now: SystemTime) -> bool {
+        match self.verification.current_at(now) {
+            Some(current) => self.refused_from = current.refused_from,
+            None => self.lapsed = true,
+        }
+        !self.lapsed
+    }
+}
+
+/// Whether `view` lets its caller watch one agent's events, under the name
+/// the request used and the member that name resolved to.
+fn agent_stream_allowed(view: &AccessView, agent_id: &str, policy_identity: &str) -> bool {
+    !view.enforced()
+        || (view.allows_agent(ACTION_AGENT_VIEW, agent_id)
+            && view.allows_agent(ACTION_AGENT_VIEW, policy_identity))
+}
+
+/// Whether `view` lets its caller watch the mob-wide streams.
+fn mob_stream_allowed(view: &AccessView) -> bool {
+    !view.enforced() || view.allows(ACTION_MOB_OBSERVE)
+}
+
+/// Whether `view` lets its caller watch WorkGraph facts.
+fn workgraph_stream_allowed(view: &AccessView) -> bool {
+    !view.enforced() || view.allows(ACTION_WORKGRAPH_VIEW)
+}
 
 pub fn agent_event_sse(interaction_id: &str, seq: u64, event: &AgentEvent) -> Event {
     let event_name = agent_event_name(event);
@@ -247,6 +464,8 @@ fn agent_sse_resume_cursor(headers: &HeaderMap) -> meerkat_core::comms::SessionE
 struct AgentSseState {
     subscribe_fn: AgentEventReplaySubscribeFn,
     decisions: Option<RuntimeDecisionState>,
+    /// The Console's session fence record the route's token checks read.
+    session_fences: ConsoleSessionFences,
     access: Option<AccessController>,
     visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
     /// Live mob runtime used to prime the access attribute cache at
@@ -259,6 +478,9 @@ struct AgentSseState {
     prime_identity_runtime: Option<Arc<crate::identity_first::IdentityRuntime>>,
 }
 
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 pub fn agent_events_sse_router(
     subscribe_fn: AgentEventSubscribeFn,
     decisions: Option<RuntimeDecisionState>,
@@ -266,6 +488,9 @@ pub fn agent_events_sse_router(
     agent_events_sse_router_with_access(subscribe_fn, decisions, None)
 }
 
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 pub fn agent_events_sse_router_with_access(
     subscribe_fn: AgentEventSubscribeFn,
     decisions: Option<RuntimeDecisionState>,
@@ -278,6 +503,7 @@ pub fn agent_events_sse_router_with_access(
         None,
         None,
         Arc::new(AllowAllConsoleVisibilityPolicy),
+        ConsoleSessionFences::detached(),
     )
 }
 
@@ -288,12 +514,14 @@ pub(crate) fn agent_events_sse_router_with_access_and_priming(
     prime_runtime: Option<MobRuntime>,
     prime_identity_runtime: Option<Arc<crate::identity_first::IdentityRuntime>>,
     visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
+    session_fences: ConsoleSessionFences,
 ) -> Router {
     Router::new()
         .route("/agents/{agent_id}/events", get(agent_events_sse_handler))
         .with_state(AgentSseState {
             subscribe_fn,
             decisions,
+            session_fences,
             access,
             visibility_policy,
             prime_runtime,
@@ -307,8 +535,12 @@ async fn agent_events_sse_handler(
     uri: Uri,
     Path(agent_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
-    let access_view = sse_access_context(
+    let SseCaller {
+        access_view,
+        mut authentication,
+    } = sse_access_context(
         state.decisions.as_ref(),
+        &state.session_fences,
         state.access.as_ref(),
         &headers,
         &uri,
@@ -354,16 +586,21 @@ async fn agent_events_sse_handler(
     {
         crate::http_console::prime_current_runtime_aliases(identity_runtime, controller).await;
     }
+    // The stream decides under the policy committed before each event, not
+    // the one the request read; the gate below reads the same view.
+    let mut live_view = access_view.map(LiveAccessView::new);
     // The access rules judge the member the request resolved to as well
     // as the spelling it used: a runtime alias is not a name the rules
     // describe, the member it names is.
-    if access_view.as_ref().is_some_and(|view| {
-        view.enforced()
-            && (!view.allows_agent(ACTION_AGENT_VIEW, &agent_id)
-                || !view.allows_agent(ACTION_AGENT_VIEW, &policy_identity))
-    }) {
+    if live_view
+        .as_ref()
+        .is_some_and(|live| !agent_stream_allowed(live.view(), &agent_id, &policy_identity))
+    {
         return Err(sse_access_denied(ACTION_AGENT_VIEW));
     }
+    let reprime_runtime = state.prime_runtime.clone();
+    let reprime_identity_runtime = state.prime_identity_runtime.clone();
+    let reprime_access = state.access.clone();
 
     let AgentEventReplay {
         epoch,
@@ -376,7 +613,51 @@ async fn agent_events_sse_handler(
     let stream = stream! {
         let mut seq = 0_u64;
         tokio::pin!(event_stream);
-        while let Some(envelope) = event_stream.next().await {
+        loop {
+            let (policy_changed, envelope) = match wake_or_policy_change(
+                live_view.as_mut(),
+                authentication.as_mut(),
+                event_stream.next(),
+            )
+            .await
+            {
+                StreamWake::AuthenticationLapsed | StreamWake::Item(None) => break,
+                StreamWake::PolicyChanged => (true, None),
+                StreamWake::Item(Some(envelope)) => (false, Some(envelope)),
+            };
+            if let Some(live) = live_view.as_mut() {
+                // Read the roster again after each committed change, until
+                // none lands during the reads: the gate below then reads the
+                // configuration committed before the event is sent.
+                let mut changed = policy_changed;
+                while live.refresh() || changed {
+                    changed = false;
+                    prime_sse_access_cache(reprime_runtime.as_ref(), reprime_access.as_ref())
+                        .await;
+                    if let (Some(identity_runtime), Some(controller)) =
+                        (reprime_identity_runtime.as_ref(), reprime_access.as_ref())
+                    {
+                        crate::http_console::prime_current_runtime_aliases(
+                            identity_runtime,
+                            controller,
+                        )
+                        .await;
+                    }
+                }
+                // A revoked grant ends the stream, so the client reconnects
+                // under the current policy.
+                if !agent_stream_allowed(live.view(), &agent_id, &policy_identity) {
+                    break;
+                }
+            }
+            // A lapsed token ends the stream too, so the client reconnects
+            // with a current one.
+            if !still_authenticated(authentication.as_mut()) {
+                break;
+            }
+            let Some(envelope) = envelope else {
+                continue;
+            };
             let event_name = agent_event_type(&envelope.payload).to_string();
             let Some(payload) = project_sse_payload(
                 visibility_policy.as_ref(),
@@ -428,12 +709,17 @@ pub type MobEventSubscribeFn = Arc<dyn Fn() -> MobEventSubscribeFuture + Send + 
 struct MobSseState {
     subscribe_fn: MobEventSubscribeFn,
     decisions: Option<RuntimeDecisionState>,
+    /// See [`AgentSseState::session_fences`].
+    session_fences: ConsoleSessionFences,
     access: Option<AccessController>,
     visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
     /// See [`AgentSseState::prime_runtime`].
     prime_runtime: Option<MobRuntime>,
 }
 
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 pub fn mob_events_sse_router(
     subscribe_fn: MobEventSubscribeFn,
     decisions: Option<RuntimeDecisionState>,
@@ -441,6 +727,9 @@ pub fn mob_events_sse_router(
     mob_events_sse_router_with_access(subscribe_fn, decisions, None)
 }
 
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 pub fn mob_events_sse_router_with_access(
     subscribe_fn: MobEventSubscribeFn,
     decisions: Option<RuntimeDecisionState>,
@@ -452,6 +741,7 @@ pub fn mob_events_sse_router_with_access(
         access,
         None,
         Arc::new(AllowAllConsoleVisibilityPolicy),
+        ConsoleSessionFences::detached(),
     )
 }
 
@@ -461,12 +751,14 @@ pub(crate) fn mob_events_sse_router_with_access_and_priming(
     access: Option<AccessController>,
     prime_runtime: Option<MobRuntime>,
     visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
+    session_fences: ConsoleSessionFences,
 ) -> Router {
     Router::new()
         .route("/mob/events", get(mob_events_sse_handler))
         .with_state(MobSseState {
             subscribe_fn,
             decisions,
+            session_fences,
             access,
             visibility_policy,
             prime_runtime,
@@ -512,9 +804,45 @@ pub(crate) async fn project_structural_envelope_for_console(
     projection: ProjectedMobEvent,
     require_exact_authority: bool,
 ) -> Option<crate::MobStructuralEventEnvelope> {
-    let access_view = access_view.filter(|view| view.enforced());
-    let mut envelope = projection.envelope;
-    let policy_identity = if let Some(identity) = envelope.agent_identity.as_deref() {
+    project_structural_member(
+        handle,
+        runtime,
+        visibility_policy,
+        projection,
+        require_exact_authority,
+    )
+    .await
+    .decide(visibility_policy, access_view)
+}
+
+/// One structural event with the member it is attributed to resolved: the
+/// part of its projection that awaits, done before the access decision.
+pub(crate) struct ProjectedStructuralEvent {
+    envelope: crate::MobStructuralEventEnvelope,
+    member: StructuralEventMember,
+}
+
+enum StructuralEventMember {
+    /// A mob-level event, attributed to no member.
+    Mob,
+    /// The exact live member that emitted the event.
+    Exact(crate::http_console::SseMemberAuthorizationProjection),
+    /// No exact authority, only the member's console identity and
+    /// visibility by alias, which an enforced view never accepts.
+    ByAlias { identity: String, visible: bool },
+    /// The member can no longer be resolved.
+    Unresolved,
+}
+
+pub(crate) async fn project_structural_member(
+    handle: &MobHandle,
+    runtime: Option<&MobRuntime>,
+    visibility_policy: &dyn ConsoleVisibilityPolicy,
+    projection: ProjectedMobEvent,
+    require_exact_authority: bool,
+) -> ProjectedStructuralEvent {
+    let envelope = projection.envelope;
+    let member = if let Some(identity) = envelope.agent_identity.as_deref() {
         let exact = if let Some(authority) = projection.member_authority.as_ref() {
             crate::http_console::sse_member_authorization_projection(
                 handle,
@@ -529,41 +857,86 @@ pub(crate) async fn project_structural_envelope_for_console(
             None
         };
         if let Some(exact) = exact {
-            if !sse_access_allows_agent_attributes(access_view, &exact.attributes) || !exact.visible
-            {
-                return None;
-            }
-            exact.identity
-        } else {
+            StructuralEventMember::Exact(exact)
+        } else if require_exact_authority {
             // Protected projections require a generation/fence-bound live
-            // roster snapshot. The public low-level AllowAll router retains
-            // its legacy behavior for structural variants that do not carry
-            // a fence token on the upstream event.
-            if require_exact_authority || access_view.is_some() {
-                return None;
-            }
-            let (console_identity, visible) = crate::http_console::sse_member_identity_visibility(
+            // roster snapshot.
+            StructuralEventMember::Unresolved
+        } else {
+            // The public low-level AllowAll router retains its legacy
+            // behavior for structural variants that do not carry a fence
+            // token on the upstream event.
+            match crate::http_console::sse_member_identity_visibility(
                 handle,
                 visibility_policy,
                 identity,
             )
-            .await?;
-            if !visible {
-                return None;
+            .await
+            {
+                Some((identity, visible)) => StructuralEventMember::ByAlias { identity, visible },
+                None => StructuralEventMember::Unresolved,
             }
-            console_identity
         }
     } else {
-        crate::console_contracts::SYSTEM_EVENT_IDENTITY.to_string()
+        StructuralEventMember::Mob
     };
-    envelope.data = project_sse_payload(
-        visibility_policy,
-        &policy_identity,
-        &envelope.kind,
-        envelope.timestamp_ms,
-        envelope.data,
-    )?;
-    Some(envelope)
+    ProjectedStructuralEvent { envelope, member }
+}
+
+impl ProjectedStructuralEvent {
+    /// Decide the event under `access_view` and project its payload. Nothing
+    /// here awaits, so a stream decides under the view it settled after its
+    /// last await.
+    pub(crate) fn decide(
+        self,
+        visibility_policy: &dyn ConsoleVisibilityPolicy,
+        access_view: Option<&AccessView>,
+    ) -> Option<crate::MobStructuralEventEnvelope> {
+        let access_view = access_view.filter(|view| view.enforced());
+        let mut envelope = self.envelope;
+        let policy_identity = match self.member {
+            StructuralEventMember::Mob => {
+                crate::console_contracts::SYSTEM_EVENT_IDENTITY.to_string()
+            }
+            StructuralEventMember::Exact(exact) => {
+                if !sse_access_allows_agent_attributes(access_view, &exact.attributes)
+                    || !exact.visible
+                {
+                    return None;
+                }
+                exact.identity
+            }
+            StructuralEventMember::ByAlias { identity, visible } => {
+                if access_view.is_some() || !visible {
+                    return None;
+                }
+                identity
+            }
+            StructuralEventMember::Unresolved => return None,
+        };
+        envelope.data = project_sse_payload(
+            visibility_policy,
+            &policy_identity,
+            &envelope.kind,
+            envelope.timestamp_ms,
+            envelope.data,
+        )?;
+        Some(envelope)
+    }
+}
+
+/// Read the live roster into the shared attribute cache for the structural
+/// stream: through the runtime when there is one, else through the handle.
+async fn prime_structural_access_cache(
+    runtime: Option<&MobRuntime>,
+    handle: &MobHandle,
+    access: Option<&AccessController>,
+) {
+    if runtime.is_some() {
+        prime_sse_access_cache(runtime, access).await;
+    } else if let Some(controller) = access.filter(|controller| controller.enabled()) {
+        crate::http_console::prime_access_cache_from_handle(handle, controller).await;
+    }
 }
 
 async fn mob_events_sse_handler(
@@ -571,27 +944,33 @@ async fn mob_events_sse_handler(
     headers: HeaderMap,
     uri: Uri,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
-    let access_view = sse_access_context(
+    let SseCaller {
+        access_view,
+        mut authentication,
+    } = sse_access_context(
         state.decisions.as_ref(),
+        &state.session_fences,
         state.access.as_ref(),
         &headers,
         &uri,
     )
     .map_err(|()| sse_unauthorized("mob events stream requires a valid auth token"))?;
     prime_sse_access_cache(state.prime_runtime.as_ref(), state.access.as_ref()).await;
+    // The stream decides under the policy committed before each event, not
+    // the one the request read; the gate below reads the same view.
+    let mut live_view = access_view.map(LiveAccessView::new);
     // `mob.observe` gates access to the merged stream surface. The events
     // flowing through it carry the same rich per-agent payload as
     // `/agents/{id}/events`, so each one is still filtered by `agent.view`
     // on its source — otherwise a `mob.observe` grant would silently defeat
     // a per-agent view denial. "Observe everything" is expressed by also
     // granting `agent.view` on `*`.
-    if access_view
+    if live_view
         .as_ref()
-        .is_some_and(|view| view.enforced() && !view.allows(ACTION_MOB_OBSERVE))
+        .is_some_and(|live| !mob_stream_allowed(live.view()))
     {
         return Err(sse_access_denied(ACTION_MOB_OBSERVE));
     }
-    let stream_view = access_view.filter(AccessView::enforced);
     // Captured so the long-lived stream can re-prime the shared attribute cache
     // for members spawned AFTER the one-time subscribe prime (the view reads
     // attributes through the controller's shared cache).
@@ -613,7 +992,38 @@ async fn mob_events_sse_handler(
         // to a new generated runtime source, so a respawn cannot inherit stale
         // authorization attributes from the previous embodiment.
         let mut authorized_source_by_alias = std::collections::HashMap::<String, String>::new();
-        while let Some(attributed) = router_handle.event_rx.recv().await {
+        loop {
+            let (policy_changed, attributed) = match wake_or_policy_change(
+                live_view.as_mut(),
+                authentication.as_mut(),
+                router_handle.event_rx.recv(),
+            )
+            .await
+            {
+                StreamWake::AuthenticationLapsed | StreamWake::Item(None) => break,
+                StreamWake::PolicyChanged => (true, None),
+                StreamWake::Item(Some(attributed)) => (false, Some(attributed)),
+            };
+            if let Some(live) = live_view.as_mut() {
+                let mut changed = policy_changed;
+                while live.refresh() || changed {
+                    changed = false;
+                    prime_sse_access_cache(reprime_runtime.as_ref(), reprime_access.as_ref())
+                        .await;
+                }
+                // A revoked `mob.observe` ends the stream, so the client
+                // reconnects under the current policy.
+                if !mob_stream_allowed(live.view()) {
+                    break;
+                }
+            }
+            let Some(attributed) = attributed else {
+                continue;
+            };
+            let enforced = live_view
+                .as_ref()
+                .and_then(LiveAccessView::enforced)
+                .is_some();
             // Decode the comms-safe roster member id back to the public
             // alias space: SDK `EventStream` consumers filter by alias, and
             // fail-closed per-agent ABAC view rules are written against
@@ -630,10 +1040,10 @@ async fn mob_events_sse_handler(
                 .insert(authorization_alias.clone(), concrete_source.clone())
                 .as_deref()
                 != Some(concrete_source.as_str());
-            if stream_view.is_some() && source_changed {
+            if enforced && source_changed {
                 prime_sse_access_cache(reprime_runtime.as_ref(), reprime_access.as_ref()).await;
             }
-            let policy_identity = if let Some(runtime) = visibility_runtime.as_ref() {
+            let exact = if let Some(runtime) = visibility_runtime.as_ref() {
                 let Some(exact) = crate::http_console::sse_member_authorization_projection(
                     &runtime.handle(),
                     Some(runtime),
@@ -649,7 +1059,27 @@ async fn mob_events_sse_handler(
                     // this event's exact runtime/fence source.
                     continue;
                 };
-                if !sse_access_allows_agent_attributes(stream_view.as_ref(), &exact.attributes)
+                Some(exact)
+            } else {
+                None
+            };
+            // Settled after the last await: the event is decided under the
+            // configuration committed before it is sent.
+            if let Some(live) = live_view.as_mut() {
+                while live.refresh() {
+                    prime_sse_access_cache(reprime_runtime.as_ref(), reprime_access.as_ref())
+                        .await;
+                }
+                if !mob_stream_allowed(live.view()) {
+                    break;
+                }
+            }
+            if !still_authenticated(authentication.as_mut()) {
+                break;
+            }
+            let stream_view = live_view.as_ref().and_then(LiveAccessView::enforced);
+            let policy_identity = if let Some(exact) = exact {
+                if !sse_access_allows_agent_attributes(stream_view, &exact.attributes)
                     || !exact.visible
                 {
                     continue;
@@ -770,6 +1200,7 @@ mod tests {
             None,
             None,
             Arc::new(AllowAllConsoleVisibilityPolicy),
+            ConsoleSessionFences::detached(),
         );
         let read_ids = |response: axum::response::Response| async move {
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -934,7 +1365,12 @@ mod tests {
     async fn mandatory_workgraph_serialization_failure_closes_without_a_fallback_body() {
         let hub = WorkGraphFactHub::new();
         let receiver = hub.subscribe();
-        let stream = workgraph_facts_event_stream(receiver, forced_workgraph_serialization_failure);
+        let stream = workgraph_facts_event_stream(
+            receiver,
+            forced_workgraph_serialization_failure,
+            None,
+            None,
+        );
         futures::pin_mut!(stream);
 
         assert!(
@@ -961,8 +1397,12 @@ mod tests {
             "retained synthetic fact is queued",
         );
 
-        let stream =
-            workgraph_facts_event_stream(receiver, forced_lag_resync_serialization_failure);
+        let stream = workgraph_facts_event_stream(
+            receiver,
+            forced_lag_resync_serialization_failure,
+            None,
+            None,
+        );
         futures::pin_mut!(stream);
         assert!(
             stream.next().await.is_some(),
@@ -1035,6 +1475,8 @@ impl MobStructuralStreamQuery {
 struct WorkGraphFactsSseState {
     hub: WorkGraphFactHub,
     decisions: Option<RuntimeDecisionState>,
+    /// See [`AgentSseState::session_fences`].
+    session_fences: ConsoleSessionFences,
     access: Option<AccessController>,
 }
 
@@ -1045,10 +1487,30 @@ struct WorkGraphFactsSseState {
 /// `workgraph.resync_required` and `reason=initial_sync`; clients establish
 /// state through the durable WorkGraph pull methods, then treat subsequent
 /// facts as wake accelerants only.
+///
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 pub fn workgraph_facts_sse_router(
     hub: WorkGraphFactHub,
     decisions: Option<RuntimeDecisionState>,
     access: Option<AccessController>,
+) -> Router {
+    workgraph_facts_sse_router_under_session_fences(
+        hub,
+        decisions,
+        access,
+        ConsoleSessionFences::detached(),
+    )
+}
+
+/// [`workgraph_facts_sse_router`] whose token checks read the Console's
+/// session fence record.
+pub(crate) fn workgraph_facts_sse_router_under_session_fences(
+    hub: WorkGraphFactHub,
+    decisions: Option<RuntimeDecisionState>,
+    access: Option<AccessController>,
+    session_fences: ConsoleSessionFences,
 ) -> Router {
     Router::new()
         .route(
@@ -1058,6 +1520,7 @@ pub fn workgraph_facts_sse_router(
         .with_state(WorkGraphFactsSseState {
             hub,
             decisions,
+            session_fences,
             access,
         })
 }
@@ -1095,6 +1558,8 @@ fn workgraph_module_sse_event(
 fn workgraph_facts_event_stream(
     mut receiver: broadcast::Receiver<crate::types::UnifiedEvent>,
     serializer: WorkGraphEventSerializer,
+    mut live_view: Option<LiveAccessView>,
+    mut authentication: Option<StreamAuthentication>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
     stream! {
         // Subscription is a state-machine transition, not a claim that this
@@ -1110,7 +1575,32 @@ fn workgraph_facts_event_stream(
         };
         yield Ok::<Event, Infallible>(initial_sync);
         loop {
-            match receiver.recv().await {
+            let (policy_changed, received) = match wake_or_policy_change(
+                live_view.as_mut(),
+                authentication.as_mut(),
+                receiver.recv(),
+            )
+            .await
+            {
+                StreamWake::AuthenticationLapsed => return,
+                StreamWake::PolicyChanged => (true, None),
+                StreamWake::Item(received) => (false, Some(received)),
+            };
+            // A revoked `workgraph.view` ends the stream, so the client
+            // reconnects under the current policy; so does a lapsed token.
+            if let Some(live) = live_view.as_mut()
+                && (live.refresh() || policy_changed)
+                && !workgraph_stream_allowed(live.view())
+            {
+                return;
+            }
+            if !still_authenticated(authentication.as_mut()) {
+                return;
+            }
+            let Some(received) = received else {
+                continue;
+            };
+            match received {
                 Ok(event) => {
                     if let Some(event) = workgraph_module_sse_event(&event, serializer) {
                         yield Ok(event);
@@ -1138,22 +1628,34 @@ async fn workgraph_facts_sse_handler(
     uri: Uri,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
 {
-    let access_view = sse_access_context(
+    let SseCaller {
+        access_view,
+        authentication,
+    } = sse_access_context(
         state.decisions.as_ref(),
+        &state.session_fences,
         state.access.as_ref(),
         &headers,
         &uri,
     )
     .map_err(|()| sse_unauthorized("workgraph facts stream requires a valid auth token"))?;
-    if access_view
+    // The stream decides under the policy committed before each fact, not
+    // the one the request read; the gate below reads the same view.
+    let live_view = access_view.map(LiveAccessView::new);
+    if live_view
         .as_ref()
-        .is_some_and(|view| view.enforced() && !view.allows(ACTION_WORKGRAPH_VIEW))
+        .is_some_and(|live| !workgraph_stream_allowed(live.view()))
     {
         return Err(sse_access_denied(ACTION_WORKGRAPH_VIEW));
     }
 
     let receiver = state.hub.subscribe();
-    let stream = workgraph_facts_event_stream(receiver, serialize_workgraph_event);
+    let stream = workgraph_facts_event_stream(
+        receiver,
+        serialize_workgraph_event,
+        live_view,
+        authentication,
+    );
 
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -1174,6 +1676,8 @@ struct MobStructuralSseState {
     /// `None`, the route is unauthenticated (in-process or trusted
     /// embedding).
     decisions: Option<RuntimeDecisionState>,
+    /// See [`AgentSseState::session_fences`].
+    session_fences: ConsoleSessionFences,
     access: Option<AccessController>,
     visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
     /// Reference/custom-policy surfaces require a generation/fence-bound
@@ -1183,6 +1687,10 @@ struct MobStructuralSseState {
 }
 
 /// Per-client SSE subscription to the meerkat structural-event ledger.
+///
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 ///
 /// Each connection opens its own `MobEventsView::subscribe_after` so
 /// catch-up and live tail share the same ordered stream and there is
@@ -1204,6 +1712,9 @@ pub fn mob_structural_events_sse_router(
     mob_structural_events_sse_router_with_access(handle, store, decisions, None)
 }
 
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 pub fn mob_structural_events_sse_router_with_access(
     handle: MobHandle,
     store: MobEventsStore,
@@ -1218,6 +1729,7 @@ pub fn mob_structural_events_sse_router_with_access(
         None,
         Arc::new(AllowAllConsoleVisibilityPolicy),
         false,
+        ConsoleSessionFences::detached(),
     )
 }
 
@@ -1228,6 +1740,7 @@ pub(crate) fn mob_structural_events_sse_router_with_access_and_priming(
     access: Option<AccessController>,
     prime_runtime: Option<MobRuntime>,
     visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
+    session_fences: ConsoleSessionFences,
 ) -> Router {
     mob_structural_events_sse_router_configured(
         handle,
@@ -1237,9 +1750,11 @@ pub(crate) fn mob_structural_events_sse_router_with_access_and_priming(
         prime_runtime,
         visibility_policy,
         true,
+        session_fences,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mob_structural_events_sse_router_configured(
     handle: MobHandle,
     store: MobEventsStore,
@@ -1248,6 +1763,7 @@ fn mob_structural_events_sse_router_configured(
     prime_runtime: Option<MobRuntime>,
     visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
     require_exact_authority: bool,
+    session_fences: ConsoleSessionFences,
 ) -> Router {
     Router::new()
         .route(
@@ -1259,6 +1775,7 @@ fn mob_structural_events_sse_router_configured(
             store,
             prime_runtime,
             decisions,
+            session_fences,
             access,
             visibility_policy,
             require_exact_authority,
@@ -1272,17 +1789,23 @@ fn mob_structural_events_sse_router_configured(
 /// `interaction_stream_router`, and the agent-/mob-event tier 2/3
 /// routers.
 ///
-/// On success returns the caller's [`AccessView`] when an
+/// On success returns the caller: its [`AccessView`] when an
 /// [`AccessController`] is wired (anonymous view on open routes), so the
-/// SSE handlers can apply per-agent ABAC checks. `Err(())` means 401.
+/// SSE handlers can apply per-agent ABAC checks, and its authentication
+/// when a token identified it. `Err(())` means 401. A token is checked
+/// against the Console's session fence record `fences` as it is now.
 pub(crate) fn sse_access_context(
     decisions: Option<&RuntimeDecisionState>,
+    fences: &ConsoleSessionFences,
     access: Option<&AccessController>,
     headers: &HeaderMap,
     uri: &Uri,
-) -> Result<Option<AccessView>, ()> {
+) -> Result<SseCaller, ()> {
     let Some(decisions) = decisions else {
-        return Ok(access.map(|controller| controller.view_for_subject(None)));
+        return Ok(SseCaller {
+            access_view: access.map(|controller| controller.view_for_subject(None)),
+            authentication: None,
+        });
     };
     let bearer_token = headers
         .get(header::AUTHORIZATION)
@@ -1299,19 +1822,37 @@ pub(crate) fn sse_access_context(
             .map(|(_, value)| value.into_owned())
     });
     let token = bearer_token.or(query_token);
-    if !decisions.console.require_app_auth {
+    let caller = if decisions.console.require_app_auth {
+        let token = token.ok_or(())?;
+        Some(
+            crate::runtime::resolve_authorized_console_caller_from_token(decisions, fences, &token)
+                .ok_or(())?,
+        )
+    } else {
         // Open route: identify callers that volunteered a valid token so
-        // per-user ABAC grants apply; everyone else is anonymous.
-        let subject = token.as_deref().and_then(|token| {
-            crate::runtime::resolve_authorized_console_auth_from_token(decisions, token)
-                .map(|auth| auth.email)
-        });
-        return Ok(access.map(|controller| controller.view_for_subject(subject.as_deref())));
-    }
-    let token = token.ok_or(())?;
-    let auth =
-        crate::runtime::resolve_authorized_console_auth_from_token(decisions, &token).ok_or(())?;
-    Ok(access.map(|controller| controller.view_for_subject(Some(auth.email.as_str()))))
+        // per-user ABAC grants apply; everyone else is anonymous. Without an
+        // access controller a token grants nothing, so it identifies nobody.
+        token.filter(|_| access.is_some()).and_then(|token| {
+            crate::runtime::resolve_authorized_console_caller_from_token(decisions, fences, &token)
+        })
+    };
+    let access_view = access.map(|controller| {
+        controller.view_for_subject(caller.as_ref().map(|caller| caller.auth.email.as_str()))
+    });
+    Ok(SseCaller {
+        access_view,
+        authentication: caller.map(|caller| StreamAuthentication::new(caller.verification)),
+    })
+}
+
+/// The caller of an SSE route, as its request authenticated it.
+pub(crate) struct SseCaller {
+    /// The caller's [`AccessView`] when an [`AccessController`] is wired
+    /// (an anonymous view on open routes).
+    pub(crate) access_view: Option<AccessView>,
+    /// The caller's authentication when a token identified the caller: a
+    /// stream ends once the verifier no longer accepts that token.
+    pub(crate) authentication: Option<StreamAuthentication>,
 }
 
 fn sse_unauthorized(reason: &str) -> (StatusCode, Json<Value>) {
@@ -1341,8 +1882,12 @@ async fn mob_structural_events_sse_handler(
     Query(params): Query<MobStructuralStreamQuery>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
 {
-    let access_view = sse_access_context(
+    let SseCaller {
+        access_view,
+        mut authentication,
+    } = sse_access_context(
         state.decisions.as_ref(),
+        &state.session_fences,
         state.access.as_ref(),
         &headers,
         &uri,
@@ -1357,19 +1902,21 @@ async fn mob_structural_events_sse_handler(
     {
         crate::http_console::prime_access_cache_from_handle(&state.handle, controller).await;
     }
+    // The stream decides under the policy committed before each event, not
+    // the one the request read; the gate below reads the same view.
+    let mut live_view = access_view.map(LiveAccessView::new);
     // Structural events span the whole mob: require the mob-wide
     // observation grant, mirroring `meta/mob_events/query`. Envelopes
     // attributed to a specific agent are additionally filtered by
     // `agent.view` on that agent (below), so `mob.observe` cannot surface
     // the lifecycle of an agent the caller is denied. Mob-level envelopes
     // with no agent attribution flow under `mob.observe` alone.
-    if access_view
+    if live_view
         .as_ref()
-        .is_some_and(|view| view.enforced() && !view.allows(ACTION_MOB_OBSERVE))
+        .is_some_and(|live| !mob_stream_allowed(live.view()))
     {
         return Err(sse_access_denied(ACTION_MOB_OBSERVE));
     }
-    let stream_view = access_view.filter(AccessView::enforced);
     let query = params.into_event_query();
     let events_view = state.handle.events();
 
@@ -1420,7 +1967,42 @@ async fn mob_structural_events_sse_handler(
     let visibility_policy = state.visibility_policy;
     let require_exact_authority = state.require_exact_authority;
     let stream = stream! {
-        while let Some(event) = subscription.event_rx.recv().await {
+        loop {
+            let (policy_changed, event) = match wake_or_policy_change(
+                live_view.as_mut(),
+                authentication.as_mut(),
+                subscription.event_rx.recv(),
+            )
+            .await
+            {
+                StreamWake::AuthenticationLapsed | StreamWake::Item(None) => break,
+                StreamWake::PolicyChanged => (true, None),
+                StreamWake::Item(Some(event)) => (false, Some(event)),
+            };
+            if let Some(live) = live_view.as_mut() {
+                let mut changed = policy_changed;
+                while live.refresh() || changed {
+                    changed = false;
+                    prime_structural_access_cache(
+                        reprime_runtime.as_ref(),
+                        &reprime_handle,
+                        reprime_access.as_ref(),
+                    )
+                    .await;
+                }
+                // A revoked `mob.observe` ends the stream, so the client
+                // reconnects under the current policy.
+                if !mob_stream_allowed(live.view()) {
+                    break;
+                }
+            }
+            let Some(event) = event else {
+                continue;
+            };
+            let enforced = live_view
+                .as_ref()
+                .and_then(LiveAccessView::enforced)
+                .is_some();
             let projection = store.project_event_with_authority(&event).await;
             if !crate::unified_runtime::mob_events::envelope_matches(&projection.envelope, &query) {
                 continue;
@@ -1433,31 +2015,45 @@ async fn mob_structural_events_sse_handler(
                 // concrete member generation. Refresh the live projection for
                 // every attributed event before deciding; the subsequent
                 // visibility lookup fails closed if the alias disappeared.
-                if stream_view.is_some() {
-                    if reprime_runtime.is_some() {
-                        prime_sse_access_cache(reprime_runtime.as_ref(), reprime_access.as_ref())
-                            .await;
-                    } else if let Some(controller) = reprime_access
-                        .as_ref()
-                        .filter(|controller| controller.enabled())
-                    {
-                        crate::http_console::prime_access_cache_from_handle(
-                            &reprime_handle,
-                            controller,
-                        )
-                        .await;
-                    }
+                if enforced {
+                    prime_structural_access_cache(
+                        reprime_runtime.as_ref(),
+                        &reprime_handle,
+                        reprime_access.as_ref(),
+                    )
+                    .await;
                 }
             }
-            let Some(envelope) = project_structural_envelope_for_console(
+            let projected = project_structural_member(
                 &visibility_handle,
                 reprime_runtime.as_ref(),
                 visibility_policy.as_ref(),
-                stream_view.as_ref(),
                 projection,
                 require_exact_authority,
             )
-            .await else {
+            .await;
+            // Settled after the last await: the event is decided under the
+            // configuration committed before it is sent.
+            if let Some(live) = live_view.as_mut() {
+                while live.refresh() {
+                    prime_structural_access_cache(
+                        reprime_runtime.as_ref(),
+                        &reprime_handle,
+                        reprime_access.as_ref(),
+                    )
+                    .await;
+                }
+                if !mob_stream_allowed(live.view()) {
+                    break;
+                }
+            }
+            if !still_authenticated(authentication.as_mut()) {
+                break;
+            }
+            let Some(envelope) = projected.decide(
+                visibility_policy.as_ref(),
+                live_view.as_ref().and_then(LiveAccessView::enforced),
+            ) else {
                 continue;
             };
             let payload = serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".to_string());

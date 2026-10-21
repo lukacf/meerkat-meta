@@ -284,8 +284,11 @@ async fn identity_first_cold_restart_preserves_transcript() {
         .await
         .expect("restore_flow (boot 1)");
         match result.outcomes.get(&alice).expect("alice outcome") {
-            RestoreOutcome::Created { record, .. } => {
-                original_session_id = record.session_id.clone();
+            RestoreOutcome::Created { binding, .. } => {
+                original_session_id = binding
+                    .session_id
+                    .clone()
+                    .expect("Core binds the member to a session");
             }
             other => panic!("expected Created on first boot, got {other:?}"),
         }
@@ -329,9 +332,10 @@ async fn identity_first_cold_restart_preserves_transcript() {
         // durable session — never re-Create (the empty fresh-spawn
         // regression) and never report a resume as anything else.
         match result.outcomes.get(&alice).expect("alice outcome") {
-            RestoreOutcome::Resumed { record, .. } => {
+            RestoreOutcome::Resumed { binding, .. } => {
                 assert_eq!(
-                    record.session_id, original_session_id,
+                    binding.session_id.as_ref(),
+                    Some(&original_session_id),
                     "cold restart must resume the SAME durable session"
                 );
             }
@@ -387,9 +391,10 @@ async fn identity_first_cold_restart_preserves_transcript() {
         .await
         .expect("restore_flow (boot 3)");
         match result.outcomes.get(&alice).expect("alice outcome") {
-            RestoreOutcome::Resumed { record, .. } => {
+            RestoreOutcome::Resumed { binding, .. } => {
                 assert_eq!(
-                    record.session_id, original_session_id,
+                    binding.session_id.as_ref(),
+                    Some(&original_session_id),
                     "second restart must still resume the SAME durable session"
                 );
             }
@@ -472,8 +477,11 @@ async fn identity_first_cold_restart_turnless_resume_chain_preserves_transcript(
         .await
         .expect("restore_flow (boot 1)");
         match result.outcomes.get(&alice).expect("alice outcome") {
-            RestoreOutcome::Created { record, .. } => {
-                original_session_id = record.session_id.clone();
+            RestoreOutcome::Created { binding, .. } => {
+                original_session_id = binding
+                    .session_id
+                    .clone()
+                    .expect("Core binds the member to a session");
             }
             other => panic!("expected Created on first boot, got {other:?}"),
         }
@@ -512,9 +520,10 @@ async fn identity_first_cold_restart_turnless_resume_chain_preserves_transcript(
         .await
         .unwrap_or_else(|e| panic!("restore_flow (turn-less boot {boot_n}): {e}"));
         match result.outcomes.get(&alice).expect("alice outcome") {
-            RestoreOutcome::Resumed { record, .. } => {
+            RestoreOutcome::Resumed { binding, .. } => {
                 assert_eq!(
-                    record.session_id, original_session_id,
+                    binding.session_id.as_ref(),
+                    Some(&original_session_id),
                     "turn-less boot {boot_n} must resume the SAME durable session"
                 );
             }
@@ -543,9 +552,10 @@ async fn identity_first_cold_restart_turnless_resume_chain_preserves_transcript(
         .await
         .expect("restore_flow (boot 5)");
         match result.outcomes.get(&alice).expect("alice outcome") {
-            RestoreOutcome::Resumed { record, .. } => {
+            RestoreOutcome::Resumed { binding, .. } => {
                 assert_eq!(
-                    record.session_id, original_session_id,
+                    binding.session_id.as_ref(),
+                    Some(&original_session_id),
                     "boot 5 must still resume the SAME durable session"
                 );
             }
@@ -624,8 +634,11 @@ async fn identity_first_resume_revives_terminally_retired_runtime() {
         .await
         .expect("restore_flow (boot 1)");
         match result.outcomes.get(&alice).expect("alice outcome") {
-            RestoreOutcome::Created { record, .. } => {
-                original_session_id = record.session_id.clone();
+            RestoreOutcome::Created { binding, .. } => {
+                original_session_id = binding
+                    .session_id
+                    .clone()
+                    .expect("Core binds the member to a session");
             }
             other => panic!("expected Created on first boot, got {other:?}"),
         }
@@ -691,9 +704,10 @@ async fn identity_first_resume_revives_terminally_retired_runtime() {
         .await
         .expect("restore_flow (boot 2) — a retired-with-intact-snapshot session must revive");
         match result.outcomes.get(&alice).expect("alice outcome") {
-            RestoreOutcome::Resumed { record, .. } => {
+            RestoreOutcome::Resumed { binding, .. } => {
                 assert_eq!(
-                    record.session_id, original_session_id,
+                    binding.session_id.as_ref(),
+                    Some(&original_session_id),
                     "revival must rebind the SAME durable session, not a fresh one"
                 );
             }
@@ -723,133 +737,6 @@ async fn identity_first_resume_revives_terminally_retired_runtime() {
             "post-revival LLM request must replay the pre-retire transcript (token {TOKEN})"
         );
         unified.shutdown().await;
-    }
-}
-
-/// Production wedge (a 2026-07-30 production incident): a continuity head record pointing at a
-/// session that was NEVER persisted (a registration/rebind-minted head for a
-/// quiet member whose content-less saves were all skipped). meerkat resume
-/// answers typed Absent; before the fix the restore path refused fresh-spawn
-/// for EVERY resume failure (#218 never-abandon), so the identity stayed
-/// Broken and reconcile retried forever - identities stayed permanently
-/// wedged. The narrowly-typed fix: typed Absent AND a store probe
-/// confirming no row was ever persisted authorize a FRESH spawn under a new
-/// session id, and the continuity record rebinds. Every other refusal keeps
-/// never-abandon semantics (the Bug I revival test above stays untouched:
-/// its archived row is present, so it can never enter this arm).
-#[tokio::test(flavor = "multi_thread")]
-async fn never_persisted_continuity_head_fresh_spawns_instead_of_wedging() {
-    let temp = tempfile::TempDir::new().expect("temp dir");
-    let state_path = temp.path().join("state");
-    let mob_id = unique_cold_restart_mob_id();
-    let alice = id("personal:alice");
-    let roster = vec![spec(
-        "personal:alice",
-        AgentAddressability::Addressable,
-        "personal",
-    )];
-
-    // --- Boot 1: register alice through the PUBLIC flow so the record has a
-    // production-shaped runtime id, then shut down cleanly. ---
-    {
-        let capture = CaptureClient::default();
-        let (unified, identity_rt) = boot(&state_path, &mob_id, capture.clone()).await;
-        let result = restore_flow(
-            &identity_rt,
-            &roster,
-            Some(&EmptyTopology as &dyn TopologyProvider),
-            Some(&NoopCustomizer as &dyn AgentCustomizer),
-        )
-        .await
-        .expect("restore_flow (boot 1)");
-        assert!(
-            matches!(
-                result.outcomes.get(&alice).expect("alice outcome"),
-                RestoreOutcome::Created { .. }
-            ),
-            "expected Created on first boot"
-        );
-        unified.shutdown().await;
-    }
-
-    // --- Forge the field shape through the continuity store's public API:
-    // rebind the record to a session id NOTHING ever persisted. ---
-    let phantom_session_id = meerkat_core::types::SessionId::new();
-    {
-        let store = LocalContinuityStore::open(state_path.join("continuity.db"))
-            .expect("open continuity store for the forge");
-        let resolved = store
-            .resolve_many(std::slice::from_ref(&alice))
-            .await
-            .expect("resolve alice after boot 1");
-        let record = match resolved.get(&alice).expect("alice state") {
-            meerkat_meta::identity_first::ContinuityResolveState::Ready { record } => {
-                record.clone()
-            }
-            other => panic!("expected Ready after boot 1, got {other:?}"),
-        };
-        let mut forged = record;
-        forged.session_id = phantom_session_id.clone();
-        store
-            .upsert_continuity_record(&forged, meerkat_meta::identity_first::FencingToken::new(1))
-            .await
-            .expect("forge the never-persisted head");
-    }
-
-    // --- Boot 2: restore must FRESH-SPAWN (not Broken, not a retry loop),
-    // and a real turn must run on the fresh member. ---
-    {
-        let capture = CaptureClient::default();
-        let (unified, identity_rt) = boot(&state_path, &mob_id, capture.clone()).await;
-        let result = restore_flow(
-            &identity_rt,
-            &roster,
-            Some(&EmptyTopology as &dyn TopologyProvider),
-            Some(&NoopCustomizer as &dyn AgentCustomizer),
-        )
-        .await
-        .expect("restore_flow (boot 2)");
-        if let RestoreOutcome::Broken(failure) = result.outcomes.get(&alice).expect("alice outcome")
-        {
-            panic!(
-                "a never-persisted continuity head must fresh-spawn, not wedge Broken \
-                 (a 2026-07-30 production incident): {failure:?}"
-            );
-        }
-        identity_rt
-            .send(
-                &alice,
-                &meerkat_core::ContentInput::Text("hello after fresh fallback".to_string()),
-            )
-            .await
-            .expect("send post-fallback turn");
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while capture.count() < 1 {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for the post-fallback turn to reach the LLM"
-            );
-            sleep(Duration::from_millis(100)).await;
-        }
-        sleep(Duration::from_millis(500)).await;
-        unified.shutdown().await;
-    }
-
-    // --- The record rebound off the phantom id durably. ---
-    let store = LocalContinuityStore::open(state_path.join("continuity.db"))
-        .expect("reopen continuity store");
-    let resolved = store
-        .resolve_many(std::slice::from_ref(&alice))
-        .await
-        .expect("re-resolve alice after the fallback");
-    match resolved.get(&alice).expect("alice state") {
-        meerkat_meta::identity_first::ContinuityResolveState::Ready { record } => {
-            assert_ne!(
-                record.session_id, phantom_session_id,
-                "the continuity record must rebind off the never-persisted id"
-            );
-        }
-        other => panic!("expected Ready after the fresh fallback, got {other:?}"),
     }
 }
 

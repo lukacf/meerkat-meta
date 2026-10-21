@@ -388,7 +388,6 @@ function normalizeConsoleInspectResult(
       agent_runtime_id: identityRecord.runtime_member_id,
     },
     topology_peers: Array.isArray(record.peers) ? record.peers : [],
-    lease: null,
   });
 }
 
@@ -5105,16 +5104,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
             <dd>{inspect.addressability}</dd>
             <dt>Generation</dt>
             <dd>{inspect.continuity?.generation ?? "n/a"}</dd>
-            <dt>Checkpoint</dt>
-            <dd>{inspect.continuity?.checkpoint_version ?? "n/a"}</dd>
             <dt>Session</dt>
             <dd>{inspect.continuity?.session_id || "n/a"}</dd>
             <dt>Runtime</dt>
             <dd>{inspect.continuity?.agent_runtime_id || "n/a"}</dd>
-            <dt>Lease Healthy</dt>
-            <dd>
-              {String(inspect.lease_healthy ?? inspect.lease?.healthy ?? false)}
-            </dd>
             <dt>Peers</dt>
             <dd>{inspect.topology_peers?.join(", ") || "none"}</dd>
             <dt>Output Preview</dt>

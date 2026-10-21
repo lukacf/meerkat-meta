@@ -417,6 +417,92 @@ fn identity_first_console_identity_drives_filtering() {
 }
 
 #[test]
+fn unchanged_experience_preserves_publication_but_changed_member_attributes_invalidate() {
+    use meerkat_authorization::publication::{LocalAuthorizationPublication, PublicationError};
+
+    let controller = AccessController::new(ops_access_config()).expect("controller");
+    let publication = LocalAuthorizationPublication::new();
+    controller
+        .join_authorization_publication(publication.clone())
+        .expect("join publication");
+    let unrelated = AgentResourceAttributes {
+        identity: "another-runtime/worker".to_string(),
+        agent_id: Some("unrelated-member".to_string()),
+        role: Some("worker".to_string()),
+        labels: BTreeMap::from([("org".to_string(), "other".to_string())]),
+    };
+    controller.record_agent_attributes(unrelated.clone());
+    let identity = "namespace/identity:ops-lead";
+    let mut snapshot = snapshot_with_members(vec![
+        member("old-runtime", "old-role", &[("agent_identity", identity)]),
+        member(
+            "member-runtime-7",
+            "lead",
+            &[("agent_identity", identity), ("org", "payments")],
+        ),
+    ]);
+    snapshot.agents.push(
+        serde_json::from_value(json!({
+            "agent_id": "member-runtime-7", "member_id": "member-runtime-7",
+            "label": "Lead", "kind": "meerkat", "identity": identity,
+            "role": "agent-projection-role"
+        }))
+        .expect("overlapping agent"),
+    );
+    snapshot.agents.push(
+        serde_json::from_value(json!({
+            "agent_id": "agent-only", "member_id": "agent-only",
+            "label": "Agent only", "kind": "meerkat", "role": "scout"
+        }))
+        .expect("agent-only projection"),
+    );
+
+    experience_for(&controller, "root@example.test", &snapshot);
+    let ((), stamp) = publication.observe(|| ()).expect("primed publication");
+    // Recording the exact expected values must be a no-op. This checks the
+    // final member's alias/role/labels, the agent-only row and unrelated cache.
+    let mut expected = AgentResourceAttributes {
+        identity: identity.to_string(),
+        agent_id: Some("member-runtime-7".to_string()),
+        role: Some("lead".to_string()),
+        labels: snapshot.members[1].labels.clone(),
+    };
+    controller.record_agent_attributes(expected.clone());
+    controller.record_agent_attributes(AgentResourceAttributes {
+        identity: "agent-only".to_string(),
+        agent_id: Some("agent-only".to_string()),
+        role: Some("scout".to_string()),
+        labels: BTreeMap::new(),
+    });
+    controller.record_agent_attributes(unrelated);
+    assert!(stamp.check_current().is_ok(), "final attributes changed");
+
+    experience_for(&controller, "root@example.test", &snapshot);
+    assert!(
+        stamp.check_current().is_ok(),
+        "unchanged experience published"
+    );
+
+    snapshot.members[1]
+        .labels
+        .insert("org".to_string(), "people".to_string());
+    snapshot.members[1].role = "reviewer".to_string();
+    experience_for(&controller, "root@example.test", &snapshot);
+    assert!(matches!(
+        stamp.check_current(),
+        Err(PublicationError::Changed)
+    ));
+    let ((), changed) = publication.observe(|| ()).expect("changed publication");
+    expected.labels = snapshot.members[1].labels.clone();
+    expected.role = Some("reviewer".to_string());
+    controller.record_agent_attributes(expected);
+    assert!(
+        changed.check_current().is_ok(),
+        "changed attributes were not retained"
+    );
+}
+
+#[test]
 fn disabled_controller_changes_nothing() {
     let controller = AccessController::disabled();
     let snapshot = snapshot_with_members(vec![
@@ -2417,7 +2503,7 @@ async fn timeline_rpc_is_filtered_per_caller() {
 /// attributed to `_system`. The aggregator exempts that identity from the
 /// per-roster visibility gate (it has no roster record), so the ABAC
 /// boundary for those frames is the RPC layer's
-/// `retain_visible_timeline_frames`: an unscoped `agent.view` grant sees
+/// `timeline_frame_visible_to`: an unscoped `agent.view` grant sees
 /// them, while a grant scoped to specific agents must not.
 #[tokio::test]
 async fn system_memory_frames_respect_timeline_access_filtering() {
@@ -5066,5 +5152,2098 @@ mod checked_v1_acceptance {
             after,
             "readback causes no further mutation"
         );
+    }
+}
+
+/// Open streams follow the access policy the owner commits while they run:
+/// each frame is decided under the policy committed before it is sent, not
+/// the one the stream opened with.
+mod streams_follow_the_committed_policy {
+    use super::*;
+    use meerkat_meta::{ConsoleFrame, ConsoleIdentityRecord};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Bounds a broken run; a passing run reads each frame as it arrives.
+    /// Timeline frames of turns started on the runtime directly arrive with
+    /// the console's periodic session-history discovery, seconds apart.
+    const DEADLINE: Duration = Duration::from_secs(30);
+    /// How long a stream is watched for a frame it must not send.
+    const QUIET: Duration = Duration::from_millis(500);
+    /// The development issuer the admin's signed tokens verify against.
+    const ISSUER: &str = "https://trusted.meta.localhost";
+    const ROOT: &str = "root@example.test";
+
+    /// Everyone may observe the mob and view and message every agent.
+    fn open_policy() -> AccessController {
+        AccessController::new(AccessControlConfig {
+            enabled: true,
+            admins: vec![ROOT.to_string()],
+            rules: vec![
+                AccessRule {
+                    id: "everyone-observes".to_string(),
+                    actions: vec!["mob.observe".to_string()],
+                    ..AccessRule::default()
+                },
+                AccessRule {
+                    id: "everyone-views-and-sends".to_string(),
+                    actions: vec!["agent.view".to_string(), "agent.send".to_string()],
+                    agents: vec!["*".to_string()],
+                    ..AccessRule::default()
+                },
+            ],
+            ..AccessControlConfig::default()
+        })
+        .expect("controller")
+    }
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        UnifiedRuntime,
+        AccessController,
+        axum::Router,
+    ) {
+        fixture_with(open_policy(), None).await
+    }
+
+    /// The fixture under `controller`, with `policy` as the console policy
+    /// instead of the reference app's own.
+    async fn fixture_with(
+        controller: AccessController,
+        policy: Option<Arc<dyn ConsoleVisibilityPolicy>>,
+    ) -> (
+        tempfile::TempDir,
+        UnifiedRuntime,
+        AccessController,
+        axum::Router,
+    ) {
+        let (temp_dir, mut runtime) = build_access_runtime_fixture().await;
+        runtime.set_access_controller(controller.clone());
+        let mut decisions = decision_state(false);
+        decisions.trusted_oidc.discovery_json = json!({
+            "issuer": ISSUER,
+            "jwks_uri": format!("{ISSUER}/.well-known/jwks.json"),
+        })
+        .to_string();
+        let app = match policy {
+            Some(policy) => {
+                runtime.build_reference_app_router_with_console_visibility_policy(decisions, policy)
+            }
+            None => runtime.build_reference_app_router(decisions),
+        };
+        (temp_dir, runtime, controller, app)
+    }
+
+    /// Commit a deny of `agent.view` on `identity` for everyone but the
+    /// admins.
+    fn commit_view_deny(controller: &AccessController, identity: &str) {
+        let before = controller.snapshot().1;
+        let revision = controller
+            .upsert_rule(AccessRule {
+                id: format!("deny-view-{identity}"),
+                effect: meerkat_meta::AccessEffect::Deny,
+                actions: vec!["agent.view".to_string()],
+                agents: vec![identity.to_string()],
+                ..AccessRule::default()
+            })
+            .expect("commit the deny");
+        assert_eq!(revision, before + 1);
+        assert!(!controller.view_for_subject(None).can_view_agent(identity));
+    }
+
+    /// The rule that hides members labelled `org=secret` from everyone but
+    /// the admins.
+    fn secret_label_deny() -> AccessRule {
+        AccessRule {
+            id: "deny-secret-label".to_string(),
+            effect: meerkat_meta::AccessEffect::Deny,
+            actions: vec!["agent.view".to_string()],
+            match_labels: BTreeMap::from([("org".to_string(), "secret".to_string())]),
+            ..AccessRule::default()
+        }
+    }
+
+    async fn spawn_secret_member(runtime: &UnifiedRuntime, identity: &str) {
+        let mut spec = SpawnMemberSpec::from_wire(
+            "lead".to_string(),
+            identity.to_string(),
+            Some(format!("You are {identity}.").into()),
+            None,
+            None,
+        );
+        spec.labels = Some(BTreeMap::from([("org".to_string(), "secret".to_string())]));
+        runtime.spawn(spec).await.expect("spawn labelled member");
+    }
+
+    tokio::task_local! {
+        /// Set while a test reads the caller's stream. The stream does its
+        /// work inside those reads, so this marks the stream's own calls
+        /// into the console policy.
+        static READING_CALLER: ();
+    }
+
+    /// A console policy that, once armed, commits a deny of `agent.view` on
+    /// `target` the first time the caller's stream asks it about that
+    /// member: inside the stream's own processing of the member's frame or
+    /// event, after the stream took its view of the access policy and
+    /// before it decides.
+    struct DenyWhileProcessing {
+        controller: AccessController,
+        target: String,
+        armed: AtomicBool,
+        committed: AtomicBool,
+    }
+
+    impl DenyWhileProcessing {
+        fn new(controller: &AccessController, target: &str) -> Arc<Self> {
+            Arc::new(Self {
+                controller: controller.clone(),
+                target: target.to_string(),
+                armed: AtomicBool::new(false),
+                committed: AtomicBool::new(false),
+            })
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        fn committed(&self) -> bool {
+            self.committed.load(Ordering::SeqCst)
+        }
+
+        fn asked_about(&self, identity: &str) {
+            if identity == self.target
+                && self.armed.load(Ordering::SeqCst)
+                && READING_CALLER.try_with(|()| ()).is_ok()
+                && !self.committed.swap(true, Ordering::SeqCst)
+            {
+                commit_view_deny(&self.controller, &self.target);
+            }
+        }
+    }
+
+    impl ConsoleVisibilityPolicy for DenyWhileProcessing {
+        fn member_visible(&self, member: &ConsoleMember) -> bool {
+            self.asked_about(&member.agent_identity);
+            true
+        }
+
+        fn identity_visible(&self, record: &ConsoleIdentityRecord) -> bool {
+            self.asked_about(&record.identity);
+            true
+        }
+
+        fn frame_visible(&self, frame: &ConsoleFrame) -> bool {
+            self.asked_about(&frame.identity);
+            true
+        }
+    }
+
+    fn bearer(subject: &str) -> String {
+        let mut jwt_header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        jwt_header.kid = Some("kid-current".to_string());
+        let token = jsonwebtoken::encode(
+            &jwt_header,
+            &json!({
+                "iss": ISSUER,
+                "aud": "meerkat-console",
+                "sub": subject,
+                "email": subject,
+                "provider": "google_oauth",
+                "exp": chrono::Utc::now().timestamp() + 300,
+            }),
+            &jsonwebtoken::EncodingKey::from_secret(b"phase7-trusted-current-secret"),
+        )
+        .expect("signed fixture token");
+        format!("Bearer {token}")
+    }
+
+    /// A console send by the admin, so the frames it makes exist whatever
+    /// the anonymous caller may see.
+    async fn admin_send(app: &axum::Router, identity: &str, content: &str) {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": "test",
+            "method": "meta/console/send",
+            "params": {
+                "identity": identity,
+                "content": content,
+                "origin": "test",
+                "idempotency_key": content,
+            },
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/console/rpc")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, bearer(ROOT))
+                    .body(Body::from(payload.to_string()))
+                    .expect("send request"),
+            )
+            .await
+            .expect("send response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("send body");
+        let sent: Value = serde_json::from_slice(&body).expect("send json");
+        assert_eq!(sent["error"], Value::Null, "send to {identity}: {sent:#?}");
+    }
+
+    /// One turn of `identity`, started on the runtime directly, after which
+    /// the member has emitted at least one event.
+    async fn member_turn(runtime: &UnifiedRuntime, identity: &str, content: &str) {
+        let member_id = MeerkatId::from(identity);
+        let mut emitted = runtime
+            .mob_handle()
+            .subscribe_agent_events(&member_id)
+            .await
+            .expect("member event witness");
+        runtime
+            .mob_handle()
+            .member(&member_id)
+            .await
+            .expect("member handle")
+            .send(content, HandlingMode::Queue)
+            .await
+            .expect("member turn");
+        tokio::time::timeout(DEADLINE, emitted.next())
+            .await
+            .expect("the member emits an event")
+            .expect("the witness stream stays open");
+    }
+
+    async fn spawn_member(runtime: &UnifiedRuntime, identity: &str) {
+        runtime
+            .spawn(SpawnMemberSpec::from_wire(
+                "lead".to_string(),
+                identity.to_string(),
+                Some(format!("You are {identity}.").into()),
+                None,
+                None,
+            ))
+            .await
+            .expect("spawn member");
+    }
+
+    #[derive(Debug)]
+    struct SseEvent {
+        name: String,
+        data: String,
+    }
+
+    impl SseEvent {
+        fn json(&self) -> Value {
+            serde_json::from_str(&self.data).expect("SSE data JSON")
+        }
+
+        /// The agent a timeline frame belongs to.
+        fn frame_identity(&self) -> Option<String> {
+            matches!(self.name.as_str(), "console_frame" | "frame_updated")
+                .then(|| {
+                    self.json()["frame"]["identity"]
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .flatten()
+        }
+
+        /// The member a merged mob event came from, as its public alias.
+        fn mob_event_source(&self) -> Option<String> {
+            self.json()["source"]
+                .as_str()
+                .and_then(|source| source.split(':').next())
+                .map(str::to_string)
+        }
+
+        /// The agent a structural event is attributed to.
+        fn structural_identity(&self) -> Option<String> {
+            self.json()["agent_identity"].as_str().map(str::to_string)
+        }
+    }
+
+    enum Next {
+        Event(SseEvent),
+        Ended,
+        Quiet,
+    }
+
+    /// Reads one SSE response body event by event.
+    struct SseReader {
+        uri: String,
+        body: axum::body::BodyDataStream,
+        buffered: String,
+    }
+
+    impl SseReader {
+        async fn open(app: &axum::Router, uri: &str, subject: Option<&str>) -> Self {
+            Self::open_with(app, uri, subject.map(bearer).as_deref()).await
+        }
+
+        /// [`Self::open`] with this `Authorization` header value, or none.
+        async fn open_with(app: &axum::Router, uri: &str, authorization: Option<&str>) -> Self {
+            let mut request = Request::builder().method("GET").uri(uri);
+            if let Some(authorization) = authorization {
+                request = request.header(header::AUTHORIZATION, authorization);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).expect("stream request"))
+                .await
+                .expect("stream response");
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            Self {
+                uri: uri.to_string(),
+                body: response.into_body().into_data_stream(),
+                buffered: String::new(),
+            }
+        }
+
+        /// The next event carrying data, skipping keep-alive comments.
+        async fn next(&mut self, wait: Duration) -> Next {
+            let deadline = tokio::time::Instant::now() + wait;
+            loop {
+                while let Some(end) = self.buffered.find("\n\n") {
+                    let raw: String = self.buffered.drain(..end + 2).collect();
+                    let mut name = "message".to_string();
+                    let mut data = Vec::new();
+                    for line in raw.lines() {
+                        if let Some(value) = line.strip_prefix("event:") {
+                            name = value.trim().to_string();
+                        } else if let Some(value) = line.strip_prefix("data:") {
+                            data.push(value.strip_prefix(' ').unwrap_or(value).to_string());
+                        }
+                    }
+                    if !data.is_empty() {
+                        return Next::Event(SseEvent {
+                            name,
+                            data: data.join("\n"),
+                        });
+                    }
+                }
+                match tokio::time::timeout_at(deadline, self.body.next()).await {
+                    Err(_) => return Next::Quiet,
+                    Ok(None) => return Next::Ended,
+                    Ok(Some(chunk)) => self
+                        .buffered
+                        .push_str(&String::from_utf8_lossy(&chunk.expect("SSE chunk"))),
+                }
+            }
+        }
+
+        /// Every event up to and including the first `found` matches.
+        async fn until(&mut self, what: &str, found: impl Fn(&SseEvent) -> bool) -> Vec<SseEvent> {
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            let mut read = Vec::new();
+            loop {
+                let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match self.next(wait).await {
+                    Next::Event(event) => {
+                        let done = found(&event);
+                        read.push(event);
+                        if done {
+                            return read;
+                        }
+                    }
+                    Next::Ended => panic!("{} ended before {what}: {read:#?}", self.uri),
+                    Next::Quiet => panic!("{} sent no {what}: {read:#?}", self.uri),
+                }
+            }
+        }
+
+        /// Every event sent within [`QUIET`], or before the stream ended.
+        async fn quiet_window(&mut self) -> Vec<SseEvent> {
+            let deadline = tokio::time::Instant::now() + QUIET;
+            let mut read = Vec::new();
+            loop {
+                let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match self.next(wait).await {
+                    Next::Event(event) => read.push(event),
+                    Next::Ended | Next::Quiet => return read,
+                }
+            }
+        }
+
+        /// Every event sent before the stream ended.
+        async fn until_end(&mut self) -> Vec<SseEvent> {
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            let mut read = Vec::new();
+            loop {
+                let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match self.next(wait).await {
+                    Next::Event(event) => read.push(event),
+                    Next::Ended => return read,
+                    Next::Quiet => panic!("{} did not end: {read:#?}", self.uri),
+                }
+            }
+        }
+    }
+
+    fn frame_with(identity: &str, content: &str) -> impl Fn(&SseEvent) -> bool {
+        let identity = identity.to_string();
+        let content = content.to_string();
+        move |event| {
+            event.frame_identity().as_deref() == Some(identity.as_str())
+                && event.data.contains(&content)
+        }
+    }
+
+    fn sent_for<'a>(
+        events: &'a [SseEvent],
+        identity: &str,
+        attribution: impl Fn(&SseEvent) -> Option<String>,
+    ) -> Vec<&'a str> {
+        events
+            .iter()
+            .filter(|event| attribution(event).as_deref() == Some(identity))
+            .map(|event| event.data.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn timeline_stream_decides_each_frame_under_the_committed_policy() {
+        let (_temp_dir, runtime, controller, app) = fixture().await;
+        let mut caller = SseReader::open(&app, "/console/timeline/stream", None).await;
+        let mut witness = SseReader::open(&app, "/console/timeline/stream", Some(ROOT)).await;
+
+        admin_send(&app, "router", "router-before-change").await;
+        caller
+            .until(
+                "router's frame before the change",
+                frame_with("router", "router-before-change"),
+            )
+            .await;
+        witness
+            .until(
+                "router's frame before the change",
+                frame_with("router", "router-before-change"),
+            )
+            .await;
+
+        commit_view_deny(&controller, "router");
+        admin_send(&app, "router", "router-after-change").await;
+        admin_send(&app, "delivery", "delivery-after-change").await;
+        witness
+            .until(
+                "router's frame after the change",
+                frame_with("router", "router-after-change"),
+            )
+            .await;
+
+        let mut read = caller
+            .until(
+                "delivery's frame after the change",
+                frame_with("delivery", "delivery-after-change"),
+            )
+            .await;
+        read.extend(caller.quiet_window().await);
+        let sent = sent_for(&read, "router", SseEvent::frame_identity);
+        assert!(
+            sent.is_empty(),
+            "router frames sent after the committed deny: {sent:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    /// A label rule committed while the stream is open judges a member that
+    /// joined after the stream opened by that member's own labels.
+    #[tokio::test]
+    async fn timeline_stream_reads_the_labels_of_members_that_joined_while_it_was_open() {
+        let (_temp_dir, runtime, controller, app) = fixture().await;
+        let mut caller = SseReader::open(&app, "/console/timeline/stream", None).await;
+        let mut witness = SseReader::open(&app, "/console/timeline/stream", Some(ROOT)).await;
+
+        // Joins after the stream opened, and nothing reads the roster again
+        // before the rule below is committed.
+        spawn_secret_member(&runtime, "late-secret").await;
+        let before = controller.snapshot().1;
+        let revision = controller
+            .upsert_rule(secret_label_deny())
+            .expect("commit the label deny");
+        assert_eq!(revision, before + 1);
+
+        // Turns started on the runtime directly, so no request path reads
+        // the roster for the stream.
+        member_turn(&runtime, "late-secret", "late-secret-after-change").await;
+        witness
+            .until("late-secret's frame after the change", |event| {
+                event.frame_identity().as_deref() == Some("late-secret")
+            })
+            .await;
+        member_turn(&runtime, "delivery", "delivery-after-change").await;
+        witness
+            .until("delivery's frame after the change", |event| {
+                event.frame_identity().as_deref() == Some("delivery")
+            })
+            .await;
+
+        let mut read = caller
+            .until("delivery's frame after the change", |event| {
+                event.frame_identity().as_deref() == Some("delivery")
+            })
+            .await;
+        read.extend(caller.quiet_window().await);
+        let sent = sent_for(&read, "late-secret", SseEvent::frame_identity);
+        assert!(
+            sent.is_empty(),
+            "late-secret frames sent after the committed label deny: {sent:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    #[tokio::test]
+    async fn identity_stream_decides_each_frame_under_the_committed_policy() {
+        let (_temp_dir, runtime, controller, app) = fixture().await;
+        let uri = "/console/identity/router/stream";
+        let mut caller = SseReader::open(&app, uri, None).await;
+        let mut witness = SseReader::open(&app, uri, Some(ROOT)).await;
+
+        admin_send(&app, "router", "router-before-change").await;
+        caller
+            .until(
+                "router's frame before the change",
+                frame_with("router", "router-before-change"),
+            )
+            .await;
+        witness
+            .until(
+                "router's frame before the change",
+                frame_with("router", "router-before-change"),
+            )
+            .await;
+
+        commit_view_deny(&controller, "router");
+        admin_send(&app, "router", "router-after-change").await;
+        // Both streams read one broadcast, so the frame the witness was sent
+        // is waiting on the caller's stream too.
+        witness
+            .until(
+                "router's frame after the change",
+                frame_with("router", "router-after-change"),
+            )
+            .await;
+
+        let read = caller.quiet_window().await;
+        let sent = sent_for(&read, "router", SseEvent::frame_identity);
+        assert!(
+            sent.is_empty(),
+            "router frames sent after the committed deny: {sent:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    #[tokio::test]
+    async fn agent_event_stream_ends_when_the_committed_policy_hides_its_agent() {
+        let (_temp_dir, runtime, controller, app) = fixture().await;
+        let mut caller = SseReader::open(&app, "/agents/router/events", None).await;
+
+        member_turn(&runtime, "router", "router-before-change").await;
+        caller
+            .until("router's event before the change", |_| true)
+            .await;
+
+        // The change alone ends the stream: it does not wait for the next
+        // event to notice.
+        commit_view_deny(&controller, "router");
+        let sent = caller.until_end().await;
+        assert!(
+            sent.is_empty(),
+            "router events sent after the committed deny: {sent:#?}"
+        );
+        // A reconnect is decided under the committed policy as well.
+        assert_eq!(
+            get_status(&app, "/agents/router/events").await,
+            StatusCode::FORBIDDEN
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    #[tokio::test]
+    async fn mob_event_stream_decides_each_event_under_the_committed_policy() {
+        let (_temp_dir, runtime, controller, app) = fixture().await;
+        let mut caller = SseReader::open(&app, "/mob/events", None).await;
+
+        member_turn(&runtime, "router", "router-before-change").await;
+        caller
+            .until("router's event before the change", |event| {
+                event.mob_event_source().as_deref() == Some("router")
+            })
+            .await;
+
+        commit_view_deny(&controller, "router");
+        member_turn(&runtime, "router", "router-after-change").await;
+        member_turn(&runtime, "delivery", "delivery-after-change").await;
+        let mut read = caller
+            .until("delivery's event after the change", |event| {
+                event.mob_event_source().as_deref() == Some("delivery")
+            })
+            .await;
+        read.extend(caller.quiet_window().await);
+        let sent = sent_for(&read, "router", SseEvent::mob_event_source);
+        assert!(
+            sent.is_empty(),
+            "router events sent after the committed deny: {sent:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    /// Withdraw `mob.observe` from everyone but the admins.
+    fn commit_observe_withdrawal(controller: &AccessController) {
+        let before = controller.snapshot().1;
+        let revision = controller
+            .delete_rule("everyone-observes")
+            .expect("commit the withdrawal");
+        assert_eq!(revision, before + 1);
+        assert!(!controller.view_for_subject(None).allows("mob.observe"));
+    }
+
+    #[tokio::test]
+    async fn mob_event_stream_ends_when_the_committed_policy_withdraws_mob_observe() {
+        let (_temp_dir, runtime, controller, app) = fixture().await;
+        let mut caller = SseReader::open(&app, "/mob/events", None).await;
+        member_turn(&runtime, "router", "router-before-change").await;
+        caller.until("an event before the change", |_| true).await;
+
+        commit_observe_withdrawal(&controller);
+        let sent = caller.until_end().await;
+        assert!(
+            sent.is_empty(),
+            "events sent after the committed withdrawal: {sent:#?}"
+        );
+        assert_eq!(get_status(&app, "/mob/events").await, StatusCode::FORBIDDEN);
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    #[tokio::test]
+    async fn structural_event_stream_ends_when_the_committed_policy_withdraws_mob_observe() {
+        let (_temp_dir, runtime, controller, app) = fixture().await;
+        let events_view = runtime.mob_handle().events();
+        let after_seq = events_view.latest_cursor().await.expect("cursor");
+        let uri = format!("/meta/mob_events/stream?after_seq={after_seq}");
+        let mut caller = SseReader::open(&app, &uri, None).await;
+        spawn_member(&runtime, "policy-a").await;
+        caller
+            .until("policy-a's spawn before the change", |event| {
+                event.structural_identity().as_deref() == Some("policy-a")
+            })
+            .await;
+
+        commit_observe_withdrawal(&controller);
+        let sent = caller.until_end().await;
+        assert!(
+            sent.is_empty(),
+            "events sent after the committed withdrawal: {sent:#?}"
+        );
+        assert_eq!(get_status(&app, &uri).await, StatusCode::FORBIDDEN);
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    #[tokio::test]
+    async fn structural_event_stream_decides_each_event_under_the_committed_policy() {
+        let (_temp_dir, runtime, controller, app) = fixture().await;
+        let events_view = runtime.mob_handle().events();
+        let after_seq = events_view.latest_cursor().await.expect("cursor");
+        let mut caller = SseReader::open(
+            &app,
+            &format!("/meta/mob_events/stream?after_seq={after_seq}"),
+            None,
+        )
+        .await;
+
+        spawn_member(&runtime, "policy-a").await;
+        caller
+            .until("policy-a's spawn before the change", |event| {
+                event.structural_identity().as_deref() == Some("policy-a")
+            })
+            .await;
+
+        commit_view_deny(&controller, "policy-x");
+        let before_x = events_view.latest_cursor().await.expect("cursor");
+        spawn_member(&runtime, "policy-x").await;
+        let x_spawned = events_view
+            .poll_strict(before_x, 128)
+            .await
+            .expect("events after the change")
+            .into_iter()
+            .any(|event| {
+                matches!(
+                    event.kind,
+                    MobEventKind::MemberSpawned(spawned)
+                        if spawned.agent_identity.as_str() == "policy-x"
+                )
+            });
+        assert!(x_spawned, "policy-x's spawn is in the mob's event log");
+        spawn_member(&runtime, "policy-y").await;
+
+        let mut read = caller
+            .until("policy-y's spawn after the change", |event| {
+                event.structural_identity().as_deref() == Some("policy-y")
+            })
+            .await;
+        read.extend(caller.quiet_window().await);
+        let sent = sent_for(&read, "policy-x", SseEvent::structural_identity);
+        assert!(
+            sent.is_empty(),
+            "policy-x events sent after the committed deny: {sent:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    /// A member that joins while the stream is open is judged by its own
+    /// labels under a rule already in force, though no change to the
+    /// configuration makes the stream read the roster again.
+    #[tokio::test]
+    async fn timeline_stream_reads_the_labels_of_members_that_join_under_an_unchanged_policy() {
+        let (_temp_dir, runtime, controller, app) = fixture().await;
+        let before = controller.snapshot().1;
+        let revision = controller
+            .upsert_rule(secret_label_deny())
+            .expect("commit the label deny");
+        assert_eq!(revision, before + 1);
+        let mut caller = SseReader::open(&app, "/console/timeline/stream", None).await;
+        let mut witness = SseReader::open(&app, "/console/timeline/stream", Some(ROOT)).await;
+
+        spawn_secret_member(&runtime, "late-secret").await;
+        // Turns started on the runtime directly, so no request path reads
+        // the roster for the stream.
+        member_turn(&runtime, "late-secret", "late-secret-turn").await;
+        witness
+            .until("late-secret's frame", |event| {
+                event.frame_identity().as_deref() == Some("late-secret")
+            })
+            .await;
+        member_turn(&runtime, "delivery", "delivery-turn").await;
+        witness
+            .until("delivery's frame", |event| {
+                event.frame_identity().as_deref() == Some("delivery")
+            })
+            .await;
+
+        let mut read = caller
+            .until("delivery's frame", |event| {
+                event.frame_identity().as_deref() == Some("delivery")
+            })
+            .await;
+        read.extend(caller.quiet_window().await);
+        let sent = sent_for(&read, "late-secret", SseEvent::frame_identity);
+        assert!(
+            sent.is_empty(),
+            "late-secret frames sent under the label deny: {sent:#?}"
+        );
+        assert_eq!(
+            controller.snapshot().1,
+            revision,
+            "the configuration did not change while the stream was open"
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    /// One identity-scoped page of `meta/console/query_timeline` for
+    /// `subject` (the open console's anonymous caller when `None`).
+    async fn rpc_timeline_page(app: &axum::Router, subject: Option<&str>, identity: &str) -> Value {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": "timeline",
+            "method": "meta/console/query_timeline",
+            "params": { "mode": "recent", "limit": 200, "identity": identity },
+        });
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/console/rpc")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(subject) = subject {
+            request = request.header(header::AUTHORIZATION, bearer(subject));
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .body(Body::from(payload.to_string()))
+                    .expect("page request"),
+            )
+            .await
+            .expect("page response");
+        let body = to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("page body");
+        let page: Value = serde_json::from_slice(&body).expect("page json");
+        assert_eq!(page["error"], Value::Null, "{page:#?}");
+        page["result"].clone()
+    }
+
+    /// One identity-scoped page of the REST timeline window for `subject`.
+    async fn rest_timeline_page(
+        app: &axum::Router,
+        subject: Option<&str>,
+        identity: &str,
+    ) -> Value {
+        let mut request = Request::builder().method("GET").uri(format!(
+            "/console/timeline?identity={identity}&mode=recent&limit=200"
+        ));
+        if let Some(subject) = subject {
+            request = request.header(header::AUTHORIZATION, bearer(subject));
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).expect("window request"))
+            .await
+            .expect("window response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("window body");
+        serde_json::from_slice(&body).expect("window json")
+    }
+
+    fn page_frames_of(page: &Value, identity: &str) -> usize {
+        page["frames"]
+            .as_array()
+            .map(|frames| {
+                frames
+                    .iter()
+                    .filter(|frame| frame["identity"] == json!(identity))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// The no-restart path: a labelled member in the denied class emits, its
+    /// frames are recorded while it lives, it leaves, and a roster rebuild
+    /// evicts its attributes from the shared cache (as the experience
+    /// projection does). The denied caller's RPC page, REST window and
+    /// identity stream decide its frames by the owner-captured attributes,
+    /// not by a bare identity no label rule can match.
+    #[tokio::test]
+    async fn a_departed_labelled_member_stays_hidden_after_its_attributes_leave_the_cache() {
+        let (_temp_dir, runtime, controller, app) = fixture().await;
+        controller
+            .upsert_rule(secret_label_deny())
+            .expect("commit the label deny");
+        spawn_secret_member(&runtime, "departed-secret").await;
+        member_turn(&runtime, "departed-secret", "departed-secret-turn").await;
+        // The admin reads the member while it lives, so its frames are on the
+        // timeline with the owner's capture.
+        tokio::time::timeout(DEADLINE, async {
+            while page_frames_of(
+                &rpc_timeline_page(&app, Some(ROOT), "departed-secret").await,
+                "departed-secret",
+            ) == 0
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the member's frames are recorded");
+        runtime
+            .mob_handle()
+            .retire(MeerkatId::from("departed-secret"))
+            .await
+            .expect("retire the member");
+        tokio::time::timeout(DEADLINE, async {
+            while runtime
+                .mob_handle()
+                .list_members_including_retiring()
+                .await
+                .iter()
+                .any(|member| member.agent_identity.as_str() == "departed-secret")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the member left the roster");
+        controller.replace_agent_attributes([AgentResourceAttributes {
+            identity: "still-here".to_string(),
+            agent_id: Some("still-here".to_string()),
+            role: Some("lead".to_string()),
+            labels: BTreeMap::new(),
+        }]);
+        assert!(
+            !controller
+                .view_for_subject(None)
+                .knows_agent("departed-secret")
+        );
+
+        // Not vacuous: the admin still reads the departed member's frames.
+        assert!(
+            page_frames_of(
+                &rpc_timeline_page(&app, Some(ROOT), "departed-secret").await,
+                "departed-secret",
+            ) > 0
+        );
+        assert_eq!(
+            page_frames_of(
+                &rpc_timeline_page(&app, None, "departed-secret").await,
+                "departed-secret",
+            ),
+            0,
+            "the RPC page sent a departed denied member's frames"
+        );
+        assert_eq!(
+            page_frames_of(
+                &rest_timeline_page(&app, None, "departed-secret").await,
+                "departed-secret",
+            ),
+            0,
+            "the REST window sent a departed denied member's frames"
+        );
+        let mut stream =
+            SseReader::open(&app, "/console/identity/departed-secret/stream", None).await;
+        let read = stream.quiet_window().await;
+        let sent = sent_for(&read, "departed-secret", SseEvent::frame_identity);
+        assert!(
+            sent.is_empty(),
+            "the identity stream sent a departed denied member's frames: {sent:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    #[tokio::test]
+    async fn timeline_stream_decides_a_frame_under_a_change_committed_while_processing_it() {
+        let controller = open_policy();
+        let policy = DenyWhileProcessing::new(&controller, "router");
+        let (_temp_dir, runtime, _controller, app) = fixture_with(
+            controller,
+            Some(policy.clone() as Arc<dyn ConsoleVisibilityPolicy>),
+        )
+        .await;
+        let mut caller = SseReader::open(&app, "/console/timeline/stream", None).await;
+        admin_send(&app, "router", "router-before-change").await;
+        READING_CALLER
+            .scope(
+                (),
+                caller.until(
+                    "router's frame before the change",
+                    frame_with("router", "router-before-change"),
+                ),
+            )
+            .await;
+
+        policy.arm();
+        admin_send(&app, "router", "router-after-change").await;
+        admin_send(&app, "delivery", "delivery-after-change").await;
+        let read = READING_CALLER
+            .scope((), async {
+                let mut read = caller
+                    .until(
+                        "delivery's frame after the change",
+                        frame_with("delivery", "delivery-after-change"),
+                    )
+                    .await;
+                read.extend(caller.quiet_window().await);
+                read
+            })
+            .await;
+        assert!(
+            policy.committed(),
+            "the stream asked the console policy about router after the policy was armed"
+        );
+        let sent = sent_for(&read, "router", SseEvent::frame_identity);
+        assert!(
+            sent.is_empty(),
+            "router frames sent after the deny committed while they were processed: {sent:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    #[tokio::test]
+    async fn mob_event_stream_decides_an_event_under_a_change_committed_while_processing_it() {
+        let controller = open_policy();
+        let policy = DenyWhileProcessing::new(&controller, "router");
+        let (_temp_dir, runtime, _controller, app) = fixture_with(
+            controller,
+            Some(policy.clone() as Arc<dyn ConsoleVisibilityPolicy>),
+        )
+        .await;
+        let mut caller = SseReader::open(&app, "/mob/events", None).await;
+        member_turn(&runtime, "router", "router-before-change").await;
+        READING_CALLER
+            .scope(
+                (),
+                caller.until("router's event before the change", |event| {
+                    event.mob_event_source().as_deref() == Some("router")
+                }),
+            )
+            .await;
+
+        policy.arm();
+        member_turn(&runtime, "router", "router-after-change").await;
+        member_turn(&runtime, "delivery", "delivery-after-change").await;
+        let read = READING_CALLER
+            .scope((), async {
+                let mut read = caller
+                    .until("delivery's event after the change", |event| {
+                        event.mob_event_source().as_deref() == Some("delivery")
+                    })
+                    .await;
+                read.extend(caller.quiet_window().await);
+                read
+            })
+            .await;
+        assert!(
+            policy.committed(),
+            "the stream asked the console policy about router after the policy was armed"
+        );
+        let sent = sent_for(&read, "router", SseEvent::mob_event_source);
+        assert!(
+            sent.is_empty(),
+            "router events sent after the deny committed while they were processed: {sent:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    #[tokio::test]
+    async fn structural_event_stream_decides_an_event_under_a_change_committed_while_processing_it()
+    {
+        let controller = open_policy();
+        let policy = DenyWhileProcessing::new(&controller, "policy-x");
+        let (_temp_dir, runtime, _controller, app) = fixture_with(
+            controller,
+            Some(policy.clone() as Arc<dyn ConsoleVisibilityPolicy>),
+        )
+        .await;
+        let events_view = runtime.mob_handle().events();
+        let after_seq = events_view.latest_cursor().await.expect("cursor");
+        let mut caller = SseReader::open(
+            &app,
+            &format!("/meta/mob_events/stream?after_seq={after_seq}"),
+            None,
+        )
+        .await;
+        spawn_member(&runtime, "policy-a").await;
+        READING_CALLER
+            .scope(
+                (),
+                caller.until("policy-a's spawn before the change", |event| {
+                    event.structural_identity().as_deref() == Some("policy-a")
+                }),
+            )
+            .await;
+
+        policy.arm();
+        spawn_member(&runtime, "policy-x").await;
+        spawn_member(&runtime, "policy-y").await;
+        let read = READING_CALLER
+            .scope((), async {
+                let mut read = caller
+                    .until("policy-y's spawn after the change", |event| {
+                        event.structural_identity().as_deref() == Some("policy-y")
+                    })
+                    .await;
+                read.extend(caller.quiet_window().await);
+                read
+            })
+            .await;
+        assert!(
+            policy.committed(),
+            "the stream asked the console policy about policy-x after the policy was armed"
+        );
+        let sent = sent_for(&read, "policy-x", SseEvent::structural_identity);
+        assert!(
+            sent.is_empty(),
+            "policy-x events sent after the deny committed while they were processed: {sent:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    /// A change committed while the stream sends its snapshot applies to the
+    /// rest of the snapshot.
+    #[tokio::test]
+    async fn timeline_snapshot_decides_each_frame_under_the_committed_policy() {
+        let (_temp_dir, runtime, controller, app) = fixture().await;
+        let mut live = SseReader::open(&app, "/console/timeline/stream", Some(ROOT)).await;
+        admin_send(&app, "router", "router-first").await;
+        admin_send(&app, "delivery", "delivery-between").await;
+        admin_send(&app, "router", "router-second").await;
+        // In the timeline once a live stream has seen it: a stream opened
+        // from here sends these frames in its snapshot.
+        live.until(
+            "router's second frame",
+            frame_with("router", "router-second"),
+        )
+        .await;
+        let is_snapshot_end = |event: &SseEvent| event.name == "snapshot_complete";
+        let mut witness = SseReader::open(&app, "/console/timeline/stream", Some(ROOT)).await;
+        let snapshot = witness
+            .until("the end of the admin's snapshot", is_snapshot_end)
+            .await;
+        let delivery_at = snapshot
+            .iter()
+            .position(frame_with("delivery", "delivery-between"))
+            .expect("delivery's frame in the snapshot");
+        assert!(
+            snapshot[delivery_at..]
+                .iter()
+                .any(frame_with("router", "router-second")),
+            "a router frame follows delivery's in the snapshot: {snapshot:#?}"
+        );
+
+        // The stream sends one frame per read, so it is paused on delivery's
+        // frame when the change is committed.
+        let mut caller = SseReader::open(&app, "/console/timeline/stream", None).await;
+        caller
+            .until(
+                "delivery's frame in the snapshot",
+                frame_with("delivery", "delivery-between"),
+            )
+            .await;
+        commit_view_deny(&controller, "router");
+        let rest = caller
+            .until("the end of the caller's snapshot", is_snapshot_end)
+            .await;
+        let sent = sent_for(&rest, "router", SseEvent::frame_identity);
+        assert!(
+            sent.is_empty(),
+            "router snapshot frames sent after the committed deny: {sent:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    /// Enabling access control applies to a stream that opened while it was
+    /// off.
+    #[tokio::test]
+    async fn timeline_stream_applies_access_control_enabled_while_it_is_open() {
+        let disabled = AccessController::new(AccessControlConfig {
+            enabled: false,
+            ..(*open_policy().snapshot().0).clone()
+        })
+        .expect("controller");
+        let (_temp_dir, runtime, controller, app) = fixture_with(disabled, None).await;
+        let mut caller = SseReader::open(&app, "/console/timeline/stream", None).await;
+        admin_send(&app, "router", "router-before-change").await;
+        caller
+            .until(
+                "router's frame before the change",
+                frame_with("router", "router-before-change"),
+            )
+            .await;
+
+        let mut enabled = (*controller.snapshot().0).clone();
+        enabled.enabled = true;
+        enabled.rules.push(AccessRule {
+            id: "deny-view-router".to_string(),
+            effect: meerkat_meta::AccessEffect::Deny,
+            actions: vec!["agent.view".to_string()],
+            agents: vec!["router".to_string()],
+            ..AccessRule::default()
+        });
+        controller
+            .replace_config(enabled)
+            .expect("enable access control");
+        assert!(!controller.view_for_subject(None).can_view_agent("router"));
+        admin_send(&app, "router", "router-after-change").await;
+        admin_send(&app, "delivery", "delivery-after-change").await;
+        let mut read = caller
+            .until(
+                "delivery's frame after the change",
+                frame_with("delivery", "delivery-after-change"),
+            )
+            .await;
+        read.extend(caller.quiet_window().await);
+        let sent = sent_for(&read, "router", SseEvent::frame_identity);
+        assert!(
+            sent.is_empty(),
+            "router frames sent after access control was enabled with a deny: {sent:#?}"
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    /// Open streams end once the Console's verifier no longer accepts the
+    /// token their caller opened them with: the moment a request with that
+    /// token is refused. They end without a frame, with or without an access
+    /// controller, and send nothing they decide after it.
+    mod token_lapse {
+        use super::*;
+        use std::sync::Mutex;
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+        const ALICE: &str = "alice@example.test";
+        /// The verifier accepts a token through 30 seconds past its `exp`,
+        /// on whole seconds, and refuses it from the next second.
+        const REFUSED_AFTER_EXP: u64 = 31;
+        /// How long after the verifier refuses its token a stream may take
+        /// to end.
+        const END_BOUND: Duration = Duration::from_secs(8);
+        /// How often the gating stream re-checks without a wake.
+        const GATING_RECHECK: Duration = Duration::from_secs(15);
+
+        fn epoch_seconds(at: SystemTime) -> u64 {
+            at.duration_since(UNIX_EPOCH)
+                .expect("clock after the epoch")
+                .as_secs()
+        }
+
+        /// A bearer token for `subject` that expires at `exp`, or carries no
+        /// `exp` at all.
+        fn bearer_until(subject: &str, exp: Option<u64>) -> String {
+            let mut claims = json!({
+                "iss": ISSUER,
+                "aud": "meerkat-console",
+                "sub": subject,
+                "email": subject,
+                "provider": "google_oauth",
+            });
+            if let Some(exp) = exp {
+                claims["exp"] = json!(exp);
+            }
+            let mut jwt_header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+            jwt_header.kid = Some("kid-current".to_string());
+            let token = jsonwebtoken::encode(
+                &jwt_header,
+                &claims,
+                &jsonwebtoken::EncodingKey::from_secret(b"phase7-trusted-current-secret"),
+            )
+            .expect("signed fixture token");
+            format!("Bearer {token}")
+        }
+
+        /// A caller's token the verifier accepts now and refuses from
+        /// `refused_from` on, `lifetime` whole seconds from now.
+        struct LapsingToken {
+            authorization: String,
+            refused_from: SystemTime,
+        }
+
+        impl LapsingToken {
+            fn new(subject: &str, lifetime: u64) -> Self {
+                let refused_from = epoch_seconds(SystemTime::now()) + lifetime;
+                Self {
+                    authorization: bearer_until(subject, Some(refused_from - REFUSED_AFTER_EXP)),
+                    refused_from: UNIX_EPOCH + Duration::from_secs(refused_from),
+                }
+            }
+        }
+
+        /// Everyone may observe the mob, the gating audit and WorkGraph, and
+        /// view and message every agent.
+        fn everyone_policy() -> AccessController {
+            let mut config = (*open_policy().snapshot().0).clone();
+            for action in ["gating.view", "workgraph.view"] {
+                config.rules.push(AccessRule {
+                    id: format!("everyone-{action}"),
+                    actions: vec![action.to_string()],
+                    ..AccessRule::default()
+                });
+            }
+            AccessController::new(config).expect("controller")
+        }
+
+        /// The decisions of a console that requires app auth, or with
+        /// `false` one that takes volunteered tokens, trusting the issuer
+        /// the fixture tokens are signed for.
+        fn decisions(require_app_auth: bool) -> meerkat_meta::RuntimeDecisionState {
+            let mut decisions = decision_state(require_app_auth);
+            decisions.trusted_oidc.discovery_json = json!({
+                "issuer": ISSUER,
+                "jwks_uri": format!("{ISSUER}/.well-known/jwks.json"),
+            })
+            .to_string();
+            decisions
+        }
+
+        /// The reference app under `controller`, or with no access controller
+        /// at all, and `policy` as its console policy.
+        async fn app_with(
+            require_app_auth: bool,
+            controller: Option<AccessController>,
+            policy: Option<Arc<dyn ConsoleVisibilityPolicy>>,
+        ) -> (tempfile::TempDir, UnifiedRuntime, axum::Router) {
+            let (temp_dir, mut runtime) = build_access_runtime_fixture().await;
+            if let Some(controller) = controller {
+                runtime.set_access_controller(controller);
+            }
+            let decisions = decisions(require_app_auth);
+            let app = match policy {
+                Some(policy) => runtime
+                    .build_reference_app_router_with_console_visibility_policy(decisions, policy),
+                None => runtime.build_reference_app_router(decisions),
+            };
+            (temp_dir, runtime, app)
+        }
+
+        async fn get_with(
+            app: &axum::Router,
+            uri: &str,
+            authorization: Option<&str>,
+        ) -> axum::response::Response {
+            let mut request = Request::builder().method("GET").uri(uri);
+            if let Some(authorization) = authorization {
+                request = request.header(header::AUTHORIZATION, authorization);
+            }
+            app.clone()
+                .oneshot(request.body(Body::empty()).expect("request"))
+                .await
+                .expect("response")
+        }
+
+        /// Read `caller` to its end, which must come once the verifier
+        /// refuses `token` and soon after.
+        async fn ends_at_the_lapse(caller: &mut SseReader, token: &LapsingToken) -> Vec<SseEvent> {
+            let read = caller.until_end().await;
+            let ended = SystemTime::now();
+            assert!(
+                ended >= token.refused_from,
+                "{} ended {:?} before the verifier refused its token",
+                caller.uri,
+                token.refused_from.duration_since(ended).unwrap_or_default()
+            );
+            assert!(
+                ended < token.refused_from + END_BOUND,
+                "{} ended {:?} after the verifier refused its token",
+                caller.uri,
+                ended.duration_since(token.refused_from).unwrap_or_default()
+            );
+            read
+        }
+
+        /// The streams at `uris`, opened together with one token on a console
+        /// that requires app auth, all end when it lapses; a request with
+        /// the token is then refused. Returns how long after opening the
+        /// last one ended.
+        async fn streams_end_at_the_lapse(
+            uris: &[&str],
+            controller: Option<AccessController>,
+        ) -> Duration {
+            let (_temp_dir, runtime, app) = app_with(true, controller, None).await;
+            let token = LapsingToken::new(ALICE, 4);
+            let opened = Instant::now();
+            let mut callers = Vec::new();
+            for uri in uris {
+                callers.push(SseReader::open_with(&app, uri, Some(&token.authorization)).await);
+            }
+            futures::future::join_all(
+                callers
+                    .iter_mut()
+                    .map(|caller| ends_at_the_lapse(caller, &token)),
+            )
+            .await;
+            let elapsed = opened.elapsed();
+            assert_eq!(
+                get_with(&app, "/console/experience", Some(&token.authorization))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED,
+                "a request with the lapsed token is refused"
+            );
+            let _ = runtime.mob_handle().stop().await;
+            elapsed
+        }
+
+        #[tokio::test]
+        async fn timeline_stream_ends_when_its_token_lapses() {
+            streams_end_at_the_lapse(&["/console/timeline/stream"], Some(everyone_policy())).await;
+        }
+
+        #[tokio::test]
+        async fn timeline_stream_ends_when_its_token_lapses_without_access_control() {
+            streams_end_at_the_lapse(&["/console/timeline/stream"], None).await;
+        }
+
+        #[tokio::test]
+        async fn mob_event_stream_ends_when_its_token_lapses() {
+            streams_end_at_the_lapse(&["/mob/events"], Some(everyone_policy())).await;
+        }
+
+        #[tokio::test]
+        async fn mob_event_stream_ends_when_its_token_lapses_without_access_control() {
+            streams_end_at_the_lapse(&["/mob/events"], None).await;
+        }
+
+        /// The gating stream ends at the lapse, not at its next periodic
+        /// re-check, and without a `gating.access_revoked` frame.
+        async fn gating_stream_ends_at_the_lapse(controller: Option<AccessController>) {
+            let (_temp_dir, runtime, app) = app_with(true, controller, None).await;
+            let token = LapsingToken::new(ALICE, 4);
+            let opened = Instant::now();
+            let mut caller =
+                SseReader::open_with(&app, "/console/gating/stream", Some(&token.authorization))
+                    .await;
+            let read = ends_at_the_lapse(&mut caller, &token).await;
+            assert!(
+                opened.elapsed() < GATING_RECHECK,
+                "the gating stream ended at a periodic re-check, {:?} after it opened",
+                opened.elapsed()
+            );
+            let names: Vec<&str> = read.iter().map(|event| event.name.as_str()).collect();
+            assert_eq!(
+                names,
+                ["gating.resync_required"],
+                "the lapse ends it silently"
+            );
+            let _ = runtime.mob_handle().stop().await;
+        }
+
+        #[tokio::test]
+        async fn gating_stream_ends_when_its_token_lapses() {
+            gating_stream_ends_at_the_lapse(Some(everyone_policy())).await;
+        }
+
+        #[tokio::test]
+        async fn gating_stream_ends_when_its_token_lapses_without_access_control() {
+            gating_stream_ends_at_the_lapse(None).await;
+        }
+
+        const OTHER_STREAMS: [&str; 3] = [
+            "/console/identity/router/stream",
+            "/agents/router/events",
+            "/meta/mob_events/stream",
+        ];
+
+        #[tokio::test]
+        async fn identity_agent_and_structural_streams_end_when_their_token_lapses() {
+            streams_end_at_the_lapse(&OTHER_STREAMS, Some(everyone_policy())).await;
+        }
+
+        #[tokio::test]
+        async fn identity_agent_and_structural_streams_end_when_their_token_lapses_without_access_control()
+         {
+            streams_end_at_the_lapse(&OTHER_STREAMS, None).await;
+        }
+
+        async fn workgraph_stream_ends_at_the_lapse(controller: Option<AccessController>) {
+            let app = meerkat_meta::http_sse::workgraph_facts_sse_router(
+                meerkat_meta::workgraph_events::WorkGraphFactHub::new(),
+                Some(decisions(true)),
+                controller,
+            );
+            let token = LapsingToken::new(ALICE, 4);
+            let mut caller = SseReader::open_with(
+                &app,
+                meerkat_meta::http_sse::WORKGRAPH_FACTS_STREAM_PATH,
+                Some(&token.authorization),
+            )
+            .await;
+            ends_at_the_lapse(&mut caller, &token).await;
+            let reconnect = get_with(
+                &app,
+                meerkat_meta::http_sse::WORKGRAPH_FACTS_STREAM_PATH,
+                Some(&token.authorization),
+            )
+            .await;
+            assert_eq!(reconnect.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn workgraph_stream_ends_when_its_token_lapses() {
+            workgraph_stream_ends_at_the_lapse(Some(everyone_policy())).await;
+        }
+
+        #[tokio::test]
+        async fn workgraph_stream_ends_when_its_token_lapses_without_access_control() {
+            workgraph_stream_ends_at_the_lapse(None).await;
+        }
+
+        /// On a console that takes volunteered tokens, a stream a token
+        /// identified ends when that token lapses; the reconnect with it is
+        /// decided as anonymous.
+        #[tokio::test]
+        async fn a_stream_opened_with_a_volunteered_token_ends_when_it_lapses() {
+            let (_temp_dir, runtime, app) = app_with(false, Some(everyone_policy()), None).await;
+            let token = LapsingToken::new(ALICE, 4);
+            let mut caller =
+                SseReader::open_with(&app, "/mob/events", Some(&token.authorization)).await;
+            ends_at_the_lapse(&mut caller, &token).await;
+            let reconnect = get_with(&app, "/mob/events", Some(&token.authorization)).await;
+            assert_eq!(reconnect.status(), StatusCode::OK, "decided as anonymous");
+            let _ = runtime.mob_handle().stop().await;
+        }
+
+        /// Control: a token without `exp` never lapses, so its stream is
+        /// still open, and still sending, after the instant a 4-second
+        /// token would have ended it.
+        #[tokio::test]
+        async fn a_stream_opened_with_a_token_without_exp_stays_open() {
+            let (_temp_dir, runtime, app) = app_with(true, None, None).await;
+            let yardstick = LapsingToken::new(ALICE, 4);
+            let mut caller = SseReader::open_with(
+                &app,
+                "/console/timeline/stream",
+                Some(&bearer_until(ALICE, None)),
+            )
+            .await;
+            admin_send(&app, "router", "router-before-the-lapse").await;
+            caller
+                .until(
+                    "router's frame before the lapse",
+                    frame_with("router", "router-before-the-lapse"),
+                )
+                .await;
+            let past_the_lapse = yardstick.refused_from + Duration::from_secs(2);
+            tokio::time::sleep(
+                past_the_lapse
+                    .duration_since(SystemTime::now())
+                    .unwrap_or_default(),
+            )
+            .await;
+            admin_send(&app, "router", "router-after-the-lapse").await;
+            caller
+                .until(
+                    "router's frame after the lapse",
+                    frame_with("router", "router-after-the-lapse"),
+                )
+                .await;
+            let _ = runtime.mob_handle().stop().await;
+        }
+
+        /// A console policy that, once armed, holds the caller's stream
+        /// inside its processing of `target` until `until`: the stream asks
+        /// it about that member after taking the frame or event and before
+        /// deciding it, so the decision falls after the token lapsed.
+        struct HoldWhileProcessing {
+            target: String,
+            until: Mutex<Option<SystemTime>>,
+            held_from: Mutex<Option<SystemTime>>,
+        }
+
+        impl HoldWhileProcessing {
+            fn new(target: &str) -> Arc<Self> {
+                Arc::new(Self {
+                    target: target.to_string(),
+                    until: Mutex::new(None),
+                    held_from: Mutex::new(None),
+                })
+            }
+
+            fn arm(&self, until: SystemTime) {
+                *self.until.lock().unwrap() = Some(until);
+            }
+
+            /// When the stream started processing the held frame, if it did.
+            fn held_from(&self) -> Option<SystemTime> {
+                *self.held_from.lock().unwrap()
+            }
+
+            fn asked_about(&self, identity: &str) {
+                if identity != self.target || READING_CALLER.try_with(|()| ()).is_err() {
+                    return;
+                }
+                let Some(until) = self.until.lock().unwrap().take() else {
+                    return;
+                };
+                *self.held_from.lock().unwrap() = Some(SystemTime::now());
+                while SystemTime::now() < until {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+
+        impl ConsoleVisibilityPolicy for HoldWhileProcessing {
+            fn member_visible(&self, member: &ConsoleMember) -> bool {
+                self.asked_about(&member.agent_identity);
+                true
+            }
+
+            fn identity_visible(&self, record: &ConsoleIdentityRecord) -> bool {
+                self.asked_about(&record.identity);
+                true
+            }
+
+            fn frame_visible(&self, frame: &ConsoleFrame) -> bool {
+                self.asked_about(&frame.identity);
+                true
+            }
+        }
+
+        /// Every event `caller` sends until it ends, or until it has been
+        /// quiet for five seconds; and whether it ended.
+        async fn read_to_end_or_quiet(caller: &mut SseReader) -> (Vec<SseEvent>, bool) {
+            let mut read = Vec::new();
+            loop {
+                match caller.next(Duration::from_secs(5)).await {
+                    Next::Event(event) => read.push(event),
+                    Next::Ended => return (read, true),
+                    Next::Quiet => return (read, false),
+                }
+            }
+        }
+
+        /// The stream reached the held member's frame or event before the
+        /// lapse, sent none of them after it was armed, and then ended.
+        fn assert_held_and_not_sent(
+            policy: &HoldWhileProcessing,
+            token: &LapsingToken,
+            (read, ended): (Vec<SseEvent>, bool),
+            attribution: impl Fn(&SseEvent) -> Option<String>,
+        ) {
+            let held_from = policy
+                .held_from()
+                .expect("the stream asked the console policy about the target after arming");
+            assert!(
+                held_from < token.refused_from,
+                "the stream reached the held frame {:?} after the lapse; the test proves nothing",
+                held_from
+                    .duration_since(token.refused_from)
+                    .unwrap_or_default()
+            );
+            let sent = sent_for(&read, &policy.target, attribution);
+            assert!(
+                sent.is_empty(),
+                "frames of {} decided after the token lapsed were sent: {sent:#?}",
+                policy.target
+            );
+            assert!(ended, "the stream did not end at the lapse: {read:#?}");
+        }
+
+        #[tokio::test]
+        async fn timeline_stream_sends_no_frame_decided_after_its_token_lapsed() {
+            let policy = HoldWhileProcessing::new("router");
+            let (_temp_dir, runtime, app) = app_with(
+                true,
+                None,
+                Some(policy.clone() as Arc<dyn ConsoleVisibilityPolicy>),
+            )
+            .await;
+            let token = LapsingToken::new(ALICE, 12);
+            let mut caller =
+                SseReader::open_with(&app, "/console/timeline/stream", Some(&token.authorization))
+                    .await;
+            admin_send(&app, "router", "router-before-the-hold").await;
+            READING_CALLER
+                .scope(
+                    (),
+                    caller.until(
+                        "router's frame before the hold",
+                        frame_with("router", "router-before-the-hold"),
+                    ),
+                )
+                .await;
+
+            policy.arm(token.refused_from + Duration::from_secs(1));
+            admin_send(&app, "router", "router-held-across-the-lapse").await;
+            let read = READING_CALLER
+                .scope((), read_to_end_or_quiet(&mut caller))
+                .await;
+            assert_held_and_not_sent(&policy, &token, read, SseEvent::frame_identity);
+            let _ = runtime.mob_handle().stop().await;
+        }
+
+        #[tokio::test]
+        async fn mob_event_stream_sends_no_event_decided_after_its_token_lapsed() {
+            let policy = HoldWhileProcessing::new("router");
+            let (_temp_dir, runtime, app) = app_with(
+                true,
+                None,
+                Some(policy.clone() as Arc<dyn ConsoleVisibilityPolicy>),
+            )
+            .await;
+            let token = LapsingToken::new(ALICE, 12);
+            let mut caller =
+                SseReader::open_with(&app, "/mob/events", Some(&token.authorization)).await;
+            member_turn(&runtime, "delivery", "delivery-before-the-hold").await;
+            READING_CALLER
+                .scope(
+                    (),
+                    caller.until("delivery's event before the hold", |event| {
+                        event.mob_event_source().as_deref() == Some("delivery")
+                    }),
+                )
+                .await;
+
+            policy.arm(token.refused_from + Duration::from_secs(1));
+            member_turn(&runtime, "router", "router-held-across-the-lapse").await;
+            let read = READING_CALLER
+                .scope((), read_to_end_or_quiet(&mut caller))
+                .await;
+            assert_held_and_not_sent(&policy, &token, read, SseEvent::mob_event_source);
+            let _ = runtime.mob_handle().stop().await;
+        }
+
+        #[tokio::test]
+        async fn structural_event_stream_sends_no_event_decided_after_its_token_lapsed() {
+            let policy = HoldWhileProcessing::new("policy-x");
+            let (_temp_dir, runtime, app) = app_with(
+                true,
+                None,
+                Some(policy.clone() as Arc<dyn ConsoleVisibilityPolicy>),
+            )
+            .await;
+            let token = LapsingToken::new(ALICE, 12);
+            let after_seq = runtime
+                .mob_handle()
+                .events()
+                .latest_cursor()
+                .await
+                .expect("cursor");
+            let mut caller = SseReader::open_with(
+                &app,
+                &format!("/meta/mob_events/stream?after_seq={after_seq}"),
+                Some(&token.authorization),
+            )
+            .await;
+            spawn_member(&runtime, "policy-a").await;
+            READING_CALLER
+                .scope(
+                    (),
+                    caller.until("policy-a's spawn before the hold", |event| {
+                        event.structural_identity().as_deref() == Some("policy-a")
+                    }),
+                )
+                .await;
+
+            policy.arm(token.refused_from + Duration::from_secs(1));
+            spawn_member(&runtime, "policy-x").await;
+            let read = READING_CALLER
+                .scope((), read_to_end_or_quiet(&mut caller))
+                .await;
+            assert_held_and_not_sent(&policy, &token, read, SseEvent::structural_identity);
+            let _ = runtime.mob_handle().stop().await;
+        }
+
+        /// No refusal of a stream carries the caller's token, whether the
+        /// token is refused (401) or the caller is denied the stream (403).
+        #[tokio::test]
+        async fn stream_refusals_never_carry_the_token() {
+            let deny_all = AccessController::new(AccessControlConfig {
+                enabled: true,
+                admins: vec![ROOT.to_string()],
+                ..AccessControlConfig::default()
+            })
+            .expect("controller");
+            let (_temp_dir, runtime, app) = app_with(true, Some(deny_all), None).await;
+            let lapsed = bearer_until(ALICE, Some(epoch_seconds(SystemTime::now()) - 120));
+            let current = bearer_until(ALICE, Some(epoch_seconds(SystemTime::now()) + 300));
+            let mut refusals = Vec::new();
+            for uri in [
+                "/console/timeline/stream",
+                "/console/identity/router/stream",
+                "/agents/router/events",
+                "/mob/events",
+                "/meta/mob_events/stream",
+                "/console/gating/stream",
+            ] {
+                let token = lapsed.strip_prefix("Bearer ").expect("bearer");
+                let header = get_with(&app, uri, Some(&lapsed)).await;
+                let query = get_with(&app, &format!("{uri}?auth_token={token}"), None).await;
+                refusals.push((uri, token.to_string(), StatusCode::UNAUTHORIZED, header));
+                refusals.push((uri, token.to_string(), StatusCode::UNAUTHORIZED, query));
+            }
+            for uri in [
+                "/agents/router/events",
+                "/mob/events",
+                "/console/gating/stream",
+            ] {
+                let token = current.strip_prefix("Bearer ").expect("bearer");
+                let denied = get_with(&app, uri, Some(&current)).await;
+                refusals.push((uri, token.to_string(), StatusCode::FORBIDDEN, denied));
+            }
+            for (uri, token, status, response) in refusals {
+                assert_eq!(response.status(), status, "{uri}");
+                let body = to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .expect("refusal body");
+                let body = String::from_utf8_lossy(&body);
+                let signature = token.rsplit('.').next().expect("signature");
+                assert!(
+                    !body.contains(&token) && !body.contains(signature),
+                    "{uri} refusal carries the token: {body}"
+                );
+            }
+            let _ = runtime.mob_handle().stop().await;
+        }
+
+        /// A bearer token for `subject` issued at `iat` and expiring at
+        /// `exp`, either of which it may lack.
+        fn bearer_issued(subject: &str, iat: Option<u64>, exp: Option<u64>) -> String {
+            let mut claims = json!({
+                "iss": ISSUER,
+                "aud": "meerkat-console",
+                "sub": subject,
+                "email": subject,
+                "provider": "google_oauth",
+            });
+            if let Some(iat) = iat {
+                claims["iat"] = json!(iat);
+            }
+            if let Some(exp) = exp {
+                claims["exp"] = json!(exp);
+            }
+            let mut jwt_header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+            jwt_header.kid = Some("kid-current".to_string());
+            let token = jsonwebtoken::encode(
+                &jwt_header,
+                &claims,
+                &jsonwebtoken::EncodingKey::from_secret(b"phase7-trusted-current-secret"),
+            )
+            .expect("signed fixture token");
+            format!("Bearer {token}")
+        }
+
+        fn now_seconds() -> u64 {
+            epoch_seconds(SystemTime::now())
+        }
+
+        /// A token of `subject` issued a minute ago that expires in an hour.
+        fn current_bearer(subject: &str) -> String {
+            let issued = now_seconds() - 60;
+            bearer_issued(subject, Some(issued), Some(issued + 3600))
+        }
+
+        /// The reference app under `controller`, or with no access controller
+        /// at all, whose runtime keeps its Console session fence record in
+        /// the returned state directory.
+        async fn fenced_app_with(
+            require_app_auth: bool,
+            controller: Option<AccessController>,
+        ) -> (
+            tempfile::TempDir,
+            tempfile::TempDir,
+            UnifiedRuntime,
+            axum::Router,
+        ) {
+            let (temp_dir, mut runtime) = build_access_runtime_fixture().await;
+            if let Some(controller) = controller {
+                runtime.set_access_controller(controller);
+            }
+            let state_dir = tempfile::tempdir().expect("state directory");
+            runtime.set_console_session_fences(
+                meerkat_meta::ConsoleSessionFences::open_in_state_dir(state_dir.path())
+                    .expect("session fence record"),
+            );
+            let app = runtime.build_reference_app_router(decisions(require_app_auth));
+            (temp_dir, state_dir, runtime, app)
+        }
+
+        async fn unified_rpc(runtime: &UnifiedRuntime, method: &str, params: Value) -> Value {
+            let request = json!({
+                "jsonrpc": "2.0", "id": "fence", "method": method, "params": params,
+            })
+            .to_string();
+            let response = meerkat_meta::handle_unified_rpc_json(
+                runtime,
+                &request,
+                Duration::from_secs(5),
+                None,
+                None,
+            )
+            .await;
+            serde_json::from_str(&response).expect("JSON-RPC response")
+        }
+
+        const FENCED_STREAMS: [&str; 3] = [
+            "/console/timeline/stream",
+            "/mob/events",
+            "/console/gating/stream",
+        ];
+
+        /// A revocation ends every stream its principal's token opened
+        /// before it, on the timeline, `/mob/events` and gating paths, without
+        /// waiting for the token's expiry; a request and a reconnect with that
+        /// token are refused with 401 from then on, and a token issued after
+        /// the fence plus the verifier's leeway is accepted.
+        async fn a_revocation_ends_open_streams_and_refuses_requests(
+            controller: Option<AccessController>,
+        ) {
+            let (_temp_dir, _state_dir, runtime, app) = fenced_app_with(true, controller).await;
+            let old = current_bearer(ALICE);
+            let mut callers = Vec::new();
+            for uri in FENCED_STREAMS {
+                callers.push(SseReader::open_with(&app, uri, Some(&old)).await);
+            }
+            assert_eq!(
+                get_with(&app, "/console/experience", Some(&old))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            let revoked = unified_rpc(
+                &runtime,
+                "meta/console/revoke_sessions",
+                json!({ "principal": ALICE }),
+            )
+            .await;
+            assert!(revoked["error"].is_null(), "{revoked}");
+            let not_before = revoked["result"]["not_before"].as_u64().expect("the fence");
+            assert_eq!(revoked["result"]["principal"], ALICE);
+            assert_eq!(
+                revoked["result"]["accepts_tokens_issued_from"],
+                json!(not_before + 30)
+            );
+            let fenced_at = Instant::now();
+            for caller in &mut callers {
+                caller.until_end().await;
+            }
+            assert!(
+                fenced_at.elapsed() < END_BOUND,
+                "the streams ended {:?} after the revocation",
+                fenced_at.elapsed()
+            );
+            assert_eq!(
+                get_with(&app, "/console/experience", Some(&old))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED,
+                "a request with the revoked token is refused"
+            );
+            for uri in FENCED_STREAMS {
+                assert_eq!(
+                    get_with(&app, uri, Some(&old)).await.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{uri} refuses the revoked token"
+                );
+            }
+            let fresh = bearer_issued(ALICE, Some(not_before + 40), Some(now_seconds() + 3600));
+            assert_eq!(
+                get_with(&app, "/console/experience", Some(&fresh))
+                    .await
+                    .status(),
+                StatusCode::OK,
+                "a token issued after the fence is accepted"
+            );
+            let _ = runtime.mob_handle().stop().await;
+        }
+
+        #[tokio::test]
+        async fn a_revocation_ends_open_streams_and_refuses_requests_with_access_control() {
+            a_revocation_ends_open_streams_and_refuses_requests(Some(everyone_policy())).await;
+        }
+
+        /// A deployment without an access file revokes the same way: the
+        /// fence belongs to the Console's authentication.
+        #[tokio::test]
+        async fn a_revocation_ends_open_streams_and_refuses_requests_without_an_access_file() {
+            a_revocation_ends_open_streams_and_refuses_requests(None).await;
+        }
+
+        /// A token without `exp` never lapses, but a revocation ends its
+        /// stream and refuses its requests all the same; the principal is
+        /// listed as non-expiring in `meta/status` (principal and flag only).
+        #[tokio::test]
+        async fn a_stream_opened_with_a_token_without_exp_ends_when_its_principal_is_revoked() {
+            let (_temp_dir, _state_dir, runtime, app) = fenced_app_with(true, None).await;
+            let unbounded = bearer_issued(ALICE, Some(now_seconds() - 60), None);
+            let mut caller =
+                SseReader::open_with(&app, "/console/timeline/stream", Some(&unbounded)).await;
+            let status = unified_rpc(&runtime, "meta/status", json!({})).await;
+            assert_eq!(
+                status["result"]["non_expiring_console_principals"],
+                json!([{ "principal": ALICE, "non_expiring": true }]),
+                "{status}"
+            );
+            runtime
+                .console_session_fences()
+                .revoke_sessions(ALICE, SystemTime::now())
+                .expect("revoke");
+            caller.until_end().await;
+            assert_eq!(
+                get_with(&app, "/console/experience", Some(&unbounded))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let _ = runtime.mob_handle().stop().await;
+        }
+
+        /// Control: a revocation of another principal wakes the stream, which
+        /// asks the verifier again and stays open.
+        #[tokio::test]
+        async fn a_revocation_of_another_principal_leaves_the_stream_open() {
+            let (_temp_dir, _state_dir, runtime, app) = fenced_app_with(true, None).await;
+            let token = current_bearer(ALICE);
+            let mut caller =
+                SseReader::open_with(&app, "/console/timeline/stream", Some(&token)).await;
+            runtime
+                .console_session_fences()
+                .revoke_sessions("carol@example.test", SystemTime::now())
+                .expect("revoke");
+            admin_send(&app, "router", "router-after-another-revocation").await;
+            caller
+                .until(
+                    "router's frame after another principal's revocation",
+                    frame_with("router", "router-after-another-revocation"),
+                )
+                .await;
+            assert_eq!(
+                get_with(&app, "/console/experience", Some(&token))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            let _ = runtime.mob_handle().stop().await;
+        }
+
+        /// The fence is written to its own file before it takes effect: a
+        /// runtime that opens the same state directory later (a restart)
+        /// refuses the revoked token, and an access file rewritten the way a
+        /// binary without fences rewrites it in between changes nothing.
+        #[tokio::test]
+        async fn a_revocation_survives_a_restart_and_an_access_file_rewrite() {
+            let (_temp_dir, state_dir, mut runtime, app) =
+                fenced_app_with(true, Some(everyone_policy())).await;
+            let old = current_bearer(ALICE);
+            assert_eq!(
+                get_with(&app, "/console/experience", Some(&old))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            runtime
+                .console_session_fences()
+                .revoke_sessions(ALICE, SystemTime::now())
+                .expect("revoke");
+            let access_file = state_dir.path().join("access.toml");
+            let (config, _) = everyone_policy().snapshot();
+            std::fs::write(
+                &access_file,
+                toml::to_string(&*config).expect("serialize the access configuration"),
+            )
+            .expect("rewrite the access file");
+            runtime.set_console_session_fences(
+                meerkat_meta::ConsoleSessionFences::open_in_state_dir(state_dir.path())
+                    .expect("reopen the session fence record"),
+            );
+            let restarted = runtime.build_reference_app_router(decisions(true));
+            assert_eq!(
+                get_with(&restarted, "/console/experience", Some(&old))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED,
+                "the reopened record still refuses the revoked token"
+            );
+            let _ = runtime.mob_handle().stop().await;
+        }
+
+        /// A runtime without a durable record refuses the revocation, typed,
+        /// rather than setting a fence a restart would drop.
+        #[tokio::test]
+        async fn a_revocation_without_a_durable_record_is_refused() {
+            let (_temp_dir, runtime, app) = app_with(true, None, None).await;
+            let refused = unified_rpc(
+                &runtime,
+                "meta/console/revoke_sessions",
+                json!({ "principal": ALICE }),
+            )
+            .await;
+            assert_eq!(refused["error"]["code"], json!(-32004), "{refused}");
+            let token = current_bearer(ALICE);
+            assert_eq!(
+                get_with(&app, "/console/experience", Some(&token))
+                    .await
+                    .status(),
+                StatusCode::OK,
+                "nothing was revoked"
+            );
+            let _ = runtime.mob_handle().stop().await;
+        }
+
+        /// The timeline route resolves a volunteered token through the
+        /// console's own request authentication: on a console that takes
+        /// volunteered tokens, a timeline stream such a token identified ends
+        /// when it lapses, and the reconnect with it is anonymous.
+        #[tokio::test]
+        async fn a_timeline_stream_opened_with_a_volunteered_token_ends_when_it_lapses() {
+            let (_temp_dir, runtime, app) = app_with(false, Some(everyone_policy()), None).await;
+            let token = LapsingToken::new(ALICE, 4);
+            let mut caller =
+                SseReader::open_with(&app, "/console/timeline/stream", Some(&token.authorization))
+                    .await;
+            ends_at_the_lapse(&mut caller, &token).await;
+            let reconnect =
+                get_with(&app, "/console/timeline/stream", Some(&token.authorization)).await;
+            assert_eq!(reconnect.status(), StatusCode::OK, "decided as anonymous");
+            let _ = runtime.mob_handle().stop().await;
+        }
     }
 }

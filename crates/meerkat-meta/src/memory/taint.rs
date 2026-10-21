@@ -1272,6 +1272,7 @@ mod tests {
             peer: None,
             request_id: None,
             sender_taint: taint,
+            delivery_id: None,
         }
     }
 

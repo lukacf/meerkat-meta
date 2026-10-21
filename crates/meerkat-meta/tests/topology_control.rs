@@ -1609,11 +1609,10 @@ async fn runtime_with_a_dormant_edge_endpoint(
     authority: &str,
 ) -> (UnifiedRuntime, DesiredPeerEdge) {
     use meerkat_meta::identity_first::{
-        AgentAddressability, AgentIdentity, AgentRuntimeId, CheckpointVersion,
-        ContinuityGeneration, ContinuityRecord, DurabilityPolicy, DurableAgentSpec,
-        IdentityFirstRuntimeContext, IdentityLifecycleState, IdentityRuntime,
-        IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider, ManagedPeerEdge,
-        MobSessionBridge, RosterContext, RosterError, RosterProvider,
+        AgentAddressability, AgentIdentity, DurabilityPolicy, DurableAgentSpec,
+        IdentityFirstRuntimeContext, IdentityRuntime, IdentityRuntimeConfig, LocalContinuityStore,
+        LocalLeaseProvider, ManagedPeerEdge, MobSessionBridge, RosterContext, RosterError,
+        RosterProvider,
     };
 
     struct FixedRoster(Vec<DurableAgentSpec>);
@@ -1645,17 +1644,6 @@ async fn runtime_with_a_dormant_edge_endpoint(
         }
     }
 
-    fn continuity(identity: &AgentIdentity) -> ContinuityRecord {
-        ContinuityRecord {
-            identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{identity}:0"))
-                .expect("runtime alias"),
-            session_id: meerkat_core::types::SessionId::new(),
-            generation: ContinuityGeneration::new(0),
-            checkpoint_version: CheckpointVersion::new(0),
-        }
-    }
-
     let mut unified = build_runtime(root, authority, "classic-member").await;
     let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
         continuity_store: Arc::new(LocalContinuityStore::in_memory().expect("continuity store")),
@@ -1670,22 +1658,8 @@ async fn runtime_with_a_dormant_edge_endpoint(
     let dormant = AgentIdentity::parse("domain:dormant").expect("dormant identity");
     let active_spec = identity_spec(&active);
     let dormant_spec = identity_spec(&dormant);
-    identity_runtime
-        .register(
-            active_spec.clone(),
-            IdentityLifecycleState::Active,
-            Some(continuity(&active)),
-            None,
-        )
-        .await;
-    identity_runtime
-        .register(
-            dormant_spec.clone(),
-            IdentityLifecycleState::Dormant,
-            Some(continuity(&dormant)),
-            None,
-        )
-        .await;
+    identity_runtime.register(active_spec.clone()).await;
+    identity_runtime.register(dormant_spec.clone()).await;
     let managed = ManagedPeerEdge::new(active.clone(), dormant.clone()).expect("managed edge");
     identity_runtime.set_desired_peer_edges(vec![managed]).await;
     unified.attach_identity_first_context(Arc::new(IdentityFirstRuntimeContext::new(

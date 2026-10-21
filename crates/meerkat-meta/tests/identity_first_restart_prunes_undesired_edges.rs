@@ -10,6 +10,11 @@
 //! boot 2 restarts with a provider that drops the lead's edges to the
 //! members, which must be gone after boot 2's restore, and the members'
 //! edge kept.
+//!
+//! A member this process never materialized (a worker or an identity Core
+//! restored, say) does not stop the reconcile of the other edges either: a
+//! raw member's wires are left out, and an identity member's are read through
+//! the incarnation Core committed for it, so a dropped edge is still unwired.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,13 +28,16 @@ use meerkat_meta::identity_first::contracts::TopologyProvider;
 use meerkat_meta::identity_first::orchestrator::RestoreOutcome;
 use meerkat_meta::identity_first::{
     AgentAddressability, AgentIdentity, AgentRuntimeId, AgentRuntimeServices, ContinuityStore,
-    DurabilityPolicy, DurableAgentSpec, IdentityFirstRuntimeContext, IdentityRuntime,
-    IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider, ManagedPeerEdge,
-    MobSessionBridge, MutableRosterProvider, SessionBridge, TopologyContext, TopologyError,
+    DurabilityPolicy, DurableAgentSpec, IdentityBootstrapMode, IdentityFirstRuntimeContext,
+    IdentityRuntime, IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider,
+    ManagedPeerEdge, MobSessionBridge, MutableRosterProvider, SessionBridge, TopologyContext,
+    TopologyError,
 };
 use meerkat_meta::mob_composition_manifest::persistent_mob_storage;
-use meerkat_meta::{DiscoverySpec, MetaConfig, MobBootstrapOptions, MobBootstrapSpec};
-use meerkat_mob::{MobDefinition, ProfileName};
+use meerkat_meta::{
+    DesiredPeerEdge, DiscoverySpec, MetaConfig, MobBootstrapOptions, MobBootstrapSpec,
+};
+use meerkat_mob::{MobDefinition, ProfileName, SpawnMemberSpec};
 
 #[path = "support/llm_usage.rs"]
 mod llm_usage;
@@ -145,22 +153,47 @@ async fn boot(
     roster: &[DurableAgentSpec],
     topology: Option<Arc<dyn TopologyProvider>>,
 ) -> Booted {
+    let (unified, bridge, outcomes) = boot_in_mode(
+        state_path,
+        definition,
+        roster,
+        topology,
+        IdentityBootstrapMode::EagerMaterialize,
+    )
+    .await;
+    Booted {
+        unified,
+        bridge,
+        runtime_ids: runtime_ids(&outcomes),
+    }
+}
+
+/// [`boot`] with the identity bootstrap mode given, returning the restore
+/// outcomes as they are: under a lazy mode the identities register without
+/// materializing.
+async fn boot_in_mode(
+    state_path: &std::path::Path,
+    definition: MobDefinition,
+    roster: &[DurableAgentSpec],
+    topology: Option<Arc<dyn TopologyProvider>>,
+    mode: IdentityBootstrapMode,
+) -> (
+    meerkat_meta::UnifiedRuntime,
+    Arc<dyn SessionBridge>,
+    BTreeMap<AgentIdentity, RestoreOutcome>,
+) {
     std::fs::create_dir_all(state_path).expect("state root");
-    let session_store = Arc::new(
-        meerkat_store::SqliteSessionStore::open(state_path.join("sessions.sqlite3"))
-            .expect("open the session store"),
-    );
     let (storage, provenance) = persistent_mob_storage(state_path.join("mob.sqlite3"))
         .expect("open persistent mob storage");
     let spec = MobBootstrapSpec::persistent(
         definition.clone(),
         storage,
+        provenance,
         state_path.to_path_buf(),
         16,
-        session_store,
     )
+    .await
     .expect("compose persistent Meta stores")
-    .with_mob_storage_provenance(provenance)
     // Creates no agent child mob. It restarts in this process, which the
     // durable child-mob default refuses as a duplicate owner; explicit
     // ProcessBound keeps this test's cold-recovery oracle.
@@ -208,22 +241,46 @@ async fn boot(
         })
         .with_runtime_services(AgentRuntimeServices::new(unified.mob_handle())),
     );
-    let context = Arc::new(IdentityFirstRuntimeContext::new(
+    let context = Arc::new(IdentityFirstRuntimeContext::new_with_bootstrap_mode(
         identity_rt,
         Arc::new(MutableRosterProvider::new(roster.to_vec())),
         topology,
         None,
         Some(definition),
+        mode,
     ));
     let result = unified
         .install_and_bootstrap_identity_first_context(context, roster)
         .await
         .expect("activate and restore the identity-first runtime");
-    Booted {
-        unified,
-        bridge,
-        runtime_ids: runtime_ids(&result.outcomes),
-    }
+    (unified, bridge, result.outcomes)
+}
+
+/// The identity edges Core's roster holds, either directed half, read from
+/// the roster itself: an identity this process has not materialized has no
+/// bridge binding to read them through.
+async fn roster_identity_edges(
+    unified: &meerkat_meta::UnifiedRuntime,
+) -> BTreeSet<(AgentIdentity, AgentIdentity)> {
+    let members = unified.mob_handle().list_members_including_retiring().await;
+    let identity_of: BTreeMap<String, AgentIdentity> = members
+        .iter()
+        .filter_map(|member| {
+            let label = member.labels.get("agent_identity")?;
+            Some((member.agent_identity.to_string(), id(label)))
+        })
+        .collect();
+    members
+        .iter()
+        .flat_map(|member| {
+            let identity_of = &identity_of;
+            member.wired_to.iter().filter_map(move |peer| {
+                let a = identity_of.get(&member.agent_identity.to_string())?;
+                let b = identity_of.get(&peer.to_string())?;
+                Some(pair(a, b))
+            })
+        })
+        .collect()
 }
 
 /// The live identity edges, as unordered identity pairs.
@@ -250,8 +307,8 @@ fn runtime_ids(
     outcomes
         .iter()
         .map(|(identity, outcome)| match outcome {
-            RestoreOutcome::Created { record, .. } | RestoreOutcome::Resumed { record, .. } => {
-                (record.agent_runtime_id.clone(), identity.clone())
+            RestoreOutcome::Created { binding, .. } | RestoreOutcome::Resumed { binding, .. } => {
+                (binding.agent_runtime_id.clone(), identity.clone())
             }
             other => panic!("{identity} did not materialize: {other:?}"),
         })
@@ -513,4 +570,295 @@ async fn a_definition_declared_edge_is_never_churned_by_the_topology() {
         "no wire/unwire churn across the restart and its reconciles"
     );
     booted.unified.shutdown().await;
+}
+
+/// Boot the three-identity team, spawn `extra` on the mob itself with
+/// `labels` (no bridge binding records it, as for a member Core restores that
+/// this process has not materialized), wire it to the lead, and unwire the
+/// lead from the member so the reconcile has a managed edge to put back.
+async fn team_with_an_unbound_member(
+    mob_prefix: &str,
+    state_path: &std::path::Path,
+    extra: &str,
+    labels: BTreeMap<String, String>,
+) -> Booted {
+    let lead = id("identity:lead-1");
+    let member = id("identity:member-1");
+    let peer = id("identity:member-2");
+    let roster = vec![
+        spec("identity:lead-1"),
+        spec("identity:member-1"),
+        spec("identity:member-2"),
+    ];
+    let topology = Arc::new(TeamTopology {
+        edges: Mutex::new(vec![
+            ManagedPeerEdge::new(lead.clone(), member.clone()).unwrap(),
+            ManagedPeerEdge::new(lead.clone(), peer.clone()).unwrap(),
+            ManagedPeerEdge::new(member.clone(), peer).unwrap(),
+        ]),
+    });
+    let booted = boot(
+        state_path,
+        definition(&next_mob_id(mob_prefix)),
+        &roster,
+        Some(topology as Arc<dyn TopologyProvider>),
+    )
+    .await;
+    let handle = booted.unified.mob_handle();
+    let mut extra_spec =
+        SpawnMemberSpec::from_wire("personal".to_string(), extra.to_string(), None, None, None);
+    if !labels.is_empty() {
+        extra_spec = extra_spec.with_labels(labels);
+    }
+    handle
+        .spawn_spec(extra_spec)
+        .await
+        .expect("spawn the unbound member");
+    handle
+        .wire(
+            meerkat_mob::AgentIdentity::from(extra),
+            meerkat_meta::member_comms_id::mob_member_id(lead.as_str()),
+        )
+        .await
+        .expect("wire the unbound member to the lead");
+    let runtime_of = |identity: &AgentIdentity| {
+        booted
+            .runtime_ids
+            .iter()
+            .find(|(_, bound)| *bound == identity)
+            .map(|(runtime_id, _)| runtime_id.clone())
+            .expect("a materialized identity")
+    };
+    booted
+        .bridge
+        .unwire_peer(&runtime_of(&lead), &runtime_of(&member))
+        .await
+        .expect("unwire the lead from the member");
+    booted
+}
+
+/// A raw roster member (no `agent_identity` label: a worker a member
+/// spawned, say) that this process never materialized has no live runtime
+/// binding, so the wire projection cannot name its incarnation. The identity
+/// topology never manages a raw member's wires, so it must not stop the
+/// reconcile of every other edge: its wire is left out, and the managed edges
+/// converge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_raw_member_without_a_runtime_binding_does_not_stop_the_edge_reconcile() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let booted = team_with_an_unbound_member(
+        "edge-unbound-raw-member",
+        &temp.path().join("state"),
+        "investigation-worker-1",
+        BTreeMap::new(),
+    )
+    .await;
+    let lead = id("identity:lead-1");
+    let member = id("identity:member-1");
+    let peer = id("identity:member-2");
+
+    let report = booted.unified.reconcile_edges().await;
+    assert!(report.failures.is_empty(), "nothing fails: {report:?}");
+    assert_eq!(
+        report.wired_edges,
+        vec![DesiredPeerEdge::new(lead.as_str(), member.as_str()).unwrap()],
+        "the unwired edge is wired again: {report:?}"
+    );
+    assert_eq!(report.retained_edges.len(), 2, "{report:?}");
+    assert!(
+        report.skipped_missing_members.is_empty(),
+        "a raw member's wire is no managed edge to skip: {report:?}"
+    );
+    assert_eq!(
+        live_identity_edges(&booted.bridge, &booted.runtime_ids).await,
+        BTreeSet::from([
+            pair(&lead, &member),
+            pair(&lead, &peer),
+            pair(&member, &peer),
+        ]),
+        "every managed edge is live"
+    );
+    booted.unified.shutdown().await;
+}
+
+/// An identity member (labelled `agent_identity`, as every identity-first
+/// spawn is) that this process has not materialized has no binding either,
+/// but Core holds its member: the wire projection names it by the incarnation
+/// Core committed for it, the read the identity runtime's binding epoch makes,
+/// so its present wire is never read as absent and nothing fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identity_member_without_a_runtime_binding_is_read_through_its_committed_incarnation() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let ghost = meerkat_meta::member_comms_id::mob_member_id("identity:ghost-1");
+    let booted = team_with_an_unbound_member(
+        "edge-unbound-identity-member",
+        &temp.path().join("state"),
+        ghost.as_str(),
+        BTreeMap::from([("agent_identity".to_string(), "identity:ghost-1".to_string())]),
+    )
+    .await;
+
+    let report = booted.unified.reconcile_edges().await;
+    assert!(report.failures.is_empty(), "nothing fails: {report:?}");
+    let wires = booted
+        .bridge
+        .current_member_wires()
+        .await
+        .expect("the projection names every wire");
+    assert_eq!(
+        wires.len(),
+        4,
+        "the team's three edges and the ghost's: {wires:?}"
+    );
+    assert!(
+        wires
+            .iter()
+            .any(|(a, b)| a.as_str().contains("ghost-1") || b.as_str().contains("ghost-1")),
+        "the ghost's wire is named by its incarnation: {wires:?}"
+    );
+    booted.unified.shutdown().await;
+}
+
+/// A restart that leaves the identities unmaterialized (lazy bootstrap here;
+/// in a deployment also an identity whose activation failed) records no
+/// runtime binding for them in this process, while Core holds their members
+/// and replays their wiring. The reconcile still reads every live wire: an
+/// edge the topology dropped is unwired rather than read as absent, the kept
+/// edge stays, and nothing fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_that_leaves_the_identities_unmaterialized_still_reconciles_every_edge() {
+    let mob_id = next_mob_id("edge-unmaterialized-restart");
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state_path = temp.path().join("state");
+    let lead = id("identity:lead-1");
+    let member = id("identity:member-1");
+    let peer = id("identity:member-2");
+    let roster = vec![
+        spec("identity:lead-1"),
+        spec("identity:member-1"),
+        spec("identity:member-2"),
+    ];
+    let members = ManagedPeerEdge::new(member.clone(), peer.clone()).unwrap();
+    let topology = Arc::new(TeamTopology {
+        edges: Mutex::new(vec![
+            ManagedPeerEdge::new(lead.clone(), member.clone()).unwrap(),
+            ManagedPeerEdge::new(lead.clone(), peer.clone()).unwrap(),
+            members.clone(),
+        ]),
+    });
+    let booted = boot(
+        &state_path,
+        definition(&mob_id),
+        &roster,
+        Some(topology.clone() as Arc<dyn TopologyProvider>),
+    )
+    .await;
+    assert_eq!(
+        roster_identity_edges(&booted.unified).await,
+        BTreeSet::from([
+            pair(&lead, &member),
+            pair(&lead, &peer),
+            pair(&member, &peer),
+        ]),
+        "boot 1 wires the team"
+    );
+    booted.unified.shutdown().await;
+    drop(booted);
+
+    // The topology now keeps the members away from the lead, and boot 2
+    // registers the identities without materializing them.
+    *topology.edges.lock().unwrap() = vec![members];
+    let (unified, _bridge, _outcomes) = boot_in_mode(
+        &state_path,
+        definition(&mob_id),
+        &roster,
+        Some(topology as Arc<dyn TopologyProvider>),
+        IdentityBootstrapMode::LazyMaterialize,
+    )
+    .await;
+    if let Some(report) = unified.bootstrap_edges_report().await {
+        assert!(
+            report.failures.is_empty(),
+            "the bootstrap reconcile fails nothing: {report:?}"
+        );
+    }
+    let report = unified.reconcile_edges().await;
+    assert!(report.failures.is_empty(), "nothing fails: {report:?}");
+    assert_eq!(
+        roster_identity_edges(&unified).await,
+        BTreeSet::from([pair(&member, &peer)]),
+        "the dropped edges are unwired and the kept edge stays"
+    );
+    unified.shutdown().await;
+}
+
+/// The managed path of the same restart: boot 2 reconciles the full topology
+/// first, so the team's edges become this process's managed edges while their
+/// identities stay unmaterialized, and the topology then drops the lead's
+/// edges. A managed edge that is no longer desired is unwired through its
+/// unbound endpoints, not dropped from the managed set with its wire left live.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_managed_edge_between_unmaterialized_identities_is_unwired_once_dropped() {
+    let mob_id = next_mob_id("edge-unmaterialized-managed");
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state_path = temp.path().join("state");
+    let lead = id("identity:lead-1");
+    let member = id("identity:member-1");
+    let peer = id("identity:member-2");
+    let roster = vec![
+        spec("identity:lead-1"),
+        spec("identity:member-1"),
+        spec("identity:member-2"),
+    ];
+    let members = ManagedPeerEdge::new(member.clone(), peer.clone()).unwrap();
+    let topology = Arc::new(TeamTopology {
+        edges: Mutex::new(vec![
+            ManagedPeerEdge::new(lead.clone(), member.clone()).unwrap(),
+            ManagedPeerEdge::new(lead.clone(), peer.clone()).unwrap(),
+            members.clone(),
+        ]),
+    });
+    let booted = boot(
+        &state_path,
+        definition(&mob_id),
+        &roster,
+        Some(topology.clone() as Arc<dyn TopologyProvider>),
+    )
+    .await;
+    booted.unified.shutdown().await;
+    drop(booted);
+
+    let (unified, _bridge, _outcomes) = boot_in_mode(
+        &state_path,
+        definition(&mob_id),
+        &roster,
+        Some(topology.clone() as Arc<dyn TopologyProvider>),
+        IdentityBootstrapMode::LazyMaterialize,
+    )
+    .await;
+    let report = unified.reconcile_edges().await;
+    assert!(report.failures.is_empty(), "nothing fails: {report:?}");
+    assert_eq!(
+        report.retained_edges.len() + report.wired_edges.len(),
+        3,
+        "boot 2 takes the team's edges as its managed edges: {report:?}"
+    );
+
+    *topology.edges.lock().unwrap() = vec![members];
+    let report = unified.reconcile_edges().await;
+    assert!(report.failures.is_empty(), "nothing fails: {report:?}");
+    assert_eq!(
+        report.unwired_edges,
+        vec![
+            DesiredPeerEdge::new(lead.as_str(), member.as_str()).unwrap(),
+            DesiredPeerEdge::new(lead.as_str(), peer.as_str()).unwrap(),
+        ],
+        "the dropped managed edges are unwired: {report:?}"
+    );
+    assert_eq!(
+        roster_identity_edges(&unified).await,
+        BTreeSet::from([pair(&member, &peer)]),
+        "Core's roster holds only the kept edge"
+    );
+    unified.shutdown().await;
 }

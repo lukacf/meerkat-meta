@@ -100,9 +100,15 @@ impl Gateway {
         stdin.flush().expect("flush");
     }
 
-    fn init(&mut self, mut params: Value) {
+    fn init(&mut self, params: Value) {
+        let state = self.state.path().to_path_buf();
+        self.init_at(params, &state);
+    }
+
+    /// `init` against `state` instead of this gateway's own state directory.
+    fn init_at(&mut self, mut params: Value, state: &std::path::Path) {
         params["mob_config"] = json!(MOB_CONFIG);
-        params["persistent_state"] = json!(self.state.path());
+        params["persistent_state"] = json!(state);
         self.send(json!({
             "jsonrpc": "2.0", "id": "init", "method": "meta/init", "params": params,
         }));
@@ -313,6 +319,124 @@ fn refusal_after_storage_began_settles_failed_with_possible_durable_effects() {
     // A refused init is a failed gateway run: exit status 1.
     let status = gateway.wait_exit();
     assert_eq!(status.code(), Some(1), "refused init exit status: {status}");
+}
+
+/// 0.9.4 removed SDK-hosted continuity. Each of its init params is refused by
+/// name, alone or together and whatever its value, with INVALID_PARAMS that
+/// names the removal and the migration guide, before any store opens: a host
+/// built for the removed path never starts on a different storage shape.
+#[test]
+fn removed_sdk_hosted_continuity_init_params_are_refused_by_name() {
+    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let cases = [
+        (
+            json!({ "has_continuity_store": true }),
+            vec!["has_continuity_store"],
+        ),
+        (
+            json!({ "has_lease_provider": true }),
+            vec!["has_lease_provider"],
+        ),
+        (
+            json!({ "scratch_dir": scratch.path() }),
+            vec!["scratch_dir"],
+        ),
+        (
+            json!({ "has_continuity_store": false }),
+            vec!["has_continuity_store"],
+        ),
+        (
+            json!({
+                "has_roster_provider": true,
+                "has_continuity_store": true,
+                "has_lease_provider": true,
+                "scratch_dir": scratch.path(),
+            }),
+            vec!["has_continuity_store", "has_lease_provider", "scratch_dir"],
+        ),
+    ];
+    for (mut params, named) in cases {
+        params["init_protocol"] = json!("accepted_then_settled");
+        params["init_id"] = json!("init-removed-continuity");
+        let mut gateway = Gateway::spawn();
+        gateway.init(params.clone());
+        assert_eq!(gateway.next("accepted")["result"]["init_state"], "accepted");
+        let seen = gateway.read_until("the failed settlement", |_| None, is_settled);
+        let settled = &seen.last().unwrap()["params"];
+        assert_eq!(settled["outcome"], "failed", "{params}: {settled}");
+        assert_eq!(settled["code"], -32602, "{params}: {settled}");
+        assert_eq!(settled["durable_effects"], "none", "{params}: {settled}");
+        let message = settled["message"].as_str().unwrap_or_default();
+        for key in named {
+            assert!(message.contains(key), "{params}: {message}");
+        }
+        assert!(
+            message.contains("removed in Meta 0.9.4"),
+            "{params}: {message}"
+        );
+        assert!(
+            message.contains("meta_gateway storage-migrate-native"),
+            "{params}: {message}"
+        );
+        assert!(
+            progress_phases(&seen).is_empty(),
+            "no phase began: {seen:?}"
+        );
+        let status = gateway.wait_exit();
+        assert_eq!(status.code(), Some(1), "refused init exit status: {status}");
+    }
+}
+
+/// One Meta runtime per state directory: a second gateway on a directory a
+/// running gateway holds refuses init typed (STORAGE_RESOLUTION, -32014)
+/// before it opens any store, and the directory is free again once the
+/// first gateway has exited.
+#[test]
+fn a_second_gateway_on_a_held_state_directory_is_refused_typed() {
+    let ready = |gateway: &mut Gateway, waiting_for: &str| {
+        assert_eq!(gateway.next("accepted")["result"]["init_state"], "accepted");
+        let seen = gateway.read_until(waiting_for, |_| None, is_settled);
+        let settled = seen.last().unwrap()["params"].clone();
+        assert_eq!(settled["outcome"], "ready", "{settled}");
+    };
+    let mut first = Gateway::spawn();
+    first.init(json!({ "init_protocol": "accepted_then_settled", "init_id": "init-first" }));
+    ready(&mut first, "the first gateway's ready settlement");
+    let state = first.state.path().to_path_buf();
+
+    let mut second = Gateway::spawn();
+    second.init_at(
+        json!({ "init_protocol": "accepted_then_settled", "init_id": "init-second" }),
+        &state,
+    );
+    assert_eq!(second.next("accepted")["result"]["init_state"], "accepted");
+    let seen = second.read_until("the second gateway's settlement", |_| None, is_settled);
+    let settled = &seen.last().unwrap()["params"];
+    assert_eq!(settled["outcome"], "failed", "{settled}");
+    assert_eq!(settled["code"], -32014, "{settled}");
+    let message = settled["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&format!(
+            "state directory {} is in use by another Meta runtime",
+            state.display()
+        )),
+        "{message}"
+    );
+    let status = second.wait_exit();
+    assert_eq!(status.code(), Some(1), "refused init exit status: {status}");
+
+    // The first gateway's exit releases the directory.
+    first.send(json!({ "jsonrpc": "2.0", "id": "bye", "method": "meta/shutdown", "params": {} }));
+    first.read_until("the shutdown answer", |_| None, |m| m["id"] == "bye");
+    let status = first.wait_exit();
+    assert!(status.success(), "first gateway exit status: {status}");
+
+    let mut third = Gateway::spawn();
+    third.init_at(
+        json!({ "init_protocol": "accepted_then_settled", "init_id": "init-third" }),
+        &state,
+    );
+    ready(&mut third, "the third gateway's ready settlement");
 }
 
 #[test]

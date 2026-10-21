@@ -123,8 +123,10 @@ The stock SDK gateway (`rpc_gateway`) consumes the `runtime_options` object of `
 | `implicit_delegate_idle_retire_secs` | Nonnegative integer or `null` | Default idle timeout in seconds for eligible delegates, default `300`. `null` disables the runtime default, not explicit per-member numeric overrides. Python `.implicit_delegate_idle_retirement(seconds)` / TypeScript `.implicitDelegateIdleRetirement(seconds)` (use `None` / `null` to disable the default). See [scope and overrides](#implicit-delegate-idle-retirement). |
 | `implicit_delegate_idle_sweep_interval_ms` | Positive integer | Delegate retirement sweep interval, default `10000` ms; the runtime clamps it to an effective minimum of `1000` ms. Raw init input only; neither SDK has a setter. |
 | `event_log` | Object | Declares the operational event log. `storage = "memory"` (preferred; `"in_memory"` is an accepted compatibility alias, with optional `batch_size`, `flush_interval_ms`) keeps a bounded queryable in-process store so `meta/query_events` returns events instead of `no_event_log_configured`; `storage = "null"` declares that events are dropped. These are declared-ephemeral choices; omitting the key means no ingestion at all, and any other storage kind fails initialization. Durable event-log backends are embedder-only (`UnifiedRuntimeBuilder` accepts any `EventLogStore`). |
-| `runtime_store` | Object | Declares the runtime store's durability (session resume, archive, retire). With top-level `persistent_state` configured, the default is persistent SQLite at `runtime.sqlite`; a failed SQLite open is a startup error (`-32014`), never a silent in-memory fallback. `{ "storage": "memory" }` explicitly selects ephemeral runtime storage (`"in_memory"` is an accepted compatibility alias); `null` is not a supported storage kind here. Without `persistent_state`, the gateway uses `InMemoryRuntimeStore` even when this option is omitted. In either ephemeral case, runtime-store state does not survive gateway restart. |
+| `runtime_store` | Object | Declares the runtime store's durability (session resume, archive, retire). With top-level `persistent_state` configured, the runtime store is persistent SQLite at `runtime.sqlite`, where sessions live: a declared in-memory store is refused (`-32014`), and a failed SQLite open is a startup error (`-32014`), never a silent in-memory fallback. Without `persistent_state`, the gateway uses `InMemoryRuntimeStore`, which `{ "storage": "memory" }` declares explicitly (`"in_memory"` is an accepted compatibility alias); `null` is not a supported storage kind here. In-memory runtime-store state does not survive a gateway restart. |
 | `declare_spec_update` | Object | One-shot canonical mob-definition compare-and-swap. `{ "expected_revision": N }` applies the `mob_config` supplied in the same `meta/init` request only when the durable definition is still at `N`. The launch must be authoritative and use persistent mob storage. Exact replay converges; stale revision or successor-content disagreement refuses initialization with typed storage error `-32014`. |
+| `mob_composition` | Object `{authority, candidate_definition?}` | Who speaks for the persistent mob storage's recorded composition (the composition pin). `authority` is `"authoritative"` by default: the launch records the definition it supplies when none is recorded, and a supplied definition that differs from the recorded one is refused with `-32019` (`divergent`); declare such a change with `declare_spec_update`, which needs an authoritative launch. `"candidate"` is for the candidate or certification boot of a candidate-then-promote pipeline on one state directory: the launch neither creates the pin nor is refused by one, but a candidate whose supplied definition differs from the stored one is refused (`-32019`, `candidate_divergent`) unless `candidate_definition` is `"stored"`, which boots the stored definition instead, logs the diverged fields at WARN and reports them in a degraded `mob_composition` storage-health slot. `candidate_definition` is candidate-only: an authoritative launch that sets it is refused when the options are parsed, and so is any other value. |
+| `fork_instruction_policy` | String | What a fork of a member with activated host instructions does with them. `"require_explicit_activation"` (the default when absent, Meerkat's default) leaves the activation to the host: a host-driven fork (the console fork, `UnifiedRuntime::fork_member`) is committed and the host activates each inherited key before the child's first turn, while a fork that starts its own first turn (`fork_off`, a delegation fork, a council participant) is refused with a typed `fork_instruction_refused` before anything is committed. `"reactivate_inherited"` re-activates, in the child and before it is committed, every key that was effective in the source at the fork. `"refuse"` refuses any fork whose child would inherit an activation. Applied to the gateway's mob on create and resume. Any other value refuses initialization. Python `.fork_instruction_policy(policy)`, TypeScript `.forkInstructionPolicy(policy)`; Rust embedders set it with `UnifiedRuntimeBuilder::fork_instruction_policy` (see [the Rust SDK](/sdks/rust#fork-instruction-policy)). `meta_gateway` takes no `runtime_options` and runs Meerkat's default. |
 | `compaction` | Object | Declares the host-level session-compaction policy for every agent the gateway builds: `auto_compact_threshold` (tokens, non-zero), `recent_turn_budget`, `max_summary_tokens`, `min_turns_between_compactions`. A compactor is always installed; this declares *when it fires*. **Omitting `auto_compact_threshold` inherits Meerkat's model-aware default — `context_window * 4 / 5`, i.e. ~840,000 tokens on a million-token model such as `gpt-5.6-sol`, which in practice never fires and resends the full transcript every turn.** Declaring the key pins it. A mob profile's own `auto_compact_threshold` still wins per member. Unknown keys and a zero threshold fail initialization. |
 | `meerkat_config_path` | String path | The Meerkat host `config.toml` every agent the gateway builds starts from (the live/realtime door included), loaded once at init, merged over `Config::default()` with Meerkat's own file semantics and validated with Meerkat's own `Config::validate` against the canonical catalog. This is the only door for the `[self_hosted]` and `[realm]` tables, which Meerkat keeps in the host config rather than in `mob.toml`; a host-config `[models]` table reaches the factory too, but does not satisfy the [init model check](#the-init-model-check), which reads the definition's own `[models.<id>]`. The gateway's own overlays (`member_comms_address`, `compaction`) are layered on top. A missing, malformed or non-validating file (a `[self_hosted.models.<id>]` alias naming an undeclared server, for one) refuses init with `-32602` naming the option and the path, never a silent `Config::default()`. Omitted, agents build from Meerkat's default config as before. Python `.meerkat_config(path)`, TypeScript `.meerkatConfig(path)`. `meta_gateway` takes the same file as its top-level `meerkat_config_path` init param and adopts `<workspace>/.rkat/config.toml` when it exists, logging one INFO line naming the adopted file either way; a top-level `meerkat_config_path` sent to `rpc_gateway` is refused with `-32602` naming `runtime_options.meerkat_config_path`. See [Self-hosted models and the Meerkat host config](#self-hosted-models-and-the-meerkat-host-config). |
 | `workgraph` | Boolean or directory string | WorkGraph construction switch, default `true`. `false` disables the store, the member `workgraph_*` tools, the attention overlays and the `meta/workgraph/*` RPCs; a non-empty string is an explicit directory for the durable store (`workgraph.sqlite3` is created inside it); any other value fails initialization. Python `.workgraph(enabled)` and TypeScript `.workgraph(enabled)` take `true`, `false` or the directory string; an unused setter sends nothing and the gateway default applies. Store placement per launch mode, the auto-issued namespace grant and the memory-backed fallback are in [WorkGraph](#workgraph). |
@@ -472,7 +474,7 @@ exposes no equivalent setter.
 
 | Property | Behavior |
 |----------|----------|
-| Lifetime | Boot-scoped. The list is installed on the session bridge, which lives for exactly one boot, and is never written to the continuity store. Dropping it from the next boot payload is how the authority goes away. |
+| Lifetime | Boot-scoped. The list is installed on the session bridge, which lives for exactly one boot, and is never written to any store. Dropping it from the next boot payload is how the authority goes away. |
 | Matching | Exact `AgentIdentity` match. No prefix, suffix, or case variant of a declared identity inherits authority. |
 | Authority | Meta only carries the declared predecessor role into the resume request. Meerkat re-verifies it against durable state and refuses with `MobError::MemberRoleMigrationRejected` on mismatch; Meta never infers a declaration and never retries a resume Meerkat refused. |
 | Leftovers | Once the durable and requested roles agree, Meerkat returns before reading the declaration, so a declaration left in place after the migration landed is inert. An identical repeated declaration is therefore accepted on purpose. |
@@ -637,7 +639,7 @@ launch that never mentions the key has one). The service backs the member
 | Launch | `workgraph: true` (default) | `workgraph: "<dir>"` |
 |--------|-----------------------------|----------------------|
 | With `persistent_state` | Durable `SqliteWorkGraphStore` at `<persistent_state>/workgraph.sqlite3`, the `workgraph` storage slot. If the store fails to open, the slot reports `degraded` and WorkGraph is disabled for that launch; nothing falls back to memory. | Durable store at `<dir>/workgraph.sqlite3`, created if needed, same open-failure posture. |
-| Without `persistent_state` | Memory-backed `MemoryWorkGraphStore`, reported as a declared-ephemeral slot: goals, work items and attention bindings do not survive a gateway restart. On an identity-first launch that persists through an SDK-hosted continuity store the gateway logs one WARN line naming this, because everything else about that launch is durable. | Durable store at `<dir>/workgraph.sqlite3`; the directory form exists for exactly this case. |
+| Without `persistent_state` | Memory-backed `MemoryWorkGraphStore`, reported as a declared-ephemeral slot: goals, work items and attention bindings do not survive a gateway restart. | Durable store at `<dir>/workgraph.sqlite3`; the directory form exists for exactly this case. |
 
 `meta_gateway` has no switch: its persistent mode attaches the durable store
 from the workspace state dir (same degraded posture on open failure) and its
@@ -704,9 +706,9 @@ directory's internal sharding, per-realm agent-memory files).
 **Canonical spellings** (decided once; stores shared with Meerkat keep
 Meerkat's names, Meta-owned files converge on `*.sqlite3`):
 
-| Slot | Canonical name | Legacy spellings (still readable) |
+| Slot | Canonical name | Legacy spellings |
 |------|----------------|------------------------------------|
-| sessions | `sessions.sqlite3` | `sessions.db`, `sessions.sqlite` |
+| sessions (0.9.3 state: read only by the migration verbs and the storage doctor; 0.9.4 creates none) | `sessions.sqlite3` | `sessions.db`, `sessions.sqlite` |
 | runtime | `runtime.sqlite` | — |
 | schedule | `schedule.sqlite` | — |
 | workgraph | `workgraph.sqlite3` | — |
@@ -717,15 +719,33 @@ Meerkat's names, Meta-owned files converge on `*.sqlite3`):
 | canonical Meerkat mob storage | `event_log.sqlite3` | — |
 | blob root | `blobs/` | — |
 
+0.9.4 keeps every session in Meerkat Core's store in `runtime.sqlite`. It
+creates and opens no session database, and keeps no session rows in the
+continuity database. An unretired sessions database under any of its
+spellings, or a continuity database under any of its spellings that still
+holds session rows, is 0.9.3 state: startup refuses it
+(`NativeStorageMigrationRequired`, `-32014`) until
+`meta_gateway storage-migrate-native` migrates it in place (see
+[Upgrading to 0.9.4](/guides/upgrading-to-0-9-4)).
+
 On normal persistent gateway launches, `event_log.sqlite3` holds Meerkat's
 canonical mob definition, events, and adopted-member state. It is live storage,
 not a reserved file, and is distinct from the optional operational query
 projection configured by `runtime_options.event_log`. The SDK gateway's
 explicit `runtime_options.mob_storage: { "storage": "memory" }` declaration
-opts out of persistent mob storage; ordinary persistent launches do not.
+keeps mob storage in memory, except under `persistent_state` while a roster
+provider is registered: the roster's identity bindings live in the mob
+storage, so that launch is refused (`-32014`). The Rust builder refuses the
+same composition (`mob_storage()` without a persistent path, together with
+`persistent_state()` and `roster_provider()`) with
+`ConflictingConfiguration`; without `mob_storage()`, `persistent_state()`
+keeps mob storage in `event_log.sqlite3`.
 
 **Canonical-name-first probing.** Opening a slot resolves the canonical name
-first, then probes the known legacy spellings in the same directory. Exactly
+first, then probes the known legacy spellings in the same directory (for the
+slots 0.9.4 opens, the continuity database included, which keeps the identity
+records; the sessions spellings are read only by the migration verbs and the
+storage doctor). Exactly
 one spelling → it is used *where it lies* (no rename at open). Two spellings
 of the same store → the gateway refuses to start (error `-32014`, "file-name
 twins") and points at `meta/storage/doctor`; physical renames happen only
@@ -735,10 +755,12 @@ through the storage migrate verb, under the maintenance fence.
 resolves to a durability class (`durable` / `scratch`) and a resolution
 (`persistent` / `declared_ephemeral` / `non_persistent`). A durable-class
 slot may run non-persistent only as an *explicit declaration*
-(`runtime_options.runtime_store`, `runtime_options.event_log`, the Rust
-builder's `ephemeral_runtime_store(true)` / `ephemeral_blobs(true)`) — never
-as a silent fallback; undeclared gaps are startup errors that SDKs surface
-as the typed `StorageResolutionError` (`-32014`). The sanctioned boot-without
+(`runtime_options.event_log`, the Rust builder's `ephemeral_blobs(true)`, and,
+without `persistent_state`, `runtime_options.runtime_store` and the builder's
+`ephemeral_runtime_store(true)`), never as a silent fallback. Under
+`persistent_state` an in-memory runtime store is refused (`-32014`, or
+`ConflictingConfiguration` from the builder). Undeclared gaps are startup
+errors that SDKs surface as the typed `StorageResolutionError` (`-32014`). The sanctioned boot-without
 degradations (schedule or workgraph store open failure) disable the feature
 and appear as `degraded` slots.
 
@@ -750,15 +772,10 @@ on `meta/status`, `meta/capabilities`, and `meta/storage/doctor`:
 
 **Incremental session persistence.** `session_store_incremental: false` means
 the session store writes the whole session document at every turn boundary.
-For an identity-first launch, that happens when the continuity store does not
-serve `ContinuityStore::as_incremental_sessions`. The method has no default,
-so every continuity store states its choice, and a wrapper must forward its
-inner store's channel. Rust embedders can opt in to strict mode with
+Rust embedders can opt in to strict mode with
 `UnifiedRuntime::builder().require_incremental_session_persistence(true)`.
 `build()` then refuses with `SessionStoreNotIncremental` instead of starting
-on that fallback. To check a wrapper, run
-`meta_store_conformance::chapters::continuity_wrapper_preserves_incremental_channel`
-with your wrapping function.
+on that fallback.
 
 <Note>
 **Changelog policy.** Any storage file rename or table move gets the
@@ -775,9 +792,7 @@ and new spellings — operators read these files directly.
 
     let runtime = UnifiedRuntime::builder()
         .definition(definition)
-        .continuity_store(continuity_store)
-        .lease_provider(lease_provider)
-        .scratch_dir("state/identity-scratch")
+        .persistent_state("state")
         .roster_provider(roster_provider)
         .identity_bootstrap_mode(
             IdentityBootstrapMode::LazyWithBackgroundWarm { concurrency: 2 },
@@ -830,26 +845,23 @@ failures that apply to the whole pass are reported in the snapshot's optional
 `error` field.
 
 During an eager restore pass each identity's entry also carries typed
-`restore` progress: `{"stage": "registered"}`, `"resuming"`, `"minted"` (a
-fresh identity's durable record and session were created), `"resumed"`, or
-`{"stage": "broken", "kind": "<continuity failure kind>"}`. A minted or resumed
-member is `active` (and a broken one `broken`) as soon as its own restore
-settles, before the whole pass ends. In process,
+`restore` progress: `{"stage": "registered"}`, `"resuming"`, `"minted"` (Core
+spawned the identity on a fresh session), `"resumed"`, or
+`{"stage": "refused", "code": <code>, "kind": "<kind>"}` with the refusal's
+error code (`kind` is absent when the refusal has none). A minted or resumed
+member is `active` (and a refused one `broken` or `dormant`, as its refusal
+says) as soon as its own restore settles, before the whole pass ends. In process,
 `IdentityRuntime::watch_identity_bootstrap_status` streams the snapshot. On
 the stdio gateway `meta/init` still returns after the eager pass; a host
 that must not wait on the whole fleet uses `lazy_with_background_warm` and
 follows the same typed progress with `meta/wait_identity_bootstrap`.
 
-Broken identities are retried by the continuity repair supervisor, which is
-event-driven. It runs one pass when it starts and then waits for a typed
-trigger: another identity's embodiment settled (a resume or a fresh durable
-mint committed, releasing the store writer it held), a host restore or
-reconcile pass settled (boot, a roster refresh, `meta/reconcile_identity`),
-a delivery or materialization was refused because the identity is Broken (a
-caller's demand), or an explicit request (`meta/request_continuity_repair`,
-`request_continuity_repair()` / `requestContinuityRepair()` in the SDKs). It
-defers a pass while other embodiments are in flight, so a warm-up burst runs
-one pass rather than one per member. Its own passes never re-trigger it.
+No background pass retries a refused identity. Every wake answers its
+refusal typed, and the identity's `wake_refusal` names the way out:
+`delete_identity` after a final refusal (`-32051`, the identity reads
+`broken`), the repair for a held one (`-32603`), and nothing for a refusal a
+retry can clear (`-32052`): the identity stays `dormant`, and its next wake
+tries again.
 Only a transient cause with no typed signal (a heal authority that could not
 be reached, a pass that failed on a roster provider or store error, a member
 still Broken on an unavailable store) arms a last-resort fallback wake: 1 s,
@@ -862,8 +874,8 @@ its bounded `stdio_shutdown_horizon_ms` in the `meta/init` result. SDK hosts
 keep stdin and provider callbacks open until that handshake completes, then
 close the process. Honor the advertised `stdio_shutdown_horizon_ms` rather than
 hard-coding it. The current stock 392-second horizon covers an already-admitted
-provider callback, runtime event and mob drains, the final lease-release
-callback, the mob's terminal shutdown report, the member MCP settlement (in
+provider callback, runtime event and mob drains, the mob's terminal shutdown
+report, the member MCP settlement (in
 the runtime shutdown and again at the gateway's executor-exit boundary), and
 bounded response-delivery/reaping margin. At the executor-exit boundary the
 gateway answers only after every member MCP server's close returned its
@@ -922,13 +934,13 @@ desired identity roster for `identity_first: true` (the default):
 | `backend`, `binding`, `placement` | no | Backend kind, runtime binding and exact Meerkat host placement; a placement never degrades to local. |
 
 At boot the seed becomes the `MutableRosterProvider` and `restore_flow` runs
-over it: the roster is validated, continuity is resolved for every listed
-identity, and each non-Broken identity is created or resumed. Omitting the
+over it: the roster is validated, Core's member history is read for every
+listed identity, and each identity is created or resumed. Omitting the
 param is an empty seed, so the gateway starts with no identities and
 `meta/ensure_member` adds them at runtime (it upserts the same provider). The
 seed is boot-scoped like `role_migrations`: it is never persisted, and an
-identity missing from the next boot's seed is not restored on that boot (its
-continuity record is untouched). Under `identity_first: false` the param is
+identity missing from the next boot's seed is not restored on that boot (Core
+keeps its session). Under `identity_first: false` the param is
 parsed and ignored, not refused.
 
 ## ConsoleUiConfig

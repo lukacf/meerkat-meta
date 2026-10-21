@@ -67,6 +67,10 @@ where
 /// The Flow Editor behind the console's HTTP authentication, with no access
 /// controller. Nobody holds a `mobpack.deploy` grant here, so it never runs
 /// `rkat` on the host: deploys stay plans and validation stays structural.
+///
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 pub fn protected_flow_editor_router(decisions: RuntimeDecisionState) -> Router {
     flow_editor_frontend_router::<()>().merge(flow_editor_rpc_router_with_decisions(decisions))
 }
@@ -79,12 +83,14 @@ pub(crate) fn protected_flow_editor_router_with_runtime_catalog(
     runtime_catalog: MobpackRuntimeCatalogState,
     access: Option<AccessController>,
     host_deploy_without_access_control: bool,
+    session_fences: crate::auth::session_fence::ConsoleSessionFences,
 ) -> Router {
     flow_editor_frontend_router::<()>().merge(flow_editor_rpc_router_with_runtime_catalog(
         decisions,
         Some(runtime_catalog),
         access,
         host_deploy_without_access_control,
+        session_fences,
     ))
 }
 
@@ -128,8 +134,18 @@ where
 
 /// The RPC plane of [`protected_flow_editor_router`]: no access controller,
 /// so no host deploys.
+///
+/// Applies no session fence; use the routers a [`crate::UnifiedRuntime`] builds,
+/// or the `_under_session_fences` variant
+/// ([`crate::runtime::validate_console_token_under_session_fences`]).
 pub fn flow_editor_rpc_router_with_decisions(decisions: RuntimeDecisionState) -> Router {
-    flow_editor_rpc_router_with_runtime_catalog(decisions, None, None, false)
+    flow_editor_rpc_router_with_runtime_catalog(
+        decisions,
+        None,
+        None,
+        false,
+        crate::auth::session_fence::ConsoleSessionFences::detached(),
+    )
 }
 
 fn flow_editor_rpc_router_with_runtime_catalog(
@@ -137,11 +153,13 @@ fn flow_editor_rpc_router_with_runtime_catalog(
     runtime_catalog: Option<MobpackRuntimeCatalogState>,
     access: Option<AccessController>,
     host_deploy_without_access_control: bool,
+    session_fences: crate::auth::session_fence::ConsoleSessionFences,
 ) -> Router {
     Router::new()
         .route("/flow-editor/rpc", post(protected_flow_editor_rpc_handler))
         .with_state(FlowEditorRpcState {
             decisions,
+            session_fences,
             runtime_catalog,
             access,
             host_deploy_without_access_control,
@@ -302,6 +320,8 @@ async fn dispatch_flow_editor_rpc_blocking(
 #[derive(Clone)]
 struct FlowEditorRpcState {
     decisions: RuntimeDecisionState,
+    /// The Console's session fence record the route's token checks read.
+    session_fences: crate::auth::session_fence::ConsoleSessionFences,
     runtime_catalog: Option<MobpackRuntimeCatalogState>,
     access: Option<AccessController>,
     /// Whether host deploys are allowed for callers that no enforced access
@@ -354,11 +374,12 @@ async fn protected_flow_editor_rpc_handler(
     };
     let access_view = match sse_access_context(
         Some(&state.decisions),
+        &state.session_fences,
         state.access.as_ref(),
         &headers,
         &uri,
     ) {
-        Ok(view) => view,
+        Ok(caller) => caller.access_view,
         Err(()) => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -875,6 +896,7 @@ mod tests {
             None,
             access,
             host_deploy_without_access_control,
+            crate::auth::session_fence::ConsoleSessionFences::detached(),
         );
         let response = router
             .oneshot(

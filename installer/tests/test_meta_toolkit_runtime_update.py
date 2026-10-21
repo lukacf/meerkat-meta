@@ -318,3 +318,28 @@ def test_changed_predecessor_or_owner_refuses_before_runtime_move(retained_candi
             next_runtime_target=new, previous_source=previous, require_current=current)
     assert (root / ".bin").is_dir() and (root / ".venv").is_dir()
     assert not (transaction / "runtime-retained.json").exists()
+
+
+def test_native_storage_release_boundary_is_exact():
+    for before, after in [("0.9.0", "0.9.4"), ("0.9.1", "0.9.4"), ("0.8.48", "0.9.4"), ("0.9.3", "0.9.5")]:
+        assert updates.crosses_native_storage(before, after)
+    for before, after in [("0.9.0", "0.9.1"), ("0.8.47", "0.9.1"), ("0.9.4", "0.9.4"), ("0.9.4", "0.9.5"),
+            ("0.9.4", "0.9.1"), (None, "0.9.4"), ("0.9.1", None), ("latest", "0.9.4"), ("0.9.1", "0.9")]:
+        assert not updates.crosses_native_storage(before, after)
+
+
+def test_runtime_crossing_into_native_storage_is_blocked_before_any_change(product_crossing, monkeypatch):
+    product, target, old, candidate, _, _ = product_crossing
+    before = deepcopy((old, candidate))
+    assert updates.runtime_dependency_transition(old, candidate, {}, runtime_target=target) is not None
+    _, blockers = updates.compatibility(old, candidate, {}, runtime_target=target)
+    assert not any("storage-migrate-native" in blocker for blocker in blockers)
+    # Move the boundary onto this inert 0.8.47 -> 0.9.0 crossing: the refresh is
+    # no longer authorized and review names the offline migration it needs.
+    monkeypatch.setattr(updates, "NATIVE_STORAGE_META_VERSION", "0.9.0")
+    assert updates.native_storage_crossing(old, candidate) == ("0.8.47", "0.9.0")
+    assert updates.runtime_dependency_transition(old, candidate, {}, runtime_target=target) is None
+    _, blockers = updates.compatibility(old, candidate, {}, runtime_target=target)
+    assert blockers[0] == updates.NATIVE_STORAGE_UPDATE_BLOCKER.format("0.8.47", "0.9.0")
+    assert "Nothing was changed" in blockers[0] and "`meta_gateway storage-migrate-native`" in blockers[0]
+    assert (old, candidate) == before

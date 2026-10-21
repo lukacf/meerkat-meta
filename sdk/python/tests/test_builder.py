@@ -413,6 +413,22 @@ class TestBuilderChain:
 
         assert params["runtime_options"]["workgraph"] == "/var/lib/mob/workgraph"
 
+    def test_fork_instruction_policy_defaults_to_omitted(self):
+        b = Meta.builder()
+        params = MetaRuntime(b._config)._build_init_params()
+
+        assert "fork_instruction_policy" not in params["runtime_options"]
+
+    def test_fork_instruction_policy_sets_runtime_option(self):
+        b = Meta.builder().fork_instruction_policy("reactivate_inherited")
+        params = MetaRuntime(b._config)._build_init_params()
+
+        assert params["runtime_options"]["fork_instruction_policy"] == "reactivate_inherited"
+
+    def test_fork_instruction_policy_rejects_unknown_names(self):
+        with pytest.raises(ValueError):
+            Meta.builder().fork_instruction_policy("inherit")
+
     def test_console_fetch_timeout_ms_rejects_non_positive_values(self):
         with pytest.raises(ValueError):
             Meta.builder().console_fetch_timeout_ms(0)
@@ -632,33 +648,6 @@ class TestBuilderChain:
             Meta.builder().agent_memory(
                 hygienist={"enabled": False, "runs_per_dya": 2}
             )
-
-    def test_external_authoritative_path_requires_all_three_parts(self):
-        class Store:
-            pass
-
-        b = Meta.builder().continuity_store(Store())
-        with pytest.raises(ValueError, match="lease_provider.*scratch_dir"):
-            b._validate()
-
-    def test_external_provider_init_params_include_flags_and_scratch_dir(self):
-        class Store:
-            pass
-
-        class Lease:
-            pass
-
-        b = (
-            Meta.builder()
-            .continuity_store(Store())
-            .lease_provider(Lease())
-            .scratch_dir("/tmp/meta-scratch")
-        )
-        params = MetaRuntime(b._config)._build_init_params()
-
-        assert params["has_continuity_store"] is True
-        assert params["has_lease_provider"] is True
-        assert params["scratch_dir"] == "/tmp/meta-scratch"
 
 
 class TestConventionDefaults:

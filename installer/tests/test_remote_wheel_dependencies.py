@@ -66,8 +66,8 @@ def test_accepted_wheel_uses_exact_frozen_bytes_and_releases_all_descriptors(tmp
         public.write_bytes(b'changed public source must not reach pip')
         assert descriptor_bytes(wheel_fd) == content
         if sys.platform == 'linux':
-            seals = fcntl.fcntl(wheel_fd, fcntl.F_GET_SEALS)
-            assert seals & fcntl.F_SEAL_WRITE
+            seals = fcntl.fcntl(wheel_fd, controller._memfd_seal_constant('F_GET_SEALS'))
+            assert seals & controller._memfd_seal_constant('F_SEAL_WRITE')
             with pytest.raises(OSError) as failure:
                 os.pwrite(wheel_fd, b'changed', 0)
             assert failure.value.errno == errno.EPERM

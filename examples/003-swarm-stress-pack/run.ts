@@ -391,7 +391,7 @@ async function main() {
   const stateDir = join(here, ".state");
   const keepState = Boolean(process.env.META_KEEP_EXAMPLE_STATE);
   const hadPersistentState =
-    existsSync(join(stateDir, "continuity.db")) ||
+    existsSync(join(stateDir, "runtime.sqlite")) ||
     existsSync(join(stateDir, "meta_console.sqlite"));
   if (!process.env.META_KEEP_EXAMPLE_STATE) {
     rmSync(stateDir, { recursive: true, force: true });

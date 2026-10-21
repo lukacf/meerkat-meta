@@ -1780,7 +1780,7 @@ def provider_owned_work():
 
 
 def provider_public_status():
-    from .architect import setup_runtime_root
+    from .architect import setup_runtime_root, setup_settings_root
     public = provider_settings.status(runtime_active=architect.runtime is not None or architect.state == 'starting')
     from .bootstrap import selected_guide_runtime
     selected = selected_guide_runtime()
@@ -1793,11 +1793,17 @@ def provider_public_status():
                 row.update(configured=True, source='native_host_config', editable=False)
         public['effective_provider'] = route['provider']
         public['effective_model'] = route['model']
+    settings_root = setup_settings_root(STUDIO_ROOT)
+    lent = settings_root != setup_runtime_root(STUDIO_ROOT)
     try:
-        locked = canonical_setup_provider(setup_runtime_root(STUDIO_ROOT))
+        locked = canonical_setup_provider(settings_root)
         binding_error = None
     except ProviderSettingsUnavailable as error:
-        locked, binding_error = None, str(error)
+        # A previous generation only lends its settings; it never binds a fresh one.
+        locked, binding_error = None, (None if lent else str(error))
+    if lent and route is not None and locked is not None and locked != route['provider']:
+        # The selected model host binds a fresh generation; a lent provider never conflicts with it.
+        locked = None
     if locked:
         public['effective_provider'] = locked if any(
             row['provider'] == locked and row['configured'] for row in public['providers']) else None

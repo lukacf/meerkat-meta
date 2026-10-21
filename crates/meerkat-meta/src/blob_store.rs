@@ -142,6 +142,19 @@ impl ObjectStoreBlobStore {
         ObjectPath::from(format!("meta/{}.json", storage_key(blob_id)))
     }
 
+    /// The files a local store keeps `blob_id` in: its bytes, then its
+    /// metadata. The object store's local puts rename them into place
+    /// without a sync, so a writer that must outlast a power cut syncs them,
+    /// and the directories that name them, itself. `None` for a store with
+    /// no local root.
+    pub(crate) fn local_files(&self, blob_id: &BlobId) -> Option<[PathBuf; 2]> {
+        let root = self.legacy_root.as_ref()?;
+        Some(
+            [Self::object_path(blob_id), Self::meta_path(blob_id)]
+                .map(|path| root.join(AsRef::<str>::as_ref(&path))),
+        )
+    }
+
     fn legacy_path(&self, blob_id: &BlobId) -> Option<PathBuf> {
         let root = self.legacy_root.as_ref()?;
         let key = storage_key(blob_id);

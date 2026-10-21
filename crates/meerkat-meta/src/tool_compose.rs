@@ -310,6 +310,18 @@ impl AgentToolDispatcher for ComposedExternalTools {
         }
     }
 
+    /// The session's mob operator authority reaches both halves: either may
+    /// hold a mob runtime's own operator tools for the member (the existing
+    /// overlay a composition falls back to usually does).
+    fn bind_session_mob_tool_authority(
+        &self,
+        authority: Option<Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>>,
+    ) {
+        self.primary
+            .bind_session_mob_tool_authority(authority.clone());
+        self.fallback.bind_session_mob_tool_authority(authority);
+    }
+
     /// Rebind each half that supports ops-lifecycle binding, keeping the
     /// composition's precedence. Binding needs exclusive ownership all the way
     /// down: a composition or an ops-capable half still shared elsewhere
@@ -1143,5 +1155,26 @@ mod tests {
             .bind_ops_lifecycle(registry(), meerkat_core::types::SessionId::new())
             .expect("nothing to bind is not a refusal");
         assert!(!outcome.was_bound());
+    }
+
+    /// The session's mob operator authority reaches both halves; the
+    /// existing overlay a composition falls back to may hold a mob
+    /// runtime's own operator tools for the member.
+    #[test]
+    fn a_composition_binds_the_session_mob_authority_on_both_halves() {
+        use crate::tool_application_test_support::{MobAuthorityBindProbe, session_mob_authority};
+        let primary = Arc::new(MobAuthorityBindProbe::default());
+        let fallback = Arc::new(MobAuthorityBindProbe::default());
+        let composed = ComposedExternalTools::over(primary.clone(), Some(fallback.clone()));
+        let authority = session_mob_authority();
+        composed.bind_session_mob_tool_authority(Some(Arc::clone(&authority)));
+        for half in [&primary, &fallback] {
+            assert!(half.last_bound_is(Some(&authority)));
+        }
+        composed.bind_session_mob_tool_authority(None);
+        for half in [&primary, &fallback] {
+            assert!(half.last_bound_is(None));
+            assert_eq!(half.bind_count(), 2);
+        }
     }
 }

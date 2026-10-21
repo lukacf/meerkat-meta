@@ -164,7 +164,9 @@ image_generation = {live_images}
         None
     };
     if let Some(scratch) = &scratch {
-        builder = builder.scratch_dir(scratch.path());
+        builder = builder
+            .scratch_dir(scratch.path())
+            .ephemeral_runtime_store(true);
     }
     if identity_mode {
         let specs = identities

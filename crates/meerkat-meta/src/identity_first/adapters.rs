@@ -15,9 +15,8 @@ use super::contracts::{
     AgentCustomizer, RosterProvider, SessionSnapshotMatchCandidate, TopologyProvider,
 };
 use super::types::{
-    AgentAddressability, AgentBuildContext, AgentBuildDraft, AgentIdentity, ContinuityStoreError,
-    CustomizerError, DurableAgentSpec, ManagedPeerEdge, RosterContext, RosterError,
-    TopologyContext, TopologyError,
+    AgentAddressability, AgentBuildContext, AgentBuildDraft, AgentIdentity, CustomizerError,
+    DurableAgentSpec, ManagedPeerEdge, RosterContext, RosterError, TopologyContext, TopologyError,
 };
 use crate::mob_handle_runtime::{SessionCreatedContext, SessionHook};
 use crate::types::AgentDiscoverySpec;
@@ -205,9 +204,7 @@ impl TopologyProvider for EdgeDiscoveryTopologyAdapter {
 /// Runtime state for a session, used by the adapter to resolve identity/fencing.
 ///
 /// Public because publishing a cursor is the documented embedder seam: the
-/// identity runtime does it through `MobSessionBridge`, and out-of-tree
-/// harnesses (`meta-store-conformance`) need the same route to exercise
-/// the registered write paths.
+/// identity runtime does it through `MobSessionBridge`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionRuntimeState {
     pub identity: AgentIdentity,
@@ -1686,10 +1683,11 @@ impl ContinuitySessionStoreAdapter {
     /// Quiesce persistence for one registered session. Acquiring the existing
     /// per-session lock is the drain barrier: every save admitted before this
     /// call completes first, and every later mutation observes `Suspended`.
+    #[cfg(test)]
     pub(crate) async fn suspend_session(
         &self,
         session_id: &meerkat_core::types::SessionId,
-    ) -> Result<(), ContinuityStoreError> {
+    ) -> Result<(), super::types::ContinuityStoreError> {
         let _guard = self.lock_session(session_id).await;
         self.suspended_sessions
             .lock()
@@ -1698,10 +1696,11 @@ impl ContinuitySessionStoreAdapter {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn unregister_session(
         &self,
         session_id: &meerkat_core::types::SessionId,
-    ) -> Result<(), ContinuityStoreError> {
+    ) -> Result<(), super::types::ContinuityStoreError> {
         let _guard = self.lock_session(session_id).await;
         self.forget_session(session_id).await;
         self.superseded_sessions
@@ -1727,6 +1726,7 @@ impl ContinuitySessionStoreAdapter {
     /// its generated terminal archive write without crossing the replacement
     /// fence; ordinary unregistration clears the tombstone only after the
     /// physical roster anchor is structurally absent.
+    #[cfg(test)]
     pub(crate) async fn abandon_superseded_session(
         &self,
         session_id: &meerkat_core::types::SessionId,

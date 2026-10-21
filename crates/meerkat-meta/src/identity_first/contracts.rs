@@ -367,8 +367,6 @@ pub trait ContinuityStore: Send + Sync {
     /// are its canonical durable session representation); the JSON-RPC
     /// `GatewayContinuityStore` returns `None` (its wire protocol has only
     /// whole-snapshot verbs).
-    /// `meta_store_conformance::chapters::continuity_wrapper_preserves_incremental_channel`
-    /// checks that a wrapper keeps the channel.
     fn as_incremental_sessions(&self) -> Option<Arc<dyn ContinuityIncrementalSessions>>;
 
     /// The concrete store type, for operator-facing diagnostics such as the

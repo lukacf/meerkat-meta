@@ -2024,6 +2024,7 @@ fn captured_backfill_test_provenance(
         },
         primary_mob_id: mob_id.clone(),
         source_mob_id: mob_id,
+        lineage: Vec::new(),
     }
 }
 

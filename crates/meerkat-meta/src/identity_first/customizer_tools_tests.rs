@@ -700,3 +700,29 @@ async fn the_identity_witness_alone_refuses_a_plan_from_an_earlier_publication()
         .expect("a plan of the current publication");
     assert_eq!(served_by(&outcome), "customize-1:lookup");
 }
+
+/// The session's mob operator authority reaches the identity's current
+/// publication and every later one; a publication made before any binding
+/// is left unbound.
+#[test]
+fn a_customizer_publication_is_bound_with_the_session_mob_authority() {
+    use crate::tool_application_test_support::{MobAuthorityBindProbe, session_mob_authority};
+    let registry = CustomizerToolRegistry::new();
+    let first = Arc::new(MobAuthorityBindProbe::default());
+    let tools = registry.publish(&identity("personal:alice"), Some(first.clone()));
+    let authority = session_mob_authority();
+    tools.bind_session_mob_tool_authority(Some(Arc::clone(&authority)));
+    assert!(first.last_bound_is(Some(&authority)));
+
+    let second = Arc::new(MobAuthorityBindProbe::default());
+    registry.publish(&identity("personal:alice"), Some(second.clone()));
+    assert!(
+        second.last_bound_is(Some(&authority)),
+        "a later publication is bound before it serves"
+    );
+    assert_eq!(first.bind_count(), 1);
+
+    let unbound = Arc::new(MobAuthorityBindProbe::default());
+    registry.publish(&identity("personal:bob"), Some(unbound.clone()));
+    assert_eq!(unbound.bind_count(), 0);
+}

@@ -7,7 +7,7 @@
  *
  * const rt = await Meta.builder()
  *   .mob("config/mob.toml")
- *   .sessionService(builder, store)
+ *   .sessionService(builder)
  *   .roster(myRoster)
  *   .build();
  *
@@ -24,8 +24,6 @@ import type { ExperimentalLiveGatewayConfig, OpenAiLiveGatewayConfig } from "./l
 import type { JobCredentialResolver } from "./jobs.js";
 import type { GatewayTransportFactory } from "./transport.js";
 import type {
-  ContinuityStore,
-  LeaseProvider,
   RosterProvider,
   AgentCustomizer,
   TopologyProvider,
@@ -104,6 +102,12 @@ function rejectUnknownKeys(
 
 // -- Builder config -------------------------------------------------------
 
+/** What a fork of a member with activated host instructions does with them. */
+export type ForkInstructionPolicy =
+  | "require_explicit_activation"
+  | "reactivate_inherited"
+  | "refuse";
+
 export interface MetaBuilderConfig {
   mobConfigPath: string | null;
   /** Opaque prepared application bytes and their declared digest; transport only. */
@@ -115,7 +119,6 @@ export interface MetaBuilderConfig {
    */
   declareSpecUpdateExpectedRevision?: number | null;
   sessionBuilder: SessionAgentBuilder | null;
-  sessionStore: unknown;
   errorCallback: ErrorCallback | null;
   eventLog: unknown;
   runtimeStore: unknown;
@@ -133,6 +136,8 @@ export interface MetaBuilderConfig {
   gatingConfigPath: string | null;
   routingConfigPath: string | null;
   workgraphEnabled: boolean | string | null;
+  /** `runtime_options.fork_instruction_policy`; `null` sends nothing (the gateway default). */
+  forkInstructionPolicy: ForkInstructionPolicy | null;
   memoryConfig: unknown;
   agentMemoryConfig: unknown;
   authConfig: unknown;
@@ -152,9 +157,6 @@ export interface MetaBuilderConfig {
   initDeadlineMs: number | null;
   modules: unknown[];
   persistentState: string | null;
-  continuityStore: ContinuityStore | null;
-  leaseProvider: LeaseProvider | null;
-  scratchDir: string | null;
   rosterProvider: RosterProvider | null;
   agentCustomizer: AgentCustomizer | null;
   topologyProvider: TopologyProvider | null;
@@ -170,7 +172,6 @@ function defaultConfig(): MetaBuilderConfig {
     preparedApplication: null,
     declareSpecUpdateExpectedRevision: null,
     sessionBuilder: null,
-    sessionStore: null,
     errorCallback: null,
     eventLog: null,
     runtimeStore: null,
@@ -188,6 +189,7 @@ function defaultConfig(): MetaBuilderConfig {
     gatingConfigPath: null,
     routingConfigPath: null,
     workgraphEnabled: null,
+    forkInstructionPolicy: null,
     memoryConfig: null,
     agentMemoryConfig: null,
     authConfig: null,
@@ -198,9 +200,6 @@ function defaultConfig(): MetaBuilderConfig {
     initDeadlineMs: null,
     modules: [],
     persistentState: null,
-    continuityStore: null,
-    leaseProvider: null,
-    scratchDir: null,
     rosterProvider: null,
     agentCustomizer: null,
     topologyProvider: null,
@@ -277,9 +276,18 @@ export class MetaBuilder {
     return this;
   }
 
-  sessionService(builder: SessionAgentBuilder, store?: unknown): this {
+  /**
+   * Register the session agent builder. A second argument (the session store
+   * of earlier releases) is refused: nothing ever read it, and Core's own
+   * session store holds every session.
+   */
+  sessionService(builder: SessionAgentBuilder, ...unsupported: never[]): this {
+    if (unsupported.length > 0) {
+      throw new TypeError(
+        "sessionService() takes only a session builder; it accepts no session store",
+      );
+    }
     this._config.sessionBuilder = builder;
-    this._config.sessionStore = store ?? null;
     return this;
   }
 
@@ -564,6 +572,25 @@ export class MetaBuilder {
    */
   workgraph(enabled: boolean | string = true): this {
     this._config.workgraphEnabled = enabled;
+    return this;
+  }
+
+  /**
+   * Set what a fork of a member with activated host instructions does
+   * (`runtime_options.fork_instruction_policy`): `"require_explicit_activation"`
+   * (the gateway default when unset), `"reactivate_inherited"` or `"refuse"`.
+   */
+  forkInstructionPolicy(policy: ForkInstructionPolicy): this {
+    if (
+      policy !== "require_explicit_activation" &&
+      policy !== "reactivate_inherited" &&
+      policy !== "refuse"
+    ) {
+      throw new RangeError(
+        "forkInstructionPolicy must be 'require_explicit_activation', 'reactivate_inherited' or 'refuse'",
+      );
+    }
+    this._config.forkInstructionPolicy = policy;
     return this;
   }
 
@@ -916,24 +943,6 @@ export class MetaBuilder {
     return this;
   }
 
-  /** Set an external ContinuityStore provider. Mutually exclusive with persistentState. */
-  continuityStore(store: ContinuityStore): this {
-    this._config.continuityStore = store;
-    return this;
-  }
-
-  /** Set an external LeaseProvider. Mutually exclusive with persistentState. */
-  leaseProvider(provider: LeaseProvider): this {
-    this._config.leaseProvider = provider;
-    return this;
-  }
-
-  /** Set scratch directory for external provider path. */
-  scratchDir(path: string): this {
-    this._config.scratchDir = path;
-    return this;
-  }
-
   /** Set a RosterProvider. */
   rosterProvider(provider: RosterProvider): this {
     this._config.rosterProvider = provider;
@@ -993,30 +1002,6 @@ export class MetaBuilder {
         throw new Error(
           "declareSpecUpdate() requires persistentState() because ephemeral mob " +
             "storage has no durable definition to update",
-        );
-      }
-    }
-    const hasPersistent = this._config.persistentState !== null;
-    const hasExternal =
-      this._config.continuityStore !== null ||
-      this._config.leaseProvider !== null ||
-      this._config.scratchDir !== null;
-    if (hasPersistent && hasExternal) {
-      throw new Error(
-        "persistentState and continuityStore/leaseProvider are mutually exclusive — " +
-          "use one path or the other, not both",
-      );
-    }
-    if (hasExternal) {
-      const missing: string[] = [];
-      if (this._config.continuityStore === null)
-        missing.push("continuityStore");
-      if (this._config.leaseProvider === null) missing.push("leaseProvider");
-      if (this._config.scratchDir === null) missing.push("scratchDir");
-      if (missing.length > 0) {
-        throw new Error(
-          "external-authoritative path requires continuityStore() + leaseProvider() + " +
-            `scratchDir(); missing: ${missing.join(", ")}`,
         );
       }
     }

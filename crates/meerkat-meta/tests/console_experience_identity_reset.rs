@@ -154,6 +154,7 @@ comms = true
             .lease_provider(Arc::new(LocalLeaseProvider::new()))
             .roster_provider(roster.clone())
             .scratch_dir(scratch.path())
+            .ephemeral_runtime_store(true)
             .identity_runtime_instance_id("console-experience-identity-reset")
             .default_llm_client(Arc::new(QuietClient))
             .build()
@@ -405,45 +406,49 @@ fn keeper_rows_if_any(experience: &Value) -> (Vec<Value>, Vec<Value>) {
     (sidebar, status)
 }
 
+/// A delete starts the identity over: a live identity moves to a fresh
+/// session at once and stays live and registered, and Core keeps the old
+/// session archived (CHANGELOG, Unreleased: "`delete_identity` starts the
+/// identity over and keeps its old session in Core [...] A live identity
+/// moves to a fresh session at once and stays live"). So the FIRST
+/// experience read after the delete shows no row for the deleted session:
+/// the keeper's rows name the fresh one, as `/console/identities` does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_first_experience_read_after_a_delete_shows_no_row_for_the_deleted_identity() {
+async fn the_first_experience_read_after_a_delete_shows_no_row_for_the_deleted_session() {
     let fixture = ResetFixture::new().await;
+    let deleted_session = fixture.bound_session().await;
     let (sidebar, _) = keeper_rows(&fixture.get("/console/experience").await);
     assert_eq!(sidebar["state"], "active");
+    assert_eq!(sidebar["session_id"], deleted_session);
 
     let deleted = fixture
         .rpc("meta/delete_identity", json!({ "identity": IDENTITY }))
         .await;
     assert!(deleted["result"].is_object(), "delete succeeds: {deleted}");
-    assert!(
-        fixture
-            .runtime
-            .identity_runtime()
-            .unwrap()
-            .status(&AgentIdentity::parse(IDENTITY).unwrap())
-            .await
-            .is_err(),
-        "the identity runtime no longer knows the deleted identity"
+    let fresh = fixture.bound_session().await;
+    assert_ne!(
+        fresh, deleted_session,
+        "the identity runtime keeps the identity, on a fresh session"
     );
-    let identities = fixture.get("/console/identities").await;
-    assert!(
-        identities["identities"]
-            .as_array()
-            .expect("identities")
-            .iter()
-            .all(|record| record["identity"] != IDENTITY),
-        "/console/identities has no record for the deleted identity: {identities}"
+    assert_eq!(
+        identities_session(&fixture.get("/console/identities").await),
+        fresh,
+        "/console/identities names the fresh session"
     );
 
     // The FIRST experience read after the delete: no retry and no wait.
-    let (sidebar, status) = keeper_rows_if_any(&fixture.get("/console/experience").await);
-    assert!(
-        sidebar.is_empty(),
-        "the sidebar still lists the deleted identity: {sidebar:?}"
+    let (sidebar, status) = keeper_rows(&fixture.get("/console/experience").await);
+    assert_eq!(
+        sidebar["session_id"], fresh,
+        "the sidebar row names the fresh session, not the deleted one: {sidebar}"
     );
-    assert!(
-        status.is_empty(),
-        "identity_status still lists the deleted identity: {status:?}"
+    assert_eq!(
+        status["session_id"], fresh,
+        "the identity_status row names the fresh session, not the deleted one: {status}"
+    );
+    assert_eq!(
+        sidebar["state"], "active",
+        "the identity stays live: {sidebar}"
     );
     fixture.stop().await;
 }
@@ -459,8 +464,12 @@ async fn the_first_experience_read_after_a_retire_shows_no_active_row_for_the_re
         .rpc("meta/retire", json!({ "identity": IDENTITY }))
         .await;
     assert!(retired["result"].is_object(), "retire succeeds: {retired}");
-    // The owner keeps the retired identity with its binding; /console/identities
-    // lists it as retired, not addressable.
+    // The owner keeps the retired identity with its binding. A retired
+    // identity is dormant: the identity runtime reads Core's member history
+    // and has no retiring state (CHANGELOG, Unreleased: "A registered
+    // identity's `state` is `active`, `dormant` or `broken`; `retiring`,
+    // `suspended` and `uninitialized` are gone"), so /console/identities
+    // lists it as dormant.
     let identities = fixture.get("/console/identities").await;
     let record = identities["identities"]
         .as_array()
@@ -469,7 +478,7 @@ async fn the_first_experience_read_after_a_retire_shows_no_active_row_for_the_re
         .find(|record| record["identity"] == IDENTITY)
         .cloned()
         .unwrap_or_else(|| panic!("the retired identity stays listed: {identities}"));
-    assert_eq!(record["health"], "retired", "{record}");
+    assert_eq!(record["health"], "dormant", "{record}");
     assert_eq!(record["session_id"], bound, "{record}");
 
     // The FIRST experience read after the retire: no retry and no wait.

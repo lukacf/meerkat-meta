@@ -174,7 +174,7 @@ async fn the_join_names_a_moved_binding_pending_only_when_the_walk_does_not_answ
     // A retire: the session stays, the lifecycle state moved.
     let mut members = vec![row(KEEPER, Some(KEEPER), Some("s0"))];
     let retire = cut(&[
-        (KEEPER, Some("s0"), IdentityLifecycleState::Retiring),
+        (KEEPER, Some("s0"), IdentityLifecycleState::Dormant),
         (OTHER, Some("o0"), IdentityLifecycleState::Active),
     ]);
     let pending = join_identity_bindings(
@@ -289,33 +289,7 @@ async fn binding_reads_order_exactly_where_the_clock_stands_still() {
 }
 
 #[tokio::test]
-async fn a_suspended_or_moving_binding_vouches_for_no_walked_fact() {
-    // A reset holds the keeper Suspended while it swaps the member: a walk
-    // whose cut read (s1, Suspended) may already hold s2's rows, and a request
-    // that read the same bindings takes that walk as answering.
-    let suspended = cut(&[(KEEPER, Some("s1"), IdentityLifecycleState::Suspended)]);
-    let mut members = vec![row(KEEPER, Some(KEEPER), Some("s2"))];
-    let pending = join_identity_bindings(
-        &mut members,
-        &suspended,
-        &suspended,
-        true,
-        &BTreeSet::new(),
-        None,
-    )
-    .await;
-    assert_eq!(pending, BTreeSet::from([KEEPER.to_string()]));
-    assert_eq!(
-        members[0].session_id.as_deref(),
-        Some("s1"),
-        "the owner's session"
-    );
-    assert_eq!(
-        members[0].progress,
-        Some(fallback_progress()),
-        "the bounded run state for that session"
-    );
-
+async fn a_moving_binding_vouches_for_no_walked_fact() {
     // Control: an Active binding with the walked session answers from the walk.
     let active = cut(&[(KEEPER, Some("s1"), IdentityLifecycleState::Active)]);
     let mut members = vec![row(KEEPER, Some(KEEPER), Some("s1"))];
@@ -346,12 +320,12 @@ fn a_walk_records_the_bindings_that_moved_while_it_ran() {
         before.moved_in(&reset),
         BTreeSet::from([KEEPER.to_string()])
     );
-    let mid_reset = cut(&[
-        (KEEPER, Some("s1"), IdentityLifecycleState::Suspended),
+    let retired = cut(&[
+        (KEEPER, Some("s1"), IdentityLifecycleState::Dormant),
         (OTHER, Some("o0"), IdentityLifecycleState::Active),
     ]);
     assert_eq!(
-        before.moved_in(&mid_reset),
+        before.moved_in(&retired),
         BTreeSet::from([KEEPER.to_string()])
     );
     let deleted = cut(&[(OTHER, Some("o0"), IdentityLifecycleState::Active)]);
@@ -469,6 +443,7 @@ fn experience_body(
 ) -> Value {
     let response = crate::runtime::handle_console_rest_json_route_with_pending_rows(
         &open_console_decisions(),
+        &crate::ConsoleSessionFences::detached(),
         &ConsoleRestJsonRequest {
             method: "GET".to_string(),
             path: "/console/experience".to_string(),
@@ -612,6 +587,7 @@ comms = true
         .lease_provider(Arc::new(LocalLeaseProvider::new()))
         .roster_provider(roster)
         .scratch_dir(scratch.path())
+        .ephemeral_runtime_store(true)
         .identity_runtime_instance_id("console-binding")
         .default_llm_client(Arc::new(NeverCalledClient))
         .build()
@@ -675,7 +651,7 @@ async fn a_binding_change_past_the_refresh_deadline_answers_pending_without_pred
     let keeper = member(&snapshot, KEEPER).unwrap();
     assert_eq!(
         keeper.session_id.as_deref(),
-        Some(successor.session_id.to_string().as_str()),
+        successor.session_id().map(ToString::to_string).as_deref(),
         "the owner's session, never the walk's"
     );
     assert_ne!(keeper.session_id, predecessor.session_id);
@@ -709,7 +685,7 @@ async fn a_binding_change_past_the_refresh_deadline_answers_pending_without_pred
     assert_eq!(keeper.state, "active");
     assert_eq!(
         keeper.session_id.as_deref(),
-        Some(successor.session_id.to_string().as_str())
+        successor.session_id().map(ToString::to_string).as_deref()
     );
     assert_eq!(
         keeper.labels.get("group").map(String::as_str),
@@ -784,7 +760,7 @@ async fn a_read_joins_with_a_walk_cut_read_after_its_own() {
     );
     assert_eq!(
         member(&snapshot, KEEPER).unwrap().session_id.as_deref(),
-        Some(successor.session_id.to_string().as_str()),
+        successor.session_id().map(ToString::to_string).as_deref(),
         "the row joins with the walk's newer cut, never the read's own older one"
     );
     runtime.mob_handle().stop().await.unwrap();
@@ -1158,7 +1134,7 @@ async fn the_join_binds_the_runtimes_own_identities_under_a_namespaced_aggregato
         .unwrap_or_else(|| panic!("the aggregator lists the namespaced record: {records:?}"));
     assert_eq!(
         record.session_id.as_deref(),
-        Some(successor.session_id.to_string().as_str())
+        successor.session_id().map(ToString::to_string).as_deref()
     );
     let (snapshot, pending) = build_live_snapshot(
         &mob_runtime,
@@ -1172,7 +1148,7 @@ async fn the_join_binds_the_runtimes_own_identities_under_a_namespaced_aggregato
     assert_eq!(pending, BTreeSet::from([KEEPER.to_string()]));
     assert_eq!(
         member(&snapshot, KEEPER).unwrap().session_id.as_deref(),
-        Some(successor.session_id.to_string().as_str()),
+        successor.session_id().map(ToString::to_string).as_deref(),
         "the experience binds its bare row to the same session"
     );
     gate.add_permits(64);

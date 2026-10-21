@@ -1004,6 +1004,19 @@ async def test_native_multipart_input_preserves_submitted_text_and_native_admiss
         await front.close()
 
 
+@pytest.mark.parametrize("scope", ["native-console", "host-health"])
+def test_console_tokens_always_carry_exp_and_iat(monkeypatch, scope):
+    # The Console lists a principal whose token has no exp as non-expiring;
+    # every token this host mints expires two minutes after it is issued.
+    monkeypatch.setattr(console_auth.time, "time", lambda: 1_900_000_000.5)
+    key = "0" * 64
+    token = console_auth._token(key, "owner@example.test", scope=scope)
+    claims = jwt.decode(token, key, algorithms=["HS256"],
+                        options={"verify_exp": False, "verify_iat": False, "verify_aud": False})
+    assert claims["iat"] == 1_900_000_000
+    assert claims["exp"] == 1_900_000_120
+
+
 def test_private_key_rejects_linked_or_public_source_and_upstream_requires_loopback(tmp_path):
     front = ConsoleFront(tmp_path, 8855, "owner", "local-password-123")
     os.chmod(tmp_path / ".mobkit/console-signing.key", 0o644)

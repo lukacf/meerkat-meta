@@ -124,6 +124,30 @@ pub struct ConsoleFrameMemberProvenance {
     pub member: crate::runtime::ConsoleMember,
     pub primary_mob_id: String,
     pub source_mob_id: String,
+    /// The member's spawn lineage as the owner captured it: the member
+    /// first, then its spawn ancestors, parent first. Each ancestor is
+    /// captured only from the incarnation the member's lineage names; one
+    /// that could not be confirmed is recorded without attributes. Empty on
+    /// frames written before lineage was captured: those are decided with
+    /// any ancestor unconfirmed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lineage: Vec<ConsoleFrameLineageLink>,
+}
+
+/// One captured link of a member's spawn lineage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleFrameLineageLink {
+    /// Console identity, in the access rules' namespace.
+    pub identity: String,
+    /// Runtime member id, in the access rules' namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Labels with registry-verified lineage. `None` for an ancestor whose
+    /// incarnation was not confirmed when the frame was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -326,6 +350,10 @@ pub struct ConsoleIdentityRecord {
     pub runtime_member_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Core's mob member id of the identity's last binding, for an
+    /// identity-first identity Core holds a binding of; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_id: Option<String>,
     pub visibility: ConsoleVisibility,
     pub addressable: bool,
     pub health: String,

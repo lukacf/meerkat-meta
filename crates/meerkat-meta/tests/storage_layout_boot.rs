@@ -8,9 +8,15 @@
 //! M2 `MetaStorageLayout` boot coverage: the dual-name fixture matrix per
 //! surface. Every surface (builder, `rpc_gateway`, `meta_gateway`) must
 //! keep booting against a legacy-named state directory (files used where
-//! they lie — the resolver never creates a twin), converge fresh
-//! directories on the canonical spellings, and refuse loudly when both
-//! spellings of one store exist.
+//! they lie, the resolver never creates a twin) and converge fresh
+//! directories on the canonical spellings.
+//!
+//! Sessions live in Core's pair on `runtime.sqlite`. No surface creates a
+//! sessions database, so a directory a fresh boot leaves starts again. A
+//! sessions database in any spelling, file-name twins included, is the
+//! 0.9.3 session projection: every surface refuses it typed before any
+//! store opens, names `meta_gateway storage-migrate-native`, and leaves it
+//! where it lies.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -48,6 +54,54 @@ fn touch(path: &Path) {
     std::fs::write(path, b"").expect("seed fixture file");
 }
 
+/// No surface creates a sessions database in any spelling: sessions live in
+/// Core's pair on `runtime.sqlite`.
+fn assert_no_sessions_database(state_dir: &Path) {
+    let slot = meerkat_meta::storage_layout::DatabaseSlot::Sessions;
+    for spelling in
+        std::iter::once(slot.canonical_name()).chain(slot.legacy_names().iter().copied())
+    {
+        assert!(
+            !state_dir.join(spelling).exists(),
+            "no surface may create a separate sessions database, found {spelling}"
+        );
+    }
+}
+
+/// The refusal a sessions database gets: the directory must be migrated,
+/// the message names the native migration verb and every file it found.
+fn assert_native_migration_refusal(message: &str, files: &[&str]) {
+    assert!(
+        message.contains("must be migrated before this version opens it")
+            && message.contains(meerkat_meta::storage_layout::NATIVE_STORAGE_MIGRATION_VERB),
+        "a sessions database must refuse with the native migration: {message}"
+    );
+    for file in files {
+        assert!(
+            message.contains(file),
+            "the refusal must name {file}: {message}"
+        );
+    }
+}
+
+/// A refused boot opens no store: every seeded file is still empty and
+/// Core's `runtime.sqlite` was never created.
+fn assert_refused_boot_left_the_directory(state_dir: &Path, seeded: &[&str]) {
+    for file in seeded {
+        assert_eq!(
+            std::fs::metadata(state_dir.join(file))
+                .expect("seeded file")
+                .len(),
+            0,
+            "a refused boot must leave {file} as it was"
+        );
+    }
+    assert!(
+        !state_dir.join("runtime.sqlite").exists(),
+        "a refused boot must not open the runtime store"
+    );
+}
+
 /// An empty desired roster: enough to drive the identity-first arm (and its
 /// continuity-store open) without materializing any member.
 struct EmptyRosterProvider;
@@ -80,7 +134,6 @@ async fn builder_fresh_state_dir_converges_on_canonical_names() {
     .expect("fresh persistent build");
 
     for canonical in [
-        "sessions.sqlite3",
         "runtime.sqlite",
         "continuity.sqlite3",
         "meta_metadata.sqlite3",
@@ -91,12 +144,8 @@ async fn builder_fresh_state_dir_converges_on_canonical_names() {
             "fresh boot must create canonical {canonical}"
         );
     }
-    for legacy in [
-        "sessions.db",
-        "sessions.sqlite",
-        "continuity.db",
-        "identity_continuity.sqlite",
-    ] {
+    assert_no_sessions_database(&state);
+    for legacy in ["continuity.db", "identity_continuity.sqlite"] {
         assert!(
             !state.join(legacy).exists(),
             "fresh boot must not create legacy {legacy}"
@@ -106,14 +155,135 @@ async fn builder_fresh_state_dir_converges_on_canonical_names() {
     runtime.mob_handle().stop().await.expect("stop");
 }
 
+/// The second start of a directory a fresh boot left: it holds no sessions
+/// database, so after a clean shutdown it reads as native and the same mob
+/// builds on it again.
+#[tokio::test]
+async fn builder_starts_a_fresh_state_dir_again_after_a_clean_shutdown() {
+    let tmp = TempDir::new().expect("temp dir");
+    let state = tmp.path().join("state");
+    // One mob throughout: the directory's topology state belongs to it.
+    let definition = test_definition();
+    let build = || {
+        Box::pin(
+            UnifiedRuntimeBuilder::default()
+                .definition(definition.clone())
+                .persistent_state(&state)
+                .roster_provider(Arc::new(EmptyRosterProvider))
+                .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+                .build(),
+        )
+    };
+
+    let first = build()
+        .await
+        .expect("first boot of a fresh state directory");
+    first.shutdown().await;
+    drop(first);
+    assert_no_sessions_database(&state);
+    assert_eq!(
+        meerkat_meta::storage_migrate_native::native_layout_status(&state),
+        meerkat_meta::storage_migrate_native::NativeLayoutStatus::Native,
+        "the directory a fresh boot leaves must read as native"
+    );
+
+    let again = build()
+        .await
+        .expect("a directory this version created must start again");
+    assert_no_sessions_database(&state);
+    again.shutdown().await;
+}
+
+/// One Meta runtime per state directory: a second builder on a directory a
+/// live runtime holds is refused typed before it opens any store. A clean
+/// shutdown releases the directory, and once the first runtime is gone the
+/// same mob builds on it again.
+#[tokio::test]
+async fn builder_refuses_a_state_directory_another_runtime_holds() {
+    let tmp = TempDir::new().expect("temp dir");
+    let state = tmp.path().join("state");
+    // One mob throughout: the directory's topology state belongs to it.
+    let definition = test_definition();
+    let build = || {
+        Box::pin(
+            UnifiedRuntimeBuilder::default()
+                .definition(definition.clone())
+                .persistent_state(&state)
+                .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+                .build(),
+        )
+    };
+    let first = build().await.expect("first runtime");
+    let Err(refused) = build().await else {
+        panic!("a second runtime on a held state directory must be refused");
+    };
+    assert!(
+        matches!(
+            refused,
+            meerkat_meta::UnifiedRuntimeBuilderError::StorageLayout(
+                meerkat_meta::storage_layout::StorageLayoutError::StateDirInUse { .. }
+            )
+        ),
+        "{refused}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .ends_with("is in use by another Meta runtime"),
+        "{refused}"
+    );
+    first.shutdown().await;
+    drop(
+        meerkat_meta::state_dir_claim::StateDirClaim::acquire(&state)
+            .expect("a clean shutdown releases the state directory"),
+    );
+    drop(first);
+    let again = build()
+        .await
+        .expect("the same mob builds on the directory once the first runtime is gone");
+    again.shutdown().await;
+}
+
+/// The builder claims its state directory only once the configuration is
+/// coherent: a configuration it refuses leaves the directory untouched.
+#[tokio::test]
+async fn a_refused_builder_configuration_leaves_the_state_directory_untouched() {
+    let tmp = TempDir::new().expect("temp dir");
+    let state = tmp.path().join("state");
+    let Err(refused) = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(test_definition())
+            .persistent_state(&state)
+            .scratch_dir(tmp.path().join("scratch"))
+            .build(),
+    )
+    .await
+    else {
+        panic!("persistent_state() with scratch_dir() must be refused");
+    };
+    assert!(
+        matches!(
+            refused,
+            meerkat_meta::UnifiedRuntimeBuilderError::ConflictingConfiguration(_)
+        ),
+        "{refused}"
+    );
+    assert!(
+        !state.exists(),
+        "a refused configuration created {}",
+        state.display()
+    );
+}
+
 #[tokio::test]
 async fn builder_keeps_using_a_legacy_named_state_dir_where_it_lies() {
     let tmp = TempDir::new().expect("temp dir");
     let state = tmp.path().join("state");
     std::fs::create_dir_all(&state).expect("state dir");
-    // The builder's own historical spellings (recon census): SQLite opens
-    // the zero-byte seeds as empty databases and initializes them in place.
-    touch(&state.join("sessions.db"));
+    // The builder's own historical continuity spelling (recon census):
+    // SQLite opens the zero-byte seed as an empty database and initializes
+    // it in place. Its historical sessions spelling refuses instead
+    // (`builder_refuses_a_legacy_sessions_database_until_it_is_migrated`).
     touch(&state.join("identity_continuity.sqlite"));
 
     let runtime = Box::pin(
@@ -127,30 +297,63 @@ async fn builder_keeps_using_a_legacy_named_state_dir_where_it_lies() {
     .await
     .expect("legacy-named persistent build");
 
-    for (legacy, canonical) in [
-        ("sessions.db", "sessions.sqlite3"),
-        ("identity_continuity.sqlite", "continuity.sqlite3"),
-    ] {
-        assert!(
-            state.join(legacy).exists(),
-            "legacy {legacy} must keep being used where it lies"
-        );
-        assert!(
-            !state.join(canonical).exists(),
-            "boot must not create a canonical twin {canonical} beside {legacy}"
-        );
-        assert!(
-            std::fs::metadata(state.join(legacy))
-                .expect("metadata")
-                .len()
-                > 0,
-            "legacy {legacy} must have been opened and initialized in place"
-        );
-    }
+    let (legacy, canonical) = ("identity_continuity.sqlite", "continuity.sqlite3");
+    assert!(
+        state.join(legacy).exists(),
+        "legacy {legacy} must keep being used where it lies"
+    );
+    assert!(
+        !state.join(canonical).exists(),
+        "boot must not create a canonical twin {canonical} beside {legacy}"
+    );
+    assert!(
+        std::fs::metadata(state.join(legacy))
+            .expect("metadata")
+            .len()
+            > 0,
+        "legacy {legacy} must have been opened and initialized in place"
+    );
+    assert_no_sessions_database(&state);
 
     runtime.mob_handle().stop().await.expect("stop");
 }
 
+/// A legacy sessions database is the 0.9.3 session projection: the builder
+/// refuses it typed before any store opens and leaves it where it lies for
+/// the native migration to move.
+#[tokio::test]
+async fn builder_refuses_a_legacy_sessions_database_until_it_is_migrated() {
+    let tmp = TempDir::new().expect("temp dir");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    touch(&state.join("sessions.db"));
+
+    let error = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(test_definition())
+            .persistent_state(&state)
+            .roster_provider(Arc::new(EmptyRosterProvider))
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .build(),
+    )
+    .await
+    .err()
+    .expect("a legacy sessions database must refuse to boot");
+    assert!(
+        matches!(
+            error,
+            meerkat_meta::UnifiedRuntimeBuilderError::StorageLayout(
+                meerkat_meta::storage_layout::StorageLayoutError::NativeStorageMigrationRequired { .. }
+            )
+        ),
+        "{error}"
+    );
+    assert_native_migration_refusal(&error.to_string(), &["sessions.db"]);
+    assert_refused_boot_left_the_directory(&state, &["sessions.db"]);
+}
+
+/// Session file-name twins are two copies of the 0.9.3 session projection:
+/// the builder refuses them like a single one, naming both.
 #[tokio::test]
 async fn builder_refuses_session_file_name_twins() {
     let tmp = TempDir::new().expect("temp dir");
@@ -169,11 +372,17 @@ async fn builder_refuses_session_file_name_twins() {
     .await
     .err()
     .expect("twin spellings must refuse to boot");
-    let message = error.to_string();
     assert!(
-        message.contains("file-name twins") && message.contains("sessions"),
-        "twins refusal must name the slot and point at the doctor: {message}"
+        matches!(
+            error,
+            meerkat_meta::UnifiedRuntimeBuilderError::StorageLayout(
+                meerkat_meta::storage_layout::StorageLayoutError::NativeStorageMigrationRequired { .. }
+            )
+        ),
+        "{error}"
     );
+    assert_native_migration_refusal(&error.to_string(), &["sessions.db", "sessions.sqlite3"]);
+    assert_refused_boot_left_the_directory(&state, &["sessions.db", "sessions.sqlite3"]);
 }
 
 /// The predecessor (pre-0.9) metadata and console file names are not
@@ -270,8 +479,8 @@ model = "gpt-5.5"
 }
 
 /// Spawn the real `rpc_gateway --persistent`, send one `meta/init` with
-/// `persistent_state`, and return the init response.
-fn rpc_gateway_init(state_dir: &Path) -> Value {
+/// `persistent_state` and `mob_config`, and return the init response.
+fn rpc_gateway_init(state_dir: &Path, mob_config: &str) -> Value {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rpc_gateway"))
         .arg("--persistent")
         .stdin(Stdio::piped())
@@ -286,7 +495,7 @@ fn rpc_gateway_init(state_dir: &Path) -> Value {
         "method": "meta/init",
         "params": {
             "persistent_state": state_dir,
-            "mob_config": &rpc_mob_config(),
+            "mob_config": mob_config,
         }
     });
     writeln!(
@@ -317,13 +526,14 @@ fn rpc_gateway_init(state_dir: &Path) -> Value {
 #[test]
 fn rpc_gateway_fresh_state_dir_converges_on_canonical_names() {
     let state = TempDir::new().expect("state dir");
-    let response = rpc_gateway_init(state.path());
+    // One mob throughout: the directory's composition record belongs to it.
+    let mob_config = rpc_mob_config();
+    let response = rpc_gateway_init(state.path(), &mob_config);
     assert!(
-        response.get("error").is_none(),
+        response["result"]["contract_version"].is_string(),
         "fresh init must succeed: {response}"
     );
     for canonical in [
-        "sessions.sqlite3",
         "runtime.sqlite",
         "meta_metadata.sqlite3",
         "meta_console.sqlite3",
@@ -333,33 +543,35 @@ fn rpc_gateway_fresh_state_dir_converges_on_canonical_names() {
             "fresh boot must create canonical {canonical}"
         );
     }
-    for legacy in ["sessions.db", "sessions.sqlite"] {
-        assert!(
-            !state.path().join(legacy).exists(),
-            "fresh boot must not create legacy {legacy}"
-        );
-    }
+    assert_no_sessions_database(state.path());
+
+    // The second start of the directory the first one left (killed after
+    // init, as a crash would) reads it as native and starts.
+    let again = rpc_gateway_init(state.path(), &mob_config);
+    assert!(
+        again["result"]["contract_version"].is_string(),
+        "a directory this version created must start again: {again}"
+    );
+    assert_no_sessions_database(state.path());
 }
 
+/// `rpc_gateway`'s historical sessions spelling is the 0.9.3 session
+/// projection: init refuses it with the storage-resolution code before any
+/// store opens and leaves it where it lies.
 #[test]
-fn rpc_gateway_keeps_using_a_legacy_named_state_dir_where_it_lies() {
+fn rpc_gateway_refuses_a_legacy_sessions_database_until_it_is_migrated() {
     let state = TempDir::new().expect("state dir");
-    // rpc_gateway's own historical spellings (recon census).
     touch(&state.path().join("sessions.db"));
 
-    let response = rpc_gateway_init(state.path());
-    assert!(
-        response.get("error").is_none(),
-        "legacy-named init must succeed: {response}"
+    let response = rpc_gateway_init(state.path(), &rpc_mob_config());
+    assert_eq!(
+        response["error"]["code"],
+        json!(meerkat_meta::STORAGE_RESOLUTION_CODE),
+        "{response}"
     );
-    assert!(
-        state.path().join("sessions.db").exists(),
-        "legacy sessions.db must keep being used where it lies"
-    );
-    assert!(
-        !state.path().join("sessions.sqlite3").exists(),
-        "boot must not create a canonical twin sessions.sqlite3 beside sessions.db"
-    );
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert_native_migration_refusal(message, &["sessions.db"]);
+    assert_refused_boot_left_the_directory(state.path(), &["sessions.db"]);
 }
 
 #[test]
@@ -368,12 +580,15 @@ fn rpc_gateway_refuses_session_file_name_twins() {
     touch(&state.path().join("sessions.db"));
     touch(&state.path().join("sessions.sqlite3"));
 
-    let response = rpc_gateway_init(state.path());
-    let message = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("file-name twins") && message.contains("sessions"),
-        "twin spellings must fail init with the twins refusal: {response}"
+    let response = rpc_gateway_init(state.path(), &rpc_mob_config());
+    assert_eq!(
+        response["error"]["code"],
+        json!(meerkat_meta::STORAGE_RESOLUTION_CODE),
+        "{response}"
     );
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert_native_migration_refusal(message, &["sessions.db", "sessions.sqlite3"]);
+    assert_refused_boot_left_the_directory(state.path(), &["sessions.db", "sessions.sqlite3"]);
 }
 
 #[test]
@@ -385,7 +600,7 @@ fn rpc_gateway_refuses_unadopted_predecessor_state() {
             .join(meerkat_meta::storage_predecessor::PREDECESSOR_CONSOLE_DB_FILE_NAMES[0]),
     );
 
-    let response = rpc_gateway_init(state.path());
+    let response = rpc_gateway_init(state.path(), &rpc_mob_config());
     let message = response["error"]["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("predecessor") && message.contains("storage-adopt-predecessor"),
@@ -466,18 +681,28 @@ fn meta_gateway_fresh_store_dir_converges_on_canonical_names() {
         response.get("error").is_none(),
         "fresh init must succeed: {response}"
     );
-    for canonical in ["sessions.sqlite3", "runtime.sqlite", "continuity.sqlite3"] {
+    for canonical in ["runtime.sqlite", "continuity.sqlite3"] {
         assert!(
             store_dir.join(canonical).exists(),
             "fresh boot must create canonical {canonical}"
         );
     }
-    for legacy in ["sessions.sqlite", "sessions.db", "continuity.db"] {
-        assert!(
-            !store_dir.join(legacy).exists(),
-            "fresh boot must not create legacy {legacy}"
-        );
-    }
+    assert_no_sessions_database(&store_dir);
+    assert!(
+        !store_dir.join("continuity.db").exists(),
+        "fresh boot must not create legacy continuity.db"
+    );
+
+    // The second start of the store directory the first one left (killed
+    // after init, as a crash would) reads it as native and creates a new
+    // runtime on it.
+    let again = meta_gateway_init(workspace.path(), &store_dir);
+    assert_eq!(
+        again["result"]["launch_state"],
+        json!("created"),
+        "a directory this version created must start again: {again}"
+    );
+    assert_no_sessions_database(&store_dir);
 }
 
 #[test]
@@ -486,8 +711,9 @@ fn meta_gateway_keeps_using_a_legacy_named_store_dir_where_it_lies() {
     let store = TempDir::new().expect("store");
     let store_dir = store.path().join("store");
     std::fs::create_dir_all(&store_dir).expect("store dir");
-    // meta_gateway's own historical spellings (recon census).
-    touch(&store_dir.join("sessions.sqlite"));
+    // meta_gateway's own historical continuity spelling (recon census). Its
+    // historical sessions spelling refuses instead
+    // (`meta_gateway_refuses_a_legacy_sessions_database_until_it_is_migrated`).
     touch(&store_dir.join("continuity.db"));
 
     let response = meta_gateway_init(workspace.path(), &store_dir);
@@ -495,19 +721,38 @@ fn meta_gateway_keeps_using_a_legacy_named_store_dir_where_it_lies() {
         response.get("error").is_none(),
         "legacy-named init must succeed: {response}"
     );
-    for (legacy, canonical) in [
-        ("sessions.sqlite", "sessions.sqlite3"),
-        ("continuity.db", "continuity.sqlite3"),
-    ] {
-        assert!(
-            store_dir.join(legacy).exists(),
-            "legacy {legacy} must keep being used where it lies"
-        );
-        assert!(
-            !store_dir.join(canonical).exists(),
-            "boot must not create a canonical twin {canonical} beside {legacy}"
-        );
-    }
+    let (legacy, canonical) = ("continuity.db", "continuity.sqlite3");
+    assert!(
+        store_dir.join(legacy).exists(),
+        "legacy {legacy} must keep being used where it lies"
+    );
+    assert!(
+        !store_dir.join(canonical).exists(),
+        "boot must not create a canonical twin {canonical} beside {legacy}"
+    );
+    assert_no_sessions_database(&store_dir);
+}
+
+/// `meta_gateway`'s historical sessions spelling is the 0.9.3 session
+/// projection: init refuses it with the storage-resolution code before any
+/// store opens and leaves it where it lies.
+#[test]
+fn meta_gateway_refuses_a_legacy_sessions_database_until_it_is_migrated() {
+    let workspace = TempDir::new().expect("workspace");
+    let store = TempDir::new().expect("store");
+    let store_dir = store.path().join("store");
+    std::fs::create_dir_all(&store_dir).expect("store dir");
+    touch(&store_dir.join("sessions.sqlite"));
+
+    let response = meta_gateway_init(workspace.path(), &store_dir);
+    assert_eq!(
+        response["error"]["code"],
+        json!(meerkat_meta::STORAGE_RESOLUTION_CODE),
+        "{response}"
+    );
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert_native_migration_refusal(message, &["sessions.sqlite"]);
+    assert_refused_boot_left_the_directory(&store_dir, &["sessions.sqlite"]);
 }
 
 /// A gateway home that only exists under its predecessor (pre-0.9) name

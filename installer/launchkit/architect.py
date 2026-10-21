@@ -25,6 +25,8 @@ from .blueprint_authoring import authoring_schema, blueprint_tool_schema, materi
 from .guided_edits import apply_guided_edits, guided_document, guided_edit_schema, guided_edit_token
 
 SETUP_RUNTIME_DIRECTORY = "architect-runtime-meta-v1"
+# The setup team's generation on Meta 0.9.4 and later; see setup_runtime_directory.
+NATIVE_STORAGE_SETUP_RUNTIME_DIRECTORY = "architect-runtime-meta-v2"
 SETUP_MODELS = {**DEFAULT_MODELS, "openai": "gpt-6.1-sol"}
 LOG = logging.getLogger(__name__)
 
@@ -274,10 +276,49 @@ def _startup_diagnostic(error: BaseException, phase: StartupPhase | None) -> tup
     return "startup_failure", None
 
 
-def setup_runtime_root(root: Path) -> Path:
+def setup_runtime_directory(version: str | None = None) -> str:
+    """Name the native generation for the selected Guide release.
+
+    Meta 0.9.4 refuses native state that an earlier release wrote until its
+    one-time, offline storage migration has converted it. A setup team on that
+    release or later therefore starts the next fresh generation.
+    """
+    from .deployment_updates import NATIVE_STORAGE_META_VERSION, meta_release
+    if version is None:
+        from .guide_sdk import SELECTED_VERSION as version
+    selected = meta_release(version)
+    if selected is None:
+        raise ValueError("The setup team needs its exact selected Meta release.")
+    if selected >= meta_release(NATIVE_STORAGE_META_VERSION):
+        return NATIVE_STORAGE_SETUP_RUNTIME_DIRECTORY
+    return SETUP_RUNTIME_DIRECTORY
+
+
+def setup_runtime_root(root: Path, *, version: str | None = None) -> Path:
     # Meta gets a fresh native generation. Predecessor actor stores and the
     # separate guide/project histories remain intact for inspection.
-    return root / SETUP_RUNTIME_DIRECTORY
+    return root / setup_runtime_directory(version)
+
+
+def setup_settings_root(root: Path, *, version: str | None = None) -> Path:
+    """Name the generation whose saved definition holds the setup team's
+    provider and compaction tuning.
+
+    A fresh native generation has no saved definition until its first
+    composition; until then the previous generation's settings carry over.
+    That generation is only read, never changed.
+    """
+    current = setup_runtime_root(root, version=version)
+    previous = root / SETUP_RUNTIME_DIRECTORY
+    if current == previous:
+        return current
+    try:
+        started = any((current / ".mobkit" / "state").iterdir())
+    except FileNotFoundError:
+        started = False
+    except OSError:
+        started = True
+    return current if started or not previous.exists() else previous
 
 
 SETUP_UPGRADE_RECEIPT = "setup-runtime-upgrade.json"
@@ -1437,15 +1478,28 @@ class ArchitectService:
             capability = planner_capability()
             from .provider_settings import canonical_setup_settings, ProviderSettingsUnavailable
             from .planner import ENV_KEYS
+            settings_root = setup_settings_root(self.root)
+            lent = settings_root != setup_runtime_root(self.root)
             try:
-                saved_settings = canonical_setup_settings(setup_runtime_root(self.root))
+                saved_settings = canonical_setup_settings(settings_root)
             except ProviderSettingsUnavailable as error:
-                raise ArchitectUnavailable(str(error)) from None
+                if not lent:
+                    raise ArchitectUnavailable(str(error)) from None
+                # A previous generation only lends its settings to a fresh one.
+                LOG.warning("The previous setup team's saved settings could not be read; "
+                            "the new setup team starts with default settings.")
+                saved_settings = None
             if not capability["available"]:
                 raise ArchitectUnavailable(capability["reason"])
             from .guide_runtime import selected_runtime, configure_builder, model_profile_lines, build_with_cleanup
             selected = selected_runtime()
             model_configuration = selected.model_configuration
+            if (lent and saved_settings is not None and model_configuration is not None
+                    and saved_settings["provider"] != model_configuration["provider"]):
+                # The selected model host binds a fresh generation; lent settings never conflict with it.
+                LOG.warning("The previous setup team used another provider than the selected model host; "
+                            "the new setup team starts on the host's provider with default settings.")
+                saved_settings = None
             provider = saved_settings["provider"] if saved_settings is not None else capability["provider"]
             if model_configuration is not None and provider != model_configuration["provider"]:
                 raise ArchitectUnavailable('The saved setup provider differs from this selected model host. Preserve its native state.')

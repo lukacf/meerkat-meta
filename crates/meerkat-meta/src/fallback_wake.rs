@@ -1,14 +1,12 @@
-//! The last-resort wake shared by Meta's event-driven supervisors.
+//! The last-resort wake of Meta's agent-memory member-event observer.
 //!
-//! The agent-memory member-event observer and the continuity repair
-//! supervisor are driven by typed events: a mob machine-state change, a
-//! settled embodiment, a settled restore pass, a caller's demand. A few
-//! transient causes have no typed signal that says they cleared (a roster
-//! provider or store blip, an unreachable heal authority, a member stream
-//! that closes as soon as it opens). For those alone a supervisor arms this
-//! backoff: its deadline is a fallback wake, never the mechanism. It starts
-//! at [`FALLBACK_WAKE_BASE`], doubles per consecutive failure up to
-//! [`FALLBACK_WAKE_MAX`], and resets on the first success.
+//! The observer is driven by typed events (a mob machine-state change). A
+//! few transient causes have no typed signal that says they cleared (a
+//! member that cannot be subscribed yet, a member stream that closes as
+//! soon as it opens). For those alone the observer arms this backoff: its
+//! deadline is a fallback wake, never the mechanism. It starts at
+//! [`FALLBACK_WAKE_BASE`], doubles per consecutive failure up to
+//! [`FALLBACK_WAKE_MAX`], and the observer drops it on the first success.
 
 use std::time::Duration;
 
@@ -40,11 +38,6 @@ impl FallbackWake {
         self.consecutive_failures == 1
     }
 
-    /// The cause cleared: disarm.
-    pub(crate) fn reset(&mut self) {
-        *self = Self::default();
-    }
-
     /// The armed fallback wake, if any.
     pub(crate) fn next_wake(&self) -> Option<tokio::time::Instant> {
         self.next_wake
@@ -69,7 +62,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallback_wake_doubles_to_the_cap_and_resets() {
+    fn fallback_wake_doubles_to_the_cap() {
         let now = tokio::time::Instant::now();
         let mut wake = FallbackWake::default();
         assert!(wake.is_due(now));
@@ -80,8 +73,6 @@ mod tests {
             assert!(!wake.record_failure(now));
         }
         assert_eq!(wake.next_wake(), Some(now + FALLBACK_WAKE_MAX));
-        wake.reset();
-        assert_eq!(wake.next_wake(), None);
-        assert!(wake.is_due(now));
+        assert!(wake.is_due(now + FALLBACK_WAKE_MAX));
     }
 }

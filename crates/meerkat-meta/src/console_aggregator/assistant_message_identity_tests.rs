@@ -1148,6 +1148,7 @@ async fn assistant_identity_backfill_publishes_only_complete_current_images_and_
         },
         primary_mob_id: mob_id.clone(),
         source_mob_id: mob_id,
+        lineage: Vec::new(),
     };
     let target = SessionBackfillTarget {
         assistant_refresh: assistant_history_refresh::AssistantHistoryRefreshReason::Recovery,
@@ -1573,14 +1574,20 @@ async fn assistant_identity_pending_refresh_retries_unchanged_head_through_disco
 /// running is not idle, so its recovery refresh stays unsettled and the
 /// member stays on the retry list. Every 5 s discovery pass used to re-read
 /// the member's whole session document even though nothing durable changed.
-/// An unsettled pass over an unchanged durable write epoch now skips that
-/// read. The pass that observes the member settled still reads, and so does
-/// any pass after a durable write.
+/// An unsettled pass over an unchanged committed boundary authority now
+/// skips that read. The pass that observes the member settled still reads,
+/// and so does any pass after a new boundary commits.
 #[tokio::test]
 async fn unsettled_recovery_refresh_does_not_reread_an_unchanged_document() -> ConsoleLogResult<()>
 {
-    let (_temp, runtime, service) =
-        super::tests::build_stress_runtime_with_write_epochs(1, Duration::ZERO, true).await;
+    let durable: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let (_temp, runtime, service) = super::tests::build_stress_runtime_with_durable_runtime_store(
+        1,
+        Duration::ZERO,
+        Some(durable.clone()),
+    )
+    .await;
     let store = Arc::new(InMemoryConsoleLogStore::new());
     let aggregator = MetaConsoleAggregator::new(store.clone());
     let mut entry = super::tests::runtime_entry_for_test(RUNTIME, &runtime);
@@ -1596,12 +1603,14 @@ async fn unsettled_recovery_refresh_does_not_reread_an_unchanged_document() -> C
         .await
         .ok_or("fixture identity missing")?;
     let session_id = record.session_id.clone().ok_or("fixture session missing")?;
+    super::tests::commit_fixture_session_boundary(durable.as_ref(), &session_id, "committed").await;
     assert!(
         entry
             .runtime
-            .session_document_write_epoch(&session_id)
+            .session_boundary_authority(&session_id)
+            .await
             .is_some(),
-        "precondition: the fixture composes the durable write-epoch witness"
+        "precondition: the session's committed boundary authority is readable"
     );
     aggregator
         .inner
@@ -1649,7 +1658,8 @@ async fn unsettled_recovery_refresh_does_not_reread_an_unchanged_document() -> C
     assert_eq!(
         service.read_calls(),
         reads + 1,
-        "unsettled passes over an unchanged write epoch must not re-read the whole document"
+        "unsettled passes over an unchanged committed boundary must not re-read the whole \
+         document"
     );
     assert!(
         aggregator
@@ -1918,12 +1928,14 @@ async fn status_unknown_refresh_is_redriven_by_the_next_typed_change_not_a_tick(
     Ok(())
 }
 
-/// One seated, idle member under a write-epoch witness, registered directly
-/// (no discovery loop runs, so only the code under test can start a pass).
-struct EpochFixture {
+/// One seated, idle member whose session has a committed boundary authority
+/// in the composition's durable runtime store, registered directly (no
+/// discovery loop runs, so only the code under test can start a pass).
+struct BoundaryFixture {
     _temp: tempfile::TempDir,
     runtime: Arc<UnifiedRuntime>,
     service: super::tests::DelayedHistorySessionService,
+    durable: Arc<dyn meerkat_runtime::RuntimeStore>,
     aggregator: MetaConsoleAggregator,
     entry: RuntimeEntry,
     record: ConsoleIdentityRecord,
@@ -1931,10 +1943,17 @@ struct EpochFixture {
     retry_key: (uuid::Uuid, String, String, String),
 }
 
-impl EpochFixture {
+impl BoundaryFixture {
     async fn seated() -> ConsoleLogResult<Self> {
+        let durable: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
         let (temp, runtime, service) =
-            super::tests::build_stress_runtime_with_write_epochs(0, Duration::ZERO, true).await;
+            super::tests::build_stress_runtime_with_durable_runtime_store(
+                0,
+                Duration::ZERO,
+                Some(durable.clone()),
+            )
+            .await;
         runtime
             .spawn(meerkat_mob::SpawnMemberSpec::from_wire(
                 "worker".to_string(),
@@ -1958,12 +1977,15 @@ impl EpochFixture {
             .await
             .ok_or("fixture identity missing")?;
         let session_id = record.session_id.clone().ok_or("fixture session missing")?;
+        super::tests::commit_fixture_session_boundary(durable.as_ref(), &session_id, "boundary 1")
+            .await;
         assert!(
             entry
                 .runtime
-                .session_document_write_epoch(&session_id)
+                .session_boundary_authority(&session_id)
+                .await
                 .is_some(),
-            "precondition: the fixture composes the durable write-epoch witness"
+            "precondition: the session's committed boundary authority is readable"
         );
         aggregator
             .inner
@@ -1989,6 +2011,7 @@ impl EpochFixture {
             _temp: temp,
             runtime,
             service,
+            durable,
             aggregator,
             entry,
             record,
@@ -2007,6 +2030,16 @@ impl EpochFixture {
         }
     }
 
+    /// Commit the session's next boundary: its committed authority moves.
+    async fn commit_boundary(&self, note: &str) {
+        super::tests::commit_fixture_session_boundary(
+            self.durable.as_ref(),
+            &self.session_id,
+            note,
+        )
+        .await;
+    }
+
     fn take_tasks(
         tasks: &std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     ) -> ConsoleLogResult<Vec<tokio::task::JoinHandle<()>>> {
@@ -2018,43 +2051,28 @@ impl EpochFixture {
     }
 }
 
-/// Downstream app and idle_cpu_gate shape (#570): a recovery refresh lands while
-/// the member is idle between runs of a queued burst, its later inputs and
-/// their commits still landing. The gate reads `Draining`: the pass skips
-/// its whole-document read, keeps the retry, and arms one re-drive. That
-/// re-drive wakes on the session's durable writes, not a discovery tick: a
-/// write that leaves inputs queued re-checks and keeps waiting, and the
-/// write that drains the queue starts the refresh, which reads once.
+/// Downstream app and idle_cpu_gate shape: a recovery refresh lands while the
+/// member is idle between runs of a queued burst, its later inputs and their
+/// commits still landing. The gate reads `Draining`: the pass skips its
+/// whole-document read, keeps the retry, and arms one re-drive. That re-drive
+/// waits for the member's next typed change, not a discovery tick, and the
+/// re-driven refresh reads.
 #[tokio::test]
-async fn draining_refresh_is_redriven_by_the_drain_transition_not_a_tick() -> ConsoleLogResult<()> {
-    let fixture = EpochFixture::seated().await?;
+async fn draining_refresh_skips_its_read_and_is_redriven_by_the_next_typed_change()
+-> ConsoleLogResult<()> {
+    let fixture = BoundaryFixture::seated().await?;
     let inner = fixture.aggregator.inner.clone();
-    // The test decides when the session has drained, and sees every check.
-    let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (checked_tx, mut checked) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let probe: DrainProbe = {
-        let drained = Arc::clone(&drained);
-        Arc::new(move |_entry, _session| {
-            let _ = checked_tx.send(());
-            let state = if drained.load(std::sync::atomic::Ordering::SeqCst) {
-                assistant_history_refresh::DrainState::Drained
-            } else {
-                assistant_history_refresh::DrainState::Draining
-            };
-            Box::pin(std::future::ready(state))
+    let pages = (0..24)
+        .map(|_| {
+            history_page(&fixture.session_id, &[MESSAGE_A]).map(|page| {
+                super::tests::ScriptedHistoryRead {
+                    page: Some(page),
+                    gate: None,
+                }
+            })
         })
-    };
-    *inner
-        .drain_probe_override
-        .lock()
-        .map_err(|_| std::io::Error::other("fixture probe lock"))? = Some(probe);
-    // Exactly one read is scripted: the re-driven pass's.
-    fixture
-        .service
-        .script_history([super::tests::ScriptedHistoryRead {
-            page: Some(history_page(&fixture.session_id, &[MESSAGE_A])?),
-            gate: None,
-        }]);
+        .collect::<ConsoleLogResult<Vec<_>>>()?;
+    fixture.service.script_history(pages);
     let reads = fixture.service.read_calls();
 
     backfill_one_session_history_with_refresh_observer(
@@ -2081,71 +2099,77 @@ async fn draining_refresh_is_redriven_by_the_drain_transition_not_a_tick() -> Co
             .contains(&fixture.retry_key),
         "the draining member stays on the retry list"
     );
-    let mut redrives = EpochFixture::take_tasks(&inner.drain_redrive_tasks)?;
-    assert_eq!(redrives.len(), 1, "exactly one drain re-drive is armed");
-    let redrive = redrives.remove(0);
-    tokio::time::timeout(Duration::from_secs(10), checked.recv())
-        .await
-        .map_err(|_| std::io::Error::other("first drained check"))?;
-    assert!(
-        !redrive.is_finished(),
-        "the re-drive waits while inputs are still queued"
-    );
-
-    // A durable write that leaves the queue non-empty: re-checked, still waiting.
-    fixture
-        .entry
-        .runtime
-        .note_session_write_for_test(&fixture.session_id);
-    tokio::time::timeout(Duration::from_secs(10), checked.recv())
-        .await
-        .map_err(|_| std::io::Error::other("check after a write"))?;
-    assert!(
-        !redrive.is_finished(),
-        "a write that leaves inputs queued keeps the re-drive waiting"
-    );
-    assert_eq!(
-        fixture.service.read_calls(),
-        reads,
-        "no read while the queue drains"
-    );
-
-    // The write that drains the queue starts the refresh.
-    drained.store(true, std::sync::atomic::Ordering::SeqCst);
-    fixture
-        .entry
-        .runtime
-        .note_session_write_for_test(&fixture.session_id);
-    tokio::time::timeout(Duration::from_secs(30), redrive)
-        .await
-        .map_err(|_| std::io::Error::other("the drain re-drive did not run after the drain"))?
-        .map_err(|error| std::io::Error::other(format!("drain re-drive task: {error}")))?;
+    // Each typed change runs the armed re-drive. Its pass reads the real
+    // gate: when the bounded status read does not answer (as it may under
+    // heavy load) the pass re-arms for the next typed change instead of
+    // reading, so the test makes another change until a re-driven pass reads.
+    for seat in 1..=20 {
+        let mut redrives = BoundaryFixture::take_tasks(&inner.status_unknown_redrive_tasks)?;
+        assert_eq!(
+            redrives.len(),
+            1,
+            "exactly one re-drive is armed for the retry key before typed change {seat}"
+        );
+        let redrive = redrives.remove(0);
+        if seat == 1 {
+            assert!(
+                !redrive.is_finished(),
+                "the re-drive waits for a typed change instead of firing at once"
+            );
+            assert_eq!(
+                fixture.service.read_calls(),
+                reads,
+                "no read before the member's next typed change"
+            );
+        }
+        // The next typed change: another member is seated (a roster mutation
+        // publishes machine state).
+        fixture
+            .runtime
+            .spawn(meerkat_mob::SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                format!("agent-{seat}"),
+                None,
+                None,
+                None,
+            ))
+            .await?;
+        tokio::time::timeout(Duration::from_secs(30), redrive)
+            .await
+            .map_err(|_| {
+                std::io::Error::other("the re-drive did not complete within 30 s of the change")
+            })?
+            .map_err(|error| std::io::Error::other(format!("re-drive task: {error}")))?;
+        if fixture.service.read_calls() > reads {
+            break;
+        }
+    }
     assert_eq!(
         fixture.service.read_calls(),
         reads + 1,
-        "the drained refresh reads exactly once"
+        "a typed change re-drove the refresh to exactly one read"
     );
     assert!(
-        inner
-            .drain_redrives
+        !inner
+            .status_unknown_redrives
             .lock()
             .map_err(|_| std::io::Error::other("fixture re-drive lock"))?
-            .is_empty(),
+            .contains(&fixture.retry_key),
         "the fired re-drive disarms"
     );
     fixture.runtime.mob_handle().stop().await?;
     Ok(())
 }
 
-/// A pass whose session write epoch moves during its read verified an image
-/// already behind the durable document (idle_cpu_gate: epoch 46 read, 60 by
-/// the end). It re-drives the session exactly once, at once, instead of
-/// waiting for a discovery tick and watermark expiry. The re-driven pass
-/// ends at the epoch it read and queues nothing, and a later pass over that
-/// unchanged epoch skips its read: no loop.
+/// A pass whose session's committed boundary moves during its read verified
+/// an image already behind the durable document. It re-drives the session
+/// exactly once, at once, instead of waiting for a discovery tick and
+/// watermark expiry. The re-driven pass ends at the boundary it read and
+/// queues nothing, and a later pass over that unchanged boundary skips its
+/// read: no loop.
 #[tokio::test]
-async fn an_epoch_that_moves_mid_read_redrives_exactly_once() -> ConsoleLogResult<()> {
-    let fixture = EpochFixture::seated().await?;
+async fn a_boundary_that_moves_mid_read_redrives_exactly_once() -> ConsoleLogResult<()> {
+    let fixture = BoundaryFixture::seated().await?;
     let inner = fixture.aggregator.inner.clone();
     let gate = super::tests::HistoryReadGate::new();
     fixture.service.script_history([
@@ -2170,36 +2194,33 @@ async fn an_epoch_that_moves_mid_read_redrives_exactly_once() -> ConsoleLogResul
         },
     ));
     gate.wait_until_entered().await;
-    // A durable write lands while the pass reads.
-    fixture
-        .entry
-        .runtime
-        .note_session_write_for_test(&fixture.session_id);
+    // A new boundary commits while the pass reads.
+    fixture.commit_boundary("boundary 2").await;
     gate.release();
     pass.await
         .map_err(|error| std::io::Error::other(format!("pass task: {error}")))??;
     // The re-drive is spawned as the pass ends and may already be reading.
-    let mut redrives = EpochFixture::take_tasks(&inner.epoch_redrive_tasks)?;
+    let mut redrives = BoundaryFixture::take_tasks(&inner.moved_boundary_redrive_tasks)?;
     assert_eq!(
         redrives.len(),
         1,
-        "the moved epoch re-drives the session exactly once"
+        "the moved boundary re-drives the session exactly once"
     );
     tokio::time::timeout(Duration::from_secs(30), redrives.remove(0))
         .await
-        .map_err(|_| std::io::Error::other("the epoch re-drive did not finish"))?
-        .map_err(|error| std::io::Error::other(format!("epoch re-drive task: {error}")))?;
+        .map_err(|_| std::io::Error::other("the moved-boundary re-drive did not finish"))?
+        .map_err(|error| std::io::Error::other(format!("moved-boundary re-drive task: {error}")))?;
     assert_eq!(
         fixture.service.read_calls(),
         reads + 2,
-        "one read by the pass and one by the re-drive at the new epoch"
+        "one read by the pass and one by the re-drive at the new boundary"
     );
     assert!(
-        EpochFixture::take_tasks(&inner.epoch_redrive_tasks)?.is_empty(),
-        "a pass that ends at the epoch it read queues no further re-drive"
+        BoundaryFixture::take_tasks(&inner.moved_boundary_redrive_tasks)?.is_empty(),
+        "a pass that ends at the boundary it read queues no further re-drive"
     );
 
-    // Converged: an ordinary pass over the unchanged epoch reads nothing.
+    // Converged: an ordinary pass over the unchanged boundary reads nothing.
     let mut positive = fixture.target();
     positive.assistant_refresh =
         assistant_history_refresh::AssistantHistoryRefreshReason::PositiveOnly;
@@ -2207,37 +2228,22 @@ async fn an_epoch_that_moves_mid_read_redrives_exactly_once() -> ConsoleLogResul
     assert_eq!(
         fixture.service.read_calls(),
         reads + 2,
-        "an unchanged epoch is not read again"
+        "an unchanged boundary is not read again"
     );
-    assert!(EpochFixture::take_tasks(&inner.epoch_redrive_tasks)?.is_empty());
+    assert!(BoundaryFixture::take_tasks(&inner.moved_boundary_redrive_tasks)?.is_empty());
     fixture.runtime.mob_handle().stop().await?;
     Ok(())
 }
 
-/// Liveness (#570 review): a member can leave the draining state without its
-/// queue ever draining, for example its mob is stopped with inputs still
-/// active. The drain re-drive also wakes on the mob's lifecycle change and
-/// hands the decision back to the refresh gate, which reads what is durable,
-/// so the session's history is still read and no waiter stays armed: the
-/// console converges. A session no runtime holds reads `Stalled`, never an
-/// inconclusive `NoAnswer` to wait out.
+/// Liveness: a member can leave the draining state without its queue ever
+/// draining, for example its mob is stopped with inputs still active. The
+/// re-drive also wakes on the mob's lifecycle change and hands the decision
+/// back to the refresh gate, which reads what is durable, so the session's
+/// history is still read and no waiter stays armed: the console converges.
 #[tokio::test]
-async fn a_member_stopped_with_inputs_still_active_is_refreshed_and_converges()
--> ConsoleLogResult<()> {
-    let fixture = EpochFixture::seated().await?;
+async fn a_member_stopped_while_draining_is_refreshed_and_converges() -> ConsoleLogResult<()> {
+    let fixture = BoundaryFixture::seated().await?;
     let inner = fixture.aggregator.inner.clone();
-    // The queue never drains: every check reports inputs still active.
-    let (checked_tx, mut checked) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let probe: DrainProbe = Arc::new(move |_entry, _session| {
-        let _ = checked_tx.send(());
-        Box::pin(std::future::ready(
-            assistant_history_refresh::DrainState::Draining,
-        ))
-    });
-    *inner
-        .drain_probe_override
-        .lock()
-        .map_err(|_| std::io::Error::other("fixture probe lock"))? = Some(probe);
     fixture
         .service
         .script_history([super::tests::ScriptedHistoryRead {
@@ -2257,15 +2263,12 @@ async fn a_member_stopped_with_inputs_still_active_is_refreshed_and_converges()
         },
     )
     .await?;
-    let mut redrives = EpochFixture::take_tasks(&inner.drain_redrive_tasks)?;
-    assert_eq!(redrives.len(), 1, "exactly one drain re-drive is armed");
+    let mut redrives = BoundaryFixture::take_tasks(&inner.status_unknown_redrive_tasks)?;
+    assert_eq!(redrives.len(), 1, "exactly one re-drive is armed");
     let redrive = redrives.remove(0);
-    tokio::time::timeout(Duration::from_secs(10), checked.recv())
-        .await
-        .map_err(|_| std::io::Error::other("first drained check"))?;
     assert!(
         !redrive.is_finished(),
-        "the re-drive waits while inputs are active"
+        "the re-drive waits for the member's next typed change"
     );
     assert_eq!(
         fixture.service.read_calls(),
@@ -2278,19 +2281,19 @@ async fn a_member_stopped_with_inputs_still_active_is_refreshed_and_converges()
     tokio::time::timeout(Duration::from_secs(30), redrive)
         .await
         .map_err(|_| std::io::Error::other("the re-drive did not fire after the stop"))?
-        .map_err(|error| std::io::Error::other(format!("drain re-drive task: {error}")))?;
+        .map_err(|error| std::io::Error::other(format!("re-drive task: {error}")))?;
     assert_eq!(
         fixture.service.read_calls(),
         reads + 1,
         "the stopped member's durable history is read once"
     );
     assert!(
-        inner
-            .drain_redrives
+        !inner
+            .status_unknown_redrives
             .lock()
             .map_err(|_| std::io::Error::other("fixture re-drive lock"))?
-            .is_empty(),
-        "no drain waiter stays armed"
+            .contains(&fixture.retry_key),
+        "no waiter stays armed for the stopped member"
     );
     tokio::time::timeout(
         Duration::from_secs(30),
@@ -2298,38 +2301,18 @@ async fn a_member_stopped_with_inputs_still_active_is_refreshed_and_converges()
     )
     .await
     .map_err(|_| std::io::Error::other("the console did not converge after the stop"))?;
-
-    // A session no runtime holds is stalled, not an inconclusive read.
-    let unheld = meerkat_core::types::SessionId::new().to_string();
-    assert_eq!(
-        fixture
-            .entry
-            .runtime
-            .session_drain_observation(&unheld, &[])
-            .await,
-        crate::mob_handle_runtime::SessionDrainRead::Stalled
-    );
     Ok(())
 }
 
 /// A refresh that lands while a run is open on the session (`Running`) still
-/// restores positive frames with one read, as before, and also arms the
-/// drain re-drive, so the settled refresh follows the run's end instead of a
-/// discovery tick (idle_cpu_gate caught the tick doing that read inside its
-/// measured window).
+/// restores positive frames with one read, as before, and also arms a
+/// re-drive on the member's next typed change, so the settled refresh follows
+/// the run's end instead of a discovery tick (idle_cpu_gate caught the tick
+/// doing that read inside its measured window).
 #[tokio::test]
-async fn running_refresh_reads_once_and_arms_the_drain_redrive() -> ConsoleLogResult<()> {
-    let fixture = EpochFixture::seated().await?;
+async fn running_refresh_reads_once_and_arms_a_typed_change_redrive() -> ConsoleLogResult<()> {
+    let fixture = BoundaryFixture::seated().await?;
     let inner = fixture.aggregator.inner.clone();
-    let probe: DrainProbe = Arc::new(|_entry, _session| {
-        Box::pin(std::future::ready(
-            assistant_history_refresh::DrainState::Draining,
-        ))
-    });
-    *inner
-        .drain_probe_override
-        .lock()
-        .map_err(|_| std::io::Error::other("fixture probe lock"))? = Some(probe);
     fixture
         .service
         .script_history([super::tests::ScriptedHistoryRead {
@@ -2353,11 +2336,11 @@ async fn running_refresh_reads_once_and_arms_the_drain_redrive() -> ConsoleLogRe
         reads + 1,
         "a running pass still restores positive frames"
     );
-    let redrives = EpochFixture::take_tasks(&inner.drain_redrive_tasks)?;
-    assert_eq!(redrives.len(), 1, "and arms exactly one drain re-drive");
+    let redrives = BoundaryFixture::take_tasks(&inner.status_unknown_redrive_tasks)?;
+    assert_eq!(redrives.len(), 1, "and arms exactly one re-drive");
     assert!(
         !redrives[0].is_finished(),
-        "which waits for the run to drain"
+        "which waits for the member's next typed change"
     );
     fixture.runtime.mob_handle().stop().await?;
     Ok(())
