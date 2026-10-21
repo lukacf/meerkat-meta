@@ -810,6 +810,12 @@ def generate_runtime_refresh(value, accepted_files, *, runtime_target=None, veri
         for name in (_RUNTIME_DESIGN_PATHS | set(protected)
                      | {name for name in accepted if name.startswith("knowledge/")}):
             generated[name] = accepted[name]
+        # The accepted Console design stays as accepted. Only this compiler's
+        # own unmodified default gains the Connect route's setup panel.
+        if (connect_route(spec, runtime_target)
+                and accepted["config/console.toml"].as_bytes() == _console(spec).encode("utf-8")):
+            generated["config/console.toml"] = PackageFile("config/console.toml",
+                _console(spec, runtime_target=runtime_target))
         from .runtime_selection import selected_runtime_marker, selected_runtime_version
         old["mobkitVersion"] = selected_runtime_version(runtime_target)
         old["runtimeCandidate"] = selected_runtime_marker(runtime_target)

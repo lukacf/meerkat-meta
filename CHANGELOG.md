@@ -1381,7 +1381,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   setup decisions such as software reviews wait on that page, and the Console
   offered no way to reach it, so a review could time out unseen. Applications
   without the Connect route get no button. Packages compiled by this Forge
-  include it; a runtime refresh keeps the accepted Console configuration.
+  include it. A runtime refresh adds it only when the accepted Console
+  configuration is the compiler's unmodified default, and otherwise keeps the
+  accepted file as it is.
 - Meta Forge's Linux isolation works on Python builds whose `fcntl` module
   lacks the memfd seal names, such as the standalone CPython builds uv
   installs. Forge sealed its seccomp filter and accepted remote input with
