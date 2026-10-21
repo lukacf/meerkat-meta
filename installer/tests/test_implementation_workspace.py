@@ -82,6 +82,55 @@ def test_linux_missing_seccomp_refuses_before_launch(tmp_path, monkeypatch):
             implementation._check_environment(scratch))
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux kernel sealing contract")
+def test_linux_seccomp_seals_work_without_python_constant_exports(monkeypatch):
+    import errno
+    import fcntl
+    from launchkit import linux_sandbox
+    for name in ("F_ADD_SEALS", "F_GET_SEALS", "F_SEAL_SEAL", "F_SEAL_SHRINK",
+                 "F_SEAL_GROW", "F_SEAL_WRITE"):
+        monkeypatch.delattr(fcntl, name, raising=False)
+    descriptor = linux_sandbox._filter()
+    try:
+        assert fcntl.fcntl(descriptor, 1034) & 0x000f == 0x000f
+        size = os.fstat(descriptor).st_size
+        assert size > 0 and os.read(descriptor, size)
+        for mutate in (lambda: os.write(descriptor, b"changed"),
+                       lambda: os.ftruncate(descriptor, 0),
+                       lambda: os.ftruncate(descriptor, size + 1)):
+            with pytest.raises(OSError) as caught:
+                mutate()
+            assert caught.value.errno == errno.EPERM
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux kernel sealing contract")
+@pytest.mark.parametrize("failure", ["add_refused", "readback_missing"])
+def test_linux_seccomp_seal_failure_closes_the_filter(monkeypatch, failure):
+    import errno
+    import fcntl
+    from launchkit import linux_sandbox
+    original = fcntl.fcntl
+    add_seals = getattr(fcntl, "F_ADD_SEALS", 1033)
+    get_seals = getattr(fcntl, "F_GET_SEALS", 1034)
+    descriptors = []
+    def observe(descriptor, command, *arguments):
+        if command == add_seals:
+            descriptors.append(descriptor)
+            if failure == "add_refused":
+                raise OSError(errno.EPERM, "Kernel refused the required seals")
+        result = original(descriptor, command, *arguments)
+        return 0 if command == get_seals and failure == "readback_missing" else result
+    monkeypatch.setattr(fcntl, "fcntl", observe)
+    with pytest.raises(linux_sandbox.LinuxSandboxError):
+        linux_sandbox._filter()
+    assert len(descriptors) == 1
+    with pytest.raises(OSError) as caught:
+        os.fstat(descriptors[0])
+    assert caught.value.errno == errno.EBADF
+
+
 def test_authored_dom_suite_is_executable_signed_source_bound_and_whole_suite(workspace):
     require_sandbox()
     workspace.write_file("assets/page.html", '<button id="increment">Add</button><output id="count">0</output><script>document.querySelector("button").onclick=()=>document.querySelector("output").textContent="1";</script>')

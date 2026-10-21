@@ -1340,6 +1340,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Meta Forge accepts a `meerkat-toolkit` 0.9.4 wheel, whose native host
   requires `meerkat-meta==0.9.4`, instead of refusing every Toolkit wheel but
   0.9.0; the exact version, METADATA, RECORD and payload checks are unchanged.
+- Meta Forge's Linux isolation works on Python builds whose `fcntl` module
+  lacks the memfd seal names, such as the standalone CPython builds uv
+  installs. Forge sealed its seccomp filter and accepted remote input with
+  `fcntl.F_ADD_SEALS`, so on those builds the isolation probe found no
+  sandbox and checker setup refused with unsupported isolation. On Linux it
+  now falls back to the kernel's values when `fcntl` has none, and it reads
+  the seals back and refuses a descriptor whose seals did not hold.
 - Meta Forge's local knowledge service starts and becomes ready for semantic
   ingestion. `knowledge/manage.py up` used to stop before the service started:
   the pinned source commit could not be fetched, and every available revision

@@ -1748,6 +1748,34 @@ def _command(arguments, root, owner, operation_id, phase, timeout=1200, *, pass_
         raise failure from None
 
 
+# Linux memfd seal values (include/uapi/linux/fcntl.h: F_LINUX_SPECIFIC_BASE
+# 1024 + 9 and + 10, and the seal bits), for Python builds whose fcntl module
+# lacks the names although the kernel supports them, such as the standalone
+# CPython builds uv installs. They apply on Linux only and only where fcntl
+# has no value of its own.
+_LINUX_MEMFD_SEALS = {'F_ADD_SEALS': 1033, 'F_GET_SEALS': 1034, 'F_SEAL_SEAL': 0x0001,
+                      'F_SEAL_SHRINK': 0x0002, 'F_SEAL_GROW': 0x0004, 'F_SEAL_WRITE': 0x0008}
+
+
+def _memfd_seal_constant(name):
+    value = getattr(fcntl, name, None)
+    if value is None and sys.platform.startswith('linux'):
+        value = _LINUX_MEMFD_SEALS[name]
+    if value is None:
+        raise AttributeError(name)
+    return value
+
+
+def _seal_memfd(descriptor):
+    """Seal a memfd against writes, size changes and further seals, and read
+    the seals back: a descriptor the kernel did not seal is refused."""
+    seals = (_memfd_seal_constant('F_SEAL_WRITE') | _memfd_seal_constant('F_SEAL_GROW')
+             | _memfd_seal_constant('F_SEAL_SHRINK') | _memfd_seal_constant('F_SEAL_SEAL'))
+    fcntl.fcntl(descriptor, _memfd_seal_constant('F_ADD_SEALS'), seals)
+    if fcntl.fcntl(descriptor, _memfd_seal_constant('F_GET_SEALS')) & seals != seals:
+        raise OSError('The memfd seals did not hold.')
+
+
 @contextlib.contextmanager
 def _input_descriptor(content, root):
     """Sealed Linux input, or an unlinked private descriptor for offline tests."""
@@ -1758,8 +1786,7 @@ def _input_descriptor(content, root):
             while pending:
                 pending = pending[os.write(descriptor, pending):]
             os.lseek(descriptor, 0, os.SEEK_SET)
-            fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS,
-                        fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+            _seal_memfd(descriptor)
             yield descriptor
         finally:
             os.close(descriptor)
