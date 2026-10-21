@@ -48,8 +48,8 @@ async function mountedPorts(initialReceipt, verify) {
     HTMLElement: dom.window.HTMLElement, sessionStorage: dom.window.sessionStorage, localStorage: dom.window.localStorage,
     IS_REACT_ACT_ENVIRONMENT: true,
     setTimeout(callback, delay, ...args) {
-      if (delay === 30000) {
-        const token = { syntheticDeadline: true };
+      if (delay === 30000 || delay === 120000) {
+        const token = { syntheticDeadline: true, delay };
         deadlines.set(token, () => callback(...args));
         return token;
       }
@@ -144,6 +144,7 @@ async function mountedPorts(initialReceipt, verify) {
       async expireCheck() {
         assert.equal(deadlines.size, 1, "Only the entered port read should be pending.");
         const [token, callback] = deadlines.entries().next().value;
+        assert.equal(token.delay, 120000, "Native setup checks use their explicit bounded deadline.");
         deadlines.delete(token);
         await act(async () => callback());
       },
@@ -286,16 +287,20 @@ test("source changes invalidate a delayed check and do not reopen an old setup d
   });
 });
 
-test("closing and reopening the same source cannot publish an abandoned port check", async () => {
-  await mountedPorts(null, async ({ document, button, enter, delayCheck, finishCheck }) => {
+test("reopening setup waits for its pending port read without publishing the abandoned observation", async () => {
+  await mountedPorts(null, async ({ document, calls, button, privateForm, enter, delayCheck, finishCheck }) => {
     await act(async () => button("Install on this computer").click());
     await enter("MOBKIT_PORT", "59123");
     delayCheck();
     await act(async () => button("Check this port").click());
     await act(async () => button("Cancel").click());
+    const before = calls.length;
     await act(async () => button("Install on this computer").click());
-    await enter("MOBKIT_PORT", "59123");
+    assert.equal(calls.length, before, "Reopening cannot overlap a native package check for the same build.");
+    assert.equal(privateForm(), null);
+    assert.match(document.body.textContent, /Checking your deployment destination/);
     await finishCheck();
+    await enter("MOBKIT_PORT", "59123");
     assert.doesNotMatch(document.body.textContent, /available when checked/);
     assert.ok(button("Check this port"));
   });
