@@ -55,6 +55,8 @@ execution; keep that failure visible instead of using an unsandboxed fallback.
 On Ubuntu, the workflow also loads the distribution's `bwrap-userns-restrict`
 AppArmor profile so bubblewrap can prepare its namespaces while its children
 remain restricted. See Ubuntu's [user-namespace release notes](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions).
+A local Ubuntu host needs the same profile; the steps are in the
+[standalone bundle prerequisites](README.md#standalone-bundle).
 
 Build the frontend with the commands above before running the complete backend
 suite. This includes `npm --prefix console ci --ignore-scripts`, which supplies

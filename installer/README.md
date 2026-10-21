@@ -213,6 +213,34 @@ source and tests, and private writable scratch. If these controls or runtime
 libraries are unavailable, the wizard keeps building unavailable. It never
 runs generated checks without isolation.
 
+On Ubuntu 24.04 and later, install Python's environment support, `unzip`, the
+isolation packages and the runtime libraries, then load the distribution's
+`bwrap-userns-restrict` AppArmor profile from `apparmor-profiles`; installing the
+package alone does not load it. These releases restrict unprivileged user
+namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`), so bubblewrap
+cannot create its namespaces until a profile allows it. The profile applies only
+to `/usr/bin/bwrap`: bubblewrap may create its namespaces, and the processes it
+starts run without capabilities. The host-wide restriction
+stays on. If `/etc/apparmor.d` already has a profile for `/usr/bin/bwrap`, such
+as a file named `bwrap`, run `sudo apparmor_parser -r` on that file instead of
+the last two commands: two profiles with the same name replace each other when
+they load.
+
+```bash
+sudo apt-get install --no-install-recommends -y python3-venv unzip bubblewrap \
+  libseccomp2 libatomic1 libstdc++6 apparmor apparmor-profiles
+sudo cp /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+```
+
+A profile in `/etc/apparmor.d` is loaded again at every boot. To check the
+isolation before you open the wizard, run:
+
+```bash
+bwrap --unshare-user --unshare-pid --unshare-net --ro-bind /usr /usr \
+  --ro-bind /lib /lib --ro-bind-try /lib64 /lib64 -- /usr/bin/true
+```
+
 Container hosts also need a real PID 1 reaper, such as Docker's `--init`, and
 an outer policy that permits bubblewrap to create its private namespaces and
 `/proc`. The wizard does not weaken the container's policy automatically.
