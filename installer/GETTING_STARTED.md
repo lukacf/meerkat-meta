@@ -67,12 +67,11 @@ Node.js or a Python SDK alone does not turn that checkout into a launchable ZIP.
 See [startup prerequisites](README.md#open-the-wizard) if preparation fails.
 
 To install applications, run Forge on CPython 3.11: the Toolkit packages in this
-release are built for it. Debian 12's `python3` is 3.11. On Ubuntu 24.04, whose
-`python3` is 3.12, run `uv python install 3.11` (or install `python3.11` and
-`python3.11-venv` from the deadsnakes PPA). If Forge already ran in this folder,
-stop it and move only `.venv` aside, as
-[the README](README.md#open-the-wizard) shows; saved setups are kept. Then
-start Forge with `PYTHON_BIN` set to that interpreter, for example
+release are built for it. On Ubuntu 24.04, whose `python3` is 3.12, run
+`uv python install 3.11` (or install `python3.11` and `python3.11-venv` from the
+deadsnakes PPA). If Forge already ran in this folder, stop it and move only
+`.venv` aside, as [the README](README.md#open-the-wizard) shows; saved setups are
+kept. Then start Forge with `PYTHON_BIN` set to that interpreter, for example
 `PYTHON_BIN="$(uv python find 3.11)" bash start.sh`.
 
 If you see **Forge dependency preparation did not finish**, correct the error

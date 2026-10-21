@@ -50,12 +50,11 @@ does not require Node.js, npm or a source checkout. You need Python 3.11+ with
 
 Applications install into Forge's own Python, and the Toolkit packages in this
 release are built for CPython 3.11. On another CPython, Forge refuses the install
-before installing anything and names the version it needs. Debian 12's `python3`
-is 3.11. On Ubuntu 24.04, whose `python3` is 3.12, install CPython 3.11 with
-`uv python install 3.11` (or `python3.11` and `python3.11-venv` from the
-deadsnakes PPA). If Forge already ran in this folder, stop it and move only its
-`.venv` aside; saved setups are kept. Then start Forge with `PYTHON_BIN` set to
-that interpreter:
+before installing anything and names the version it needs. On Ubuntu 24.04, whose
+`python3` is 3.12, install CPython 3.11 with `uv python install 3.11` (or
+`python3.11` and `python3.11-venv` from the deadsnakes PPA). If Forge already ran
+in this folder, stop it and move only its `.venv` aside; saved setups are kept.
+Then start Forge with `PYTHON_BIN` set to that interpreter:
 
 ```bash
 test ! -e .venv.previous && test ! -L .venv.previous && mv .venv .venv.previous
