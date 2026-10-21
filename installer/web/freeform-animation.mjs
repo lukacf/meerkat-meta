@@ -89,7 +89,7 @@ export class FreeformAnimation {
     this.frame.sandbox='allow-scripts';
     this.frame.className='ps-authored-frame';
     let busy=false,last=performance.now(),lastRaf=last,watchdog,raf,booted=false,firstFrame=false,drawId=0,stopTimer,removed=false,drawDiagnostics=null;
-    let invalidated=true,renderedInputs=null,runtimeActivity=null,pendingCapture=null;
+    let invalidated=true,renderedInputs=null,runtimeActivity=null,pendingCapture=null,surfaceVisible=true;
     const invalidate=()=>{invalidated=true;};
     Object.defineProperty(this,'runtimeActivity',{enumerable:true,configurable:true,get:()=>runtimeActivity,set:value=>{runtimeActivity=value;invalidate();}});
     const resizeObserver=typeof ResizeObserver==='function' ? new ResizeObserver(invalidate):null;
@@ -115,7 +115,7 @@ export class FreeformAnimation {
     const clearWatchdog=()=>{if(watchdog)clearTimeout(watchdog.timer);watchdog=null;};
     const resumeWatchdog=()=>{
       const current=watchdog;
-      if(!this.alive || !current || current.timer!==null || document.hidden)return;
+      if(!this.alive || !current || current.timer!==null || document.hidden || !surfaceVisible)return;
       current.started=performance.now();
       current.observed=0;
       const timer=setTimeout(()=>{
@@ -123,7 +123,7 @@ export class FreeformAnimation {
         current.timer=null;
         // A queued timer can run before the visibility event. Hidden browser
         // scheduling is not evidence that the program exceeded visible time.
-        if(document.hidden){
+        if(document.hidden || !surfaceVisible){
           current.remaining=Math.max(0,current.remaining-current.observed);
           current.started=null;current.observed=0;return;
         }
@@ -164,7 +164,7 @@ export class FreeformAnimation {
     const render=()=>{
       if(this.alive && this.ready && !busy){
         const capture=pendingCapture && !pendingCapture.draw ? pendingCapture:null;
-        if(document.hidden && !capture)return;
+        if((document.hidden || !surfaceVisible) && !capture)return;
         // Public controls can change while a draw is in flight. Compare only
         // the inputs actually sent, then preserve any later invalidation.
         const rect=this.frame.getBoundingClientRect?.();
@@ -208,15 +208,15 @@ export class FreeformAnimation {
       lastRaf=performance.now();
       // Retain observed visible progress even if a queued timer precedes the
       // hidden transition event. Unobserved background time stays uncharged.
-      if(!document.hidden && watchdog && watchdog.started!==null)
+      if(!document.hidden && surfaceVisible && watchdog && watchdog.started!==null)
         watchdog.observed=Math.max(watchdog.observed,now-watchdog.started);
       const dt=Math.min((now-last)/1000,.1);last=now;
-      if(this.ready && !this.paused && !document.hidden)this.time=(this.time+dt)%this.duration;
+      if(this.ready && !this.paused && !document.hidden && surfaceVisible)this.time=(this.time+dt)%this.duration;
       render();
       raf=requestAnimationFrame(draw);
     };
     const visibilityChanged=()=>{
-      if(document.hidden){pauseWatchdog();return;}
+      if(document.hidden || !surfaceVisible){pauseWatchdog();return;}
       last=performance.now();resumeWatchdog();render();
     };
     this.receive=event=>{
@@ -268,10 +268,20 @@ export class FreeformAnimation {
     };
     window.addEventListener('message',this.receive);
     document.addEventListener('visibilitychange',visibilityChanged);
+    // Browsers can defer an offscreen child frame while the parent remains
+    // visible. Its missing paint ACK is not an authored-program timeout.
+    const surfaceObserver=typeof IntersectionObserver==='function' ? new IntersectionObserver(entries=>{
+      const entry=entries.find(item=>item.target===this.frame);
+      if(!entry)return;
+      const visible=entry.isIntersecting===true;
+      if(visible===surfaceVisible)return;
+      surfaceVisible=visible;visibilityChanged();
+    }):null;
+    surfaceObserver?.observe(this.frame);
     this.destroy=()=>{
       if(!this.alive)return;
       this.alive=false;settleCapture(captureError('destroyed'));clearWatchdog();cancelAnimationFrame(raf);
-      resizeObserver?.disconnect();window.removeEventListener('resize',invalidate);
+      resizeObserver?.disconnect();surfaceObserver?.disconnect();window.removeEventListener('resize',invalidate);
       document.removeEventListener('visibilitychange',visibilityChanged);
       this.frame.style.visibility='hidden';
       send({stop:true});stopTimer=setTimeout(remove,250);
