@@ -728,6 +728,10 @@ original reports and findings; a different write rejected as an immutable confli
 is not a saved correction. Make repeated corrections idempotent, enforce ownership,
 and let consumers read the authoritative current interpretation together with its
 inspectable history. Peer prose may report a correction but does not persist it.
+Findings and recommendations must be able to record, as an authoritative current
+outcome, that no option is feasible or that the decision is underdetermined. A
+correction or withdrawal must supersede the earlier recommendation without inventing
+a replacement choice or leaving the current outcome only in notes.
 Present concise current conclusions, relevant uncertainty and the person's next action.
 Keep provenance detail, tool conflicts and agent repair chatter in labelled audit
 history; explain a correction briefly in the main result when it changes a decision.
