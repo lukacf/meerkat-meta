@@ -386,3 +386,90 @@ async def test_installed_recovery_checks_domain_source_against_complete_accepted
         source.recover_ordinary_application_source(owner, saved["id"], result["build_id"], installed=(receipt, changed))
     assert (directory / "package.zip").read_bytes() == payload
     assert not owner._builds and not owner._installations and not service.tasks
+
+
+async def staged_improvement(f, saved, result, directory):
+    """Stage an accepted continuation through the ordinary deployment service."""
+    second = await build(f, saved, "Improve the requested local job.", previous=result)
+    await accept_source_fixture(f, second)
+    staged = await f.service.stage_update(saved["id"], directory.name, saved["version"], second["build_id"])
+    assert staged["update"]["status"] in {"staged", "blocked"}
+    assert staged["build_id"] == result["build_id"]
+    return staged
+
+
+async def test_staged_update_keeps_the_stopped_original_startable(ordinary_registry, monkeypatch):
+    f = ordinary_registry
+    saved = ordinary_guide(f)
+    result = await build(f, saved)
+    await accept_source_fixture(f, result)
+    directory, _ = await install_fixture(f, saved, result, monkeypatch)
+    # The first lookup retains this Forge process's installed owner.
+    original = f.registry._selected_startup(saved["id"], directory.name)
+    staged = await staged_improvement(f, saved, result, directory)
+    from launchkit.deployment_updates import update_directory
+    record = update_directory(directory, staged["update"]["update_id"]) / "update.json"
+    recorded = record.read_bytes()
+    # Stop runs the original setup continuation after stopping; it completes.
+    await f.service.action(saved["id"], directory.name, "stop")
+    before = len(f.service.launched)
+    await f.service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
+    assert len(f.service.launched) == before + 1 and f.service.launched[-1][1] == "start"
+    from launchkit.deployment_application_bootstrap import read_bootstrap_admission
+    selected = read_bootstrap_admission(directory, f.service.launched[-1][2]["bootstrap_selection"])
+    assert selected["application_startup"] == original
+    assert f.registry._selected_startup(saved["id"], directory.name) == original
+    # Starting neither consumes nor rewrites the staged update.
+    current = deployment.read_receipt(directory)["update"]
+    assert (current["update_id"], current["status"]) == (staged["update"]["update_id"], staged["update"]["status"])
+    assert record.read_bytes() == recorded
+    # The unapplied update still cannot redirect this original installation.
+    with pytest.raises(CustodyError, match="cannot be redirected to another build or source owner"):
+        f.registry._selected_replacement(saved["id"], directory.name, staged["update"]["update_id"])
+
+
+async def test_forge_reload_with_a_staged_update_recovers_the_original_start(ordinary_registry, monkeypatch):
+    f = ordinary_registry
+    saved = ordinary_guide(f)
+    result = await build(f, saved)
+    await accept_source_fixture(f, result)
+    directory, _ = await install_fixture(f, saved, result, monkeypatch)
+    original = f.registry._selected_startup(saved["id"], directory.name)
+    await staged_improvement(f, saved, result, directory)
+    store, implementation, service, owner = reloaded_registry(f)
+    launched = []
+    monkeypatch.setattr(service, "_launch", lambda *args, **kwargs: launched.append((args, kwargs)))
+    await service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
+    assert owner._selected_startup(saved["id"], directory.name) == original
+    assert len(launched) == 1 and launched[0][0][1] == "start"
+
+
+async def test_only_a_pending_staged_update_keeps_the_original_owner(ordinary_registry, monkeypatch):
+    f = ordinary_registry
+    saved = ordinary_guide(f)
+    result = await build(f, saved)
+    await accept_source_fixture(f, result)
+    directory, _ = await install_fixture(f, saved, result, monkeypatch)
+    f.registry._selected_startup(saved["id"], directory.name)
+    staged = await staged_improvement(f, saved, result, directory)
+    from launchkit.deployment_updates import update_receipt
+    # A test-only status edit: any other update state keeps the strict owner check.
+    update_receipt(directory, update={**staged["update"], "status": "snapshotting"})
+    with pytest.raises(CustodyError, match="cannot be redirected to another build or source owner"):
+        f.registry._selected_startup(saved["id"], directory.name)
+
+
+async def test_apply_after_reload_refuses_a_helperless_staged_update_cleanly(ordinary_registry, monkeypatch):
+    f = ordinary_registry
+    saved = ordinary_guide(f)
+    result = await build(f, saved)
+    await accept_source_fixture(f, result)
+    directory, _ = await install_fixture(f, saved, result, monkeypatch)
+    staged = await staged_improvement(f, saved, result, directory)
+    store, implementation, service, owner = reloaded_registry(f)
+    monkeypatch.setattr(service, "_launch", lambda *args, **kwargs: None)
+    # After a Forge restart, Start retains the staged binding as the original.
+    await service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
+    with pytest.raises(CustodyError, match="cannot be redirected to another build or source owner"):
+        owner._selected_replacement(saved["id"], directory.name, staged["update"]["update_id"])
+    assert deployment.read_receipt(directory)["update"]["update_id"] == staged["update"]["update_id"]

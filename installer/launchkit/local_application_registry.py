@@ -18,7 +18,7 @@ import uuid
 
 from .connect_installer_caller import CustodyError, MAX_INPUT_BYTES, _json, _private_directory, _read
 from .deployment import DeploymentService, read_receipt
-from .deployment_application_bootstrap import bootstrap_installation_binding
+from .deployment_application_bootstrap import bootstrap_installation_binding, same_installation_apart_from_staged_update
 from .deployment_sources import read_package_source
 from .deployment_updates import checked_package, _candidate_source_selection, _same_toml
 from .forge_application_host import ForgeApplicationHost, application_setup_binding
@@ -293,7 +293,7 @@ class LocalApplicationRegistry:
             chosen.host.require_current()
             return chosen.host
 
-    def _receipt_host(self, guide_id, deployment_id):
+    def _receipt_host(self, guide_id, deployment_id, *, staged_update_allowed=True):
         self._require_registry()
         guide_id, deployment_id = _identity(guide_id), _identity(deployment_id)
         directory = self.deployment._directory(guide_id, deployment_id)
@@ -332,8 +332,12 @@ class LocalApplicationRegistry:
                 or any(files.get(name, (None, None))[0] != pin.read() for name, pin in host._protected)):
             raise CustodyError("The canonical package differs from this original protected application owner.")
         binding = _installation_binding(receipt, source)
-        if retained is not None and (retained[0] is not host or retained[1] != binding):
-            raise CustodyError("The original installation cannot be redirected to another build or source owner.")
+        if retained is not None:
+            # Only Apply compares the staged update pointer itself.
+            same = (same_installation_apart_from_staged_update(retained[1], binding, receipt)
+                if staged_update_allowed else retained[1] == binding)
+            if retained[0] is not host or not same:
+                raise CustodyError("The original installation cannot be redirected to another build or source owner.")
         current = read_receipt(directory)
         if (self.deployment._directory(guide_id) != directory
                 or _installation_binding(current, source) != binding):
@@ -341,10 +345,11 @@ class LocalApplicationRegistry:
         self._require_registry()
         return host, binding
 
-    def selected_host(self, guide_id, deployment_id):
+    def selected_host(self, guide_id, deployment_id, *, staged_update_allowed=True):
         """Read the exact original installation owner without native effects."""
         with self._lock:
-            host, binding = self._receipt_host(guide_id, deployment_id)
+            host, binding = self._receipt_host(guide_id, deployment_id,
+                staged_update_allowed=staged_update_allowed)
             if host is not None:
                 key = (guide_id, deployment_id)
                 if key not in self._installations:
@@ -551,11 +556,14 @@ class LocalApplicationRegistry:
             return True
 
     def _selected_replacement(self, guide_id, deployment_id, update_id):
-        host = self.selected_host(guide_id, deployment_id)
+        host = self.selected_host(guide_id, deployment_id, staged_update_allowed=False)
         if host is None:
             raise CustodyError("This installation has no trusted replacement source owner.")
+        if not callable(getattr(host, "_selected_replacement", None)):
+            # A helperless application has no installed replacement owner.
+            raise CustodyError("The original installation cannot be redirected to another build or source owner.")
         result = host._selected_replacement(guide_id, deployment_id, update_id)
-        if self.selected_host(guide_id, deployment_id) is not host:
+        if self.selected_host(guide_id, deployment_id, staged_update_allowed=False) is not host:
             raise CustodyError("The original installed replacement owner changed.")
         return result
 

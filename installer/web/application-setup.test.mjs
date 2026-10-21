@@ -313,6 +313,19 @@ test("ordinary, live, remote, unproven and unsettled receipts cannot enter the s
   }
 });
 
+test("a staged or blocked update keeps the stopped original's Start; other update states do not", () => {
+  const state = guide();
+  for (const status of ["staged", "blocked"]) {
+    const receipt = receiptFor(state, { update: { update_id: "synthetic-staged-update", status } });
+    assert.equal(deploymentApplicationStartupPending(receipt, state), true, status);
+  }
+  for (const status of ["snapshotting", "applying", "verifying", "restoring", "recovering-candidate",
+    "recovering-current", "recovery-needed", "completed", "rolled-back", undefined]) {
+    const receipt = receiptFor(state, { update: { update_id: "synthetic-staged-update", status } });
+    assert.equal(deploymentApplicationStartupPending(receipt, state), false, String(status));
+  }
+});
+
 for (const [kind, title, label] of [["fresh", "Set up Synthetic Reading", "Set up and start application"],
   ["restore", "Start Synthetic Reading", "Start installed application"]]) {
   test(`a genuine bound ${kind} readback uses its own label and only the explicit finish-setup callback`, async () => {

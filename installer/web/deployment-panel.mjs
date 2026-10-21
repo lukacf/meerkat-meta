@@ -331,6 +331,12 @@ function restoredBackgroundRestartAvailable(receipt, guide) {
     (!receipt.service_supervisor_pid || receipt.service_cleanup_confirmed === true);
 }
 
+// A staged or blocked update has changed nothing installed, so the stopped
+// original still offers Start. Every other update state keeps it hidden.
+function updateLeavesOriginalStartable(update) {
+  return !update || ["staged", "blocked"].includes(update.status);
+}
+
 export function deploymentApplicationStartupPending(receipt, guide) {
   const completed = installedRuntimeMatches(receipt);
   return typeof guide?.id === "string" && !!guide.id && receipt?.guide_id === guide.id &&
@@ -341,7 +347,7 @@ export function deploymentApplicationStartupPending(receipt, guide) {
     (receipt.execution_mode || "interactive") === "interactive" && !receipt.service &&
     receipt.status === "stopped" && receipt.process_live === false &&
     receipt.runtime_pid == null && receipt.interactive_cleanup?.boundary !== "worker-not-admitted" &&
-    completed && !deploymentNeedsCleanup(receipt) && !receipt.update;
+    completed && !deploymentNeedsCleanup(receipt) && updateLeavesOriginalStartable(receipt.update);
 }
 
 export function deploymentAwaitingApplicationSetup(receipt, guide) {

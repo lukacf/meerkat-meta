@@ -19,7 +19,8 @@ from .connect_application_finalizer import _write_bytes, _sync_directory
 from .connect_application_startup import _ModelConfiguration
 from .connect_application_update_startup import _file_identity
 from .connect_installer_caller import CustodyError, ExactFile, _path, _private_directory, _private_parent
-from .deployment_application_bootstrap import bootstrap_installation_binding, require_bootstrap_history_settled
+from .deployment_application_bootstrap import (bootstrap_installation_binding, require_bootstrap_history_settled,
+    same_installation_apart_from_staged_update)
 from .deployment_updates import checked_package
 from .forge_application_host import application_setup_binding
 from .projects import DraftConflict, fingerprint
@@ -159,7 +160,8 @@ class OrdinaryApplicationHost:
             inputs["model_configuration"] = self._model.selection()
         binding = bootstrap_installation_binding(receipt)
         previous = self._startups.get(deployment_id)
-        if previous is not None and previous != (binding, inputs):
+        if previous is not None and (previous[1] != inputs
+                or not same_installation_apart_from_staged_update(previous[0], binding, receipt)):
             raise CustodyError("The original ordinary installation inputs cannot be rebound.")
         current()
         self.require_current()

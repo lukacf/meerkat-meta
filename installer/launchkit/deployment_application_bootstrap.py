@@ -69,6 +69,20 @@ def bootstrap_installation_binding(receipt):
     return deepcopy(result)
 
 
+def same_installation_apart_from_staged_update(retained, current, receipt):
+    """A staged or blocked update has changed nothing installed.
+
+    Its pointer alone does not redirect the original build, package, source or
+    runtime, so the stopped original can still start. Applying the update
+    compares the whole binding, update included.
+    """
+    if retained == current:
+        return True
+    if (receipt.get("update") or {}).get("status") not in {"staged", "blocked"}:
+        return False
+    return {**retained, "update": None} == {**current, "update": None}
+
+
 def bootstrap_lifecycle_binding(receipt):
     """Freeze this worker's existing lifecycle without source normalization."""
     keys = LIFECYCLE_KEYS | ({"service_supervisor_pid", "service_instance_id",
