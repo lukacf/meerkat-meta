@@ -1463,6 +1463,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   now offers Retry installation for that state. Forge rechecks the saved
   package's source and cleanup before continuing, and starting the
   application remains a separate step.
+- Meta Forge refuses an application installation on this computer early when
+  it runs on a different CPython than the selected Toolkit packages were built
+  for (CPython 3.11 in this release). The refusal names the CPython needed and
+  how to restart Forge on it while keeping saved setups, instead of failing
+  midway in pip. The README, the getting started guide and the generated
+  package README say which CPython to use.
 - `/console/experience` reports `health_overview.live_snapshot.running` as
   the mob's owner answers when the experience is read, as `meta/status`
   does. It came from the console's cached roster walk, and was `true` when
@@ -1739,6 +1745,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Meta Toolkit Connect route that was installed before 0.9.4 keeps its Console
   without the "Connect setup" button; its setup page stays at
   /host/toolkit/setup on its Console address.
+- Meta Forge application installs need CPython 3.11 in this release, the
+  version the Toolkit packages are built for. On Ubuntu 24.04, install
+  CPython 3.11 (for example with `uv python install 3.11`), stop Forge, move
+  only its `.venv` folder aside, and start it again with `PYTHON_BIN`
+  pointing to CPython 3.11; saved setups are kept.
 
 ## [0.9.3] - 2026-10-18
 
