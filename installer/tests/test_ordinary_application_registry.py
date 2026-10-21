@@ -407,6 +407,11 @@ async def test_staged_update_keeps_the_stopped_original_startable(ordinary_regis
     # The first lookup retains this Forge process's installed owner.
     original = f.registry._selected_startup(saved["id"], directory.name)
     staged = await staged_improvement(f, saved, result, directory)
+    from launchkit.deployment_updates import update_directory
+    record = update_directory(directory, staged["update"]["update_id"]) / "update.json"
+    recorded = record.read_bytes()
+    # Stop runs the original setup continuation after stopping; it completes.
+    await f.service.action(saved["id"], directory.name, "stop")
     before = len(f.service.launched)
     await f.service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
     assert len(f.service.launched) == before + 1 and f.service.launched[-1][1] == "start"
@@ -414,7 +419,10 @@ async def test_staged_update_keeps_the_stopped_original_startable(ordinary_regis
     selected = read_bootstrap_admission(directory, f.service.launched[-1][2]["bootstrap_selection"])
     assert selected["application_startup"] == original
     assert f.registry._selected_startup(saved["id"], directory.name) == original
-    assert deployment.read_receipt(directory)["update"]["update_id"] == staged["update"]["update_id"]
+    # Starting neither consumes nor rewrites the staged update.
+    current = deployment.read_receipt(directory)["update"]
+    assert (current["update_id"], current["status"]) == (staged["update"]["update_id"], staged["update"]["status"])
+    assert record.read_bytes() == recorded
     # The unapplied update still cannot redirect this original installation.
     with pytest.raises(CustodyError, match="cannot be redirected to another build or source owner"):
         f.registry._selected_replacement(saved["id"], directory.name, staged["update"]["update_id"])
@@ -434,3 +442,18 @@ async def test_forge_reload_with_a_staged_update_recovers_the_original_start(ord
     await service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
     assert owner._selected_startup(saved["id"], directory.name) == original
     assert len(launched) == 1 and launched[0][0][1] == "start"
+
+
+async def test_only_a_pending_staged_update_keeps_the_original_owner(ordinary_registry, monkeypatch):
+    f = ordinary_registry
+    saved = ordinary_guide(f)
+    result = await build(f, saved)
+    await accept_source_fixture(f, result)
+    directory, _ = await install_fixture(f, saved, result, monkeypatch)
+    f.registry._selected_startup(saved["id"], directory.name)
+    staged = await staged_improvement(f, saved, result, directory)
+    from launchkit.deployment_updates import update_receipt
+    # A test-only status edit: any other update state keeps the strict owner check.
+    update_receipt(directory, update={**staged["update"], "status": "snapshotting"})
+    with pytest.raises(CustodyError, match="cannot be redirected to another build or source owner"):
+        f.registry._selected_startup(saved["id"], directory.name)
