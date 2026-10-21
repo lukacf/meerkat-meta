@@ -1444,6 +1444,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   explicitly chosen pin is kept. The exported knowledge README states the
   licences of the embedded storage engine and names the source's notes on its
   patches to it.
+- Meta Forge's installation step no longer gives up on the destination
+  options when the machine takes longer than 30 s to prepare them, as seen on
+  small 2-vCPU cloud machines right after a build. The page stopped waiting
+  for every read after 30 s, so the destination card never loaded even though
+  the server answered, and each retry started the same preparation again. The
+  destination options read and the console port checks now wait up to 120 s,
+  a retry shares the read still in progress instead of sending another, and a
+  check for a changed console port waits for the previous check to finish.
 - `/console/experience` reports `health_overview.live_snapshot.running` as
   the mob's owner answers when the experience is read, as `meta/status`
   does. It came from the console's cached roster walk, and was `true` when
