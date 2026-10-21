@@ -1322,13 +1322,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `meta/identity/resolved_tools`, and `resolved_tools_for_session` and
   `resolved_tools_for_member` in Rust, answer the tools the member's next
   model request carries under its active filters: meerkat's catalog view of
-  the member's live tool dispatcher. Before, they answered the member's tool scope as its last
-  model call left it, and meerkat refreshes that scope from the dispatcher
-  only when a model call starts. So tools published after meerkat built the
-  member were listed only once it had run a turn, although that turn carried
-  them: after an unclean stop, every restored member whose customizer tools
-  the bootstrap published listed only its other tools until its first turn.
-  A service that reports no catalog view still answers the tool scope.
+  the member's live tool dispatcher. Before, they answered the member's
+  tool scope as its last model call left it, and meerkat refreshes that
+  scope from the dispatcher only when a model call starts. So tools
+  published after meerkat built the member were listed only once it had run
+  a turn, although that turn carried them: after an unclean stop, every
+  restored member whose customizer tools the bootstrap published listed
+  only its other tools until its first turn. A service that reports no
+  catalog view still answers the tool scope.
 - A resume that collides with a spawn of the same member still in Core's
   custody (a client retry) adopts that spawn once Core has committed the
   member. Before, it could read the member's session binding before the
