@@ -385,9 +385,9 @@
         const sp=p.spec;
         if(!sp.label || p.a<.3 || !(this.opts.labels || sp.always))return;
         const hot=p.active>this.t || p.flash>this.t;
-        const fs=Math.max(11,Math.min(14,12*S)), line=fs*1.22;
+        const fs=sp.labelSize || Math.max(11,Math.min(14,12*S)), line=fs*1.22;
         ctx.font=`${hot?600:500} ${fs}px ${SANS}`;
-        const maxWidth=Math.min(148,Math.max(86,W*.19));
+        const maxWidth=sp.labelWidth || Math.min(148,Math.max(86,W*.19));
         const words=sp.label.split(/\s+/), lines=[];
         for(const word of words){
           if(!lines.length || ctx.measureText(`${lines.at(-1)} ${word}`).width>maxWidth)lines.push(word);

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import os
 import re
+import time
 from urllib.parse import quote
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -55,6 +56,9 @@ VERSION = "0.8.47"
 APP_ROOT = Path(__file__).resolve().parents[1]
 checker_setup = CheckerSetupService(APP_ROOT)
 LOG = logging.getLogger(__name__)
+# uvicorn configures this logger at INFO, so the owners' stop lines show
+# under every uvicorn launch.
+STOP_LOG = logging.getLogger("uvicorn.error")
 
 
 def setup_home():
@@ -308,10 +312,15 @@ async def lifespan(app):
             ("saved Toolkit requests", toolkit_saved_requests),
             ("architect", architect),
         ):
+            STOP_LOG.info("Meta Forge: stopping %s", name)
+            started = time.monotonic()
             try:
                 await service.shutdown()
             except BaseException as error:
+                STOP_LOG.warning("Meta Forge: stopping %s failed (%s)", name, type(error).__name__)
                 failures.append((name, error))
+            else:
+                STOP_LOG.info("Meta Forge: stopped %s in %.1f s", name, time.monotonic() - started)
         if failures:
             raise BaseExceptionGroup(
                 "Meta Forge cleanup failed for: " + ", ".join(name for name, _ in failures),
@@ -419,7 +428,7 @@ def cloud_capability() -> dict:
 @app.get("/api/capabilities")
 async def capabilities():
     return {"planner": planner_capability(), "platform": "mac" if platform.system() == "Darwin" else "linux", "gcp": await asyncio.to_thread(cloud_capability), "version": VERSION,
-            "rehearsal": {"start_request_replay": True}}
+            "rehearsal": {"start_request_replay": True}, "agent_team": deployment.agent_team_availability()}
 
 
 class BlueprintBody(BaseModel):
@@ -1670,9 +1679,17 @@ async def validate_blueprint(value: dict):
         raise HTTPException(422, str(error)) from None
 
 
+def require_agent_team_export():
+    """Refuse an agent team package where this Forge does not offer one."""
+    availability = deployment.agent_team_availability()
+    if not availability["available"]:
+        raise HTTPException(409, availability["reason"])
+
+
 @app.post("/api/blueprint/package")
 async def blueprint_package(value: dict):
     from .compiler import build_archive
+    require_agent_team_export()
     spec = blueprint_or_error(value)
     try:
         archive = await asyncio.to_thread(build_archive, spec)
@@ -1998,6 +2015,7 @@ async def preview(spec: DeploymentSpec):
 @app.post("/api/package")
 async def package(spec: DeploymentSpec):
     from .generator import build_archive
+    require_agent_team_export()
     return Response(build_archive(spec), media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{spec.project.slug}.zip"'})
 
 

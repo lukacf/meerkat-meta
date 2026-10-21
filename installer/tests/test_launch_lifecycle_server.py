@@ -1,6 +1,7 @@
 """Launch API delegation and private configuration error boundaries."""
 
 import asyncio
+import logging
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -35,6 +36,7 @@ def services(monkeypatch):
     operations = SimpleNamespace(submit=AsyncMock(name="guide_operations.submit"))
     guide = SimpleNamespace(apply=AsyncMock(name="guide.apply"),
         attachments=SimpleNamespace(resolve=lambda identity, values: values), input_surface=lambda: {})
+    deployment.agent_team_availability = lambda: {"available": True}
     monkeypatch.setattr(server, "deployment", deployment)
     monkeypatch.setattr(server, "rehearsal", rehearsal)
     monkeypatch.setattr(server, "guide_operations", operations)
@@ -610,6 +612,32 @@ def test_lifespan_attempts_every_cleanup_after_owner_or_body_failure(monkeypatch
     else:
         asyncio.run(run())
     assert calls == owners
+
+
+def test_lifespan_logs_each_owner_stop_in_order(monkeypatch, caplog):
+    failure = RuntimeError("owned cleanup unavailable")
+    for name in ["guide_operations", "deployment", "rehearsal", "architect"]:
+        async def shutdown(owner=name):
+            if owner == "rehearsal":
+                raise failure
+        monkeypatch.setattr(server, name, SimpleNamespace(shutdown=shutdown))
+
+    async def run():
+        async with server.lifespan(server.app):
+            pass
+
+    caplog.set_level(logging.INFO, logger="uvicorn.error")
+    with pytest.raises(ExceptionGroup):
+        asyncio.run(run())
+    lines = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
+    stopping = [line.removeprefix("Meta Forge: stopping ") for line in lines
+                if line.startswith("Meta Forge: stopping ") and not line.endswith(")")]
+    assert stopping == ["guide operations", "visualization operations", "visualization reviews",
+        "visual critic runtime", "remote deployment", "GCP resource preparation", "GCP access checks",
+        "deployment", "rehearsal", "implementation", "checker preparation", "saved Toolkit requests", "architect"]
+    assert any(line.startswith("Meta Forge: stopped deployment in ") and line.endswith(" s") for line in lines)
+    assert "Meta Forge: stopping rehearsal failed (RuntimeError)" in lines
+    assert not any(line.startswith("Meta Forge: stopped rehearsal") for line in lines)
 
 
 def test_lifespan_retains_multiple_cleanup_failures_and_cancellation(monkeypatch):

@@ -24,6 +24,13 @@ packager reads, per target (`linux-x86_64`, `macos-arm64`):
 - `paths`: where each selected artifact sits among `files`, under
   `artifact_root`, in the form `launchkit.packaged_runtime.relocate_selection` reads.
 - `gateway`: the pinned guide gateway, outside the product root.
+- `ordinary_gateway` (optional): the pinned `rpc_gateway` member of the
+  `meta-rpc-gateway-<version>-<triple>.tar.gz` Meta release asset whose version
+  equals the selection's Meta version, for the target's own triple
+  (`x86_64-unknown-linux-gnu` for `linux-x86_64`, `aarch64-apple-darwin` for
+  `macos-arm64`), outside the product root. The package
+  then also builds applications without a connection setup helper. Pin the
+  asset of a published Meta release; its SHA-256 is never written in source.
 
 `guide` holds the guide's Meta and Core versions and their source commits.
 Inputs must be public, and they must not carry private paths, user names or

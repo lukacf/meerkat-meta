@@ -33,7 +33,10 @@ Inputs (installer/release/forge-release-inputs.json, schema 1): per target,
 every file the packager reads, each pinned by size and SHA-256 and taken
 from this checkout (installer/release/inputs/) or from an allowlisted public
 release or PyPI URL, plus the owner's product selection and the guide's
-pinned Meta and Core versions and sources.
+pinned Meta and Core versions and sources. A target's optional
+ordinary_gateway names the pinned Meta rpc_gateway release asset of the
+selection's Meta version; the package then also builds applications without a
+connection setup helper.
 
 Selections are strict JSON objects:
   forge-accepted-candidate: schema_version=1, kind, repository, run_id,
@@ -79,6 +82,8 @@ INPUTS = "installer/release/forge-release-inputs.json"
 INPUTS_DIR = "installer/release/inputs/"
 PYPROJECT = "installer/pyproject.toml"
 TARGETS = ("linux-x86_64", "macos-arm64")
+# Each Forge target's Meta native release asset triple.
+GATEWAY_TRIPLES = {"linux-x86_64": "x86_64-unknown-linux-gnu", "macos-arm64": "aarch64-apple-darwin"}
 TAG_PREFIX = "forge-v"
 MANIFEST = "forge-candidate-manifest.json"
 MANIFEST_PROVENANCE = "forge-manifest-provenance.jsonl"
@@ -189,7 +194,9 @@ def validate_pin(pin, name):
 
 
 def validate_target(target, entry):
-    rc.exact_keys(entry, "files gateway selection paths", f"{target} inputs")
+    keys = "files gateway selection paths"
+    rc.exact_keys(entry, keys + (" ordinary_gateway" if isinstance(entry, dict) and "ordinary_gateway" in entry else ""),
+        f"{target} inputs")
     files = entry["files"]
     require(isinstance(files, dict) and 0 < len(files) <= MAX_INPUT_FILES, f"{target} needs pinned input files")
     for name, pin in files.items():
@@ -219,6 +226,20 @@ def validate_target(target, entry):
     for name, artifact in zip(wheels, selected):
         bound(name, artifact, "dependency wheel")
     require(not entry["gateway"].startswith(root + "/"), f"{target} guide gateway must stay outside the product root")
+    if "ordinary_gateway" in entry:
+        # The application's ordinary Meta RPC gateway: the release asset of the
+        # selected Meta SDK's own version, never the guide's or a product file.
+        ordinary = entry["ordinary_gateway"]
+        require(isinstance(ordinary, str) and ordinary in files and ordinary != entry["gateway"]
+                and not ordinary.startswith(root + "/"),
+                f"{target} ordinary gateway must be a separate pinned input outside the product root")
+        pin, meta = files[ordinary], selection.get("meta")
+        version = meta.get("version") if isinstance(meta, dict) else None
+        require(isinstance(version, str) and VERSION.fullmatch(version) and "member" in pin
+                and pin["url"] == ("https://github.com/lukacf/meerkat-meta/releases/download/"
+                                   f"v{version}/meta-rpc-gateway-{version}-{GATEWAY_TRIPLES[target]}.tar.gz")
+                and pin["member"] == "rpc_gateway",
+                f"{target} ordinary gateway must be the Meta {version} rpc_gateway release asset for {target}")
 
 
 def validate_inputs(value):
@@ -595,7 +616,7 @@ def fetch_inputs(args):
             else:
                 download(pin["url"], destination, pin["size"])
             check_bytes(destination, pin["size"], pin["sha256"], name)
-            destination.chmod(0o700 if name == entry["gateway"] else 0o600)
+            destination.chmod(0o700 if name in {entry["gateway"], entry.get("ordinary_gateway")} else 0o600)
     finally:
         shutil.rmtree(downloads)
     print(f"fetched {len(entry['files'])} pinned inputs for {args.target} into {output}")
@@ -620,8 +641,14 @@ def package(args):
     selected_guide = launchkit_module("bootstrap").SelectedGuideRuntime(
         gateway=gateway, version=guide["version"], core_version=guide["core_version"],
         meta_source=guide["meta_source"], core_source=guide["core_source"])
+    ordinary = None
+    if "ordinary_gateway" in entry:
+        ordinary = launchkit_module("connect_installer_caller").ExactFile(
+            root.joinpath(*PurePosixPath(entry["ordinary_gateway"]).parts),
+            entry["files"][entry["ordinary_gateway"]]["sha256"])
     require(args.output.name == package_name(forge_version(), args.target), "unexpected package name")
-    result = launchkit_module("product_distribution").package(ROOT / "installer", target, selected_guide, args.output)
+    result = launchkit_module("product_distribution").package(ROOT / "installer", target, selected_guide, args.output,
+        **({"ordinary_gateway": ordinary} if ordinary is not None else {}))
     require(result["native_target"] == args.target, "the package was built for another target")
     print(json.dumps(result, sort_keys=True))
 

@@ -169,6 +169,16 @@ def _initial_policy(spec, inventory, guide_id):
     return content
 
 
+ORDINARY_SOURCE_UNAVAILABLE = (
+    "This Forge was started without the Meta RPC gateway that an application without a "
+    "connection setup helper needs. Use a Forge package that includes that gateway, or "
+    "add the connection setup helper to the plan. Your plan is preserved.")
+ORDINARY_TARGET_UNSUPPORTED = (
+    "An application without a connection setup helper can be built here only for a Mac "
+    "or Linux destination. Change the plan's destination, or add the connection setup "
+    "helper. Your plan is preserved.")
+
+
 def create_local_application_source(*, guide_store, guide_id, guide_version,
         runtime_target, output_directory, model_configuration=None, replacement_selection=None):
     """Return one real source factory after publishing and checking its source.
@@ -189,6 +199,13 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
     spec = _guide(guide_store, guide_id, guide_version, storage)
     selected_plan = spec.model_dump(mode="json")
     if not compiler._product_acquisition_supported(spec, runtime_target=runtime_target):
+        # Name the actual missing input; only a helper plan is pending setup support.
+        if spec.acquisition is None:
+            if any(row.tools.rust_bundles for row in spec.agent_classes):
+                raise CustodyError(compiler.NATIVE_BUNDLE_PENDING)
+            if spec.target not in {"mac", "linux"}:
+                raise CustodyError(ORDINARY_TARGET_UNSUPPORTED)
+            raise CustodyError(ORDINARY_SOURCE_UNAVAILABLE)
         raise CustodyError(compiler.CONNECTION_SETUP_PENDING)
     sources = _compiler_sources()
     artifacts = selected_runtime_artifacts(runtime_target)

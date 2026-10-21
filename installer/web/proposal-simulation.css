@@ -148,3 +148,10 @@
   .proposal-simulation.ps-expanded>.ps-details{flex:0 0 auto;max-height:none;overflow:visible}
   .proposal-simulation.ps-expanded .ps-caption{max-height:none;overflow:visible}
 }
+
+/* Small teams keep the complete conversation and shared context in view. */
+.proposal-simulation .ps-stage.ps-stage--small{aspect-ratio:2/1;min-height:280px}
+@media(min-width:900px){.proposal-simulation.ps-expanded>.ps-instrument>.ps-stage.ps-stage--small{aspect-ratio:auto;min-height:0;max-height:560px}}
+@container forge-simulation (max-width:460px){
+  .proposal-simulation .ps-stage.ps-stage--small{aspect-ratio:1/1;min-height:280px}
+}

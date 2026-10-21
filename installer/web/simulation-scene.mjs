@@ -584,3 +584,11 @@ export function createSimulationScene(model, plan) {
 }
 
 export const createScene = createSimulationScene;
+
+/** Shared drawing and hit-target projection for the automatic preview only. */
+export function simulationViewport(scene, width, height) {
+  const sc = Math.min(width / scene.W, height / scene.H);
+  const small = scene.population?.count > 0 && scene.population.count <= 8 && !scene.selectedFlowId;
+  return small ? {sc, sx: width / scene.W, sy: height / scene.H, ox: 0, oy: 0}
+    : {sc, sx: sc, sy: sc, ox: (width - scene.W * sc) / 2, oy: (height - scene.H * sc) / 2};
+}

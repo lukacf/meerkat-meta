@@ -1140,6 +1140,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `installer/release/inputs/forge-release-inputs.skeleton.json` holds the
   Guide's Linux release inputs; only the product owner's selection is still to
   be filled.
+- An installed Meta Forge (the packaged product, not the developer source entry)
+  no longer offers agent team packages: they install the older MobKit 0.8
+  runtime, while its applications run on Meta 0.9.4. It refuses an agent team
+  export or installation with that reason and points to Build application; the
+  developer source entry still offers both. Agent teams already installed keep
+  their controls.
 - Adopts the Meerkat Core typed provider stop detail. Every place Meta builds
   an `LlmDoneOutcome::Success` (test clients, the scenario client, the memory
   pipeline fakes) builds it with `LlmDoneOutcome::success(stop_reason)`, and
@@ -1372,6 +1378,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Meta Forge accepts a `meerkat-toolkit` 0.9.4 wheel, whose native host
   requires `meerkat-meta==0.9.4`, instead of refusing every Toolkit wheel but
   0.9.0; the exact version, METADATA, RECORD and payload checks are unchanged.
+- Stopping Meta Forge (Ctrl+C, or the SIGTERM an installer host sends) no
+  longer waits without limit for requests still in flight: they get 20 s
+  (`--timeout-graceful-shutdown 20`). Each owner of native work now logs its
+  stop ("stopping X", then "stopped X in N s" or its failure), so a slow stop
+  names the owner still working. The owners' own stops are not cut short, so
+  an install in progress still finishes its cleanup.
 - Meta Forge's "Rebuild with updated runtime" builds a new package of an
   application built from a host-selected Meta and Toolkit runtime on the
   installer's current runtime (see Known limitations).
@@ -1389,6 +1401,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the same model configuration owner as `OrdinaryMetaApplicationSelection` and
   is checked the same way at selection. A bare target is unchanged and still
   refuses managed-host models.
+- A Meta Forge package can build an application without a connection setup
+  helper. A product package can include the Meta rpc_gateway release of its
+  selected Meta SDK, and the packaged entry then uses it for local Mac and
+  Linux plans without a helper. Such a plan used to end in an error claiming it
+  selected a helper; a plan that still cannot build now names the missing input.
 - Meta Forge's generated Console has a "Connect setup" sidebar button for an
   application on the selected Meta Toolkit Connect route (a host-selected
   product with an acquisition helper). The button opens the host's Toolkit
@@ -1507,6 +1524,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `parentRafAgeMs` and `deadlineOvershootMs` in whole milliseconds. Each is a
   clock difference and could show its floating-point error, such as
   3.0000000000000284 for a 3 ms render.
+- Meta Forge's proposal preview shows a team of up to eight agents in a compact
+  overview with readable labels. An authored animation scrolled out of view no
+  longer fails: browsers defer drawing an offscreen frame, and the visible-time
+  watchdog counted that wait as a stall. The watchdog and playback now pause
+  while the preview is offscreen and resume where they stopped; a stall while
+  visible still fails.
 - Meta Forge no longer strands the slot of a visual review that an earlier
   version left running when the animation renderer changes. The first review
   after such an update failed to start, and the slot stayed taken after that
@@ -1648,7 +1671,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`IdentityRuntime::retire`; its next wake then starts it fresh), and any
   other bound identity starts fresh, with no history (its status reports
   `replaced_session`). A check that reads any mob storage is planned for
-  0.9.4.1.
+  0.9.5.
 - A lost or replaced state directory cannot be detected: the identity
   bindings are recorded in it, so a start over an emptied or replaced
   directory starts every identity with an empty transcript and does not

@@ -37,6 +37,8 @@ OWNER_FILE = ".mobkit/launch-deployment-owner.json"
 PRIVATE_RUNTIME_UPDATE_ONLY = "This private runtime candidate is admitted only through the checked update of an existing stopped installation. Use that exact update or its forward recovery."
 
 PRODUCT_CONFIGURE_REQUIRED = "This selected Meta/Toolkit installation needs its original Configure startup inputs. Ordinary Start and background startup are unavailable."
+AGENT_TEAM_PRODUCT_UNAVAILABLE = ("Agent team packages are not available in this Forge: they install the older MobKit 0.8 "
+    "runtime. Use Build application to build and install your agents as an application on Meta 0.9.4.")
 
 
 def product_runtime_source(files, selected, *, verified_artifacts=None, source_custody=None):
@@ -954,6 +956,29 @@ class DeploymentService:
     async def _guide(self, identity):
         return await (self.operations.read(self.guide, identity) if self.operations else self.guide.get(identity))
 
+    def _product_launched(self):
+        # Every trusted launcher selects its application owner's startup
+        # (``application_setup_selection``): the per-user application registry,
+        # which also selects ``application_host_selection``, and a selected
+        # application host. The developer source entry selects neither.
+        return self.application_setup_selection is not None or self.application_host_selection is not None
+
+    def agent_team_availability(self):
+        """Whether this Forge exports and installs agent team packages.
+
+        A product-launched Forge builds its applications on Meta 0.9.4. An
+        agent team package installs the MobKit 0.8 runtime, so such a Forge
+        refuses to export or install one; the developer source entry keeps
+        both.
+        """
+        if self._product_launched():
+            return {"available": False, "reason": AGENT_TEAM_PRODUCT_UNAVAILABLE}
+        return {"available": True}
+
+    def require_agent_team_available(self):
+        if self._product_launched():
+            raise DraftConflict(AGENT_TEAM_PRODUCT_UNAVAILABLE)
+
     def _directory(self, guide_id, deployment_id=None):
         for value in [guide_id, *([deployment_id] if deployment_id else [])]:
             try:
@@ -1385,6 +1410,7 @@ class DeploymentService:
             raise DraftConflict("The retained installed package or its source ownership could not be verified.") from error
 
     async def native_package(self, guide_id, version):
+        self.require_agent_team_available()
         state = await self._guide(guide_id)
         if state.get("id") != guide_id:
             raise DraftConflict("The accepted plan belongs to a different guide.")
@@ -1427,6 +1453,7 @@ class DeploymentService:
         if source_kind not in {"application", "native-team"}:
             raise ValueError("Choose an application or native-team source.")
         if source_kind == "native-team":
+            self.require_agent_team_available()
             if build_id is not None:
                 raise ValueError("An agent-team package has no application build ID.")
             payload, source, slug = await self.native_package(guide_id, version)
@@ -1513,6 +1540,8 @@ class DeploymentService:
     async def submit(self, guide_id, version, build_id, destination, settings=None, use_host_provider_credentials=False,
                      execution_mode="interactive", *, source_kind="application", source_id=None, source_digest=None):
         async with self.lock:
+            if source_kind == "native-team":
+                self.require_agent_team_available()
             if execution_mode not in {"interactive", "background"}:
                 raise ValueError("Choose interactive or background deployment.")
             if execution_mode == "background" and not (await self.service_manager.capability())["available"]:

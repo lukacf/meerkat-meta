@@ -1,0 +1,146 @@
+"""The packaged default entry also builds ordinary applications.
+
+A product package may include the Meta RPC gateway release of its selected
+Meta SDK. The packaged entry then selects it as the ordinary Meta gateway, so
+an application without a connection setup helper builds through the ordinary
+route. All bytes are inert; no gateway, SDK or server process runs.
+"""
+from copy import deepcopy
+import hashlib
+from pathlib import Path
+import stat
+from types import SimpleNamespace
+import zipfile
+
+import pytest
+
+from launchkit import bootstrap, packaged_runtime
+from launchkit.connect_installer_caller import ExactFile, _private_parent
+from test_meta_toolkit_runtime_selection import product, no_product_execution, json_bytes, put
+from test_distribution import bundle_source
+from test_development_product_selection import development, guide_product_inputs
+
+
+@pytest.fixture
+def fresh_entry(monkeypatch):
+    """Each row opens its own package in this process, as one launch does."""
+    for name in ("_selected_target", "_selected_root", "_selected_ordinary_gateway"):
+        monkeypatch.setattr(packaged_runtime, name, None)
+    monkeypatch.setattr(bootstrap, "_selected_guide_runtime", None)
+
+
+def ordinary_gateway(product, content=b"inert ordinary Meta RPC gateway, never execute\n"):
+    pin = put(product.root / "ordinary-release/rpc_gateway", content)
+    pin.path.chmod(0o700)
+    return ExactFile(pin.path, pin.sha256)
+
+
+def packaged(product, bundle_source, monkeypatch, tmp_path, *, gateway=True, meta_version="0.9.4"):
+    from launchkit import product_distribution
+    root, _, _, guide = guide_product_inputs(product, bundle_source, monkeypatch)
+    target, _, _ = development(product, meta_version)
+    selected = ordinary_gateway(product) if gateway else None
+    output = tmp_path / "selected-product.zip"
+    product_distribution.package(root, target, guide, output,
+        **({"ordinary_gateway": selected} if gateway else {}))
+    extracted = tmp_path / "selected-product"
+    with zipfile.ZipFile(output) as archive:
+        archive.extractall(extracted)
+    return extracted, target, selected
+
+
+def test_package_carries_the_selected_meta_release_gateway_for_ordinary_applications(
+        product, bundle_source, tmp_path, monkeypatch, fresh_entry):
+    from launchkit import product_distribution
+    extracted, target, selected = packaged(product, bundle_source, monkeypatch, tmp_path)
+    observed = product_distribution.verify(extracted)
+    assert observed["ordinary"] == {"version": target.meta.version, "gateway": {
+        "path": "vendor/ordinary/rpc_gateway", "sha256": selected.sha256,
+        "bytes": selected.path.stat().st_size}}
+    gateway = extracted / "vendor/ordinary/rpc_gateway"
+    assert stat.S_IMODE(gateway.stat().st_mode) == 0o700
+    assert stat.S_IMODE(gateway.parent.stat().st_mode) == 0o700
+    readme = (extracted / "README.md").read_text()
+    assert f"use the included Meta {target.meta.version} RPC gateway" in readme
+    # The packaged entry opens the same verified bytes; the registry's own
+    # custody checks for an ordinary gateway hold for the extracted file.
+    assert packaged_runtime.open_selection(extracted).meta.version == target.meta.version
+    chosen = packaged_runtime.selected_ordinary_gateway()
+    assert chosen == ExactFile(gateway.resolve(), selected.sha256)
+    _private_parent(chosen.path)
+    chosen.verify(executable=True)
+
+
+def test_package_without_the_gateway_keeps_the_helper_only_entry(
+        product, bundle_source, tmp_path, monkeypatch, fresh_entry):
+    from launchkit import product_distribution
+    extracted, _, _ = packaged(product, bundle_source, monkeypatch, tmp_path, gateway=False)
+    assert "ordinary" not in product_distribution.verify(extracted)
+    assert not (extracted / "vendor/ordinary").exists()
+    packaged_runtime.open_selection(extracted)
+    assert packaged_runtime.selected_ordinary_gateway() is None
+
+
+@pytest.mark.parametrize("drift", ["version", "sha256", "unbound-file", "bytes", "mode"])
+def test_ordinary_gateway_binding_refuses_drift(product, bundle_source, tmp_path, monkeypatch, fresh_entry, drift):
+    from launchkit import distribution, product_distribution
+    extracted, target, _ = packaged(product, bundle_source, monkeypatch, tmp_path)
+    manifest = extracted / distribution.MANIFEST
+    value = product_distribution.verify(extracted)
+    changed = deepcopy(value)
+    if drift == "version":
+        changed["ordinary"]["version"] = "0.9.3"
+    elif drift == "sha256":
+        changed["ordinary"]["gateway"]["sha256"] = "f" * 64
+    elif drift == "unbound-file":
+        changed.pop("ordinary")
+    elif drift == "mode":
+        changed["file_modes"]["vendor/ordinary/rpc_gateway"] = 0o755
+    if drift == "bytes":
+        (extracted / "vendor/ordinary/rpc_gateway").write_bytes(b"changed ordinary gateway\n")
+    else:
+        manifest.write_bytes(json_bytes(changed))
+    with pytest.raises(distribution.DistributionError):
+        product_distribution.verify(extracted)
+    with pytest.raises(distribution.DistributionError):
+        packaged_runtime.open_selection(extracted)
+
+
+def test_package_refuses_gateway_bytes_that_differ_from_their_pin(product, bundle_source, tmp_path, monkeypatch):
+    from launchkit import distribution, product_distribution
+    root, _, _, guide = guide_product_inputs(product, bundle_source, monkeypatch)
+    target, _, _ = development(product, "0.9.4")
+    selected = ordinary_gateway(product)
+    output = tmp_path / "refused.zip"
+    with pytest.raises(distribution.DistributionError, match="ordinary Meta gateway"):
+        product_distribution.package(root, target, guide, output,
+            ordinary_gateway=ExactFile(selected.path, "e" * 64))
+    assert not output.exists()
+    with pytest.raises(distribution.DistributionError, match="exact product inputs"):
+        product_distribution.package(root, target, guide, output, ordinary_gateway=str(selected.path))
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("included", [True, False])
+def test_packaged_entry_selects_the_ordinary_gateway_only_when_included(monkeypatch, included):
+    target, gateway = object(), ExactFile(Path("/inert/vendor/ordinary/rpc_gateway"), "a" * 64)
+    selections = []
+
+    def open_selection(root=None):
+        monkeypatch.setattr(packaged_runtime, "_selected_target", target)
+        monkeypatch.setattr(packaged_runtime, "_selected_ordinary_gateway", gateway if included else None)
+        return target
+
+    server = SimpleNamespace(app=object(),
+        select_local_application_runtime=lambda selected, **options: selections.append((selected, options)))
+    monkeypatch.setattr(packaged_runtime, "open_selection", open_selection)
+    monkeypatch.setattr(packaged_runtime.importlib, "import_module",
+        lambda name: server if name == "launchkit.server" else pytest.fail(name))
+    assert packaged_runtime.create_app() is server.app
+    assert selections == [(target, {"ordinary_meta_gateway": gateway} if included else {})]
+
+
+def test_selected_ordinary_gateway_needs_an_opened_package(monkeypatch):
+    monkeypatch.setattr(packaged_runtime, "_selected_target", None)
+    with pytest.raises(ValueError, match="Open the packaged runtime"):
+        packaged_runtime.selected_ordinary_gateway()

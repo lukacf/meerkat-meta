@@ -207,9 +207,9 @@ echo ""
 echo "Open Meta Forge at http://127.0.0.1:$launch_port"
 echo "Keep this terminal open. Press Ctrl+C to stop Meta Forge."
 if [ -n "${META_FORGE_APPLICATION_HOST_FACTORY:-}" ]; then
-  exec .venv/bin/python -m uvicorn launchkit.application_host_launch:create_app --factory --host 127.0.0.1 --port "$launch_port"
+  exec .venv/bin/python -m uvicorn launchkit.application_host_launch:create_app --factory --host 127.0.0.1 --port "$launch_port" --timeout-graceful-shutdown 20
 fi
 if [ "$standalone_runtime" = meta-toolkit ]; then
-  exec .venv/bin/python -m uvicorn launchkit.packaged_runtime:create_app --factory --host 127.0.0.1 --port "$launch_port"
+  exec .venv/bin/python -m uvicorn launchkit.packaged_runtime:create_app --factory --host 127.0.0.1 --port "$launch_port" --timeout-graceful-shutdown 20
 fi
-exec .venv/bin/python -m uvicorn launchkit.server:app --host 127.0.0.1 --port "$launch_port"
+exec .venv/bin/python -m uvicorn launchkit.server:app --host 127.0.0.1 --port "$launch_port" --timeout-graceful-shutdown 20

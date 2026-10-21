@@ -81,7 +81,7 @@ def test_product_entry_keeps_both_sdks_and_uses_the_selected_runtime(product_ent
     assert not any("launchkit.bootstrap" in args or any("meerkat_mobkit" in part for part in args) for args in calls)
     serving = [args for args in calls if args[:2] == ["-m", "uvicorn"]]
     assert serving == ([] if prepare_only else [["-m", "uvicorn", "launchkit.packaged_runtime:create_app",
-        "--factory", "--host", "127.0.0.1", "--port", "8791"]])
+        "--factory", "--host", "127.0.0.1", "--port", "8791", "--timeout-graceful-shutdown", "20"]])
 
 
 @pytest.mark.parametrize("failure", ["verification", "dependencies", "sdk", "product"])
