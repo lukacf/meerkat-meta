@@ -1,5 +1,6 @@
 /* Adapt the detailed reference renderer to the proposal's semantic layers. */
 import { Net, COL, rgba, SANS } from './network-renderer.mjs';
+import { simulationViewport } from './simulation-scene.mjs';
 import { createRelationshipProjection } from './mob-sim-relationships.mjs';
 
 export class MobSim extends Net {
@@ -13,16 +14,16 @@ export class MobSim extends Net {
     this.source = source;
     const relationships = createRelationshipProjection(source), simulation = this;
     super.setScene((width, height) => {
-      const sc = Math.min(width/source.W, height/source.H);
-      const ox = (width-source.W*sc)/2, oy=(height-source.H*sc)/2;
-      this.transform = {sc,ox,oy};
-      const point=p=>({x:p.x*sc+ox,y:p.y*sc+oy});
+      const smallTeam = source.population?.count <= 8 && !source.selectedFlowId;
+      const {sc,sx,sy,ox,oy} = simulationViewport(source,width,height);
+      this.transform = {sc,sx,sy,ox,oy};
+      const point=p=>({x:p.x*sx+ox,y:p.y*sy+oy});
       const annotations=source.nodes.filter(n=>n.kind==='text');
       const convert = n => ({...n, ...point(n),
-        r:Math.max(n.dense ? 1.35 : n.kind==='coord'?4.5:2.8,(n.r||5)*sc),
+        r:Math.max(n.dense ? 1.35 : smallTeam ? n.kind==='coord' ? 7 : 5 : n.kind==='coord'?4.5:2.8,(n.r||5)*sc),
         kind:n.kind === 'ext' ? n.semanticKind === 'input' ? 'person' : 'source' : n.kind === 'mem' ? 'store' : n.kind === 'worker' ? 'agent' : n.kind,
         label:n.dense || n.kind==='text' ? '' : n.label,
-        labelSize:12, mem:n.mem || false,
+        labelSize:smallTeam ? 14 : undefined, labelWidth:smallTeam ? Math.min(150,width*.4) : undefined, mem:n.mem || false,
       });
       const routed=Object.fromEntries(Object.entries(source.routes || {}).map(([id,points])=>[id,points.map(point)]));
       const phase=net=>source.phaseOffsets[Math.min(source.phaseOffsets.length-1,Math.floor(net.t/4.2))];

@@ -69,7 +69,23 @@ export function composeTopology(model, options = {}) {
 
   if (entry) put(entry, 520, large ? 165 : 142, "right");
 
-  if (!large) {
+  const smallTeam = agents.length <= 8 && !model?.selectedFlowId;
+  if (smallTeam) {
+    // A handful of collaborators needs one coherent focal area, not empty lanes.
+    const collaborators = agents.filter(node => node.id !== entry?.id);
+    if (entry) Object.assign(placed.get(entry.id), {
+      x: collaborators.length === 1 ? 460 : 500,
+      y: collaborators.length <= 1 ? 240 : 260, labelPos: "above",
+    });
+    collaborators.forEach((node, index) => {
+      if (collaborators.length === 1) put(node, 680, 240, "right");
+      else {
+        const angle = -Math.PI / 2 + index * Math.PI * 2 / collaborators.length;
+        put(node, 500 + Math.cos(angle) * 260, 260 + Math.sin(angle) * 120,
+          Math.sin(angle) < -.2 ? "above" : "below");
+      }
+    });
+  } else if (!large) {
     // Classes occupy their own rows. Unrelated singletons share a broad row,
     // ordered by their configured class order, never by incidental DAG order.
     const repeated = byClass.map(({ key, members }) => ({ key, members: members.filter((n) => n.id !== entry?.id) }))
@@ -155,14 +171,29 @@ export function composeTopology(model, options = {}) {
     }
   }
 
+  if (smallTeam && options.narrow) {
+    if (entry) Object.assign(placed.get(entry.id), {x: 330, y: 242, labelPos: "above"});
+    const rest=agents.filter(node=>node.id!==entry?.id);
+    rest.forEach((node,index)=>{
+      const p=placed.get(node.id);
+      if(rest.length===1) Object.assign(p,{x:735,y:345,labelPos:"below"});
+      else {
+        const a=-Math.PI/2+index*Math.PI*2/rest.length;
+        Object.assign(p,{x:500+Math.cos(a)*300,y:280+Math.sin(a)*120,
+          labelPos:Math.sin(a)<0?"above":"below"});
+      }
+    });
+  }
+
   const inputNodes = nodes.filter((node) => node.kind === "input");
   const owner = entry && placed.get(entry.id);
   inputNodes.forEach((node, index) => put(node,
-    (owner?.x || 520) + (index - (inputNodes.length - 1) / 2) * 100, 48, "above"));
+    smallTeam ? options.narrow ? 170 : 145 : (owner?.x || 520) + (index - (inputNodes.length - 1) / 2) * 100,
+    smallTeam ? (options.narrow ? 75 : 240) + index * 55 : 48, "above"));
   const workflows = nodes.filter((node) => node.kind === "workflow");
   workflows.forEach((node, index) => put(node, 112 + index * 155, 122, "above", "Workflow run"));
   const outputs = nodes.filter((node) => node.kind === "output");
-  outputs.forEach((node, index) => put(node, 855 + index * 60, 142, "above",
+  outputs.forEach((node, index) => put(node, smallTeam ? options.narrow ? 780 : 855 : 855 + index * 60, smallTeam ? (options.narrow ? 75 : 110) + index * 55 : 142, "above",
     node.name === "Workflow result" ? "Result" : node.name));
 
   const memories = nodes.filter((node) => ["knowledge", "notes"].includes(node.kind));
@@ -178,11 +209,11 @@ export function composeTopology(model, options = {}) {
     const row = Math.floor(index / 5);
     const count = Math.min(5, resources.length - row * 5);
     const x = spread(count, 180, 890)[index % 5];
-    put(node, x, resourceRows > 1 ? 448 + row * Math.min(28, 47 / (resourceRows - 1)) : 453, "below");
+    put(node, x, resourceRows > 1 ? (smallTeam ? 420 : 448) + row * Math.min(28, 47 / (resourceRows - 1)) : smallTeam ? 414 : 453, "below");
   });
-  if (resources.length) annotation("TOOLS & SOURCES", 60, 429);
-  memories.forEach((node, index) => put(node, spread(memories.length, 360, 715)[index], 510, "below"));
-  if (memories.length) annotation("SHARED", 60, 510);
+  if (resources.length && !smallTeam) annotation("TOOLS & SOURCES", 60, 429);
+  memories.forEach((node, index) => put(node, spread(memories.length, 360, 715)[index], smallTeam ? options.narrow ? 482 : 408 : 510, "below"));
+  if (memories.length && !smallTeam) annotation("SHARED", 60, 510);
 
   // Unexpected future node kinds must still survive a scaffold revision.
   nodes.filter((node) => !placed.has(node.id)).forEach((node, index) => put(node, 80 + index * 50, 480));
@@ -191,11 +222,11 @@ export function composeTopology(model, options = {}) {
     const a = placed.get(edge.source), b = placed.get(edge.target);
     if (!a || !b) continue;
     let points = [{ x: a.x, y: a.y }];
-    if (!large && edge.kind !== "tool" && Math.abs(a.x - b.x) > 2 && Math.abs(a.y - b.y) > 2) {
+    if (!smallTeam && !large && edge.kind !== "tool" && Math.abs(a.x - b.x) > 2 && Math.abs(a.y - b.y) > 2) {
       const upper = Math.min(a.y, b.y), lower = Math.max(a.y, b.y);
       const bus = upper < 180 && lower > 210 ? lower - 42 : (upper + lower) / 2;
       points.push({ x: a.x, y: bus }, { x: b.x, y: bus });
-    } else if (!large && ["peer", "flow"].includes(edge.kind) && Math.abs(a.y - b.y) < 2 && Math.abs(a.x - b.x) > 2) {
+    } else if (!smallTeam && !large && ["peer", "flow"].includes(edge.kind) && Math.abs(a.y - b.y) < 2 && Math.abs(a.x - b.x) > 2) {
       points.push({ x: a.x, y: a.y - 27 }, { x: b.x, y: b.y - 27 });
     }
     points.push({ x: b.x, y: b.y });

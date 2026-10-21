@@ -3,8 +3,8 @@ import test from 'node:test';
 import vm from 'node:vm';
 import { FreeformAnimation, animationFrameDocument, animationFailureDetail, ANIMATION_CAPTURE_LIMITS } from './freeform-animation.mjs';
 
-function host(t, callbacks={}, {observeResize=true,clock=performance.now()}={}) {
-  const listeners=new Map(),documentListeners=new Map(),timers=new Map(),frames=new Map(),messages=[],resizeObservers=[];
+function host(t, callbacks={}, {observeResize=true,observeIntersection=false,clock=performance.now()}={}) {
+  const listeners=new Map(),documentListeners=new Map(),timers=new Map(),frames=new Map(),messages=[],resizeObservers=[],intersectionObservers=[];
   let next=0,removed=0,now=clock;
   const rect={width:600,height:340};
   const frame={style:{},contentWindow:{postMessage:message=>messages.push(message)},getBoundingClientRect:()=>rect,remove(){removed++;}};
@@ -13,12 +13,17 @@ function host(t, callbacks={}, {observeResize=true,clock=performance.now()}={}) 
     observe(target){this.target=target;}
     disconnect(){this.disconnected=true;}
   }
+  class IntersectionObserver {
+    constructor(callback){this.callback=callback;intersectionObservers.push(this);}
+    observe(target){this.target=target;}
+    disconnect(){this.disconnected=true;}
+  }
   const replacements={
     document:{hidden:false,createElement:()=>frame,
       addEventListener:(name,fn)=>documentListeners.set(name,fn),
       removeEventListener:(name,fn)=>{if(documentListeners.get(name)===fn)documentListeners.delete(name);}},
     window:{addEventListener:(name,fn)=>listeners.set(name,fn),removeEventListener:(name,fn)=>{if(listeners.get(name)===fn)listeners.delete(name);}},
-    ResizeObserver:observeResize?ResizeObserver:undefined,devicePixelRatio:1,performance:{now:()=>now},
+    ResizeObserver:observeResize?ResizeObserver:undefined,IntersectionObserver:observeIntersection?IntersectionObserver:undefined,devicePixelRatio:1,performance:{now:()=>now},
     requestAnimationFrame:fn=>{const id=++next;frames.set(id,fn);return id;},
     cancelAnimationFrame:id=>frames.delete(id),
     setTimeout:(fn,delay)=>{const id=++next;timers.set(id,{fn,delay});return id;},
@@ -37,7 +42,7 @@ function host(t, callbacks={}, {observeResize=true,clock=performance.now()}={}) 
   const timeout=delay=>{for(const [id,timer] of timers){if(Math.abs(timer.delay-delay)<1e-9){timers.delete(id);now+=delay;timer.fn();return;}}throw Error(`No ${delay}ms timer`);};
   const visibility=hidden=>{replacements.document.hidden=hidden;documentListeners.get('visibilitychange')?.();};
   return {instance,emit,tick,timeout,visibility,advance:milliseconds=>{now+=milliseconds;},now:()=>now,messages,timers,listeners,documentListeners,
-    rect,resizeObservers,document:replacements.document,removed:()=>removed};
+    rect,resizeObservers,intersectionObservers,surface:visible=>intersectionObservers[0].callback([{target:frame,isIntersecting:visible}]),document:replacements.document,removed:()=>removed};
 }
 
 function readyPaused(h) {
@@ -826,4 +831,35 @@ test('a queued iframe dispatch cannot renew an expired draw but its exact painte
     else{p.h.timeout(100);assert.equal(p.errors.length,1);assert.equal(p.errors[0].kind,'timeout');await p.releasePaintAcks();assert.equal(p.errors.length,1);}
     await p.stop();
   });
+});
+
+
+test('an offscreen animation freezes and resumes without replacing a healthy program',t=>{
+  let errors=0;
+  const h=host(t,{onError:()=>errors++},{observeIntersection:true});
+  readyPaused(h);
+  h.instance.paused=false;
+  h.surface(false);
+  const before=h.instance.time,count=draws(h).length;
+  for(let i=0;i<20;i++)h.tick(500);
+  assert.equal(h.instance.time,before);
+  assert.equal(draws(h).length,count);
+  assert.equal(errors,0);
+  h.surface(true);h.tick();
+  assert.ok(h.instance.time>before);
+  assert.equal(draws(h).length,count+1);
+  h.emit({drawn:true,frameId:draws(h).at(-1).frameId});
+  assert.equal(errors,0);
+  h.instance.destroy();assert.equal(h.intersectionObservers[0].disconnected,true);
+});
+
+test('offscreen waiting does not consume a pending draw deadline; a visible stall still fails',t=>{
+  let failure;
+  const h=host(t,{onError:value=>failure=value},{observeIntersection:true});
+  readyPaused(h);h.instance.seek(3);h.tick();
+  h.advance(750);h.surface(false);
+  assert.equal([...h.timers.values()].some(timer=>timer.delay===2000),false);
+  h.advance(10000);h.surface(true);
+  h.timeout(1250);assert.equal(failure,undefined);
+  h.timeout(100);assert.equal(failure.kind,'timeout');assert.equal(failure.phase,'draw');
 });
