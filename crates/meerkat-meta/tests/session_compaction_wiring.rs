@@ -260,7 +260,7 @@ const LONG_TURN_INPUT_TOKENS: u64 = 60_000;
 const LONG_TURN_THRESHOLD: u64 = 50_000;
 /// Tool-calling boundaries of the one long turn before its final answer.
 const LONG_TURN_TOOL_BOUNDARIES: usize = 12;
-/// More than Core 0.9.4's default retention (4) plus one.
+/// More than Core 0.9.4's default retention (4), past which a turn fails.
 const LONG_TURN_MIN_COMPACTIONS: usize = 6;
 
 /// One turn that keeps calling a tool: every tool-offering request answers
@@ -416,10 +416,11 @@ async fn long_turn(mob_id: &str, retained: Option<usize>) -> (Result<(), String>
 }
 
 /// Core 0.9.4 retires rewrite bodies past `history_retained_rewrites` after
-/// each compaction. One turn that compacts more than `retained + 1` times
-/// then cannot prove its own intra-turn checkpoint and is abandoned. Meta
-/// 0.9.4 builds every session with a 64-rewrite window, so the same long turn
-/// completes; an explicitly narrow window still shows the refusal.
+/// each compaction. One turn that compacts more than
+/// `history_retained_rewrites` times then cannot prove its own intra-turn
+/// checkpoint and is abandoned. Meta 0.9.4 builds every session with a
+/// 64-rewrite window, so the same long turn completes; an explicitly narrow
+/// window still shows the refusal.
 #[tokio::test]
 async fn one_turn_with_many_compactions_completes_under_meta_retention() {
     let (outcome, compactions) = long_turn("compaction-long-turn-meta", None).await;
