@@ -1452,6 +1452,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   destination options read and the console port checks now wait up to 120 s,
   a retry shares the read still in progress instead of sending another, and a
   check for a changed console port waits for the previous check to finish.
+- Meta Forge can install an application on Ubuntu or Debian with the system
+  Python. The installation looked up the application environment's package
+  folder with Python's default layout, which Debian and Ubuntu change to
+  `local/lib/python3.X/dist-packages`, so it stopped with a
+  `FileNotFoundError`. It now asks for the virtual environment's own layout.
+- When a failed application installation was stopped and its cleanup
+  verified, Meta Forge's installation panel offered neither Start nor Retry,
+  so the installation could not continue with its saved settings. The panel
+  now offers Retry installation for that state. Forge rechecks the saved
+  package's source and cleanup before continuing, and starting the
+  application remains a separate step.
 - `/console/experience` reports `health_overview.live_snapshot.running` as
   the mob's owner answers when the experience is read, as `meta/status`
   does. It came from the console's cached roster walk, and was `true` when
