@@ -143,6 +143,7 @@ jobs:
           installer/tests/test_product_start_entry.py
           installer/tests/test_native_console_login.py
           installer/tests/test_native_callback_member_contract.py
+          installer/tests/test_default_native_console_login.py
       # forge-release.py binds a reused run to the versions it ran with.
       - name: Record the toolchain
         run: |

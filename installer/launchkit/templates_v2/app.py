@@ -1378,7 +1378,11 @@ async def run(spec, args, *, application_startup=None):
             if stop.is_set():
                 return
             if console_front:
-                if application_startup is not None or callable(getattr(application.integration, "console_login_factory", None)):
+                # The default factory enrolls only through a selected native Toolkit
+                # runtime. A startup without one keeps the configured password login.
+                # A present hook, valid or not, keeps the guarded factory.
+                if (getattr(application.integration, "console_login_factory", None) is not None
+                        or application_startup is not None and getattr(application_startup, "console_login", True)):
                     console_front.console_login_factory = application.console_login_factory
                 controller_review = callable(getattr(application.integration, "controller_review_factory", None))
                 if controller_review:

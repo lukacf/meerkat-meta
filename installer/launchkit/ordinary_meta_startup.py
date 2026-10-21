@@ -54,6 +54,9 @@ class OrdinaryMetaStartup:
     """
 
     require_tool_policy_source = False
+    # Its Console keeps the configured password login. Native Console login
+    # enrollment needs a selected Toolkit runtime, which this path never has.
+    console_login = False
 
     def __init__(self, *, project_lease, accepted_source, gateway,
                  definition, compiled_policies, startup_timeout,
@@ -133,6 +136,14 @@ class OrdinaryMetaStartup:
         self._check_application(application)
         self._definition_bytes, self._policy_bytes = content
         self.application = application
+        # An app copied from an earlier template installs the default Console
+        # login factory for every startup. That default enrolls only through a
+        # selected Toolkit runtime, so here it could only refuse each login.
+        # Clear it only when no hook is present: the configured password session
+        # and native_auth are this route's contract. A present hook, valid or
+        # not, keeps the guarded factory and its own refusals.
+        if getattr(getattr(application, "integration", None), "console_login_factory", None) is None:
+            application.console_login_factory = None
 
     def builder_config(self, **options):
         from meerkat_meta.builder import MetaBuilderConfig

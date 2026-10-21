@@ -65,6 +65,8 @@ async def test_real_admission_and_child_select_ordinary_meta_without_helper_prep
             assert config.prepared_application_bundle is None
             assert config.prepared_application_digest is None
             assert not startup.require_tool_policy_source
+            # The generated app reads this at Console wiring: password login, no enrollment.
+            assert startup.console_login is False
         assert factory.source._closed
     assert not (f.directory / bootstrap.FRESH_ENTRY_NAME).exists()
     assert not (f.destination / "shared").exists() and not (f.destination / "current").exists()
