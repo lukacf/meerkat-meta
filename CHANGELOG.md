@@ -1417,16 +1417,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   of the rest) next to its `reconcile_incomplete` line, which carries only
   the counts. Before, no log line named the failed edge, and most failed
   steps logged nothing.
-- An identity-first edge reconcile no longer fails every edge when a raw
-  roster member (one without the `agent_identity` label, such as a worker a
-  member spawned) has no live runtime binding. After a restart this process
-  records bindings only for the members it materializes, and the identity
-  topology never manages a raw member's wires, so the wire projection
-  leaves them out and every other edge reconciles. Before, the inspect
-  failed as a whole ("no live runtime binding recorded for roster member
-  ..."), so the bootstrap reconcile after a restart that followed a worker
-  fan-out wired none of the managed peer edges. An identity member without
-  a binding still fails the inspect, as before.
+- An identity-first edge reconcile no longer fails every edge when a roster
+  member has no live runtime binding in this process, which after a restart
+  records bindings only for the members it materializes. An identity member
+  Core holds (one registered lazily, or one whose activation failed) is read
+  through the incarnation Core committed for it, the read the reconcile
+  plans on, so its edges reconcile like any other and a dropped one is
+  still unwired. A raw member's wires (no `agent_identity` label, such as a
+  worker a member spawned) are left out: the identity topology never
+  manages them. Before, the inspect failed as a whole ("no live runtime
+  binding recorded for roster member ..."), so the bootstrap reconcile after
+  such a restart wired none of the managed peer edges.
 - The console Memory and WorkGraph panels no longer move their controls when
   a refresh fails or recovers. Memory rendered the refresh error above its
   tabs and body, and WorkGraph rendered it above the work items, which stay

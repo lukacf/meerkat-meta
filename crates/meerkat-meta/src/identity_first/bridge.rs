@@ -5664,8 +5664,10 @@ impl MobSessionBridge {
         require_reciprocal: bool,
     ) -> Result<Vec<(AgentRuntimeId, AgentRuntimeId)>, BridgeError> {
         let members = self.handle.list_members_including_retiring().await;
-        let runtime_members = self.runtime_members.read().await;
-        let member_runtimes = runtime_members
+        let member_runtimes = self
+            .runtime_members
+            .read()
+            .await
             .iter()
             .map(|(runtime, member)| (member.clone(), runtime.clone()))
             .collect::<HashMap<_, _>>();
@@ -5695,39 +5697,46 @@ impl MobSessionBridge {
             })
             .collect::<std::collections::BTreeSet<_>>();
         // Wires are reported as runtime ids, so each roster member id has to be
-        // looked up in the live bookkeeping. It must NOT be derived.
+        // resolved to the incarnation it names. It must NOT be derived from the
+        // roster id.
         //
         // The old fallback decoded the roster id and parsed the result as an
         // AgentRuntimeId. Since the stable-identity lowering a roster id decodes
         // to a bare durable identity like `agent:alpha`, and `AgentRuntimeId`
         // validates only non-empty/no-space/no-slash - so that parse SUCCEEDS
-        // and mints a runtime id that names no incarnation at all. A missing
-        // mapping is a bookkeeping gap, and for an identity member (labelled
-        // `agent_identity` at every identity-first spawn) the honest answer is
-        // to say so: identity decisions then fail closed instead of reading a
-        // present wire as absent. A raw member (a worker a member spawned,
-        // say) has no binding after a restart until something materializes
-        // it, and the identity topology never manages its wires (bound, they
-        // are filtered out downstream), so its wires are left out instead of
-        // failing every other wire.
-        let identity_members = members
+        // and mints a runtime id that names no incarnation at all.
+        //
+        // The bookkeeping answers first. An identity member (labelled
+        // `agent_identity` at every identity-first spawn) it holds no binding
+        // for, such as one Core restored that this process has not
+        // materialized, is resolved through the incarnation Core committed
+        // for it: the read the identity runtime's binding epoch makes
+        // (`live_member`), so the projection and the epoch name the same
+        // incarnation and a present wire is never read as absent. A raw member
+        // (a worker a member spawned, say) the identity topology never
+        // manages: bound, its wires are filtered out downstream, so unbound
+        // they are left out instead of failing every other wire.
+        let endpoints = edges
             .iter()
-            .filter(|member| member.labels.contains_key("agent_identity"))
-            .map(|member| member.agent_identity.to_string())
+            .flat_map(|(a, b)| [a.as_str(), b.as_str()])
             .collect::<std::collections::BTreeSet<_>>();
+        let mut committed: HashMap<String, Option<AgentRuntimeId>> = HashMap::new();
+        for member in &members {
+            let member_id = member.agent_identity.to_string();
+            if member_runtimes.contains_key(&member_id) || !endpoints.contains(member_id.as_str()) {
+                continue;
+            }
+            let Some(identity) = member.labels.get("agent_identity") else {
+                continue;
+            };
+            let runtime_id = self
+                .committed_identity_member_runtime_id(identity, &member.agent_identity)
+                .await?;
+            committed.insert(member_id, runtime_id);
+        }
         let resolve = |member_id: &str| -> Result<Option<AgentRuntimeId>, BridgeError> {
-            // Wires report incarnations, and an incarnation cannot be derived from a
-            // stable roster id - the generation simply is not in it. So this one has
-            // no strict-derivation fallback available: bookkeeping or nothing.
             let Some(runtime_id) = member_runtimes.get(member_id) else {
-                if !identity_members.contains(member_id) {
-                    return Ok(None);
-                }
-                return Err(BridgeError::Mob(format!(
-                    "no live runtime binding recorded for roster member {member_id}; the wire \
-                     projection cannot name its incarnation (retryable: the mapping is \
-                     populated at create/resume materialization)"
-                )));
+                return Ok(committed.get(member_id).cloned().flatten());
             };
             AgentRuntimeId::parse(runtime_id).map(Some).map_err(|error| {
                 BridgeError::Mob(format!(
@@ -5743,6 +5752,37 @@ impl MobSessionBridge {
             }
         }
         Ok(wires)
+    }
+
+    /// The incarnation Core committed for the identity member `member_id`,
+    /// labelled with `label` as its durable identity, read back from the
+    /// roster as [`SessionBridge::live_member`] reads it; `None` when Core
+    /// holds no such member. A label that names another member, or a read
+    /// that fails, refuses.
+    async fn committed_identity_member_runtime_id(
+        &self,
+        label: &str,
+        member_id: &MobAgentIdentity,
+    ) -> Result<Option<AgentRuntimeId>, BridgeError> {
+        let identity = AgentIdentity::parse(label).map_err(|error| {
+            BridgeError::Mob(format!(
+                "roster member {member_id} carries an unusable agent_identity label {label}: \
+                 {error}"
+            ))
+        })?;
+        if member_id_for_identity(&identity) != *member_id {
+            return Err(BridgeError::Mob(format!(
+                "roster member {member_id} is labelled with identity {identity}, which is \
+                 another member's"
+            )));
+        }
+        match self.handle.get_member(member_id).await {
+            Ok(Some(entry)) => public_runtime_id(&identity, &entry.agent_runtime_id).map(Some),
+            Ok(None) => Ok(None),
+            Err(error) => Err(BridgeError::Mob(format!(
+                "reading the committed roster entry for {identity}: {error}"
+            ))),
+        }
     }
 
     async fn runtime_session_id(
