@@ -136,6 +136,13 @@ class OrdinaryMetaStartup:
         self._check_application(application)
         self._definition_bytes, self._policy_bytes = content
         self.application = application
+        # An app copied from an earlier template installs the default Console
+        # login factory for every startup. That default enrolls only through a
+        # selected Toolkit runtime, so here it could only refuse each login.
+        # Clear it: the configured password session and native_auth are this
+        # route's contract. An integration-declared factory keeps its semantics.
+        if not callable(getattr(getattr(application, "integration", None), "console_login_factory", None)):
+            application.console_login_factory = None
 
     def builder_config(self, **options):
         from meerkat_meta.builder import MetaBuilderConfig

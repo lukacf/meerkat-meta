@@ -4,6 +4,7 @@ This proves host enrollment wiring and lifetime fences, not native execution.
 The existing adapter fixture retains real SDK types but opens no private pipe.
 """
 import asyncio
+import importlib.util
 import json
 import sys
 from types import SimpleNamespace
@@ -142,7 +143,29 @@ async def test_default_login_selection_keeps_exact_original_runtime_client_sourc
         await value.application.stop()
 
 
-@pytest.mark.parametrize("case", ["ordinary-meta", "toolkit", "toolkit-refused"])
+EARLIER_WIRING = ('                if application_startup is not None or callable(getattr(application.integration, '
+    '"console_login_factory", None)):\n')
+
+
+def earlier_template_host(monkeypatch, root):
+    # The installed copy of an earlier template: its Console wiring selects
+    # the default login factory whenever any startup is present.
+    path = root / "app.py"
+    source = path.read_text()
+    start = source.find("                # The default factory enrolls only")
+    if start != -1:
+        end = source.index("\n", source.index('"console_login", True)):', start)) + 1
+        source = source[:start] + EARLIER_WIRING + source[end:]
+    assert source.count(EARLIER_WIRING) == 1 and '"console_login", True' not in source
+    path.write_text(source)
+    definition = importlib.util.spec_from_file_location("application_test_host", path)
+    module = importlib.util.module_from_spec(definition)
+    definition.loader.exec_module(module)
+    monkeypatch.setattr(module, "ROOT", root)
+    return module
+
+
+@pytest.mark.parametrize("case", ["ordinary-meta", "earlier-template", "ordinary-hook", "toolkit", "toolkit-refused"])
 async def test_actual_run_installs_default_login_only_for_a_toolkit_startup(tmp_path, monkeypatch, case):
     # Actual generated app.run() Console wiring and password login through the
     # ASGI front, with inert runtime/SDK doubles. The ordinary Meta startup runs
@@ -151,16 +174,34 @@ async def test_actual_run_installs_default_login_only_for_a_toolkit_startup(tmp_
     from launchkit.ordinary_meta_startup import OrdinaryMetaStartup
     toolkit = case.startswith("toolkit")
     monkeypatch.delitem(sys.modules, "native_console_login", raising=False)
-    value = package(tmp_path, monkeypatch, adapter=ADAPTER.replace(HOOK, ""))
-    module, contexts, fronts, forwarded = value.module, [], [], []
+    declared = HOOK.replace("controller_review_factory", "console_login_factory")
+    value = package(tmp_path, monkeypatch, adapter=ADAPTER.replace(HOOK, declared if case == "ordinary-hook" else ""))
+    module = earlier_template_host(monkeypatch, value.root) if case == "earlier-template" else value.module
+    contexts, fronts, forwarded, owners = [], [], [], []
     auth = sys.modules[module.ConsoleFront.__module__]
     (value.root / "application/tool-policy.json").write_text(json.dumps({
         "provider_id": "inert-console-source", "policy_id": "inert-console-policy", "revision": 1,
         "members": [{"member_identity": row["identity"], "grants": []} for row in value.spec["agents"]]}))
+    class RefusingOwner:
+        # The declared hook's own login owner; its admission refuses.
+        def is_current(self):
+            return True
+        def start(self):
+            raise RuntimeError("INERT_DECLARED_LOGIN_REFUSAL")
+        def revoke(self):
+            pass
+        async def ready(self):
+            return False
+        async def retire(self, reason):
+            pass
+        async def close(self):
+            pass
+
     original_context = module.ApplicationContext
     def make_context(root, deployment, stop):
         context = original_context(root, deployment, stop)
         context.events = []
+        context.owner_factory = lambda login: owners.append(RefusingOwner()) or owners[-1]
         contexts.append(context)
         return context
     monkeypatch.setattr(module, "ApplicationContext", make_context)
@@ -286,7 +327,7 @@ async def test_actual_run_installs_default_login_only_for_a_toolkit_startup(tmp_
     await module.run(value.spec, args, application_startup=startup)
     front, = fronts
     application = contexts[0]._application
-    if not toolkit:
+    if case in ("ordinary-meta", "earlier-template"):
         # The configured password session and native_auth; no enrollment owner.
         assert front.statuses == [200, 200] and len(forwarded) == 2 and front.required == [False]
         assert front.console_login_factory is None and private.selections == []
@@ -297,6 +338,12 @@ async def test_actual_run_installs_default_login_only_for_a_toolkit_startup(tmp_
     assert front.console_login_factory.__self__ is application
     assert front.console_login_factory.__func__ is module.Application.console_login_factory
     assert front.required == [True]
+    if case == "ordinary-hook":
+        # A declared hook stays the login owner: its refusal is never replaced
+        # by the password session, and no Toolkit enrollment is attempted.
+        assert front.statuses == [503, 503] and forwarded == []
+        assert len(application.integration.calls) == len(owners) == 1 and private.selections == []
+        return
     assert len(private.selections) == 1 and enrollment.retire_calls == 1 and private.close_calls == 0
     if case == "toolkit-refused":
         assert front.statuses == [503, 503] and forwarded == []
