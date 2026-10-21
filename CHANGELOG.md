@@ -1648,7 +1648,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`IdentityRuntime::retire`; its next wake then starts it fresh), and any
   other bound identity starts fresh, with no history (its status reports
   `replaced_session`). A check that reads any mob storage is planned for
-  0.9.4.1.
+  0.9.5.
 - A lost or replaced state directory cannot be detected: the identity
   bindings are recorded in it, so a start over an emptied or replaced
   directory starts every identity with an empty transcript and does not
