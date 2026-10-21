@@ -1230,6 +1230,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A Meta-hosted member's own mob operator tools (`spawn_member`,
+  `spawn_many_members` and the rest) admit against its session's mob
+  operator authority, including a host's narrowing of it. Meerkat 0.9.4
+  binds that authority on a session's external tools through
+  `AgentToolDispatcher::bind_session_mob_tool_authority`, and Meta's own
+  wrappers of a member's tools now pass it to the tools they wrap: the
+  composition of customizer tools over a member's tools, the identity
+  customizer tools (for each publication), the agent-memory recorder, the
+  schedule tool wrappers and the parent-mob tool wrapper. Without it the
+  wrapped tools stayed unbound, listed but denying every call.
 - An unchanged roster no longer changes the shared access facts, whichever
   console route records them. Every console experience request recorded an
   identity that is both a listed agent and a roster member twice: the

@@ -480,6 +480,13 @@ impl FiringHostGatedScheduleTools {
 
 #[async_trait]
 impl meerkat_core::AgentToolDispatcher for FiringHostGatedScheduleTools {
+    fn bind_session_mob_tool_authority(
+        &self,
+        authority: Option<Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>>,
+    ) {
+        self.inner.bind_session_mob_tool_authority(authority);
+    }
+
     fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
         self.inner.tools()
     }
@@ -595,6 +602,13 @@ impl MobIdentityScheduleToolDispatcher {
 
 #[async_trait]
 impl meerkat_core::AgentToolDispatcher for MobIdentityScheduleToolDispatcher {
+    fn bind_session_mob_tool_authority(
+        &self,
+        authority: Option<Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>>,
+    ) {
+        self.inner.bind_session_mob_tool_authority(authority);
+    }
+
     fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
         self.inner.tools()
     }
@@ -1815,6 +1829,28 @@ pub fn spawn_schedule_claim_watchdog(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// Both schedule wrappers pass the session's mob operator authority to
+    /// the tools they wrap.
+    #[test]
+    fn the_schedule_wrappers_bind_the_session_mob_authority_on_their_inner_tools() {
+        use crate::tool_application_test_support::{MobAuthorityBindProbe, session_mob_authority};
+        let inner = Arc::new(MobAuthorityBindProbe::default());
+        let identity_tools =
+            MobIdentityScheduleToolDispatcher::new_for_test(inner.clone(), |_| async { None });
+        let gated = FiringHostGatedScheduleTools {
+            inner: Arc::new(identity_tools),
+            binding: ScheduleFiringHostBinding::external_driver(),
+        };
+        let authority = session_mob_authority();
+        meerkat_core::AgentToolDispatcher::bind_session_mob_tool_authority(
+            &gated,
+            Some(Arc::clone(&authority)),
+        );
+        assert!(inner.last_bound_is(Some(&authority)));
+        meerkat_core::AgentToolDispatcher::bind_session_mob_tool_authority(&gated, None);
+        assert!(inner.last_bound_is(None));
+    }
 
     use meerkat::{
         AgentFactory, MemoryScheduleStore, MobTargetBinding,

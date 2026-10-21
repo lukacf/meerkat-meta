@@ -1475,6 +1475,17 @@ impl RecorderToolDispatcher {
 
 #[async_trait]
 impl meerkat_core::agent::AgentToolDispatcher for RecorderToolDispatcher {
+    /// The wrapped member tools may hold a mob runtime's own operator tools,
+    /// which admit against the session's mob operator authority.
+    fn bind_session_mob_tool_authority(
+        &self,
+        authority: Option<Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>>,
+    ) {
+        if let Some(inner) = self.inner.as_ref() {
+            inner.bind_session_mob_tool_authority(authority);
+        }
+    }
+
     async fn resolve_tool_application(
         &self,
         source_tool: &str,
@@ -3444,6 +3455,27 @@ memory = false
                 mob.map(str::to_string),
             ),
         )))
+    }
+
+    /// The recorder passes the session's mob operator authority to the
+    /// member tools it wraps, which may hold a mob runtime's own operator
+    /// tools.
+    #[test]
+    fn the_memory_recorder_binds_the_session_mob_authority_on_the_tools_it_wraps()
+    -> Result<(), Box<dyn Error>> {
+        use crate::tool_application_test_support::{MobAuthorityBindProbe, session_mob_authority};
+        let dir = tempfile::tempdir()?;
+        let provider: Arc<dyn AgentMemoryProvider> =
+            Arc::new(SqliteAgentMemoryStore::open(dir.path())?);
+        let inner = Arc::new(MobAuthorityBindProbe::default());
+        let recorder = RecorderToolDispatcher::new(
+            Some(inner.clone()),
+            MemoryRecorder::new(provider, AgentMemoryConfig::default(), identity()?, None),
+        );
+        let authority = session_mob_authority();
+        recorder.bind_session_mob_tool_authority(Some(Arc::clone(&authority)));
+        assert!(inner.last_bound_is(Some(&authority)));
+        Ok(())
     }
 
     fn own_identity_scope() -> MemoryScope {

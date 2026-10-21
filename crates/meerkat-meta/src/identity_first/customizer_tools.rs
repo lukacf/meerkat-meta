@@ -49,12 +49,20 @@ use meerkat_mob::{
 
 use super::types::AgentIdentity;
 
+/// The session's mob operator authority, as the agent factory binds it.
+type SessionMobAuthority =
+    Option<Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>>;
+
 /// One `customize_build` result: the dispatcher serving the published tools
 /// (`None` when the build declared none) and the publication generation.
+/// `mob_authority` is the last session mob operator authority bound on this
+/// dispatcher (outer `None` until one is bound); each later publication is
+/// bound with it before it serves.
 #[derive(Clone)]
 struct Published {
     generation: u64,
     dispatcher: Option<Arc<dyn AgentToolDispatcher>>,
+    mob_authority: Option<SessionMobAuthority>,
 }
 
 /// The stable, dynamic customizer-tool dispatcher of one identity member.
@@ -88,6 +96,7 @@ impl IdentityCustomizerTools {
             current: RwLock::new(Published {
                 generation: 0,
                 dispatcher: None,
+                mob_authority: None,
             }),
             execution_authority_id: NEXT_EXECUTION_AUTHORITY_ID.fetch_add(1, Ordering::Relaxed),
         }
@@ -113,6 +122,9 @@ impl IdentityCustomizerTools {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         current.generation = current.generation.saturating_add(1);
+        if let (Some(dispatcher), Some(authority)) = (dispatcher.as_ref(), &current.mob_authority) {
+            dispatcher.bind_session_mob_tool_authority(authority.clone());
+        }
         current.dispatcher = dispatcher;
         current.generation
     }
@@ -182,6 +194,20 @@ impl IdentityCustomizerTools {
 
 #[async_trait::async_trait]
 impl AgentToolDispatcher for IdentityCustomizerTools {
+    /// The current publication is bound with the session's mob operator
+    /// authority, and so is every later one: a host's tools may hold
+    /// operator tools that admit against it.
+    fn bind_session_mob_tool_authority(&self, authority: SessionMobAuthority) {
+        let mut current = self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(dispatcher) = current.dispatcher.as_ref() {
+            dispatcher.bind_session_mob_tool_authority(authority.clone());
+        }
+        current.mob_authority = Some(authority);
+    }
+
     async fn resolve_tool_application(
         &self,
         source_tool: &str,

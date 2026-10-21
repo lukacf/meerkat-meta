@@ -1976,6 +1976,15 @@ struct AutoWireParentMobToolDispatcher {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl meerkat_core::AgentToolDispatcher for AutoWireParentMobToolDispatcher {
+    /// The wrapped mob tools admit against the session's mob operator
+    /// authority, so it reaches them unchanged.
+    fn bind_session_mob_tool_authority(
+        &self,
+        authority: Option<Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>>,
+    ) {
+        self.inner.bind_session_mob_tool_authority(authority);
+    }
+
     fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
         self.inner
             .tools()
@@ -11423,6 +11432,26 @@ mod tests {
         ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
             Err(meerkat_core::ToolError::not_found(call.name))
         }
+    }
+
+    /// The wrapped mob tools admit against the session's mob operator
+    /// authority, so the wrapper passes the binding through unchanged.
+    #[test]
+    fn the_parent_mob_tool_wrapper_binds_the_session_mob_authority_on_its_tools() {
+        use crate::tool_application_test_support::{MobAuthorityBindProbe, session_mob_authority};
+        let inner = Arc::new(MobAuthorityBindProbe::default());
+        let wrapper = AutoWireParentMobToolDispatcher {
+            inner: inner.clone(),
+            ..wrapper_with_overrides(ImplicitDelegateRetirementOverrides::default())
+        };
+        let authority = session_mob_authority();
+        meerkat_core::AgentToolDispatcher::bind_session_mob_tool_authority(
+            &wrapper,
+            Some(Arc::clone(&authority)),
+        );
+        assert!(inner.last_bound_is(Some(&authority)));
+        meerkat_core::AgentToolDispatcher::bind_session_mob_tool_authority(&wrapper, None);
+        assert!(inner.last_bound_is(None));
     }
 
     fn wrapper_with_overrides(
