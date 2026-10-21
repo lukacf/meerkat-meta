@@ -1,5 +1,5 @@
 import type { ConsoleAgent, ConsoleFrame } from "../types";
-import { cursorSeq } from "./identity-log";
+import { WORKGRAPH_LOCAL_SOURCE_KIND } from "./adapters";
 
 /// The member status poll is the server's authoritative idle signal: the
 /// console projection reports no response phase and Core reports no open
@@ -41,37 +41,45 @@ export function decideIdleSettlement(args: {
   return args.armedAtVersion === args.logVersionNow ? "settle" : "arm";
 }
 
-/// The newest frame the console had seen when the member was settled, in
-/// transcript order: timestamp, then the console cursor sequence.
+/// The identity key of a frame in the console's per-identity log: the
+/// event id both pipelines carry, then the cursor, then a synthetic key.
+export function consoleFrameKey(frame: ConsoleFrame): string {
+  if (frame.id) return frame.id;
+  if (frame.cursor) return frame.cursor;
+  return `${frame.event}:${frame.identity || ""}:${frame.interactionId || ""}:${frame.timestampMs || 0}`;
+}
+
+/// What the console had seen when the member was settled: every frame key
+/// in the log, and the newest SERVER timestamp among them. Frames the
+/// console mints itself (`console-local`) carry the browser's clock, which
+/// can run ahead of the server's, so they never set the timestamp.
 export interface IdleWatermark {
   timestampMs: number;
-  cursorSeq: number | null;
+  settledKeys: ReadonlySet<string>;
 }
 
 export function idleWatermarkFor(frames: readonly ConsoleFrame[]): IdleWatermark | undefined {
-  let newest: IdleWatermark | undefined;
+  if (frames.length === 0) return undefined;
+  let newest = Number.NEGATIVE_INFINITY;
+  const settledKeys = new Set<string>();
   for (const frame of frames) {
-    if (typeof frame.timestampMs !== "number") continue;
-    const seq = cursorSeq(frame.cursor);
-    if (!newest || frame.timestampMs > newest.timestampMs
-      || (frame.timestampMs === newest.timestampMs && seq !== null
-        && (newest.cursorSeq === null || seq > newest.cursorSeq))) {
-      newest = { timestampMs: frame.timestampMs, cursorSeq: seq };
+    settledKeys.add(consoleFrameKey(frame));
+    if (frame.sourceKind !== WORKGRAPH_LOCAL_SOURCE_KIND
+      && typeof frame.timestampMs === "number" && frame.timestampMs > newest) {
+      newest = frame.timestampMs;
     }
   }
-  return newest;
+  return { timestampMs: newest, settledKeys };
 }
 
-/// Whether a frame is newer than an idle watermark. A frame at or before it
-/// was settled, and so is a frame without a timestamp. A frame stamped in
-/// the watermark's millisecond is newer only when both carry a console
-/// cursor and its cursor is later; without cursors it counts as settled.
+/// Whether a frame is newer than an idle watermark. A frame the console had
+/// when the member was settled is settled, and so is a late frame stamped
+/// strictly before the watermark. Any other frame is read, including one
+/// stamped in the watermark's own millisecond.
 export function isAfterIdleWatermark(frame: ConsoleFrame, watermark: IdleWatermark | undefined): boolean {
   if (!watermark) return true;
-  if (typeof frame.timestampMs !== "number") return false;
-  if (frame.timestampMs !== watermark.timestampMs) return frame.timestampMs > watermark.timestampMs;
-  const seq = cursorSeq(frame.cursor);
-  return seq !== null && watermark.cursorSeq !== null && seq > watermark.cursorSeq;
+  if (watermark.settledKeys.has(consoleFrameKey(frame))) return false;
+  return !(typeof frame.timestampMs === "number" && frame.timestampMs < watermark.timestampMs);
 }
 
 /// The frames a fold should still read after an idle watermark. Without a

@@ -6,6 +6,7 @@ import { consoleCustomPanelTarget, type ConsolePanelDefinition, type ConsolePane
 import { withConsoleSendStorageLock } from "./lib/send-storage-lock";
 import {
   framesAfterIdleWatermark,
+  consoleFrameKey,
   decideIdleSettlement,
   idleWatermarkFor,
   isAfterIdleWatermark,
@@ -1341,9 +1342,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   /// fallback only fires for synthetic frames without an id; including
   /// `interactionId` keeps interaction-bound events from colliding.
   function frameKey(frame: ConsoleFrame): string {
-    if (frame.id) return frame.id;
-    if (frame.cursor) return frame.cursor;
-    return `${frame.event}:${frame.identity || ""}:${frame.interactionId || ""}:${frame.timestampMs || 0}`;
+    return consoleFrameKey(frame);
   }
 
   /// Append one frame to the identity log, deduped by key. Appended

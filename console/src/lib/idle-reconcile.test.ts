@@ -121,29 +121,36 @@ test("work that starts after the idle watermark is busy again", () => {
   assert.equal(projection.busy, false);
 });
 
-test("a frame at or before the watermark is settled, a newer one is not", () => {
-  const watermark = { timestampMs: 2004, cursorSeq: 40 };
-  assert.equal(isAfterIdleWatermark(frame("tool_execution_completed", 1500, { cursor: "console:90" }), watermark), false);
-  assert.equal(isAfterIdleWatermark(frame("run_started", 2005, { cursor: "console:1" }), watermark), true);
-  assert.equal(isAfterIdleWatermark({ ...frame("run_started", 0), timestampMs: undefined }, watermark), false,
-    "a frame without a timestamp was settled");
+test("a frame the console had when it settled is settled; a later one is read, even in the same millisecond", () => {
+  const frames = callbackPauseThenContinuation();
+  const watermark = idleWatermarkFor(frames);
+  assert.equal(watermark?.timestampMs, 2004);
+  for (const seen of frames) assert.equal(isAfterIdleWatermark(seen, watermark), false);
+  assert.equal(isAfterIdleWatermark(frame("run_started", 2004, { runId: "R9" }), watermark), true,
+    "a new frame stamped in the watermark's millisecond is read");
+  assert.equal(isAfterIdleWatermark(frame("run_started", 2005, { runId: "R9" }), watermark), true);
+  assert.equal(isAfterIdleWatermark(frame("tool_execution_completed", 1500), watermark), false,
+    "a late frame stamped before the watermark belongs to the settled turn");
+  assert.equal(isAfterIdleWatermark({ ...frame("run_started", 0), timestampMs: undefined }, watermark), true,
+    "a new frame without a timestamp is read");
   assert.equal(isAfterIdleWatermark(frame("run_started", 1), undefined), true);
-  // The same millisecond: the console cursor orders them.
-  assert.equal(isAfterIdleWatermark(frame("run_started", 2004, { cursor: "console:41" }), watermark), true);
-  assert.equal(isAfterIdleWatermark(frame("run_started", 2004, { cursor: "console:40" }), watermark), false);
-  assert.equal(isAfterIdleWatermark(frame("run_started", 2004, { cursor: undefined }), watermark), false,
-    "a same-millisecond frame without a cursor counts as settled");
-  assert.equal(isAfterIdleWatermark(frame("run_started", 2004, { cursor: "console:41" }), { timestampMs: 2004, cursorSeq: null }), false);
 });
 
-test("the watermark is the newest frame by timestamp, then console cursor", () => {
+test("a skewed browser clock does not hide a new server frame", () => {
+  // A frame the console mints itself carries the browser's clock, here an
+  // hour ahead of the server's.
   const frames = [
-    frame("run_started", 2004, { cursor: "console:7" }),
-    frame("text_delta", 2004, { cursor: "console:9" }),
-    frame("text_delta", 2003, { cursor: "console:12" }),
-    { ...frame("user_input", 0), timestampMs: undefined },
+    ...callbackPauseThenContinuation(),
+    frame("workgraph_card", 2004 + 3_600_000, { sourceKind: "console-local" }),
   ];
-  assert.deepEqual(idleWatermarkFor(frames), { timestampMs: 2004, cursorSeq: 9 });
+  const watermark = idleWatermarkFor(frames);
+  assert.equal(watermark?.timestampMs, 2004, "only server timestamps set the watermark");
+  const next = frame("run_started", 2100, { interactionId: "I2", runId: "R3" });
+  assert.equal(isAfterIdleWatermark(next, watermark), true);
+  assert.equal(fold(framesAfterIdleWatermark([...frames, next], watermark)).busy, true);
+});
+
+test("no frames, no watermark", () => {
   assert.equal(idleWatermarkFor([]), undefined);
 });
 

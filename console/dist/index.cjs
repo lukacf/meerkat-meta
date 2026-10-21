@@ -43993,264 +43993,6 @@ async function withConsoleSendStorageLock(key, update) {
   }
 }
 
-// src/lib/identity-log.ts
-function cursorSeq(cursor) {
-  if (!cursor) return null;
-  const match = /^console:(\d+)$/.exec(cursor);
-  if (!match) return null;
-  const parsed = Number(match[1]);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-function transcriptOrder(a, aIndex, b2, bIndex) {
-  const ta = typeof a.timestampMs === "number" ? a.timestampMs : Number.MAX_SAFE_INTEGER;
-  const tb = typeof b2.timestampMs === "number" ? b2.timestampMs : Number.MAX_SAFE_INTEGER;
-  if (ta !== tb) return ta - tb;
-  const ca = cursorSeq(a.cursor);
-  const cb = cursorSeq(b2.cursor);
-  if (ca !== null && cb !== null && ca !== cb) return ca - cb;
-  return aIndex - bIndex;
-}
-function insertSorted(sorted, frame) {
-  let lo = 0;
-  let hi = sorted.length;
-  while (lo < hi) {
-    const mid = lo + hi >>> 1;
-    if (transcriptOrder(sorted[mid], 0, frame, 1) <= 0) lo = mid + 1;
-    else hi = mid;
-  }
-  if (lo === sorted.length) sorted.push(frame);
-  else sorted.splice(lo, 0, frame);
-}
-function sortedEvents(log) {
-  if (log.sorted) return log.sorted;
-  const view = log.events.map((frame, index2) => ({ frame, index: index2 })).sort((a, b2) => transcriptOrder(a.frame, a.index, b2.frame, b2.index)).map((entry) => entry.frame);
-  log.sorted = view;
-  return view;
-}
-function pushFrame(log, key, frame) {
-  if (log.byKey.has(key)) return false;
-  log.byKey.set(key, log.events.length);
-  log.events.push(frame);
-  log.version += 1;
-  if (log.sorted) insertSorted(log.sorted, frame);
-  return true;
-}
-function mergeFrameUpdate(log, updated) {
-  if (!updated.id) return null;
-  const index2 = log.byKey.get(updated.id);
-  if (index2 === void 0) return null;
-  const previous3 = log.events[index2];
-  if (!previous3) return null;
-  const existingVersion = previous3.frameVersion ?? 0;
-  const updatedVersion = updated.frameVersion ?? existingVersion;
-  if (updatedVersion < existingVersion) return null;
-  const next = { ...previous3, ...updated };
-  log.events[index2] = next;
-  log.version += 1;
-  const moved = previous3.timestampMs !== next.timestampMs || cursorSeq(previous3.cursor) !== cursorSeq(next.cursor);
-  if (moved) {
-    log.sorted = null;
-  } else if (log.sorted) {
-    const at = log.sorted.indexOf(previous3);
-    if (at >= 0) log.sorted[at] = next;
-    else log.sorted = null;
-  }
-  return { previous: previous3, next, moved };
-}
-function trimIdentityLogCore(log, max, keyOf) {
-  const sorted = sortedEvents(log);
-  const drop = sorted.length - max;
-  if (drop <= 0) return null;
-  const dropped = new Set(sorted.slice(0, drop));
-  const retained = log.events.filter((frame) => !dropped.has(frame));
-  log.events = retained;
-  log.sorted = sorted.slice(drop);
-  log.byKey.clear();
-  retained.forEach((frame, index2) => log.byKey.set(keyOf(frame), index2));
-  log.version += 1;
-  return retained;
-}
-function resetIdentityLogCore(log) {
-  log.events = [];
-  log.byKey.clear();
-  log.sorted = null;
-  log.version += 1;
-}
-
-// src/lib/idle-reconcile.ts
-function agentReportsIdle(agent) {
-  return agent.response_phase === null && agent.progress?.run_state === "idle";
-}
-function decideIdleSettlement(args) {
-  if (!agentReportsIdle(args.agent)) return "reset";
-  if (args.logVersionAtRequest === void 0 || args.logVersionAtRequest !== args.logVersionNow) return "reset";
-  if (args.sendInFlight) return "reset";
-  if (!args.foldBusy && args.foldPhase === null) return "reset";
-  return args.armedAtVersion === args.logVersionNow ? "settle" : "arm";
-}
-function idleWatermarkFor(frames) {
-  let newest;
-  for (const frame of frames) {
-    if (typeof frame.timestampMs !== "number") continue;
-    const seq = cursorSeq(frame.cursor);
-    if (!newest || frame.timestampMs > newest.timestampMs || frame.timestampMs === newest.timestampMs && seq !== null && (newest.cursorSeq === null || seq > newest.cursorSeq)) {
-      newest = { timestampMs: frame.timestampMs, cursorSeq: seq };
-    }
-  }
-  return newest;
-}
-function isAfterIdleWatermark(frame, watermark) {
-  if (!watermark) return true;
-  if (typeof frame.timestampMs !== "number") return false;
-  if (frame.timestampMs !== watermark.timestampMs) return frame.timestampMs > watermark.timestampMs;
-  const seq = cursorSeq(frame.cursor);
-  return seq !== null && watermark.cursorSeq !== null && seq > watermark.cursorSeq;
-}
-function framesAfterIdleWatermark(frames, watermark) {
-  if (!watermark) return frames;
-  return frames.filter((frame) => isAfterIdleWatermark(frame, watermark));
-}
-
-// src/ConsoleApp.tsx
-var import_react49 = __toESM(require("react"));
-
-// src/lib/agents.ts
-function buildConsoleIdentityAliasMap(agents) {
-  const map4 = /* @__PURE__ */ new Map();
-  for (const agent of agents) {
-    const canonical = (agent.identity || agent.member_id || agent.agent_id || "").trim();
-    if (!canonical) continue;
-    const labelIdentity = typeof agent.labels?.agent_identity === "string" ? agent.labels.agent_identity.trim() : "";
-    for (const alias of [agent.identity, agent.member_id, agent.agent_id, labelIdentity]) {
-      const key = alias?.trim();
-      if (key && !map4.has(key)) map4.set(key, canonical);
-    }
-  }
-  return map4;
-}
-function canonicalConsoleIdentityFromMap(identity, aliases) {
-  const normalized = identity?.trim() || "";
-  if (!normalized) return "";
-  return aliases.get(normalized) ?? normalized;
-}
-function normalizeModelCapabilities(entry) {
-  const record8 = entry && typeof entry === "object" ? entry : {};
-  const caps = record8.model_capabilities && typeof record8.model_capabilities === "object" ? record8.model_capabilities : {};
-  return { image_input: caps.image_input === true };
-}
-function normalizeAgents(experience, modules) {
-  const identityStatusRows = Array.isArray(experience?.identity_status?.rows) ? experience.identity_status.rows : [];
-  const normalizedIdentityStatusRows = identityStatusRows.map((entry) => normalizeIdentityStatusRow(entry)).filter((entry) => entry !== null);
-  const identityStatusByIdentity = new Map(
-    normalizedIdentityStatusRows.map((row) => [row.identity, row])
-  );
-  const snapshotAgents = experience?.agent_sidebar?.live_snapshot?.agents;
-  if (Array.isArray(snapshotAgents) && snapshotAgents.length > 0) {
-    const agents = snapshotAgents.map((entry) => {
-      const entryIdentity = typeof entry.identity === "string" ? entry.identity.trim() : "";
-      const entryMemberId = typeof entry.member_id === "string" ? entry.member_id.trim() : "";
-      const entryLabels = entry.labels && typeof entry.labels === "object" ? entry.labels : {};
-      const durableAgentIdentity = typeof entryLabels.agent_identity === "string" ? entryLabels.agent_identity.trim() : "";
-      const statusRow = identityStatusByIdentity.get(durableAgentIdentity) || identityStatusByIdentity.get(entryIdentity) || identityStatusByIdentity.get(entryMemberId) || normalizeIdentityStatusRow(entry);
-      const watchFields = normalizeSidebarWatchFields(entry);
-      const responsePhase = normalizeResponsePhase(entry.response_phase);
-      const modelCapabilities = entry.model_capabilities !== void 0 ? normalizeModelCapabilities(entry) : normalizeModelCapabilities(identityStatusRows.find((row) => {
-        const normalized = normalizeIdentityStatusRow(row);
-        return normalized?.identity === statusRow?.identity;
-      }));
-      return {
-        ...statusRow?.identity ? { identity: statusRow.identity } : durableAgentIdentity ? { identity: durableAgentIdentity } : entry.identity ? { identity: String(entry.identity) } : {},
-        agent_id: String(entry.agent_id || statusRow?.identity || durableAgentIdentity || entry.identity || entry.member_id || ""),
-        member_id: String(entry.member_id || statusRow?.identity || entry.identity || entry.agent_id || ""),
-        ...typeof entry.session_id === "string" && entry.session_id.trim() ? { session_id: entry.session_id.trim() } : {},
-        label: String(entry.label || statusRow?.display_name || entry.display_name || statusRow?.identity || entry.identity || entry.member_id || entry.agent_id || "unknown"),
-        kind: String(entry.kind || statusRow?.role || entry.role || "module_agent"),
-        ...statusRow?.role !== void 0 ? { role: statusRow.role } : entry.role !== void 0 ? { role: String(entry.role) } : {},
-        ...statusRow?.state !== void 0 ? { state: statusRow.state } : entry.state !== void 0 ? { state: String(entry.state) } : {},
-        ...statusRow?.addressability ? { addressability: statusRow.addressability } : {},
-        ...statusRow?.generation !== void 0 ? { generation: statusRow.generation } : {},
-        ...statusRow?.progress !== void 0 ? { progress: statusRow.progress } : {},
-        ...(entry.response_phase === null || responsePhase !== null) && { response_phase: responsePhase },
-        ...entry.wired_to !== void 0 && { wired_to: entry.wired_to },
-        ...statusRow?.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : entry.labels !== void 0 ? { labels: entry.labels } : {},
-        ...entry.group !== void 0 && { group: String(entry.group) },
-        ...entry.subgroup !== void 0 && { subgroup: String(entry.subgroup) },
-        ...entry.addressable !== void 0 ? { addressable: Boolean(entry.addressable) } : statusRow?.addressability ? { addressable: statusRow.addressability === "addressable" } : {},
-        ...entry.affordances !== void 0 && { affordances: entry.affordances },
-        model_capabilities: modelCapabilities,
-        ...watchFields,
-        ...(() => {
-          const unobserved = normalizeUnobservedFacts(entry.unobserved) ?? statusRow?.unobserved;
-          return unobserved ? { unobserved } : {};
-        })()
-      };
-    });
-    const seen = new Set(
-      agents.flatMap((agent) => [agent.identity, agent.member_id, agent.agent_id]).filter((value) => Boolean(value)).map((value) => value.toLowerCase())
-    );
-    for (const statusRow of normalizedIdentityStatusRows) {
-      if (seen.has(statusRow.identity.toLowerCase())) continue;
-      const addressable = statusRow.addressability === "addressable";
-      agents.push({
-        identity: statusRow.identity,
-        agent_id: statusRow.identity,
-        member_id: statusRow.identity,
-        label: String(statusRow.display_name || statusRow.identity),
-        kind: String(statusRow.role || "identity"),
-        ...statusRow.role !== void 0 ? { role: statusRow.role } : {},
-        state: statusRow.state,
-        addressability: statusRow.addressability,
-        ...statusRow.generation !== void 0 ? { generation: statusRow.generation } : {},
-        ...statusRow.progress !== void 0 ? { progress: statusRow.progress } : {},
-        ...statusRow.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : {},
-        ...statusRow.labels?.group ? { group: statusRow.labels.group } : {},
-        ...statusRow.labels?.console_subgroup ? { subgroup: statusRow.labels.console_subgroup } : statusRow.labels?.org ? { subgroup: statusRow.labels.org } : {},
-        addressable,
-        affordances: { can_send_message: addressable },
-        model_capabilities: { image_input: false },
-        ...statusRow.unobserved ? { unobserved: statusRow.unobserved } : {}
-      });
-      seen.add(statusRow.identity.toLowerCase());
-    }
-    return agents;
-  }
-  if (Array.isArray(identityStatusRows) && identityStatusRows.length > 0) {
-    return identityStatusRows.map((entry) => {
-      const statusRow = normalizeIdentityStatusRow(entry);
-      const identity = statusRow?.identity || "";
-      const modelCapabilities = normalizeModelCapabilities(entry);
-      return {
-        identity,
-        agent_id: String(identity),
-        member_id: identity ? "identity-only:".concat(identity) : "",
-        ...typeof statusRow?.session_id === "string" && statusRow.session_id.trim() ? { session_id: statusRow.session_id.trim() } : {},
-        label: String(statusRow?.display_name || identity || "unknown"),
-        kind: String(statusRow?.role || "identity"),
-        ...statusRow?.role !== void 0 ? { role: statusRow.role } : {},
-        ...statusRow?.state !== void 0 ? { state: statusRow.state } : {},
-        ...statusRow?.addressability ? { addressability: statusRow.addressability } : {},
-        ...statusRow?.generation !== void 0 ? { generation: statusRow.generation } : {},
-        ...statusRow?.progress !== void 0 ? { progress: statusRow.progress } : {},
-        ...statusRow?.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : {},
-        addressable: false,
-        affordances: { can_send_message: false },
-        model_capabilities: modelCapabilities,
-        ...statusRow?.unobserved ? { unobserved: statusRow.unobserved } : {}
-      };
-    });
-  }
-  if (Array.isArray(modules) && modules.length > 0) {
-    return modules.map((moduleId) => ({
-      agent_id: String(moduleId),
-      member_id: String(moduleId),
-      label: String(moduleId),
-      kind: "module_agent",
-      model_capabilities: { image_input: false }
-    }));
-  }
-  return [];
-}
-
 // src/lib/council-entries.ts
 var COUNCIL_TOOL_NAME = "council";
 var COUNCIL_TOOL_EVENTS = /* @__PURE__ */ new Set([
@@ -44837,7 +44579,7 @@ function eventSortRank(event) {
 function isInteractionStartEvent(event) {
   return event === "user_input" || event === "interaction_started" || event === "run_started";
 }
-function cursorSeq2(cursor) {
+function cursorSeq(cursor) {
   if (!cursor) return null;
   const match = /^console:(\d+)$/.exec(cursor);
   if (!match) return null;
@@ -44859,7 +44601,7 @@ function transcriptSourceOrder(left, right) {
   const sameRun = Boolean(left.runId?.trim() && left.runId === right.runId);
   if (!sameSession && !sameInteraction && !sameRun) return null;
   if (left.sourceKind === "session_history" || right.sourceKind === "session_history") return null;
-  const a = cursorSeq2(left.cursor), b2 = cursorSeq2(right.cursor);
+  const a = cursorSeq(left.cursor), b2 = cursorSeq(right.cursor);
   return a !== null && b2 !== null && a !== b2 ? a - b2 : null;
 }
 function noteInteractionStart(interactionStartMs, frame) {
@@ -44909,8 +44651,8 @@ function transcriptFrameComparator(interactionStartMs) {
         return leftRank - rightRank;
       }
     }
-    const leftCursor = cursorSeq2(left.frame.cursor);
-    const rightCursor = cursorSeq2(right.frame.cursor);
+    const leftCursor = cursorSeq(left.frame.cursor);
+    const rightCursor = cursorSeq(right.frame.cursor);
     if (leftCursor !== null && rightCursor !== null && leftCursor !== rightCursor) {
       return leftCursor - rightCursor;
     }
@@ -47761,7 +47503,7 @@ function fullTimelineDerivation(agent, frames, options) {
   resume.compactionOpen = openCompactions.length > 0;
   for (const frame of frames) {
     noteInteractionStart(resume.interactionStartMs, frame);
-    const cursor = cursorSeq2(frame.cursor);
+    const cursor = cursorSeq(frame.cursor);
     if (cursor !== null && cursor > resume.maxCursor) resume.maxCursor = cursor;
     const scope = sequenceScopeOf(frame);
     const sequence = sourceSequence(frame);
@@ -47795,7 +47537,7 @@ function extendTimelineDerivation(previous3, agent, frames, options) {
   for (let j2 = 0; j2 < appended.length; j2++) {
     const frame = appended[j2];
     if (frame.event !== "text_delta" || options.renderTextDeltas === false || frame.sourceKind === "session_history" || isRealtimeHistoryMessage(frame) || typeof frame.timestampMs !== "number") return null;
-    const cursor = cursorSeq2(frame.cursor);
+    const cursor = cursorSeq(frame.cursor);
     if (cursor === null || cursor <= maxCursor) return null;
     if (frame.timestampMs < (resume.fold.unloadedBeforeMs ?? Number.NEGATIVE_INFINITY)) return null;
     maxCursor = cursor;
@@ -48518,6 +48260,184 @@ function createUserEntry2(message, images = [], options = {}) {
 }
 function appendOptimisticConversationEntry2(entries, optimisticEntry) {
   return optimisticEntry ? [...entries, optimisticEntry] : entries;
+}
+
+// src/lib/idle-reconcile.ts
+function agentReportsIdle(agent) {
+  return agent.response_phase === null && agent.progress?.run_state === "idle";
+}
+function decideIdleSettlement(args) {
+  if (!agentReportsIdle(args.agent)) return "reset";
+  if (args.logVersionAtRequest === void 0 || args.logVersionAtRequest !== args.logVersionNow) return "reset";
+  if (args.sendInFlight) return "reset";
+  if (!args.foldBusy && args.foldPhase === null) return "reset";
+  return args.armedAtVersion === args.logVersionNow ? "settle" : "arm";
+}
+function consoleFrameKey(frame) {
+  if (frame.id) return frame.id;
+  if (frame.cursor) return frame.cursor;
+  return "".concat(frame.event, ":").concat(frame.identity || "", ":").concat(frame.interactionId || "", ":").concat(frame.timestampMs || 0);
+}
+function idleWatermarkFor(frames) {
+  if (frames.length === 0) return void 0;
+  let newest = Number.NEGATIVE_INFINITY;
+  const settledKeys = /* @__PURE__ */ new Set();
+  for (const frame of frames) {
+    settledKeys.add(consoleFrameKey(frame));
+    if (frame.sourceKind !== WORKGRAPH_LOCAL_SOURCE_KIND && typeof frame.timestampMs === "number" && frame.timestampMs > newest) {
+      newest = frame.timestampMs;
+    }
+  }
+  return { timestampMs: newest, settledKeys };
+}
+function isAfterIdleWatermark(frame, watermark) {
+  if (!watermark) return true;
+  if (watermark.settledKeys.has(consoleFrameKey(frame))) return false;
+  return !(typeof frame.timestampMs === "number" && frame.timestampMs < watermark.timestampMs);
+}
+function framesAfterIdleWatermark(frames, watermark) {
+  if (!watermark) return frames;
+  return frames.filter((frame) => isAfterIdleWatermark(frame, watermark));
+}
+
+// src/ConsoleApp.tsx
+var import_react49 = __toESM(require("react"));
+
+// src/lib/agents.ts
+function buildConsoleIdentityAliasMap(agents) {
+  const map4 = /* @__PURE__ */ new Map();
+  for (const agent of agents) {
+    const canonical = (agent.identity || agent.member_id || agent.agent_id || "").trim();
+    if (!canonical) continue;
+    const labelIdentity = typeof agent.labels?.agent_identity === "string" ? agent.labels.agent_identity.trim() : "";
+    for (const alias of [agent.identity, agent.member_id, agent.agent_id, labelIdentity]) {
+      const key = alias?.trim();
+      if (key && !map4.has(key)) map4.set(key, canonical);
+    }
+  }
+  return map4;
+}
+function canonicalConsoleIdentityFromMap(identity, aliases) {
+  const normalized = identity?.trim() || "";
+  if (!normalized) return "";
+  return aliases.get(normalized) ?? normalized;
+}
+function normalizeModelCapabilities(entry) {
+  const record8 = entry && typeof entry === "object" ? entry : {};
+  const caps = record8.model_capabilities && typeof record8.model_capabilities === "object" ? record8.model_capabilities : {};
+  return { image_input: caps.image_input === true };
+}
+function normalizeAgents(experience, modules) {
+  const identityStatusRows = Array.isArray(experience?.identity_status?.rows) ? experience.identity_status.rows : [];
+  const normalizedIdentityStatusRows = identityStatusRows.map((entry) => normalizeIdentityStatusRow(entry)).filter((entry) => entry !== null);
+  const identityStatusByIdentity = new Map(
+    normalizedIdentityStatusRows.map((row) => [row.identity, row])
+  );
+  const snapshotAgents = experience?.agent_sidebar?.live_snapshot?.agents;
+  if (Array.isArray(snapshotAgents) && snapshotAgents.length > 0) {
+    const agents = snapshotAgents.map((entry) => {
+      const entryIdentity = typeof entry.identity === "string" ? entry.identity.trim() : "";
+      const entryMemberId = typeof entry.member_id === "string" ? entry.member_id.trim() : "";
+      const entryLabels = entry.labels && typeof entry.labels === "object" ? entry.labels : {};
+      const durableAgentIdentity = typeof entryLabels.agent_identity === "string" ? entryLabels.agent_identity.trim() : "";
+      const statusRow = identityStatusByIdentity.get(durableAgentIdentity) || identityStatusByIdentity.get(entryIdentity) || identityStatusByIdentity.get(entryMemberId) || normalizeIdentityStatusRow(entry);
+      const watchFields = normalizeSidebarWatchFields(entry);
+      const responsePhase = normalizeResponsePhase(entry.response_phase);
+      const modelCapabilities = entry.model_capabilities !== void 0 ? normalizeModelCapabilities(entry) : normalizeModelCapabilities(identityStatusRows.find((row) => {
+        const normalized = normalizeIdentityStatusRow(row);
+        return normalized?.identity === statusRow?.identity;
+      }));
+      return {
+        ...statusRow?.identity ? { identity: statusRow.identity } : durableAgentIdentity ? { identity: durableAgentIdentity } : entry.identity ? { identity: String(entry.identity) } : {},
+        agent_id: String(entry.agent_id || statusRow?.identity || durableAgentIdentity || entry.identity || entry.member_id || ""),
+        member_id: String(entry.member_id || statusRow?.identity || entry.identity || entry.agent_id || ""),
+        ...typeof entry.session_id === "string" && entry.session_id.trim() ? { session_id: entry.session_id.trim() } : {},
+        label: String(entry.label || statusRow?.display_name || entry.display_name || statusRow?.identity || entry.identity || entry.member_id || entry.agent_id || "unknown"),
+        kind: String(entry.kind || statusRow?.role || entry.role || "module_agent"),
+        ...statusRow?.role !== void 0 ? { role: statusRow.role } : entry.role !== void 0 ? { role: String(entry.role) } : {},
+        ...statusRow?.state !== void 0 ? { state: statusRow.state } : entry.state !== void 0 ? { state: String(entry.state) } : {},
+        ...statusRow?.addressability ? { addressability: statusRow.addressability } : {},
+        ...statusRow?.generation !== void 0 ? { generation: statusRow.generation } : {},
+        ...statusRow?.progress !== void 0 ? { progress: statusRow.progress } : {},
+        ...(entry.response_phase === null || responsePhase !== null) && { response_phase: responsePhase },
+        ...entry.wired_to !== void 0 && { wired_to: entry.wired_to },
+        ...statusRow?.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : entry.labels !== void 0 ? { labels: entry.labels } : {},
+        ...entry.group !== void 0 && { group: String(entry.group) },
+        ...entry.subgroup !== void 0 && { subgroup: String(entry.subgroup) },
+        ...entry.addressable !== void 0 ? { addressable: Boolean(entry.addressable) } : statusRow?.addressability ? { addressable: statusRow.addressability === "addressable" } : {},
+        ...entry.affordances !== void 0 && { affordances: entry.affordances },
+        model_capabilities: modelCapabilities,
+        ...watchFields,
+        ...(() => {
+          const unobserved = normalizeUnobservedFacts(entry.unobserved) ?? statusRow?.unobserved;
+          return unobserved ? { unobserved } : {};
+        })()
+      };
+    });
+    const seen = new Set(
+      agents.flatMap((agent) => [agent.identity, agent.member_id, agent.agent_id]).filter((value) => Boolean(value)).map((value) => value.toLowerCase())
+    );
+    for (const statusRow of normalizedIdentityStatusRows) {
+      if (seen.has(statusRow.identity.toLowerCase())) continue;
+      const addressable = statusRow.addressability === "addressable";
+      agents.push({
+        identity: statusRow.identity,
+        agent_id: statusRow.identity,
+        member_id: statusRow.identity,
+        label: String(statusRow.display_name || statusRow.identity),
+        kind: String(statusRow.role || "identity"),
+        ...statusRow.role !== void 0 ? { role: statusRow.role } : {},
+        state: statusRow.state,
+        addressability: statusRow.addressability,
+        ...statusRow.generation !== void 0 ? { generation: statusRow.generation } : {},
+        ...statusRow.progress !== void 0 ? { progress: statusRow.progress } : {},
+        ...statusRow.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : {},
+        ...statusRow.labels?.group ? { group: statusRow.labels.group } : {},
+        ...statusRow.labels?.console_subgroup ? { subgroup: statusRow.labels.console_subgroup } : statusRow.labels?.org ? { subgroup: statusRow.labels.org } : {},
+        addressable,
+        affordances: { can_send_message: addressable },
+        model_capabilities: { image_input: false },
+        ...statusRow.unobserved ? { unobserved: statusRow.unobserved } : {}
+      });
+      seen.add(statusRow.identity.toLowerCase());
+    }
+    return agents;
+  }
+  if (Array.isArray(identityStatusRows) && identityStatusRows.length > 0) {
+    return identityStatusRows.map((entry) => {
+      const statusRow = normalizeIdentityStatusRow(entry);
+      const identity = statusRow?.identity || "";
+      const modelCapabilities = normalizeModelCapabilities(entry);
+      return {
+        identity,
+        agent_id: String(identity),
+        member_id: identity ? "identity-only:".concat(identity) : "",
+        ...typeof statusRow?.session_id === "string" && statusRow.session_id.trim() ? { session_id: statusRow.session_id.trim() } : {},
+        label: String(statusRow?.display_name || identity || "unknown"),
+        kind: String(statusRow?.role || "identity"),
+        ...statusRow?.role !== void 0 ? { role: statusRow.role } : {},
+        ...statusRow?.state !== void 0 ? { state: statusRow.state } : {},
+        ...statusRow?.addressability ? { addressability: statusRow.addressability } : {},
+        ...statusRow?.generation !== void 0 ? { generation: statusRow.generation } : {},
+        ...statusRow?.progress !== void 0 ? { progress: statusRow.progress } : {},
+        ...statusRow?.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : {},
+        addressable: false,
+        affordances: { can_send_message: false },
+        model_capabilities: modelCapabilities,
+        ...statusRow?.unobserved ? { unobserved: statusRow.unobserved } : {}
+      };
+    });
+  }
+  if (Array.isArray(modules) && modules.length > 0) {
+    return modules.map((moduleId) => ({
+      agent_id: String(moduleId),
+      member_id: String(moduleId),
+      label: String(moduleId),
+      kind: "module_agent",
+      model_capabilities: { image_input: false }
+    }));
+  }
+  return [];
 }
 
 // src/lib/errors.ts
@@ -50652,6 +50572,90 @@ function SpriteSheet() {
 }
 function Icon({ name: name2, className }) {
   return /* @__PURE__ */ (0, import_jsx_runtime42.jsx)("svg", { className, "aria-label": name2, children: /* @__PURE__ */ (0, import_jsx_runtime42.jsx)("use", { href: "#".concat(name2) }) });
+}
+
+// src/lib/identity-log.ts
+function cursorSeq2(cursor) {
+  if (!cursor) return null;
+  const match = /^console:(\d+)$/.exec(cursor);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function transcriptOrder(a, aIndex, b2, bIndex) {
+  const ta = typeof a.timestampMs === "number" ? a.timestampMs : Number.MAX_SAFE_INTEGER;
+  const tb = typeof b2.timestampMs === "number" ? b2.timestampMs : Number.MAX_SAFE_INTEGER;
+  if (ta !== tb) return ta - tb;
+  const ca = cursorSeq2(a.cursor);
+  const cb = cursorSeq2(b2.cursor);
+  if (ca !== null && cb !== null && ca !== cb) return ca - cb;
+  return aIndex - bIndex;
+}
+function insertSorted(sorted, frame) {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = lo + hi >>> 1;
+    if (transcriptOrder(sorted[mid], 0, frame, 1) <= 0) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo === sorted.length) sorted.push(frame);
+  else sorted.splice(lo, 0, frame);
+}
+function sortedEvents(log) {
+  if (log.sorted) return log.sorted;
+  const view = log.events.map((frame, index2) => ({ frame, index: index2 })).sort((a, b2) => transcriptOrder(a.frame, a.index, b2.frame, b2.index)).map((entry) => entry.frame);
+  log.sorted = view;
+  return view;
+}
+function pushFrame(log, key, frame) {
+  if (log.byKey.has(key)) return false;
+  log.byKey.set(key, log.events.length);
+  log.events.push(frame);
+  log.version += 1;
+  if (log.sorted) insertSorted(log.sorted, frame);
+  return true;
+}
+function mergeFrameUpdate(log, updated) {
+  if (!updated.id) return null;
+  const index2 = log.byKey.get(updated.id);
+  if (index2 === void 0) return null;
+  const previous3 = log.events[index2];
+  if (!previous3) return null;
+  const existingVersion = previous3.frameVersion ?? 0;
+  const updatedVersion = updated.frameVersion ?? existingVersion;
+  if (updatedVersion < existingVersion) return null;
+  const next = { ...previous3, ...updated };
+  log.events[index2] = next;
+  log.version += 1;
+  const moved = previous3.timestampMs !== next.timestampMs || cursorSeq2(previous3.cursor) !== cursorSeq2(next.cursor);
+  if (moved) {
+    log.sorted = null;
+  } else if (log.sorted) {
+    const at = log.sorted.indexOf(previous3);
+    if (at >= 0) log.sorted[at] = next;
+    else log.sorted = null;
+  }
+  return { previous: previous3, next, moved };
+}
+function trimIdentityLogCore(log, max, keyOf) {
+  const sorted = sortedEvents(log);
+  const drop = sorted.length - max;
+  if (drop <= 0) return null;
+  const dropped = new Set(sorted.slice(0, drop));
+  const retained = log.events.filter((frame) => !dropped.has(frame));
+  log.events = retained;
+  log.sorted = sorted.slice(drop);
+  log.byKey.clear();
+  retained.forEach((frame, index2) => log.byKey.set(keyOf(frame), index2));
+  log.version += 1;
+  return retained;
+}
+function resetIdentityLogCore(log) {
+  log.events = [];
+  log.byKey.clear();
+  log.sorted = null;
+  log.version += 1;
 }
 
 // src/panels/TimelinePanel.tsx
@@ -63399,9 +63403,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     clearOptimisticUserByContent(identity, frame);
   }
   function frameKey(frame) {
-    if (frame.id) return frame.id;
-    if (frame.cursor) return frame.cursor;
-    return "".concat(frame.event, ":").concat(frame.identity || "", ":").concat(frame.interactionId || "", ":").concat(frame.timestampMs || 0);
+    return consoleFrameKey(frame);
   }
   function appendFrame(identity, frame) {
     const log = getOrCreateLog(identity);
@@ -63523,15 +63525,15 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     return changed;
   }
   function newerCursor(a, b2) {
-    const aSeq = cursorSeq(a);
-    const bSeq = cursorSeq(b2);
+    const aSeq = cursorSeq2(a);
+    const bSeq = cursorSeq2(b2);
     if (aSeq === null) return b2 || a;
     if (bSeq === null) return a || b2;
     return bSeq > aSeq ? b2 : a;
   }
   function olderCursor(a, b2) {
-    const aSeq = cursorSeq(a);
-    const bSeq = cursorSeq(b2);
+    const aSeq = cursorSeq2(a);
+    const bSeq = cursorSeq2(b2);
     if (aSeq === null) return b2 || a;
     if (bSeq === null) return a || b2;
     return bSeq < aSeq ? b2 : a;
