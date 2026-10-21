@@ -1395,6 +1395,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the same model configuration owner as `OrdinaryMetaApplicationSelection` and
   is checked the same way at selection. A bare target is unchanged and still
   refuses managed-host models.
+- A Meta Forge package can build an application without a connection setup
+  helper. A product package can include the Meta rpc_gateway release of its
+  selected Meta SDK, and the packaged entry then uses it for local Mac and
+  Linux plans without a helper. Such a plan used to end in an error claiming it
+  selected a helper; a plan that still cannot build now names the missing input.
 - Meta Forge's generated Console has a "Connect setup" sidebar button for an
   application on the selected Meta Toolkit Connect route (a host-selected
   product with an acquisition helper). The button opens the host's Toolkit
