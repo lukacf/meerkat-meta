@@ -3805,15 +3805,21 @@ class DeploymentService:
         interactive = receipt.get("execution_mode", "interactive") == "interactive" and not receipt.get("service")
         if interactive and receipt.get("interactive_lifecycle_id") is not None and not interactive_cleanup_matches(receipt):
             raise DraftConflict("The owned runtime's cleanup is unconfirmed. Stop and verify cleanup before a fresh start.")
-        payload = (directory / "package.zip").read_bytes()
-        if hashlib.sha256(payload).hexdigest() != receipt["package_sha256"]:
-            raise DraftConflict("The saved checked package changed. No process was started.")
-        files = package_files(payload)
-        destination = verify_destination(receipt, files, allow_missing=action == "retry")
+        def checked_package():
+            payload = (directory / "package.zip").read_bytes()
+            if hashlib.sha256(payload).hexdigest() != receipt["package_sha256"]:
+                raise DraftConflict("The saved checked package changed. No process was started.")
+            files = package_files(payload)
+            return files, verify_destination(receipt, files, allow_missing=action == "retry")
+        # Reading and hashing the saved package, its installed copy and the
+        # selected product must not hold the event loop.
+        files, destination = await asyncio.to_thread(checked_package)
+        # Every in-process taker of this project lock runs under self.lock, and
+        # the lock refuses instead of waiting, so its holder may await threads.
         with project_lock(destination) if interactive else nullcontext():
             validate_installed_console_settings(files, destination)
             if interactive and receipt.get("interactive_lifecycle_id") is not None:
-                checked_cleanup = interactive_source_binding(directory, receipt,
+                checked_cleanup = await asyncio.to_thread(interactive_source_binding, directory, receipt,
                     allow_missing=(receipt.get("interactive_cleanup") or {}).get("boundary") == "worker-not-admitted")
                 if any(receipt["interactive_cleanup"].get(key) != value for key, value in checked_cleanup.items()):
                     raise DraftConflict("The cleanup confirmation belongs to different installed source or ownership.")
@@ -3825,7 +3831,7 @@ class DeploymentService:
                 from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
                 selected_target = parse_candidate_selection(receipt["runtime_candidate"])
                 if type(selected_target) is MetaToolkitRuntimeTarget:
-                    product_runtime_source(files, receipt["runtime_candidate"])
+                    await asyncio.to_thread(product_runtime_source, files, receipt["runtime_candidate"])
                     if mode != "install" or not interactive:
                         raise DraftConflict(PRODUCT_CONFIGURE_REQUIRED)
                     if receipt.get("update") is not None:
