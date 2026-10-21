@@ -791,3 +791,74 @@ async fn a_restart_that_leaves_the_identities_unmaterialized_still_reconciles_ev
     );
     unified.shutdown().await;
 }
+
+/// The managed path of the same restart: boot 2 reconciles the full topology
+/// first, so the team's edges become this process's managed edges while their
+/// identities stay unmaterialized, and the topology then drops the lead's
+/// edges. A managed edge that is no longer desired is unwired through its
+/// unbound endpoints, not dropped from the managed set with its wire left live.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_managed_edge_between_unmaterialized_identities_is_unwired_once_dropped() {
+    let mob_id = next_mob_id("edge-unmaterialized-managed");
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state_path = temp.path().join("state");
+    let lead = id("identity:lead-1");
+    let member = id("identity:member-1");
+    let peer = id("identity:member-2");
+    let roster = vec![
+        spec("identity:lead-1"),
+        spec("identity:member-1"),
+        spec("identity:member-2"),
+    ];
+    let members = ManagedPeerEdge::new(member.clone(), peer.clone()).unwrap();
+    let topology = Arc::new(TeamTopology {
+        edges: Mutex::new(vec![
+            ManagedPeerEdge::new(lead.clone(), member.clone()).unwrap(),
+            ManagedPeerEdge::new(lead.clone(), peer.clone()).unwrap(),
+            members.clone(),
+        ]),
+    });
+    let booted = boot(
+        &state_path,
+        definition(&mob_id),
+        &roster,
+        Some(topology.clone() as Arc<dyn TopologyProvider>),
+    )
+    .await;
+    booted.unified.shutdown().await;
+    drop(booted);
+
+    let (unified, _bridge, _outcomes) = boot_in_mode(
+        &state_path,
+        definition(&mob_id),
+        &roster,
+        Some(topology.clone() as Arc<dyn TopologyProvider>),
+        IdentityBootstrapMode::LazyMaterialize,
+    )
+    .await;
+    let report = unified.reconcile_edges().await;
+    assert!(report.failures.is_empty(), "nothing fails: {report:?}");
+    assert_eq!(
+        report.retained_edges.len() + report.wired_edges.len(),
+        3,
+        "boot 2 takes the team's edges as its managed edges: {report:?}"
+    );
+
+    *topology.edges.lock().unwrap() = vec![members];
+    let report = unified.reconcile_edges().await;
+    assert!(report.failures.is_empty(), "nothing fails: {report:?}");
+    assert_eq!(
+        report.unwired_edges,
+        vec![
+            DesiredPeerEdge::new(lead.as_str(), member.as_str()).unwrap(),
+            DesiredPeerEdge::new(lead.as_str(), peer.as_str()).unwrap(),
+        ],
+        "the dropped managed edges are unwired: {report:?}"
+    );
+    assert_eq!(
+        roster_identity_edges(&unified).await,
+        BTreeSet::from([pair(&member, &peer)]),
+        "Core's roster holds only the kept edge"
+    );
+    unified.shutdown().await;
+}

@@ -5716,6 +5716,12 @@ impl MobSessionBridge {
         // (a worker a member spawned, say) the identity topology never
         // manages: bound, its wires are filtered out downstream, so unbound
         // they are left out instead of failing every other wire.
+        //
+        // The roster listing carries no runtime id, so the committed
+        // incarnation is a second read after it. A respawn between the two
+        // reads is caught where a plan commits: the commit revalidates the
+        // endpoints' bindings (`peer_bindings_moved`), the plan goes stale,
+        // and it is made again from fresh reads.
         let endpoints = edges
             .iter()
             .flat_map(|(a, b)| [a.as_str(), b.as_str()])
