@@ -1524,6 +1524,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `parentRafAgeMs` and `deadlineOvershootMs` in whole milliseconds. Each is a
   clock difference and could show its floating-point error, such as
   3.0000000000000284 for a 3 ms render.
+- Meta Forge's proposal preview shows a team of up to eight agents in a compact
+  overview with readable labels. An authored animation scrolled out of view no
+  longer fails: browsers defer drawing an offscreen frame, and the visible-time
+  watchdog counted that wait as a stall. The watchdog and playback now pause
+  while the preview is offscreen and resume where they stopped; a stall while
+  visible still fails.
 - Meta Forge no longer strands the slot of a visual review that an earlier
   version left running when the animation renderer changes. The first review
   after such an update failed to start, and the slot stayed taken after that
