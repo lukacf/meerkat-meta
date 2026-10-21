@@ -1473,6 +1473,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   starts on Meta 0.9.4. Its startup read the Meta SDK's `session_store`
   builder option, which 0.9.4 removed, so every such start stopped with an
   `AttributeError`; it now reads `runtime_store`.
+- The Console of an application that Meta Forge builds without a connection
+  setup helper opens after sign-in. It tried the Toolkit's native login
+  enrollment, which such an application does not have, so after every
+  sign-in it answered 503 ("Console login enrollment is unavailable"). It now
+  signs in with the Console password, as the configured user.
 - `/console/experience` reports `health_overview.live_snapshot.running` as
   the mob's owner answers when the experience is read, as `meta/status`
   does. It came from the console's cached roster walk, and was `true` when
