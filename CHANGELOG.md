@@ -1238,8 +1238,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   wrappers of a member's tools now pass it to the tools they wrap: the
   composition of customizer tools over a member's tools, the identity
   customizer tools (for each publication), the agent-memory recorder, the
-  schedule tool wrappers and the parent-mob tool wrapper. Without it the
-  wrapped tools stayed unbound, listed but denying every call.
+  schedule tool wrappers and the parent-mob tool wrapper. Before, those
+  tools admitted every profile of the member's mob, whatever a host's
+  session hook granted.
 - An unchanged roster no longer changes the shared access facts, whichever
   console route records them. Every console experience request recorded an
   identity that is both a listed agent and a roster member twice: the
