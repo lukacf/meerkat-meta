@@ -270,6 +270,23 @@ export function deploymentResumeAction(receipt, guide) {
       detail: "No application worker started. Retry completes the saved checked package's installation; private settings and ordinary Start stay unavailable until its files are verified." };
   }
   const resume = receipt.status === "stopped" || ["restored-stopped", "candidate-restored-stopped"].includes(receipt.update?.status);
+  // A failed installer can have verified teardown without an installed SDK
+  // proof. Offer the existing guarded retry, never ordinary runtime startup.
+  if (resume && deploymentRequiresApplicationStartup(receipt) && receipt.installed_candidate_runtime_proof == null &&
+      (receipt.target || "local") === "local" && (receipt.execution_mode || "interactive") === "interactive" &&
+      !receipt.service && !receipt.update && receipt.process_live === false && receipt.runtime_pid == null &&
+      receipt.startup_attempt_id === null && receipt.interactive_cleanup_attempt_id === null &&
+      cleanup?.boundary === "owned-process-groups-absent" && cleanup.confirmed === true && cleanup.worker_exit_confirmed === true &&
+      Number.isSafeInteger(cleanup.return_code) && cleanup.return_code !== 0 &&
+      Number.isSafeInteger(cleanup.supervisor_pid) && cleanup.supervisor_pid > 0 &&
+      typeof receipt.interactive_lifecycle_id === "string" && ACTION_REQUEST_UUID.test(receipt.interactive_lifecycle_id) &&
+      cleanup.lifecycle_id === receipt.interactive_lifecycle_id && cleanup.startup_attempt_id === null &&
+      Number.isSafeInteger(receipt.guide_version) &&
+      ["deployment_id", "guide_id", "build_id", "guide_version", "blueprint_hash", "destination", "package_sha256"].every(key => cleanup[key] === receipt[key]) &&
+      ["source_digest", "owner_sha256", "package_sha256"].every(key => typeof cleanup[key] === "string" && HASH.test(cleanup[key])) &&
+      (receipt.source_digest == null || receipt.source_digest === cleanup.source_digest))
+    return { action: "retry", label: "Retry installation",
+      detail: "Retry this saved package using its saved private settings. Forge rechecks its source and cleanup before continuing; application startup remains a separate step." };
   if (resume && deploymentRequiresApplicationStartup(receipt) && !restoredBackgroundRestartAvailable(receipt, guide)) return null;
   return { action: resume ? "restart" : "retry", label: resume
     ? deploymentSourceKind(receipt) === "native-team" ? "Start installed agent team" : "Start installed application"
