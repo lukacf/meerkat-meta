@@ -806,7 +806,8 @@ def test_standalone_start_uses_selected_port_and_keeps_loopback_binding(bundle_s
     assert result.returncode == 0, result.stderr
     assert "Open Meta Forge at http://127.0.0.1:" + selected in result.stdout
     assert log.read_text().splitlines()[-1] == (
-        "-m uvicorn launchkit.server:app --host 127.0.0.1 --port " + selected)
+        "-m uvicorn launchkit.server:app --host 127.0.0.1 --port " + selected
+        + " --timeout-graceful-shutdown 20")
 
 
 @pytest.mark.parametrize("port", ["0", "65536", "-1", "8788x", "08788"])
@@ -1035,7 +1036,8 @@ class SimpleDependencyRecovery:
             assert not any(row["argv"][:2] == ["-m", "uvicorn"] for row in observed)
         else:
             assert "Open Meta Forge at http://127.0.0.1:" + self.launch_port in result.stdout
-            assert observed[-1]["argv"] == ["-m", "uvicorn", "launchkit.server:app", "--host", "127.0.0.1", "--port", self.launch_port]
+            assert observed[-1]["argv"] == ["-m", "uvicorn", "launchkit.server:app", "--host", "127.0.0.1", "--port", self.launch_port,
+                "--timeout-graceful-shutdown", "20"]
 
 
 @pytest.mark.parametrize("failure,label,failed_command", [
