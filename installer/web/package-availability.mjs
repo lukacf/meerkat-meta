@@ -24,4 +24,11 @@ export function retainsCandidateFramework(receipt, guide) {
     typeof candidate === "object" && !Array.isArray(candidate);
 }
 
+/** A host-selected product refreshes its runtime only from its exact current, independently accepted build. */
+export function candidateRuntimeRefreshReady(receipt, guide) {
+  return retainsCandidateFramework(receipt, guide) && receipt.status === "completed" &&
+    ["current", "source_verified", "acceptance_trusted", "acceptance_current", "ready_to_package"]
+      .every((key) => receipt[key] === true);
+}
+
 export const PACKAGE_REVISION_PROMPT = "Review the current package preparation limitation with me. Preserve my requirements and choices. Explain which installation support is missing and what would enable my current plan. Ask before changing the plan.";
