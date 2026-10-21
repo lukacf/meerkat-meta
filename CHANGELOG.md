@@ -1754,6 +1754,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   CPython 3.11 (for example with `uv python install 3.11`), stop Forge, move
   only its `.venv` folder aside, and start it again with `PYTHON_BIN`
   pointing to CPython 3.11; saved setups are kept.
+- Meta Forge refuses remote and guided cloud installation of a Meta/Toolkit
+  product application before any transfer, as 0.9.3 did; install it on the
+  computer that runs Forge. On Linux the product needs glibc 2.39 or newer, so
+  Debian 12 (glibc 2.36) cannot run it.
 
 ## [0.9.3] - 2026-10-18
 
