@@ -1140,6 +1140,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `installer/release/inputs/forge-release-inputs.skeleton.json` holds the
   Guide's Linux release inputs; only the product owner's selection is still to
   be filled.
+- An installed Meta Forge (the packaged product, not the developer source entry)
+  no longer offers agent team packages: they install the older MobKit 0.8
+  runtime, while its applications run on Meta 0.9.4. It refuses an agent team
+  export or installation with that reason and points to Build application; the
+  developer source entry still offers both. Agent teams already installed keep
+  their controls.
 - Adopts the Meerkat Core typed provider stop detail. Every place Meta builds
   an `LlmDoneOutcome::Success` (test clients, the scenario client, the memory
   pipeline fakes) builds it with `LlmDoneOutcome::success(stop_reason)`, and
