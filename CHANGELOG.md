@@ -1374,6 +1374,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the same model configuration owner as `OrdinaryMetaApplicationSelection` and
   is checked the same way at selection. A bare target is unchanged and still
   refuses managed-host models.
+- Meta Forge's generated Console has a "Connect setup" sidebar button for an
+  application on the selected Meta Toolkit Connect route (a host-selected
+  product with an acquisition helper). The button opens the host's Toolkit
+  setup page, `/host/toolkit/setup`, as a docked operator panel. Protected
+  setup decisions such as software reviews wait on that page, and the Console
+  offered no way to reach it, so a review could time out unseen. Applications
+  without the Connect route get no button. Packages compiled by this Forge
+  include it; a runtime refresh keeps the accepted Console configuration.
 - Meta Forge's Linux isolation works on Python builds whose `fcntl` module
   lacks the memfd seal names, such as the standalone CPython builds uv
   installs. Forge sealed its seccomp filter and accepted remote input with
