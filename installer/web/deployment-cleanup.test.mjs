@@ -119,6 +119,38 @@ test("selected product setup instructions do not point to a removed ordinary Sta
   assert.match(renderToStaticMarkup(DeploymentPrivateSettingsInstructions({ receipt })), /Start installed application/);
 });
 
+test("a failed product installer with exact confirmed teardown offers guarded retry using saved settings", () => {
+  const partial = { ...receipt, cleanup_recovery: undefined, status: "stopped", phase: "stop", target: "local",
+    destination: "/owned/partial-install", blueprint_hash: "c".repeat(64), startup_attempt_id: null,
+    interactive_cleanup_attempt_id: null, interactive_lifecycle_id: "5c1f4b32-b1c9-4bd0-ab1a-332806ec52a8",
+    runtime_candidate: { format: "forge-meta-toolkit-runtime-selection-v1" } };
+  partial.interactive_cleanup = { confirmed: true, worker_exit_confirmed: true,
+    boundary: "owned-process-groups-absent", return_code: 1, supervisor_pid: 123,
+    lifecycle_id: partial.interactive_lifecycle_id, startup_attempt_id: null,
+    source_digest: "d".repeat(64), owner_sha256: "e".repeat(64),
+    ...Object.fromEntries(["deployment_id", "guide_id", "build_id", "guide_version", "blueprint_hash", "destination", "package_sha256"].map(key => [key, partial[key]])) };
+  const before = structuredClone(partial), actions = [];
+  assert.equal(deploymentResumeAction(partial, guide)?.action, "retry");
+  const element = DeploymentResumeAction({ receipt: partial, state: guide, onAction: value => actions.push(value) });
+  const html = renderToStaticMarkup(element);
+  assert.match(html, /Retry installation/);
+  assert.match(html, /saved private settings/);
+  assert.doesNotMatch(html, /No application worker started|>Start installed application<|Installation complete/);
+  assert.deepEqual(actions, []);
+  element.props.children[0].props.onClick();
+  assert.deepEqual(actions, ["retry"]);
+  assert.deepEqual(partial, before);
+  for (const change of [{ confirmed: false }, { worker_exit_confirmed: false }, { return_code: 0 },
+    { lifecycle_id: "old" }, { startup_attempt_id: "attempt" }, { source_digest: "bad" },
+    { package_sha256: "f".repeat(64) }, { owner_sha256: null }, { supervisor_pid: 0 }, { guide_version: 5 }])
+    assert.equal(deploymentResumeAction({ ...partial, interactive_cleanup: { ...partial.interactive_cleanup, ...change } }, guide), null);
+  for (const change of [{ process_live: true }, { runtime_pid: 123 }, { startup_attempt_id: "attempt" },
+    { interactive_cleanup_attempt_id: "attempt" }, { service: {} }, { execution_mode: "background" },
+    { update: { status: "completed" } }, { guide_id: "other" }, { target: "gcp" },
+    { installed_candidate_runtime_proof: {} }, { installed_candidate_runtime_proof: installedProduct.installed_candidate_runtime_proof }])
+    assert.equal(deploymentResumeAction({ ...partial, ...change }, guide), null);
+});
+
 test("initial install explains the host-selected Configure step without claiming agents have started", () => {
   const options = { source_kind: "application", fresh_install: { available: true, next_step: "configure" } };
   const before = structuredClone(options);
