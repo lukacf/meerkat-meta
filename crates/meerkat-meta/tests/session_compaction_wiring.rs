@@ -400,7 +400,7 @@ async fn long_turn(mob_id: &str, retained: Option<usize>) -> (Result<(), String>
         )
         .await
         .unwrap_or_else(|error| panic!("the long turn must be admitted: {error}"));
-    let outcome = tokio::time::timeout(Duration::from_secs(120), admission.turn.wait())
+    let outcome = tokio::time::timeout(Duration::from_mins(2), admission.turn.wait())
         .await
         .unwrap_or_else(|error| panic!("the long turn timed out: {error}"))
         .map(|_| ())
