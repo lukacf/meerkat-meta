@@ -3,6 +3,7 @@ import test from "node:test";
 import { ConsoleActivityProjection, resolvePanelResponsePhase } from "@console-core";
 import type { ConsoleAgent, ConsoleFrame } from "../types";
 import {
+  IDLE_SETTLE_MIN_GAP_MS,
   agentReportsIdle,
   decideIdleSettlement,
   framesAfterIdleWatermark,
@@ -167,7 +168,7 @@ test("only an idle status poll settles: response phase null and no open run", ()
   assert.equal(agentReportsIdle({ response_phase: null }), false, "no run state is not idle");
 });
 
-test("two idle polls in a row settle; every guard resets the count", () => {
+test("two idle polls a poll interval apart settle; every guard resets the count", () => {
   const base = {
     agent: idleAgent,
     logVersionAtRequest: 7,
@@ -175,27 +176,31 @@ test("two idle polls in a row settle; every guard resets the count", () => {
     sendInFlight: false,
     foldBusy: true,
     foldPhase: "waiting",
-    armedAtVersion: undefined as number | undefined,
+    armed: undefined as { version: number; atMs: number } | undefined,
+    nowMs: 100_000,
   };
+  const armed = { version: 7, atMs: 100_000 - IDLE_SETTLE_MIN_GAP_MS };
   assert.equal(decideIdleSettlement(base), "arm", "the first idle poll changes nothing");
-  assert.equal(decideIdleSettlement({ ...base, armedAtVersion: 7 }), "settle", "the second, with no frame since");
-  assert.equal(decideIdleSettlement({ ...base, armedAtVersion: 6 }), "arm",
-    "a frame since the first idle poll starts the count again");
+  assert.equal(decideIdleSettlement({ ...base, armed }), "settle", "an idle poll a poll interval later, with no frame since");
+  assert.equal(decideIdleSettlement({ ...base, armed: { version: 7, atMs: 100_000 - 150 } }), "wait",
+    "two idle polls 150 ms apart (a poll after another member's event) do not settle");
+  assert.equal(decideIdleSettlement({ ...base, armed: { version: 6, atMs: 0 } }), "arm",
+    "a frame since the arming poll starts the count again");
   for (const [agent, why] of [
     [{ ...idleAgent, response_phase: "generating" as const }, "a response phase"],
     [{ ...idleAgent, progress: { ...idleAgent.progress!, run_state: "run_open" } }, "an open run"],
   ] as const) {
-    assert.equal(decideIdleSettlement({ ...base, agent, armedAtVersion: 7 }), "reset",
+    assert.equal(decideIdleSettlement({ ...base, agent, armed }), "reset",
       `never while the server reports a live run: ${why}`);
   }
-  assert.equal(decideIdleSettlement({ ...base, logVersionNow: 8, armedAtVersion: 8 }), "reset",
+  assert.equal(decideIdleSettlement({ ...base, logVersionNow: 8, armed: { version: 8, atMs: 0 } }), "reset",
     "never when a frame arrived while the poll was in flight");
-  assert.equal(decideIdleSettlement({ ...base, logVersionAtRequest: undefined, armedAtVersion: 7 }), "reset",
+  assert.equal(decideIdleSettlement({ ...base, logVersionAtRequest: undefined, armed }), "reset",
     "never for a log the poll did not cover");
-  assert.equal(decideIdleSettlement({ ...base, sendInFlight: true, armedAtVersion: 7 }), "reset",
+  assert.equal(decideIdleSettlement({ ...base, sendInFlight: true, armed }), "reset",
     "never while this console's own send is in flight");
-  assert.equal(decideIdleSettlement({ ...base, foldBusy: false, foldPhase: null, armedAtVersion: 7 }), "reset",
+  assert.equal(decideIdleSettlement({ ...base, foldBusy: false, foldPhase: null, armed }), "reset",
     "nothing to settle");
-  assert.equal(decideIdleSettlement({ ...base, foldBusy: false, foldPhase: "waiting", armedAtVersion: 7 }), "settle",
+  assert.equal(decideIdleSettlement({ ...base, foldBusy: false, foldPhase: "waiting", armed }), "settle",
     "a stale phase alone is settled too");
 });

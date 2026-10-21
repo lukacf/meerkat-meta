@@ -8,6 +8,7 @@ import { createConsoleSendAttempt, beginConsoleSendAttempt } from "../../../pack
 import { consoleSendStorageKey, saveConsoleSendAttempts } from "./send-attempt-storage";
 import { createConsoleContextRecord } from "../../../packages/console-core/src/context-record";
 import { ACCEPTANCE_NOTICE_GRACE_MS, PendingStack, type PendingItem } from "../panels/PendingStack";
+import { idleSettleClock } from "./idle-reconcile";
 
 const identity = "identity:queue-agent";
 function seed(twoPanes = false) {
@@ -2168,6 +2169,12 @@ describe("idle status poll settles a fold the frames left open", () => {
     ],
   };
   const WORKING = "Queue agent is working";
+  // The settlement's clock: each poll below runs a regular poll interval
+  // after the previous one unless a test says otherwise.
+  let nowMs = 1_000_000;
+  const realNow = idleSettleClock.now;
+  beforeEach(() => { nowMs = 1_000_000; idleSettleClock.now = () => nowMs; });
+  afterEach(() => { idleSettleClock.now = realNow; });
   const BUSY = { response_phase: "waiting", run_state: "run_open" } as const;
   const IDLE = { response_phase: null, run_state: "idle" } as const;
 
@@ -2196,7 +2203,8 @@ describe("idle status poll settles a fold the frames left open", () => {
     };
     // One status poll, triggered by a frame that is not part of the
     // member's conversation (it does not enter the member's log).
-    const poll = async (next: { response_phase: string | null; run_state: string }) => {
+    const poll = async (next: { response_phase: string | null; run_state: string }, gapMs = 15_000) => {
+      nowMs += gapMs;
       status = { ...next };
       const before = loadExperience.mock.calls.length;
       trigger += 1;
@@ -2223,6 +2231,20 @@ describe("idle status poll settles a fold the frames left open", () => {
     await h.poll(IDLE);
     expect(working()).not.toBeNull();
     await h.poll(IDLE);
+    await waitFor(() => expect(working()).toBeNull());
+  });
+
+  it("two idle polls 150 ms apart do not settle; one a poll interval after the first does", async () => {
+    const h = harness(stuckFrames.paused);
+    await h.start();
+    await screen.findByLabelText(WORKING);
+    await h.poll(IDLE);
+    // Another member's lifecycle event triggers a poll right away.
+    await h.poll(IDLE, 150);
+    expect(working()).not.toBeNull();
+    await h.poll(IDLE, 150);
+    expect(working()).not.toBeNull();
+    await h.poll(IDLE, 15_000);
     await waitFor(() => expect(working()).toBeNull());
   });
 

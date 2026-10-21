@@ -48266,12 +48266,15 @@ function appendOptimisticConversationEntry2(entries, optimisticEntry) {
 function agentReportsIdle(agent) {
   return agent.response_phase === null && agent.progress?.run_state === "idle";
 }
+var IDLE_SETTLE_MIN_GAP_MS = 1e4;
+var idleSettleClock = { now: () => Date.now() };
 function decideIdleSettlement(args) {
   if (!agentReportsIdle(args.agent)) return "reset";
   if (args.logVersionAtRequest === void 0 || args.logVersionAtRequest !== args.logVersionNow) return "reset";
   if (args.sendInFlight) return "reset";
   if (!args.foldBusy && args.foldPhase === null) return "reset";
-  return args.armedAtVersion === args.logVersionNow ? "settle" : "arm";
+  if (!args.armed || args.armed.version !== args.logVersionNow) return "arm";
+  return args.nowMs - args.armed.atMs >= IDLE_SETTLE_MIN_GAP_MS ? "settle" : "wait";
 }
 function consoleFrameKey(frame) {
   if (frame.id) return frame.id;
@@ -64134,6 +64137,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   });
   function settleIdleIdentities(agents2, logVersionsAtRequest) {
     let changed = false;
+    const nowMs = idleSettleClock.now();
     for (const agent of agents2) {
       for (const identity of /* @__PURE__ */ new Set([agent.identity, agent.member_id, agent.agent_id])) {
         if (!identity) continue;
@@ -64151,14 +64155,15 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           sendInFlight,
           foldBusy: log.busyLifecycle.busy || isIdentityBusy(identity),
           foldPhase: log.busyLifecycle.phase ?? panelPhase,
-          armedAtVersion: log.idlePollArmedAtVersion
+          armed: log.idlePollArmed,
+          nowMs
         });
-        if (decision === "arm") log.idlePollArmedAtVersion = log.version;
+        if (decision === "arm") log.idlePollArmed = { version: log.version, atMs: nowMs };
         if (decision !== "settle") {
-          if (decision === "reset") log.idlePollArmedAtVersion = void 0;
+          if (decision === "reset") log.idlePollArmed = void 0;
           continue;
         }
-        log.idlePollArmedAtVersion = void 0;
+        log.idlePollArmed = void 0;
         const watermark = idleWatermarkFor(log.events);
         if (!watermark) continue;
         log.idleSettledThrough = watermark;

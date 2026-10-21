@@ -13,17 +13,34 @@ export function agentReportsIdle(agent: Pick<ConsoleAgent, "response_phase" | "p
   return agent.response_phase === null && agent.progress?.run_state === "idle";
 }
 
+/// The least time between the idle poll that arms a settlement and the one
+/// that settles it. Polls also run shortly after any member's lifecycle
+/// event, so two polls can read the same cached walk a few hundred
+/// milliseconds apart; the regular poll runs every 15 s.
+export const IDLE_SETTLE_MIN_GAP_MS = 10_000;
+
+/// The clock the settlement reads; tests replace `now`.
+export const idleSettleClock = { now: (): number => Date.now() };
+
 /// What one status poll does to one identity's fold:
 /// - "reset": the poll does not count toward settling (the server reports
 ///   the member busy, a frame arrived while the poll was in flight, this
 ///   console's own send is in flight, or nothing is held open);
-/// - "arm": the first idle poll; nothing changes yet;
-/// - "settle": the second idle poll in a row with no frame since the first.
+/// - "arm": the first idle poll since the last frame; nothing changes yet;
+/// - "wait": another idle poll too soon after the arming one; it keeps the
+///   arming poll;
+/// - "settle": an idle poll at least `IDLE_SETTLE_MIN_GAP_MS` after the
+///   arming one, with no frame for the member in between.
 ///
 /// One idle poll is not enough: a run the runtime starts itself shows no
 /// response phase until its first output, and the run state the poll reads
-/// can predate the run, so a single poll can catch a live run looking idle.
-export type IdleSettlement = "reset" | "arm" | "settle";
+/// comes from a cached walk that can predate the run.
+export type IdleSettlement = "reset" | "arm" | "wait" | "settle";
+
+export interface IdleArm {
+  version: number;
+  atMs: number;
+}
 
 export function decideIdleSettlement(args: {
   agent: Pick<ConsoleAgent, "response_phase" | "progress">;
@@ -32,13 +49,15 @@ export function decideIdleSettlement(args: {
   sendInFlight: boolean;
   foldBusy: boolean;
   foldPhase: string | null;
-  armedAtVersion: number | undefined;
+  armed: IdleArm | undefined;
+  nowMs: number;
 }): IdleSettlement {
   if (!agentReportsIdle(args.agent)) return "reset";
   if (args.logVersionAtRequest === undefined || args.logVersionAtRequest !== args.logVersionNow) return "reset";
   if (args.sendInFlight) return "reset";
   if (!args.foldBusy && args.foldPhase === null) return "reset";
-  return args.armedAtVersion === args.logVersionNow ? "settle" : "arm";
+  if (!args.armed || args.armed.version !== args.logVersionNow) return "arm";
+  return args.nowMs - args.armed.atMs >= IDLE_SETTLE_MIN_GAP_MS ? "settle" : "wait";
 }
 
 /// The identity key of a frame in the console's per-identity log: the

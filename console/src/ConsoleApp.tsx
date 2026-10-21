@@ -8,7 +8,9 @@ import {
   framesAfterIdleWatermark,
   consoleFrameKey,
   decideIdleSettlement,
+  idleSettleClock,
   idleWatermarkFor,
+  type IdleArm,
   isAfterIdleWatermark,
   type IdleWatermark,
 } from "./lib/idle-reconcile";
@@ -315,8 +317,8 @@ interface IdentityLog extends IdentityLogCore {
   /// phase folds, including a full replay, read only newer frames (see
   /// `lib/idle-reconcile.ts`).
   idleSettledThrough?: IdleWatermark;
-  /// The log version at the first of those two idle polls.
-  idlePollArmedAtVersion?: number;
+  /// The first of those idle polls: the log version then, and when.
+  idlePollArmed?: IdleArm;
   /// `null` while we haven't asked the server yet; `true` if the
   /// runtime has an EventLogStore (we'll fetch backfill); `false`
   /// once we've observed `available: false` (SSE is the only source).
@@ -2355,9 +2357,9 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   // The member status poll is the server's authoritative idle signal (see
   // lib/idle-reconcile.ts). A fold that still holds an owner open after the
   // member finished (frames that opened it never got a matching terminal)
-  // reads "working" and queues every send; two idle polls in a row, with no
-  // frame for the member since the first, settle every frame the console
-  // had seen.
+  // reads "working" and queues every send; two idle polls in a row, at
+  // least IDLE_SETTLE_MIN_GAP_MS apart and with no frame for the member
+  // since the first, settle every frame the console had seen.
   const settleIdleIdentitiesRef = React.useRef<
     (agents: ConsoleAgent[], logVersionsAtRequest: Map<string, number>) => void
   >(() => {});
@@ -2366,6 +2368,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     logVersionsAtRequest: Map<string, number>,
   ): void {
     let changed = false;
+    const nowMs = idleSettleClock.now();
     for (const agent of agents) {
       for (const identity of new Set([agent.identity, agent.member_id, agent.agent_id])) {
         if (!identity) continue;
@@ -2385,14 +2388,15 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           sendInFlight,
           foldBusy: log.busyLifecycle.busy || isIdentityBusy(identity),
           foldPhase: log.busyLifecycle.phase ?? panelPhase,
-          armedAtVersion: log.idlePollArmedAtVersion,
+          armed: log.idlePollArmed,
+          nowMs,
         });
-        if (decision === "arm") log.idlePollArmedAtVersion = log.version;
+        if (decision === "arm") log.idlePollArmed = { version: log.version, atMs: nowMs };
         if (decision !== "settle") {
-          if (decision === "reset") log.idlePollArmedAtVersion = undefined;
+          if (decision === "reset") log.idlePollArmed = undefined;
           continue;
         }
-        log.idlePollArmedAtVersion = undefined;
+        log.idlePollArmed = undefined;
         const watermark = idleWatermarkFor(log.events);
         if (!watermark) continue;
         log.idleSettledThrough = watermark;

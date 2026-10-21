@@ -1236,13 +1236,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   frames closed only their own run, so the paused turn (or a frame without
   lifecycle ids) kept the chat "working" and queued every new message. The
   Console now treats the member status poll as the idle signal: when two
-  polls in a row report no response phase and no open run, with no new
-  frame for the member since the first, every frame the Console had seen is
-  settled, the working indicator clears and a queued message is sent. The
-  settled point survives a full rebuild of the activity fold. A poll that
-  reports the member busy (including a turn paused at a callback), a frame
-  that arrives while a poll is in flight or between the two polls, and the
-  Console's own send in flight each leave the chat as it is.
+  polls at least 10 s apart report no response phase and no open run, with
+  no new frame for the member since the first, every frame the Console had
+  seen is settled, the working indicator clears and a queued message is
+  sent. The settled point survives a full rebuild of the activity fold. A
+  poll that reports the member busy (including a turn paused at a
+  callback), a frame that arrives while a poll is in flight or between the
+  two polls, and the Console's own send in flight each leave the chat as it
+  is.
 - A Meta-hosted member's own mob operator tools (`spawn_member`,
   `spawn_many_members` and the rest) admit against its session's mob
   operator authority, including a host's narrowing of it. Meerkat 0.9.4
