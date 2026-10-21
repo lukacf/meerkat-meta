@@ -211,15 +211,17 @@ ORDINARY = b"ordinary meta gateway bytes"
 ORDINARY_ARCHIVE = gateway_archive(ORDINARY)
 
 
-def ordinary_url(version="0.9.4"):
+def ordinary_url(version="0.9.4", triple="x86_64-unknown-linux-gnu"):
     return (f"https://github.com/lukacf/meerkat-meta/releases/download/v{version}/"
-            f"meta-rpc-gateway-{version}-x86_64-unknown-linux-gnu.tar.gz")
+            f"meta-rpc-gateway-{version}-{triple}.tar.gz")
 
 
-def with_ordinary(entry, version="0.9.4", name="ordinary/rpc_gateway"):
+def with_ordinary(entry, version="0.9.4", name="ordinary/rpc_gateway", triple=None):
     """Select the application's ordinary gateway: the selected Meta's rpc_gateway release."""
     entry["selection"]["meta"] = {"version": "0.9.4"}
-    entry["files"][name] = {"url": ordinary_url(version), "archive_size": len(ORDINARY_ARCHIVE),
+    triple = triple or {"linux-x86_64": "x86_64-unknown-linux-gnu",
+                        "macos-arm64": "aarch64-apple-darwin"}[entry["selection"]["target"]]
+    entry["files"][name] = {"url": ordinary_url(version, triple), "archive_size": len(ORDINARY_ARCHIVE),
                             "archive_sha256": sha256(ORDINARY_ARCHIVE), "member": "rpc_gateway", **pin(ORDINARY)}
     entry["ordinary_gateway"] = name
     return entry
@@ -571,11 +573,13 @@ class InputsTests(unittest.TestCase):
 
 
     def test_an_ordinary_gateway_is_the_selected_meta_rpc_gateway_release(self):
-        value = inputs()
-        with_ordinary(value["targets"]["linux-x86_64"])
+        value = inputs(("linux-x86_64", "macos-arm64"))
+        for entry in value["targets"].values():
+            with_ordinary(entry)
         forge.validate_inputs(value)
-        message = "ordinary gateway must be the Meta 0.9.4 rpc_gateway release asset"
+        message = "ordinary gateway must be the Meta 0.9.4 rpc_gateway release asset for linux-x86_64"
         self.refused(lambda entry, _: with_ordinary(entry, version="0.9.3"), message)
+        self.refused(lambda entry, _: with_ordinary(entry, triple="aarch64-apple-darwin"), message)
         self.refused(lambda entry, _: with_ordinary(entry)["files"]["ordinary/rpc_gateway"].__setitem__(
             "member", "meta_gateway"), message)
         self.refused(lambda entry, _: with_ordinary(entry)["selection"].__setitem__("meta", {}), "ordinary gateway")

@@ -82,6 +82,8 @@ INPUTS = "installer/release/forge-release-inputs.json"
 INPUTS_DIR = "installer/release/inputs/"
 PYPROJECT = "installer/pyproject.toml"
 TARGETS = ("linux-x86_64", "macos-arm64")
+# Each Forge target's Meta native release asset triple.
+GATEWAY_TRIPLES = {"linux-x86_64": "x86_64-unknown-linux-gnu", "macos-arm64": "aarch64-apple-darwin"}
 TAG_PREFIX = "forge-v"
 MANIFEST = "forge-candidate-manifest.json"
 MANIFEST_PROVENANCE = "forge-manifest-provenance.jsonl"
@@ -234,9 +236,10 @@ def validate_target(target, entry):
         pin, meta = files[ordinary], selection.get("meta")
         version = meta.get("version") if isinstance(meta, dict) else None
         require(isinstance(version, str) and VERSION.fullmatch(version) and "member" in pin
-                and pin["url"].startswith(f"https://github.com/lukacf/meerkat-meta/releases/download/v{version}/meta-rpc-gateway-{version}-")
+                and pin["url"] == ("https://github.com/lukacf/meerkat-meta/releases/download/"
+                                   f"v{version}/meta-rpc-gateway-{version}-{GATEWAY_TRIPLES[target]}.tar.gz")
                 and pin["member"] == "rpc_gateway",
-                f"{target} ordinary gateway must be the Meta {version} rpc_gateway release asset")
+                f"{target} ordinary gateway must be the Meta {version} rpc_gateway release asset for {target}")
 
 
 def validate_inputs(value):
