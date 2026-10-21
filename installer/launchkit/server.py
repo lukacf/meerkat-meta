@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import os
 import re
+import time
 from urllib.parse import quote
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -55,6 +56,9 @@ VERSION = "0.8.47"
 APP_ROOT = Path(__file__).resolve().parents[1]
 checker_setup = CheckerSetupService(APP_ROOT)
 LOG = logging.getLogger(__name__)
+# uvicorn configures this logger at INFO, so the owners' stop lines show
+# under every uvicorn launch.
+STOP_LOG = logging.getLogger("uvicorn.error")
 
 
 def setup_home():
@@ -308,10 +312,15 @@ async def lifespan(app):
             ("saved Toolkit requests", toolkit_saved_requests),
             ("architect", architect),
         ):
+            STOP_LOG.info("Meta Forge: stopping %s", name)
+            started = time.monotonic()
             try:
                 await service.shutdown()
             except BaseException as error:
+                STOP_LOG.warning("Meta Forge: stopping %s failed (%s)", name, type(error).__name__)
                 failures.append((name, error))
+            else:
+                STOP_LOG.info("Meta Forge: stopped %s in %.1f s", name, time.monotonic() - started)
         if failures:
             raise BaseExceptionGroup(
                 "Meta Forge cleanup failed for: " + ", ".join(name for name, _ in failures),

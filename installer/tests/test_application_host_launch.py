@@ -353,12 +353,16 @@ def test_actual_start_declarations_keep_default_and_select_factory_only_when_con
     packaged = shlex.split(lines[5])
     assert lines[6] == "fi"
     default = shlex.split(lines[7])
+    # Requests still in flight get 20 s after a stop signal, not an unbounded wait.
+    graceful = ["--timeout-graceful-shutdown", "20"]
     assert configured == ["exec", ".venv/bin/python", "-m", "uvicorn",
-        "launchkit.application_host_launch:create_app", "--factory", "--host", "127.0.0.1", "--port", "$launch_port"]
+        "launchkit.application_host_launch:create_app", "--factory", "--host", "127.0.0.1", "--port", "$launch_port",
+        *graceful]
     assert default == ["exec", ".venv/bin/python", "-m", "uvicorn", "launchkit.server:app",
-        "--host", "127.0.0.1", "--port", "$launch_port"]
+        "--host", "127.0.0.1", "--port", "$launch_port", *graceful]
     assert packaged == ["exec", ".venv/bin/python", "-m", "uvicorn",
-        "launchkit.packaged_runtime:create_app", "--factory", "--host", "127.0.0.1", "--port", "$launch_port"]
+        "launchkit.packaged_runtime:create_app", "--factory", "--host", "127.0.0.1", "--port", "$launch_port",
+        *graceful]
     assert len(lines) == 8
     recovery = next(line for line in script.splitlines() if line.startswith("  for setting in "))
     assert launch.FACTORY_ENV in [word.rstrip(";") for word in recovery.split()]

@@ -1372,6 +1372,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Meta Forge accepts a `meerkat-toolkit` 0.9.4 wheel, whose native host
   requires `meerkat-meta==0.9.4`, instead of refusing every Toolkit wheel but
   0.9.0; the exact version, METADATA, RECORD and payload checks are unchanged.
+- Stopping Meta Forge (Ctrl+C, or the SIGTERM an installer host sends) no
+  longer waits without limit for requests still in flight: they get 20 s
+  (`--timeout-graceful-shutdown 20`). Each owner of native work now logs its
+  stop ("stopping X", then "stopped X in N s" or its failure), so a slow stop
+  names the owner still working. The owners' own stops are not cut short, so
+  an install in progress still finishes its cleanup.
 - Meta Forge's "Rebuild with updated runtime" builds a new package of an
   application built from a host-selected Meta and Toolkit runtime on the
   installer's current runtime (see Known limitations).
