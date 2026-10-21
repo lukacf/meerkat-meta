@@ -256,3 +256,23 @@ async def test_freezer_refuses_requirements_mutated_after_real_authenticated_dep
     with pytest.raises(ValueError, match="control requirements changed during freezing"):
         control.freeze_product_control(f.selection)
     assert not f.destination.exists() and not f.transport.frames
+
+
+async def test_remote_product_install_never_consults_the_local_interpreter(origin_product, monkeypatch):
+    # A remote destination's application venv is built by the guest's python3.
+    # Local Forge on another CPython (here macOS CPython 3.13, refusing every
+    # closure) must not refuse an SSH or guided-GCP product install.
+    from launchkit import deployment
+    consulted = []
+    def refusing(*args, **kwargs):
+        consulted.append(args)
+        return "The local interpreter cannot install this closure."
+    monkeypatch.setattr(deployment, "forge_interpreter", lambda: {"python_tag": "cp313", "abi_tag": "cp313",
+        "implementation": "cpython", "system": "Darwin", "machine": "arm64", "glibc_minimum": [0, 0],
+        "macos": (15, 0)}, raising=False)
+    monkeypatch.setattr(deployment, "selected_interpreter_refusal", refusing, raising=False)
+    f = origin_product
+    await f.service.install(GUIDE, 3, BUILD, f.deployment_id, f.settings, product_owner=f.selection)
+    installs = [row["payload"] for row in f.transport.calls if row["payload"]["action"] == "install"]
+    assert len(installs) == 1 and consulted == []
+    assert read_receipt(f.directory)["install_operation_id"] == installs[0]["operation_id"]
