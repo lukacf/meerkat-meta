@@ -1469,6 +1469,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   how to restart Forge on it while keeping saved setups, instead of failing
   midway in pip. The README, the getting started guide and the generated
   package README say which CPython to use.
+- An application that Meta Forge builds without a connection setup helper
+  starts on Meta 0.9.4. Its startup read the Meta SDK's `session_store`
+  builder option, which 0.9.4 removed, so every such start stopped with an
+  `AttributeError`; it now reads `runtime_store`.
 - `/console/experience` reports `health_overview.live_snapshot.running` as
   the mob's owner answers when the experience is read, as `meta/status`
   does. It came from the console's cached roster walk, and was `true` when
