@@ -2705,9 +2705,20 @@ async fn eager_identity_restore_reports_edges_after_persisted_members_attach() {
         &roster,
         IdentityBootstrapMode::EagerMaterialize,
     );
+    // Before the identities attach, a fresh bridge has recorded no binding,
+    // and it names the persisted wire through the incarnations Core committed
+    // for both identity members: the read the binding epoch makes.
+    let before_attachment = bridge
+        .current_member_wires()
+        .await
+        .expect("a fresh bridge names the persisted wire before member attachment");
+    assert_eq!(before_attachment.len(), 1, "{before_attachment:?}");
+    let (runtime_a, runtime_b) = &before_attachment[0];
+    let mut named = [runtime_a.as_str(), runtime_b.as_str()];
+    named.sort_unstable();
     assert!(
-        bridge.current_member_wires().await.is_err(),
-        "a fresh bridge cannot name the persisted wire before member attachment"
+        named[0].contains("lead-1") && named[1].contains("worker-1"),
+        "the wire is the persisted lead-worker wire: {before_attachment:?}"
     );
     let restored = second
         .install_and_bootstrap_identity_first_context(context.clone(), &roster)
@@ -2737,9 +2748,9 @@ async fn eager_identity_restore_reports_edges_after_persisted_members_attach() {
         bridge
             .current_member_wires()
             .await
-            .expect("restored physical wire")
-            .len(),
-        1
+            .expect("restored physical wire"),
+        before_attachment,
+        "attachment keeps the incarnations the fresh bridge named"
     );
     let report = second
         .bootstrap_edges_report()
