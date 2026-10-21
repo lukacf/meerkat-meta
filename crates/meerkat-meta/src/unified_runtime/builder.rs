@@ -1888,13 +1888,11 @@ impl UnifiedRuntimeBuilder {
             storage_layout.as_ref(),
         ) {
             (Some(registry), Some(roster), Some(customizer), Some(_)) => {
-                crate::identity_first::customizer_tools::prepublish(
+                crate::identity_first::customizer_tools::prepublish_before_mob_build(
                     registry,
                     roster,
                     customizer.as_ref(),
                     AgentRuntimeServices::empty(),
-                    &[],
-                    &[],
                 )
                 .await
             }

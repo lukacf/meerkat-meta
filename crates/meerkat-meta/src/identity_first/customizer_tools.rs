@@ -511,6 +511,56 @@ pub async fn prepublish(
     active_peers: &[AgentIdentity],
     managed_edges: &[super::types::ManagedPeerEdge],
 ) -> BTreeMap<AgentIdentity, super::types::CustomizerToolsPending> {
+    prepublish_logged(
+        registry,
+        roster,
+        customizer,
+        runtime_services,
+        active_peers,
+        managed_edges,
+        PrepublishFailureLog::Warn,
+    )
+    .await
+}
+
+/// [`prepublish`] for the mob build's early publication, which runs before
+/// the mob handle exists, so a customizer whose tools need it always fails
+/// there. The identity bootstrap's publication always follows it with the
+/// runtime's services and logs its own failures, so these are logged at
+/// DEBUG.
+pub(crate) async fn prepublish_before_mob_build(
+    registry: &CustomizerToolRegistry,
+    roster: &[super::types::DurableAgentSpec],
+    customizer: &dyn super::contracts::AgentCustomizer,
+    runtime_services: super::types::AgentRuntimeServices,
+) -> BTreeMap<AgentIdentity, super::types::CustomizerToolsPending> {
+    prepublish_logged(
+        registry,
+        roster,
+        customizer,
+        runtime_services,
+        &[],
+        &[],
+        PrepublishFailureLog::DeferredToBootstrap,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum PrepublishFailureLog {
+    Warn,
+    DeferredToBootstrap,
+}
+
+async fn prepublish_logged(
+    registry: &CustomizerToolRegistry,
+    roster: &[super::types::DurableAgentSpec],
+    customizer: &dyn super::contracts::AgentCustomizer,
+    runtime_services: super::types::AgentRuntimeServices,
+    active_peers: &[AgentIdentity],
+    managed_edges: &[super::types::ManagedPeerEdge],
+    failure_log: PrepublishFailureLog,
+) -> BTreeMap<AgentIdentity, super::types::CustomizerToolsPending> {
     let mut pending = BTreeMap::new();
     for spec in roster {
         let build_context = super::types::AgentBuildContext {
@@ -545,12 +595,20 @@ pub async fn prepublish(
                     }
                     _ => None,
                 };
-                tracing::warn!(
-                    identity = %spec.identity,
-                    %reason,
-                    "restored member's customizer tools are not published; it advertises none \
-                     until its materialization publishes them"
-                );
+                match failure_log {
+                    PrepublishFailureLog::Warn => tracing::warn!(
+                        identity = %spec.identity,
+                        %reason,
+                        "restored member's customizer tools are not published; it advertises \
+                         none until its materialization publishes them"
+                    ),
+                    PrepublishFailureLog::DeferredToBootstrap => tracing::debug!(
+                        identity = %spec.identity,
+                        %reason,
+                        "customizer tools not published before the mob build; deferred to the \
+                         identity bootstrap's publication, which runs with the runtime's services"
+                    ),
+                }
                 registry.ensure(&spec.identity);
                 pending.insert(
                     spec.identity.clone(),

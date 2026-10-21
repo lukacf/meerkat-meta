@@ -1330,6 +1330,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   restored member whose customizer tools the bootstrap published listed
   only its other tools until its first turn. A service that reports no
   catalog view still answers the tool scope.
+- The mob build's early customizer publication runs before the mob handle
+  exists, so a customizer whose tools need the handle fails there on every
+  boot, and the identity bootstrap's publication always follows it. Its
+  failures are now logged at DEBUG, as deferred to that publication, instead
+  of one WARN per identity. A failure of the bootstrap's publication still
+  logs a WARN per identity. The publication after an unclean stop logs one
+  INFO summary, or a WARN naming the identities still unpublished.
 - A resume that collides with a spawn of the same member still in Core's
   custody (a client retry) adopts that spawn once Core has committed the
   member. Before, it could read the member's session binding before the
