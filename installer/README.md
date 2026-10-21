@@ -478,6 +478,10 @@ native history and notes stay in the owned project folder.
 
 The agent-team path contains the compiler's native host and configured tools. It
 does not add custom application behavior or independently verify a useful job.
+Connector prerequisites must already be available on the destination, including
+any computer-specific paths in the plan. This direct installation path currently
+supports the local computer. Native-team source updates are not yet supported;
+refining the guide does not change an existing installation.
 
 An installed Forge (the packaged product, as opposed to the developer source
 entry) does not offer the agent-team path: its applications run on Meta 0.9.4,
@@ -486,10 +490,6 @@ and an agent team package installs the older MobKit 0.8 runtime. It shows no
 and it refuses an agent team export or installation with that reason. Use
 **Build application** instead; it builds and installs your agents as an
 application. Agent teams already installed keep their own controls.
-Connector prerequisites must already be available on the destination, including
-any computer-specific paths in the plan. This direct installation path currently
-supports the local computer. Native-team source updates are not yet supported;
-refining the guide does not change an existing installation.
 
 Use the **Custom application** section when your requested outcomes need custom
 screens or additional application code. A team export does not implement remaining
