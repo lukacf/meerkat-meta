@@ -1236,6 +1236,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Meta now builds every session with a 64-rewrite transcript history window
+  (`compaction.history_retained_rewrites`; Meerkat's default is 4) unless the
+  host declares another value. With Meerkat 0.9.4's default window, one turn
+  that compacted more than four times retired rewrites its own in-turn
+  checkpoint still needed, so that checkpoint was refused ("failed to prove
+  pending rewrite suffix") and the turn was abandoned. Host compaction
+  declarations (`runtime_options.compaction`, the gateway's `compaction`
+  launch field and `UnifiedRuntimeBuilder::compaction`) now accept
+  `history_retained_rewrites`; zero is refused. A declared 4, Meerkat's
+  default, is treated as undeclared and becomes 64; a host that wants a
+  smaller window sets any value other than 4. Hosts that run Meerkat 0.9.4
+  without Meta can set `compaction.history_retained_rewrites` in their own
+  config. The Meerkat fix ships in Meerkat 0.9.5.
 - Console: a member's chat no longer stays "working" after the member
   finished. When a turn stopped at a host callback (an approved setup, for
   example) and the runtime continued it on its own, the continuation's

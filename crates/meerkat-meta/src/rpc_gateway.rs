@@ -517,7 +517,7 @@ fn gateway_agent_config(options: &GatewayRuntimeOptions) -> Config {
             );
         }
     }
-    config
+    crate::with_meta_compaction_defaults(config)
 }
 
 /// Parse the init `mob_config` TOML. A refusal keeps meerkat's message and

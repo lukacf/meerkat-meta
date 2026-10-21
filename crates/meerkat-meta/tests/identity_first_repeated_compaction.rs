@@ -56,6 +56,8 @@ comms = true
 "#;
 
 const IDENTITIES: [&str; 2] = ["agent:alice", "agent:bob"];
+/// Meta's default transcript retention (`meerkat_meta::META_HISTORY_RETAINED_REWRITES`).
+const META_HISTORY_RETAINED_REWRITES: u64 = 64;
 /// Adopted rewrites every member must reach before the reboot.
 const MIN_COMPACTIONS: u64 = 5;
 const TURNS: usize = 14;
@@ -312,13 +314,12 @@ fn identity_first_members_survive_repeated_auto_compaction() {
             "{identity} must reach {MIN_COMPACTIONS} adopted compactions: {head:#?}"
         );
         // Core serves bodies only for the rewrites its retention keeps: the
-        // newest DEFAULT_RETAINED_REWRITES occurrences. Older ones are retired
-        // to their commits and prefix digests, so five adopted compactions
-        // serve four bodies.
-        let retained = head.rewrite_count.min(
-            u64::try_from(meerkat_core::TranscriptHistoryRetention::DEFAULT_RETAINED_REWRITES)
-                .unwrap(),
-        );
+        // newest `history_retained_rewrites` occurrences; older ones are
+        // retired to their commits and prefix digests. The shipped gateway
+        // declares no compaction here, so Meta's default window applies and
+        // every adopted compaction of this run keeps its body (Core's own
+        // default of 4 would retire all but the newest four).
+        let retained = head.rewrite_count.min(META_HISTORY_RETAINED_REWRITES);
         assert_eq!(
             u64::try_from(*rewrites).unwrap(),
             retained,

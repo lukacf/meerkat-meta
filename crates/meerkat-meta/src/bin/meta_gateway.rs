@@ -377,6 +377,11 @@ fn config_fingerprint(
         hasher.update(policy.recent_turn_budget.to_le_bytes());
         hasher.update(policy.max_summary_tokens.to_le_bytes());
         hasher.update(policy.min_turns_between_compactions.to_le_bytes());
+        hasher.update(
+            u64::try_from(policy.history_retained_rewrites)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
     }
     hasher.update(b"\n");
     // The control listener binds at launch; resuming a live gateway that was
@@ -596,7 +601,9 @@ fn gateway_agent_config(
         // trigger.
         meerkat_meta::apply_compaction_policy(&mut config, policy).map_err(|e| anyhow!("{e}"))?;
     }
-    Ok(config)
+    // This gateway builds its own `FactoryAgentBuilder` from this config, so
+    // Meta's transcript retention default is applied here as well.
+    Ok(meerkat_meta::with_meta_compaction_defaults(config))
 }
 
 /// Returns (session_service, runtime_adapter, binary_blob_store).
@@ -4533,6 +4540,32 @@ mod tests {
         assert_ne!(
             pinned_key, lower_key,
             "two different thresholds must not share a runtime"
+        );
+        let wider = meerkat_meta::parse_compaction_policy(&json!({
+            "auto_compact_threshold": 120_000,
+            "history_retained_rewrites": 128
+        }))
+        .map_err(|e| anyhow!("{e}"))?;
+        let wider_key = config_fingerprint(
+            temp.path(),
+            None,
+            false,
+            "tux-auto",
+            false,
+            false,
+            temp.path(),
+            temp.path(),
+            temp.path(),
+            None,
+            Some(&wider),
+            None,
+            meerkat_meta::gateway_composition::DEFAULT_GATEWAY_HTTP_LISTEN,
+            None,
+            &paths,
+        )?;
+        assert_ne!(
+            pinned_key, wider_key,
+            "two different transcript retention windows must not share a runtime"
         );
         Ok(())
     }

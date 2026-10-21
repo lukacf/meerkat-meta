@@ -48,17 +48,46 @@
 use meerkat_core::Config;
 use meerkat_core::config::CompactionRuntimeConfig;
 
+/// Transcript-history retention for every session Meta builds, unless the
+/// host declares another value.
+///
+/// Core 0.9.4 keeps the bodies of the newest `history_retained_rewrites`
+/// transcript rewrites (default 4) and retires older ones after each
+/// compaction. One turn that compacts more than `history_retained_rewrites`
+/// times (four at the default) retires rewrites its own intra-turn
+/// checkpoint still has to prove, so that checkpoint is refused ("failed to
+/// prove pending rewrite suffix") and the turn is abandoned. A wider window
+/// keeps long single turns inside it; the Core fix ships in Core 0.9.5.
+pub const META_HISTORY_RETAINED_REWRITES: usize = 64;
+
+/// Raise Core's default transcript retention to
+/// [`META_HISTORY_RETAINED_REWRITES`].
+///
+/// `CompactionRuntimeConfig` cannot tell an inherited default from a
+/// declared one, so Core's default value counts as unset here; any other
+/// declared value is kept.
+#[must_use]
+pub fn with_meta_compaction_defaults(mut config: Config) -> Config {
+    if config.compaction.history_retained_rewrites
+        == meerkat_core::TranscriptHistoryRetention::DEFAULT_RETAINED_REWRITES
+    {
+        config.compaction.history_retained_rewrites = META_HISTORY_RETAINED_REWRITES;
+    }
+    config
+}
+
 /// Keys a host-level compaction declaration may carry.
 ///
 /// Closed on purpose: `CompactionRuntimeConfig`'s own deserializer ignores
 /// unknown keys, so a typo would silently inherit the model-aware default —
 /// the exact failure mode this module exists to remove. Meta's config
 /// surfaces reject the typo instead.
-pub const COMPACTION_POLICY_KEYS: [&str; 4] = [
+pub const COMPACTION_POLICY_KEYS: [&str; 5] = [
     "auto_compact_threshold",
     "recent_turn_budget",
     "max_summary_tokens",
     "min_turns_between_compactions",
+    "history_retained_rewrites",
 ];
 
 /// Parse a JSON host-level compaction declaration.
@@ -106,10 +135,14 @@ pub fn parse_compaction_policy(
 ///
 /// # Errors
 ///
-/// Fails when `auto_compact_threshold` is zero.
+/// Fails when `auto_compact_threshold` or `history_retained_rewrites` is
+/// zero.
 pub fn validate_compaction_policy(policy: &CompactionRuntimeConfig) -> Result<(), String> {
     if policy.auto_compact_threshold == 0 {
         return Err("auto_compact_threshold must be greater than 0".to_string());
+    }
+    if policy.history_retained_rewrites == 0 {
+        return Err("history_retained_rewrites must be greater than 0".to_string());
     }
     Ok(())
 }
@@ -135,6 +168,7 @@ pub fn apply_compaction_policy(
         recent_turn_budget = policy.recent_turn_budget,
         max_summary_tokens = policy.max_summary_tokens,
         min_turns_between_compactions = policy.min_turns_between_compactions,
+        history_retained_rewrites = policy.history_retained_rewrites,
         "host compaction policy applied to the session-build config"
     );
     config.compaction = policy.clone();
@@ -146,6 +180,41 @@ pub fn apply_compaction_policy(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A declared window is kept, Core's default value counts as unset and
+    /// becomes Meta's, and zero is refused like Core's own validation does.
+    #[test]
+    fn history_retention_is_declared_defaulted_and_never_zero() {
+        let declared = parse_compaction_policy(&json!({ "history_retained_rewrites": 9 }))
+            .expect("a declared window parses");
+        assert_eq!(declared.history_retained_rewrites, 9);
+        let zero = parse_compaction_policy(&json!({ "history_retained_rewrites": 0 }))
+            .expect_err("a zero window is refused");
+        assert!(
+            zero.contains("history_retained_rewrites must be greater than 0"),
+            "{zero}"
+        );
+        assert_eq!(
+            with_meta_compaction_defaults(Config::default())
+                .compaction
+                .history_retained_rewrites,
+            META_HISTORY_RETAINED_REWRITES
+        );
+        let mut config = Config::default();
+        config.compaction.history_retained_rewrites = 9;
+        assert_eq!(
+            with_meta_compaction_defaults(config)
+                .compaction
+                .history_retained_rewrites,
+            9
+        );
+        // The default never pins the threshold.
+        assert!(
+            !with_meta_compaction_defaults(Config::default())
+                .compaction
+                .auto_compact_threshold_explicit
+        );
+    }
 
     /// A declared threshold must set the explicit flag — that flag is the
     /// only thing standing between the declared number and meerkat's

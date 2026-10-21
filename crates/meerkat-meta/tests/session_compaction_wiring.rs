@@ -254,3 +254,190 @@ async fn host_compaction_policy_pins_the_trigger() {
          session is built with",
     );
 }
+
+/// Provider input tokens one long-turn boundary reports: over [`LONG_TURN_THRESHOLD`].
+const LONG_TURN_INPUT_TOKENS: u64 = 60_000;
+const LONG_TURN_THRESHOLD: u64 = 50_000;
+/// Tool-calling boundaries of the one long turn before its final answer.
+const LONG_TURN_TOOL_BOUNDARIES: usize = 12;
+/// More than Core 0.9.4's default retention (4), past which a turn fails.
+const LONG_TURN_MIN_COMPACTIONS: usize = 6;
+
+/// One turn that keeps calling a tool: every tool-offering request answers
+/// with a tool call over the threshold until [`LONG_TURN_TOOL_BOUNDARIES`],
+/// then with the final answer. A request without tools is the compactor's
+/// summary call and gets a summary.
+struct LongTurnClient {
+    boundaries: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl meerkat_client::LlmClient for LongTurnClient {
+    fn project_replay_messages(
+        &self,
+        messages: &[meerkat_core::Message],
+    ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+        Ok(messages.to_vec())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a meerkat_client::LlmRequest,
+    ) -> std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<LlmEvent, meerkat_client::LlmError>> + Send + 'a>,
+    > {
+        let usage = |input_tokens| LlmEvent::UsageUpdate {
+            usage: llm_usage::turn_usage(
+                FIXTURE_MODEL,
+                meerkat_core::Provider::Other,
+                Usage {
+                    input_tokens,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+            ),
+        };
+        let events = match request.tools.first() {
+            None => vec![
+                LlmEvent::TextDelta {
+                    delta: "summary of the long turn so far".to_string(),
+                    meta: None,
+                },
+                usage(1),
+                LlmEvent::Done {
+                    outcome: LlmDoneOutcome::success(StopReason::EndTurn),
+                },
+            ],
+            Some(tool) => {
+                let boundary = self
+                    .boundaries
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if boundary < LONG_TURN_TOOL_BOUNDARIES {
+                    vec![
+                        LlmEvent::ToolCallComplete {
+                            id: format!("long-turn-call-{boundary}"),
+                            name: tool.name.to_string(),
+                            args: serde_json::json!({}),
+                            meta: None,
+                        },
+                        usage(LONG_TURN_INPUT_TOKENS),
+                        LlmEvent::Done {
+                            outcome: LlmDoneOutcome::success(StopReason::ToolUse),
+                        },
+                    ]
+                } else {
+                    vec![
+                        LlmEvent::TextDelta {
+                            delta: "done".to_string(),
+                            meta: None,
+                        },
+                        usage(LONG_TURN_INPUT_TOKENS),
+                        LlmEvent::Done {
+                            outcome: LlmDoneOutcome::success(StopReason::EndTurn),
+                        },
+                    ]
+                }
+            }
+        };
+        Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+    }
+
+    fn provider(&self) -> meerkat_core::Provider {
+        meerkat_core::Provider::Other
+    }
+
+    async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+        Ok(())
+    }
+}
+
+/// Run one persistent member turn through [`LongTurnClient`] with a policy
+/// that compacts at every boundary; return the turn outcome and how many
+/// compactions it completed.
+async fn long_turn(mob_id: &str, retained: Option<usize>) -> (Result<(), String>, usize) {
+    let state = tempfile::tempdir().expect("state directory");
+    let mut policy = meerkat_core::config::CompactionRuntimeConfig {
+        auto_compact_threshold: LONG_TURN_THRESHOLD,
+        auto_compact_threshold_explicit: true,
+        recent_turn_budget: 1,
+        min_turns_between_compactions: 1,
+        ..Default::default()
+    };
+    if let Some(retained) = retained {
+        policy.history_retained_rewrites = retained;
+    }
+    let runtime = Box::pin(
+        UnifiedRuntime::builder()
+            .definition(definition(mob_id))
+            .default_llm_client(Arc::new(LongTurnClient {
+                boundaries: std::sync::atomic::AtomicUsize::new(0),
+            }))
+            .persistent_state(state.path())
+            .compaction(policy)
+            .max_sessions(4)
+            .build(),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("runtime builds: {error}"));
+    runtime
+        .spawn(SpawnMemberSpec::from_wire(
+            "worker".to_string(),
+            MEMBER_ALIAS.to_string(),
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("member spawns: {error}"));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+    let admission = runtime
+        .start_member_turn(
+            MEMBER_ALIAS,
+            ContentInput::Text("one long turn".to_string()),
+            HandlingMode::Queue,
+            MemberTurnOptions::new(),
+            Some(tx.clone()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("the long turn must be admitted: {error}"));
+    let outcome = tokio::time::timeout(Duration::from_mins(2), admission.turn.wait())
+        .await
+        .unwrap_or_else(|error| panic!("the long turn timed out: {error}"))
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    drop(tx);
+    let mut completed = 0;
+    while let Ok(Some(envelope)) = tokio::time::timeout(DRAIN_QUIET_PERIOD, rx.recv()).await {
+        if matches!(envelope.payload, AgentEvent::CompactionCompleted { .. }) {
+            completed += 1;
+        }
+    }
+    (outcome, completed)
+}
+
+/// Core 0.9.4 retires rewrite bodies past `history_retained_rewrites` after
+/// each compaction. One turn that compacts more than
+/// `history_retained_rewrites` times then cannot prove its own intra-turn
+/// checkpoint and is abandoned. Meta 0.9.4 builds every session with a
+/// 64-rewrite window, so the same long turn completes; an explicitly narrow
+/// window still shows the refusal.
+#[tokio::test]
+async fn one_turn_with_many_compactions_completes_under_meta_retention() {
+    let (outcome, compactions) = long_turn("compaction-long-turn-meta", None).await;
+    assert!(
+        outcome.is_ok(),
+        "the long turn must complete under Meta's retention: {outcome:?}"
+    );
+    assert!(
+        compactions >= LONG_TURN_MIN_COMPACTIONS,
+        "the long turn must compact at least {LONG_TURN_MIN_COMPACTIONS} times, saw {compactions}"
+    );
+    let (narrow, narrow_compactions) = long_turn("compaction-long-turn-narrow", Some(2)).await;
+    let error = narrow.expect_err(&format!(
+        "a 2-rewrite window must refuse the long turn's checkpoint ({narrow_compactions} compactions)"
+    ));
+    assert!(
+        error.contains("failed to prove pending rewrite suffix") && error.contains("was retired"),
+        "the narrow window fails with Core's retirement refusal: {error}"
+    );
+}

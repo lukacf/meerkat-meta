@@ -138,8 +138,8 @@ pub use child_mob_storage::{
     RetainedChildMobKind,
 };
 pub use compaction_policy::{
-    COMPACTION_POLICY_KEYS, apply_compaction_policy, parse_compaction_policy,
-    validate_compaction_policy,
+    COMPACTION_POLICY_KEYS, META_HISTORY_RETAINED_REWRITES, apply_compaction_policy,
+    parse_compaction_policy, validate_compaction_policy, with_meta_compaction_defaults,
 };
 pub use config_convention::ConventionalPaths;
 pub use console_aggregator::{
