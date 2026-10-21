@@ -139,9 +139,10 @@ class OrdinaryMetaStartup:
         # An app copied from an earlier template installs the default Console
         # login factory for every startup. That default enrolls only through a
         # selected Toolkit runtime, so here it could only refuse each login.
-        # Clear it: the configured password session and native_auth are this
-        # route's contract. An integration-declared factory keeps its semantics.
-        if not callable(getattr(getattr(application, "integration", None), "console_login_factory", None)):
+        # Clear it only when no hook is present: the configured password session
+        # and native_auth are this route's contract. A present hook, valid or
+        # not, keeps the guarded factory and its own refusals.
+        if getattr(getattr(application, "integration", None), "console_login_factory", None) is None:
             application.console_login_factory = None
 
     def builder_config(self, **options):

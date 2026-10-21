@@ -165,7 +165,8 @@ def earlier_template_host(monkeypatch, root):
     return module
 
 
-@pytest.mark.parametrize("case", ["ordinary-meta", "earlier-template", "ordinary-hook", "toolkit", "toolkit-refused"])
+@pytest.mark.parametrize("case", ["ordinary-meta", "earlier-template", "ordinary-hook", "ordinary-malformed-hook",
+    "toolkit", "toolkit-refused"])
 async def test_actual_run_installs_default_login_only_for_a_toolkit_startup(tmp_path, monkeypatch, case):
     # Actual generated app.run() Console wiring and password login through the
     # ASGI front, with inert runtime/SDK doubles. The ordinary Meta startup runs
@@ -197,6 +198,15 @@ async def test_actual_run_installs_default_login_only_for_a_toolkit_startup(tmp_
         async def close(self):
             pass
 
+    if case == "ordinary-malformed-hook":
+        original_load = module.Application.load
+        async def load_then_malform(self, *args, **kwargs):
+            await original_load(self, *args, **kwargs)
+            # Application.load refuses a present hook that is not a synchronous
+            # callable. Adding one after load shows that the seam and the wiring
+            # still never turn it into the password-only login.
+            self.integration.console_login_factory = "present-but-not-callable"
+        monkeypatch.setattr(module.Application, "load", load_then_malform)
     original_context = module.ApplicationContext
     def make_context(root, deployment, stop):
         context = original_context(root, deployment, stop)
@@ -338,11 +348,12 @@ async def test_actual_run_installs_default_login_only_for_a_toolkit_startup(tmp_
     assert front.console_login_factory.__self__ is application
     assert front.console_login_factory.__func__ is module.Application.console_login_factory
     assert front.required == [True]
-    if case == "ordinary-hook":
-        # A declared hook stays the login owner: its refusal is never replaced
+    if case in ("ordinary-hook", "ordinary-malformed-hook"):
+        # A present hook keeps the guarded factory: its refusal is never replaced
         # by the password session, and no Toolkit enrollment is attempted.
-        assert front.statuses == [503, 503] and forwarded == []
-        assert len(application.integration.calls) == len(owners) == 1 and private.selections == []
+        assert front.statuses == [503, 503] and forwarded == [] and private.selections == []
+        expected = 1 if case == "ordinary-hook" else 0
+        assert len(application.integration.calls) == len(owners) == expected
         return
     assert len(private.selections) == 1 and enrollment.retire_calls == 1 and private.close_calls == 0
     if case == "toolkit-refused":
@@ -354,3 +365,33 @@ async def test_actual_run_installs_default_login_only_for_a_toolkit_startup(tmp_
         front.key, algorithms=["HS256"], audience=auth.AUDIENCE, issuer=auth.ISSUER)
     assert (claims["iss"], claims["sub"], claims["sid"]) == (
         selected.issuer, selected.subject, selected.login_scope_id)
+
+
+@pytest.mark.parametrize("hook", ["absent", "callable", "not-callable"])
+async def test_ordinary_prepare_clears_only_an_absent_console_login_hook(tmp_path, hook):
+    # The real prepare() seam alone. Application.load refuses a present hook that
+    # is not a synchronous callable; the seam itself must still leave it in place.
+    from launchkit.ordinary_meta_startup import OrdinaryMetaStartup
+    integration = SimpleNamespace()
+    if hook == "callable":
+        integration.console_login_factory = lambda login: None
+    elif hook == "not-callable":
+        integration.console_login_factory = "present-but-not-callable"
+    application = SimpleNamespace(context=SimpleNamespace(root=tmp_path, runtime=None), dynamic=False,
+        _application_callbacks=None, integration=integration)
+
+    class Startup(OrdinaryMetaStartup):
+        # The real class and prepare(); no custody input is read.
+        def __new__(cls):
+            return object.__new__(cls)
+        def __init__(self):
+            self.root, self.runtime, self.application = tmp_path, None, None
+            self._prepared = False
+            self._require_current = lambda: None
+            self._read_inputs = lambda: (b"", ())
+
+    await Startup().prepare(application)
+    if hook == "absent":
+        assert application.console_login_factory is None
+    else:
+        assert not hasattr(application, "console_login_factory")
