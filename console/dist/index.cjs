@@ -43993,29 +43993,121 @@ async function withConsoleSendStorageLock(key, update) {
   }
 }
 
+// src/lib/identity-log.ts
+function cursorSeq(cursor) {
+  if (!cursor) return null;
+  const match = /^console:(\d+)$/.exec(cursor);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function transcriptOrder(a, aIndex, b2, bIndex) {
+  const ta = typeof a.timestampMs === "number" ? a.timestampMs : Number.MAX_SAFE_INTEGER;
+  const tb = typeof b2.timestampMs === "number" ? b2.timestampMs : Number.MAX_SAFE_INTEGER;
+  if (ta !== tb) return ta - tb;
+  const ca = cursorSeq(a.cursor);
+  const cb = cursorSeq(b2.cursor);
+  if (ca !== null && cb !== null && ca !== cb) return ca - cb;
+  return aIndex - bIndex;
+}
+function insertSorted(sorted, frame) {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = lo + hi >>> 1;
+    if (transcriptOrder(sorted[mid], 0, frame, 1) <= 0) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo === sorted.length) sorted.push(frame);
+  else sorted.splice(lo, 0, frame);
+}
+function sortedEvents(log) {
+  if (log.sorted) return log.sorted;
+  const view = log.events.map((frame, index2) => ({ frame, index: index2 })).sort((a, b2) => transcriptOrder(a.frame, a.index, b2.frame, b2.index)).map((entry) => entry.frame);
+  log.sorted = view;
+  return view;
+}
+function pushFrame(log, key, frame) {
+  if (log.byKey.has(key)) return false;
+  log.byKey.set(key, log.events.length);
+  log.events.push(frame);
+  log.version += 1;
+  if (log.sorted) insertSorted(log.sorted, frame);
+  return true;
+}
+function mergeFrameUpdate(log, updated) {
+  if (!updated.id) return null;
+  const index2 = log.byKey.get(updated.id);
+  if (index2 === void 0) return null;
+  const previous3 = log.events[index2];
+  if (!previous3) return null;
+  const existingVersion = previous3.frameVersion ?? 0;
+  const updatedVersion = updated.frameVersion ?? existingVersion;
+  if (updatedVersion < existingVersion) return null;
+  const next = { ...previous3, ...updated };
+  log.events[index2] = next;
+  log.version += 1;
+  const moved = previous3.timestampMs !== next.timestampMs || cursorSeq(previous3.cursor) !== cursorSeq(next.cursor);
+  if (moved) {
+    log.sorted = null;
+  } else if (log.sorted) {
+    const at = log.sorted.indexOf(previous3);
+    if (at >= 0) log.sorted[at] = next;
+    else log.sorted = null;
+  }
+  return { previous: previous3, next, moved };
+}
+function trimIdentityLogCore(log, max, keyOf) {
+  const sorted = sortedEvents(log);
+  const drop = sorted.length - max;
+  if (drop <= 0) return null;
+  const dropped = new Set(sorted.slice(0, drop));
+  const retained = log.events.filter((frame) => !dropped.has(frame));
+  log.events = retained;
+  log.sorted = sorted.slice(drop);
+  log.byKey.clear();
+  retained.forEach((frame, index2) => log.byKey.set(keyOf(frame), index2));
+  log.version += 1;
+  return retained;
+}
+function resetIdentityLogCore(log) {
+  log.events = [];
+  log.byKey.clear();
+  log.sorted = null;
+  log.version += 1;
+}
+
 // src/lib/idle-reconcile.ts
 function agentReportsIdle(agent) {
   return agent.response_phase === null && agent.progress?.run_state === "idle";
 }
-function shouldSettleIdleIdentity(args) {
-  if (!agentReportsIdle(args.agent)) return false;
-  if (args.logVersionAtRequest === void 0 || args.logVersionAtRequest !== args.logVersionNow) return false;
-  if (args.sendInFlight) return false;
-  return args.foldBusy || args.foldPhase !== null;
+function decideIdleSettlement(args) {
+  if (!agentReportsIdle(args.agent)) return "reset";
+  if (args.logVersionAtRequest === void 0 || args.logVersionAtRequest !== args.logVersionNow) return "reset";
+  if (args.sendInFlight) return "reset";
+  if (!args.foldBusy && args.foldPhase === null) return "reset";
+  return args.armedAtVersion === args.logVersionNow ? "settle" : "arm";
 }
 function idleWatermarkFor(frames) {
-  let newest = Number.NEGATIVE_INFINITY;
+  let newest;
   for (const frame of frames) {
-    if (typeof frame.timestampMs === "number" && frame.timestampMs > newest) newest = frame.timestampMs;
+    if (typeof frame.timestampMs !== "number") continue;
+    const seq = cursorSeq(frame.cursor);
+    if (!newest || frame.timestampMs > newest.timestampMs || frame.timestampMs === newest.timestampMs && seq !== null && (newest.cursorSeq === null || seq > newest.cursorSeq)) {
+      newest = { timestampMs: frame.timestampMs, cursorSeq: seq };
+    }
   }
   return newest;
 }
 function isAfterIdleWatermark(frame, watermark) {
-  if (watermark === void 0 || watermark === Number.NEGATIVE_INFINITY) return true;
-  return typeof frame.timestampMs === "number" && frame.timestampMs > watermark;
+  if (!watermark) return true;
+  if (typeof frame.timestampMs !== "number") return false;
+  if (frame.timestampMs !== watermark.timestampMs) return frame.timestampMs > watermark.timestampMs;
+  const seq = cursorSeq(frame.cursor);
+  return seq !== null && watermark.cursorSeq !== null && seq > watermark.cursorSeq;
 }
 function framesAfterIdleWatermark(frames, watermark) {
-  if (watermark === void 0 || watermark === Number.NEGATIVE_INFINITY) return frames;
+  if (!watermark) return frames;
   return frames.filter((frame) => isAfterIdleWatermark(frame, watermark));
 }
 
@@ -44745,7 +44837,7 @@ function eventSortRank(event) {
 function isInteractionStartEvent(event) {
   return event === "user_input" || event === "interaction_started" || event === "run_started";
 }
-function cursorSeq(cursor) {
+function cursorSeq2(cursor) {
   if (!cursor) return null;
   const match = /^console:(\d+)$/.exec(cursor);
   if (!match) return null;
@@ -44767,7 +44859,7 @@ function transcriptSourceOrder(left, right) {
   const sameRun = Boolean(left.runId?.trim() && left.runId === right.runId);
   if (!sameSession && !sameInteraction && !sameRun) return null;
   if (left.sourceKind === "session_history" || right.sourceKind === "session_history") return null;
-  const a = cursorSeq(left.cursor), b2 = cursorSeq(right.cursor);
+  const a = cursorSeq2(left.cursor), b2 = cursorSeq2(right.cursor);
   return a !== null && b2 !== null && a !== b2 ? a - b2 : null;
 }
 function noteInteractionStart(interactionStartMs, frame) {
@@ -44817,8 +44909,8 @@ function transcriptFrameComparator(interactionStartMs) {
         return leftRank - rightRank;
       }
     }
-    const leftCursor = cursorSeq(left.frame.cursor);
-    const rightCursor = cursorSeq(right.frame.cursor);
+    const leftCursor = cursorSeq2(left.frame.cursor);
+    const rightCursor = cursorSeq2(right.frame.cursor);
     if (leftCursor !== null && rightCursor !== null && leftCursor !== rightCursor) {
       return leftCursor - rightCursor;
     }
@@ -47669,7 +47761,7 @@ function fullTimelineDerivation(agent, frames, options) {
   resume.compactionOpen = openCompactions.length > 0;
   for (const frame of frames) {
     noteInteractionStart(resume.interactionStartMs, frame);
-    const cursor = cursorSeq(frame.cursor);
+    const cursor = cursorSeq2(frame.cursor);
     if (cursor !== null && cursor > resume.maxCursor) resume.maxCursor = cursor;
     const scope = sequenceScopeOf(frame);
     const sequence = sourceSequence(frame);
@@ -47703,7 +47795,7 @@ function extendTimelineDerivation(previous3, agent, frames, options) {
   for (let j2 = 0; j2 < appended.length; j2++) {
     const frame = appended[j2];
     if (frame.event !== "text_delta" || options.renderTextDeltas === false || frame.sourceKind === "session_history" || isRealtimeHistoryMessage(frame) || typeof frame.timestampMs !== "number") return null;
-    const cursor = cursorSeq(frame.cursor);
+    const cursor = cursorSeq2(frame.cursor);
     if (cursor === null || cursor <= maxCursor) return null;
     if (frame.timestampMs < (resume.fold.unloadedBeforeMs ?? Number.NEGATIVE_INFINITY)) return null;
     maxCursor = cursor;
@@ -50560,90 +50652,6 @@ function SpriteSheet() {
 }
 function Icon({ name: name2, className }) {
   return /* @__PURE__ */ (0, import_jsx_runtime42.jsx)("svg", { className, "aria-label": name2, children: /* @__PURE__ */ (0, import_jsx_runtime42.jsx)("use", { href: "#".concat(name2) }) });
-}
-
-// src/lib/identity-log.ts
-function cursorSeq2(cursor) {
-  if (!cursor) return null;
-  const match = /^console:(\d+)$/.exec(cursor);
-  if (!match) return null;
-  const parsed = Number(match[1]);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-function transcriptOrder(a, aIndex, b2, bIndex) {
-  const ta = typeof a.timestampMs === "number" ? a.timestampMs : Number.MAX_SAFE_INTEGER;
-  const tb = typeof b2.timestampMs === "number" ? b2.timestampMs : Number.MAX_SAFE_INTEGER;
-  if (ta !== tb) return ta - tb;
-  const ca = cursorSeq2(a.cursor);
-  const cb = cursorSeq2(b2.cursor);
-  if (ca !== null && cb !== null && ca !== cb) return ca - cb;
-  return aIndex - bIndex;
-}
-function insertSorted(sorted, frame) {
-  let lo = 0;
-  let hi = sorted.length;
-  while (lo < hi) {
-    const mid = lo + hi >>> 1;
-    if (transcriptOrder(sorted[mid], 0, frame, 1) <= 0) lo = mid + 1;
-    else hi = mid;
-  }
-  if (lo === sorted.length) sorted.push(frame);
-  else sorted.splice(lo, 0, frame);
-}
-function sortedEvents(log) {
-  if (log.sorted) return log.sorted;
-  const view = log.events.map((frame, index2) => ({ frame, index: index2 })).sort((a, b2) => transcriptOrder(a.frame, a.index, b2.frame, b2.index)).map((entry) => entry.frame);
-  log.sorted = view;
-  return view;
-}
-function pushFrame(log, key, frame) {
-  if (log.byKey.has(key)) return false;
-  log.byKey.set(key, log.events.length);
-  log.events.push(frame);
-  log.version += 1;
-  if (log.sorted) insertSorted(log.sorted, frame);
-  return true;
-}
-function mergeFrameUpdate(log, updated) {
-  if (!updated.id) return null;
-  const index2 = log.byKey.get(updated.id);
-  if (index2 === void 0) return null;
-  const previous3 = log.events[index2];
-  if (!previous3) return null;
-  const existingVersion = previous3.frameVersion ?? 0;
-  const updatedVersion = updated.frameVersion ?? existingVersion;
-  if (updatedVersion < existingVersion) return null;
-  const next = { ...previous3, ...updated };
-  log.events[index2] = next;
-  log.version += 1;
-  const moved = previous3.timestampMs !== next.timestampMs || cursorSeq2(previous3.cursor) !== cursorSeq2(next.cursor);
-  if (moved) {
-    log.sorted = null;
-  } else if (log.sorted) {
-    const at = log.sorted.indexOf(previous3);
-    if (at >= 0) log.sorted[at] = next;
-    else log.sorted = null;
-  }
-  return { previous: previous3, next, moved };
-}
-function trimIdentityLogCore(log, max, keyOf) {
-  const sorted = sortedEvents(log);
-  const drop = sorted.length - max;
-  if (drop <= 0) return null;
-  const dropped = new Set(sorted.slice(0, drop));
-  const retained = log.events.filter((frame) => !dropped.has(frame));
-  log.events = retained;
-  log.sorted = sorted.slice(drop);
-  log.byKey.clear();
-  retained.forEach((frame, index2) => log.byKey.set(keyOf(frame), index2));
-  log.version += 1;
-  return retained;
-}
-function resetIdentityLogCore(log) {
-  log.events = [];
-  log.byKey.clear();
-  log.sorted = null;
-  log.version += 1;
 }
 
 // src/panels/TimelinePanel.tsx
@@ -63457,7 +63465,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       recomputeBusyStateFromLog(identity);
       return;
     }
-    if (!isAfterIdleWatermark(frame, log.idleSettledThroughMs)) return;
+    if (!isAfterIdleWatermark(frame, log.idleSettledThrough)) return;
     const ts = frame.timestampMs ?? log.busyFoldedThroughMs;
     if (!log.busyFoldValid || ts < log.busyFoldedThroughMs || frame.sourceKind === "session_history") {
       recomputeBusyStateFromLog(identity);
@@ -63474,8 +63482,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   function recomputeBusyStateFromLog(identity) {
     const log = getOrCreateLog(identity);
     const lifecycle = new ConsoleActivityProjection();
-    let foldedThrough = log.idleSettledThroughMs ?? Number.NEGATIVE_INFINITY;
-    const ordered = framesAfterIdleWatermark(sortedEvents(log), log.idleSettledThroughMs).sort((a, b2) => {
+    let foldedThrough = log.idleSettledThrough?.timestampMs ?? Number.NEGATIVE_INFINITY;
+    const ordered = framesAfterIdleWatermark(sortedEvents(log), log.idleSettledThrough).sort((a, b2) => {
       const timeDelta = (a.timestampMs || 0) - (b2.timestampMs || 0);
       if (timeDelta !== 0) return timeDelta;
       const rankDelta = busyTransitionSortRank(a) - busyTransitionSortRank(b2);
@@ -63515,15 +63523,15 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     return changed;
   }
   function newerCursor(a, b2) {
-    const aSeq = cursorSeq2(a);
-    const bSeq = cursorSeq2(b2);
+    const aSeq = cursorSeq(a);
+    const bSeq = cursorSeq(b2);
     if (aSeq === null) return b2 || a;
     if (bSeq === null) return a || b2;
     return bSeq > aSeq ? b2 : a;
   }
   function olderCursor(a, b2) {
-    const aSeq = cursorSeq2(a);
-    const bSeq = cursorSeq2(b2);
+    const aSeq = cursorSeq(a);
+    const bSeq = cursorSeq(b2);
     if (aSeq === null) return b2 || a;
     if (bSeq === null) return a || b2;
     return bSeq < aSeq ? b2 : a;
@@ -64065,7 +64073,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     if (frame.sourceKind === "session_history" || frame.event === "assistant_history_snapshot" || frame.event === "frame_updated") {
       return recomputePhaseForIdentity(identity);
     }
-    if (!isAfterIdleWatermark(frame, identityLogRef.current[identity]?.idleSettledThroughMs)) return false;
+    if (!isAfterIdleWatermark(frame, identityLogRef.current[identity]?.idleSettledThrough)) return false;
     let changed = false;
     for (const panel of dockRef.current.viewState.panels) {
       const target = panel.target;
@@ -64106,7 +64114,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   function recomputePhaseForIdentity(identity) {
     const frames = framesAfterIdleWatermark(
       getSortedFrames(identity),
-      identityLogRef.current[identity]?.idleSettledThroughMs
+      identityLogRef.current[identity]?.idleSettledThrough
     ).filter((frame) => PANEL_ROUTABLE_EVENTS.has(frame.event));
     const phase2 = inferResponsePhaseFromFrames(frames, null);
     let changed = false;
@@ -64134,18 +64142,26 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         const panelPhase = Object.entries(phaseValueByKey.current).find(
           ([panelKey, phase2]) => panelKey.endsWith(suffix) && phase2 != null
         )?.[1] ?? null;
-        if (!shouldSettleIdleIdentity({
+        const decision = decideIdleSettlement({
           agent,
           logVersionAtRequest: logVersionsAtRequest.get(identity),
           logVersionNow: log.version,
           sendInFlight,
           foldBusy: log.busyLifecycle.busy || isIdentityBusy(identity),
-          foldPhase: log.busyLifecycle.phase ?? panelPhase
-        })) continue;
+          foldPhase: log.busyLifecycle.phase ?? panelPhase,
+          armedAtVersion: log.idlePollArmedAtVersion
+        });
+        if (decision === "arm") log.idlePollArmedAtVersion = log.version;
+        if (decision !== "settle") {
+          if (decision === "reset") log.idlePollArmedAtVersion = void 0;
+          continue;
+        }
+        log.idlePollArmedAtVersion = void 0;
         const watermark = idleWatermarkFor(log.events);
-        log.idleSettledThroughMs = watermark;
+        if (!watermark) continue;
+        log.idleSettledThrough = watermark;
         log.busyLifecycle = new ConsoleActivityProjection();
-        log.busyFoldedThroughMs = watermark;
+        log.busyFoldedThroughMs = watermark.timestampMs;
         log.busyFoldValid = true;
         identityLifecycleRef.current[identity] = { interactionOpen: false, runOpen: false };
         applyBusyState(identity, false);
@@ -66052,7 +66068,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       panelKey
     );
     const honorLocalPhase = hasLocalPhase && (isSending || optimisticEntry !== null);
-    const phase2 = panelPhaseFor(panelKey, framesAfterIdleWatermark(sortedFrames, identityLog.idleSettledThroughMs), {
+    const phase2 = panelPhaseFor(panelKey, framesAfterIdleWatermark(sortedFrames, identityLog.idleSettledThrough), {
       localPhase: honorLocalPhase ? phaseRef.current[panelKey] ?? null : null,
       hasLocalPhase: honorLocalPhase,
       serverPhase: agent?.response_phase ?? null

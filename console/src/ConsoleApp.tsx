@@ -6,9 +6,10 @@ import { consoleCustomPanelTarget, type ConsolePanelDefinition, type ConsolePane
 import { withConsoleSendStorageLock } from "./lib/send-storage-lock";
 import {
   framesAfterIdleWatermark,
+  decideIdleSettlement,
   idleWatermarkFor,
   isAfterIdleWatermark,
-  shouldSettleIdleIdentity,
+  type IdleWatermark,
 } from "./lib/idle-reconcile";
 import React from "react";
 import "@console-components/styles";
@@ -308,10 +309,13 @@ interface IdentityLog extends IdentityLogCore {
   busyLifecycle: ConsoleActivityProjection;
   busyFoldedThroughMs: number;
   busyFoldValid: boolean;
-  /// Set when the member status poll reported the member idle: every frame
-  /// at or before this timestamp is settled, and the busy and phase folds
-  /// read only newer frames (see `lib/idle-reconcile.ts`).
-  idleSettledThroughMs?: number;
+  /// Set when two member status polls in a row reported the member idle:
+  /// every frame at or before this watermark is settled, and the busy and
+  /// phase folds, including a full replay, read only newer frames (see
+  /// `lib/idle-reconcile.ts`).
+  idleSettledThrough?: IdleWatermark;
+  /// The log version at the first of those two idle polls.
+  idlePollArmedAtVersion?: number;
   /// `null` while we haven't asked the server yet; `true` if the
   /// runtime has an EventLogStore (we'll fetch backfill); `false`
   /// once we've observed `available: false` (SSE is the only source).
@@ -1479,7 +1483,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       recomputeBusyStateFromLog(identity);
       return;
     }
-    if (!isAfterIdleWatermark(frame, log.idleSettledThroughMs)) return;
+    if (!isAfterIdleWatermark(frame, log.idleSettledThrough)) return;
     const ts = frame.timestampMs ?? log.busyFoldedThroughMs;
     if (!log.busyFoldValid || ts < log.busyFoldedThroughMs || frame.sourceKind === "session_history") {
       recomputeBusyStateFromLog(identity);
@@ -1500,8 +1504,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   function recomputeBusyStateFromLog(identity: string): void {
     const log = getOrCreateLog(identity);
     const lifecycle = new ConsoleActivityProjection();
-    let foldedThrough = log.idleSettledThroughMs ?? Number.NEGATIVE_INFINITY;
-    const ordered = framesAfterIdleWatermark(sortedEvents(log), log.idleSettledThroughMs)
+    let foldedThrough = log.idleSettledThrough?.timestampMs ?? Number.NEGATIVE_INFINITY;
+    const ordered = framesAfterIdleWatermark(sortedEvents(log), log.idleSettledThrough)
       .sort((a, b) => {
         const timeDelta = (a.timestampMs || 0) - (b.timestampMs || 0);
         if (timeDelta !== 0) return timeDelta;
@@ -2286,7 +2290,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       || frame.event === "frame_updated") {
       return recomputePhaseForIdentity(identity);
     }
-    if (!isAfterIdleWatermark(frame, identityLogRef.current[identity]?.idleSettledThroughMs)) return false;
+    if (!isAfterIdleWatermark(frame, identityLogRef.current[identity]?.idleSettledThrough)) return false;
     let changed = false;
     for (const panel of dockRef.current.viewState.panels) {
       const target = panel.target as MetaDockTarget | null;
@@ -2334,7 +2338,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   function recomputePhaseForIdentity(identity: string): boolean {
     const frames = framesAfterIdleWatermark(
       getSortedFrames(identity),
-      identityLogRef.current[identity]?.idleSettledThroughMs,
+      identityLogRef.current[identity]?.idleSettledThrough,
     ).filter((frame) => PANEL_ROUTABLE_EVENTS.has(frame.event));
     const phase = inferResponsePhaseFromFrames(frames, null);
     let changed = false;
@@ -2352,8 +2356,9 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   // The member status poll is the server's authoritative idle signal (see
   // lib/idle-reconcile.ts). A fold that still holds an owner open after the
   // member finished (frames that opened it never got a matching terminal)
-  // reads "working" and queues every send; an idle poll settles every frame
-  // the console had seen when it asked.
+  // reads "working" and queues every send; two idle polls in a row, with no
+  // frame for the member since the first, settle every frame the console
+  // had seen.
   const settleIdleIdentitiesRef = React.useRef<
     (agents: ConsoleAgent[], logVersionsAtRequest: Map<string, number>) => void
   >(() => {});
@@ -2374,18 +2379,26 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         const panelPhase = Object.entries(phaseValueByKey.current).find(
           ([panelKey, phase]) => panelKey.endsWith(suffix) && phase != null,
         )?.[1] ?? null;
-        if (!shouldSettleIdleIdentity({
+        const decision = decideIdleSettlement({
           agent,
           logVersionAtRequest: logVersionsAtRequest.get(identity),
           logVersionNow: log.version,
           sendInFlight,
           foldBusy: log.busyLifecycle.busy || isIdentityBusy(identity),
           foldPhase: log.busyLifecycle.phase ?? panelPhase,
-        })) continue;
+          armedAtVersion: log.idlePollArmedAtVersion,
+        });
+        if (decision === "arm") log.idlePollArmedAtVersion = log.version;
+        if (decision !== "settle") {
+          if (decision === "reset") log.idlePollArmedAtVersion = undefined;
+          continue;
+        }
+        log.idlePollArmedAtVersion = undefined;
         const watermark = idleWatermarkFor(log.events);
-        log.idleSettledThroughMs = watermark;
+        if (!watermark) continue;
+        log.idleSettledThrough = watermark;
         log.busyLifecycle = new ConsoleActivityProjection();
-        log.busyFoldedThroughMs = watermark;
+        log.busyFoldedThroughMs = watermark.timestampMs;
         log.busyFoldValid = true;
         identityLifecycleRef.current[identity] = { interactionOpen: false, runOpen: false };
         applyBusyState(identity, false);
@@ -4867,7 +4880,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       panelKey,
     );
     const honorLocalPhase = hasLocalPhase && (isSending || optimisticEntry !== null);
-    const phase = panelPhaseFor(panelKey, framesAfterIdleWatermark(sortedFrames, identityLog.idleSettledThroughMs), {
+    const phase = panelPhaseFor(panelKey, framesAfterIdleWatermark(sortedFrames, identityLog.idleSettledThrough), {
       localPhase: honorLocalPhase ? phaseRef.current[panelKey] ?? null : null,
       hasLocalPhase: honorLocalPhase,
       serverPhase: agent?.response_phase ?? null,

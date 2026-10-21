@@ -4,10 +4,10 @@ import { ConsoleActivityProjection, resolvePanelResponsePhase } from "@console-c
 import type { ConsoleAgent, ConsoleFrame } from "../types";
 import {
   agentReportsIdle,
+  decideIdleSettlement,
   framesAfterIdleWatermark,
   idleWatermarkFor,
   isAfterIdleWatermark,
-  shouldSettleIdleIdentity,
 } from "./idle-reconcile";
 
 const scope = { runtimeKey: "runtime", identity: "original:main", sessionId: "session" };
@@ -87,11 +87,22 @@ for (const [name, build] of [
     );
 
     const watermark = idleWatermarkFor(frames);
-    assert.equal(watermark, 2004);
+    assert.equal(watermark?.timestampMs, 2004);
     const settled = framesAfterIdleWatermark(frames, watermark);
     assert.deepEqual(settled, []);
     assert.equal(fold(settled).busy, false);
     assert.equal(resolvePanelResponsePhase({ frames: settled, serverPhase: null }), null);
+  });
+
+  test(`${name}: a rebuild of the fold after reconciliation stays idle`, () => {
+    const frames = build();
+    const watermark = idleWatermarkFor(frames);
+    // A full replay reads the whole log again, including a late frame that
+    // still belongs to the settled turn: the watermark is applied again.
+    const replayed = [...frames, frame("tool_execution_completed", 1600, { interactionId: "I1", runId: "R1" })];
+    const projection = fold(framesAfterIdleWatermark(replayed, watermark));
+    assert.equal(projection.busy, false);
+    assert.equal(projection.phase, null);
   });
 }
 
@@ -111,17 +122,34 @@ test("work that starts after the idle watermark is busy again", () => {
 });
 
 test("a frame at or before the watermark is settled, a newer one is not", () => {
-  assert.equal(isAfterIdleWatermark(frame("tool_execution_completed", 2004), 2004), false);
-  assert.equal(isAfterIdleWatermark(frame("tool_execution_completed", 1500), 2004), false);
-  assert.equal(isAfterIdleWatermark(frame("run_started", 2005), 2004), true);
-  assert.equal(isAfterIdleWatermark({ ...frame("run_started", 0), timestampMs: undefined }, 2004), false);
+  const watermark = { timestampMs: 2004, cursorSeq: 40 };
+  assert.equal(isAfterIdleWatermark(frame("tool_execution_completed", 1500, { cursor: "console:90" }), watermark), false);
+  assert.equal(isAfterIdleWatermark(frame("run_started", 2005, { cursor: "console:1" }), watermark), true);
+  assert.equal(isAfterIdleWatermark({ ...frame("run_started", 0), timestampMs: undefined }, watermark), false,
+    "a frame without a timestamp was settled");
   assert.equal(isAfterIdleWatermark(frame("run_started", 1), undefined), true);
+  // The same millisecond: the console cursor orders them.
+  assert.equal(isAfterIdleWatermark(frame("run_started", 2004, { cursor: "console:41" }), watermark), true);
+  assert.equal(isAfterIdleWatermark(frame("run_started", 2004, { cursor: "console:40" }), watermark), false);
+  assert.equal(isAfterIdleWatermark(frame("run_started", 2004, { cursor: undefined }), watermark), false,
+    "a same-millisecond frame without a cursor counts as settled");
+  assert.equal(isAfterIdleWatermark(frame("run_started", 2004, { cursor: "console:41" }), { timestampMs: 2004, cursorSeq: null }), false);
+});
+
+test("the watermark is the newest frame by timestamp, then console cursor", () => {
+  const frames = [
+    frame("run_started", 2004, { cursor: "console:7" }),
+    frame("text_delta", 2004, { cursor: "console:9" }),
+    frame("text_delta", 2003, { cursor: "console:12" }),
+    { ...frame("user_input", 0), timestampMs: undefined },
+  ];
+  assert.deepEqual(idleWatermarkFor(frames), { timestampMs: 2004, cursorSeq: 9 });
+  assert.equal(idleWatermarkFor([]), undefined);
 });
 
 test("without a watermark the frames pass through unchanged", () => {
   const frames = callbackPauseThenContinuation();
   assert.equal(framesAfterIdleWatermark(frames, undefined), frames);
-  assert.equal(framesAfterIdleWatermark(frames, Number.NEGATIVE_INFINITY), frames);
 });
 
 test("only an idle status poll settles: response phase null and no open run", () => {
@@ -132,7 +160,7 @@ test("only an idle status poll settles: response phase null and no open run", ()
   assert.equal(agentReportsIdle({ response_phase: null }), false, "no run state is not idle");
 });
 
-test("each guard keeps the fold as it is", () => {
+test("two idle polls in a row settle; every guard resets the count", () => {
   const base = {
     agent: idleAgent,
     logVersionAtRequest: 7,
@@ -140,18 +168,27 @@ test("each guard keeps the fold as it is", () => {
     sendInFlight: false,
     foldBusy: true,
     foldPhase: "waiting",
+    armedAtVersion: undefined as number | undefined,
   };
-  assert.equal(shouldSettleIdleIdentity(base), true);
-  assert.equal(shouldSettleIdleIdentity({ ...base, agent: { ...idleAgent, response_phase: "generating" } }), false,
-    "never while the server is not idle");
-  assert.equal(shouldSettleIdleIdentity({ ...base, logVersionNow: 8 }), false,
-    "never when a frame arrived after the poll was issued");
-  assert.equal(shouldSettleIdleIdentity({ ...base, logVersionAtRequest: undefined }), false,
+  assert.equal(decideIdleSettlement(base), "arm", "the first idle poll changes nothing");
+  assert.equal(decideIdleSettlement({ ...base, armedAtVersion: 7 }), "settle", "the second, with no frame since");
+  assert.equal(decideIdleSettlement({ ...base, armedAtVersion: 6 }), "arm",
+    "a frame since the first idle poll starts the count again");
+  for (const [agent, why] of [
+    [{ ...idleAgent, response_phase: "generating" as const }, "a response phase"],
+    [{ ...idleAgent, progress: { ...idleAgent.progress!, run_state: "run_open" } }, "an open run"],
+  ] as const) {
+    assert.equal(decideIdleSettlement({ ...base, agent, armedAtVersion: 7 }), "reset",
+      `never while the server reports a live run: ${why}`);
+  }
+  assert.equal(decideIdleSettlement({ ...base, logVersionNow: 8, armedAtVersion: 8 }), "reset",
+    "never when a frame arrived while the poll was in flight");
+  assert.equal(decideIdleSettlement({ ...base, logVersionAtRequest: undefined, armedAtVersion: 7 }), "reset",
     "never for a log the poll did not cover");
-  assert.equal(shouldSettleIdleIdentity({ ...base, sendInFlight: true }), false,
+  assert.equal(decideIdleSettlement({ ...base, sendInFlight: true, armedAtVersion: 7 }), "reset",
     "never while this console's own send is in flight");
-  assert.equal(shouldSettleIdleIdentity({ ...base, foldBusy: false, foldPhase: null }), false,
+  assert.equal(decideIdleSettlement({ ...base, foldBusy: false, foldPhase: null, armedAtVersion: 7 }), "reset",
     "nothing to settle");
-  assert.equal(shouldSettleIdleIdentity({ ...base, foldBusy: false, foldPhase: "waiting" }), true,
+  assert.equal(decideIdleSettlement({ ...base, foldBusy: false, foldPhase: "waiting", armedAtVersion: 7 }), "settle",
     "a stale phase alone is settled too");
 });
