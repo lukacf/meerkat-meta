@@ -1528,7 +1528,8 @@ class DeploymentService:
             state = await self._guide(guide_id)
             payload, slug = await self.implementation.package(guide_id, status["build_id"])
         proposal = state.get("proposal") or state.get("blueprint") or {}
-        files = package_files(payload)
+        # Unpacking the whole package must not hold the event loop.
+        files = await asyncio.to_thread(package_files, payload)
         deployment = json.loads(files["deployment.json"][0])
         source = read_package_source(files)
         if source["build_id"] != status["build_id"] or not package_matches(source, state):
