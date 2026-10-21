@@ -956,21 +956,27 @@ class DeploymentService:
     async def _guide(self, identity):
         return await (self.operations.read(self.guide, identity) if self.operations else self.guide.get(identity))
 
+    def _product_launched(self):
+        # Every trusted launcher selects its application owner's startup
+        # (``application_setup_selection``): the per-user application registry,
+        # which also selects ``application_host_selection``, and a selected
+        # application host. The developer source entry selects neither.
+        return self.application_setup_selection is not None or self.application_host_selection is not None
+
     def agent_team_availability(self):
         """Whether this Forge exports and installs agent team packages.
 
-        A product-launched Forge selects its per-user application registry
-        (``application_host_selection``), whose applications run on Meta
-        0.9.4. An agent team package installs the MobKit 0.8 runtime, so
-        such a Forge refuses to export or install one; the developer source
-        entry selects no registry and keeps both.
+        A product-launched Forge builds its applications on Meta 0.9.4. An
+        agent team package installs the MobKit 0.8 runtime, so such a Forge
+        refuses to export or install one; the developer source entry keeps
+        both.
         """
-        if self.application_host_selection is not None:
+        if self._product_launched():
             return {"available": False, "reason": AGENT_TEAM_PRODUCT_UNAVAILABLE}
         return {"available": True}
 
     def require_agent_team_available(self):
-        if self.application_host_selection is not None:
+        if self._product_launched():
             raise DraftConflict(AGENT_TEAM_PRODUCT_UNAVAILABLE)
 
     def _directory(self, guide_id, deployment_id=None):

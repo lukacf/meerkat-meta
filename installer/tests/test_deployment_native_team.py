@@ -319,16 +319,19 @@ def test_native_http_schema_and_routes_have_no_fake_application_build(monkeypatc
     assert client.get(base + "/package?source_kind=application&version=4").status_code == 422
 
 
-def product_launched(service):
-    """Select a per-user application registry the way a product launcher does."""
-    service.application_host_selection = lambda *args, **kwargs: None
+def product_launched(service, launcher):
+    """Select an application owner the way a trusted product launcher does."""
+    service.application_setup_selection = lambda *args, **kwargs: None
+    if launcher == "registry":  # The per-user application registry also selects its host.
+        service.application_host_selection = lambda *args, **kwargs: None
     return service
 
 
-async def test_product_launched_forge_refuses_agent_team_export_options_and_install(service, tmp_path):
+@pytest.mark.parametrize("launcher", ["registry", "application-host"])
+async def test_product_launched_forge_refuses_agent_team_export_options_and_install(service, tmp_path, launcher):
     # An installed product Forge runs its applications on Meta 0.9.4; an agent
     # team package installs the MobKit 0.8 runtime, so none is exported or installed.
-    product_launched(service)
+    product_launched(service, launcher)
     refusal = deployment.AGENT_TEAM_PRODUCT_UNAVAILABLE
     assert service.agent_team_availability() == {"available": False, "reason": refusal}
     with pytest.raises(DraftConflict) as export:
@@ -344,8 +347,8 @@ async def test_product_launched_forge_refuses_agent_team_export_options_and_inst
 
 
 async def test_source_entry_keeps_exporting_and_offering_the_agent_team(service):
-    # The developer source entry selects no application registry.
-    assert service.application_host_selection is None
+    # The developer source entry selects no application owner.
+    assert service.application_setup_selection is None and service.application_host_selection is None
     assert service.agent_team_availability() == {"available": True}
     payload, source, _ = await service.native_package(service.guide.identity, 4)
     assert payload and source["source_kind"] == "native-team"
