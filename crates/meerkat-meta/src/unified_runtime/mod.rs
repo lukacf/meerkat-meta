@@ -676,6 +676,25 @@ async fn publish_customizer_tools_after_resume(
         .runtime
         .release_customizer_tool_holds(&release_owed)
         .await;
+    // A publication and a release that succeed log nothing per identity, so
+    // the pass reports itself once: each identity still pending was logged
+    // with its reason above.
+    let still_pending = owed
+        .iter()
+        .filter(|spec| {
+            context
+                .runtime
+                .customizer_tools_pending_for(&spec.identity)
+                .is_some()
+        })
+        .count();
+    tracing::info!(
+        owed = owed.len(),
+        released = release_owed.len(),
+        still_pending,
+        "published the customizer tools of the members restored while the mob resumed \
+         Running; a member still pending publishes them at its wake or delivery"
+    );
 }
 
 /// [`publish_customizer_tools_after_resume`] as a held bootstrap's prelude,

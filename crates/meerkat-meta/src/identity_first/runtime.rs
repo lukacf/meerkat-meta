@@ -4670,7 +4670,7 @@ impl IdentityRuntime {
         }
     }
 
-    fn customizer_tools_pending_for(
+    pub(crate) fn customizer_tools_pending_for(
         &self,
         identity: &AgentIdentity,
     ) -> Option<CustomizerToolsPending> {

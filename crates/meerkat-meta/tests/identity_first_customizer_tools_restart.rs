@@ -262,6 +262,28 @@ async fn resolved_tools(runtime: &meerkat_meta::UnifiedRuntime) -> Vec<String> {
     .tools
 }
 
+/// The visible names of the member's tool scope, as its last model-call
+/// boundary left them.
+async fn scope_visible_tools(runtime: &meerkat_meta::UnifiedRuntime) -> Vec<String> {
+    let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+    let status = identity_runtime.status(&id(MEMBER)).await.expect("status");
+    let session_id = status.session_id.expect("member has a session");
+    let mut names = runtime
+        .mob_runtime()
+        .session_service()
+        .expect("session service")
+        .tool_scope_snapshot(&session_id)
+        .await
+        .expect("read the tool scope")
+        .expect("the member's tool scope")
+        .visible_names
+        .into_iter()
+        .map(meerkat_core::types::ToolName::into_string)
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
 /// Whether meerkat holds the member's run starts, read from its runtime
 /// (`None` while the member's session is not registered there).
 async fn member_run_starts_held(runtime: &meerkat_meta::UnifiedRuntime) -> Option<bool> {
@@ -582,6 +604,14 @@ async fn a_member_restored_after_an_unclean_stop_lists_its_customizer_tools_befo
         "the mob build's early publication (no handle yet) and the bootstrap's"
     );
     assert_eq!(capture.count(), 0, "no turn has run yet");
+    // Meerkat's resume built the member before the publication, so its tool
+    // scope still holds the base set it was built with; the resolved tools
+    // are those its next model request carries, which include the published
+    // tools.
+    assert!(
+        resolved_tools(&runtime).await.contains(&TOOL.to_string()),
+        "the restored member's resolved tools list its customizer tools before any turn"
+    );
 
     identity_runtime
         .send(
@@ -592,9 +622,11 @@ async fn a_member_restored_after_an_unclean_stop_lists_its_customizer_tools_befo
         .expect("send boot-2 turn");
     wait_for_turn(&capture, 1, "boot 2's first turn").await;
     assert!(capture.last().expect("captured request").contains(TOOL));
-    // The member was built by meerkat's resume before the publication; its
-    // tool scope snapshot is taken at a turn boundary, so it lists the tools
-    // once the member has run.
     assert!(resolved_tools(&runtime).await.contains(&TOOL.to_string()));
+    // Once the member has run, its tool scope holds the same tools.
+    assert_eq!(
+        resolved_tools(&runtime).await,
+        scope_visible_tools(&runtime).await
+    );
     runtime.shutdown().await;
 }

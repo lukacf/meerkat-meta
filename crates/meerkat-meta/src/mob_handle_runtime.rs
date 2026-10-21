@@ -10235,6 +10235,13 @@ pub struct ResolvedToolsSnapshot {
     pub tools: Vec<String>,
 }
 
+/// The member session's resolved tools: those its next model request
+/// carries, as meerkat's catalog view projects them from the session's live
+/// tool dispatcher under its active filters. The session's tool scope keeps
+/// the base set its last model call refreshed, so tools published since (a
+/// restored member's customizer tools, published after meerkat built the
+/// member on an unclean stop's resume) would show there only once the member
+/// has run. A service that reports no catalog view answers the tool scope.
 pub async fn resolved_tools_for_session(
     session_service: Option<&Arc<dyn MobSessionService>>,
     identity: &str,
@@ -10245,18 +10252,29 @@ pub async fn resolved_tools_for_session(
             "resolved tools unavailable for this runtime",
         ));
     };
-    let scope = session_service
-        .tool_scope_snapshot(&session_id)
+    let view = session_service
+        .tool_catalog_view(&session_id)
         .await
-        .map_err(|err| MobRuntimeError::Mob(MobError::Internal(err.to_string())))?
-        .ok_or(MobRuntimeError::InvalidInput(
-            "identity tool scope is unavailable",
-        ))?;
-    let mut tools = scope
-        .visible_names
-        .into_iter()
-        .map(meerkat_core::types::ToolName::into_string)
-        .collect::<Vec<_>>();
+        .map_err(|err| MobRuntimeError::Mob(MobError::Internal(err.to_string())))?;
+    let mut tools = match view {
+        Some(view) => view
+            .entries
+            .into_iter()
+            .filter(|entry| entry.visibility == meerkat_core::ToolCatalogVisibility::Visible)
+            .map(|entry| entry.name.into_string())
+            .collect::<Vec<_>>(),
+        None => session_service
+            .tool_scope_snapshot(&session_id)
+            .await
+            .map_err(|err| MobRuntimeError::Mob(MobError::Internal(err.to_string())))?
+            .ok_or(MobRuntimeError::InvalidInput(
+                "identity tool scope is unavailable",
+            ))?
+            .visible_names
+            .into_iter()
+            .map(meerkat_core::types::ToolName::into_string)
+            .collect::<Vec<_>>(),
+    };
     tools.sort();
     Ok(ResolvedToolsSnapshot {
         identity: identity.to_string(),
