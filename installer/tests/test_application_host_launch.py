@@ -1,4 +1,5 @@
 """Inert launcher controls with safe suppliers and no production server import."""
+import hashlib
 from pathlib import Path
 import inspect
 import shlex
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from launchkit import application_host_launch as launch
+from launchkit import connect_application_startup as startup
 
 
 class SelectedHost:
@@ -92,12 +94,8 @@ def test_ordinary_selection_rejects_untyped_runtime_or_gateway(gateway):
 
 def test_ordinary_application_retains_explicit_model_owner_without_selecting_guide(supplier, tmp_path, monkeypatch):
     from launchkit.connect_installer_caller import ExactFile
-    from launchkit.connect_application_startup import _ModelConfiguration
     from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
-    from test_managed_model_factory_selection import model_source
-    selection = model_source(tmp_path, monkeypatch)
-    monkeypatch.setenv("XDG_CONFIG_HOME", selection["credential_config_root"])
-    owner = _ModelConfiguration.observe(selection)
+    owner = model_owner(tmp_path, monkeypatch)
     target = object.__new__(MetaToolkitRuntimeTarget)
     gateway = ExactFile(tmp_path / "ordinary-rpc", "a" * 64)
     chosen = launch.OrdinaryMetaApplicationSelection(target, gateway, owner)
@@ -113,12 +111,8 @@ def test_ordinary_application_retains_explicit_model_owner_without_selecting_gui
 
 def test_changed_application_model_source_refuses_before_server_selection(supplier, tmp_path, monkeypatch):
     from launchkit.connect_installer_caller import ExactFile, CustodyError
-    from launchkit.connect_application_startup import _ModelConfiguration
     from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
-    from test_managed_model_factory_selection import model_source
-    selection = model_source(tmp_path, monkeypatch)
-    monkeypatch.setenv("XDG_CONFIG_HOME", selection["credential_config_root"])
-    owner = _ModelConfiguration.observe(selection)
+    owner = model_owner(tmp_path, monkeypatch)
     target = object.__new__(MetaToolkitRuntimeTarget)
     gateway = ExactFile(tmp_path / "ordinary-rpc", "a" * 64)
     chosen = launch.OrdinaryMetaApplicationSelection(target, gateway, owner)
@@ -140,11 +134,23 @@ def test_application_model_configuration_needs_actual_custody_owner(tmp_path, va
 
 
 def model_owner(tmp_path, monkeypatch):
-    from launchkit.connect_application_startup import _ModelConfiguration
-    from test_managed_model_factory_selection import model_source
-    selection = model_source(tmp_path, monkeypatch)
-    monkeypatch.setenv("XDG_CONFIG_HOME", selection["credential_config_root"])
-    return _ModelConfiguration.observe(selection)
+    """An inert private model source with Linux custody for this feature only.
+
+    The launcher supplier replaces import_module, so build the owner without
+    first imports of Forge services or other test modules.
+    """
+    directory = tmp_path / "model-owner"
+    directory.mkdir(mode=0o700)
+    config = directory / "host.toml"
+    content = b'[model]\nselected = "inert-custody-specimen"\n'
+    config.write_bytes(content)
+    config.chmod(0o600)
+    root = directory / "xdg"
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(startup, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(root))
+    return startup._ModelConfiguration.observe({"host_config": {"path": str(config),
+        "sha256": hashlib.sha256(content).hexdigest()}, "credential_config_root": str(root)})
 
 
 def test_toolkit_application_forwards_explicit_model_owner_to_local_runtime(supplier, tmp_path, monkeypatch):
