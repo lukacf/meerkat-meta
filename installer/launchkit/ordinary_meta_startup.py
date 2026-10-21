@@ -159,7 +159,7 @@ class OrdinaryMetaStartup:
         _model_builder_options(self, options)
         self.config = MetaBuilderConfig(**options)
         self._config_providers = tuple(getattr(self.config, name) for name in (
-            "session_builder", "session_store", "agent_customizer", "auth_config"))
+            "session_builder", "runtime_store", "agent_customizer", "auth_config"))
         self._http_options = tuple(getattr(self.config, name) for name in (
             "http_listen", "http_public_base_url", "allow_remote", "console_require_app_auth",
             "console_config_path"))
@@ -184,7 +184,7 @@ class OrdinaryMetaStartup:
                 or config.declare_spec_update_expected_revision is not None
                 or self._model_configuration is None and config.meerkat_config_path is not None
                 or any(getattr(config, name) is not original for name, original in zip(
-                    ("session_builder", "session_store", "agent_customizer", "auth_config"), self._config_providers))
+                    ("session_builder", "runtime_store", "agent_customizer", "auth_config"), self._config_providers))
                 or tuple(getattr(config, name) for name in (
                     "http_listen", "http_public_base_url", "allow_remote", "console_require_app_auth",
                     "console_config_path")) != self._http_options):
