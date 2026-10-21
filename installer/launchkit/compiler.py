@@ -35,6 +35,9 @@ GCP_PROJECT_PENDING = (
     "Tell the guide your Google Cloud project ID, or enter it in the advanced editor, "
     "before preparing the deployment package.")
 MCP_VERSION = "1.30.0"
+# A Console operator panel for the host's Toolkit setup page on the selected
+# Connect route. The native Console accepts only same-origin panel paths.
+CONNECT_SETUP_BUTTON = {"id": "connect-setup", "label": "Connect setup", "panel": "/host/toolkit/setup"}
 CONSOLE_TEXT_ASSETS = ("console_setup.mjs", "console_setup.css", "console_shell.mjs", "console_shell.css",
     "controller_review.mjs", "controller_review.css")
 TOOLKIT_UI_FILES = ("LICENSE-APACHE", "LICENSE-MIT", "THIRD_PARTY_NOTICES.md", "package.json",
@@ -266,10 +269,15 @@ def _runtime(spec, *, native_version=None):
             "storage": {"runtime": ".mobkit/state", "notes": "data/notes.sqlite3"}}
 
 
+def connect_route(spec, runtime_target):
+    """The selected Connect route: a host-selected product with an acquisition helper."""
+    from .runtime_selection import MetaToolkitRuntimeTarget
+    return type(runtime_target) is MetaToolkitRuntimeTarget and _spec(spec).acquisition is not None
+
+
 def mob_toml(value, *, native_version=None, runtime_target=None, verified_artifacts=None, guide_runtime=None):
     spec = _spec(value)
-    from .runtime_selection import MetaToolkitRuntimeTarget
-    scoped_connect = type(runtime_target) is MetaToolkitRuntimeTarget and spec.acquisition is not None
+    scoped_connect = connect_route(spec, runtime_target)
     resolved = resolved_blueprint(spec)
     profiles = {row["identity"]: row["profile"] for row in resolved["identities"]}
     reusable = application_profiles(spec)
@@ -333,8 +341,8 @@ def mob_toml(value, *, native_version=None, runtime_target=None, verified_artifa
     return "\n".join(lines)
 
 
-def _console(spec):
-    return "\n".join([
+def _console(spec, *, runtime_target=None):
+    lines = [
         f"title = {_json(spec.project.name)}", "[brand]", f"label = {_json(spec.project.name)}", "",
         "[appearance]", 'default_theme = "dark"', 'default_variant = "graphite"', "",
         "[environment]", f"label = {_json(spec.target)}", "[layout]", 'initial_preset = "two_columns"',
@@ -342,7 +350,14 @@ def _console(spec):
         "[agent_list]", 'group_by = ["labels.console_group"]',
         f"default_pinned_agent_ids = [{_json(spec.topology.entrypoint)}]", "",
         "[actions]", "show_reset = false", "",
-    ])
+    ]
+    if connect_route(spec, runtime_target):
+        # The selected Connect route's protected setup decisions live on the
+        # host's Toolkit setup page; the Console opens it as a docked panel.
+        lines += ["[[sidebar.buttons]]", f"id = {_json(CONNECT_SETUP_BUTTON['id'])}",
+            f"label = {_json(CONNECT_SETUP_BUTTON['label'])}",
+            f"panel = {_json(CONNECT_SETUP_BUTTON['panel'])}", ""]
+    return "\n".join(lines)
 
 
 def _readme(spec, *, native_version=None, candidate=False, product=False):
@@ -700,7 +715,8 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None):
               PackageFile("deployment.json", json.dumps(runtime, ensure_ascii=True, indent=2) + "\n"),
               PackageFile("requirements.txt", requirements),
               PackageFile("config/mob.toml", mob_toml(spec, native_version=native_version,
-                  runtime_target=runtime_target if product else None, verified_artifacts=verified_artifacts)), PackageFile("config/console.toml", _console(spec)),
+                  runtime_target=runtime_target if product else None, verified_artifacts=verified_artifacts)),
+              PackageFile("config/console.toml", _console(spec, runtime_target=runtime_target if product else None)),
               PackageFile("config/connections.json", json.dumps(runtime["mcpConnections"], ensure_ascii=True, indent=2) + "\n"),
               PackageFile("README.md", _readme(spec, native_version=native_version, candidate=selection is not None, product=product)),
               PackageFile(".gitignore", ".env\n.venv/\n.bin/\n.mobkit/\ndata/\nworkspace/\nknowledge/.env\nknowledge/.source/\n__pycache__/\n*.pyc\n"),
@@ -794,6 +810,12 @@ def generate_runtime_refresh(value, accepted_files, *, runtime_target=None, veri
         for name in (_RUNTIME_DESIGN_PATHS | set(protected)
                      | {name for name in accepted if name.startswith("knowledge/")}):
             generated[name] = accepted[name]
+        # The accepted Console design stays as accepted. Only this compiler's
+        # own unmodified default gains the Connect route's setup panel.
+        if (connect_route(spec, runtime_target)
+                and accepted["config/console.toml"].as_bytes() == _console(spec).encode("utf-8")):
+            generated["config/console.toml"] = PackageFile("config/console.toml",
+                _console(spec, runtime_target=runtime_target))
         from .runtime_selection import selected_runtime_marker, selected_runtime_version
         old["mobkitVersion"] = selected_runtime_version(runtime_target)
         old["runtimeCandidate"] = selected_runtime_marker(runtime_target)

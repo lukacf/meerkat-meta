@@ -6,6 +6,7 @@ provider, SDK, native gateway, install or user credential is executed.
 from dataclasses import replace
 import hashlib
 import json
+import tomllib
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -65,6 +66,49 @@ async def test_normal_refresh_selects_new_trusted_host_product_and_preserves_acc
     # Native work and acceptance still belong to the new build, not its predecessor.
     assert not result['acceptance_trusted']
     assert candidate_selection(f.registry.runtime_target) == candidate_selection(f.target)
+
+
+@pytest.mark.parametrize('predecessor', ['compiler-default', 'customized', 'with-setup-panel'])
+async def test_refresh_adds_the_connect_setup_panel_only_to_an_unmodified_default_console(
+        registry, products, monkeypatch, predecessor):
+    """The accepted Console design is kept unless it is the compiler's own default."""
+    from launchkit import compiler
+    f = registry
+    saved = new_guide(f)
+    spec = compiler._spec(saved['proposal'])
+    default = compiler._console(spec)
+    # Builders cannot edit compiled Console files; a different accepted design
+    # comes from the compiler that built the predecessor.
+    earlier_console = {'compiler-default': default,
+        'customized': default + '[rail]\nvisible = false\n'}.get(predecessor)
+    with monkeypatch.context() as earlier:
+        if earlier_console is not None:
+            earlier.setattr(compiler, '_console', lambda value, *, runtime_target=None: earlier_console)
+        first = await build(f, saved)
+    old = await accept_source_fixture(f, first)
+    old_files = {item.path: (item.as_bytes(), item.mode) for item in old.export_files(require_verified=False)}
+    assert (old_files['config/console.toml'][0] == default.encode()) is (predecessor == 'compiler-default')
+    new_target = products[1].target
+    current_host = LocalApplicationRegistry(guide_store=f.store, implementation=f.implementation,
+        deployment=f.service, runtime_target=new_target)
+    f.implementation.prepare_workspace = current_host.prepare_workspace
+    monkeypatch.setattr(server, 'implementation', f.implementation)
+    monkeypatch.setattr(server, 'application_host', current_host)
+    result = await server.build_implementation(saved['id'], server.ImplementationRequest(
+        version=saved['version'], previous_build_id=first['build_id'],
+        refresh_framework=True, preserve_design=True))
+    successor = {item.path: (item.as_bytes(), item.mode)
+        for item in workspace(f.implementation, result).export_files(require_verified=False)}
+    console = successor['config/console.toml']
+    if predecessor == 'compiler-default':
+        assert console == (compiler._console(spec, runtime_target=new_target).encode(), 0o644)
+    else:
+        assert console == old_files['config/console.toml']
+    buttons = tomllib.loads(console[0].decode()).get('sidebar', {}).get('buttons', [])
+    assert [row['id'] for row in buttons] == ([] if predecessor == 'customized' else ['connect-setup'])
+    for name, value in old_files.items():
+        if name != 'config/console.toml' and (name.startswith(('application/', 'config/')) or name == 'blueprint.json'):
+            assert successor[name] == value
 
 
 

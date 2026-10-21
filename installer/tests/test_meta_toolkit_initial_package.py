@@ -187,6 +187,38 @@ def test_exact_product_can_compile_original_fixed_setup_source_but_public_previe
     assert not any(name in files for name in ("application/tool-policy.json", "activation.json", "plan.json"))
 
 
+def test_connect_route_console_opens_the_toolkit_setup_panel(product):
+    target = catalog_target(product)
+    files = {item.path: item for item in compiler.generate_package(setup_spec(), runtime_target=target)}
+    console = tomllib.loads(files["config/console.toml"].content)
+    assert console["sidebar"] == {"buttons": [{"id": "connect-setup", "label": "Connect setup",
+        "panel": "/host/toolkit/setup"}]}
+    # The native Console docks only a same-origin panel path without a
+    # control or link, and drops an invalid button silently.
+    panel = console["sidebar"]["buttons"][0]["panel"]
+    assert panel.startswith("/") and not panel.startswith("//") and len(panel.encode()) <= 2048
+    assert not any(character.isspace() or not character.isprintable() or character in "\\\ufeff"
+        for character in panel)
+    assert not {".", ".."} & set(panel.split("?", 1)[0].split("#", 1)[0].lower().replace("%2e", ".").split("/"))
+    ordinary = deepcopy(setup_spec())
+    ordinary["acquisition"] = None
+    del ordinary["agent_classes"][0]["tools"]["rust_bundles"]
+    without = {item.path: item for item in compiler.generate_package(ordinary, runtime_target=target)}
+    assert {key: value for key, value in console.items() if key != "sidebar"} == tomllib.loads(
+        without["config/console.toml"].content)
+
+
+@pytest.mark.parametrize("kind", ["product-without-connect", "public-package"])
+def test_console_without_the_connect_route_has_no_setup_panel(product, kind):
+    spec = setup_spec()
+    spec["acquisition"] = None
+    del spec["agent_classes"][0]["tools"]["rust_bundles"]
+    options = {"runtime_target": catalog_target(product)} if kind == "product-without-connect" else {}
+    files = {item.path: item for item in compiler.generate_package(spec, **options)}
+    console = tomllib.loads(files["config/console.toml"].content)
+    assert "sidebar" not in console and "/host/toolkit/setup" not in files["config/console.toml"].content
+
+
 @pytest.mark.parametrize("defect", ["bundle", "no-caller-bundle", "helper-mode", "helper-profile", "reusable-class", "cloud"])
 def test_target_does_not_enable_arbitrary_acquisition_or_dynamic_source(product, defect):
     target = catalog_target(product)

@@ -7,6 +7,7 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import tomllib
 import uuid
 import zipfile
 
@@ -146,6 +147,52 @@ def test_actual_archive_product_successor_preserves_policy_viewer_access_and_set
     assert private == {name: (destination / name).read_bytes() for name in private_names}
     for name in descriptor["protected_application_paths"] + ["application/domain.py", "requirements.application.txt"]:
         assert (destination / name).read_bytes() == previous[name][0]
+
+
+@pytest.mark.parametrize("predecessor", ["compiler-default", "customized"])
+def test_installed_update_to_a_refreshed_connect_product_admits_its_console(
+        tmp_path, products, inputs, monkeypatch, predecessor):
+    """The update authority admits the refreshed Console: a regenerated default or a kept design."""
+    real = compiler._console
+    spec = compiler._spec(setup_spec())
+    default = real(spec)
+    earlier = default if predecessor == "compiler-default" else default + "[rail]\nvisible = false\n"
+    old_target = products[0].target
+    # The predecessor's compiler emitted this Console; the current one refreshes it.
+    monkeypatch.setattr(compiler, "_console", lambda value, *, runtime_target=None:
+        earlier if runtime_target is old_target else real(value, runtime_target=runtime_target))
+    selected = crossing.__wrapped__(tmp_path, products, inputs)
+    old_product, target, previous, candidate, _, _ = selected
+    assert previous["config/console.toml"] == (earlier.encode(), 0o644)
+    expected = (real(spec, runtime_target=target) if predecessor == "compiler-default" else earlier).encode()
+    assert candidate["config/console.toml"] == (expected, 0o644)
+    retained = old_product.successor_workspace.framework_provenance()["retained_template_paths"]
+    assert ("config/console.toml" in retained) is (predecessor == "customized")
+    receipt = original_receipt(previous)
+    changes, blockers = updates.compatibility(previous, candidate, receipt, runtime_target=target)
+    assert blockers == []
+    assert ({"path": "config/console.toml", "change": "changed"} in changes) is (predecessor == "compiler-default")
+    # The Console change is admitted only as a product framework path of this refresh.
+    descriptor = updates.runtime_dependency_transition(previous, candidate, receipt, runtime_target=target)
+    assert descriptor is not None and "config/console.toml" in descriptor["protected_paths"]
+    directory, destination, identity = staged(tmp_path, selected)
+    updates.activate(directory, identity)
+    installed = (destination / "config/console.toml").read_bytes()
+    assert installed == expected
+    buttons = tomllib.loads(installed.decode()).get("sidebar", {}).get("buttons", [])
+    assert [row["id"] for row in buttons] == (["connect-setup"] if predecessor == "compiler-default" else [])
+
+
+def test_refresh_of_a_product_without_the_connect_route_keeps_its_console(products):
+    spec = setup_spec()
+    spec["acquisition"] = None
+    del spec["agent_classes"][0]["tools"]["rust_bundles"]
+    accepted = {item.path: item for item in compiler.generate_package(spec, runtime_target=products[0].target)}
+    refreshed = {item.path: item for item in compiler.generate_runtime_refresh(spec, list(accepted.values()),
+        runtime_target=products[1].target, protected_application_paths=())}
+    console = refreshed["config/console.toml"].as_bytes()
+    assert console == accepted["config/console.toml"].as_bytes() == compiler._console(compiler._spec(spec)).encode()
+    assert "sidebar" not in tomllib.loads(console.decode())
 
 
 @pytest.mark.parametrize("defect", ["policy", "viewer", "access", "mode", "new-app", "app", "pin", "paths", "receipt", "previous"])
