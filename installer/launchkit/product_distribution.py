@@ -31,6 +31,15 @@ def candidate_readme(guide, target, origin, *, ordinary=False):
         else "Apple Silicon macOS 13.5 or newer")
     ordinary_note = (f"\nApplications without a connection setup helper use the included Meta "
         f"{target.meta.version} RPC gateway with that Meta SDK.\n" if ordinary else "")
+    # Applications install into Forge's own Python: name the one CPython the
+    # selected compiled (non-abi3) dependency wheels are built for.
+    cpythons = sorted({int(tag[3:]) for wheel in target.dependency_wheels
+        for py_tags, abi_tags, _ in [Path(wheel.path).name.removesuffix(".whl").split("-")[-3:]]
+        if "abi3" not in abi_tags.split(".") for tag in py_tags.split(".") if re.fullmatch(r"cp3[0-9]+", tag)})
+    python = f"CPython 3.{cpythons[0]}" if len(cpythons) == 1 else "Python 3.11+"
+    python_note = (f"\nApplications install into Forge's own Python. If your `python3` is another version,\n"
+        f"start Forge with `PYTHON_BIN` set to a CPython 3.{cpythons[0]} interpreter; GETTING_STARTED.md\n"
+        "shows how.\n" if len(cpythons) == 1 else "")
     return f"""# Meta Forge local candidate
 
 The Forge guide uses Core {guide.core_version} and Meta {guide.version}. The
@@ -44,12 +53,12 @@ are not qualified by this package.
 
 ## Open Forge
 
-You need a complete Python 3.11+ installation with `venv` and `ensurepip`.
+You need a complete {python} installation with `venv` and `ensurepip`.
 Initial installation of the exactly pinned Forge Python dependencies needs
 internet access. The package supplies its exact Meta and Toolkit SDK wheels,
 native guide gateway and selected Connect product. Node.js and a source checkout
 are not needed to open the wizard.
-
+{python_note}
 Extract the archive into a new folder you will keep. Open a terminal there:
 
 ```sh

@@ -1,6 +1,7 @@
 import { captureGuideSelection, guideSelectionAvailable, guideSelectionEvents } from "./guide-selection.mjs";
 import React, { useEffect, useRef, useState } from "react";
 import { request } from "./state.mjs";
+import { readDeploymentSetup } from "./deployment-setup-read.mjs";
 import { createDeploymentPollingGate } from "./deployment-panel.mjs";
 import { remoteDeploymentUrl, remoteSelectionKey, remotePrivateDraftScope, remoteCanConnect, remoteConnectionInput, remoteReceiptOwned,
   remoteReceiptBinding, remoteReceiptCurrent, remoteObservationAvailable, remotePrivateOptions, remoteCanConfigure,
@@ -178,7 +179,7 @@ export function RemoteDeployment({ state, build, options, plan, blocked = false,
     if (!ownerCurrent) return;
     setPortCheck({ key: portCheckKey, checking: true, observation: null });
     const query = new URLSearchParams({ build_id: build.build_id, console_port: portValue });
-    request(`/api/guide/${encodeURIComponent(state.id)}/deployment/options?${query}`).then((checkedOptions) => {
+    readDeploymentSetup(`/api/guide/${encodeURIComponent(state.id)}/deployment/options?${query}`).then((checkedOptions) => {
       const current = latest.current;
       if (cancelled || !ownerCurrent() || current.portCheckKey !== portCheckKey || !current.formOpen || !current.formReady) return;
       const observation = remoteSetupPortObservation(checkedOptions, current.receipt, current.options,

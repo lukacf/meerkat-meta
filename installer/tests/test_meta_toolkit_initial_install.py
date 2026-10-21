@@ -4,6 +4,7 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -505,3 +506,104 @@ async def test_original_queue_owner_refuses_ordinary_product_start_before_lifecy
         deployment.DeploymentService._launch(f.service, f.directory, mode)
     assert deployment.read_receipt(f.directory) == before
     assert not f.service.tasks and not f.service.worker_admissions
+
+
+CP312_LINUX = {"python_tag": "cp312", "abi_tag": "cp312", "implementation": "cpython", "system": "Linux",
+    "machine": "x86_64", "glibc_minimum": [2, 39], "macos": (0, 0)}
+ORIGINAL_INTERPRETER_REFUSAL = getattr(deployment, "selected_interpreter_refusal", None)
+
+
+def closure(*names):
+    return SimpleNamespace(dependency_wheels=tuple(SimpleNamespace(path=Path("/selected") / name) for name in names))
+
+
+async def test_cp311_closure_under_cp312_forge_refuses_fresh_install_before_publication(initial, monkeypatch):
+    # The inert fixture's dependency is pure Python; model the product's
+    # cp311-only compiled closure (the real helper) under a cp312 Forge.
+    def cp311_only(target, interpreter=None):
+        return ORIGINAL_INTERPRETER_REFUSAL(closure(
+            "pydantic_core-2.27.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "httpx-0.28.1-py3-none-any.whl"), CP312_LINUX)
+    monkeypatch.setattr(deployment, "selected_interpreter_refusal", cp311_only, raising=False)
+    f = initial
+    fresh = (await f.service.options(f.guide_id, f.build_id))["fresh_install"]
+    assert fresh["available"] is False and "next_step" not in fresh
+    assert "built for CPython 3.11" in fresh["reason"] and "runs CPython 3.12" in fresh["reason"]
+    # The remedy keeps the folder's saved setups: only .venv is moved aside.
+    assert "PYTHON_BIN" in fresh["reason"] and ".venv" in fresh["reason"] and "fresh unpack" not in fresh["reason"]
+    with pytest.raises(DraftConflict, match=r"CPython 3\.11"):
+        await f.submit()
+    assert not f.destination.exists() and not f.service.launched
+
+
+@pytest.mark.parametrize("built_for", ["cp311", "cp312"])
+async def test_worker_refuses_a_closure_for_another_cpython_before_creating_the_venv(tmp_path, monkeypatch, built_for):
+    # The application venv inherits Forge's interpreter. Without this refusal a
+    # cp311-only closure under cp312 fails only in pip, mid-install.
+    monkeypatch.setattr(deployment, "forge_interpreter", lambda: CP312_LINUX, raising=False)
+    selected = closure(f"cffi-1.17.1-{built_for}-{built_for}-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "cryptography-44.0.0-cp39-abi3-manylinux_2_28_x86_64.whl", "httpx-0.28.1-py3-none-any.whl")
+    destination = tmp_path / "application"
+    destination.mkdir(mode=0o700)
+    supervisor = SimpleNamespace(stop=asyncio.Event(), destination=destination)
+    commands = []
+    async def command(arguments, *args, **kwargs):
+        commands.append(arguments)
+        raise RuntimeError("inert venv creation")
+    install = worker._install_selected_product(supervisor, SimpleNamespace(selection=selected), lambda: True, command)
+    if built_for == "cp311":
+        with pytest.raises(DraftConflict, match=r"built for CPython 3\.11.*runs CPython 3\.12.*PYTHON_BIN"):
+            await install
+        assert commands == [] and not (destination / ".venv").exists()
+    else:
+        with pytest.raises(RuntimeError, match="inert venv creation"):
+            await install
+        assert commands[0][1:4] == ["-I", "-m", "venv"]
+
+
+DARWIN_ARM64_CP311 = {"python_tag": "cp311", "abi_tag": "cp311", "implementation": "cpython", "system": "Darwin",
+    "machine": "arm64", "glibc_minimum": [0, 0], "macos": (14, 5)}
+MACOS_ARM64_CLOSURE = ("pydantic_core-2.27.2-cp311-cp311-macosx_11_0_arm64.whl",
+    "cryptography-44.0.0-cp39-abi3-macosx_10_9_universal2.whl", "httpx-0.28.1-py3-none-any.whl")
+
+
+@pytest.mark.parametrize("host, extra, refused", [
+    ({}, (), None),
+    ({"python_tag": "cp312", "abi_tag": "cp312"}, (), r"built for CPython 3\.11, but this Forge runs CPython 3\.12"),
+    ({}, ("rpds_py-0.22.3-cp311-cp311-macosx_10_12_x86_64.whl",), "do not support this computer"),
+    ({}, ("cffi-1.17.1-cp311-cp311-macosx_15_0_arm64.whl",), "do not support this computer")],
+    ids=["matching", "other-cpython", "x86_64-wheel", "newer-macos"])
+def test_darwin_arm64_host_admits_its_matching_closure_and_refuses_others(host, extra, refused):
+    # _wheel_compatible knows only Linux platform tags. A macOS arm64 Forge on
+    # the closure's CPython must still be admitted; architecture, macOS version
+    # and CPython mismatches are refused.
+    reason = deployment.selected_interpreter_refusal(closure(*MACOS_ARM64_CLOSURE, *extra), {**DARWIN_ARM64_CP311, **host})
+    if refused is None:
+        assert reason is None
+    else:
+        assert re.search(refused, reason)
+
+
+def test_platform_only_refusal_names_no_cpython():
+    # An abi3 wheel refused only for its glibc floor needs a newer system, not CPython 3.9.
+    reason = deployment.selected_interpreter_refusal(
+        closure("cryptography-44.0.0-cp39-abi3-manylinux_2_34_x86_64.whl", "httpx-0.28.1-py3-none-any.whl"),
+        {**CP312_LINUX, "glibc_minimum": [2, 31]})
+    assert "do not support this computer" in reason and "CPython" not in reason
+
+
+def test_generated_readme_names_the_cpython_of_a_compiled_closure():
+    from launchkit import product_distribution
+    guide = SimpleNamespace(core_version="0.9.4", version="0.9.4", core_source="core", meta_source="meta")
+    def readme(*names):
+        selected = SimpleNamespace(target="linux-x86_64", meta=SimpleNamespace(version="0.9.4"),
+            toolkit=SimpleNamespace(version="0.9.4"), meta_wheel=SimpleNamespace(sha256="1" * 64),
+            toolkit_wheel=SimpleNamespace(sha256="2" * 64), assembly=SimpleNamespace(sha256="3" * 64),
+            dependency_wheels=closure(*names).dependency_wheels)
+        return product_distribution.candidate_readme(guide, selected, "origin")
+    compiled = readme("pydantic_core-2.27.2-cp311-cp311-manylinux_2_17_x86_64.whl",
+        "cryptography-44.0.0-cp39-abi3-manylinux_2_28_x86_64.whl", "httpx-0.28.1-py3-none-any.whl")
+    assert "You need a complete CPython 3.11 installation" in compiled
+    assert "`PYTHON_BIN` set to a CPython 3.11 interpreter" in compiled
+    portable = readme("cryptography-44.0.0-cp39-abi3-manylinux_2_28_x86_64.whl", "httpx-0.28.1-py3-none-any.whl")
+    assert "You need a complete Python 3.11+ installation" in portable and "PYTHON_BIN" not in portable

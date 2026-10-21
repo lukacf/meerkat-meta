@@ -1444,6 +1444,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   explicitly chosen pin is kept. The exported knowledge README states the
   licences of the embedded storage engine and names the source's notes on its
   patches to it.
+- Meta Forge's installation step no longer gives up on the destination
+  options when the machine takes longer than 30 s to prepare them, as seen on
+  small 2-vCPU cloud machines right after a build. The page stopped waiting
+  for every read after 30 s, so the destination card never loaded even though
+  the server answered, and each retry started the same preparation again. The
+  destination options read and the console port checks now wait up to 120 s,
+  a retry shares the read still in progress instead of sending another, and a
+  check for a changed console port waits for the previous check to finish.
+- Meta Forge can install an application on Ubuntu or Debian with the system
+  Python. The installation looked up the application environment's package
+  folder with Python's default layout, which Debian and Ubuntu change to
+  `local/lib/python3.X/dist-packages`, so it stopped with a
+  `FileNotFoundError`. It now asks for the virtual environment's own layout.
+- When a failed application installation was stopped and its cleanup
+  verified, Meta Forge's installation panel offered neither Start nor Retry,
+  so the installation could not continue with its saved settings. The panel
+  now offers Retry installation for that state. Forge rechecks the saved
+  package's source and cleanup before continuing, and starting the
+  application remains a separate step.
+- Meta Forge refuses an application installation on this computer early when
+  it runs on a different CPython than the selected Toolkit packages were built
+  for (CPython 3.11 in this release). The refusal names the CPython needed and
+  how to restart Forge on it while keeping saved setups, instead of failing
+  midway in pip. The README, the getting started guide and the generated
+  package README say which CPython to use.
+- An application that Meta Forge builds without a connection setup helper
+  starts on Meta 0.9.4. Its startup read the Meta SDK's `session_store`
+  builder option, which 0.9.4 removed, so every such start stopped with an
+  `AttributeError`; it now reads `runtime_store`.
 - `/console/experience` reports `health_overview.live_snapshot.running` as
   the mob's owner answers when the experience is read, as `meta/status`
   does. It came from the console's cached roster walk, and was `true` when
@@ -1720,6 +1749,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Meta Toolkit Connect route that was installed before 0.9.4 keeps its Console
   without the "Connect setup" button; its setup page stays at
   /host/toolkit/setup on its Console address.
+- Meta Forge application installs need CPython 3.11 in this release, the
+  version the Toolkit packages are built for. On Ubuntu 24.04, install
+  CPython 3.11 (for example with `uv python install 3.11`), stop Forge, move
+  only its `.venv` folder aside, and start it again with `PYTHON_BIN`
+  pointing to CPython 3.11; saved setups are kept.
+- Meta Forge refuses remote and guided cloud installation of a Meta/Toolkit
+  product application before any transfer, as 0.9.3 did; install it on the
+  computer that runs Forge. On Linux the product needs glibc 2.39 or newer, so
+  Debian 12 (glibc 2.36) cannot run it.
 
 ## [0.9.3] - 2026-10-18
 

@@ -1441,7 +1441,7 @@ async def _install_selected_product(supervisor, artifacts, require_current, comm
         _sdk_location)
     from .product_runtime_custody import (await_product_validation, require_product_source,
         require_product_installation)
-    from .deployment import _DestinationSourceObservation
+    from .deployment import _DestinationSourceObservation, selected_interpreter_refusal
     source_observation = None
     def current(fence=require_current):
         if supervisor.stop.is_set():
@@ -1483,6 +1483,11 @@ async def _install_selected_product(supervisor, artifacts, require_current, comm
             destination=supervisor.destination, files=files)
         source_observation = _DestinationSourceObservation(read_receipt(supervisor.directory), files)
         current()
+    # The venv below inherits this interpreter: refuse a closure it cannot
+    # install before anything is installed into it.
+    refusal = selected_interpreter_refusal(artifacts.selection)
+    if refusal is not None:
+        raise DraftConflict(refusal)
     venv = supervisor.destination / ".venv"
     if not venv.exists() and not venv.is_symlink():
         venv.mkdir(mode=0o700)
@@ -1493,10 +1498,13 @@ async def _install_selected_product(supervisor, artifacts, require_current, comm
         "Selected SDK environment", CHECK_TIMEOUT)
     current()
     python = venv / "bin/python"
+    # With -S, Debian Python can expose its system layout instead of the venv.
+    # Select the venv scheme without running installed .pth or sitecustomize.
     site_json = await command([str(python), "-I", "-S", "-c",
         "import json,sysconfig,sys; from pathlib import Path; "
         "base=str(Path(sys.executable).parent.parent); "
-        "print(json.dumps(sysconfig.get_path('purelib',vars={'base':base,'platbase':base})))"],
+        "scheme='posix_venv' if 'posix_venv' in sysconfig.get_scheme_names() else 'posix_prefix'; "
+        "print(json.dumps(sysconfig.get_path('purelib',scheme=scheme,vars={'base':base,'platbase':base})))"],
         "Selected SDK site path", CHECK_TIMEOUT, capture_output=True)
     try:
         site = Path(json.loads(site_json))
