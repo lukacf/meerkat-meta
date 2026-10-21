@@ -72,24 +72,32 @@ def selected_interpreter_refusal(target, interpreter=None):
         return tag == "any" or (found is not None and found[3] in {host["machine"], "universal2"}
             and (int(found[1]), int(found[2])) <= host["macos"])
 
+    def tags(name):
+        return [part.split(".") for part in name.removesuffix(".whl").split("-")[-3:]]
+
+    def abi_compatible(name):
+        return _wheel_compatible(name.removesuffix(".whl").rpartition("-")[0] + "-any.whl", host)
+
     def compatible(name):
         if host["system"] == "Linux":
             return _wheel_compatible(name, host)
         # _wheel_compatible knows only Linux platform tags: it checks the python
         # and ABI tags, and the macOS platform tags are checked here.
-        head, _, platforms = name.removesuffix(".whl").rpartition("-")
-        return _wheel_compatible(head + "-any.whl", host) and any(map(macos_platform, platforms.split(".")))
+        return abi_compatible(name) and any(map(macos_platform, tags(name)[2]))
 
     refused = [name for name in (Path(wheel.path).name for wheel in target.dependency_wheels) if not compatible(name)]
     if not refused:
         return None
-    running = "3." + host["python_tag"][3:]
-    needed = sorted({"3." + tag[3:] for name in refused for tag in name.split("-")[-3].split(".")
-        if re.fullmatch(r"cp3[0-9]+", tag)} - {running})
+    running = int(host["python_tag"][3:])
+    # Only a wheel refused for its own CPython ABI names the CPython it needs;
+    # an abi3 or platform-only refusal does not.
+    needed = sorted({int(tag[3:]) for name in refused if not abi_compatible(name) and "abi3" not in tags(name)[1]
+        for tag in tags(name)[0] if re.fullmatch(r"cp3[0-9]+", tag)} - {running})
     if needed:
-        return (f"This product's application packages are built for CPython {' or '.join(needed)}, but this Forge "
-            f"runs CPython {running}, so installing them would fail midway. Start Forge from a fresh unpack with "
-            f"PYTHON_BIN set to a CPython {needed[0]} interpreter, as the README describes, then install again.")
+        return (f"This product's application packages are built for CPython {' or '.join(f'3.{minor}' for minor in needed)}, "
+            f"but this Forge runs CPython 3.{running}, so installing them would fail midway. Stop Forge, move only its "
+            f".venv folder aside and start it again with PYTHON_BIN set to a CPython 3.{needed[0]} interpreter, as the "
+            "README describes. Your saved setups are kept.")
     return f"This product's application packages do not support this computer: {', '.join(refused[:3])}."
 
 

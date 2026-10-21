@@ -48,6 +48,20 @@ The prepared package includes the frontend and its selected runtime; opening it
 does not require Node.js, npm or a source checkout. You need Python 3.11+ with
 `venv` and `ensurepip`, plus internet for initial pinned Python dependencies.
 
+Applications install into Forge's own Python, and the Toolkit packages in this
+release are built for CPython 3.11. On another CPython, Forge refuses the install
+before installing anything and names the version it needs. Debian 12's `python3`
+is 3.11. On Ubuntu 24.04, whose `python3` is 3.12, install CPython 3.11 with
+`uv python install 3.11` (or `python3.11` and `python3.11-venv` from the
+deadsnakes PPA). If Forge already ran in this folder, stop it and move only its
+`.venv` aside; saved setups are kept. Then start Forge with `PYTHON_BIN` set to
+that interpreter:
+
+```bash
+test ! -e .venv.previous && test ! -L .venv.previous && mv .venv .venv.previous
+PYTHON_BIN="$(uv python find 3.11)" bash start.sh
+```
+
 To prepare the package without starting its web server or agents, use
 `bash start.sh --prepare-only`. To return to an existing setup, reuse the same
 extracted folder and private state directory. If Forge is already running,
@@ -111,17 +125,6 @@ An explicit `PYTHON_BIN` takes precedence for setup checks and creating a new
 virtual environment. An existing `.venv` is retained and must itself run Python
 3.11 or newer. If it is incompatible or broken, startup stops before installing
 dependencies. Selecting `PYTHON_BIN` does not upgrade that environment.
-
-Application installs use the same Python as Forge, and the Toolkit packages in
-this release are built for CPython 3.11. On another CPython, Forge refuses the
-install before installing anything and names the version it needs. Debian 12's
-`python3` is 3.11. On Ubuntu 24.04, whose `python3` is 3.12, install CPython 3.11
-with `uv python install 3.11` (or `python3.11` and `python3.11-venv` from the
-deadsnakes PPA), then start Forge from a fresh unpack with `PYTHON_BIN` set to it:
-
-```bash
-PYTHON_BIN="$(uv python find 3.11)" bash start.sh
-```
 
 If creating the environment or preparing pip fails, Forge prints the prerequisite
 and recovery steps before dependency installation or server startup. A partial

@@ -529,7 +529,8 @@ async def test_cp311_closure_under_cp312_forge_refuses_fresh_install_before_publ
     fresh = (await f.service.options(f.guide_id, f.build_id))["fresh_install"]
     assert fresh["available"] is False and "next_step" not in fresh
     assert "built for CPython 3.11" in fresh["reason"] and "runs CPython 3.12" in fresh["reason"]
-    assert "PYTHON_BIN" in fresh["reason"]
+    # The remedy keeps the folder's saved setups: only .venv is moved aside.
+    assert "PYTHON_BIN" in fresh["reason"] and ".venv" in fresh["reason"] and "fresh unpack" not in fresh["reason"]
     with pytest.raises(DraftConflict, match=r"CPython 3\.11"):
         await f.submit()
     assert not f.destination.exists() and not f.service.launched
@@ -581,3 +582,28 @@ def test_darwin_arm64_host_admits_its_matching_closure_and_refuses_others(host, 
         assert reason is None
     else:
         assert re.search(refused, reason)
+
+
+def test_platform_only_refusal_names_no_cpython():
+    # An abi3 wheel refused only for its glibc floor needs a newer system, not CPython 3.9.
+    reason = deployment.selected_interpreter_refusal(
+        closure("cryptography-44.0.0-cp39-abi3-manylinux_2_34_x86_64.whl", "httpx-0.28.1-py3-none-any.whl"),
+        {**CP312_LINUX, "glibc_minimum": [2, 31]})
+    assert "do not support this computer" in reason and "CPython" not in reason
+
+
+def test_generated_readme_names_the_cpython_of_a_compiled_closure():
+    from launchkit import product_distribution
+    guide = SimpleNamespace(core_version="0.9.4", version="0.9.4", core_source="core", meta_source="meta")
+    def readme(*names):
+        selected = SimpleNamespace(target="linux-x86_64", meta=SimpleNamespace(version="0.9.4"),
+            toolkit=SimpleNamespace(version="0.9.4"), meta_wheel=SimpleNamespace(sha256="1" * 64),
+            toolkit_wheel=SimpleNamespace(sha256="2" * 64), assembly=SimpleNamespace(sha256="3" * 64),
+            dependency_wheels=closure(*names).dependency_wheels)
+        return product_distribution.candidate_readme(guide, selected, "origin")
+    compiled = readme("pydantic_core-2.27.2-cp311-cp311-manylinux_2_17_x86_64.whl",
+        "cryptography-44.0.0-cp39-abi3-manylinux_2_28_x86_64.whl", "httpx-0.28.1-py3-none-any.whl")
+    assert "You need a complete CPython 3.11 installation" in compiled
+    assert "`PYTHON_BIN` set to a CPython 3.11 interpreter" in compiled
+    portable = readme("cryptography-44.0.0-cp39-abi3-manylinux_2_28_x86_64.whl", "httpx-0.28.1-py3-none-any.whl")
+    assert "You need a complete Python 3.11+ installation" in portable and "PYTHON_BIN" not in portable
