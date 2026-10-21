@@ -1372,8 +1372,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Meta Forge accepts a `meerkat-toolkit` 0.9.4 wheel, whose native host
   requires `meerkat-meta==0.9.4`, instead of refusing every Toolkit wheel but
   0.9.0; the exact version, METADATA, RECORD and payload checks are unchanged.
-- Meta Forge's "Rebuild with updated runtime" moves an application built from a
-  host-selected Meta and Toolkit runtime to the installer's current runtime.
+- Meta Forge's "Rebuild with updated runtime" builds a new package of an
+  application built from a host-selected Meta and Toolkit runtime on the
+  installer's current runtime (see Known limitations).
   It sent the legacy framework refresh, which the server refuses for such an
   application ("Replacing the selected candidate needs a separately bound
   runtime transition"); it now sends the host-owned runtime refresh of the
@@ -1684,6 +1685,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   turn ends. Install it with `UnifiedRuntime::install_identity_first_context`
   (or let the builder's identity-first composition make the runtime), and
   register peer mobs with `register_peer_runtime`.
+- Meta Forge cannot yet update a Meta Toolkit product application after its
+  setup. "Stage accepted update" refuses ("This application retains a Fresh
+  bootstrap attempt..."). Applying a runtime update built with "Rebuild with
+  updated runtime" to an installed product application is also refused, as
+  before 0.9.4. To run a newer build, install it into a new empty folder and
+  set it up again there. The new installation starts with a fresh setup and
+  none of the old installation's conversations or application data. The old
+  folder keeps its setup, history and data unchanged and can still be started.
+  Stop the old application before you start the new one. An application on the
+  Meta Toolkit Connect route that was installed before 0.9.4 keeps its Console
+  without the "Connect setup" button; its setup page stays at
+  /host/toolkit/setup on its Console address.
 
 ## [0.9.3] - 2026-10-18
 
