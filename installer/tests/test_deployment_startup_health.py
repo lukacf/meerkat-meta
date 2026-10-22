@@ -128,6 +128,163 @@ def assert_unready(supervisor):
     return receipt
 
 
+@pytest.mark.parametrize("reported", [392_000, None], ids=["reported", "unreported"])
+async def test_pending_admission_waits_for_later_native_ready_before_console_probe(fixture, monkeypatch, reported):
+    from test_admission_health import pending_payload
+    import launchkit.deployment_worker as worker
+    supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})])
+    pending = pending_payload()
+    pending["console_url"] = f"http://127.0.0.1:{definition['port']}/console"
+    ready = deepcopy(pending)
+    ready.pop("admission")
+    ready["bootstrap"]["identities"]["project:one"] = {"state": "active"}
+    ready["bootstrap"].update(ready=True, counts={"broken": 0})
+    if reported is not None:
+        ready["gateway_shutdown_horizon_ms"] = reported
+    supervisor.service_owned = True
+    widened = []
+    async def widen(horizon):
+        widened.append((horizon, read_receipt(supervisor.directory)["admission_health"]))
+    monkeypatch.setattr(supervisor, "widen_service_stop_budget", widen)
+    release = supervisor.destination / "release-fixture"
+    (supervisor.destination / "app.py").write_text(
+        "import json,os,time\n"
+        f"pending={pending!r}\nready={ready!r}\n"
+        "fd=int(os.environ['MOBKIT_LAUNCH_READY_FD'])\n"
+        "pending['pid']=ready['pid']=os.getpid()\n"
+        "os.write(fd,(json.dumps(pending)+'\\n').encode())\n"
+        f"while not os.path.exists({str(release)!r}):\n"
+        " time.sleep(.05)\n os.write(fd,(json.dumps(pending)+'\\n').encode())\n"
+        "os.write(fd,(json.dumps(ready)+'\\n').encode())\nos.close(fd)\ntime.sleep(60)\n")
+    monkeypatch.setattr(worker, "START_TIMEOUT", .2)
+    monkeypatch.setattr(worker, "PENDING_HEALTH_WINDOW", .15)
+    published = []
+    def on_ready():
+        published.append(True)
+        supervisor.stop.set()
+    task = asyncio.create_task(supervisor.start(definition, on_ready=on_ready))
+    try:
+        for _ in range(100):
+            if task.done():
+                await task
+            receipt = read_receipt(supervisor.directory)
+            if receipt.get("health") == "pending":
+                break
+            await asyncio.sleep(.01)
+        else:
+            pytest.fail("The owned child never reported pending admission")
+        assert receipt["status"] == "starting" and receipt["bootstrap"] == pending["bootstrap"]
+        assert receipt["admission_health"] == {"attempt_id": receipt["startup_attempt_id"], **pending["admission"]}
+        assert receipt["console_url"] is None and console.requests == [] and published == []
+        assert receipt["gateway_shutdown_horizon_ms"] is None and widened == []
+        # A known pending condition is not an absent startup handshake.
+        await asyncio.sleep(.25)
+        assert not task.done() and console.requests == []
+        release.touch()
+        await asyncio.wait_for(task, 3)
+        receipt = read_receipt(supervisor.directory)
+        assert published == [True] and receipt["health"] == "ready"
+        assert receipt["admission_health"] is None and len(console.requests) == 1
+        assert receipt["gateway_shutdown_horizon_ms"] == supervisor.gateway_shutdown_horizon_ms == reported
+        assert widened == [(reported, None)]
+    finally:
+        supervisor.stop.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("linger", [0, 60], ids=["exiting", "live"])
+async def test_pending_admission_preserves_later_child_refusal(fixture, linger):
+    from test_admission_health import pending_payload
+    supervisor, definition, console = await fixture([])
+    pending = pending_payload()
+    pending["console_url"] = f"http://127.0.0.1:{definition['port']}/console"
+    refusal = "The original application source changed during native admission."
+    release = supervisor.destination / "release-refusal"
+    (supervisor.destination / "app.py").write_text(
+        "import json,os,sys,time\n"
+        f"payload={pending!r}\npayload['pid']=os.getpid()\n"
+        "fd=int(os.environ['MOBKIT_LAUNCH_READY_FD'])\n"
+        "os.write(fd,(json.dumps(payload)+'\\n').encode())\n"
+        f"while not os.path.exists({str(release)!r}):\n time.sleep(.01)\n"
+        f"os.write(fd,(json.dumps({{'refused':{refusal!r}}})+'\\n').encode())\n"
+        f"time.sleep({linger!r})\nsys.exit(1)\n")
+    published = []
+    task = asyncio.create_task(supervisor.start(definition, on_ready=lambda: published.append(True)))
+    try:
+        for _ in range(100):
+            if task.done():
+                await task
+            if read_receipt(supervisor.directory).get("health") == "pending":
+                break
+            await asyncio.sleep(.01)
+        else:
+            pytest.fail("The child never reported pending admission")
+        release.touch()
+        with pytest.raises(RuntimeError) as raised:
+            await asyncio.wait_for(task, 3)
+        assert str(raised.value) == "The application refused to start: " + refusal
+        receipt = read_receipt(supervisor.directory)
+        assert receipt["status"] == "starting" and receipt["health"] == "pending"
+        assert receipt["console_url"] is None and supervisor.child is None
+        assert console.requests == [] and published == []
+    finally:
+        supervisor.stop.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_pending_child_must_keep_reporting_within_frame_deadline(fixture, monkeypatch):
+    from test_admission_health import pending_payload
+    import launchkit.deployment_worker as worker
+    supervisor, definition, console = await fixture([])
+    pending = pending_payload()
+    pending["console_url"] = f"http://127.0.0.1:{definition['port']}/console"
+    (supervisor.destination / "app.py").write_text(
+        "import json,os,time\n"
+        f"payload={pending!r}\npayload['pid']=os.getpid()\n"
+        "fd=int(os.environ['MOBKIT_LAUNCH_READY_FD'])\n"
+        "os.write(fd,(json.dumps(payload)+'\\n').encode())\ntime.sleep(60)\n")
+    monkeypatch.setattr(worker, "PENDING_HEALTH_WINDOW", .15, raising=False)
+    task = asyncio.create_task(supervisor.start(definition))
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), 1)
+        assert task.done(), "The worker frame deadline must expire without test cancellation"
+        assert supervisor.child is None and console.requests == []
+    finally:
+        supervisor.stop.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 3)
+
+
+async def test_pending_admission_can_be_stopped_without_publishing_ready(fixture):
+    from test_admission_health import pending_payload
+    supervisor, definition, console = await fixture([])
+    pending = pending_payload()
+    pending["console_url"] = f"http://127.0.0.1:{definition['port']}/console"
+    (supervisor.destination / "app.py").write_text(
+        "import json,os,time\n"
+        f"payload={pending!r}\npayload['pid']=os.getpid()\n"
+        "fd=int(os.environ['MOBKIT_LAUNCH_READY_FD'])\n"
+        "os.write(fd,(json.dumps(payload)+'\\n').encode())\ntime.sleep(60)\n")
+    task = asyncio.create_task(supervisor.start(definition, on_ready=lambda: pytest.fail("Pending is not ready")))
+    try:
+        for _ in range(100):
+            if task.done():
+                await task
+            if read_receipt(supervisor.directory).get("health") == "pending":
+                break
+            await asyncio.sleep(.01)
+        else:
+            pytest.fail("The owned child never reported pending admission")
+        supervisor.stop.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 3)
+        assert supervisor.child is None and console.requests == []
+        assert read_receipt(supervisor.directory)["health"] == "pending"
+    finally:
+        supervisor.stop.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_delayed_authenticated_console_and_complete_identities_gate_ready(fixture):
     supervisor, definition, console = await fixture([
         (503, {"private": "response content must never be persisted"}),
