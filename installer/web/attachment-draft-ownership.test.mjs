@@ -92,6 +92,10 @@ async function mount({ session = new Map(), state = structuredClone(guide), onPo
     const file = new dom.window.File([content], name, { type: name.endsWith('.png') ? 'image/png' : 'text/markdown' });
     Object.defineProperty(picker, 'files', { configurable: true, value: [file] });
     await act(async () => { picker.dispatchEvent(new dom.window.Event('change', { bubbles: true })); await pause(); });
+    const deadline = Date.now() + 5000;
+    while (dom.window.document.querySelector('.setup-attachment-wait') && Date.now() < deadline) await act(pause);
+    assert.equal(dom.window.document.querySelector('.setup-attachment-wait') === null, true,
+      'Wait for the actual FileReader/upload response before checking its retained draft.');
   };
   try {
     await act(async () => { root.render(React.createElement(GuidedSetup, { active: true, bp: null, Icon: () => null,
@@ -130,11 +134,11 @@ test('a failed attachment draft survives another guide upload and same-name pend
     assert.match(document.querySelector('.setup-attachments [role="alert"]').textContent, /A upload failed/);
     assert.ok([...document.querySelectorAll('button')].find(node => node.textContent === 'Retry upload'));
     await switchTo('Attachment guide B');
-    assert.equal(document.querySelector('.setup-attachments li'), null, 'A pending files are hidden in B.');
+    assert.equal(document.querySelector('.setup-attachments li') === null, true, 'A pending files are hidden in B.');
     await choose('shared.md', 'Unsent B evidence');
     assert.match(document.querySelector('.setup-attachments [role="alert"]').textContent, /B upload failed/);
     await act(async () => { document.querySelector('button[aria-label="Remove attachment shared.md"]').click(); await pause(); });
-    assert.equal(document.querySelector('.setup-attachments li'), null, 'Removing B clears only its colliding pending item.');
+    assert.equal(document.querySelector('.setup-attachments li') === null, true, 'Removing B clears only its colliding pending item.');
     await choose('shared.md', 'Confirmed B evidence');
     assert.equal(document.querySelector('.setup-attachments a').getAttribute('href'), responseRef(other.id, sent.at(-1).files[0]).url);
     await switchTo('Attachment guide A');
@@ -145,7 +149,7 @@ test('a failed attachment draft survives another guide upload and same-name pend
     for (let step = 0; !document.querySelector('.setup-attachments a') && step < 40; step++) await act(pause);
     assert.ok(document.querySelector('.setup-attachments a'), `A retry must settle to its checked reference. Files: ${JSON.stringify(sent)}; UI: ${document.querySelector('.setup-attachments').textContent}`);
     assert.equal(document.querySelector('.setup-attachments a').getAttribute('href'), responseRef(guide.id, sent.at(-1).files[0]).url);
-    assert.equal(document.querySelector('.setup-attachments [role="alert"]'), null);
+    assert.equal(document.querySelector('.setup-attachments [role="alert"]') === null, true);
     assert.deepEqual(sent.map(({ id, files }) => [id, files[0].name, files[0].text]), [
       [guide.id, 'shared.md', 'Original A evidence'],
       [other.id, 'shared.md', 'Unsent B evidence'],

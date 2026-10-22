@@ -86,6 +86,33 @@ def test_rpc_and_multipart_preserve_body_and_content_type(console_api):
         assert f.requests[-1].content == body and f.requests[-1].headers["content-type"] == content_type
 
 
+def test_timeline_reconnect_preserves_native_resume_cursor(guide_console):
+    f = guide_console
+    cursor = "timeline:00042/owner-7"
+    def events(request):
+        if request.headers.get("last-event-id") == cursor:
+            body = b'id: timeline:00043/owner-7\ndata: {"event":"next"}\n\n'
+        else:
+            body = b'id: timeline:00042/owner-7\ndata: {"event":"first"}\n\n'
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+    f.handler.reply = events
+    first = f.client.get(f.prefix + "/console/timeline/stream")
+    assert first.status_code == 200 and b'"first"' in first.content
+    resumed = f.client.get(f.prefix + "/console/timeline/stream",
+        headers={"Last-Event-ID": cursor, "Cookie": "private=fake", "Authorization": "Bearer fake"})
+    assert resumed.status_code == 200 and b'"next"' in resumed.content
+    assert b'"first"' not in resumed.content
+    assert f.requests[-1].headers["last-event-id"] == cursor
+    assert not {"cookie", "authorization"} & set(f.requests[-1].headers)
+
+
+@pytest.mark.parametrize("cursor", ["x" * (owned_console.MAX_EVENT_CURSOR + 1), "line\r\nbreak", "bad\x00cursor"])
+def test_invalid_event_cursor_is_rejected_before_forwarding(console_api, cursor):
+    f = console_api
+    assert f.client.get(f.prefix + "/console/timeline/stream", headers={"Last-Event-ID": cursor}).status_code == 400
+    assert not f.requests
+
+
 @pytest.mark.parametrize("address", ["https://example.invalid/console", "http://localhost:38659/console",
     "http://127.0.0.1:38659/console?next=http://example.invalid", "http://user@127.0.0.1:38659/console",
     "http://127.0.0.1:22/console", "http://127.0.0.1:99999/console", None])
@@ -148,6 +175,23 @@ def test_redirect_is_not_followed(console_api):
     assert len(f.requests) == 1
 
 
+async def read_console_stream(f):
+    class Read:
+        method = "GET"
+        headers = {}
+        url = httpx.URL("http://testserver" + f.prefix + "/console/timeline/stream")
+        scope = {"query_string": b""}
+        async def stream(self):
+            yield b""
+    owner = owned_console.resolve_owner(f.service, GUIDE, JOB, "implementation")
+    response = await owned_console.console_response(Read(), owner, "console/timeline/stream")
+    async def consume():
+        return b"".join([chunk async for chunk in response.body_iterator])
+    # Revocation must also close an idle upstream, rather than waiting forever
+    # for another event. The deadline makes a missing custody check fail promptly.
+    return response, await asyncio.wait_for(consume(), timeout=2)
+
+
 def test_idle_sse_closes_when_the_owned_worker_retires(console_api):
     f = console_api
     class Events(httpx.AsyncByteStream):
@@ -160,10 +204,28 @@ def test_idle_sse_closes_when_the_owned_worker_retires(console_api):
             self.closed = True
     events = Events()
     f.handler.reply = lambda request: httpx.Response(200, stream=events, headers={"content-type": "text/event-stream"})
-    response = f.client.get(f.prefix + "/console/timeline/stream")
+    response, content = asyncio.run(read_console_stream(f))
     assert response.status_code == 200
-    assert response.content == b'data: {"event":"native-frame"}\n\n'
+    assert content == b'data: {"event":"native-frame"}\n\n'
     assert response.headers["x-accel-buffering"] == "no"
+    assert events.closed
+
+
+def test_chunk_arriving_after_worker_retirement_is_not_forwarded(console_api):
+    f = console_api
+    class Events(httpx.AsyncByteStream):
+        closed = False
+        async def __aiter__(self):
+            yield b'data: {"event":"current-owner"}\n\n'
+            f.process.returncode = 0
+            yield b'data: {"event":"retired-owner"}\n\n'
+        async def aclose(self):
+            self.closed = True
+    events = Events()
+    f.handler.reply = lambda request: httpx.Response(200, stream=events, headers={"content-type": "text/event-stream"})
+    response, content = asyncio.run(read_console_stream(f))
+    assert response.status_code == 200
+    assert content == b'data: {"event":"current-owner"}\n\n'
     assert events.closed
 
 

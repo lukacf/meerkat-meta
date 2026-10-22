@@ -17,6 +17,7 @@ from .implementation import read_receipt
 
 
 MAX_BODY = 8_000_000
+MAX_EVENT_CURSOR = 4096
 _KINDS = {"implementation": "build_id", "rehearsal": "rehearsal_id"}
 _PUBLIC_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
                    "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "frame-ancestors 'self'"}
@@ -165,10 +166,14 @@ async def console_response(request, owner, path, *, transport=None):
         raise HTTPException(400, "Invalid Console query.") from None
     if len(query) > 16_384:
         raise HTTPException(400, "The Console query exceeds its size limit.")
+    cursor = request.headers.get("last-event-id")
+    if cursor is not None and (len(cursor) > MAX_EVENT_CURSOR
+            or any(ord(character) < 32 or ord(character) == 127 for character in cursor)):
+        raise HTTPException(400, "Invalid Console event cursor.")
     if not await asyncio.to_thread(owner.current):
         raise HTTPException(410, "This agent Console has closed.")
     url = owner.origin + "/" + path + ("?" + query if query else "")
-    headers = {name: request.headers[name] for name in ("accept", "content-type", "range")
+    headers = {name: request.headers[name] for name in ("accept", "content-type", "range", "last-event-id")
                if name in request.headers}
     # Authoring cookies, bearer credentials and forwarded-host headers stay here.
     client = httpx.AsyncClient(trust_env=False, follow_redirects=False, transport=transport,
