@@ -1203,14 +1203,21 @@ own waits and service commands use it at once. A background service runs the
 supervisor that was saved when it was installed, so one installed before Forge
 0.9.5 keeps its earlier stop budgets until **Apply support update** under
 **Installation support** replaces that supervisor. After that, a Linux user
-service keeps its frozen unit: when its application reports a longer horizon, the
+service keeps its frozen unit: when that unit's stop timeout is shorter than the
+derived one (the unreported horizon's when its application reports none), the
 service's own run adds an owned systemd drop-in, `forge-stop-budget.conf`, with
-the larger stop timeout and reloads the user manager. A destination's supervisor
-comes with its package and does the same for its own unit from the next package
-the destination runs. A macOS LaunchAgent keeps the stop timeout it was installed
-with (397 seconds from Forge before 0.9.5): launchd has no drop-in, so a longer
-horizon that its application reports later is not applied, and native cleanup can
-be cut at that timeout. On Linux, logout and shutdown are bounded by the systemd
+the derived stop timeout and reloads the user manager. Until that drop-in and the
+reload succeed, a service run fits its application stop inside the stop timeout
+its manager enforces (367 seconds under an earlier 397-second unit), so Forge can
+still record its cleanup. A destination's supervisor comes with its package and
+does the same for its own unit from the next package the destination runs; a
+destination deployed from a package that Forge 0.9.4 accepted keeps that
+release's helper and stop budgets until the package is rebuilt. A macOS
+LaunchAgent keeps the stop timeout it was installed with (397 seconds from Forge
+before 0.9.5): launchd has no drop-in, so a longer horizon that its application
+reports later is not applied. Its application's stop is shortened to fit that
+timeout (367 seconds, or 15 under the 45-second timeout of the earliest
+releases), so native cleanup can be cut short. On Linux, logout and shutdown are bounded by the systemd
 user manager's own stop timeout (120 seconds by default), whatever the unit sets;
 the unit's stop timeout governs an explicit Stop or Restart.
 

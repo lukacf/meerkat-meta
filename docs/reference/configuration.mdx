@@ -1116,7 +1116,7 @@ close the process. Honor the advertised `stdio_shutdown_horizon_ms` rather than
 hard-coding it. The SDKs report the value they accepted as
 `runtime.gateway_shutdown_horizon_ms` (Python) and
 `runtime.gatewayShutdownHorizonMs` (TypeScript), `None` or `null` when the
-gateway advertised none, so a process that supervises the application can
+gateway advertised no valid horizon, so a process that supervises the application can
 wait for it. The current stock 432-second horizon covers an already-admitted
 provider callback, runtime event and mob drains, the mob's terminal shutdown
 report, the durable child-mob stand-down, the member MCP settlement (in

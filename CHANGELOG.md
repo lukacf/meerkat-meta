@@ -182,11 +182,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   installed, so one installed before 0.9.5 keeps its earlier stop budgets
   until **Apply support update** under **Installation support** replaces that
   supervisor. After that, a Linux user service keeps its frozen unit and, when
-  its application reports a longer horizon, gets an owned systemd drop-in with
-  the larger stop timeout. A destination's supervisor comes with its package,
-  so it does the same for its own unit from the next package the destination
-  runs. The Guide's rehearsal, implementation and trial workers wait the
-  derived budget too.
+  that unit's stop timeout is shorter than the derived one (the unreported
+  horizon's when its application reports none), gets an owned systemd drop-in
+  with the derived stop timeout. Until the drop-in and the manager's reload
+  succeed, and under launchd, a service run fits its application stop inside
+  the stop timeout its manager enforces: 367 seconds under an earlier
+  397-second unit. A destination's supervisor comes with its package, so it
+  does the same for its own unit from the next package the destination runs.
+  The Guide's rehearsal, implementation and trial workers wait the derived
+  budget too.
 
 ### Known limitations
 
@@ -213,7 +217,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A macOS LaunchAgent keeps the stop timeout it was installed with (397
   seconds from Forge before 0.9.5). launchd has no drop-in, so a longer
   horizon that its application reports later is not applied, and native
-  cleanup can be cut at that timeout.
+  cleanup can be cut at that timeout. The application's stop is shortened to
+  fit it (367 seconds, or 15 under the 45-second timeout of the earliest
+  releases), so native cleanup can be cut short, and Forge still records its
+  own cleanup.
+- A destination deployed from a package that Forge 0.9.4 accepted keeps that
+  release's destination helper and its stop budgets until the package is
+  rebuilt.
 - On Linux, logout and shutdown stop user services within the systemd user
   manager's own stop timeout (`TimeoutStopSec=120s` by default), whatever Forge
   sets. The unit's stop timeout governs an explicit Stop or Restart.
