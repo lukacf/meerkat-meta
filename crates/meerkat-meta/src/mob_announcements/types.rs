@@ -183,6 +183,48 @@ pub enum AnnouncementStoreError {
         limit: u32,
         mob_id: Option<MobId>,
     },
+    /// Another step advanced the source first: the caller read an older
+    /// cursor version. Carries where the cursor stands; its token goes to
+    /// the caller's data only.
+    SourceVersionConflict {
+        revision: u64,
+        state: super::sources::SourceState,
+        cursor: super::sources::SourceCursor,
+    },
+    /// The principal a collector used is not the one the source's
+    /// generation pins. Carries both digests, never a principal.
+    PrincipalChanged {
+        pinned_digest: String,
+        offered_digest: String,
+    },
+    /// The source is taking a baseline: its advances carry no items until
+    /// its final page.
+    BaselineRequired,
+    /// Items of streams whose baseline is not taken.
+    StreamNotBaselined {
+        streams: Vec<String>,
+    },
+    /// The page would announce more history than the backfill (the
+    /// source's, or a stream's when `stream` names it) takes.
+    BackfillBoundExceeded {
+        remaining: u32,
+        stream: Option<String>,
+    },
+    /// A deletion on a source whose provider has no observable deletions.
+    DeletionsUnobservable,
+}
+
+impl AnnouncementStoreError {
+    /// The kind an onboarding refusal of an advance is counted under in the
+    /// source's failure streak, if this is one.
+    pub(crate) fn onboarding_refusal(&self) -> Option<&'static str> {
+        match self {
+            Self::BaselineRequired => Some("baseline_required"),
+            Self::StreamNotBaselined { .. } => Some("stream_not_baselined"),
+            Self::BackfillBoundExceeded { .. } => Some("backfill_bound_exceeded"),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for AnnouncementStoreError {
@@ -293,6 +335,30 @@ impl fmt::Display for AnnouncementStoreError {
                 f,
                 "limit reached: at most {limit} live sources on this gateway"
             ),
+            Self::SourceVersionConflict { cursor, .. } => write!(
+                f,
+                "the source's cursor is at version {}; read it again",
+                cursor.version
+            ),
+            Self::PrincipalChanged { .. } => f.write_str(
+                "the principal is not the one this source's generation pins; another principal \
+                 needs a new generation",
+            ),
+            Self::BaselineRequired => f.write_str(
+                "the source is taking a baseline: an advance carries no items until its final page",
+            ),
+            Self::StreamNotBaselined { streams } => write!(
+                f,
+                "items of {} streams whose baseline is not taken; onboard them first",
+                streams.len()
+            ),
+            Self::BackfillBoundExceeded { remaining, .. } => write!(
+                f,
+                "the page passes the backfill's bound: {remaining} items of history remain"
+            ),
+            Self::DeletionsUnobservable => {
+                f.write_str("the source declares no observable deletions, so it carries none")
+            }
         }
     }
 }
@@ -510,13 +576,6 @@ impl AnnounceRequest {
                 "an announcement carries 1..={MAX_ANNOUNCEMENT_TOPICS} topics"
             )));
         }
-        if !matches!(self.announced_by, Announcer::Source { .. })
-            && self.source_key.as_str().starts_with(SOURCE_KEY_PREFIX)
-        {
-            return Err(AnnouncementStoreError::Invalid(format!(
-                "the key prefix {SOURCE_KEY_PREFIX:?} is reserved for source items"
-            )));
-        }
         if self.body.len() > MAX_BODY_BYTES {
             return Err(AnnouncementStoreError::TooLarge(format!(
                 "an announcement body is at most {MAX_BODY_BYTES} bytes"
@@ -528,6 +587,20 @@ impl AnnounceRequest {
         if self.causes.len() > MAX_CAUSES {
             return Err(AnnouncementStoreError::Invalid(format!(
                 "an announcement names at most {MAX_CAUSES} causes"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuse a new announcement under the key prefix reserved for source
+    /// items unless a source makes it. Checked once no announcement holds
+    /// the key: a retry of one 0.9.4 accepted still answers its original.
+    pub(crate) fn ensure_key_open(&self) -> Result<()> {
+        if !matches!(self.announced_by, Announcer::Source { .. })
+            && self.source_key.as_str().starts_with(SOURCE_KEY_PREFIX)
+        {
+            return Err(AnnouncementStoreError::Invalid(format!(
+                "the key prefix {SOURCE_KEY_PREFIX:?} is reserved for source items"
             )));
         }
         Ok(())
@@ -1699,7 +1772,7 @@ pub struct PruneReport {
 /// A string as a JSON literal: quoted, with every quote and control
 /// character escaped, so a caller-chosen name cannot change the structure of
 /// the line it appears in.
-fn quoted(text: &str) -> String {
+pub(crate) fn quoted(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())
 }
 

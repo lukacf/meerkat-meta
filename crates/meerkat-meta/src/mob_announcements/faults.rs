@@ -33,3 +33,16 @@ pub(crate) fn after_remote_commit() {
     #[cfg(feature = "announcement-test-faults")]
     hit("after_remote_commit");
 }
+
+/// Inside a source advance's transaction, after its items, its cursor and
+/// its receipt were written and before the commit.
+pub(crate) fn inside_source_advance() {
+    #[cfg(feature = "announcement-test-faults")]
+    hit("inside_source_advance");
+}
+
+/// After a source advance committed, before its answer.
+pub(crate) fn after_source_advance() {
+    #[cfg(feature = "announcement-test-faults")]
+    hit("after_source_advance");
+}

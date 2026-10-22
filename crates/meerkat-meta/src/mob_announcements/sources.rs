@@ -18,7 +18,8 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use super::types::{
-    AnnouncementStoreError, MAX_ID_BYTES, Member, MobId, Result, SourceId, Topic, sha256_hex,
+    AnnouncementStoreError, MAX_ANNOUNCEMENT_TOPICS, MAX_BODY_BYTES, MAX_ID_BYTES, Member, MobId,
+    Result, SOURCE_KEY_PREFIX, SourceId, SourceKey, Topic, sha256_hex,
 };
 
 /// Most topics a source owns for its items.
@@ -45,6 +46,20 @@ pub const MAX_PRINCIPAL_BYTES: usize = 1_024;
 pub const MAX_SOURCES_PER_MOB: u32 = 256;
 /// Most live sources one gateway holds.
 pub const MAX_SOURCES_PER_GATEWAY: u32 = 1_024;
+/// Most items one advance carries.
+pub const MAX_ITEMS_PER_ADVANCE: usize = 100;
+/// Most bytes of item bodies one advance carries.
+pub const MAX_ADVANCE_BODY_BYTES: usize = 1024 * 1024;
+/// Longest cursor token, in bytes: a longer one is refused, never cut.
+pub const MAX_CURSOR_TOKEN_BYTES: usize = 8 * 1024;
+/// Longest item id, item version or stream, in bytes.
+pub const MAX_ITEM_FIELD_BYTES: usize = 256;
+/// Most streams one source onboards, in a generation.
+pub const MAX_STREAMS_PER_SOURCE: usize = 1_024;
+/// Longest failure detail a collector reports, in bytes.
+pub const MAX_FAILURE_DETAIL_BYTES: usize = 512;
+/// Longest coverage gap reason, in bytes.
+const MAX_GAP_REASON_BYTES: usize = 64;
 
 const MINUTE_MS: u64 = 60 * 1_000;
 const HOUR_MS: u64 = 60 * MINUTE_MS;
@@ -686,6 +701,25 @@ impl CollectionPhase {
             SourceStart::Backfill { .. } => Self::Backfilling,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Baselining => "baselining",
+            Self::Backfilling => "backfilling",
+            Self::Live => "live",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "baselining" => Ok(Self::Baselining),
+            "backfilling" => Ok(Self::Backfilling),
+            "live" => Ok(Self::Live),
+            other => Err(AnnouncementStoreError::Storage(format!(
+                "unknown collection phase {other}"
+            ))),
+        }
+    }
 }
 
 /// A source's progress: an opaque provider position and the version every
@@ -766,6 +800,13 @@ pub struct SourceHealth {
     pub empty_snapshot_since_ms: Option<u64>,
     pub consecutive_failures: u32,
     pub totals: SourceTotals,
+    /// The last failure the collector reported, or the last onboarding
+    /// refusal counted for it.
+    #[serde(default)]
+    pub last_failure: Option<SourceFailureRecord>,
+    /// The last item that came back with other content under its key.
+    #[serde(default)]
+    pub last_conflict: Option<SourceConflictRecord>,
 }
 
 impl SourceHealth {
@@ -779,8 +820,54 @@ impl SourceHealth {
             empty_snapshot_since_ms: None,
             consecutive_failures: 0,
             totals: SourceTotals::default(),
+            last_failure: None,
+            last_conflict: None,
         }
     }
+
+    /// Record what an advance observed, at `now_ms`; an advance that says
+    /// nothing keeps the last evidence.
+    pub(crate) fn observe(&mut self, observed: Option<Observed>, now_ms: u64) {
+        let Some(observed) = observed else {
+            return;
+        };
+        self.last_observed = Some(observed);
+        self.last_observed_at_ms = Some(now_ms);
+        match observed {
+            Observed::Snapshot { records: 0 } => {
+                self.empty_snapshot_since_ms.get_or_insert(now_ms);
+            }
+            Observed::Delta | Observed::Snapshot { .. } => self.empty_snapshot_since_ms = None,
+        }
+    }
+}
+
+/// A failure a source's collector reported, or an onboarding refusal Meta
+/// counted toward its failure streak.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SourceFailureRecord {
+    /// The failure's class, or `refused:<kind>` for a counted refusal.
+    pub class: String,
+    pub at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    /// The collector's own words: `sources/get` returns them, a list, a
+    /// status or a delivered body never does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// An item that came back with other content under its key: both content
+/// digests, so the leak is diagnosable without the content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SourceConflictRecord {
+    pub source_key: SourceKey,
+    pub existing_sequence: u64,
+    pub existing_digest: String,
+    pub offered_digest: String,
+    pub at_ms: u64,
 }
 
 /// A durable announcement source, one generation of it.
@@ -807,6 +894,10 @@ pub struct AnnouncementSource {
     pub collection: CollectionPhase,
     pub cursor: SourceCursor,
     pub streams: SourceStreamCounts,
+    /// Items of history the source's own backfill has announced in this
+    /// generation, across its pages.
+    #[serde(default)]
+    pub backfilled: u32,
     pub health: SourceHealth,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -844,6 +935,7 @@ impl AnnouncementSource {
             collection,
             cursor: SourceCursor::default(),
             streams: SourceStreamCounts::default(),
+            backfilled: 0,
             health: SourceHealth::fresh(SourceHealthStatus::Baselining),
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
@@ -891,6 +983,14 @@ impl AnnouncementSource {
     pub(crate) fn rebaseline(&mut self) {
         self.cursor.token = None;
         self.collection = CollectionPhase::Baselining;
+    }
+
+    /// The most items the source's own backfill takes, if it backfills.
+    pub(crate) fn backfill_bound(&self) -> Option<u32> {
+        match self.start {
+            SourceStart::Backfill { max_items } => Some(max_items),
+            SourceStart::Baseline => None,
+        }
     }
 
     /// The health status the state and the collection phase give.
@@ -945,4 +1045,446 @@ pub struct SourceQuery {
     pub after: Option<(MobId, SourceId)>,
     pub state: Option<SourceState>,
     pub limit: usize,
+}
+
+/// What happened to the record an item names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ItemChange {
+    Upsert,
+    /// An explicit deletion, under the provider's deletion revision: never
+    /// inferred from absence.
+    Delete,
+}
+
+impl ItemChange {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Upsert => "upsert",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// One record version a collector observed. Meta derives its key; the
+/// adapter never spells one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceItem {
+    /// The provider's stable record id, inside the principal's scope.
+    pub item_id: String,
+    /// The provider's revision, or the adapter's digest of the record's
+    /// non-volatile fields.
+    pub version: String,
+    /// The item's one container; the default stream is `""`.
+    #[serde(default)]
+    pub stream: String,
+    pub change: ItemChange,
+    /// Each one of the source's own topics.
+    pub topics: BTreeSet<Topic>,
+    /// A reference or a summary, never a credential.
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+}
+
+/// A stream name: empty for the default stream, otherwise bounded and free
+/// of control characters.
+fn stream_name(value: &str, what: &str) -> Result<()> {
+    if value.len() > MAX_ITEM_FIELD_BYTES || value.chars().any(char::is_control) {
+        return Err(AnnouncementStoreError::Invalid(format!(
+            "{what} must be at most {MAX_ITEM_FIELD_BYTES} bytes without control characters"
+        )));
+    }
+    Ok(())
+}
+
+impl SourceItem {
+    pub fn validate(&self) -> Result<()> {
+        text(&self.item_id, MAX_ITEM_FIELD_BYTES, "an item id")?;
+        text(&self.version, MAX_ITEM_FIELD_BYTES, "an item version")?;
+        stream_name(&self.stream, "an item's stream")?;
+        if self.topics.is_empty() || self.topics.len() > MAX_ANNOUNCEMENT_TOPICS {
+            return Err(AnnouncementStoreError::Invalid(format!(
+                "an item carries 1..={MAX_ANNOUNCEMENT_TOPICS} topics"
+            )));
+        }
+        if self.body.len() > MAX_BODY_BYTES {
+            return Err(AnnouncementStoreError::TooLarge(format!(
+                "an item body is at most {MAX_BODY_BYTES} bytes"
+            )));
+        }
+        if let Some(correlation) = &self.correlation_id {
+            text(correlation, MAX_ID_BYTES, "a correlation id")?;
+        }
+        Ok(())
+    }
+
+    /// The item's key: the source id, then a digest of the principal, the
+    /// scope, the stream, the item, its version and its change. Every
+    /// version and every deletion is its own key, and two principals' items
+    /// never share one.
+    pub fn key(&self, source_id: &SourceId, identity: &SourceIdentity) -> Result<SourceKey> {
+        let digest = sha256_hex(&[
+            b"mob-announcement-source-item-v2",
+            identity.principal.digest()?.as_bytes(),
+            identity.scope.kind.as_bytes(),
+            identity.scope.id.as_bytes(),
+            self.stream.as_bytes(),
+            self.item_id.as_bytes(),
+            self.version.as_bytes(),
+            self.change.as_str().as_bytes(),
+        ]);
+        let hex = digest.strip_prefix("sha256:").unwrap_or(&digest);
+        SourceKey::new(format!("{SOURCE_KEY_PREFIX}{source_id}:{hex}"))
+    }
+}
+
+/// Where a page sits in a read that spans pages. Only a final page settles
+/// a checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourcePage {
+    pub index: u32,
+    #[serde(rename = "final")]
+    pub is_final: bool,
+}
+
+/// What the final page of an onboarding can prove about what it covered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Coverage {
+    Complete,
+    /// The adapter cannot prove lossless coverage.
+    Gap(CoverageGap),
+}
+
+/// Why an adapter cannot prove lossless coverage: a snake_case class, never
+/// free text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageGap {
+    pub reason: String,
+}
+
+/// Why a collector takes a fresh baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RebaselineReason {
+    /// The provider can no longer continue from the cursor.
+    CursorExpired,
+    /// The connection was authorized again.
+    Reauthorized,
+    /// An operator asked for it.
+    Operator,
+}
+
+impl RebaselineReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CursorExpired => "cursor_expired",
+            Self::Reauthorized => "reauthorized",
+            Self::Operator => "operator",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rebaseline {
+    pub reason: RebaselineReason,
+}
+
+/// How a stream is onboarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OnboardingMode {
+    /// Take the stream's position and announce none of its history.
+    Baseline,
+    /// Announce at most `max_items` of its history across pages.
+    Backfill,
+}
+
+impl OnboardingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Backfill => "backfill",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "baseline" => Ok(Self::Baseline),
+            "backfill" => Ok(Self::Backfill),
+            other => Err(AnnouncementStoreError::Storage(format!(
+                "unknown onboarding mode {other}"
+            ))),
+        }
+    }
+}
+
+/// One stream an advance onboards; `final` makes it live.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamOnboarding {
+    pub stream: String,
+    pub mode: OnboardingMode,
+    /// A backfill's bound across its pages, 1..=1000; a baseline has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u32>,
+    #[serde(rename = "final")]
+    pub is_final: bool,
+}
+
+impl StreamOnboarding {
+    pub fn validate(&self) -> Result<()> {
+        text(&self.stream, MAX_ITEM_FIELD_BYTES, "an onboarded stream")?;
+        match (self.mode, self.max_items) {
+            (OnboardingMode::Baseline, None) => Ok(()),
+            (OnboardingMode::Backfill, Some(max_items))
+                if (1..=MAX_BACKFILL_ITEMS).contains(&max_items) =>
+            {
+                Ok(())
+            }
+            (OnboardingMode::Baseline, Some(_)) => Err(AnnouncementStoreError::Invalid(
+                "a stream baseline takes no max_items".to_string(),
+            )),
+            _ => Err(AnnouncementStoreError::Invalid(format!(
+                "a stream backfill takes max_items 1..={MAX_BACKFILL_ITEMS}"
+            ))),
+        }
+    }
+}
+
+/// One step of a source's collector: what it read from one cursor version,
+/// at one revision, under one principal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvanceSource {
+    pub mob_id: MobId,
+    pub source_id: SourceId,
+    pub expected_revision: u64,
+    pub expected_version: u64,
+    /// The principal the collector read with: it must be the one the
+    /// generation pins.
+    pub principal: Principal,
+    /// The adapter's opaque token for the next read, kept byte for byte.
+    pub next_cursor: Option<String>,
+    pub page: Option<SourcePage>,
+    pub coverage: Option<Coverage>,
+    pub items: Vec<SourceItem>,
+    pub streams: Vec<StreamOnboarding>,
+    pub rebaseline: Option<Rebaseline>,
+    pub observed: Option<Observed>,
+    /// When the collector read the provider; the end of the window a gap
+    /// notice names.
+    pub collected_at_ms: Option<u64>,
+}
+
+impl AdvanceSource {
+    /// Whether this step ends its read: a step without a page is one final
+    /// page.
+    pub fn settles(&self) -> bool {
+        self.page.is_none_or(|page| page.is_final)
+    }
+
+    /// The bounds an advance meets before it reaches the store's state.
+    pub fn validate(&self) -> Result<()> {
+        self.principal.validate()?;
+        if let Some(token) = &self.next_cursor
+            && token.len() > MAX_CURSOR_TOKEN_BYTES
+        {
+            return Err(AnnouncementStoreError::TooLarge(format!(
+                "a cursor token is at most {MAX_CURSOR_TOKEN_BYTES} bytes; it is never cut"
+            )));
+        }
+        if self.items.len() > MAX_ITEMS_PER_ADVANCE {
+            return Err(AnnouncementStoreError::TooLarge(format!(
+                "an advance carries at most {MAX_ITEMS_PER_ADVANCE} items"
+            )));
+        }
+        self.items.iter().try_for_each(SourceItem::validate)?;
+        let bodies: usize = self.items.iter().map(|item| item.body.len()).sum();
+        if bodies > MAX_ADVANCE_BODY_BYTES {
+            return Err(AnnouncementStoreError::TooLarge(format!(
+                "the item bodies of an advance are at most {MAX_ADVANCE_BODY_BYTES} bytes"
+            )));
+        }
+        if self.streams.len() > MAX_STREAMS_PER_SOURCE {
+            return Err(AnnouncementStoreError::TooLarge(format!(
+                "an advance onboards at most {MAX_STREAMS_PER_SOURCE} streams"
+            )));
+        }
+        let mut onboarded = BTreeSet::new();
+        for entry in &self.streams {
+            entry.validate()?;
+            if !onboarded.insert(entry.stream.as_str()) {
+                return Err(AnnouncementStoreError::Invalid(
+                    "an advance onboards a stream once".to_string(),
+                ));
+            }
+        }
+        if let Some(Coverage::Gap(CoverageGap { reason })) = &self.coverage
+            && (reason.is_empty()
+                || reason.len() > MAX_GAP_REASON_BYTES
+                || !reason
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'))
+        {
+            return Err(AnnouncementStoreError::Invalid(format!(
+                "a coverage gap reason is a snake_case class of 1..={MAX_GAP_REASON_BYTES} bytes"
+            )));
+        }
+        if self.coverage.is_some()
+            && !self.settles()
+            && !self.streams.iter().any(|entry| entry.is_final)
+        {
+            return Err(AnnouncementStoreError::Invalid(
+                "coverage belongs on a final page".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// What became of one item of an advance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ItemOutcomeKind {
+    /// New to the mob: committed and captured.
+    Announced,
+    /// The same content under the same key: the original stands.
+    Replayed,
+    /// Other content under the same key: recorded, the original stands.
+    Conflict,
+}
+
+/// One item's outcome. A count of captures, never names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ItemOutcome {
+    pub item_id: String,
+    pub version: String,
+    pub source_key: SourceKey,
+    pub outcome: ItemOutcomeKind,
+    /// The announcement's sequence; for a conflict, the original's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offered_digest: Option<String>,
+}
+
+/// A stream's phase after an advance that onboarded it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct StreamPhase {
+    pub stream: String,
+    pub phase: CollectionPhase,
+}
+
+/// A stream of a source, as `sources/get` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SourceStream {
+    pub stream: String,
+    pub phase: CollectionPhase,
+    pub mode: OnboardingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u32>,
+    /// Items of history its backfill has announced.
+    pub backfilled: u32,
+    /// When it entered its phase.
+    pub since_ms: u64,
+}
+
+/// The result of an advance: the source as it committed, each item's
+/// outcome, and the phases of the streams it onboarded. `replayed` says the
+/// step was answered from its receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SourceAdvance {
+    pub source: AnnouncementSource,
+    pub replayed: bool,
+    pub items: Vec<ItemOutcome>,
+    pub streams: Vec<StreamPhase>,
+    /// Whether the step captured anything for a subscriber, so the
+    /// dispatcher should wake. Not part of the answer.
+    #[serde(skip)]
+    pub(crate) captured: bool,
+}
+
+/// A collector's failure class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FailureClass {
+    AuthRequired,
+    ProviderUnavailable,
+    RateLimited,
+    CursorInvalid,
+    AdapterError,
+    Other,
+}
+
+impl FailureClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthRequired => "auth_required",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::RateLimited => "rate_limited",
+            Self::CursorInvalid => "cursor_invalid",
+            Self::AdapterError => "adapter_error",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// What a collector reports when it could not collect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceFailure {
+    pub class: FailureClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    /// Kept for `sources/get` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// A collector's failure, fenced like an advance: at the revision and the
+/// cursor version it read, under the principal it used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordSourceFailure {
+    pub mob_id: MobId,
+    pub source_id: SourceId,
+    pub expected_revision: u64,
+    pub expected_version: u64,
+    pub principal: Principal,
+    pub failure: SourceFailure,
+}
+
+impl RecordSourceFailure {
+    pub fn validate(&self) -> Result<()> {
+        self.principal.validate()?;
+        if self
+            .failure
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.len() > MAX_FAILURE_DETAIL_BYTES)
+        {
+            return Err(AnnouncementStoreError::TooLarge(format!(
+                "a failure detail is at most {MAX_FAILURE_DETAIL_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
 }

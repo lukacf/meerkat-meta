@@ -12456,3 +12456,49 @@ async fn a_pre_upgrade_host_announcement_under_the_source_prefix_still_replays()
     .unwrap_err();
     assert_eq!(fresh.code, -32602, "{fresh:?}");
 }
+
+/// A gateway holds a bounded number of live sources across all its mobs:
+/// with every mob under its own bound, the next source is refused typed
+/// with the gateway's bound and no mob, and an ended source frees its place.
+#[tokio::test]
+async fn a_gateway_holds_a_bounded_number_of_live_sources_across_its_mobs() {
+    let (_dir, store) = temp_store();
+    let full = super::sources::MAX_SOURCES_PER_GATEWAY / super::sources::MAX_SOURCES_PER_MOB;
+    let mobs = ["payments", "events", "builds", "refunds", "a-newer"];
+    for (index, mob_name) in (0..).zip(mobs.iter().take(full as usize)) {
+        for slot in 0..super::sources::MAX_SOURCES_PER_MOB {
+            let topic = format!("mail.{slot}");
+            let mut put = put_source(
+                &format!("s{slot}"),
+                &format!("subject-{index}-{slot}"),
+                &[topic.as_str()],
+            );
+            put.mob_id = mob(mob_name);
+            store
+                .put_source(&op(&format!("o-{index}-{slot}")), put, 1)
+                .await
+                .unwrap();
+        }
+    }
+    let mut over = put_source("over", "subject-over", &["mail.over"]);
+    over.mob_id = mob("a-newer");
+    assert_eq!(
+        store.put_source(&op("over-1"), over.clone(), 2).await,
+        Err(AnnouncementStoreError::SourceLimit {
+            limit: super::sources::MAX_SOURCES_PER_GATEWAY,
+            mob_id: None,
+        })
+    );
+    store
+        .change_source(
+            &op("end"),
+            &mob("payments"),
+            &SourceId::new("s0").unwrap(),
+            1,
+            super::sources::SourceChange::End,
+            3,
+        )
+        .await
+        .unwrap();
+    store.put_source(&op("over-2"), over, 4).await.unwrap();
+}

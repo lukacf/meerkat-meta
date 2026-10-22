@@ -12,9 +12,11 @@ use serde_json::{Value, json};
 
 use super::owner::{AnnouncementError, AnnouncementService};
 use super::sources::{
-    AnnouncementSource, AudienceGrant, ObservationCapability, PutSource, SourceChange,
-    SourceConfig, SourceConnection, SourceDelivery, SourceHealthPolicy, SourceIdentity,
-    SourceQuery, SourceRoute, SourceRunner, SourceStart, SourceState,
+    AdvanceSource, AnnouncementSource, AudienceGrant, Coverage, ObservationCapability, Observed,
+    Principal, PutSource, Rebaseline, RecordSourceFailure, SourceChange, SourceConfig,
+    SourceConnection, SourceDelivery, SourceFailure, SourceHealthPolicy, SourceIdentity,
+    SourceItem, SourcePage, SourceQuery, SourceRoute, SourceRunner, SourceStart, SourceState,
+    StreamOnboarding,
 };
 use super::types::{
     AnnounceRequest, AnnouncementRef, AnnouncementStoreError, Announcer, BatchId, BatchQuery,
@@ -56,6 +58,8 @@ pub const ANNOUNCEMENT_METHODS: &[&str] = &[
     "meta/mob_announcements/sources/end",
     "meta/mob_announcements/sources/get",
     "meta/mob_announcements/sources/list",
+    "meta/mob_announcements/sources/advance",
+    "meta/mob_announcements/sources/record_failure",
 ];
 
 pub fn is_announcement_method(method: &str) -> bool {
@@ -75,6 +79,8 @@ pub const ANNOUNCEMENT_MUTATE_METHODS: &[&str] = &[
     "meta/mob_announcements/sources/pause",
     "meta/mob_announcements/sources/resume",
     "meta/mob_announcements/sources/end",
+    "meta/mob_announcements/sources/advance",
+    "meta/mob_announcements/sources/record_failure",
 ];
 
 pub fn is_announcement_mutating_method(method: &str) -> bool {
@@ -312,6 +318,60 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
                 message,
                 json!({ "limit": limit, "mob_id": mob_id }),
             ),
+            AnnouncementStoreError::SourceVersionConflict {
+                revision,
+                state,
+                cursor,
+            } => typed(
+                ANNOUNCEMENTS_CONFLICT_CODE,
+                "source_version_conflict",
+                message,
+                json!({
+                    "current_version": cursor.version,
+                    "cursor": cursor,
+                    "state": state,
+                    "revision": revision,
+                }),
+            ),
+            AnnouncementStoreError::PrincipalChanged {
+                pinned_digest,
+                offered_digest,
+            } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "principal_changed",
+                message,
+                json!({ "pinned_digest": pinned_digest, "offered_digest": offered_digest }),
+            ),
+            AnnouncementStoreError::BaselineRequired => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "baseline_required",
+                message,
+                Value::Null,
+            ),
+            AnnouncementStoreError::StreamNotBaselined { streams } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "stream_not_baselined",
+                message,
+                json!({ "streams": streams }),
+            ),
+            AnnouncementStoreError::BackfillBoundExceeded { remaining, stream } => {
+                let mut data = json!({ "remaining": remaining });
+                if let Some(stream) = stream {
+                    data["stream"] = json!(stream);
+                }
+                typed(
+                    ANNOUNCEMENTS_REFUSED_CODE,
+                    "backfill_bound_exceeded",
+                    message,
+                    data,
+                )
+            }
+            AnnouncementStoreError::DeletionsUnobservable => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "deletions_unobservable",
+                message,
+                Value::Null,
+            ),
             AnnouncementStoreError::IllegalTransition { .. } => JsonRpcError::new(-32000, message),
             AnnouncementStoreError::TooLarge(_) | AnnouncementStoreError::Invalid(_) => {
                 invalid_params(message)
@@ -478,6 +538,51 @@ struct SourceParams {
     #[serde(default)]
     mob_id: Option<MobId>,
     source_id: SourceId,
+    /// Also list the streams the current generation onboarded.
+    #[serde(default)]
+    include_streams: bool,
+}
+
+/// `meta/mob_announcements/sources/advance`: one collector step.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdvanceSourceParams {
+    operation_id: OperationId,
+    #[serde(default)]
+    mob_id: Option<MobId>,
+    source_id: SourceId,
+    expected_revision: u64,
+    expected_version: u64,
+    principal: Principal,
+    next_cursor: Option<String>,
+    #[serde(default)]
+    page: Option<SourcePage>,
+    #[serde(default)]
+    coverage: Option<Coverage>,
+    #[serde(default)]
+    items: Vec<SourceItem>,
+    #[serde(default)]
+    streams: Vec<StreamOnboarding>,
+    #[serde(default)]
+    rebaseline: Option<Rebaseline>,
+    #[serde(default)]
+    observed: Option<Observed>,
+    #[serde(default)]
+    collected_at_ms: Option<u64>,
+}
+
+/// `meta/mob_announcements/sources/record_failure`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordFailureParams {
+    operation_id: OperationId,
+    #[serde(default)]
+    mob_id: Option<MobId>,
+    source_id: SourceId,
+    expected_revision: u64,
+    expected_version: u64,
+    principal: Principal,
+    failure: SourceFailure,
 }
 
 #[derive(Deserialize)]
@@ -495,12 +600,26 @@ struct ListSourcesParams {
     limit: Option<usize>,
 }
 
-/// A source as a list shows it: everything but its cursor token, which only
+/// A source as a list shows it: its principal as its kind and digest only,
+/// and neither its cursor token nor a failure's detail, which only
 /// `sources/get` returns.
 fn listed_source(source: &AnnouncementSource) -> Result<Value, JsonRpcError> {
     let mut value = to_value(source)?;
     if let Some(cursor) = value.get_mut("cursor").and_then(Value::as_object_mut) {
         cursor.remove("token");
+    }
+    if let Some(failure) = value
+        .pointer_mut("/health/last_failure")
+        .and_then(Value::as_object_mut)
+    {
+        failure.remove("detail");
+    }
+    let principal = &source.identity.principal;
+    let digest = principal
+        .digest()
+        .map_err(|error| rpc_error(error.into()))?;
+    if let Some(listed) = value.pointer_mut("/identity/principal") {
+        *listed = json!({ "kind": principal.kind(), "digest": digest });
     }
     Ok(value)
 }
@@ -727,10 +846,59 @@ pub async fn handle_announcement_method(
         }
         "meta/mob_announcements/sources/get" => {
             let request: SourceParams = params(raw)?;
+            let mob_id = request.mob_id.unwrap_or_else(|| own_mob.clone());
             let source = service
-                .source(
-                    &request.mob_id.unwrap_or_else(|| own_mob.clone()),
-                    &request.source_id,
+                .source(&mob_id, &request.source_id)
+                .await
+                .map_err(rpc_error)?;
+            let mut answer = json!({ "source": to_value(source)? });
+            if request.include_streams {
+                let streams = service
+                    .source_streams(&mob_id, &request.source_id)
+                    .await
+                    .map_err(rpc_error)?;
+                answer["streams"] = to_value(streams)?;
+            }
+            Ok(answer)
+        }
+        "meta/mob_announcements/sources/advance" => {
+            let request: AdvanceSourceParams = params(raw)?;
+            let advance = service
+                .advance_source(
+                    &request.operation_id,
+                    AdvanceSource {
+                        mob_id: request.mob_id.unwrap_or_else(|| own_mob.clone()),
+                        source_id: request.source_id,
+                        expected_revision: request.expected_revision,
+                        expected_version: request.expected_version,
+                        principal: request.principal,
+                        next_cursor: request.next_cursor,
+                        page: request.page,
+                        coverage: request.coverage,
+                        items: request.items,
+                        streams: request.streams,
+                        rebaseline: request.rebaseline,
+                        observed: request.observed,
+                        collected_at_ms: request.collected_at_ms,
+                    },
+                )
+                .await
+                .map_err(rpc_error)?;
+            to_value(advance)
+        }
+        "meta/mob_announcements/sources/record_failure" => {
+            let request: RecordFailureParams = params(raw)?;
+            let source = service
+                .record_source_failure(
+                    &request.operation_id,
+                    RecordSourceFailure {
+                        mob_id: request.mob_id.unwrap_or_else(|| own_mob.clone()),
+                        source_id: request.source_id,
+                        expected_revision: request.expected_revision,
+                        expected_version: request.expected_version,
+                        principal: request.principal,
+                        failure: request.failure,
+                    },
                 )
                 .await
                 .map_err(rpc_error)?;

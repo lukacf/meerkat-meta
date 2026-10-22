@@ -16,9 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   New methods `meta/mob_announcements/sources/{put, pause, resume, end, get,
   list}` declare it, change its operator state at its revision, and read
   it. A list reads one mob's sources (the gateway's own unless `mob_id`
-  names another) and never returns the cursor token. A change at a stale
-  revision is refused `stale_revision` with the source's revision,
-  generation and cursor.
+  names another), shows each source's principal as its kind and digest,
+  and never returns the cursor token or a failure's detail; `sources/get`
+  returns both, and the source's streams with `"include_streams": true`.
+  A change at a stale revision is refused `stale_revision` with the
+  source's revision, generation and cursor.
   - A mob keeps at most 256 live sources and a gateway 1024
     (`source_limit`); an ended source frees its place.
   - A mob keeps one live source per principal's scope
@@ -35,6 +37,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     observable.
   - Routes select by topic: a route that selects by stream is refused
     (`route_selector_unsupported`).
+- Mob announcement sources collect. `meta/mob_announcements/sources/advance`
+  takes one collector step in one transaction: its items (each announced as
+  the source's, replayed when the same version comes back, or recorded as a
+  conflict with both content digests while the cursor still advances), their
+  captures, and the cursor. A step names the revision and the cursor
+  version it read and the principal it read with: another revision is
+  `stale_revision`, another version `source_version_conflict` (with the
+  current cursor in the error data, never in its message), another
+  principal `principal_changed`, and a paused or ended source refuses it. A
+  retry under the step's operation id answers the original result, marked
+  `"replayed": true`. `meta/mob_announcements/sources/record_failure` records
+  a collector's failure under the same fences and moves no cursor.
+  - Onboarding: a new source takes a baseline, or a bounded backfill, across
+    pages and announces none of what its baseline reads. Only a final page
+    settles a checkpoint (the source's last success) and turns an onboarding
+    live, and the final page of every onboarding says what it covered.
+    Items while a source baselines are refused (`baseline_required`) and
+    past a backfill's bound (`backfill_bound_exceeded`).
+  - Streams onboard on their own, by baseline or bounded backfill. An item
+    of a stream whose baseline is not taken refuses the whole step
+    (`stream_not_baselined`), and these refusals, like the other two
+    onboarding refusals, count toward the source's failure streak.
+  - A rebaseline, or a final page that cannot prove complete coverage,
+    announces one gap notice on the source's topics.
+  - Each version of an item, and each explicit deletion, is its own
+    announcement; a source that declares deletions unobservable takes none
+    (`deletions_unobservable`).
+  - An advance records what its adapter observed (a delta, or a snapshot
+    and its record count) and when a spell of empty snapshots began.
+  - Bounds: 100 items and 1 MiB of item bodies per step, an 8 KiB cursor
+    token (refused, never cut), 1024 streams per source, a 512 byte
+    failure detail.
 
 ### Changed
 
@@ -46,8 +80,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Announcements gain the announcer kind `{"kind": "source", "source_id"}`,
   a new value raw readers of announcements may see once sources announce.
   A batch names such an item's source by its id only.
-- The key prefix `source:` is reserved for source items: a host
-  announcement under it is refused as invalid params.
+- The key prefix `source:` is reserved for source items: a new host
+  announcement under it is refused as invalid params. A retry of one made
+  before the upgrade still answers its original.
 - The mob announcement database moves to schema version 2, which only adds
   the source tables. A version 1 database is migrated in place on first
   open; an older binary refuses a version 2 database, so going back means

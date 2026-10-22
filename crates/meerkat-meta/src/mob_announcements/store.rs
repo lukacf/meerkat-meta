@@ -4,7 +4,10 @@ use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 
-use super::sources::{AnnouncementSource, PutSource, SourceChange, SourceQuery};
+use super::sources::{
+    AdvanceSource, AnnouncementSource, PutSource, RecordSourceFailure, SourceAdvance, SourceChange,
+    SourceQuery, SourceStream,
+};
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
     BatchId, BatchPosition, BatchQuery, BatchStateTag, ExpiryReport, Member, MemberBacklog,
@@ -296,6 +299,46 @@ pub trait AnnouncementStore: Send + Sync {
     /// Sources in `(mob_id, source_id)` order.
     async fn sources(&self, query: &SourceQuery) -> Result<Vec<AnnouncementSource>> {
         let _ = query;
+        Err(no_sources())
+    }
+
+    /// One collector step, in one transaction: the step's receipt, the
+    /// fences (state, revision, principal, cursor version), onboarding, each
+    /// item announced as the source's (with its captures) or replayed or
+    /// recorded as a conflict, at most one gap notice, then the cursor, the
+    /// phases and the health. A refusal leaves all of it unchanged; an
+    /// onboarding refusal (baseline required, stream not baselined,
+    /// backfill bound exceeded) then counts toward the source's failure
+    /// streak on its own.
+    async fn advance_source(
+        &self,
+        operation: &OperationId,
+        request: AdvanceSource,
+        now_ms: u64,
+    ) -> Result<SourceAdvance> {
+        let _ = (operation, request, now_ms);
+        Err(no_sources())
+    }
+
+    /// Record a collector's failure, fenced like an advance; the cursor does
+    /// not move.
+    async fn record_source_failure(
+        &self,
+        operation: &OperationId,
+        request: RecordSourceFailure,
+        now_ms: u64,
+    ) -> Result<AnnouncementSource> {
+        let _ = (operation, request, now_ms);
+        Err(no_sources())
+    }
+
+    /// The streams the source's current generation onboarded, by name.
+    async fn source_streams(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<Vec<SourceStream>> {
+        let _ = (mob_id, source_id);
         Err(no_sources())
     }
 }

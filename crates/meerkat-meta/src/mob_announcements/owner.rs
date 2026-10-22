@@ -25,7 +25,10 @@ use super::native::{
     NativeStatus, NativeStatusError, NativeSubmitError, OwnerRefusal, PrepareError,
     route_contradiction,
 };
-use super::sources::{AnnouncementSource, PutSource, SourceChange, SourceQuery};
+use super::sources::{
+    AdvanceSource, AnnouncementSource, PutSource, RecordSourceFailure, SourceAdvance, SourceChange,
+    SourceQuery, SourceStream,
+};
 use super::store::AnnouncementStore;
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
@@ -734,6 +737,52 @@ impl AnnouncementService {
         query: &SourceQuery,
     ) -> Result<Vec<AnnouncementSource>, AnnouncementError> {
         Ok(self.inner.store.sources(query).await?)
+    }
+
+    /// Advance a source of a mob hosted here by one collector step: its
+    /// items, their captures and its cursor commit together or not at all.
+    /// A retry of the step with its operation id answers the original,
+    /// marked replayed.
+    pub async fn advance_source(
+        &self,
+        operation: &OperationId,
+        request: AdvanceSource,
+    ) -> Result<SourceAdvance, AnnouncementError> {
+        self.ensure_hosted(&BTreeSet::from([request.mob_id.clone()]))
+            .await?;
+        let advance = self
+            .inner
+            .store
+            .advance_source(operation, request, self.now())
+            .await?;
+        super::faults::after_source_advance();
+        if advance.captured {
+            self.wake();
+        }
+        Ok(advance)
+    }
+
+    /// Record a source collector's failure at the revision and cursor
+    /// version it read.
+    pub async fn record_source_failure(
+        &self,
+        operation: &OperationId,
+        request: RecordSourceFailure,
+    ) -> Result<AnnouncementSource, AnnouncementError> {
+        Ok(self
+            .inner
+            .store
+            .record_source_failure(operation, request, self.now())
+            .await?)
+    }
+
+    /// The streams a source's current generation onboarded.
+    pub async fn source_streams(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<Vec<SourceStream>, AnnouncementError> {
+        Ok(self.inner.store.source_streams(mob_id, source_id).await?)
     }
 
     pub async fn put_subscription(
