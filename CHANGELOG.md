@@ -90,7 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reported once as the new `ErrorEvent` category
   `retired_member_release_failed` (`identity`, `agent_runtime_id`,
   `session_id?`, `cause`, `error`), which both SDKs' `ErrorCategory` lists
-  carry. Without a host, retires read nothing extra.
+  carry. With a host, a retire whose incarnation read from Core fails is
+  refused before Core is asked (fail closed). Without a host, retires read
+  nothing extra.
 
 - An identity that owes its host a held completion (a held roster pass or a
   held member add did not publish its member) is refused with structured
