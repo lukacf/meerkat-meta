@@ -10195,17 +10195,19 @@ async fn a_sources_own_item_reaches_its_own_topic_and_no_other_sources() {
 #[test]
 fn a_source_announcer_enters_the_content_digest() {
     let host = announce_request(OWN_MOB, "k", &["t"], "b");
-    let mut inbox = host.clone();
-    inbox.announced_by = Announcer::Source {
-        source_id: SourceId::new("inbox").unwrap(),
+    let by_source = |source_id: &str| {
+        let mut request = host.clone();
+        request.announced_by = Announcer::Source {
+            source_id: SourceId::new(source_id).unwrap(),
+        };
+        request
     };
-    let mut calendar = host.clone();
-    calendar.announced_by = Announcer::Source {
-        source_id: SourceId::new("calendar").unwrap(),
-    };
+    let inbox = by_source("inbox");
+    let inbox_again = by_source("inbox");
+    let calendar = by_source("calendar");
     assert_ne!(host.digest(), inbox.digest());
     assert_ne!(inbox.digest(), calendar.digest());
-    assert_eq!(inbox.digest(), inbox.clone().digest());
+    assert_eq!(inbox.digest(), inbox_again.digest());
 }
 
 /// Pause and resume move a source at its revision; a repeated pause changes
