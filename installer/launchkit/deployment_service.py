@@ -189,6 +189,19 @@ def drop_in_bytes(stop_timeout):
     return f"[Service]\nTimeoutStopSec={stop_timeout}\n".encode()
 
 
+def owned_drop_in(content, unit_budget, recorded):
+    """The recorded drop-in, or the earlier one a longer widening has not replaced yet.
+
+    A widening records its budget before it replaces the drop-in, so an
+    interrupted one leaves the earlier drop-in: a budget above the unit's own
+    and below the recorded one. The next readiness replaces it.
+    """
+    if content == drop_in_bytes(recorded):
+        return True
+    earlier = re.fullmatch(rb"\[Service\]\nTimeoutStopSec=([1-9][0-9]{0,7})\n", content)
+    return earlier is not None and unit_budget < int(earlier[1]) < recorded
+
+
 def recorded_stop_budget(receipt):
     """The widened stop budget recorded outside the service identity, or None."""
     record = receipt.get("service_stop_budget")
@@ -227,10 +240,11 @@ def widen_service_stop_budget(directory, horizon_ms):
 
     The unit bytes and the service identity never change: an owned systemd
     drop-in carries the larger TimeoutStopSec. Its record is written first, so
-    an interrupted write leaves a controllable unit, and every readiness while
-    a record exists rewrites a missing drop-in and reloads the manager again,
-    completing an interrupted step. It never narrows a budget. launchd reads
-    ExitTimeOut only when it loads a job, so a recorded plist keeps its own.
+    an interrupted write leaves a controllable unit with the earlier drop-in or
+    none, and every readiness while a record exists rewrites a missing or
+    earlier drop-in and reloads the manager again, completing an interrupted
+    step. It never narrows a budget. launchd reads ExitTimeOut only when it
+    loads a job, so a recorded plist keeps its own.
     """
     from .deployment import now, read_receipt, receipt_lock
     from .templates.storage_setup import write_private
@@ -306,15 +320,17 @@ def verify_service(directory, receipt):
         raise DraftConflict("This recorded owned systemd unit has an invalid quoted WorkingDirectory. Its original definition is preserved; activation requires a verified service-definition migration.")
     if digest(content) != service.get("unit_sha256") or content != unit_bytes(plan):
         raise DraftConflict("The owned service definition changed. No service was controlled.")
-    # A widened stop budget lives outside the service identity: a recorded
-    # drop-in, byte-exact, or none yet after an interrupted write.
+    # A widened stop budget lives outside the service identity: the recorded
+    # drop-in, byte-exact, the earlier one an interrupted widening left, or
+    # none yet after an interrupted first write.
     record = recorded_stop_budget(receipt)
     if plan["manager"] != "systemd-user":
         if record is not None:
             raise DraftConflict("The recorded service shutdown budget is unsupported. Its definition is preserved.")
     else:
         widened = _drop_in_content(stop_budget_drop_in(plan))
-        if widened is not None and (record is None or widened != drop_in_bytes(record["stop_timeout_seconds"])):
+        if widened is not None and (record is None or not owned_drop_in(
+                widened, stop_timeout, record["stop_timeout_seconds"])):
             raise DraftConflict("The owned service definition changed. No service was controlled.")
     host = Path(directory) / "service-host"
     manifest = service.get("host_files")

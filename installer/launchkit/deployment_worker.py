@@ -275,13 +275,14 @@ class Supervisor:
             raise RuntimeError("The owned application process did not confirm exit after bounded force cleanup.") from None
 
     async def widen_service_stop_budget(self, horizon_ms):
-        """The service's own run widens its unit's stop budget; a failure is only logged."""
+        """The service's own run widens its unit's stop budget; any failure is only logged."""
         from .deployment_service import UserServiceManager, widen_service_stop_budget
         try:
             reload = widen_service_stop_budget(self.directory, horizon_ms)
             if reload is not None:
                 await UserServiceManager().command(reload)
-        except (DraftConflict, OSError, ValueError, RuntimeError, TimeoutError) as error:
+        except Exception as error:
+            # The widening never blocks native readiness.
             self.record_log("service", f"The owned service stop budget was not widened: {error}")
 
     async def parent_exit(self, process):

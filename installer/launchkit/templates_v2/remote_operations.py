@@ -481,6 +481,19 @@ def drop_in_bytes(stop_timeout):
     return ('[Service]\nTimeoutStopSec=' + str(stop_timeout) + '\n').encode()
 
 
+def owned_drop_in(content, unit_budget, recorded):
+    """The recorded drop-in, or the earlier one a longer widening has not replaced yet.
+
+    A widening records its budget before it replaces the drop-in, so an
+    interrupted one leaves the earlier drop-in: a budget above the unit's own
+    and below the recorded one. The next readiness replaces it.
+    """
+    if content == drop_in_bytes(recorded):
+        return True
+    earlier = re.fullmatch(rb'\[Service\]\nTimeoutStopSec=([1-9][0-9]{0,7})\n', content)
+    return earlier is not None and unit_budget < int(earlier[1]) < recorded
+
+
 def recorded_stop_budget(receipt):
     """The widened stop budget recorded beside the unit identity, or None."""
     record = receipt.get('service_stop_budget')
@@ -563,11 +576,13 @@ class Operations:
             known_content = content == unit_content(receipt, legacy_directory=True)
         if not known_content or hashlib.sha256(content).hexdigest() != receipt.get('unit_sha256'):
             raise DestinationError('The owned service definition changed. No existing unit was replaced or controlled.')
-        # A widened stop budget is a recorded drop-in, byte-exact, or none yet
-        # after an interrupted write.
+        # A widened stop budget is the recorded drop-in, byte-exact, the
+        # earlier one an interrupted widening left, or none yet after an
+        # interrupted first write.
         record = recorded_stop_budget(receipt)
         widened = drop_in_content(stop_budget_drop_in(receipt))
-        if widened is not None and (record is None or widened != drop_in_bytes(record['stop_timeout_seconds'])):
+        if widened is not None and (record is None or not owned_drop_in(
+                widened, service_stop_timeout(receipt), record['stop_timeout_seconds'])):
             raise DestinationError('The owned service definition changed. No existing unit was replaced or controlled.')
         return receipt
 
@@ -575,9 +590,9 @@ class Operations:
         """Widen the unit's stop budget to a reported horizon; never narrow it.
 
         The record is written before the drop-in, so an interrupted write
-        leaves a controllable unit. Every readiness while a record exists
-        rewrites a missing drop-in and reloads the manager again, completing
-        an interrupted step.
+        leaves a controllable unit with the earlier drop-in or none. Every
+        readiness while a record exists rewrites a missing or earlier drop-in
+        and reloads the manager again, completing an interrupted step.
         """
         receipt = self.load()
         budget = shutdown_budget(horizon_ms)['service']
@@ -855,8 +870,9 @@ async def supervise(operations):
         if horizon_ms is not None:
             try:
                 await asyncio.to_thread(operations.widen_unit, horizon_ms)
-            except (DestinationError, OSError, ValueError, RuntimeError) as error:
-                # A refused widening is reported; it never blocks native readiness.
+            except Exception as error:
+                # A refused or failed widening, including a manager reload
+                # past its bound, is reported; it never blocks native readiness.
                 print('The owned service stop budget was not widened: ' + str(error), flush=True)
         while not stop.is_set() and process.returncode is None:
             try:
