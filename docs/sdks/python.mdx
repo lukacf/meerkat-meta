@@ -617,9 +617,30 @@ rt = await (
 | `.console_read_only(read_only=True)` | View-only console: mutating console RPCs are denied and omitted from capabilities |
 | `.console_fetch_timeout_ms(ms)` | Bundled-console JSON fetch timeout override (positive integer) |
 | `.console_config(path)` | Console UI TOML (`ConsoleUiConfig`) forwarded as `runtime_options.console_config_path` |
+| `.fork_instruction_policy(policy)` | What a fork of a member with activated instructions does with them, forwarded as `runtime_options.fork_instruction_policy`: `"require_explicit_activation"` (the default when unset), `"reactivate_inherited"` or `"refuse"`. Another value raises `ValueError`. See [Fork instruction policy](/reference/configuration#fork-instruction-policy) |
 | `.gateway(bin_path)` | Path to rpc_gateway binary |
 | `.modules(specs)` | Module specifications |
 | `.build()` | Build and connect the runtime |
+
+A member forked with `fork_off`, a delegation fork or a council does not run
+the instructions its source activated (`meta/member_activate_instruction`,
+skills included) unless the gateway's fork instruction policy says so. Under
+the default, such a fork is refused with `fork_instruction_refused` before
+anything is committed. To let forks carry their source's activations, opt in
+at boot:
+
+```python
+runtime = await (
+    Meta.builder()
+    .mob("config/mob.toml")
+    .fork_instruction_policy("reactivate_inherited")
+    .build()
+)
+```
+
+The setting applies to every fork of the gateway's mob and cannot be chosen
+per fork. Read [what `reactivate_inherited` trusts](/reference/configuration#what-reactivate_inherited-trusts)
+before you enable it.
 
 Boot-time membership is declared, never derived: a member exists only once a
 `.roster(provider)` names it (identity plane) or `ensure_member` creates it

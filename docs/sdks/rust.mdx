@@ -319,6 +319,18 @@ launches, on create and on resume. Unset, Meerkat's default
 `UnifiedRuntimeBuilderError::ConflictingConfiguration`: set it on that spec
 with `MobBootstrapSpec::with_fork_instruction_policy`.
 
+The mob does not store the policy, so the builder applies it on every create
+and resume, and it cannot be chosen per fork. Under the default, a fork you
+drive yourself with `UnifiedRuntime::fork_member` is committed, and its child
+runs no turn until you activate each inherited key on it with
+`runtime.mob_handle().activate_member_instruction(child, request)`; read the
+key's `key_state` with `read_member_instruction_activations` first for the
+`expectation` and `supersedes` to use. A fork that starts its own first turn
+(`fork_off`, a delegation fork, a council participant, the bounded and
+detached member forks) is refused with `MobError::ForkInstructionRefused`
+instead. See [Fork instruction policy](/reference/configuration#fork-instruction-policy)
+for what a fork copies and what `ReactivateInherited` trusts.
+
 ## Module routing
 
 ### `route_module_call`
