@@ -710,10 +710,15 @@ def worker_install(ops, root, owner, operation_id, settings_fd, manifest):
     _require(outcome.get("operation_id") == operation_id, "The original actual Install completion changed.")
 
 
-def install_control_dependencies(control, refs, *, site_packages=None, pip_bootstrap=None):
+def install_control_dependencies(control, refs, *, site_packages, pip_bootstrap=None):
     from .runtime_candidates import ArtifactFile
     from .templates.install_candidate import install_selected_dependency_wheels
-    import sysconfig
+    # The interpreter's default scheme can name the system site-packages, so
+    # the caller names the created control venv's own site, the only target.
+    venv = Path(control) / ".venv"
+    _require(isinstance(site_packages, Path) and ".." not in site_packages.parts
+        and site_packages != venv and site_packages.is_relative_to(venv),
+        "The control dependencies install only into the created control environment.")
     requirements = ArtifactFile(**{**refs["dependencies/requirements.txt"],
         "path": Path(refs["dependencies/requirements.txt"]["path"])})
     wheels = tuple(ArtifactFile(**{**row, "path": Path(row["path"])})
@@ -724,7 +729,7 @@ def install_control_dependencies(control, refs, *, site_packages=None, pip_boots
             _require(len(data) == row["size"] and hashlib.sha256(data).hexdigest() == row["sha256"],
                 "The original owner-selected control dependency changed.")
     install_selected_dependency_wheels(requirements, wheels, deployment_root=control,
-        site_packages=site_packages or Path(sysconfig.get_path("purelib")), sdk_python=control / ".venv/bin/python",
+        site_packages=site_packages, sdk_python=control / ".venv/bin/python",
         require_current=current, execute_command=_control_dependency_executor(control, pip_bootstrap, current))
     import ast
     folder = control.parent
@@ -732,10 +737,9 @@ def install_control_dependencies(control, refs, *, site_packages=None, pip_boots
         if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
             and target.id == "PRODUCT_CONTROL_MANIFEST" for target in node.targets)]
     _require(len(values) == 1, "The original selected control manifest is absent.")
-    site = site_packages or Path(sysconfig.get_path("purelib"))
-    _verify_installed_control_dependencies(control, _decode(values[0]), site)
-    if str(site) not in sys.path:
-        sys.path.insert(0, str(site))
+    _verify_installed_control_dependencies(control, _decode(values[0]), site_packages)
+    if str(site_packages) not in sys.path:
+        sys.path.insert(0, str(site_packages))
     # These actual imports happen before any application installer is admitted.
     import httpx
     from .blueprint import Blueprint

@@ -180,3 +180,58 @@ async def test_verified_dependency_dispatch_selects_real_ensurepip_only_after_cr
     assert sys.path == path and str(control_path) not in sys.path
     assert not (f.selected.destination / ".env").exists()
     assert not (f.remote_folder / "product-install-completed.json").exists()
+
+
+INERT_PIP = (b"inert pip bootstrap, never executed", {"name": "pip-inert-py3-none-any.whl", "size": 1,
+    "sha256": "0" * 64})
+
+
+def inert_control_installer(monkeypatch):
+    """Record the site the installer would receive; nothing is installed or executed."""
+    calls = []
+    def installer(*args, **kwargs):
+        calls.append(kwargs.get("site_packages"))
+        raise AssertionError("inert installer: no installation may start")
+    monkeypatch.setattr(install_candidate, "install_selected_dependency_wheels", installer)
+    monkeypatch.setattr(control, "_control_dependency_executor",
+        lambda control_path, bootstrap, current: lambda *args, **kwargs: pytest.fail("Inert executor ran."))
+    return calls
+
+
+def control_dependency_refs(control_path):
+    # The refusal comes first: these pins are never opened.
+    return {"dependencies/requirements.txt": {"path": str(control_path / "dependencies/requirements.txt"),
+        "size": 1, "sha256": "0" * 64}}
+
+
+@pytest.mark.parametrize("site", ["missing", "none", "default-scheme", "outside", "venv-root", "parent-escape"])
+def test_control_dependencies_install_only_into_the_named_control_venv(tmp_path, monkeypatch, site):
+    # The interpreter's default scheme can name the system site (Debian's
+    # dist-packages), so the control site has no default: only a site inside
+    # the created control venv is a target, refused before any installation.
+    import sysconfig
+    calls = inert_control_installer(monkeypatch)
+    control_path = tmp_path / "control-host"
+    venv = control_path / ".venv"
+    refs = control_dependency_refs(control_path)
+    selected = {"none": None, "default-scheme": Path(sysconfig.get_path("purelib")),
+        "outside": tmp_path / "elsewhere/site-packages", "venv-root": venv,
+        "parent-escape": venv / "lib/../../elsewhere/site-packages"}
+    if site == "missing":
+        with pytest.raises(TypeError, match="site_packages"):
+            control.install_control_dependencies(control_path, refs, pip_bootstrap=INERT_PIP)
+    else:
+        with pytest.raises(ValueError, match="only into the created control environment"):
+            control.install_control_dependencies(control_path, refs, site_packages=selected[site],
+                pip_bootstrap=INERT_PIP)
+    assert calls == []
+
+
+def test_control_dependencies_keep_the_named_control_venv_site(tmp_path, monkeypatch):
+    calls = inert_control_installer(monkeypatch)
+    control_path = tmp_path / "control-host"
+    site = control_path / ".venv/lib/python3.12/site-packages"
+    with pytest.raises(AssertionError, match="inert installer"):
+        control.install_control_dependencies(control_path, control_dependency_refs(control_path),
+            site_packages=site, pip_bootstrap=INERT_PIP)
+    assert calls == [site]
