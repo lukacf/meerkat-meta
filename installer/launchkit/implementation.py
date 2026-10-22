@@ -593,6 +593,17 @@ ordinary application code for domain logic, adapters, channels, triggers and UI.
 There is no required custom-app schema, domain roster, prescribed architecture or
 hardwired example. Choose useful modules for this system. Consult read_runtime_reference
 for the installed SDK and host contract instead of inventing methods or tool names.
+Use the responsible native agents, their context and tools to interpret free-form
+requests, assess relevance and understand corrections. Give them scoped tools for
+explicit typed edits; application code validates authority, identifiers, revisions
+and domain constraints, then persists the edit and exposes current readback/history.
+Keep deterministic parsing for explicit formats and rules actually specified by
+the user. Phrase lists, keyword classifiers, regex negation windows and branches
+matching review examples cannot replace agent judgment over natural language.
+When a required agent/tool/runtime capability is unavailable, identify that exact
+gap instead of emulating the requested intelligence in application code. Offline
+fixtures may supply labelled agent outputs to test the real typed edit boundary;
+they do not establish that the live agent understands the person's request.
 If continuing contexts must be created by users or existing continuing identities
 need account-specific separation, use the seeded host's paired
 desired_roster/desired_edges hooks and context.reconcile_agents with its compiled

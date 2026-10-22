@@ -802,6 +802,9 @@ async def review_and_repair(directory, tools, reviewer, invoke, *, max_reviews=3
         completed_builder = await invoke("implementation:main",
             "The independent reviewer found requested behavior that needs repair. Read inspect_implementation "
             "and read_acceptance_feedback for exact counterexamples, execution failures and protected test source. "
+            "Treat counterexamples as evidence of a general defect, not phrases to recognize. Preserve "
+            "native agent judgment over free text and repair its context/tools and typed edit path; "
+            "do not substitute keyword or regex classification to satisfy a review fixture. "
             "Repair application behavior while preserving the user's scope and native design. Do not weaken "
             "tests or claim unresolved offline behavior as a live prerequisite. Run check_implementation and "
             "publish_implementation again on the repaired source. The host will run a fresh independent review.\n\n"
