@@ -26,9 +26,9 @@ may need to install the plugin into their packaged Python environment.
 
 The host selects one entry-point name from `meerkat_forge.organizations.v1`.
 Forge calls that installed function once at startup and validates its returned
-data. Missing, ambiguous or invalid explicit selections, including an empty value,
-stop startup. They do not fall back to unrelated stock examples. No plugin is
-loaded by default.
+data. Missing, ambiguous or invalid explicit selections, including an empty
+value, stop startup. They do not fall back to unrelated stock examples. No plugin
+is loaded by default.
 
 The fields are documented by `launchkit.organization.OrganizationPlugin`:
 
@@ -57,5 +57,6 @@ The selection is host-wide, not a tenant identity or authorization boundary.
 This contribution offers context and ideas, not deployment, account setup,
 installed integrations, permissions or a fixed agent design. Those remain
 separate operations owned by Forge, Connect and the native runtime. Integration
-hints do not claim that a connector is installed or available. Hosted OAuth sign-in
-and service writes are not supported yet; this example connects no live application.
+hints do not claim that a connector is installed or available. Hosted OAuth
+sign-in and service writes are not supported yet; this example connects no live
+application.
