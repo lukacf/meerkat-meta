@@ -134,6 +134,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   declares a newer glibc than this computer has, or whose packages are
   built for another CPython than Forge runs on. Forge refused such an update
   only while applying it, after the current runtime had been set aside.
+- A remote Meta/Toolkit product installation through a launcher-selected
+  Linux control (the `META_FORGE_APPLICATION_HOST_FACTORY` developer hook)
+  is refused before Forge connects to the remote computer when the
+  control's glibc minimum is below the product's declared floor. The remote
+  check compared the computer's glibc only with that minimum. The refusal
+  names both glibc versions.
 
 ### Known limitations
 

@@ -112,7 +112,15 @@ class ProductControlSelection:
         _require(self._selection == self._original, "The original control selection changed.")
         from .templates.install_candidate import _read_selected_dependency_wheels
         from .runtime_selection import selected_runtime_artifacts
-        selected_runtime_artifacts(self.runtime_target)
+        # The guest checks its glibc against this control's minimum only, so
+        # a minimum below the product's declared floor is refused here.
+        floor, minimum = selected_runtime_artifacts(self.runtime_target).glibc_floor, self._selection[5]
+        if floor is not None and minimum < floor:
+            from .projects import DraftConflict
+            needed = f"glibc {floor[0]}.{floor[1]}"
+            raise DraftConflict(f"This product's native programs need {needed} or newer, but the selected Linux "
+                f"control admits computers with glibc {minimum[0]}.{minimum[1]}. Raise the control selection's glibc "
+                f"minimum to {floor[0]}.{floor[1]} and install on a Linux computer with {needed} or newer.")
         pending = _read_selected_dependency_wheels(self._selection[1], self._selection[2])
         names = {row[0] for row in pending}
         _require({"pydantic", "pydantic-core", "httpx"} <= names,
