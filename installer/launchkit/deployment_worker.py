@@ -1634,6 +1634,57 @@ class _InitialProductFence:
         selected_runtime_artifacts(self.artifacts.selection, verified_artifacts=self.artifacts)
 
 
+MAX_VENV_CONFIG_BYTES = 64 * 1024
+
+
+def existing_environment_refusal(venv, running=None):
+    """Why an existing application venv cannot be reused by this Forge, or None.
+
+    venv adds only missing links. Over a venv that another CPython created,
+    bin/python keeps running that CPython, so pip would install this Forge's
+    checked closure with an interpreter that nothing checked. The venv's own
+    configuration, links and library folders all name the CPython it holds.
+    """
+    running = tuple(sys.version_info[:2] if running is None else running)
+    unreadable = ("This application's environment does not show which CPython created it, so Forge cannot "
+        "safely reuse it. Install into a new empty folder.")
+    found = set()
+    try:
+        descriptor = os.open(venv / "pyvenv.cfg", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        descriptor = None
+    except OSError:
+        return unreadable
+    if descriptor is not None:
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            content = stream.read(MAX_VENV_CONFIG_BYTES + 1)
+        if not stat.S_ISREG(info.st_mode) or len(content) > MAX_VENV_CONFIG_BYTES:
+            return unreadable
+        for line in content.decode("utf-8", "replace").splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip() in {"version", "version_info"}:
+                version = re.fullmatch(r"([0-9]+)\.([0-9]+)(\.[0-9A-Za-z.+-]*)?", value.strip())
+                if version is None:
+                    return unreadable
+                found.add((int(version[1]), int(version[2])))
+    for folder in (venv / "bin", venv / "lib"):
+        if folder.is_dir() and not folder.is_symlink():
+            for path in folder.iterdir():
+                version = re.fullmatch(r"python([0-9]+)\.([0-9]+)", path.name)
+                if version is not None:
+                    found.add((int(version[1]), int(version[2])))
+    others = sorted(found - {running})
+    if not others:
+        return None
+    created = " and ".join(f"CPython {major}.{minor}" for major, minor in others)
+    return (f"This application's environment was created by {created}, but this Forge runs CPython "
+        f"{running[0]}.{running[1]}, so reusing it would install the application's packages for another "
+        f"interpreter. Stop Forge, move only Forge's own .venv folder aside and start it again with PYTHON_BIN "
+        f"set to a CPython {others[-1][0]}.{others[-1][1]} interpreter, as the README describes, or install "
+        "into a new empty folder. Your saved setups are kept.")
+
+
 async def _install_selected_product(supervisor, artifacts, require_current, command,
         *, source_custody=None, files=None, report_progress=lambda message: None):
     """Prepare selected bytes using the original child executor and fence.
@@ -1697,6 +1748,11 @@ async def _install_selected_product(supervisor, artifacts, require_current, comm
     if not venv.exists() and not venv.is_symlink():
         venv.mkdir(mode=0o700)
     owned_directory(venv, private=True)
+    # An existing venv keeps the interpreter that created it: check it before
+    # the venv command below reuses it.
+    refusal = existing_environment_refusal(venv)
+    if refusal is not None:
+        raise DraftConflict(refusal)
     current()
     report_progress("Preparing the application environment.")
     await command([sys.executable, "-I", "-m", "venv", str(venv)],

@@ -140,7 +140,9 @@ def _wheel_compatible(filename, interpreter):
     python_tags, abi_tags, platforms = (part.split(".") for part in parts[-3:])
     selected = interpreter["python_tag"]
     minor = int(selected[3:])
-    python_ok = any(tag in {selected, "py3", "py3" + str(minor)}
+    # As pip does, a pure py3N tag fits CPython 3.M for every N <= M.
+    python_ok = any(tag in {selected, "py3"}
+        or re.fullmatch(r"py3[0-9]{1,2}", tag) and int(tag[3:]) <= minor
         or re.fullmatch(r"cp3[0-9]{1,2}", tag) and int(tag[3:]) <= minor
             and "abi3" in abi_tags for tag in python_tags)
     abi_ok = any(tag in {interpreter["abi_tag"], "none", "abi3"} for tag in abi_tags)

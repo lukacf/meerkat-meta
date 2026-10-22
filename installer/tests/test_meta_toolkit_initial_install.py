@@ -10,6 +10,7 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -776,6 +777,106 @@ def test_platform_only_refusal_names_no_cpython():
         closure("cryptography-44.0.0-cp39-abi3-manylinux_2_34_x86_64.whl", "httpx-0.28.1-py3-none-any.whl"),
         {**CP312_LINUX, "glibc_minimum": [2, 31]})
     assert "do not support this computer" in reason and "CPython" not in reason
+
+
+@pytest.mark.parametrize("name, admitted", [
+    ("typing_extensions-4.12.2-py38-none-any.whl", True),
+    ("inert_fixture-1.0.0-py311-none-any.whl", True),
+    ("inert_fixture-1.0.0-py312-none-any.whl", True),
+    ("inert_fixture-1.0.0-py3-none-any.whl", True),
+    ("inert_fixture-1.0.0-py2.py3-none-any.whl", True),
+    ("inert_fixture-1.0.0-py313-none-any.whl", False),
+    ("inert_fixture-1.0.0-cp311-none-any.whl", False)],
+    ids=["py38", "py311", "py312", "py3", "universal", "py313", "cp311-none"])
+def test_python_tags_for_an_older_minor_are_admitted_as_pip_admits_them(name, admitted):
+    # pip installs py3N wheels on CPython 3.M for every N <= M; a newer minor or
+    # another CPython's interpreter-specific tag stays refused.
+    reason = deployment.selected_interpreter_refusal(closure(name), CP312_LINUX)
+    assert (reason is None) is admitted, reason
+
+
+def existing_venv(destination, *, config=None, links=(), libraries=()):
+    venv = destination / ".venv"
+    (venv / "bin").mkdir(mode=0o700, parents=True)
+    venv.chmod(0o700)
+    if config is not None:
+        (venv / "pyvenv.cfg").write_text(config)
+    for name in links:
+        (venv / "bin" / name).symlink_to(sys.executable)
+    for name in libraries:
+        (venv / "lib" / name / "site-packages").mkdir(mode=0o700, parents=True)
+    return venv
+
+
+@pytest.mark.parametrize("existing", ["other-minor", "relinked", "other-library", "same-minor", "empty", "absent"])
+async def test_worker_checks_an_existing_venv_interpreter_before_reusing_it(tmp_path, monkeypatch, existing):
+    # venv adds only missing links: over another CPython's environment its
+    # bin/python keeps running that CPython, and pip would install this Forge's
+    # checked closure with it.
+    major, minor = sys.version_info[:2]
+    running, other = f"{major}.{minor}", f"{major}.{minor + 1}"
+    monkeypatch.setattr(deployment, "forge_interpreter", lambda: {**CP312_LINUX,
+        "python_tag": f"cp{major}{minor}", "abi_tag": f"cp{major}{minor}"}, raising=False)
+    destination = tmp_path / "application"
+    destination.mkdir(mode=0o700)
+    def config(version):
+        return f"home = /inert\ninclude-system-site-packages = false\nversion = {version}.1\n"
+    if existing == "other-minor":
+        existing_venv(destination, config=config(other), links=("python", "python3", "python" + other))
+    elif existing == "relinked":
+        # An earlier venv run rewrote pyvenv.cfg; the other CPython's links stay.
+        existing_venv(destination, config=config(running), links=("python", "python3", "python" + other))
+    elif existing == "other-library":
+        existing_venv(destination, config=config(running), libraries=("python" + other,))
+    elif existing == "same-minor":
+        existing_venv(destination, config=config(running), links=("python", "python3", "python" + running),
+            libraries=("python" + running,))
+    elif existing == "empty":
+        existing_venv(destination)
+    supervisor = SimpleNamespace(stop=asyncio.Event(), destination=destination)
+    commands = []
+    async def command(arguments, *args, **kwargs):
+        commands.append(arguments)
+        raise RuntimeError("inert venv creation")
+    install = worker._install_selected_product(supervisor,
+        SimpleNamespace(selection=closure("httpx-0.28.1-py3-none-any.whl"), glibc_floor=None),
+        lambda: True, command)
+    if existing in {"other-minor", "relinked", "other-library"}:
+        with pytest.raises(DraftConflict, match=rf"created by CPython {re.escape(other)}.*runs CPython "
+                rf"{re.escape(running)}.*PYTHON_BIN.*new empty folder"):
+            await install
+        assert commands == []
+    else:
+        with pytest.raises(RuntimeError, match="inert venv creation"):
+            await install
+        assert commands[0][1:4] == ["-I", "-m", "venv"]
+
+
+@pytest.mark.parametrize("defect", ["link", "oversized", "unreadable-version"])
+async def test_worker_refuses_an_existing_venv_whose_interpreter_cannot_be_read(tmp_path, monkeypatch, defect):
+    major, minor = sys.version_info[:2]
+    monkeypatch.setattr(deployment, "forge_interpreter", lambda: {**CP312_LINUX,
+        "python_tag": f"cp{major}{minor}", "abi_tag": f"cp{major}{minor}"}, raising=False)
+    destination = tmp_path / "application"
+    destination.mkdir(mode=0o700)
+    venv = existing_venv(destination)
+    if defect == "link":
+        (tmp_path / "elsewhere.cfg").write_text(f"version = {major}.{minor}.1\n")
+        (venv / "pyvenv.cfg").symlink_to(tmp_path / "elsewhere.cfg")
+    elif defect == "oversized":
+        (venv / "pyvenv.cfg").write_text(f"version = {major}.{minor}.1\n" + "#" * (64 * 1024))
+    else:
+        (venv / "pyvenv.cfg").write_text("version = unknown\n")
+    supervisor = SimpleNamespace(stop=asyncio.Event(), destination=destination)
+    commands = []
+    async def command(arguments, *args, **kwargs):
+        commands.append(arguments)
+        raise RuntimeError("inert venv creation")
+    with pytest.raises(DraftConflict, match="environment.*new empty folder"):
+        await worker._install_selected_product(supervisor,
+            SimpleNamespace(selection=closure("httpx-0.28.1-py3-none-any.whl"), glibc_floor=None),
+            lambda: True, command)
+    assert commands == []
 
 
 def test_generated_readme_names_the_cpython_of_a_compiled_closure():
