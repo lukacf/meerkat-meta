@@ -719,7 +719,8 @@ class RemoteDeploymentService:
                 "scope": "native-bootstrap-and-console", "custom_interfaces_verified": False,
                 "external_workflows_verified": False, "remote_admission_requested": False,
                 "observation": {"available": False}, "detail": "Checking the chosen Linux computer through its existing trusted SSH connection."}
-            write_bytes(directory / "package.zip", selected["payload"])
+            # Writing and syncing the whole package must not hold the event loop.
+            await await_validation(write_bytes, directory / "package.zip", selected["payload"])
             write_bytes(directory / "controller.py", controller)
             if product_bundle is not None:
                 from .remote_product_control import _json

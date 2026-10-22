@@ -1353,3 +1353,22 @@ async def test_remote_stop_and_restart_hash_the_package_off_the_event_loop(servi
     (stopped, restarted), gap = await longest_loop_gap(stopped_and_restarted())
     assert stopped["status"] == "stopped" and restarted["status"] == "running"
     assert gap < 0.5
+
+
+def slow_package_writes(monkeypatch):
+    from launchkit import remote_deployment
+    original = remote_deployment.write_bytes
+    def slowed(path, content):
+        if path.name == "package.zip":
+            time.sleep(1.0)  # Writing and syncing a large package on a small host.
+        return original(path, content)
+    monkeypatch.setattr(remote_deployment, "write_bytes", slowed)
+
+
+async def test_remote_connect_writes_the_package_off_the_event_loop(service, monkeypatch):
+    slow_package_writes(monkeypatch)
+    connected, gap = await longest_loop_gap(connect(service))
+    saved = (service.directory(service.guide.identity) / "package.zip").read_bytes()
+    assert connected["status"] == "configuration-required"
+    assert hashlib.sha256(saved).hexdigest() == connected["package_sha256"]
+    assert gap < 0.5
