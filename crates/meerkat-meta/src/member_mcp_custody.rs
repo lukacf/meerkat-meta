@@ -333,32 +333,115 @@ impl MemberMcpCustody {
     }
 }
 
+/// One member adapter's answer when the host reports a credential change for
+/// an MCP target ([`MemberMcpCustody::credential_landed`]).
+#[derive(Debug)]
+pub struct MemberMcpCredentialOutcome<T> {
+    /// What the member's MCP router recorded for exactly that target.
+    pub recorded: Result<T, meerkat::McpError>,
+    /// The MCP boundaries the custody then applied in that member, in order,
+    /// each with its native result ([`McpRouterAdapter::apply_staged`]);
+    /// empty when the record left nothing to apply. It stops at the first
+    /// that fails, and whatever that boundary did not apply stays staged in
+    /// the member. Each is the member's whole MCP boundary: it also applies
+    /// anything else staged there, such as the release of a server one of
+    /// its calls found without a usable credential.
+    pub applied: Vec<Result<meerkat::McpApplyResult, String>>,
+}
+
 impl MemberMcpCustody {
-    /// After a successful MCP login for `target`, stage again, in every
-    /// member adapter this custody holds whose own shutdown has not
-    /// reported, the failed operation awaiting exactly that target
+    /// After a successful MCP login for `target`, reconnect the server that
+    /// awaits exactly that target in every member adapter this custody holds
+    /// whose own shutdown has not reported, in the same runtime.
+    ///
+    /// Per adapter, in adoption order, the member's router stages the failed
+    /// operation again with the config it attempted
     /// ([`McpRouterAdapter::retry_authorized`], the call Meerkat's own RPC
-    /// and REST surfaces make after their completions). A staged retry
-    /// applies at its member's next boundary and resolves the credential
-    /// then. Best effort per adapter: the login's success stands, and each
-    /// adapter's outcome is returned, in adoption order.
+    /// and REST surfaces make after their completions), and the custody
+    /// applies it at once. Those surfaces apply staged MCP changes at the
+    /// start of each turn; nothing applies them in a gateway member after
+    /// its construction, so the custody applies them as Meerkat's live MCP
+    /// attachment applies an add. The reconnect then runs in the background
+    /// and reads the stored credential itself (nothing is copied from the
+    /// login); the member's agent sees the server's tools when it next polls
+    /// its tools, between model calls.
+    ///
+    /// [`MemberMcpCredentialOutcome::recorded`] is the router's
+    /// [`meerkat::AuthorizedRetry`]:
+    /// - `Staged`: staged, then applied by one boundary.
+    /// - `AfterRelease`: a release of that server has not settled; the first
+    ///   boundary settles it, and the second stages the server again with the
+    ///   sign-in it kept and applies it.
+    /// - `AlreadyPending`: a newer staged intent or an operation in flight
+    ///   owns the server; one boundary applies whatever is staged.
+    /// - `NotAwaiting`: nothing in that member awaits exactly this target.
+    /// - `RouterClosed`: that member's router was shut down.
+    ///
+    /// The last two, and an `Err` (the router's typed refusal to stage it),
+    /// apply nothing. Best effort per adapter: the login's success stands
+    /// whatever a member answers.
+    ///
+    /// Each adapter's record and each of its boundaries take its router's
+    /// write lock, which waits for every MCP call the member has in flight
+    /// (a call holds the read lock until it returns), one adapter after
+    /// another. So this can take as long as the longest of those calls:
+    /// answer the browser's https callback first, and run this as owned work
+    /// after it. A boundary also advances the member's MCP binding epoch: a
+    /// call the member planned before it and dispatches after it is refused
+    /// as unavailable (its execution owner changed), as after any live MCP
+    /// change.
     pub async fn credential_landed(
         &self,
         target: &meerkat::McpServerIdentity,
-    ) -> Vec<Result<meerkat::AuthorizedRetry, meerkat::McpError>> {
-        let adapters: Vec<Arc<McpRouterAdapter>> = self
-            .lock()
+    ) -> Vec<MemberMcpCredentialOutcome<meerkat::AuthorizedRetry>> {
+        let adapters = self.live_adapters();
+        let mut outcomes = Vec::with_capacity(adapters.len());
+        for adapter in adapters {
+            let recorded = adapter.retry_authorized(target).await;
+            let boundaries = match &recorded {
+                Ok(meerkat::AuthorizedRetry::Staged | meerkat::AuthorizedRetry::AlreadyPending) => {
+                    1
+                }
+                Ok(meerkat::AuthorizedRetry::AfterRelease) => 2,
+                Ok(
+                    meerkat::AuthorizedRetry::NotAwaiting | meerkat::AuthorizedRetry::RouterClosed,
+                )
+                | Err(_) => 0,
+            };
+            let applied = apply_boundaries(&adapter, boundaries).await;
+            outcomes.push(MemberMcpCredentialOutcome { recorded, applied });
+        }
+        outcomes
+    }
+
+    /// Every adapter this custody holds whose own shutdown has not reported,
+    /// in adoption order.
+    fn live_adapters(&self) -> Vec<Arc<McpRouterAdapter>> {
+        self.lock()
             .entries
             .iter()
             .filter(|entry| entry.reported().is_none())
             .map(|entry| Arc::clone(&entry.adapter))
-            .collect();
-        let mut outcomes = Vec::with_capacity(adapters.len());
-        for adapter in adapters {
-            outcomes.push(adapter.retry_authorized(target).await);
-        }
-        outcomes
+            .collect()
     }
+}
+
+/// Applies `boundaries` MCP boundaries in `adapter`, in order, stopping at
+/// the first that fails.
+async fn apply_boundaries(
+    adapter: &McpRouterAdapter,
+    boundaries: usize,
+) -> Vec<Result<meerkat::McpApplyResult, String>> {
+    let mut applied = Vec::with_capacity(boundaries);
+    for _ in 0..boundaries {
+        let boundary = adapter.apply_staged().await;
+        let failed = boundary.is_err();
+        applied.push(boundary);
+        if failed {
+            break;
+        }
+    }
+    applied
 }
 
 impl McpAdapterCustody for MemberMcpCustody {
@@ -1007,42 +1090,88 @@ mod tests {
         }
     }
 
-    /// An MCP endpoint that refuses every request with `401`, so a
-    /// connection to it waits for a human login.
-    async fn refusing_endpoint() -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    /// A streamable-HTTP MCP endpoint that serves one tool, `echo`, only to
+    /// requests carrying `Bearer member-token`; any other request is refused
+    /// with `401`.
+    async fn authorized_endpoint() -> String {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        async fn mcp(headers: HeaderMap, body: axum::body::Bytes) -> axum::response::Response {
+            if headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                != Some("Bearer member-token")
+            {
+                return (StatusCode::UNAUTHORIZED, [("www-authenticate", "Bearer")])
+                    .into_response();
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            let Some(id) = request.get("id").cloned() else {
+                return StatusCode::ACCEPTED.into_response();
+            };
+            let result = match request["method"].as_str() {
+                Some("initialize") => serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "member-mcp", "version": "0.1.0" },
+                }),
+                Some("tools/list") => serde_json::json!({
+                    "tools": [{
+                        "name": "echo",
+                        "description": "Echo input",
+                        "inputSchema": { "type": "object", "properties": {} },
+                    }]
+                }),
+                _ => serde_json::json!({}),
+            };
+            axum::Json(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+                .into_response()
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let url = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        let app = axum::Router::new().route("/mcp", axum::routing::post(mcp));
         tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut buffer = [0_u8; 8192];
-                    let _ = stream.read(&mut buffer).await;
-                    let _ = stream
-                        .write_all(
-                            b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\n\
-                              Content-Length: 0\r\nConnection: close\r\n\r\n",
-                        )
-                        .await;
-                });
-            }
+            let _ = axum::serve(listener, app).await;
         });
         url
     }
 
-    /// The native credential owner of a host without a browser: no stored
-    /// credential, and an interactive login needs a human.
-    struct AwaitingHuman;
+    /// The native credential owner of a host without a browser: the test
+    /// stores and removes the credential (a login and a logout), and an
+    /// interactive login needs a human.
+    struct StoredCredential(Mutex<Option<String>>);
+
+    impl StoredCredential {
+        fn new(token: Option<&str>) -> Arc<Self> {
+            Arc::new(Self(Mutex::new(token.map(str::to_owned))))
+        }
+
+        fn set(&self, token: Option<&str>) {
+            *self.0.lock().unwrap_or_else(PoisonError::into_inner) = token.map(str::to_owned);
+        }
+
+        fn is_stored(&self) -> bool {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_some()
+        }
+    }
 
     #[async_trait::async_trait]
-    impl meerkat_mcp::McpAuthResolver for AwaitingHuman {
+    impl meerkat_mcp::McpAuthResolver for StoredCredential {
         async fn stored_bearer_token(
             &self,
             _target: &meerkat::McpServerIdentity,
         ) -> Result<Option<String>, meerkat::McpOAuthError> {
-            Ok(None)
+            Ok(self
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone())
         }
         async fn interactive_login(
             &self,
@@ -1055,89 +1184,156 @@ mod tests {
         }
     }
 
-    /// A member adapter whose `guarded` server failed for want of a login and
-    /// now waits for exactly `target`.
-    async fn adapter_awaiting(url: String) -> (Arc<McpRouterAdapter>, meerkat::McpServerIdentity) {
+    /// A member adapter for the `guarded` server at `url` under `credential`,
+    /// once its first connect settled: connected while a credential is
+    /// stored, else waiting for a login to exactly its target.
+    async fn member_adapter(
+        url: String,
+        credential: Arc<StoredCredential>,
+    ) -> (Arc<McpRouterAdapter>, meerkat::McpServerIdentity) {
         let config = meerkat_core::McpServerConfig::streamable_http(
             "guarded",
             url,
             std::collections::HashMap::new(),
         );
         let target = meerkat::McpServerIdentity::from_config(&config).expect("identity");
+        let connects = credential.is_stored();
         let mut router = meerkat_mcp::McpRouter::new_with_surface_handle_and_stdio_profile(
             Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
             meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
         )
-        .with_mcp_auth(
-            meerkat::McpAuthMode::Interactive,
-            Some(Arc::new(AwaitingHuman)),
-        );
+        .with_mcp_auth(meerkat::McpAuthMode::Interactive, Some(credential));
         router.stage_add(config).expect("stage add");
         router.apply_staged().await.expect("apply staged add");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while router.servers_awaiting_authorization() != vec![target.clone()] {
+        loop {
+            let _ = router.take_external_updates();
+            let settled = if connects {
+                router.active_server_names() == vec!["guarded".to_string()]
+            } else {
+                router.servers_awaiting_authorization() == vec![target.clone()]
+            };
+            if settled {
+                break;
+            }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the server never waited for a login"
+                "the first connect never settled"
             );
-            let _ = router.take_external_updates();
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         (Arc::new(McpRouterAdapter::new(router)), target)
     }
 
-    /// A credential landed through the custody re-stages, in every member
-    /// adapter it holds, the operation that awaits exactly that target (the
-    /// call Meerkat's own surfaces make after a completion), and reports
-    /// each adapter's outcome. An adapter awaiting nothing is untouched, a
-    /// second landing finds the retry already staged, and an adapter whose
-    /// own shutdown reported is no longer addressed.
+    /// Polls `member` as its agent loop does between model calls
+    /// (`poll_external_updates`, which drains settled connects and applies
+    /// nothing) until exactly `servers` are active.
+    async fn until_member_serves(member: &McpRouterAdapter, servers: &[&str]) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let _ = meerkat_core::AgentToolDispatcher::poll_external_updates(member).await;
+            if member.active_server_names().await == servers {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the member never served {servers:?}: {:?}",
+                member.active_server_names().await
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Whether `member`'s current catalog offers `tool`.
+    fn offers(member: &McpRouterAdapter, tool: &str) -> bool {
+        meerkat_core::AgentToolDispatcher::tools(member)
+            .iter()
+            .any(|offered| offered.name == tool)
+    }
+
+    /// A gateway member gets no MCP boundary after its construction: its
+    /// agent loop only drains settled connects. So a credential landed
+    /// through the custody reconnects the server that awaited it with no
+    /// other boundary, and the member's catalog offers its tool again.
     #[tokio::test]
-    async fn a_landed_credential_restages_what_each_member_awaits() {
-        let (awaiting, target) = adapter_awaiting(refusing_endpoint().await).await;
+    async fn a_landed_credential_reconnects_the_member_without_another_boundary() {
+        let credential = StoredCredential::new(None);
+        let (member, target) =
+            member_adapter(authorized_endpoint().await, Arc::clone(&credential)).await;
+        let custody = MemberMcpCustody::new();
+        custody.adopt(&member).expect("adopted");
+        assert!(member.active_server_names().await.is_empty());
+        assert!(!offers(&member, "echo"));
+
+        // The login stored the credential; the host reports it landed.
+        credential.set(Some("member-token"));
+        let _ = custody.credential_landed(&target).await;
+
+        until_member_serves(&member, &["guarded"]).await;
+        assert!(offers(&member, "echo"));
+        assert!(member.servers_awaiting_authorization().await.is_empty());
+        member.shutdown().await;
+    }
+
+    /// Each member's recorded outcome and whether each boundary the custody
+    /// applied after it succeeded.
+    fn answers<T: Copy>(outcomes: &[MemberMcpCredentialOutcome<T>]) -> Vec<(Option<T>, Vec<bool>)> {
+        outcomes
+            .iter()
+            .map(|outcome| {
+                (
+                    outcome.recorded.as_ref().ok().copied(),
+                    outcome.applied.iter().map(Result::is_ok).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// A credential landed through the custody answers for every member
+    /// adapter it holds, in adoption order, and applies a boundary only where
+    /// the record staged something: the member awaiting exactly that target
+    /// is staged and applied, an idle member is untouched, a second landing
+    /// after the reconnect finds nothing awaiting, and an adapter whose own
+    /// shutdown reported is no longer addressed.
+    #[tokio::test]
+    async fn a_landed_credential_answers_per_member_and_applies_what_it_staged() {
+        use meerkat::AuthorizedRetry::{NotAwaiting, Staged};
+        let credential = StoredCredential::new(None);
+        let (member, target) =
+            member_adapter(authorized_endpoint().await, Arc::clone(&credential)).await;
         let idle = adapter();
         let custody = MemberMcpCustody::new();
-        custody.adopt(&awaiting).expect("adopted");
+        custody.adopt(&member).expect("adopted");
         custody.adopt(&idle).expect("adopted");
 
+        credential.set(Some("member-token"));
         let landed = custody.credential_landed(&target).await;
-        assert!(
-            matches!(
-                landed.as_slice(),
-                [
-                    Ok(meerkat::AuthorizedRetry::Staged),
-                    Ok(meerkat::AuthorizedRetry::NotAwaiting)
-                ]
-            ),
+        assert_eq!(
+            answers(&landed),
+            vec![(Some(Staged), vec![true]), (Some(NotAwaiting), vec![])],
             "{landed:?}"
         );
+        until_member_serves(&member, &["guarded"]).await;
+
         let again = custody.credential_landed(&target).await;
-        assert!(
-            matches!(
-                again.as_slice(),
-                [
-                    Ok(meerkat::AuthorizedRetry::AlreadyPending),
-                    Ok(meerkat::AuthorizedRetry::NotAwaiting)
-                ]
-            ),
+        assert_eq!(
+            answers(&again),
+            vec![(Some(NotAwaiting), vec![]), (Some(NotAwaiting), vec![])],
             "{again:?}"
         );
 
-        awaiting.shutdown().await;
+        member.shutdown().await;
         let after = custody.credential_landed(&target).await;
-        assert!(
-            matches!(
-                after.as_slice(),
-                [Ok(meerkat::AuthorizedRetry::NotAwaiting)]
-            ),
+        assert_eq!(
+            answers(&after),
+            vec![(Some(NotAwaiting), vec![])],
             "only the live adapter is addressed: {after:?}"
         );
-        assert_eq!(
+        assert!(
             MemberMcpCustody::new()
                 .credential_landed(&target)
                 .await
-                .len(),
-            0,
+                .is_empty(),
             "an empty custody addresses nothing"
         );
     }
