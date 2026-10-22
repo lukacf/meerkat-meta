@@ -219,6 +219,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Meta Forge no longer leaves a partial remote installation behind when a
   connect is cancelled or refused partway, so removing the cloud computer
   afterwards no longer fails on it.
+- Console: the 10 s between the two member status polls that clear a stale
+  "working" chat is now measured on the page's monotonic clock instead of
+  the computer's clock. A clock set forward between the polls could clear
+  the chat after two polls a few seconds apart, and a clock set back could
+  keep a finished member's chat "working" until the clock caught up.
 
 ### Known limitations
 

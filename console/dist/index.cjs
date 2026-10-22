@@ -48267,7 +48267,7 @@ function agentReportsIdle(agent) {
   return agent.response_phase === null && agent.progress?.run_state === "idle";
 }
 var IDLE_SETTLE_MIN_GAP_MS = 1e4;
-var idleSettleClock = { now: () => Date.now() };
+var idleSettleClock = { now: () => performance.now() };
 function decideIdleSettlement(args) {
   if (!agentReportsIdle(args.agent)) return "reset";
   if (args.logVersionAtRequest === void 0 || args.logVersionAtRequest !== args.logVersionNow) return "reset";
