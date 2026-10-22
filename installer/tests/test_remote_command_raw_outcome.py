@@ -19,9 +19,8 @@ from launchkit import deployment_deadlines
 
 def load_command_owner():
     path = Path(__file__).parents[1] / 'launchkit/templates_v2/remote_operations.py'
-    source = path.read_text().replace("'__LAUNCH_SHUTDOWN_BUDGET__'", repr({
-        'application': 1, 'force_reap': deployment_deadlines.PROCESS_FORCE_REAP_TIMEOUT,
-        'worker': 1, 'service': 1, 'command': 1, 'legacy_service': 1}))
+    # The shared renderer, as the compiler exports it; command() never reads a stop budget.
+    source = deployment_deadlines.render_destination_shutdown_budget(path.read_text())
     spec = importlib.util.spec_from_file_location('raw_remote_command_owner', path)
     module = importlib.util.module_from_spec(spec)
     exec(compile(source, str(path), 'exec'), module.__dict__)
