@@ -283,6 +283,33 @@ class CloudOptions(Cloud):
     machine_type: Literal["e2-small", "e2-medium", "e2-standard-2", "e2-standard-4", "e2-standard-8", "e2-standard-16"] = "e2-medium"
     disk_gb: int = Field(default=30, ge=30, le=2000, strict=True)
 
+    provisioning: Literal["new_vm", "existing_host"] = Field(default="new_vm",
+        description="Whether to create a new VM or install on an existing host. Existing-host intent never authorizes provisioning or changes to cloud resources.")
+    existing_instance: str = Field(default="", pattern=r"^(?:[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)?$",
+        description="Existing Compute Engine instance name, distinct from the application's project slug. Leave empty while discovering the destination; required before packaging existing-host deployments.")
+    existing_zone_confirmed: bool = Field(default=False, strict=True,
+        description="True only after the actual existing VM zone has been confirmed for this project and instance. Set region and zone to that destination. The new-VM default zone is not confirmation; leave false while unknown or after the destination changes.")
+
+    @model_validator(mode="after")
+    def destination_consistency(self):
+        if self.existing_instance and self.provisioning != "existing_host":
+            raise ValueError("An existing instance requires existing_host provisioning.")
+        if self.existing_zone_confirmed and self.provisioning != "existing_host":
+            raise ValueError("Existing zone confirmation requires existing_host provisioning.")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_destination(self, handler):
+        data = handler(self)
+        # Existing accepted proposals retain their serialized content and hashes.
+        if self.provisioning == "new_vm":
+            data.pop("provisioning", None)
+        if not self.existing_instance:
+            data.pop("existing_instance", None)
+        if not self.existing_zone_confirmed:
+            data.pop("existing_zone_confirmed", None)
+        return data
+
 
 class AcquisitionSetup(StrictModel):
     """Desired application setup role; not a native member or authorization."""
@@ -438,7 +465,7 @@ class Blueprint(StrictModel):
                 pending -= ready
                 complete |= ready
         if self.target == "gcp":
-            if self.knowledge.mode == "local" and (self.gcp.machine_type not in ("e2-standard-8", "e2-standard-16") or self.gcp.disk_gb < 100):
+            if self.gcp.provisioning == "new_vm" and self.knowledge.mode == "local" and (self.gcp.machine_type not in ("e2-standard-8", "e2-standard-16") or self.gcp.disk_gb < 100):
                 raise ValueError("Building the local knowledge service on GCP requires an e2-standard-8 or larger VM and at least 100 GB disk. Use remote knowledge for a smaller VM.")
             if self.gcp.project != "" and not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", self.gcp.project):
                 raise ValueError("Enter a valid Google Cloud project ID.")

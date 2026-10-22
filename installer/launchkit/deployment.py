@@ -462,6 +462,8 @@ def deployment_handoff(definition, files, proposal, guide_id, build_id):
     target = definition.get("target")
     if target not in {"mac", "linux", "gcp"} or target != proposal.get("target"):
         raise DraftConflict("The package destination differs from this proposal. Rebuild before installing.")
+    cloud = proposal.get("gcp") or {}
+    existing_host = target == "gcp" and cloud.get("provisioning") == "existing_host"
     host_target = _local_host_target()
     local = target == host_target
     handoff = {"mode": "local" if local else "remote-package", "status": "not-connected",
@@ -484,11 +486,20 @@ def deployment_handoff(definition, files, proposal, guide_id, build_id):
     steps = handoff["steps"]
     steps.append({"title": "Download and extract the accepted package" if target == "gcp" else "Download the accepted package",
                   "where": "this computer",
-                  "description": "Use the download button above. " + ("Extract into a new empty folder that you own on this computer. Open the project folder containing install.sh and start.sh; this may be an inner folder created by the ZIP. Open a terminal there for the provisioning and tunnel commands." if target == "gcp" else "Keep this exact ZIP for transfer to the destination; Forge does not upload it for you."), "commands": []})
-    if target != "gcp":
+                  "description": "Use the download button above. " + ("Extract into a new empty folder that you own on this computer. Open the project folder containing install.sh and start.sh; this may be an inner folder created by the ZIP. Open a terminal there for the provisioning and tunnel commands." if target == "gcp" and not existing_host else "Keep this exact ZIP for transfer to the destination; Forge does not upload it for you."), "commands": []})
+    if target != "gcp" or existing_host:
         steps.append({"title": "Transfer the ZIP and extract it on the destination", "where": "destination computer",
                       "description": "Transfer the downloaded ZIP to your destination using your usual file transfer, then extract it into a new empty folder you own there. If this is the destination computer, extract here. Keep the source unchanged. Open the project folder containing install.sh and start.sh; this may be an inner folder created by the ZIP. Open a terminal there for the destination commands below.", "commands": []})
-    if target == "gcp":
+    if existing_host:
+        from .blueprint import CloudOptions
+        selected = CloudOptions.model_validate(cloud)
+        if (not selected.existing_instance or not selected.existing_zone_confirmed
+                or not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", selected.project)):
+            raise DraftConflict("The existing-host package needs its actual project, instance name and confirmed zone.")
+        steps.append({"title": "Use the existing VM", "where": "existing destination",
+            "description": f"Destination: {selected.project}, {selected.zone}, {selected.existing_instance}. Use its authorized SSH access and prepare Python 3.11+ and selected connector prerequisites there. The application folder is {definition.get('slug', '')}; it is not the VM name. No new VM, firewall rule or host bootstrap is offered. Preserve any existing installation and use its saved update controls.",
+            "commands": []})
+    if target == "gcp" and not existing_host:
         cloud = proposal.get("gcp") or {}
         project, zone, slug = cloud.get("project", ""), cloud.get("zone", ""), definition.get("slug", "")
         if (not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", project)
@@ -540,6 +551,8 @@ def deployment_handoff(definition, files, proposal, guide_id, build_id):
     steps.append({"title": "Open the native MobKit Console", "where": "your computer with the browser",
                   "description": f"{'Keep the IAP tunnel open, then visit' if target == 'gcp' else 'Use a browser on the destination, or keep the SSH tunnel above open on your computer, then visit'} http://127.0.0.1:{port}/console. This is the native agent chat and admin Console. Its remote health is not tracked by Forge.",
                   "commands": ["bash deploy/tunnel-gcp.sh"] if target == "gcp" else []})
+    if existing_host:
+        handoff["limitations"].append("The optional IAP tunnel uses the selected existing instance and requires already authorized SSH access. Forge has not verified that access or this host's capacity. Its new-VM provisioner is unavailable for this proposal.")
     if service:
         handoff["operations"] = [
             {"title": "Check service status", "commands": ["bash deploy/install-service.sh status"]},
@@ -550,7 +563,7 @@ def deployment_handoff(definition, files, proposal, guide_id, build_id):
             {"title": "Use a terminal instead of the background service", "description": "Choose this alternative when a user systemd manager is unavailable. Stop the background service first if it is running. Keep this terminal open and stop the application with Control-C; do not run both copies.", "commands": ["bash start.sh"]},
         ]
         handoff["limitations"].append("The background service belongs to the destination's current Linux user. The guided service setup asks before enabling operation after logout; that system setting can require sudo. A user manager without that setting normally stops its services on logout. No unattended boot or remote health is established by these instructions.")
-    if target == "gcp":
+    if target == "gcp" and not existing_host:
         handoff["limitations"].append("If VM installation stops, keep this exact package folder and use bash deploy/deploy-gcp.sh --resume. Cleanup commands and ownership evidence are in the package README and script output.")
     return target, host_target, handoff
 

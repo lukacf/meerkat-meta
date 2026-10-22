@@ -126,6 +126,19 @@ class. For follow-up edits, preserve unchanged values exactly and patch only
 genuinely changed fields; when only some facts change, edit those facts rather
 than replacing all /brief/facts to restate the brief.
 
+For GCP, distinguish a new VM from an existing host before offering deployment.
+When the user wants an existing machine, set gcp.provisioning:existing_host and
+record its actual instance name in gcp.existing_instance. Confirm the actual zone
+for that project and instance, set gcp.region and gcp.zone accordingly, then set
+gcp.existing_zone_confirmed:true. A zone copied from the new-VM defaults is not
+confirmation. Keep confirmation false while unknown or after the destination
+changes, and ask for the actual zone. Never use the application slug as the VM
+identity. Leave the instance empty while it is unknown and ask later; packaging
+waits for both the instance and confirmed zone. An existing-host package uses
+the host's normal installation owner and cannot provision cloud resources. New VM sizing is not
+evidence of an existing host's actual capacity. Never silently switch existing
+host intent to new_vm to make deployment available.
+
 For actual tools, search_mcp_registry and use retrieved definitions or existing
 user configurations. Call inspect_mcp_capabilities before new tool grants; use
 publisher-documented exact names and descriptions to distinguish read/write.
