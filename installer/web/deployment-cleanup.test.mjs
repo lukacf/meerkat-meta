@@ -151,6 +151,31 @@ test("a failed product installer with exact confirmed teardown offers guarded re
     assert.equal(deploymentResumeAction({ ...partial, ...change }, guide), null);
 });
 
+test("guarded product retry stays closed for a foreign boundary, a different source digest or a non-UUID lifecycle", () => {
+  // The cleanup above, with a lifecycle id and the receipt's own source digest chosen per case.
+  const failed = (lifecycle = "5c1f4b32-b1c9-4bd0-ab1a-332806ec52a8", receiptChange = {}, cleanupChange = {}) => {
+    const partial = { ...receipt, cleanup_recovery: undefined, status: "stopped", phase: "stop", target: "local",
+      destination: "/owned/partial-install", blueprint_hash: "c".repeat(64), startup_attempt_id: null,
+      interactive_cleanup_attempt_id: null, interactive_lifecycle_id: lifecycle,
+      runtime_candidate: { format: "forge-meta-toolkit-runtime-selection-v1" }, ...receiptChange };
+    partial.interactive_cleanup = { confirmed: true, worker_exit_confirmed: true,
+      boundary: "owned-process-groups-absent", return_code: 1, supervisor_pid: 123,
+      lifecycle_id: lifecycle, startup_attempt_id: null, source_digest: "d".repeat(64), owner_sha256: "e".repeat(64),
+      ...Object.fromEntries(["deployment_id", "guide_id", "build_id", "guide_version", "blueprint_hash", "destination", "package_sha256"].map(key => [key, partial[key]])),
+      ...cleanupChange };
+    return partial;
+  };
+  assert.equal(deploymentResumeAction(failed(), guide)?.action, "retry");
+  assert.equal(deploymentResumeAction(failed(undefined, { source_digest: "d".repeat(64) }), guide)?.action, "retry",
+    "The receipt's own source digest may name the cleaned source.");
+  for (const boundary of ["foreign-boundary", "worker-not-admitted", "owned-process-groups-absent-unverified"])
+    assert.equal(deploymentResumeAction(failed(undefined, {}, { boundary }), guide), null, boundary);
+  assert.equal(deploymentResumeAction(failed(undefined, { source_digest: "f".repeat(64) }), guide), null,
+    "A cleanup of another source cannot retry this installation.");
+  for (const lifecycle of ["lifecycle-1", "5C1F4B32-B1C9-4BD0-AB1A-332806EC52A8", "5c1f4b32-b1c9-4bd0-ab1a-332806ec52a8-extra", ""])
+    assert.equal(deploymentResumeAction(failed(lifecycle), guide), null, lifecycle);
+});
+
 test("initial install explains the host-selected Configure step without claiming agents have started", () => {
   const options = { source_kind: "application", fresh_install: { available: true, next_step: "configure" } };
   const before = structuredClone(options);
