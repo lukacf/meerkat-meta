@@ -472,8 +472,8 @@ Avoid manual runtime ID extraction for ordinary identity-scoped work. Do not ass
   itself; until then its first model request fails with
   `forked session must explicitly activate inherited instruction keys`. Mob
   operator authority is never copied. `meta/fork_helper` is not a durable
-  fork: its default full-history context renders the source's transcript as
-  text, activation bodies included, under every policy.
+  fork: an autonomous-host helper gets the source's transcript as text,
+  activation bodies included, under every policy.
 - `runtime_options.fork_instruction_policy` decides for every fork of the
   gateway's mob, never per fork, and is applied again on every boot (the mob
   does not store it). Python `.fork_instruction_policy(...)`, TypeScript

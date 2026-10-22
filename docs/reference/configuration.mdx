@@ -521,11 +521,12 @@ A durable fork copies the source member's committed transcript, up to the fork
 boundary, into a new session and seats that session as a new member. The
 durable forks are the agent `fork_off` tool, `UnifiedRuntime::fork_member`, a
 live delegation's fork of the member, and the participants of a temporary
-council. (`meta/fork_helper` is not a durable fork: it seeds a fresh member with
-the source's transcript rendered as text, and this policy does not apply to it.
-With its default full-history context, that text includes the source's system
-rows, so the bodies of the source's activated instructions reach the helper as
-plain context under every policy, `refuse` included.)
+council. (`meta/fork_helper` is not a durable fork, and this policy does not
+apply to it. It renders the source's transcript as text for a fresh member. A
+helper that runs as an autonomous host gets that text as its first prompt, and
+with the default full-history context it includes the source's system rows, so
+the bodies of the source's activated instructions reach that helper as plain
+context under every policy, `refuse` included.)
 
 | Copied into the child | Not copied |
 |---|---|
@@ -622,8 +623,8 @@ own:
   members may carry is safe to run, unchanged, in any fork of them.
   `require_explicit_activation` keeps that decision with the host for each
   child (and refuses forks that leave it no chance), and `refuse` rules out
-  durable forks of activated members (a `meta/fork_helper` still sees their
-  text).
+  durable forks of activated members (an autonomous-host `meta/fork_helper`
+  still sees their text).
 
 ### Refusals
 
