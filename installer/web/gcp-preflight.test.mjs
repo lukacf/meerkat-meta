@@ -443,3 +443,13 @@ test("the optional manual handoff download keeps its ordinary button event separ
     assert.ok(button); await act(async () => button.click()); await ui.waitFor(() => ui.savedPackages.length === 1);
   }, true);
 });
+
+test("existing-host proposals cannot expose the new-VM provisioner or reuse its result", () => {
+  const changed = structuredClone(state);
+  changed.proposal.gcp = { ...changed.proposal.gcp, provisioning: "existing_host", existing_instance: "retained-vm" };
+  assert.equal(gcpPreflightAvailable(changed, build), false);
+  assert.equal(gcpBindingMatches(options(), changed, build), false);
+  assert.notEqual(gcpPreflightScope(changed, build), gcpPreflightScope(state, build));
+  changed.proposal.gcp.provisioning = "new_vm";
+  assert.equal(gcpPreflightAvailable(changed, build), true);
+});

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Forge operators can select organization-provided starting examples and guide
+  context with `META_FORGE_ORGANIZATION` and the
+  `meerkat_forge.organizations.v1` Python entry-point group. New setups retain
+  their selected contribution; examples remain editable drafts.
+
 ### Changed
 
 - Docs: the configuration reference has a new "Fork instruction policy"

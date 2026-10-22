@@ -93,3 +93,36 @@ def test_null_or_non_object_legacy_brief_cannot_prove_cross_revision_scope(missi
     frozen = {"guide_id": "guide", "guide_version": 3, "blueprint": state["proposal"], "brief": missing}
     receipt = {"guide_id": "guide", "guide_version": 3, **inputs(state)}
     assert not frozen_matches(receipt, frozen, state)
+
+
+@pytest.mark.parametrize("change", ["replace", "remove"])
+def test_organization_bound_build_and_export_cannot_match_changed_context(change):
+    state = scope()
+    state["organization"] = {"id": "example", "version": "1", "guide_context": "Required identity contract"}
+    frozen = {"guide_id": state["id"], "guide_version": 3, "blueprint": deepcopy(state["proposal"]),
+              "brief": deepcopy(state["brief"]), "organization": deepcopy(state["organization"])}
+    receipt = {"guide_id": state["id"], "guide_version": 3, **inputs(state)}
+    assert frozen_matches(receipt, frozen, state)
+    assert package_matches(receipt, state)
+    if change == "replace": state["organization"]["guide_context"] = "Different identity contract"
+    else: del state["organization"]
+    assert not matches(receipt, state)
+    assert not frozen_matches(receipt, frozen, state)
+    assert not package_matches(receipt, state)
+    stripped = deepcopy(frozen)
+    del stripped["organization"]
+    assert not frozen_matches(receipt, stripped, state)
+
+
+@pytest.mark.parametrize("full_brief", [False, True])
+def test_legacy_receipt_cannot_gain_unbound_organization_context(full_brief):
+    state = scope()
+    receipt = {"guide_id": state["id"], "guide_version": 3, **inputs(state)}
+    package = dict(receipt)
+    if not full_brief:
+        del package["brief_hash"]
+    assert matches(receipt, state)
+    assert package_matches(package, state)
+    state["organization"] = {"id": "example", "version": "1", "guide_context": "Required identity contract"}
+    assert not matches(receipt, state)
+    assert not package_matches(package, state)

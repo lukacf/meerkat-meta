@@ -30,6 +30,41 @@ brief.facts.outcome.status unresolved, even if their wish for help is clear.
 Help them discover a useful job; do not invent a team or treat a broad wish
 as a confirmed concrete outcome.
 
+When the work needs incoming information, discover it in context rather than
+starting with a connector menu. Ask which changes matter and who needs to notice
+them. Use brief.incoming_data to retain the proposed source scope, purpose,
+audience, recipients and history choice, linked to a requested feature and real
+user evidence. Unknown recipients may remain empty until a team is proposed.
+Use recipient_kind class only when all current and future members of a proposed
+class should receive the same matching information. This can describe a class
+with zero initial members. Do not choose a whole class when information belongs
+to one person's or project's private context. Name one identity for a triage or
+conversation owner. A class choice requires native role/subscription support and
+verified access at delivery; it does not grant access to future agents.
+This is design intent only; it creates no native source, subscription, permission
+or collector. Keep implementation gaps in the linked requirement.
+Offer context-specific multiple choices: send matching updates straight to known
+owners, let a triage agent judge ambiguous relevance, or use both for different
+scopes. A dedicated triager is useful for semantic decisions, not mandatory for
+a known recipient. A conversation owner receiving a channel through its chat
+frontend should not also receive awareness notifications for that same scope.
+Do not treat direct and triage paths as proof that an agent cannot be woken twice.
+Clarify privacy before proposing recipients. Native policy must enforce access;
+topic names, prompts and this plan are not an authorization boundary.
+Offer starting with new changes or an explicitly bounded history window. Preserve
+an undecided choice until the user chooses; adding a source or a new record kind
+must not silently replay all history. Discuss prompt alerts versus quiet review
+in terms of the user's work. Store sources as descriptive intent until Connect
+can resolve their exact capabilities and scopes; do not invent provider IDs,
+subscription methods or cursor tokens. Ask one useful question at a time.
+The intended shared implementation is Meta mob announcements with Connect observation
+adapters. Core owns scheduling and delivery admission. Forge configures those
+capabilities; it does not supply a separate polling loop, cursor store or inbox.
+Until the selected native runtime and adapter expose the required contract,
+describe collection as implementation work rather than supported setup. Existing
+MCP tools alone do not establish a usable changefeed. Keep searchable knowledge,
+announcement retention, successful delivery and successfully handled work distinct.
+
 Agent design:
 - Proactively explore the useful specialties in the person's work, including
   for a single user. Look at the domain knowledge and working methods needed,
@@ -655,6 +690,8 @@ def compact_guidance_context(context):
         "saved_plan_available", "manual_plan_submitted", "brief", "reopened_topics",
         "manual_changes", "manual_edits", "suggested_stage",
     ) if key in context}
+    if context.get("organization") is not None:
+        projected["organization"] = copy.deepcopy(context["organization"])
     projected["readiness"] = review_readiness(context.get("brief") or {})
     if "visualization_feedback" in context:
         projected["visualization_feedback"] = copy.deepcopy(context["visualization_feedback"])
@@ -821,7 +858,9 @@ def _revisit_question(group, fact):
 
 class GuideService:
     def __init__(self, store, architect, implementation_evidence_provider=None, trial_evidence_provider=None,
-                 deployment_evidence_provider=None, remote_deployment_evidence_provider=None):
+                 deployment_evidence_provider=None, remote_deployment_evidence_provider=None, *, organization=None):
+        from .organization import organization_snapshot
+        self.organization = organization_snapshot(organization) if organization is not None else None
         self.store = store
         self.attachments = GuideAttachments(store.root)
         self.architect = architect
@@ -876,7 +915,10 @@ class GuideService:
 
     def new(self):
         from .guide_models import starter_state
-        return starter_state(planner_capability())
+        state = starter_state(planner_capability())
+        if self.organization is not None:
+            state["organization"] = copy.deepcopy(self.organization)
+        return state
 
     async def create(self, request_id=None):
         return await asyncio.to_thread(self.store.create, self.new(), request_id=request_id)
@@ -1160,6 +1202,8 @@ class GuideService:
                 "manual_choices": state.get("manual_choices"), "preserve_manual_choices": False,
                 "suggested_stage": suggestion, "next_stage": suggestion,
             }
+            if state.get("organization") is not None:
+                context["organization"] = copy.deepcopy(state["organization"])
             context["edit_base_token"] = guided_edit_token(context, draft)
             # Manual changes may already have replaced the draft returned by
             # get(). Rebind evidence to that exact candidate before the turn.
@@ -1178,13 +1222,16 @@ class GuideService:
                       "It contains the full brief, original evidence, selected option meanings, manual intent, "
                       "available actions and exact edit_base_token.\n\nCurrent setup turn:\n"
                       + json.dumps(_guide_request_context(context), ensure_ascii=True))
+            if context.get("organization") is not None:
+                from .organization import ORGANIZATION_GUIDANCE
+                prompt += "\n" + ORGANIZATION_GUIDANCE
             result = await self.architect.message(prompt, draft, guide_context=context)
             if not result.get("guide"):
                 raise GuidePublicationMissing("The guide answered without publishing its response. Your saved setup remains unchanged.")
             proposed = result.get("proposal")
             if proposed is not None:
                 proposed = Blueprint.model_validate(proposed).model_dump(mode="json")
-            guided = validate_guide_publication(result["guide"], context, proposed)
+            guided = validate_guide_publication(result["guide"], context, proposed, current_blueprint=draft)
             if guided.get("visualization_feedback") is not None:
                 state["visualization_feedback"] = publication_visualization_feedback(guided, context)
             if status_only_publication(guided, context, proposed):

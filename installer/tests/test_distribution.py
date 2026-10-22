@@ -949,7 +949,7 @@ def dependency_recovery_python(path, *, failure, failed_command):
     """Log selected argv/settings and simulate only the chosen pip failure."""
     mock_preparation_python(path)
     setting_names = ["PYTHON_BIN", "META_FORGE_PORT", "MOBKIT_LAUNCH_PORT", "META_FORGE_HOME",
-                     "MOBKIT_LAUNCH_HOME", "MOBKIT_GATEWAY_BIN"]
+                     "MOBKIT_LAUNCH_HOME", "MOBKIT_GATEWAY_BIN", "META_FORGE_ORGANIZATION"]
     logger = "import json,os,sys; print(json.dumps({'argv':sys.argv[1:],'settings':{name:os.environ.get(name) for name in " + repr(setting_names) + "}}))"
     prelude = ('"$PREPARATION_REAL_PYTHON" -c ' + shlex.quote(logger) + ' "$@" >> "$DEPENDENCY_RECOVERY_LOG"\n'
         'if [ "${DEPENDENCY_RECOVERY_FAILURE:-}" = ' + shlex.quote(failure) + ' ] && [ "$*" = ' + shlex.quote(failed_command) + ' ]; then\n'
@@ -968,7 +968,8 @@ def dependency_recovery_trial(folder, tmp_path, explicit_gateway, *, failure, fa
     state = tmp_path / 'Forge state $literal;$(printf unwanted) "quoted"'
     alias = tmp_path / "alias state $literal; 'quoted'"
     settings = {"PYTHON_BIN": str(selected), "META_FORGE_PORT": "8788", "MOBKIT_LAUNCH_PORT": "8789",
-        "META_FORGE_HOME": str(state), "MOBKIT_LAUNCH_HOME": str(alias), "MOBKIT_GATEWAY_BIN": str(gateway)}
+        "META_FORGE_HOME": str(state), "MOBKIT_LAUNCH_HOME": str(alias), "MOBKIT_GATEWAY_BIN": str(gateway),
+        "META_FORGE_ORGANIZATION": "example-workplace"}
     log = tmp_path / "dependency-recovery.jsonl"
     support = {"PATH": "/usr/bin:/bin", "PREPARATION_REAL_PYTHON": sys.executable,
         "PREPARE_LOG": str(tmp_path / "prepare.log"), "DEPENDENCY_RECOVERY_LOG": str(log)}

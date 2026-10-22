@@ -29,6 +29,7 @@ from .architect import ArchitectService, ArchitectUnavailable
 from .projects import ProjectStore, DraftConflict, fingerprint
 from .guide import GuideService
 from .guide_store import GuideStore
+from .organization import load_organization_plugin
 from .guide_attachments import AttachmentReference, MAX_FILES, MAX_FILE_BYTES, MAX_TURN_BYTES
 from .guide_operations import GuideOperations
 from .guide_preview import staged_guide_preview
@@ -37,6 +38,8 @@ from .visualization_operations import VisualizationConflict, VisualizationIntent
 from .visualization_review import ReviewAdmissionUnavailable, VisualizationReviewService, bundled_review_reference_context
 from .visual_review_runtime import VisualReviewRuntime
 from .implementation import ImplementationService, BuildSelectionUnavailable
+from .owned_console import (browser_console_url, console_response, resolve_owner,
+                            resolve_guide_owner, MAX_BODY as CONSOLE_MAX_BODY)
 from .forge_application_host import ForgeApplicationHost, application_setup_binding
 from .local_application_registry import LocalApplicationRegistry
 from .deployment import DeploymentService
@@ -72,7 +75,7 @@ provider_settings = ProviderSettings(STUDIO_ROOT)
 architect = ArchitectService(STUDIO_ROOT)
 architect.provider_settings = provider_settings
 projects = ProjectStore(STUDIO_ROOT)
-guide = GuideService(GuideStore(STUDIO_ROOT), architect)
+guide = GuideService(GuideStore(STUDIO_ROOT), architect, organization=load_organization_plugin())
 toolkit_saved_requests = ToolkitSavedRequests(STUDIO_ROOT / 'toolkit-saved-requests')
 
 
@@ -382,7 +385,9 @@ async def local_requests(request: Request, call_next):
     if request.method in ("POST", "PUT"):
         # The animation request includes the fully resolved graph, not just its
         # class definitions. Keep every identity and relationship for large mobs.
-        if request.url.path == "/api/visualizations":
+        if request.url.path.startswith("/api/owned-console/"):
+            limit = CONSOLE_MAX_BODY
+        elif request.url.path == "/api/visualizations":
             limit = 8_000_000
         elif re.fullmatch(r'/api/visualizations/[0-9a-f]{64}/review', request.url.path):
             limit = 20_000_000
@@ -1274,7 +1279,8 @@ async def end_rehearsal(identity: str, value: RehearsalCancel):
 
 @app.get("/api/guide/{identity}/rehearsal")
 async def rehearsal_status(identity: str):
-    return await guide_result(rehearsal.status(identity))
+    receipt = await guide_result(rehearsal.status(identity))
+    return {**receipt, "browser_console_url": await browser_console_url(rehearsal, identity, receipt, "rehearsal")}
 
 
 @app.get("/api/guide/{identity}/rehearsal/timeline")
@@ -1613,7 +1619,23 @@ async def stop_implementation(identity: str, value: ImplementationStopRequest):
 
 @app.get("/api/guide/{identity}/implementation")
 async def implementation_status(identity: str):
-    return await guide_result(implementation.status(identity))
+    receipt = await guide_result(implementation.status(identity))
+    return {**receipt, "browser_console_url": await browser_console_url(implementation, identity, receipt, "implementation")}
+
+
+@app.api_route("/api/owned-console/guide/{generation}/{path:path}", methods=["GET", "HEAD", "POST"])
+async def owned_guide_console(generation: str, path: str, request: Request):
+    owner = resolve_guide_owner(architect, generation)
+    return await console_response(request, owner, path)
+
+
+@app.api_route("/api/owned-console/{kind}/{identity}/{job_id}/{path:path}", methods=["GET", "HEAD", "POST"])
+async def owned_worker_console(kind: str, identity: str, job_id: str, path: str, request: Request):
+    service = {"implementation": implementation, "rehearsal": rehearsal}.get(kind)
+    if service is None:
+        raise HTTPException(404, "Unknown agent Console.")
+    owner = await asyncio.to_thread(resolve_owner, service, identity, job_id, kind)
+    return await console_response(request, owner, path)
 
 
 @app.get("/api/guide/{identity}/implementation/saved-selection")

@@ -358,3 +358,17 @@
 @media (min-width: 761px) and (max-width: 1050px) {
   .setup-shell.setup-first-conversation .setup-columns { grid-template-columns: minmax(0, 1.2fr) minmax(0, .8fr); }
 }
+
+.setup-shell .forge-organization-start { border: 0; border-radius: 0; background: transparent; margin-top: 4px; }
+.forge-organization-start__header { display: flex; align-items: start; gap: 20px; justify-content: space-between; margin-bottom: 16px; }
+.forge-organization-start__header h2 { font-family: Newsreader, Georgia, serif; font-size: 24px; font-weight: 400; margin: 0 0 8px; }
+.forge-organization-start__header p { margin: 0; color: #716e65; font-size: 13px; line-height: 1.5; }
+.setup-shell .forge-organization-start__header > button { flex-shrink: 0; min-height: 44px; padding: 4px 0; color: #994523; font-size: 13px; }
+.setup-shell.setup-welcome .forge-organization-start .setup-starting-points { gap: 10px; margin: 0; }
+.setup-shell.setup-welcome .forge-organization-start .setup-starting-points > button { padding: 14px; border: 1px solid #e2dfd4; border-radius: 8px; min-height: 88px; background: #fffefa; font-size: 14px; }
+.setup-shell.setup-welcome .forge-organization-start .setup-starting-points > button:last-of-type:nth-of-type(odd) { grid-column: 1 / -1; }
+.forge-organization-start .setup-starting-point-copy small { font-size: 12px; line-height: 1.45; }
+.forge-organization-start__hint { font-size: 12px; color: #716e65; margin: 12px 0 18px; }
+@media (max-width: 540px) {
+  .forge-organization-start__header { flex-direction: column; gap: 8px; }
+}

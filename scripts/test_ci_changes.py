@@ -850,6 +850,8 @@ class CiChangesTests(unittest.TestCase):
                 "console/src/App.tsx": "export {}\n",
                 "docs/guide.md": "# Guide\n",
                 "scripts/tool.py": "\n",
+                # A real installer source read still needs an audited lane.
+                "installer/launchkit/read_source.py": 'Path("crates/x/src/lib.rs").read_text()\n',
                 "crates/x/src/lib.rs": '// sdk/python/meerkat_meta/types.py is only named here\n'
                                       'const T: &str = include_str!("../../../sdk/python/meerkat_meta/types.py");\n',
                 "flow-editor/src/a.ts": 'import { X } from "../../console/src/App";\n',
@@ -873,11 +875,14 @@ class CiChangesTests(unittest.TestCase):
             ("crates/*/src/", "sdk/python/"), ("flow-editor/", "console/"),
             ("packages/", "console/"), ("packages/", "sdk/"), ("packages/", "scripts/"),
             ("examples/", "docs/"), ("examples/", "sdk/typescript/"), ("tests/", "docs/"),
-            ("sdk/python/", "crates/"),
+            ("sdk/python/", "crates/"), ("installer/", "crates/"),
         })
         self.assertEqual(reads[("sdk/python/", "crates/")],
                          {"sdk/python/tests/test_wire.py -> crates/x/tests/fixtures/wire.json"})
         self.assertNotIn(("crates/*/src/", "sdk/python/"), CROSS_AREA_READS)
+        self.assertEqual(reads[("installer/", "crates/")],
+                         {"installer/launchkit/read_source.py -> crates/x/src/lib.rs"})
+        self.assertNotIn(("installer/", "crates/"), CROSS_AREA_READS)
 
     def test_pushes_dispatches_and_empty_diffs_run_everything(self):
         self.assertEqual(self.lanes("README.md", event="push"), EVERY_LANE)

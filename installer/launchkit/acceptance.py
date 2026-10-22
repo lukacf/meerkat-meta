@@ -75,6 +75,8 @@ class SemanticAcceptance:
         # history and cannot be changed while reusing earlier acceptance.
         if requests and requests != [binding["request"]]:
             binding["implementation_requests"] = requests
+        if frozen.get("organization") is not None:
+            binding["organization"] = frozen["organization"]
         self.binding_digest = _sha(_json(binding))
         self.state_path = self.root / "acceptance-state.json"
         self.key_path = self.root / "acceptance-key"
@@ -186,7 +188,9 @@ class SemanticAcceptance:
                     files.append({"path": name, "sha256": _sha(item.content),
                                   **({"binary": True, "size": len(item.content)}
                                      if isinstance(item.content, bytes) else {})})
-            return {"brief": self.frozen.get("brief", {}), "blueprint": self.frozen["blueprint"],
+            return {**({"organization": json.loads(_json(self.frozen["organization"]))}
+                       if self.frozen.get("organization") is not None else {}),
+                    "brief": self.frozen.get("brief", {}), "blueprint": self.frozen["blueprint"],
                     "messages": self.frozen.get("messages", []), "request": self.frozen.get("request", ""),
                     "implementation_requests": self.frozen.get("implementation_requests", []),
                     "requirements": self.requirements, "source_digest": row["source_digest"], "review_round": row["number"],

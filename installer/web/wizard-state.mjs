@@ -139,7 +139,8 @@ export function inputSubmissionText(input) {
   const context = startingContextText(inputStartingHelp(input));
   return context ? context + (draft.length ? `\n\n${draft}` : "") : draft;
 }
-function startingHelpInput(input) {
+function startingHelpInput(input, state) {
+  if (state?.organization) return {};
   const hint = inputStartingHelp(input);
   return hint ? { starting_help: hint } : {};
 }
@@ -161,7 +162,7 @@ export function readInput(storage, state) {
     selected: inputSelections(state?.question, saved.selected, saved.combine_options),
     mode: textSource.mode === "chat" ? "chat" : "answer",
     ...combinedInput(state?.question, saved),
-    ...(saved.key === key && textSource === saved ? startingHelpInput(saved) : {}),
+    ...(saved.key === key && textSource === saved ? startingHelpInput(saved, state) : {}),
   };
 }
 function combinedInput(question, input) {
@@ -185,14 +186,14 @@ export function guideInputForState(storage, state, current, { newlyCompleted = f
     const { combine_options, starting_help, ...ordinary } = restored;
     return { ...ordinary, draft: live.draft,
       selected: inputSelections(state?.question, live.selected, live.combine_options), mode: live.mode,
-      ...combinedInput(state?.question, live), ...startingHelpInput(live) };
+      ...combinedInput(state?.question, live), ...startingHelpInput(live, state) };
   }
   if (live.draft) {
     // Legacy inserted context may restore with its exact saved prose.
     // Separate choices never attach to text from another question.
     const { starting_help, ...ordinary } = restored;
     return { ...ordinary, draft: live.draft, mode: live.mode,
-      ...(live.draft === restored.draft && !startingContextDetails(restored.starting_help) ? startingHelpInput(restored) : {}) };
+      ...(live.draft === restored.draft && !startingContextDetails(restored.starting_help) ? startingHelpInput(restored, state) : {}) };
   }
   return restored;
 }
@@ -204,7 +205,7 @@ export function admitNewGuideInput(storage, state, current) {
   return { ...restored, draft: current.draft, mode: current.mode,
     selected: sameQuestion ? inputSelections(state.question, current.selected, current.combine_options) : [],
     ...(sameQuestion ? combinedInput(state.question, current) : {}),
-    ...(sameQuestion && startingContextDetails(inputStartingHelp(current)) ? startingHelpInput(current) : {}) };
+    ...(sameQuestion && startingContextDetails(inputStartingHelp(current)) ? startingHelpInput(current, state) : {}) };
 }
 export function writeInput(storage, input) {
   try {

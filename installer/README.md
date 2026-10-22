@@ -340,6 +340,17 @@ retains its explicit metadata support.
 
 ## Follow the guide
 
+An organization can supply its own starting examples and guide context through
+an installed Python plugin selected by the Forge host. Its examples replace the
+stock opening suggestions; people can always describe their own idea. Choosing
+an example fills an editable draft and never installs a connector or grants
+access. Saved setups retain the plugin context they started with.
+
+For operators, see the [installable workplace example](examples/workplace-starters/README.md)
+and its version 1 contribution contract. Plugin installation and selection are
+host configuration, not a tenant authorization boundary. This context-only
+extension does not implement hosted account sign-in or cloud deployment.
+
 The wizard first explores the job, audience and scale, how people will interact,
 operational reliability, and deployment. Compatible channels and interfaces can
 be selected together. It narrows down tools and connectors once that context is
@@ -455,6 +466,18 @@ your answer. See [Return without starting over](GETTING_STARTED.md#6-return-with
 for the recovery controls.
 
 ## Build the application
+
+When a guide has saved organization context, each new build retains that exact
+snapshot for both the builder and independent reviewer. Updating the installed
+organization plugin does not rewrite an existing guide or build. Acceptance and
+package matching include the saved context, so changing it requires fresh review.
+Older builds without organization context retain their original scope.
+
+This handoff carries visible context and references only. A reference to a private
+authentication or installation package does not install it or grant access. The
+host must adopt the actual package through its supported source-preparation path,
+with compatible dependencies in the selected runtime. Missing source or conflicting
+dependency versions remain explicit implementation dependencies.
 
 When the guide has sufficient context and no necessary decisions remain open,
 **Get your agent team** opens a visible package card. Package availability is
@@ -1481,7 +1504,15 @@ timeline retains native frame versions and replay semantics across reloads;
 the optional detailed editor uses the console workbench components. The backend
 is a durable four-agent MobKit team: deployment architect, integration specialist,
 systems reviewer, and visualization programmer. Open its native console to inspect real identities,
-conversations, tools, and memory. The four-role setup runtime keeps its native
+conversations, tools, and memory. Setup, builder and trial Console links use the
+Forge origin, so they also work when Forge runs on a remote computer behind an
+SSH tunnel or an authenticated host wrapper. Forge serves the existing native
+Console assets and forwards its requests only while it owns that live runtime.
+An ended or replaced runtime closes the link and its live streams; the saved
+conversation and build history remain available in Forge. The host wrapper must
+protect the whole Forge origin, including `/api/owned-console/`. These links do
+not change the installed application's separate Console access configuration.
+The four-role setup runtime keeps its native
 state in the Forge state directory: `architect-runtime-meta-v1` for a guide on a
 Meta release before 0.9.4, and `architect-runtime-meta-v2` from Meta 0.9.4 on.
 Meta 0.9.4 refuses native state that an earlier release wrote until a one-time,

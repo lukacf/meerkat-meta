@@ -301,13 +301,14 @@ async def test_roster_reference_is_registered_and_pages_exact_installed_provider
 
 
 @pytest.mark.asyncio
-async def test_both_native_agents_receive_selected_recurrence_guidance_and_installed_callbacks(team):
+async def test_both_native_agents_receive_selected_recurrence_guidance_and_installed_callbacks(team, monkeypatch):
     from importlib import metadata
     from meerkat_meta.builder import MetaBuilder
     from meerkat_meta.runtime import MetaRuntime
     from launchkit.native_schedule_reference import selected_recurrence_guidance
 
     tools, reviewer = team
+    monkeypatch.setattr(metadata, "version", lambda name: "0.9.43")
     results = []
     for agent in (tools, reviewer):
         offset, lines = 0, []
@@ -315,7 +316,7 @@ async def test_both_native_agents_receive_selected_recurrence_guidance_and_insta
             page = await agent.reference({"name": "schedule", "offset": offset, "limit": 47})
             assert page.get("ok") is not False
             assert page["installed_sdk_version"] == metadata.version("meerkat-meta")
-            assert page["native_authoring_schema"] == "Not supplied by selected SDK source; inspect the actual granted native tools."
+            assert "No bundled contract matches" in page["native_authoring_schema"]
             assert "reference_version" not in page and "version_matches" not in page
             assert {item["path"] for item in page["source_files"]} == {"meerkat_meta/runtime.py", "meerkat_meta/builder.py"}
             numbered = page["content"].splitlines()
@@ -382,6 +383,13 @@ def selected_reference_team(reference_product, tmp_path, request):
     from test_meta_toolkit_runtime_update import catalog_target
 
     f = reference_product
+    if getattr(request, "param", None) == "sdk-0.9.4":
+        from test_sdk_wheel_integrity import InertWheel
+        wheels = (InertWheel("meerkat-meta", version="0.9.4"),
+                  InertWheel("meerkat-toolkit", version="0.9.4", meta_version="0.9.4"))
+        for new, old in zip(wheels, f.wheels):
+            new.payload = dict(old.payload)
+        f.wheels = wheels
     poison = "raise RuntimeError('selected SDK source must never import or execute')\n"
     meta_sources = {
         "runtime.py": "class MetaRuntime:\n    def agent(self): return 'selected-agent'\n    def dispatch(self): return 'selected-dispatch'\n    def dispatch_text(self): return 'selected-text'\n    def inspect_identity(self): return 'selected-inspection'\n    def on_schedule_fire(self): return 'selected-schedule'\n    def mob_handle(self): return 'selected-flow'\n    def reconcile(self): return 'selected-roster'\nclass IdentityAgentHandle:\n    def send_and_wait(self): return 'selected-send'\n    def inspect(self): return 'selected-handle'\nclass MobHandle:\n    def run_flow(self): return 'selected-run'\n    def flow_status(self): return 'selected-status'\n",
@@ -469,6 +477,51 @@ async def test_selected_runtime_references_use_original_wheels_not_forge_sdk(
         assert "Native authoring schema:" in schedule["content"]
         assert "meerkat_schedule_create:" not in schedule["content"]
     assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selected_reference_team", ["sdk-0.9.4"], indirect=True)
+async def test_selected_094_schedule_reference_reaches_both_agents_without_host_sdk(selected_reference_team, monkeypatch):
+    import builtins
+
+    f = selected_reference_team
+    def no_host_version(name):
+        pytest.fail("A selected SDK must not use Forge's installed version.")
+    monkeypatch.setattr(worker.metadata, "version", no_host_version)
+    original_import = builtins.__import__
+    def no_sdk_import(name, *args, **kwargs):
+        if name.split(".")[0] in {"meerkat_meta", "meerkat_toolkit", "meerkat_mobkit"}:
+            pytest.fail("Reading a selected SDK must not execute it.")
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", no_sdk_import)
+    for agent in (f.tools, f.reviewer):
+        page = await agent.reference({"name": "schedule", "limit": 250,
+                                      "installed_sdk_version": "0.8.42"})
+        assert page.get("ok") is not False
+        assert page["selected_sdk_versions"]["meerkat-meta"] == "0.9.4"
+        assert page["installed_sdk_version"] is None and not page["observed_destination"]
+        assert page["schedule_reference_version"] == "0.9.4"
+        assert "meerkat_schedule_create:" in page["content"]
+        assert '"host_runnable"' in page["content"]
+        assert "selected-schedule" in page["content"]
+        assert "0.8.42" not in page["content"]
+        lookup = await agent.reference({"name": "schedule", "query": "meerkat_schedule_create:"})
+        assert lookup["matches"] and not lookup["unavailable_references"]
+        hit = lookup["matches"][0]
+        assert hit["source_file"] == "launchkit/meta_schedule_reference_0_9_4.json#rendered_contract"
+        line = await agent.reference({"name": "schedule", "offset": hit["offset"], "limit": 1})
+        assert line["content"] == str(hit["line"]) + ": " + hit["snippet"]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_094_schedule_reference_uses_host_version_not_caller_version(team, monkeypatch):
+    monkeypatch.setattr(worker.metadata, "version", lambda name: "0.9.4")
+    for agent in team:
+        page = await agent.reference({"name": "schedule", "limit": 250,
+                                      "installed_sdk_version": "0.9.0"})
+        assert page["schedule_reference_version"] == page["installed_sdk_version"] == "0.9.4"
+        assert "meerkat_schedule_create:" in page["content"]
+        assert not page["observed_destination"]
 
 
 @pytest.mark.asyncio

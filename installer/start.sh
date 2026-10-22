@@ -74,7 +74,7 @@ prepare_forge_dependency_step() {
   printf '  cd -- %q\n' "$PWD" >&2
   printf '  PYTHON_BIN=%q' "$PYTHON_BIN" >&2
   local setting
-  for setting in META_FORGE_PORT MOBKIT_LAUNCH_PORT META_FORGE_HOME MOBKIT_LAUNCH_HOME MOBKIT_GATEWAY_BIN META_FORGE_APPLICATION_HOST_FACTORY; do
+  for setting in META_FORGE_PORT MOBKIT_LAUNCH_PORT META_FORGE_HOME MOBKIT_LAUNCH_HOME MOBKIT_GATEWAY_BIN META_FORGE_APPLICATION_HOST_FACTORY META_FORGE_ORGANIZATION; do
     if [ "${!setting+x}" ]; then
       printf ' %s=%q' "$setting" "${!setting}" >&2
     fi
