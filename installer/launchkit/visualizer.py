@@ -107,6 +107,41 @@ intact and describe intended system behavior instead. Let the host show current
 lifecycle state separately.
 """
 
+DYNAMIC_CLASS_GUIDANCE = """Configured starting identities are not necessarily the
+whole intended team over time. A reusable class with instances:0 has no initial
+member; its definition still describes expertise that the application may need
+later. Read its instructions and the current design context before deciding what
+to illustrate. Zero initial members alone does not prove automatic discovery,
+creation, a schedule or any granted tool access.
+
+When the source describes a changing population, make that intended behavior
+understandable in the composition. Show why a distinct context needs an owner,
+what that owner contributes, and how later work returns to the same continuing
+context when reuse is intended. Preserve recognizable marks and positions across
+those moments so reuse does not look like creating a replacement. Distinguish a
+continuing owner from a temporary helper that returns its result and leaves, but
+only include either behavior when the source calls for it. A scheduled refresh
+needs a source-backed trigger; a peer permission is not a schedule. These are
+optional storytelling opportunities, not a required sequence or topology.
+
+Illustrative future members may appear as clearly distinguished, non-selectable
+marks drawn by your program. Use neutral example labels when real contexts are
+not supplied. Do not invent actual project names, discovered accounts, identity
+IDs or a forecast population. Keep illustrative future marks out of model.nodes,
+configured identity counts, hitTest and api.inspect. Keep existing configured
+identities represented; a simulation does not add, remove or retire real members.
+Class tools and intended cooperation explain a design, not verified per-member
+grants or configured edges for hypothetical members. Do not route their clicks
+to an unrelated configured owner. Use captions for their illustrative context.
+
+Explain the distinction once in plain language and let the animation show the
+work. Do not blanket the canvas with warning labels. This intended application
+behavior is separate from transient Forge build/install/admission progress and
+does not claim any current native execution. Keep paused and reduced-motion
+frames meaningful at the selected time. Keep layout, marks, grouping, pacing and
+chapter structure fully custom; there is no lifecycle event or layout schema.
+"""
+
 RESPONSIVE_POPULATION_GUIDANCE = """Compose for the space the viewer actually has. At compact sizes, preserve the
 system's recognizable hierarchy and readable principal names; condense or reveal
 secondary detail instead of shrinking everything into tiny type. At roomy sizes,
@@ -279,7 +314,7 @@ and grants. Keep further detail available through inspection. Choose a presentat
 that fits this proposal and space, without inventing common access for a whole group.
 Keep traces and labels clear enough that they do not imply unrelated participants
 or permissions.
-""" + LIFECYCLE_GUIDANCE + RESPONSIVE_POPULATION_GUIDANCE + """
+""" + LIFECYCLE_GUIDANCE + DYNAMIC_CLASS_GUIDANCE + RESPONSIVE_POPULATION_GUIDANCE + """
 Publish the complete program for the current request through publish_visualization.
 For an ordinary revision, compare the current facts and visual feedback with the
 checked previous_program. Carry forward useful composition, helpers and motion
