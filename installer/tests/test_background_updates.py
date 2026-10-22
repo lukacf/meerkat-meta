@@ -32,6 +32,8 @@ class FakeManager:
         self.cleanup = True
         self.started = asyncio.Event()
         self.block = asyncio.Event()
+        # The horizon the fresh service worker's application reports at readiness.
+        self.reported_horizon = None
 
     async def observe(self, service):
         services.verify_service(self.directory, read_receipt(self.directory))
@@ -59,6 +61,11 @@ class FakeManager:
                   "runtime_pid": 9000 + len(self.starts), "bootstrap": bootstrap,
                   "status": "running", "phase": "run",
                   "logs": [{"at": now(), "phase": "runtime", "text": "fake fresh supervisor output"}]}
+        if self.reported_horizon is not None:
+            # The service worker records the report and widens its own unit's
+            # stop budget at readiness, while the update waits for its health.
+            change["gateway_shutdown_horizon_ms"] = self.reported_horizon
+            services.widen_service_stop_budget(self.directory, self.reported_horizon)
         if behavior == "reused-instance":
             change["service_instance_id"] = receipt["service_instance_id"]
         elif behavior == "reused-attempt":
@@ -97,6 +104,15 @@ class FakeManager:
             update_receipt(self.directory, service_cleanup_confirmed=True,
                            runtime_pid=None, process_live=False)
         return deepcopy(self.observation)
+
+
+@pytest.fixture
+def unit_from_earlier_forge(monkeypatch):
+    """The background fixture's unit carries the 397-second budget an earlier Forge wrote."""
+    plan = services.service_plan
+    def earlier(*args, **kwargs):
+        return {**plan(*args, **kwargs), "stop_timeout_seconds": 397}
+    monkeypatch.setattr(services, "service_plan", earlier)
 
 
 @pytest.fixture
@@ -670,3 +686,23 @@ async def test_exact_recorded_legacy_linux_definition_is_preserved_and_explicitl
     cap = services.background_update_capabilities(directory, read_receipt(directory))
     assert cap["background_activation_supported"] is False and "migration" in cap["reason"]
     assert path.read_bytes() == content and not manager.starts and not manager.stops
+
+
+@pytest.mark.parametrize("reported", [392_000, 432_000], ids=["meta-0.9.4", "meta-0.9.5"])
+async def test_first_update_on_an_earlier_unit_widens_its_stop_budget_without_rollback(
+        unit_from_earlier_forge, background, reported):
+    # The update was staged against the earlier unit, before any drop-in existed.
+    service, directory, target, old, private, identity, manager, definition = background
+    assert definition["stop_timeout_seconds"] == 397
+    unit = Path(definition["unit_path"]).read_bytes()
+    manager.reported_horizon = reported
+    await services.update_background(directory, manager, "update", update_id=identity)
+    current = read_receipt(directory)
+    assert current["update"]["status"] == "completed" and current["status"] == "running"
+    assert manager.starts == [service.implementation.identity] and manager.stops == []
+    budget = reported // 1000 + 20 + 10 + 5 + 15
+    drop_in = Path(definition["unit_path"] + ".d/forge-stop-budget.conf")
+    assert drop_in.read_bytes() == f"[Service]\nTimeoutStopSec={budget}\n".encode()
+    # The frozen unit and the service identity the update was staged with hold.
+    assert Path(definition["unit_path"]).read_bytes() == unit
+    assert services.service_binding(services.verify_service(directory, current)) == services.service_binding(definition)

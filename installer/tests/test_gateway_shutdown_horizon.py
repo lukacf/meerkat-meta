@@ -178,3 +178,106 @@ async def test_recorded_unit_budgets_are_exactly_the_derived_ones(background):
     for refused in (396, 398, service_budget(432_000) + 1, 3600):
         with pytest.raises(Exception, match="budget is unsupported"):
             recorded_with(refused)
+
+
+DROP_IN = "forge-stop-budget.conf"
+
+
+def earlier_unit(f, directory):
+    """Record the unit an earlier Forge wrote from the 347-second pin."""
+    service = f.service.prepare_service(directory, f.deployment.read_receipt(directory))
+    earlier = {**service, "stop_timeout_seconds": 397}
+    content = f.service.unit_bytes(earlier)
+    Path(service["unit_path"]).write_bytes(content)
+    earlier["unit_sha256"] = f.service.digest(content)
+    f.deployment.update_receipt(directory, service=earlier)
+    return earlier, content
+
+
+@pytest.mark.parametrize("background", ["darwin", "linux"], indirect=True)
+@pytest.mark.parametrize("reported", [392_000, 432_000], ids=["meta-0.9.4", "meta-0.9.5"])
+async def test_an_earlier_unit_gets_a_stop_budget_drop_in_for_the_reported_horizon(background, reported):
+    f = background
+    directory = await f.prepared()
+    earlier, content = earlier_unit(f, directory)
+    unit = Path(earlier["unit_path"])
+    widen = getattr(f.service, "widen_service_stop_budget", None)
+    assert widen is not None, "the service owner cannot widen a recorded unit's stop budget"
+    reload = widen(directory, reported)
+    receipt = f.deployment.read_receipt(directory)
+    drop_in = Path(str(unit) + ".d") / DROP_IN
+    # The frozen unit and the service identity never change.
+    assert unit.read_bytes() == content and receipt["service"] == earlier
+    assert f.service.verify_service(directory, receipt) == earlier
+    if f.platform == "darwin":
+        # launchd reads ExitTimeOut only when it loads the job: an earlier plist
+        # keeps its own until it is reinstalled.
+        assert reload is None and not drop_in.parent.exists() and "service_stop_budget" not in receipt
+        return
+    budget = service_budget(reported)
+    assert reload == ["/usr/bin/systemctl", "--user", "daemon-reload"]
+    assert drop_in.read_bytes() == f"[Service]\nTimeoutStopSec={budget}\n".encode()
+    assert receipt["service_stop_budget"] == {"gateway_shutdown_horizon_ms": reported, "stop_timeout_seconds": budget}
+    # A shorter or equal report never narrows or rewrites it.
+    before = (drop_in.read_bytes(), f.deployment.read_receipt(directory)["service_stop_budget"])
+    for again in (392_000, reported):
+        assert widen(directory, again) is None
+    assert (drop_in.read_bytes(), f.deployment.read_receipt(directory)["service_stop_budget"]) == before
+
+
+@pytest.mark.parametrize("background", ["linux"], indirect=True)
+async def test_a_unit_at_the_derived_budget_needs_no_drop_in(background):
+    f = background
+    directory = await f.prepared()
+    service = f.service.prepare_service(directory, f.deployment.read_receipt(directory))
+    assert f.service.widen_service_stop_budget(directory, gateway_horizon_ms()) is None
+    assert not Path(service["unit_path"] + ".d").exists()
+    assert "service_stop_budget" not in f.deployment.read_receipt(directory)
+
+
+@pytest.mark.parametrize("background", ["linux"], indirect=True)
+async def test_a_stop_budget_drop_in_is_verified_byte_exact(background):
+    f = background
+    directory = await f.prepared()
+    earlier, _ = earlier_unit(f, directory)
+    drop_in = Path(earlier["unit_path"] + ".d") / DROP_IN
+    f.service.widen_service_stop_budget(directory, 432_000)
+    written = drop_in.read_bytes()
+    receipt = f.deployment.read_receipt(directory)
+    # Foreign bytes in the owned drop-in control nothing.
+    drop_in.write_bytes(b"[Service]\nTimeoutStopSec=3600\n")
+    with pytest.raises(Exception, match="definition changed"):
+        f.service.verify_service(directory, receipt)
+    # Neither does a drop-in this installation never recorded.
+    drop_in.write_bytes(written)
+    unrecorded = {key: value for key, value in receipt.items() if key != "service_stop_budget"}
+    with pytest.raises(Exception, match="definition changed"):
+        f.service.verify_service(directory, unrecorded)
+    # A record whose drop-in write was interrupted stays controllable, and the
+    # next readiness completes it.
+    drop_in.unlink()
+    assert f.service.verify_service(directory, receipt) == earlier
+    assert f.service.widen_service_stop_budget(directory, 432_000) == ["/usr/bin/systemctl", "--user", "daemon-reload"]
+    assert drop_in.read_bytes() == written
+    # A forged record is refused like a forged unit budget.
+    for forged in ({"gateway_shutdown_horizon_ms": 432_000, "stop_timeout_seconds": 3600},
+                   {"gateway_shutdown_horizon_ms": "432000", "stop_timeout_seconds": 482}):
+        with pytest.raises(Exception, match="budget is unsupported"):
+            f.service.verify_service(directory, {**receipt, "service_stop_budget": forged})
+
+
+@pytest.mark.parametrize("background", ["linux"], indirect=True)
+async def test_the_manager_stop_command_outlasts_a_stop_budget_drop_in(background):
+    f = background
+    directory = await f.prepared()
+    earlier, _ = earlier_unit(f, directory)
+    f.service.widen_service_stop_budget(directory, 432_000)
+    calls = []
+    class Manager(f.service.UserServiceManager):
+        async def observe(self, service):
+            return {"loaded": True, "pid": 123, "state": "running"}
+        async def command(self, arguments, **kwargs):
+            calls.append((arguments[2:4], kwargs.get("timeout")))
+            return 0, ""
+    await Manager().stop(earlier)
+    assert calls == [(["disable", "--now"], service_budget(432_000) + 15)]

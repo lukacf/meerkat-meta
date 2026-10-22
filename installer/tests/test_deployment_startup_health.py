@@ -711,3 +711,44 @@ async def test_readiness_refuses_a_malformed_gateway_horizon(fixture, horizon):
     with pytest.raises(ValueError, match="gateway shutdown horizon"):
         await asyncio.wait_for(supervisor.start(definition, on_ready=lambda: published.append(True)), 3)
     assert not published and read_receipt(supervisor.directory).get("gateway_shutdown_horizon_ms") is None
+
+
+@pytest.mark.parametrize("service_owned", [True, False], ids=["service", "interactive"])
+async def test_service_worker_widens_its_unit_to_the_reported_horizon_at_readiness(fixture, monkeypatch, service_owned):
+    # The service-run worker is the owner that observes readiness while Forge
+    # may be closed; it widens its own unit before any stop needs the budget.
+    from launchkit import deployment_service
+    supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})],
+        readiness_extra={"gateway_shutdown_horizon_ms": 432_000})
+    supervisor.service_owned = service_owned
+    widened, reloads = [], []
+    def widen(directory, horizon_ms):
+        widened.append((directory, horizon_ms))
+        return ["/usr/bin/systemctl", "--user", "daemon-reload"]
+    class Manager:
+        async def command(self, arguments, **kwargs):
+            reloads.append(arguments)
+            return 0, ""
+    monkeypatch.setattr(deployment_service, "widen_service_stop_budget", widen, raising=False)
+    monkeypatch.setattr(deployment_service, "UserServiceManager", Manager)
+    await asyncio.wait_for(supervisor.start(definition, on_ready=supervisor.stop.set), 3)
+    # Only the service-run worker owns the unit; an interactive run has none.
+    assert widened == ([(supervisor.directory, 432_000)] if service_owned else [])
+    assert reloads == ([["/usr/bin/systemctl", "--user", "daemon-reload"]] if service_owned else [])
+
+
+async def test_a_failed_stop_budget_widening_is_logged_and_never_blocks_readiness(fixture, monkeypatch):
+    from launchkit import deployment_service
+    supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})],
+        readiness_extra={"gateway_shutdown_horizon_ms": 432_000})
+    supervisor.service_owned = True
+    def widen(directory, horizon_ms):
+        raise deployment_service.DraftConflict("The owned service definition changed. No service was controlled.")
+    monkeypatch.setattr(deployment_service, "widen_service_stop_budget", widen, raising=False)
+    published = []
+    def ready():
+        published.append(True)
+        supervisor.stop.set()
+    await asyncio.wait_for(supervisor.start(definition, on_ready=ready), 3)
+    assert published == [True]
+    assert any("stop budget" in item["text"] for item in read_receipt(supervisor.directory)["logs"])

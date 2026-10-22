@@ -1428,57 +1428,90 @@ def test_remote_readiness_horizon_is_validated_like_the_local_worker(value, expe
         assert parse(payload) == expected
 
 
-def test_remote_unit_budgets_are_exactly_the_derived_ones():
+def test_remote_unit_budgets_are_exactly_the_recognised_ones():
     module = load_helper()
-    recorded = {'gateway_shutdown_horizon_ms': 432_000}
-    # The legacy 45-second unit, the unit the 347-second pin wrote, and units
-    # derived from the recorded or the unreported horizon stay controllable.
-    for budget in (45, 397, remote_budget('service', gateway_horizon_ms()), remote_budget('service', 432_000)):
-        assert module.service_stop_timeout({**recorded, 'stop_timeout_seconds': budget}) == budget
-    for budget in (396, 398, remote_budget('service', 432_000) + 1, 3600):
+    # The legacy 45-second unit, the unit the 347-second pin wrote, and the
+    # unreported horizon's unit. A reported horizon widens a drop-in instead.
+    for budget in (45, 397, remote_budget('service', gateway_horizon_ms())):
+        assert module.service_stop_timeout({'stop_timeout_seconds': budget}) == budget
+    for budget in (396, 398, remote_budget('service', 432_000), 3600):
         with pytest.raises(ValueError, match='unsupported shutdown budget'):
-            module.service_stop_timeout({**recorded, 'stop_timeout_seconds': budget})
+            module.service_stop_timeout({'stop_timeout_seconds': budget})
 
 
-def test_remote_short_unit_is_widened_to_the_reported_horizon_and_reloaded(package, tmp_path):
+def remote_earlier_unit(module, operations):
+    """Record the unit an earlier Forge wrote from the 347-second pin."""
+    receipt = operations.prepare()
+    earlier = {**receipt, 'stop_timeout_seconds': 397}
+    content = module.unit_content(earlier)
+    Path(receipt['unit_path']).write_bytes(content)
+    earlier['unit_sha256'] = hashlib.sha256(content).hexdigest()
+    module.write_private(operations.path, earlier)
+    return earlier, content
+
+
+def remote_drop_in(receipt):
+    return Path(receipt['unit_path'] + '.d/forge-stop-budget.conf')
+
+
+def test_remote_earlier_unit_gets_a_stop_budget_drop_in_and_reload(package, tmp_path):
     module = load_helper(package / 'remote_operations.py')
     operations = fake_operations(module, package, tmp_path / 'home')
-    receipt = operations.prepare()
-    unit = Path(receipt['unit_path'])
-    # The unit an earlier Forge wrote from the 347-second pin.
-    short = {**receipt, 'stop_timeout_seconds': 397}
-    content = module.unit_content(short)
-    unit.write_bytes(content)
-    short['unit_sha256'] = hashlib.sha256(content).hexdigest()
-    module.write_private(operations.path, short)
+    earlier, content = remote_earlier_unit(module, operations)
     widen = getattr(operations, 'widen_unit', None)
     assert widen is not None, 'the destination supervisor cannot widen its unit'
     for reported in (392_000, 432_000):
         operations.calls.clear()
         assert widen(reported) is True
         receipt = operations.load()
-        assert receipt['stop_timeout_seconds'] == remote_budget('service', reported)
-        assert receipt['gateway_shutdown_horizon_ms'] == reported
-        assert f"TimeoutStopSec={remote_budget('service', reported)}\n".encode() in unit.read_bytes()
+        # The owned unit and its receipt identity never change.
+        assert Path(earlier['unit_path']).read_bytes() == content
+        assert {key: value for key, value in receipt.items() if key != 'service_stop_budget'} == earlier
+        assert receipt['service_stop_budget'] == {'gateway_shutdown_horizon_ms': reported,
+                                                  'stop_timeout_seconds': remote_budget('service', reported)}
+        assert remote_drop_in(earlier).read_bytes() == (
+            f"[Service]\nTimeoutStopSec={remote_budget('service', reported)}\n".encode())
         assert operations.calls == [['daemon-reload']]
-    # A shorter report never narrows the recorded unit.
+    # A shorter or equal report never narrows or rewrites it.
     operations.calls.clear()
-    before = (unit.read_bytes(), operations.path.read_bytes())
-    assert widen(392_000) is False
-    assert operations.calls == [] and (unit.read_bytes(), operations.path.read_bytes()) == before
+    before = (remote_drop_in(earlier).read_bytes(), operations.path.read_bytes())
+    assert widen(392_000) is False and widen(432_000) is False
+    assert operations.calls == [] and (remote_drop_in(earlier).read_bytes(), operations.path.read_bytes()) == before
 
 
-def test_remote_stop_and_restart_wait_for_the_recorded_horizon(package, tmp_path, monkeypatch):
+def test_remote_stop_budget_drop_in_is_verified_byte_exact(package, tmp_path):
+    module = load_helper(package / 'remote_operations.py')
+    operations = fake_operations(module, package, tmp_path / 'home')
+    earlier, _ = remote_earlier_unit(module, operations)
+    operations.widen_unit(432_000)
+    drop_in = remote_drop_in(earlier)
+    written, recorded = drop_in.read_bytes(), json.loads(operations.path.read_text())
+    drop_in.write_bytes(b'[Service]\nTimeoutStopSec=3600\n')
+    with pytest.raises(ValueError, match='definition changed'):
+        operations.load()
+    drop_in.write_bytes(written)
+    module.write_private(operations.path, earlier)
+    with pytest.raises(ValueError, match='definition changed'):
+        operations.load()
+    # A record whose drop-in write was interrupted stays controllable, and the
+    # next readiness completes it.
+    module.write_private(operations.path, recorded)
+    drop_in.unlink()
+    assert operations.load() == recorded
+    assert operations.widen_unit(432_000) is True and drop_in.read_bytes() == written
+    for forged in ({'gateway_shutdown_horizon_ms': 432_000, 'stop_timeout_seconds': 3600},
+                   {'gateway_shutdown_horizon_ms': '432000', 'stop_timeout_seconds': 482}):
+        module.write_private(operations.path, {**recorded, 'service_stop_budget': forged})
+        with pytest.raises(ValueError, match='unsupported shutdown budget'):
+            operations.load()
+
+
+def test_remote_stop_and_restart_wait_for_the_widened_budget(package, tmp_path, monkeypatch):
     module = load_helper(package / 'remote_operations.py')
     monkeypatch.setattr(module, 'console_healthy', lambda *args: True)
     operations = fake_operations(module, package, tmp_path / 'home')
-    receipt = operations.prepare()
-    widened = {**receipt, 'stop_timeout_seconds': remote_budget('service', 432_000),
-               'gateway_shutdown_horizon_ms': 432_000}
-    content = module.unit_content(widened)
-    Path(receipt['unit_path']).write_bytes(content)
-    widened['unit_sha256'] = hashlib.sha256(content).hexdigest()
-    module.write_private(operations.path, widened)
+    remote_earlier_unit(module, operations)
+    operations.widen_unit(432_000)
     operations.current = 'active'
     operations.stop()
     operations.start(restart=True)
@@ -1487,21 +1520,35 @@ def test_remote_stop_and_restart_wait_for_the_recorded_horizon(package, tmp_path
         ('restart', remote_budget('command', 432_000) + module.START_TIMEOUT + 10)]
 
 
+def test_remote_service_removal_also_removes_its_stop_budget_drop_in(package, tmp_path):
+    module = load_helper(package / 'remote_operations.py')
+    operations = fake_operations(module, package, tmp_path / 'home')
+    earlier, _ = remote_earlier_unit(module, operations)
+    operations.widen_unit(432_000)
+    assert operations.stop(remove=True)['status'] == 'service-removed'
+    assert not Path(earlier['unit_path']).exists() and not remote_drop_in(earlier).parent.exists()
+
+
 FIXTURE_APP_REPORTING = FIXTURE_APP.replace("payload = {'pid'", "payload = {'gateway_shutdown_horizon_ms': HORIZON, 'pid'", 1)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('reported', [432_000, '432000'], ids=['reported', 'malformed'])
+@pytest.mark.parametrize('reported, widening', [(432_000, 'widened'), (432_000, 'refused'), ('432000', 'widened')],
+                         ids=['reported', 'widening-refused', 'malformed'])
 async def test_actual_supervisor_widens_at_readiness_and_stops_within_the_reported_horizon(
-        package, tmp_path, monkeypatch, reported):
+        package, tmp_path, monkeypatch, capsys, reported, widening):
     assert FIXTURE_APP_REPORTING != FIXTURE_APP
     module = load_helper()
     operations = fixture_supervisor(package, tmp_path, module,
         FIXTURE_APP_REPORTING.replace('HORIZON', repr(reported)))
     widened, stops = [], []
     # No operating-system manager is reached: the unit widening is recorded only.
-    monkeypatch.setattr(operations, 'widen_unit', lambda horizon_ms: widened.append(horizon_ms) or True,
-                        raising=False)
+    def widen(horizon_ms):
+        widened.append(horizon_ms)
+        if widening == 'refused':
+            raise module.DestinationError('The owned service definition changed. No existing unit was replaced or controlled.')
+        return True
+    monkeypatch.setattr(operations, 'widen_unit', widen, raising=False)
     owned_stop = module.stop_supervised_application
     async def recorded_stop(process, **options):
         stops.append(options.get('horizon_ms'))
@@ -1521,4 +1568,7 @@ async def test_actual_supervisor_widens_at_readiness_and_stops_within_the_report
         assert isinstance(outcome, ValueError) and 'gateway shutdown horizon' in str(outcome)
         assert (widened, stops) == ([], [None])
     else:
+        # A refused widening is reported and never blocks readiness.
+        assert isinstance(outcome, asyncio.CancelledError)
         assert (widened, stops) == ([432_000], [432_000])
+        assert ('stop budget' in capsys.readouterr().out) is (widening == 'refused')
