@@ -14619,9 +14619,13 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// outside the roster bootstrap, such as a reset's fresh life), the
     /// identity-first context (the roster bootstrap and reconcile) and the
     /// RPC context hold, so it runs for every build the composed customizer
-    /// would have run for. A wrapper delegates `customize_build` and
-    /// `after_create` to keep what it wraps. The default returns the given
-    /// customizer unchanged.
+    /// would have run for. The default returns the given customizer unchanged.
+    ///
+    /// A wrapper must delegate `after_create` as well as `customize_build`:
+    /// [`AgentCustomizer::after_create`](crate::identity_first::AgentCustomizer::after_create)
+    /// has a no-op default, so a wrapper that overrides only `customize_build`
+    /// still compiles and silently drops the wrapped `after_create`: the SDK's
+    /// `after_create` callback, and agent memory's when that is configured.
     ///
     /// - `Some` -> `Ok(Some)`: the returned customizer is installed; it may
     ///   wrap the given one.
