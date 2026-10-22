@@ -1257,6 +1257,15 @@ def kept_native_inventory(directory):
 
 def run_child(directory, selection_path, selection_sha256, lifecycle_id=None, *,
         owner_source=None, owner_source_sha256=None):
+    import time
+    started = time.monotonic()
+
+    def phase(name):
+        # One timestamped line per startup phase in the worker's captured
+        # output, so a slow Start can be split by phase. Nothing reads it.
+        print(f"forge-child-phase: {name} +{time.monotonic() - started:.3f}s", file=sys.stderr, flush=True)
+
+    phase("entered")
     wrapper = InstalledBootstrapFactory(Path(directory),
         {"path": selection_path, "sha256": selection_sha256}, lifecycle_id=lifecycle_id,
         owner_source=owner_source, owner_source_sha256=owner_source_sha256)
@@ -1286,6 +1295,7 @@ def run_child(directory, selection_path, selection_sha256, lifecycle_id=None, *,
     except startup_refusals() as error:
         report_startup_refusal(error)
         raise
+    phase("custody-observed")
     wrapper.require_selection_current()
     model_configuration = observation.model_configuration
     if model_configuration is not None:
@@ -1300,6 +1310,7 @@ def run_child(directory, selection_path, selection_sha256, lifecycle_id=None, *,
         ("meerkat_meta.builder", "meerkat_toolkit.host_control", "meerkat_toolkit.application_runtime"))
     for name in imports:
         importlib.import_module(name)
+    phase("sdk-imported")
     observation.require_current()
     wrapper.require_selection_current()
     if model_configuration is not None:
@@ -1308,11 +1319,13 @@ def run_child(directory, selection_path, selection_sha256, lifecycle_id=None, *,
     app = importlib.import_module("app")
     if Path(app.__file__).absolute() != destination / "app.py":
         raise CustodyError("The trusted bootstrap selected another application module.")
+    phase("app-imported")
     observation.require_current()
     wrapper.require_selection_current()
     if model_configuration is not None:
         model_configuration.require_environment()
     sys.argv = [str(destination / "app.py")]
+    phase("app-main")
     try:
         app.main(application_startup_factory=wrapper if relocated else factory)
     except startup_refusals() as error:
