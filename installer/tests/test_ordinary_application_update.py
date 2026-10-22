@@ -250,3 +250,56 @@ async def test_stage_blocks_a_helperless_update_that_changes_native_instructions
         await service.shutdown()
     assert update["status"] == "blocked" and updates.ORDINARY_REPLACEMENT_BLOCKER in update["blockers"]
     assert update["native_definition_update"] is True
+
+
+async def test_helperless_owner_keeps_its_refusal_for_a_source_its_updates_do_not_reach(
+        ordinary_registry, monkeypatch):
+    """A broken chain of the installation's own updates keeps the owner's own refusal."""
+    f = await installed(ordinary_registry, monkeypatch)
+    update = await staged_continuation(f)
+    await run_worker(f, monkeypatch, "update", await apply(f, update))
+    journal = updates.update_directory(f.directory, update["update_id"]) / "update.json"
+    journal.rename(journal.with_name("update.json.moved"))
+    with pytest.raises(CustodyError) as refused:
+        f.registry.selected_host(f.guide_id, f.directory.name)
+    assert "cannot be redirected to another build or source owner" in str(refused.value)
+    assert "original setup" not in str(refused.value)
+
+
+async def test_apply_refuses_an_earlier_staged_helperless_update_that_changes_native_inputs(
+        ordinary_registry, monkeypatch):
+    """A transaction staged by an earlier Forge, whose Stage had no mode for this application.
+
+    It records a native input change but no blocker. Apply refuses it before
+    any worker, as Stage now blocks it.
+    """
+    f = await installed(ordinary_registry, monkeypatch)
+    second = await build(f, f.saved, "Improve the requested local job.", previous=f.first)
+    await accept_source_fixture(f, second)
+    original, first_build = updates.prepare_stage, f.first["build_id"]
+
+    def earlier_stage(directory, payload, report, *, runtime_target=None, restore_selection=None,
+            setup_blockers=(), ordinary_owner=False):
+        return original(directory, payload, report, runtime_target=runtime_target,
+            restore_selection=restore_selection)
+
+    def carrier(files):
+        # The installed package predates the host instruction carrier; the candidate has it.
+        return json.loads(files["implementation-report.json"][0])["build_id"] != first_build
+
+    with monkeypatch.context() as patch:
+        patch.setattr(updates, "prepare_stage", earlier_stage)
+        patch.setattr(updates, "has_host_instruction_carrier", carrier)
+        staged = await f.service.stage_update(f.guide_id, f.directory.name, f.saved["version"],
+            second["build_id"])
+    update = staged["update"]
+    assert update["status"] == "staged" and update["blockers"] == [] and update["host_instruction_update"] is True
+    keys = ("status", "build_id", "package_sha256", "update", "update_action")
+    before = deployment.read_receipt(f.directory)
+    f.service.launched.clear()
+    with pytest.raises(CustodyError, match="changes the application's native definition, instructions or runtime"):
+        await f.service.action(f.guide_id, f.directory.name, "apply-update", update["update_id"],
+            action_request_id=str(uuid4()))
+    assert not f.service.launched
+    after = deployment.read_receipt(f.directory)
+    assert {key: after.get(key) for key in keys} == {key: before.get(key) for key in keys}

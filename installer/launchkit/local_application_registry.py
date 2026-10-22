@@ -21,8 +21,8 @@ from .deployment import DeploymentService, read_receipt
 from .deployment_application_bootstrap import (FRESH_ENTRY_NAME, bootstrap_installation_binding,
     require_owner_installation, same_installation_apart_from_staged_update)
 from .deployment_sources import read_package_source
-from .deployment_updates import (FIRST_SETUP_UPDATE, ORDINARY_OWNER_BLOCKER, OWNER_RECONNECT_UPDATE,
-    checked_package, inspect_transaction, _candidate_source_selection, _same_toml)
+from .deployment_updates import (FIRST_SETUP_UPDATE, ORDINARY_OWNER_BLOCKER, ORDINARY_REPLACEMENT_BLOCKER,
+    OWNER_RECONNECT_UPDATE, checked_package, inspect_transaction, _candidate_source_selection, _same_toml)
 from .forge_application_host import ForgeApplicationHost, application_setup_binding, owner_choices_match
 from .guide_store import GuideStore
 from .implementation import ImplementationService
@@ -652,6 +652,10 @@ class LocalApplicationRegistry:
         directory = self.deployment._directory(guide_id, deployment_id)
         if type(host) is OrdinaryApplicationHost:
             _, root, update = inspect_transaction(directory, update_id)
+            # An earlier Forge staged without these blockers; refuse what Stage now blocks.
+            if any(update.get(name) for name in ("native_definition_update", "host_instruction_update",
+                    "runtime_dependency_update", "maintained_host_update")):
+                raise CustodyError(ORDINARY_REPLACEMENT_BLOCKER)
             _, files = checked_package(root, "candidate.zip", update["package_sha256"])
             if (not owner_choices_match(host, files) or not self.continues_installed_source(
                     guide_id, deployment_id, update["to_build_id"], update["source_digest"])):
