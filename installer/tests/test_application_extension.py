@@ -1005,7 +1005,7 @@ async def test_dynamic_roster_derives_class_authority_and_copies_complete_snapsh
         "context": {"record": "one", "role": "data only", "tools": {"workspace": True}}})
     application.integration.edges = [{"a": "lead:main", "b": "lead:synthetic-one"}]
     await application._prepare_snapshot()
-    agents, roster, edges = application._snapshot
+    agents, roster, edges = application._snapshot[:3]
     created = next(row for row in roster if row.identity == "lead:synthetic-one")
     lead = next(row for row in spec["classes"] if row["id"] == "lead")
     assert created.profile == spec["applicationProfiles"]["lead"]
@@ -1130,6 +1130,109 @@ async def test_actual_sdk_provider_customizer_scopes_same_class_on_create_and_re
     with pytest.raises(ValueError, match="no handler"):
         await dispatcher.handle_callback("callback/call_tool", {"scope_id": "fresh-one", "tool": "record_state", "arguments": {}})
     assert await dispatcher.handle_callback("callback/call_tool", {"scope_id": "fresh-two", "tool": "record_state", "arguments": {}}) == two
+
+
+async def test_admitting_identity_is_buildable_but_not_projected(tmp_path, monkeypatch):
+    from meerkat_mobkit.agent_builder import CallbackDispatcher
+    _, application, spec = await dynamic_host(tmp_path, monkeypatch)
+    pending = {"identity": "lead:pending", "classId": "lead", "context": {"record": "private-pending"}}
+    application.integration.admission_roster = lambda: {"listed": application.integration.rows, "admitting": [pending]}
+    await application._prepare_snapshot()
+    dispatcher = CallbackDispatcher()
+    dispatcher.register_agent_customizer(application)
+    assert pending["identity"] not in {row.identity for row in await application.roster(None)}
+    assert pending["identity"] not in application.integration.targets
+    buildable = next(row for row in application._snapshot.buildable_specs if row.identity == pending["identity"])
+    assert buildable.profile == spec["applicationProfiles"]["lead"]
+    assert buildable.profile != application._snapshot[0]["lead:main"]["profile"]
+    await dispatcher.handle_callback("callback/agent_customizer/customize_build", {
+        "scope_id": "held-pending", "context": {"identity": pending["identity"]}, "spec": buildable.to_dict(),
+        "draft": {"labels": {"agent_identity": pending["identity"]}}})
+    result = await dispatcher.handle_callback("callback/call_tool", {
+        "scope_id": "held-pending", "tool": "record_state", "arguments": {}})
+    assert result["content"]["identity"] == pending["identity"]
+    assert result["content"]["context"] == {"record": "private-pending"}
+    assert result["content"]["tools"] == spec["classes"][0]["tools"]
+    pending["context"]["record"] = "mutated"
+    assert buildable.context == {"record": "private-pending"}
+    assert await application.compute_edges(["lead:main", "lead:pending"], None) == []
+
+
+async def test_admission_snapshot_uses_one_read_for_both_partitions(tmp_path, monkeypatch):
+    _, application, _ = await dynamic_host(tmp_path, monkeypatch)
+    reads = []
+    def legacy_read():
+        raise AssertionError("Do not mix a separate listed read with the admission snapshot.")
+    async def snapshot():
+        reads.append("one app transaction")
+        await asyncio.sleep(0)
+        return {"listed": application.integration.rows,
+                "admitting": [{"identity": "lead:pending", "classId": "lead"}]}
+    application.integration.desired_roster = legacy_read
+    application.integration.admission_roster = snapshot
+    await application._prepare_snapshot()
+    assert reads == ["one app transaction"]
+    assert "lead:pending" not in {row.identity for row in await application.roster(None)}
+    assert "lead:pending" in application._snapshot.buildable_agents
+
+
+async def test_projection_refresh_completes_while_native_reconcile_is_parked(tmp_path, monkeypatch):
+    _, application, _ = await dynamic_host(tmp_path, monkeypatch)
+    pending = [{"identity": "lead:pending", "classId": "lead"}]
+    application.integration.admission_roster = lambda: {"listed": application.integration.rows, "admitting": pending}
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def reconcile():
+        entered.set()
+        await release.wait()
+        return {"source": "test runtime"}
+    runtime = SimpleNamespace(is_running=True, reconcile=reconcile)
+    application.context.runtime = runtime
+    task = asyncio.create_task(application.reconcile_agents())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert application._reconcile_lock.locked()
+        assert "lead:pending" not in {row.identity for row in await application.roster(None)}
+        application.integration.rows.append(pending.pop())
+        await asyncio.wait_for(application._prepare_snapshot(runtime=runtime), 1)
+        assert application._reconcile_lock.locked()
+        assert "lead:pending" in {row.identity for row in await application.roster(None)}
+    finally:
+        release.set()
+        await task
+
+
+@pytest.mark.parametrize("case", ["seed", "duplicate", "profile", "unknown-class", "edge", "not-list", "schema"])
+async def test_admitting_rows_cannot_weaken_roster_or_tool_validation(tmp_path, monkeypatch, case):
+    _, application, _ = await dynamic_host(tmp_path, monkeypatch)
+    pending = {"identity": "lead:pending", "classId": "lead"}
+    rows = [pending]
+    if case == "seed":
+        rows = [copy.deepcopy(application.integration.rows[0])]
+        application.integration.rows = application.integration.rows[1:]
+    elif case == "duplicate":
+        application.integration.rows.append(copy.deepcopy(pending))
+    elif case == "profile":
+        pending["profile"] = "lead__main"
+    elif case == "unknown-class":
+        pending["classId"] = "uncompiled"
+    elif case == "edge":
+        application.integration.edges = [{"a": "lead:main", "b": "lead:pending"}]
+    elif case == "not-list":
+        rows = {"pending": pending}
+    elif case == "schema":
+        hook = application.integration.tools_for_agent
+        def tools(agent):
+            result = hook(agent)
+            if agent["identity"] == "lead:pending":
+                result[0]["schema"] = {"type": "string"}
+            return result
+        application.integration.tools_for_agent = tools
+    application.integration.admission_roster = lambda: {"listed": application.integration.rows, "admitting": rows}
+    snapshot = application._snapshot
+    with pytest.raises(ValueError):
+        await application._prepare_snapshot()
+    assert application._snapshot is snapshot
+    assert "lead:pending" not in application._identity_classes
 
 
 async def test_customizer_refuses_wrong_adopted_spec_and_stale_hook_completion(tmp_path, monkeypatch):

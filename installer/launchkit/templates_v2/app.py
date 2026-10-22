@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import namedtuple
 import copy
 import hashlib
 import importlib.machinery
@@ -351,6 +352,10 @@ def identity_models(*, native=False):
     return identity_first_models
 
 
+_ApplicationSnapshot = namedtuple("_ApplicationSnapshot", (
+    "agents", "specs", "edges", "buildable_agents", "buildable_specs"))
+
+
 class Application:
     """Load trusted package code and its exact per-agent callback tools."""
 
@@ -363,6 +368,7 @@ class Application:
         self.dynamic = False
         self._snapshot = None
         self._reconcile_lock = asyncio.Lock()
+        self._projection_lock = asyncio.Lock()
         self._tool_catalog = {}
         self._identity_classes = {}
         self._native_tools = None
@@ -478,7 +484,7 @@ class Application:
             self.integration = await await_value(factory(self.context))
             if self.integration is None:
                 raise ValueError("application.build(context) must return an integration object.")
-            for name in ("tools_for_agent", "select_host_tools", "schedule_runnables", "start", "stop", "on_console_input", "desired_roster", "desired_edges", "frontend_management", "controller_review_factory", "console_login_factory"):
+            for name in ("tools_for_agent", "select_host_tools", "schedule_runnables", "start", "stop", "on_console_input", "desired_roster", "admission_roster", "desired_edges", "frontend_management", "controller_review_factory", "console_login_factory"):
                 hook = getattr(self.integration, name, None)
                 if hook is not None and not callable(hook):
                     raise ValueError(f"Application {name} must be callable.")
@@ -519,6 +525,8 @@ class Application:
             if roster != edges:
                 raise ValueError("Application desired_roster and desired_edges must be provided together.")
             self.dynamic = roster
+            if getattr(self.integration, "admission_roster", None) is not None and not self.dynamic:
+                raise ValueError("Application admission_roster requires desired_roster and desired_edges.")
             if self.dynamic and self._tool_policy_selection is not None:
                 raise ValueError("Explicit application tool policy currently requires a fixed durable roster.")
             if self.dynamic:
@@ -617,6 +625,12 @@ class Application:
         return json.dumps(cls._json_copy(value, label), sort_keys=True, ensure_ascii=True, allow_nan=False)
 
     async def _prepare_snapshot(self, *, initial=False, runtime=None):
+        """Validate an application-owned view without creating native members.
+
+        admission_roster() reads listed and admitting rows together from the
+        application's store. Only listed rows feed native roster/topology reads;
+        both partitions can supply the exact spec for a held native build.
+        """
         models = identity_models(native=self._native_identity_models or self._application_callbacks is not None)
         DurableAgentSpec, ManagedPeerEdge = models.DurableAgentSpec, models.ManagedPeerEdge
 
@@ -629,18 +643,32 @@ class Application:
                 or len(set(profiles.values())) != len(profiles)
                 or set(profiles.values()) & {item["profile"] for item in fixed.values()}):
             raise ValueError("Dynamic application identities need compiled reusable applicationProfiles. Rebuild through Forge; do not clone fixed member profiles.")
-        rows = self._json_copy(await await_value(self.integration.desired_roster()), "Application desired roster")
-        if not isinstance(rows, list):
-            raise ValueError("Application desired_roster must return a complete list.")
+        admission_roster = getattr(self.integration, "admission_roster", None)
+        if admission_roster is None:
+            rows = self._json_copy(await await_value(self.integration.desired_roster()), "Application desired roster")
+            if not isinstance(rows, list):
+                raise ValueError("Application desired_roster must return a complete list.")
+            pending = []
+        else:
+            # One application-owned read must capture both partitions. Separate
+            # awaited reads could omit an identity during an admitting-to-listed move.
+            partitions = self._json_copy(await await_value(admission_roster()), "Application admission roster")
+            if (not isinstance(partitions, dict) or set(partitions) != {"listed", "admitting"}
+                    or not isinstance(partitions["listed"], list) or not isinstance(partitions["admitting"], list)):
+                raise ValueError("Application admission_roster must return complete listed and admitting lists together.")
+            rows, pending = partitions["listed"], partitions["admitting"]
         agents, specs = {}, []
+        projected = {}
         allowed = {"identity", "classId", "display_name", "labels", "context", "additional_instructions"}
-        for row in rows:
+        for row, listed in [(row, True) for row in rows] + [(row, False) for row in pending]:
             if not isinstance(row, dict) or set(row) - allowed:
                 raise ValueError("Desired identity rows may not override native profile, model, grants or authority.")
             identity, class_id = row.get("identity"), row.get("classId")
             if not isinstance(identity, str) or not isinstance(class_id, str) or class_id not in classes or identity in agents:
                 raise ValueError("Desired identities need a unique identity and an existing compiled classId.")
             original = fixed.get(identity)
+            if original and not listed:
+                raise ValueError("A compiled seed identity cannot await class admission.")
             if original and class_id != original["classId"]:
                 raise ValueError("A compiled seed identity cannot change class or profile.")
             labels = row.get("labels", {})
@@ -664,16 +692,18 @@ class Application:
                 addressability="addressable", runtime_mode_override="turn_driven", labels={**labels, **authority_labels},
                 context=copy.deepcopy(row.get("context")), additional_instructions=identity_instructions + instructions))
             agents[identity] = agent
-        if set(fixed) - set(agents):
+            if listed:
+                projected[identity] = agent
+        if set(fixed) - set(projected):
             raise ValueError("The complete desired roster must retain every compiled seed identity and fixed flow target.")
-        edges = self._json_copy(await await_value(self.integration.desired_edges(list(agents))), "Application desired edges")
+        edges = self._json_copy(await await_value(self.integration.desired_edges(list(projected))), "Application desired edges")
         if not isinstance(edges, list):
             raise ValueError("Application desired_edges must return native edge rows.")
         managed, seen = [], set()
         for edge in edges:
             if (not isinstance(edge, dict) or set(edge) != {"a", "b"}
                     or not isinstance(edge["a"], str) or not isinstance(edge["b"], str)
-                    or edge["a"] not in agents or edge["b"] not in agents):
+                    or edge["a"] not in projected or edge["b"] not in projected):
                 raise ValueError("Desired peer edges must reference this exact desired roster.")
             value = ManagedPeerEdge(a=edge["a"], b=edge["b"])
             key = (value.a, value.b)
@@ -698,13 +728,17 @@ class Application:
             names = [tool["name"] for tool in callbacks]
             if len(set(names)) != len(names):
                 raise ValueError("Application callback collides with another tool for this exact identity.")
-        if self._snapshot is not previous_snapshot:
-            raise ValueError("The desired roster changed during identity callback validation.")
-        if runtime is not None and (self.context.runtime is not runtime or not runtime.is_running):
-            raise RuntimeError("The application native runtime changed during desired identity validation.")
-        self._tool_catalog = catalog
-        self._identity_classes.update({identity: agent["classId"] for identity, agent in agents.items()})
-        self._snapshot = (agents, specs, managed)
+        # Publish one validated view. Never hold this lock while consulting
+        # application code or waiting for the native reconciliation controller.
+        async with self._projection_lock:
+            if self._snapshot is not previous_snapshot:
+                raise ValueError("The desired roster changed during identity callback validation.")
+            if runtime is not None and (self.context.runtime is not runtime or not runtime.is_running):
+                raise RuntimeError("The application native runtime changed during desired identity validation.")
+            self._tool_catalog = catalog
+            self._identity_classes.update({identity: agent["classId"] for identity, agent in agents.items()})
+            self._snapshot = _ApplicationSnapshot(projected,
+                [spec for spec in specs if spec.identity in projected], managed, agents, specs)
 
     async def reconcile_agents(self):
         runtime = self.context.runtime
@@ -725,7 +759,8 @@ class Application:
             self._application_callbacks.observe_roster_context(context)
         DurableAgentSpec = identity_models(native=self._native_identity_models or self._application_callbacks is not None).DurableAgentSpec
         if self.dynamic:
-            return copy.deepcopy(self._snapshot[1])
+            async with self._projection_lock:
+                return copy.deepcopy(self._snapshot.specs)
         classes = {item["id"]: item for item in self.deployment["classes"]}
         return [DurableAgentSpec(identity=item["identity"], profile=item["profile"],
             display_name=item["name"], addressability="addressable", runtime_mode_override="turn_driven",
@@ -735,15 +770,20 @@ class Application:
     async def compute_edges(self, target_identities, context):
         ManagedPeerEdge = identity_models(native=self._native_identity_models or self._application_callbacks is not None).ManagedPeerEdge
         admitted = set(target_identities)
-        edges = self._snapshot[2] if self.dynamic else [ManagedPeerEdge(a=a, b=b) for a, b in self.deployment["connections"]]
+        if self.dynamic:
+            async with self._projection_lock:
+                edges = self._snapshot.edges
+        else:
+            edges = [ManagedPeerEdge(a=a, b=b) for a, b in self.deployment["connections"]]
         return copy.deepcopy([edge for edge in edges if edge.a in admitted and edge.b in admitted])
 
     async def customize_build(self, context, spec, draft):
         if not self.dynamic or context.identity != spec.identity:
             raise ValueError("Application callback build needs the exact adopted desired identity.")
-        snapshot = self._snapshot
-        agent = snapshot[0].get(spec.identity)
-        expected = next((item for item in snapshot[1] if item.identity == spec.identity), None)
+        async with self._projection_lock:
+            snapshot = self._snapshot
+        agent = snapshot.buildable_agents.get(spec.identity)
+        expected = next((item for item in snapshot.buildable_specs if item.identity == spec.identity), None)
         if (agent is None or expected is None
                 or self._json_signature(spec.to_dict(), "Native adopted identity")
                 != self._json_signature(expected.to_dict(), "Validated desired identity")):
@@ -754,7 +794,7 @@ class Application:
 
     async def _identity_callbacks(self, identity, snapshot):
         """Build current callbacks for one identity in a validated snapshot."""
-        agent = snapshot[0].get(identity)
+        agent = snapshot.buildable_agents.get(identity)
         if agent is None:
             raise ValueError("Application callbacks need an exact validated desired identity.")
         tools = await self.tools_for_agent(agent)
