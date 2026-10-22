@@ -167,8 +167,8 @@ async def test_after_a_forge_restart_apply_waits_for_the_reconnected_helperless_
     monkeypatch.setattr(service, "_launch",
         lambda directory, mode, **kwargs: service.launched.append((directory, mode, kwargs)))
     try:
-        # Before the owner reconnects, Apply refuses before any worker.
-        with pytest.raises(CustodyError, match="needs its retained original host"):
+        # Before the owner reconnects, Apply refuses before any worker and says how to reconnect.
+        with pytest.raises(CustodyError, match="has not reconnected this application since it restarted"):
             await service.action(f.guide_id, f.directory.name, "apply-update", update["update_id"],
                 action_request_id=str(uuid4()))
         assert not service.launched

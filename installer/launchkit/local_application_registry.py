@@ -21,8 +21,8 @@ from .deployment import DeploymentService, read_receipt
 from .deployment_application_bootstrap import (FRESH_ENTRY_NAME, bootstrap_installation_binding,
     require_owner_installation, same_installation_apart_from_staged_update)
 from .deployment_sources import read_package_source
-from .deployment_updates import (FIRST_SETUP_UPDATE, ORDINARY_OWNER_BLOCKER, checked_package,
-    inspect_transaction, _candidate_source_selection, _same_toml)
+from .deployment_updates import (FIRST_SETUP_UPDATE, ORDINARY_OWNER_BLOCKER, OWNER_RECONNECT_UPDATE,
+    checked_package, inspect_transaction, _candidate_source_selection, _same_toml)
 from .forge_application_host import ForgeApplicationHost, application_setup_binding, owner_choices_match
 from .guide_store import GuideStore
 from .implementation import ImplementationService
@@ -643,7 +643,11 @@ class LocalApplicationRegistry:
         and that owner must accept the staged candidate's protected choices and
         source. A product application that has not entered its setup has no
         update worker that could start it, so Apply refuses before any worker.
+        After a Forge restart, an owner that only a claimed setup action can
+        reconnect is named as such before any lookup.
         """
+        if self._reconnect_status(self.deployment, guide_id, deployment_id) is not None:
+            raise CustodyError(OWNER_RECONNECT_UPDATE)
         host = self.selected_host(guide_id, deployment_id)
         directory = self.deployment._directory(guide_id, deployment_id)
         if type(host) is OrdinaryApplicationHost:

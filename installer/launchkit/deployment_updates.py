@@ -2014,6 +2014,8 @@ ORDINARY_OWNER_BLOCKER = ("This update is not built from the installed applicati
     "to an application without a setup helper. Keep the installed build, or install the new build into a new folder.")
 FIRST_SETUP_UPDATE = ("This application has not finished its setup, so it cannot take a staged update in "
     "place yet. Its installed application is unchanged. Finish its setup, then stage the accepted update again.")
+OWNER_RECONNECT_UPDATE = ("Forge has not reconnected this application since it restarted. Its installed "
+    "application is unchanged. Use Continue setup once, then apply the update again.")
 
 
 SETUP_RESTORE_NAME = "setup-restore.json"
