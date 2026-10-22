@@ -121,6 +121,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   remote controller, hashing and unpacking the accepted package, archiving
   its source, saving a remote installation's copy of it and a product's
   control bundle, and comparing a local installation's files.
+- Meta Forge refuses a Meta/Toolkit product application installation on a
+  Linux computer whose glibc is older than the product declares, before
+  anything is installed. The product's resource build record states the
+  oldest glibc its native programs run on (glibc 2.39 for the 0.9.4
+  product). Forge offered Fresh install on an older glibc, such as 2.35,
+  and installed an application that then failed when it started. The
+  refusal names both glibc versions.
 
 ### Known limitations
 
