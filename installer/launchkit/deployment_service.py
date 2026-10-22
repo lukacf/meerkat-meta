@@ -561,7 +561,8 @@ class UserServiceManager:
 def _service_health_current(current, expected):
     from .deployment_updates import inspection_binding, _same_toml
     return (_same_toml(inspection_binding(current), inspection_binding(expected))
-            and _same_toml(current.get("bootstrap"), expected.get("bootstrap")))
+            and _same_toml(current.get("bootstrap"), expected.get("bootstrap"))
+            and _same_toml(current.get("admission_health"), expected.get("admission_health")))
 
 
 def _record_service_observation(directory, service, public, observation, *, expected_receipt, detail=None):
@@ -585,6 +586,7 @@ def _record_service_observation(directory, service, public, observation, *, expe
 async def background_status(directory, manager):
     """Read actual manager ownership; never revive a saved PID or readiness flag."""
     from .deployment import now, package_files, read_receipt, verify_destination
+    from .admission_health import retained_pending_admission
     directory = Path(directory)
     receipt = read_receipt(directory)
     inspected_receipt = receipt
@@ -602,7 +604,11 @@ async def background_status(directory, manager):
             return {**receipt, "process_live": False, "health": "unknown", "console_url": None}
         observed_pid = observation.get("pid")
         matching = bool(observed_pid and observed_pid == receipt.get("service_supervisor_pid"))
-        confirmed = matching and receipt["status"] == "running" and receipt.get("runtime_pid") and receipt.get("bootstrap")
+        pending = bool(matching and receipt["status"] == "starting" and receipt.get("runtime_pid")
+            and receipt.get("process_live") is True and receipt.get("health") == "pending"
+            and retained_pending_admission(receipt) is not None)
+        confirmed = (matching and receipt["status"] == "running" and receipt.get("runtime_pid")
+            and receipt.get("bootstrap") and receipt.get("admission_health") is None)
         healthy = False
         if confirmed:
             definition = json.loads(files["deployment.json"][0])
@@ -622,8 +628,9 @@ async def background_status(directory, manager):
             except Exception:
                 healthy = False
         changes = {"service_observation": {**observation, "checked_at": now(), "owned": True},
-                   "process_live": bool(confirmed), "health": "ready" if healthy else "unavailable",
-                   "console_url": url if healthy else None, "health_checked_at": now()}
+                   "process_live": bool(confirmed or pending), "health": "ready" if healthy else "pending" if pending else "unavailable",
+                   "console_url": url if healthy else None,
+                   "health_checked_at": receipt.get("health_checked_at") if pending else now()}
         if observed_pid and not matching:
             changes.update(status="starting", runtime_pid=None, bootstrap=None)
         elif not observed_pid:

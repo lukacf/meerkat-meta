@@ -30,6 +30,33 @@ def project(state, receipt):
     return project_deployment_evidence(state, receipt, now=NOW)
 
 
+def test_fresh_owned_pending_admission_projects_counts_without_claiming_readiness():
+    from test_admission_health import pending_payload
+    state, receipt = sample()
+    pending = pending_payload()
+    attempt = "12345678-1234-1234-1234-123456789abc"
+    receipt.update(status="starting", health="pending", console_url=None,
+        startup_attempt_id=attempt, bootstrap=pending["bootstrap"],
+        admission_health={"attempt_id": attempt, **pending["admission"]})
+    before = copy.deepcopy(receipt)
+    evidence = project(state, receipt)
+    assert evidence["admission_health"] == {"status": "pending", "admitting_count": 0, "owed_count": 1}
+    assert not evidence["native_runtime_available"]
+    assert "Open your Console" not in evidence["suggested_actions"]
+    assert "private native detail" not in str(evidence) and "project:one" not in str(evidence)
+    assert receipt == before
+    for change in ({"process_live": False}, {"source_verified": False}, {"status": "failed"},
+                   {"health_checked_at": (NOW - timedelta(seconds=31)).isoformat()},
+                   {"startup_attempt_id": "different"}):
+        assert project(state, {**receipt, **change})["admission_health"] is None
+
+
+def test_pending_marker_cannot_be_overridden_by_stale_ready_flags():
+    state, receipt = sample()
+    receipt["admission_health"] = {"admitting": ["project:one"], "owed": []}
+    assert not project(state, receipt)["native_runtime_available"]
+
+
 def test_owned_native_runtime_does_not_certify_application_or_connections():
     state, receipt = sample()
     before = copy.deepcopy((state, receipt))

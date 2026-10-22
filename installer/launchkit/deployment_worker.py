@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 from .deployment import (MAX_PACKAGE_BYTES, await_validation, journal, materialize, now, package_files, read_receipt,
                          parse_setting, update_receipt, verify_destination)
 from .projects import DraftConflict
+from .admission_health import NativeAdmissionPending, pending_admission
 from .templates.storage_setup import project_lock
 from .deployment_deadlines import APPLICATION_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOUT
 from .deployment_ports import require_available_console_port, LocalConsolePortUnavailable
@@ -120,18 +121,30 @@ class Redactor:
 
 
 def readiness(payload, definition, expected_pid, port):
-    if not isinstance(payload, dict) or payload.get("pid") != expected_pid:
+    if not isinstance(payload, dict) or type(payload.get("pid")) is not int or payload["pid"] != expected_pid:
         raise ValueError("The application did not provide owned startup evidence.")
     bootstrap = payload.get("bootstrap")
     expected = {item["identity"] for item in definition["agents"]}
+    if not isinstance(bootstrap, dict) or not isinstance(bootstrap.get("identities"), dict) or not expected.issubset(bootstrap["identities"]):
+        raise ValueError("The native startup observation omitted a configured agent.")
+    url = payload.get("console_url", "")
+    if not isinstance(url, str):
+        raise ValueError("The native console does not match this deployment.")
+    parsed = urlparse(url)
+    if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port != port
+            or parsed.path != "/console" or parsed.query or parsed.fragment
+            or parsed.username is not None or parsed.password is not None):
+        raise ValueError("The native console does not match this deployment.")
+    if "admission" in payload:
+        admission = pending_admission(bootstrap, payload["admission"], seeds=expected)
+        if admission is not None:
+            raise NativeAdmissionPending(bootstrap, admission)
     if (not isinstance(bootstrap, dict) or bootstrap.get("complete") is not True
-            or bootstrap.get("ready") is not True or bootstrap.get("counts", {}).get("broken") != 0
+            or bootstrap.get("ready") is not True
+            or not isinstance(bootstrap.get("counts"), dict)
+            or type(bootstrap["counts"].get("broken")) is not int or bootstrap["counts"]["broken"] != 0
             or not expected.issubset(bootstrap.get("identities", {}))):
         raise ValueError("The native agents did not finish bootstrap.")
-    url = payload.get("console_url", "")
-    parsed = urlparse(url)
-    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port != port or parsed.path != "/console":
-        raise ValueError("The native console does not match this deployment.")
     return bootstrap, url
 
 
@@ -1254,6 +1267,7 @@ class Supervisor:
         attempt_id = str(uuid.uuid4())
         journal(self.directory, "Starting your application and bootstrapping its native agents.",
                 status="starting", phase="start", startup_attempt_id=attempt_id, startup_console_health=None,
+                admission_health=None,
                 startup_port_observation={**observation, "attempt_id": attempt_id,
                     "deployment_id": current["deployment_id"], "package_sha256": current["package_sha256"]},
                 **({"startup_candidate_runtime_proof": candidate_proof} if candidate_proof is not None else {}),
@@ -1305,24 +1319,41 @@ class Supervisor:
         try:
             if cancelled or self.stop.is_set():
                 raise asyncio.CancelledError
-            done, _ = await asyncio.wait({started, exited, stopped}, timeout=START_TIMEOUT, return_when=asyncio.FIRST_COMPLETED)
-            if stopped in done:
-                raise asyncio.CancelledError
-            if exited in done:
-                raise RuntimeError(f"The application stopped before startup verification (exit {process.returncode}).")
-            if started not in done:
-                raise TimeoutError("The application did not finish native startup verification in time. Rebuild a package with the current host if it lacks Forge readiness reporting.")
-            startup = started.result()
-            if not startup:
-                raise RuntimeError("The application closed its startup verification channel before reporting readiness. Inspect the runtime logs for the native startup failure.")
-            try:
-                payload = json.loads(startup)
-            except (ValueError, UnicodeError):
-                raise ValueError("The application returned invalid startup evidence. Inspect the runtime logs and rebuild the checked package.") from None
-            bootstrap, url = readiness(payload, definition, process.pid, self.port)
+            startup_timeout = START_TIMEOUT
+            while True:
+                done, _ = await asyncio.wait({started, exited, stopped}, timeout=startup_timeout, return_when=asyncio.FIRST_COMPLETED)
+                if stopped in done:
+                    raise asyncio.CancelledError
+                if exited in done:
+                    raise RuntimeError(f"The application stopped before startup verification (exit {process.returncode}).")
+                if started not in done:
+                    raise TimeoutError("The application did not finish native startup verification in time. Rebuild a package with the current host if it lacks Forge readiness reporting.")
+                startup = started.result()
+                if not startup:
+                    raise RuntimeError("The application closed its startup verification channel before reporting readiness. Inspect the runtime logs for the native startup failure.")
+                try:
+                    payload = json.loads(startup)
+                except (ValueError, UnicodeError):
+                    raise ValueError("The application returned invalid startup evidence. Inspect the runtime logs and rebuild the checked package.") from None
+                try:
+                    bootstrap, url = readiness(payload, definition, process.pid, self.port)
+                except NativeAdmissionPending as pending:
+                    journal(self.directory, "Waiting for agent admission to finish. Your application is not ready yet.",
+                        status="starting", phase="start", bootstrap=pending.bootstrap,
+                        admission_health={"attempt_id": attempt_id, **pending.admission},
+                        console_url=None, runtime_pid=process.pid, process_live=True,
+                        health="pending", health_checked_at=now())
+                    # The child has reported a recoverable native condition.
+                    # Keep its normal Stop/exit controls and await an explicit
+                    # later observation; a ready timeout must not turn it into
+                    # a failed installation. This performs no admission/retry.
+                    started = asyncio.create_task(reader.readline())
+                    startup_timeout = None
+                    continue
+                break
             journal(self.directory, "Native agents finished bootstrap. Checking the actual Console before publishing readiness.",
                     status="starting", phase="start", bootstrap=bootstrap, console_url=None, runtime_pid=process.pid,
-                    process_live=True, health="unknown", health_checked_at=now())
+                    process_live=True, health="unknown", health_checked_at=now(), admission_health=None)
             import httpx
             async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
                 await self.startup_console(client, url, definition, process, exited, stopped)
