@@ -111,6 +111,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   checking the installed files and the selected product, run outside the
   server's event loop, so a large package on a small host no longer stalls
   the rest of Forge.
+- Meta Forge also keeps answering other requests while the guide checks an
+  installed application's source, which it does on every guide turn.
+  Reading, hashing and unpacking the saved package and comparing the
+  installed files run outside the server's event loop.
 
 ### Known limitations
 
