@@ -373,6 +373,7 @@ class Application:
         self._identity_classes = {}
         self._native_tools = None
         self._application_callbacks = None
+        self._member_mcp = None
         self._native_identity_models = False
         self._frontend_sources = None
         self._frontend_private_fields = None
@@ -484,7 +485,7 @@ class Application:
             self.integration = await await_value(factory(self.context))
             if self.integration is None:
                 raise ValueError("application.build(context) must return an integration object.")
-            for name in ("tools_for_agent", "select_host_tools", "schedule_runnables", "start", "stop", "on_console_input", "desired_roster", "admission_roster", "desired_edges", "frontend_management", "controller_review_factory", "console_login_factory"):
+            for name in ("tools_for_agent", "select_host_tools", "schedule_runnables", "start", "stop", "on_console_input", "desired_roster", "admission_roster", "desired_edges", "retain_member_mcp", "lookup_member_mcp", "frontend_management", "controller_review_factory", "console_login_factory"):
                 hook = getattr(self.integration, name, None)
                 if hook is not None and not callable(hook):
                     raise ValueError(f"Application {name} must be callable.")
@@ -527,6 +528,7 @@ class Application:
             self.dynamic = roster
             if getattr(self.integration, "admission_roster", None) is not None and not self.dynamic:
                 raise ValueError("Application admission_roster requires desired_roster and desired_edges.")
+            self._member_mcp_hooks()
             if self.dynamic and self._tool_policy_selection is not None:
                 raise ValueError("Explicit application tool policy currently requires a fixed durable roster.")
             if self.dynamic:
@@ -947,14 +949,71 @@ class Application:
         self.frontend_host()
         return self._frontend_private_fields
 
+    def _member_mcp_hooks(self):
+        retain = getattr(self.integration, "retain_member_mcp", None)
+        lookup = getattr(self.integration, "lookup_member_mcp", None)
+        if retain is None and lookup is None:
+            return None
+        if not callable(retain) or not callable(lookup):
+            raise ValueError("Application retain_member_mcp and lookup_member_mcp must be provided together.")
+        if not self.dynamic or not callable(getattr(self.integration, "admission_roster", None)):
+            raise ValueError("Member MCP retention requires the application's existing admission_roster store.")
+        return retain, lookup
+
+    def member_mcp_runtime_options(self):
+        """Bind private callbacks over the loaded store, before native restore.
+
+        The application owns the durable same-row CAS. This adapter neither
+        infers bindings from a public roster nor stores a second set of grants.
+        """
+        hooks = self._member_mcp_hooks()
+        if hooks is None:
+            return {}
+        if self._member_mcp is None:
+            from meerkat_toolkit.member_classes import (
+                MemberMcpApplication, MemberMcpAdmissionSelection, RetainedMemberMcpBindings,
+            )
+            retain, lookup = hooks
+
+            async def retain_bindings(value):
+                # Reparse even typed values: constructed dataclasses can be invalid.
+                wire = RetainedMemberMcpBindings.from_wire(value.wire()).wire()
+                result = await await_value(retain(wire))
+                if result is not None:
+                    raise ValueError("Member MCP retention must return only after commit, with no result.")
+
+            async def lookup_bindings(selection):
+                exact = MemberMcpAdmissionSelection.from_wire(selection.wire())
+                value = await await_value(lookup(exact.wire()))
+                retained = RetainedMemberMcpBindings.from_wire(value)
+                if retained.selection != exact:
+                    raise ValueError("Member MCP lookup returned a different admission.")
+                return retained
+
+            self._member_mcp = MemberMcpApplication(retain_bindings, lookup_bindings)
+        return {"member_mcp": self._member_mcp}
+
     async def stop(self):
+        failures = []
         try:
+            if self._member_mcp is not None:
+                try:
+                    await _settle_application_shutdown(self._member_mcp.join, preserve_cancellation=True)
+                except BaseException as error:
+                    failures.append(error)
             hook = getattr(self.integration, "stop", None)
             if callable(hook):
-                await await_value(hook())
+                try:
+                    await await_value(hook())
+                except BaseException as error:
+                    failures.append(error)
         finally:
             if self._frontend_imports is not None:
                 self._frontend_imports.close()
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("Member MCP join and application stop failed", failures)
 
 
 async def application_check(spec):
@@ -1103,6 +1162,8 @@ async def connect_application_runtime(config, application, *, application_startu
             finally:
                 application.context.runtime = None
             raise
+    if application._member_mcp_hooks() is not None:
+        raise ValueError("Member MCP admission requires the selected native Toolkit startup.")
     from meerkat_mobkit import MobKitRuntime
 
     native_path = application.context.root / "config/mob.toml"
