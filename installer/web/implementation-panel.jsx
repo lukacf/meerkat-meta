@@ -168,7 +168,7 @@ export function BuilderActivity({ guideId, receipt, refresh, selectionScope }) {
       <strong>{currentPhase.label}</strong>{currentPhase.measurement && <> - {currentPhase.measurement}</>}
     </p>}
     {timeline.error && <p className="implementation-error" role="status">Live activity interrupted. Reconnecting...</p>}
-    {receipt.native_console_url && <a className="implementation-link" href={selectionBlocked ? undefined : receipt.native_console_url}
+    {receipt.browser_console_url && <a className="implementation-link" href={selectionBlocked ? undefined : receipt.browser_console_url}
       aria-disabled={selectionBlocked} tabIndex={selectionBlocked ? -1 : undefined}
       target="_blank" rel="noreferrer">Open builder console</a>}
   </details>;

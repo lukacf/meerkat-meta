@@ -2141,7 +2141,7 @@ export function GuidedSetup({
   const blocked = busy || applyUnconfirmed || sendUnconfirmed || packageBusy || loadingSetup || !!manualNote;
   const hasSavedToolsGuide = typeof state.id === "string" && state.id.trim().length > 0;
   const savedToolsOpen = hasSavedToolsGuide && savedToolsGuide === state.id;
-  const consoleUrl = runtime?.console_url ?? null;
+  const consoleUrl = runtime?.browser_console_url ?? null;
   const messages = state.messages || [];
   const opening = !plan && !messages.some(message => message.role === "user") && !question?.options?.length;
   const welcome = isForgeOpening(state, plan, { pending: !!manualNote, busy, loading: loadingSetup });

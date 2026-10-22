@@ -398,7 +398,7 @@ export function App() {
     } catch { setDraftStorageAvailable(false); }
   }, [savedProject]);
   useEffect(() => {
-    if (!architectBusy && !config?.architect?.console_url) return;
+    if (!architectBusy && !config?.architect?.browser_console_url) return;
     const timer = setInterval(async () => {
       try {
         const status = await request("/api/architect/status");
@@ -421,7 +421,7 @@ export function App() {
       } catch {}
     }, 5000);
     return () => clearInterval(timer);
-  }, [architectBusy, config?.architect?.console_url]);
+  }, [architectBusy, config?.architect?.browser_console_url]);
   useEffect(() => {
     if (!bp) return;
     const ids = bp.agent_classes.map((c) => c.id);
@@ -471,8 +471,8 @@ export function App() {
         body: { blueprint: bp },
       });
       setConfig((c) => ({ ...c, architect: status }));
-      if (status.console_url)
-        setModal({ type: "console", url: status.console_url });
+      if (status.browser_console_url)
+        setModal({ type: "console", url: status.browser_console_url });
       else
         throw new Error(status.detail || "The console is not available yet.");
     } catch (e) {
@@ -604,10 +604,10 @@ export function App() {
         method: "POST",
         body: { message, blueprint: base },
       });
-      if (response.console_url)
+      if (response.browser_console_url)
         setConfig((c) => ({
           ...c,
-          architect: { ...c.architect, console_url: response.console_url },
+          architect: { ...c.architect, browser_console_url: response.browser_console_url },
         }));
       setMessages((m) => [
         ...m,
@@ -757,7 +757,7 @@ export function App() {
           <Icon name="external" size={12} />
           {consoleStarting
             ? "Starting setup team..."
-            : config?.architect?.console_url
+            : config?.architect?.browser_console_url
               ? "Open the live setup console"
               : "Start the Forge setup team"}
         </button>

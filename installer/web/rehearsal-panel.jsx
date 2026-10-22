@@ -102,6 +102,8 @@ export function RehearsalTrialSummary({ receipt, canRepair }) {
       {summary?.problem && canRepair && " Choose Fix this trial to ask the builder to investigate."}
     </p>
     {summary && receipt.detail && <details><summary>Saved native trial result</summary><p>{receipt.detail}</p></details>}
+    {receipt.current && receipt.browser_console_url && <a className="implementation-link"
+      href={receipt.browser_console_url} target="_blank" rel="noreferrer">Open trial console</a>}
   </>;
 }
 
