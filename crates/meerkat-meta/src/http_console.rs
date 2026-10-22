@@ -27040,6 +27040,12 @@ mod mob_announcement_console_access_tests {
         ("meta/mob_announcements/deliveries/list", false),
         ("meta/mob_announcements/deliveries/observe", false),
         ("meta/mob_announcements/deliveries/reconcile", true),
+        ("meta/mob_announcements/sources/put", true),
+        ("meta/mob_announcements/sources/pause", true),
+        ("meta/mob_announcements/sources/resume", true),
+        ("meta/mob_announcements/sources/end", true),
+        ("meta/mob_announcements/sources/get", false),
+        ("meta/mob_announcements/sources/list", false),
     ];
 
     /// The console takes the family's methods and its read/mutate split from

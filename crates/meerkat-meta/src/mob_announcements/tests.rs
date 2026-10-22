@@ -8479,8 +8479,10 @@ async fn a_local_route_on_a_gateway_without_its_own_mob_is_blocked_unread() {
 /// absence in any of them is caught when the store opens.
 #[test]
 fn the_ledger_owns_every_object_the_schema_creates() {
-    let connection = rusqlite::Connection::open_in_memory().unwrap();
-    connection.execute_batch(super::sqlite::SCHEMA).unwrap();
+    let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+    let tx = connection.transaction().unwrap();
+    (super::storage::ANNOUNCEMENT_SCHEMA_DOMAIN.initialize_current)(&tx).unwrap();
+    tx.commit().unwrap();
     let mut statement = connection
         .prepare("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
         .unwrap();
@@ -8604,10 +8606,10 @@ fn the_version_one_schema_is_pinned() {
     assert_eq!(
         domain
             .migrations
-            .iter()
-            .map(|migration| migration.version)
-            .max(),
-        Some(1)
+            .first()
+            .map(|migration| (migration.version, migration.name)),
+        Some((1, "announcements-subscriptions-batches")),
+        "version 1 stays the first migration"
     );
     let digest = Sha256::digest(super::sqlite::SCHEMA.as_bytes())
         .iter()
@@ -9287,4 +9289,829 @@ fn a_clock_skew_read_from_a_later_request_is_the_same_wait() {
         window_ms: 60_000,
     }));
     assert!(!first.same_wait(&SuspendCause::MemberNotLive));
+}
+
+// ---------------------------------------------------------------------------
+// Announcement sources: the record, its generations, its identity and the
+// topics it owns, through the one handler every gateway dispatches to.
+// ---------------------------------------------------------------------------
+
+const SOURCES_PUT: &str = "meta/mob_announcements/sources/put";
+const SOURCES_GET: &str = "meta/mob_announcements/sources/get";
+const SOURCES_LIST: &str = "meta/mob_announcements/sources/list";
+const SOURCES_END: &str = "meta/mob_announcements/sources/end";
+const ANNOUNCE: &str = "meta/mob_announcements/announce";
+
+/// One `meta/mob_announcements/*` call as this host, keeping a refusal.
+async fn try_host_call(
+    service: &AnnouncementService,
+    method: &str,
+    params: serde_json::Value,
+) -> std::result::Result<serde_json::Value, crate::rpc::JsonRpcError> {
+    super::rpc::handle_announcement_method(Some(service), &mob(OWN_MOB), method, &params).await
+}
+
+/// The typed kind a refused call carries.
+fn refusal_kind(error: &crate::rpc::JsonRpcError) -> Option<String> {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// `sources/put` params for a mailbox source of this gateway's mob, read
+/// through a Connect setup whose verified account has `subject`.
+fn source_params(
+    operation: &str,
+    source_id: &str,
+    subject: &str,
+    topic: &[&str],
+) -> serde_json::Value {
+    serde_json::json!({
+        "operation_id": operation,
+        "source_id": source_id,
+        "identity": {
+            "provider": "google.gmail",
+            "principal": {
+                "kind": "connector_verified_account",
+                "issuer": "https://accounts.example",
+                "strategy_id": "oauth-code",
+                "subject": subject,
+            },
+            "scope": { "kind": "mailbox_label", "id": "INBOX" },
+        },
+        "connection": { "kind": "connect_setup", "id": "setup-1" },
+        "observation": { "baseline": "delta", "deletions": "explicit" },
+        "topics": topic,
+        "audience": [
+            { "kind": "member", "member": { "mob_id": OWN_MOB, "identity": "agent:a" } }
+        ],
+    })
+}
+
+fn with(mut params: serde_json::Value, key: &str, value: serde_json::Value) -> serde_json::Value {
+    params[key] = value;
+    params
+}
+
+/// A source is declared, read and listed whole: a first generation at its
+/// first revision, active, baselining from no cursor, with the defaults the
+/// contract names. A replay of the same operation answers the original, and
+/// a list never carries the cursor token.
+#[tokio::test]
+async fn a_source_is_declared_and_read_back_whole() {
+    let harness = harness_with(ScriptedNative::new());
+    let params = source_params("o1", "inbox", "subject-1", &["mail.received"]);
+    let put = try_host_call(&harness.service, SOURCES_PUT, params.clone())
+        .await
+        .unwrap();
+    let source = &put["source"];
+    assert_eq!(source["mob_id"], serde_json::json!(OWN_MOB));
+    assert_eq!(source["source_id"], serde_json::json!("inbox"));
+    assert_eq!(source["generation"], serde_json::json!(1));
+    assert_eq!(source["revision"], serde_json::json!(1));
+    assert_eq!(source["state"], serde_json::json!("active"));
+    assert_eq!(source["collection"], serde_json::json!("baselining"));
+    assert_eq!(
+        source["cursor"],
+        serde_json::json!({ "version": 0, "token": null, "advanced_at_ms": null })
+    );
+    assert_eq!(
+        source["identity"], params["identity"],
+        "the identity is kept as declared"
+    );
+    assert_eq!(
+        source["observation"],
+        serde_json::json!({ "baseline": "delta", "deletions": "explicit" })
+    );
+    assert_eq!(source["routes"], serde_json::json!([{ "kind": "direct" }]));
+    assert_eq!(
+        source["delivery"],
+        serde_json::json!({
+            "priority": "normal", "max_per_batch": 20, "on_unhandled": "redeliver"
+        })
+    );
+    assert_eq!(source["start"], serde_json::json!({ "kind": "baseline" }));
+
+    let replay = try_host_call(&harness.service, SOURCES_PUT, params)
+        .await
+        .unwrap();
+    assert_eq!(replay, put, "a replay answers the original");
+
+    let got = try_host_call(
+        &harness.service,
+        SOURCES_GET,
+        serde_json::json!({ "source_id": "inbox" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(got["source"], *source);
+
+    let listed = try_host_call(&harness.service, SOURCES_LIST, serde_json::json!({}))
+        .await
+        .unwrap();
+    let listed = listed["sources"].as_array().cloned().unwrap_or_default();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["source_id"], serde_json::json!("inbox"));
+    assert!(
+        listed[0]["cursor"].get("token").is_none(),
+        "a list never carries the cursor token: {}",
+        listed[0]["cursor"]
+    );
+}
+
+/// Every source declares how its adapter baselines and whether deletions are
+/// observable; there is no capability "none".
+#[tokio::test]
+async fn a_source_declares_its_baseline_and_deletion_capability() {
+    let harness = harness_with(ScriptedNative::new());
+    let mut missing = source_params("o1", "inbox", "subject-1", &["mail.received"]);
+    missing.as_object_mut().unwrap().remove("observation");
+    let refused = try_host_call(&harness.service, SOURCES_PUT, missing)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, -32602, "{refused:?}");
+
+    let none = with(
+        source_params("o2", "inbox", "subject-1", &["mail.received"]),
+        "observation",
+        serde_json::json!({ "baseline": "none", "deletions": "explicit" }),
+    );
+    let refused = try_host_call(&harness.service, SOURCES_PUT, none)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, -32602, "{refused:?}");
+
+    let snapshot = with(
+        source_params("o3", "inbox", "subject-1", &["mail.received"]),
+        "observation",
+        serde_json::json!({ "baseline": "snapshot", "deletions": "unobservable" }),
+    );
+    let put = try_host_call(&harness.service, SOURCES_PUT, snapshot)
+        .await
+        .unwrap();
+    assert_eq!(
+        put["source"]["observation"],
+        serde_json::json!({ "baseline": "snapshot", "deletions": "unobservable" })
+    );
+}
+
+/// No identity evidence, no source: a principal is required, and only the
+/// declared kinds are accepted.
+#[tokio::test]
+async fn a_source_without_a_principal_is_refused() {
+    let harness = harness_with(ScriptedNative::new());
+    let mut missing = source_params("o1", "inbox", "subject-1", &["mail.received"]);
+    missing["identity"]
+        .as_object_mut()
+        .unwrap()
+        .remove("principal");
+    let refused = try_host_call(&harness.service, SOURCES_PUT, missing)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, -32602, "{refused:?}");
+
+    let mut slot = source_params("o2", "inbox", "subject-1", &["mail.received"]);
+    slot["identity"]["principal"] =
+        serde_json::json!({ "kind": "credential_slot", "realm": "r", "account": "shared" });
+    let refused = try_host_call(&harness.service, SOURCES_PUT, slot)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, -32602, "a credential slot is not a principal");
+}
+
+/// A host-attested principal is accepted only from a host connection: it is
+/// the host vouching for an account, never a verified connector account.
+#[tokio::test]
+async fn a_host_attested_principal_needs_a_host_connection() {
+    let harness = harness_with(ScriptedNative::new());
+    let attested = |operation: &str, connection: serde_json::Value| {
+        let mut params = source_params(operation, "inbox", "unused", &["mail.received"]);
+        params["identity"]["principal"] = serde_json::json!({
+            "kind": "host_attested", "attester": "host-app", "account": "shared-mail"
+        });
+        params["connection"] = connection;
+        params
+    };
+    let refused = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        attested(
+            "o1",
+            serde_json::json!({ "kind": "connect_setup", "id": "setup-1" }),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, super::rpc::ANNOUNCEMENTS_REFUSED_CODE);
+    assert_eq!(
+        refusal_kind(&refused).as_deref(),
+        Some("principal_not_allowed")
+    );
+    assert_eq!(
+        refused
+            .data
+            .as_ref()
+            .and_then(|data| data.get("principal_kind")),
+        Some(&serde_json::json!("host_attested")),
+        "the refused principal's kind rides beside the refusal kind, never over it"
+    );
+    let refused = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        attested("o2", serde_json::Value::Null),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        refusal_kind(&refused).as_deref(),
+        Some("principal_not_allowed")
+    );
+    let put = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        attested(
+            "o3",
+            serde_json::json!({ "kind": "host", "id": "host-mail" }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        put["source"]["identity"]["principal"]["kind"],
+        serde_json::json!("host_attested")
+    );
+}
+
+/// One principal's scope is one live source per mob: a second source for the
+/// same account and scope is refused naming the first; another account's
+/// same scope is another source; an ended source frees its identity.
+#[tokio::test]
+async fn one_principal_scope_is_one_source_per_mob() {
+    let harness = harness_with(ScriptedNative::new());
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("o1", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    let refused = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("o2", "inbox-again", "subject-1", &["mail.other"]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, super::rpc::ANNOUNCEMENTS_REFUSED_CODE);
+    assert_eq!(
+        refusal_kind(&refused).as_deref(),
+        Some("source_identity_taken")
+    );
+    assert_eq!(
+        refused.data.as_ref().unwrap()["source_id"],
+        serde_json::json!("inbox")
+    );
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("o3", "inbox-bob", "subject-2", &["mail.bob"]),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        &harness.service,
+        SOURCES_END,
+        serde_json::json!({ "operation_id": "o4", "source_id": "inbox", "expected_revision": 1 }),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("o5", "inbox-again", "subject-1", &["mail.other"]),
+    )
+    .await
+    .unwrap();
+}
+
+/// A source owns its topics: another source cannot claim them, and a plain
+/// announcement on one is refused, from the host and from a member's tool
+/// alike. Other topics are untouched.
+#[tokio::test]
+async fn a_source_owns_its_topics_and_plain_announces_are_refused_there() {
+    let tools = tool_harness(super::tools::MemberLimits::default());
+    let service = &tools.harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("o1", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    let claimed = try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("o2", "other", "subject-2", &["mail.received"]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(claimed.code, super::rpc::ANNOUNCEMENTS_REFUSED_CODE);
+    assert_eq!(refusal_kind(&claimed).as_deref(), Some("topic_owned"));
+    assert_eq!(
+        claimed.data.as_ref().unwrap()["source_id"],
+        serde_json::json!("inbox")
+    );
+
+    let host = try_host_call(
+        service,
+        ANNOUNCE,
+        serde_json::json!({ "source_key": "k1", "topics": ["mail.received"], "body": "b" }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(host.code, super::rpc::ANNOUNCEMENTS_REFUSED_CODE);
+    assert_eq!(
+        refusal_kind(&host).as_deref(),
+        Some("topic_owned_by_source")
+    );
+    assert_eq!(
+        host.data.as_ref().unwrap()["source_id"],
+        serde_json::json!("inbox")
+    );
+
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::ANNOUNCE_TOOL,
+            serde_json::json!({ "topics": ["mail.received"], "body": "b", "key": "k2" }),
+        )
+        .await;
+    assert!(
+        failed,
+        "a member cannot announce on a source topic: {result}"
+    );
+
+    try_host_call(
+        service,
+        ANNOUNCE,
+        serde_json::json!({ "source_key": "k3", "topics": ["ops"], "body": "b" }),
+    )
+    .await
+    .unwrap();
+}
+
+/// A triage route's forward topics are owned by its source: only that
+/// route's triage member announces on them; another member and the host are
+/// refused.
+#[tokio::test]
+async fn only_the_triage_member_announces_on_a_forward_topic() {
+    let tools = tool_harness(super::tools::MemberLimits::default());
+    let service = &tools.harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            source_params("o1", "inbox", "subject-1", &["mail.received"]),
+            "routes",
+            serde_json::json!([{
+                "kind": "triage",
+                "member": { "mob_id": OWN_MOB, "identity": "agent:a" },
+                "forward_topics": ["mail.task"],
+            }]),
+        ),
+    )
+    .await
+    .unwrap();
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::ANNOUNCE_TOOL,
+            serde_json::json!({ "topics": ["mail.task"], "body": "handle it", "key": "fwd-1" }),
+        )
+        .await;
+    assert!(!failed, "the triage member forwards: {result}");
+    let (failed, result) = tools
+        .call(
+            Some("agent:b"),
+            super::tools::ANNOUNCE_TOOL,
+            serde_json::json!({ "topics": ["mail.task"], "body": "spoof", "key": "fwd-2" }),
+        )
+        .await;
+    assert!(failed, "another member cannot: {result}");
+    let host = try_host_call(
+        service,
+        ANNOUNCE,
+        serde_json::json!({ "source_key": "k1", "topics": ["mail.task"], "body": "b" }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        refusal_kind(&host).as_deref(),
+        Some("topic_owned_by_source")
+    );
+}
+
+/// An ended source keeps its topics reserved to its source id: no other
+/// source and no plain announcement may claim them, and declaring the same
+/// source id again takes them back.
+#[tokio::test]
+async fn an_ended_sources_topics_stay_reserved_to_its_source_id() {
+    let harness = harness_with(ScriptedNative::new());
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("o1", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    let ended = try_host_call(
+        &harness.service,
+        SOURCES_END,
+        serde_json::json!({ "operation_id": "o2", "source_id": "inbox", "expected_revision": 1 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ended["source"]["state"], serde_json::json!("ended"));
+    let claimed = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("o3", "other", "subject-2", &["mail.received"]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal_kind(&claimed).as_deref(), Some("topic_owned"));
+    let host = try_host_call(
+        &harness.service,
+        ANNOUNCE,
+        serde_json::json!({ "source_key": "k1", "topics": ["mail.received"], "body": "b" }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        refusal_kind(&host).as_deref(),
+        Some("topic_owned_by_source")
+    );
+    let again = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("o4", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again["source"]["generation"], serde_json::json!(2));
+}
+
+/// A source's identity never changes within a generation. A new generation
+/// (asked for, or a declaration after an end) starts from a fresh baseline
+/// with no cursor, and the revision keeps rising across generations, so an
+/// advance fenced on an older one can never match.
+#[tokio::test]
+async fn a_redeclared_source_starts_a_new_generation_from_a_fresh_baseline() {
+    let harness = harness_with(ScriptedNative::new());
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("o1", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    let switched = with(
+        source_params("o2", "inbox", "subject-2", &["mail.received"]),
+        "expected_revision",
+        serde_json::json!(1),
+    );
+    let refused = try_host_call(&harness.service, SOURCES_PUT, switched)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, super::rpc::ANNOUNCEMENTS_REFUSED_CODE);
+    assert_eq!(
+        refusal_kind(&refused).as_deref(),
+        Some("identity_immutable")
+    );
+
+    let renewed = with(
+        with(
+            source_params("o3", "inbox", "subject-2", &["mail.received"]),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+        "new_generation",
+        serde_json::json!(true),
+    );
+    let renewed = try_host_call(&harness.service, SOURCES_PUT, renewed)
+        .await
+        .unwrap();
+    let source = &renewed["source"];
+    assert_eq!(source["generation"], serde_json::json!(2));
+    assert_eq!(source["revision"], serde_json::json!(2));
+    assert_eq!(source["collection"], serde_json::json!("baselining"));
+    assert_eq!(
+        source["cursor"],
+        serde_json::json!({ "version": 0, "token": null, "advanced_at_ms": null })
+    );
+    assert_eq!(
+        source["identity"]["principal"]["subject"],
+        serde_json::json!("subject-2")
+    );
+
+    try_host_call(
+        &harness.service,
+        SOURCES_END,
+        serde_json::json!({ "operation_id": "o4", "source_id": "inbox", "expected_revision": 2 }),
+    )
+    .await
+    .unwrap();
+    let declared = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("o5", "inbox", "subject-2", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(declared["source"]["generation"], serde_json::json!(3));
+    assert_eq!(declared["source"]["revision"], serde_json::json!(4));
+    assert_eq!(declared["source"]["state"], serde_json::json!("active"));
+
+    let stale = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("o6", "inbox", "subject-2", &["mail.received"]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale.code, super::rpc::ANNOUNCEMENTS_CONFLICT_CODE);
+    assert_eq!(refusal_kind(&stale).as_deref(), Some("stale_revision"));
+}
+
+/// Routes select by topic in this release: a route selecting streams is
+/// refused typed, naming the selector.
+#[tokio::test]
+async fn a_route_selecting_streams_is_refused_typed() {
+    let harness = harness_with(ScriptedNative::new());
+    let refused = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with(
+            source_params("o1", "inbox", "subject-1", &["mail.received"]),
+            "routes",
+            serde_json::json!([{ "kind": "direct", "streams": ["label-work"] }]),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, super::rpc::ANNOUNCEMENTS_REFUSED_CODE);
+    assert_eq!(
+        refusal_kind(&refused).as_deref(),
+        Some("route_selector_unsupported")
+    );
+    assert_eq!(
+        refused.data.as_ref().unwrap()["selector"],
+        serde_json::json!("streams")
+    );
+}
+
+/// The key prefix "source:" belongs to source items: a host announcement
+/// under it is refused before anything is stored.
+#[tokio::test]
+async fn a_host_announce_under_the_reserved_source_prefix_is_refused() {
+    let harness = harness_with(ScriptedNative::new());
+    let refused = try_host_call(
+        &harness.service,
+        ANNOUNCE,
+        serde_json::json!({ "source_key": "source:inbox:0123", "topics": ["ops"], "body": "b" }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, -32602, "{refused:?}");
+    assert!(
+        harness
+            .service
+            .announcement(&mob(OWN_MOB), &SourceKey::new("source:inbox:0123").unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A source item names its source as the announcer, by id only: the batch
+/// line carries nothing of the connection, the principal or the cursor.
+#[test]
+fn a_source_item_renders_its_source_id_and_nothing_of_its_connection() {
+    let announcement: Announcement = serde_json::from_value(serde_json::json!({
+        "mob_id": OWN_MOB,
+        "sequence": 7,
+        "announced_by": { "kind": "source", "source_id": "inbox" },
+        "source_key": "source:inbox:0123",
+        "topics": ["mail.received"],
+        "body": "From: someone, subject: invoice",
+        "digest": "sha256:00",
+        "announced_at_ms": 1,
+    }))
+    .unwrap();
+    assert_eq!(
+        render_item(&announcement),
+        "- Announcement #7 in mob \"payments\", by source \"inbox\"; topics \
+         [\"mail.received\"]; key \"source:inbox:0123\":\n  > From: someone, subject: invoice\n"
+    );
+}
+
+/// The objects schema version 2 adds, as SQLite records them: each table
+/// with its columns (type, not null, primary key position) and each index
+/// with its table and columns.
+fn objects_added_by(tx: &rusqlite::Transaction<'_>, before: &BTreeSet<String>) -> Vec<String> {
+    let mut statement = tx
+        .prepare(
+            "SELECT type, name, tbl_name FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .unwrap();
+    let objects: Vec<(String, String, String)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    let mut lines = Vec::new();
+    for (kind, name, table) in objects {
+        if before.contains(&name) {
+            continue;
+        }
+        if kind == "table" {
+            let mut columns = tx.prepare(&format!("PRAGMA table_info({name})")).unwrap();
+            let described: Vec<String> = columns
+                .query_map([], |row| {
+                    let column: String = row.get(1)?;
+                    let kind: String = row.get(2)?;
+                    let not_null: i64 = row.get(3)?;
+                    let key: i64 = row.get(5)?;
+                    let mut text = format!("{column} {kind}");
+                    if not_null != 0 {
+                        text.push_str(" notnull");
+                    }
+                    if key != 0 {
+                        text.push_str(&format!(" pk{key}"));
+                    }
+                    Ok(text)
+                })
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            lines.push(format!("table {name}: {}", described.join(", ")));
+        } else {
+            let mut columns = tx.prepare(&format!("PRAGMA index_info({name})")).unwrap();
+            let described: Vec<String> = columns
+                .query_map([], |row| row.get::<_, String>(2))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            lines.push(format!(
+                "{kind} {name} on {table}: {}",
+                described.join(", ")
+            ));
+        }
+    }
+    lines
+}
+
+/// Version 2 of the announcement schema, the sources, freezes with the
+/// release that ships it: after that, a change is a new version with its
+/// migration. The pin makes a change fail here instead of at a user's open.
+#[test]
+fn the_version_two_schema_is_pinned() {
+    let domain = &super::storage::ANNOUNCEMENT_SCHEMA_DOMAIN;
+    let versions: Vec<i64> = domain
+        .migrations
+        .iter()
+        .map(|migration| migration.version)
+        .collect();
+    assert_eq!(versions, vec![1, 2]);
+    let version_two = &domain.migrations[1];
+    assert_eq!(version_two.name, "announcement-sources");
+    let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+    let tx = connection.transaction().unwrap();
+    (domain.migrations[0].apply)(&tx).unwrap();
+    let before: BTreeSet<String> = {
+        let mut statement = tx.prepare("SELECT name FROM sqlite_master").unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    };
+    (version_two.apply)(&tx).unwrap();
+    assert_eq!(
+        objects_added_by(&tx, &before),
+        vec![
+            "table announcement_source_topics: mob_id TEXT notnull pk1, topic TEXT notnull \
+             pk2, source_id TEXT notnull, kind TEXT notnull"
+                .to_string(),
+            "index announcement_source_topics_by_source on announcement_source_topics: \
+             mob_id, source_id"
+                .to_string(),
+            "table announcement_sources: mob_id TEXT notnull pk1, source_id TEXT notnull pk2, \
+             generation INTEGER notnull, state TEXT notnull, identity_key TEXT notnull, \
+             updated_at_ms INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "index announcement_sources_by_identity on announcement_sources: mob_id, \
+             identity_key, state"
+                .to_string(),
+        ],
+        "the version 2 schema changed: before the release that ships it, update this pin; \
+         after it, add version 3 with its migration instead"
+    );
+}
+
+/// A store as 0.9.4 left it (the version 1 schema under its ledger row, with
+/// an announcement in it) opens migrated to version 2 in place: the ledger
+/// moves, the source tables exist, and what it held is still there.
+#[tokio::test]
+async fn a_version_one_store_migrates_to_version_two_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mob_announcements.sqlite3");
+    {
+        // The announcement goes in as rows of the frozen version 1 tables,
+        // as 0.9.4 wrote them: a store of this release announces only over
+        // the tables of its own version.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(super::sqlite::SCHEMA).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE main.meerkat_schema (
+                     domain TEXT PRIMARY KEY,
+                     version INTEGER NOT NULL
+                 );
+                 INSERT INTO main.meerkat_schema (domain, version)
+                     VALUES ('meta-mob-announcements', 1);",
+            )
+            .unwrap();
+        let request = announce_request(OWN_MOB, "kept", &["ios"], "from 0.9.4");
+        let announcement = Announcement {
+            mob_id: request.mob_id.clone(),
+            sequence: 1,
+            announced_by: Announcer::Host,
+            source_key: request.source_key.clone(),
+            topics: request.topics.clone(),
+            body: request.body.clone(),
+            correlation_id: None,
+            causes: Vec::new(),
+            digest: request.digest(),
+            announced_at_ms: 1,
+        };
+        let rendered_bytes = i64::try_from(render_item(&announcement).len()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO announcement_logs (mob_id, head_sequence, earliest_retained)
+                 VALUES (?1, 1, 1)",
+                rusqlite::params![OWN_MOB],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO announcements
+                 (mob_id, sequence, source_key, announced_at_ms, rendered_bytes, record)
+                 VALUES (?1, 1, 'kept', 1, ?2, ?3)",
+                rusqlite::params![
+                    OWN_MOB,
+                    rendered_bytes,
+                    serde_json::to_string(&announcement).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO announcement_topics (topic, mob_id, sequence) VALUES ('ios', ?1, 1)",
+                rusqlite::params![OWN_MOB],
+            )
+            .unwrap();
+    }
+    let store = super::storage::open_disk_store(path.clone()).unwrap();
+    let kept = store
+        .announcement(&mob(OWN_MOB), &SourceKey::new("kept").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        kept.map(|announcement| announcement.body),
+        Some("from 0.9.4".to_string())
+    );
+    drop(store);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row(
+            "SELECT version FROM meerkat_schema WHERE domain = 'meta-mob-announcements'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 2);
+    let tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+             AND name IN ('announcement_sources', 'announcement_source_topics')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 2);
 }
