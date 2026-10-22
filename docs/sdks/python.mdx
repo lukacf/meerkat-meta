@@ -624,10 +624,10 @@ rt = await (
 
 A member forked with `fork_off`, a delegation fork or a council does not run
 the instructions its source activated (`meta/member_activate_instruction`,
-skill bodies activated that way included) unless the gateway's fork instruction policy says so. Under
-the default, such a fork is refused with `fork_instruction_refused` before
-anything is committed. To let forks carry their source's activations, opt in
-at boot:
+skill bodies activated that way included) unless the gateway's fork instruction
+policy says so. Under the default, such a fork is refused with
+`fork_instruction_refused` before anything is committed. To let forks carry
+their source's activations, opt in at boot:
 
 ```python
 runtime = await (

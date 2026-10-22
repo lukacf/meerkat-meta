@@ -504,12 +504,12 @@ trusts, and how to set the policy.
 
 A host changes a member's standing instructions with
 [`meta/member_activate_instruction`](/api/rpc): each new activation appends one
-keyed, immutable activation row to the member's session, for example the body of a
-skill your application keeps under namespace `app.skills` and key `calendar`.
-For each namespace and key, the newest row that the member's own session wrote
-is the instruction in effect. Meerkat treats every namespace alike, so a skill,
-a persona, a standing rule and any other key are all activation rows, and the
-policy applies to every one of them.
+keyed, immutable activation row to the member's session, for example the body
+of a skill your application keeps under namespace `app.skills` and key
+`calendar`. For each namespace and key, the newest row that the member's own
+session wrote is the instruction in effect. Meerkat treats every namespace
+alike, so a skill, a persona, a standing rule and any other key are all
+activation rows, and the policy applies to every one of them.
 
 Instructions a member gets from its build (its profile, the skills its profile
 preloads included, and its system prompt) are not activation rows. The policy

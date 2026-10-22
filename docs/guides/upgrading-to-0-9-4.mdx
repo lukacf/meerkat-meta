@@ -758,8 +758,9 @@ are unchanged.
 
 A member's activated instructions (everything a host appended with
 `meta/member_activate_instruction`, skill bodies activated that way included)
-reach a fork only as history. The gateway's `runtime_options.fork_instruction_policy` decides what
-happens to them, and its default changes what a fork of such a member does:
+reach a fork only as history. The gateway's
+`runtime_options.fork_instruction_policy` decides what happens to them, and its
+default changes what a fork of such a member does:
 
 - In 0.9.3, the fork was committed and the child's first turn failed with
   `forked session must explicitly activate inherited instruction keys`.
