@@ -7,7 +7,9 @@ source/lease composition only, never native preparation or useful-work success.
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
+import errno
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -284,6 +286,13 @@ async def test_original_private_parent_closes_source_and_project_scope_before_la
         assert guide_id == f.selected.context["guide_id"]
         return deployment.read_receipt(f.directory)
 
+    from launchkit import runtime_candidates as candidates
+    inflated = []
+    original_entries = candidates.product_prefix_entries
+    def entries(content, prefix):
+        inflated.append(prefix)
+        return original_entries(content, prefix)
+    monkeypatch.setattr(candidates, "product_prefix_entries", entries)
     monkeypatch.setattr(installed, "open_installed_product_source", observe_open)
     monkeypatch.setattr(service, "_launch", launch)
     monkeypatch.setattr(service, "status", status)
@@ -293,6 +302,8 @@ async def test_original_private_parent_closes_source_and_project_scope_before_la
     assert result["status"] == "queued" and len(launched) == 1
     assert service.tasks == {} and service.processes == {}
     assert not (f.directory / bootstrap.FRESH_ENTRY_NAME).exists()
+    # The parent's source opening uses the kept inventory, not the archive.
+    assert inflated == []
 
 
 async def test_initialized_destination_host_forwards_original_owner_selection_only(
@@ -340,10 +351,10 @@ async def test_actual_supervisor_verifies_relocated_source_before_fixed_child_sp
             opened.append((source, kwargs["project_lease"]))
             yield source
 
-    def verify(supervisor, files, *, source_custody=None):
+    def verify(supervisor, files, *, source_custody=None, **options):
         assert source_custody is opened[-1][0] and not source_custody._closed
         source_custody.require_filesystem_current()
-        proof = original_verify(supervisor, files, source_custody=source_custody)
+        proof = original_verify(supervisor, files, source_custody=source_custody, **options)
         assert proof["source"] == "meta-toolkit-product"
         verified.append(source_custody)
         return proof
@@ -382,6 +393,400 @@ async def test_actual_supervisor_verifies_relocated_source_before_fixed_child_sp
     assert len(opened) == 1 and opened[0][0]._closed and opened[0][1]._closed
     assert supervisor.child is None
     assert not (f.directory / bootstrap.FRESH_ENTRY_NAME).exists()
+
+
+KEPT_FIELD = "native_prefix_receipt_sha256"
+
+
+def _kept_files(f):
+    return sorted(path.name for path in f.directory.iterdir() if "native-prefix-receipt" in path.name)
+
+
+def _forget_kept_inventory(f):
+    receipt = deployment.read_receipt(f.directory)
+    named = receipt.pop(KEPT_FIELD)
+    deployment.write_private(f.directory / "receipt.json", receipt)
+    (f.directory / f"native-prefix-receipt-{named}.json").unlink()
+    return named
+
+
+async def _start_until_spawn(f, monkeypatch):
+    """Run one actual product Start up to its inert spawn boundary."""
+    from launchkit import runtime_candidates as candidates
+    inflated, sources = [], []
+    original_entries = candidates.product_prefix_entries
+    def entries(content, prefix):
+        inflated.append(prefix)
+        return original_entries(content, prefix)
+    original_verify = worker.Supervisor._verify_candidate_runtime
+    def verify(supervisor, files, **options):
+        proof = original_verify(supervisor, files, **options)
+        sources.append((options.get("observation") or {}).get("inventory_source"))
+        return proof
+    class SpawnBoundary(RuntimeError):
+        pass
+    async def spawn(supervisor, *args, **options):
+        raise SpawnBoundary("Inert application spawn boundary reached")
+    with monkeypatch.context() as held:
+        held.setattr(candidates, "product_prefix_entries", entries)
+        held.setattr(worker.Supervisor, "_verify_candidate_runtime", verify)
+        held.setattr(worker.Supervisor, "spawn_child", spawn)
+        held.setattr(worker, "require_available_console_port", lambda port: {"available": True})
+        supervisor = worker.Supervisor(f.directory)
+        supervisor._bootstrap_owner_source = f.selected.source
+        try:
+            await supervisor.start(json.loads(f.selected.files["deployment.json"]), bootstrap_selection=f.pin)
+        except SpawnBoundary:
+            outcome = None
+        except Exception as error:
+            outcome = error
+        else:
+            pytest.fail("The inert product Start passed its spawn boundary.")
+    return inflated, sources, outcome
+
+
+async def test_product_start_checks_the_prefix_against_the_kept_inventory_without_the_archive(
+        installed_bootstrap, monkeypatch):
+    f = installed_bootstrap
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    assert outcome is None and inflated == [] and sources == ["retained"]
+    named = deployment.read_receipt(f.directory)[KEPT_FIELD]
+    assert _kept_files(f) == [f"native-prefix-receipt-{named}.json"]
+
+
+async def test_legacy_product_start_runs_the_full_check_once_and_then_keeps_the_inventory(
+        installed_bootstrap, monkeypatch):
+    f = installed_bootstrap
+    _forget_kept_inventory(f)
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    assert outcome is None and inflated == [f.source.artifacts.prefix] and sources == ["archive"]
+    # The lazy mint keeps the same verified entries the install kept.
+    kept = deployment.read_receipt(f.directory)[KEPT_FIELD]
+    assert _kept_files(f) == [f"native-prefix-receipt-{kept}.json"]
+    assert (json.loads((f.directory / f"native-prefix-receipt-{kept}.json").read_bytes())["inventory_sha256"]
+        == deployment.read_receipt(f.directory)["installed_candidate_runtime_proof"]["prefix_inventory_sha256"])
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    assert outcome is None and inflated == [] and sources == ["retained"]
+
+
+async def test_product_start_with_kept_fingerprints_reads_no_unchanged_native_file(
+        installed_bootstrap, monkeypatch):
+    from launchkit import native_prefix_receipt as kept
+    from launchkit.templates import install_candidate as adapter
+    f = installed_bootstrap
+    _forget_kept_inventory(f)
+    # The fixture's install has just written every file, so all of them are
+    # racy; a later legacy Start keeps their fingerprints.
+    monkeypatch.setattr(kept, "RACY_NS", 0)
+    monkeypatch.setattr(kept, "local_disk_filesystem", lambda path: True)
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    assert outcome is None and sources == ["archive"]
+    named = deployment.read_receipt(f.directory)[KEPT_FIELD]
+    files = sorted(entry.name for entry in f.source.artifacts.entries if entry.kind == "file")
+    document = json.loads((f.directory / f"native-prefix-receipt-{named}.json").read_bytes())
+    assert sorted(document["fingerprints"]) == files
+    prefix = f.selected.destination / ".bin" / f.source.artifacts.prefix
+    reads = []
+    original = adapter.read_owned
+    def read_owned(path, *args, **kwargs):
+        if prefix in Path(path).parents:
+            reads.append(Path(path).relative_to(prefix).as_posix())
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(adapter, "read_owned", read_owned)
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    # Only the executed gateway is read again, once per prefix walk.
+    assert outcome is None and inflated == [] and sources == ["retained"]
+    assert reads and set(reads) == {"bin/toolkit_gateway"}
+
+
+async def test_failed_legacy_product_start_keeps_no_inventory(installed_bootstrap, monkeypatch):
+    f = installed_bootstrap
+    _forget_kept_inventory(f)
+    readme = f.selected.destination / ".bin" / f.source.artifacts.prefix / "README.md"
+    original = readme.read_bytes()
+    readme.chmod(0o644)
+    readme.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+    readme.chmod(0o444)
+    for _ in range(2):
+        inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+        assert outcome is not None and "native prefix file changed" in str(outcome)
+        assert inflated == [f.source.artifacts.prefix] and sources == []
+        assert KEPT_FIELD not in deployment.read_receipt(f.directory) and _kept_files(f) == []
+
+
+async def test_changed_kept_inventory_refuses_the_product_start(installed_bootstrap, monkeypatch):
+    f = installed_bootstrap
+    named = deployment.read_receipt(f.directory)[KEPT_FIELD]
+    path = f.directory / f"native-prefix-receipt-{named}.json"
+    content = path.read_bytes()
+    path.write_bytes(content.rstrip(b"\n") + b" \n")
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    assert outcome is not None and "differs from the copy receipt.json names" in str(outcome)
+    assert str(path) in str(outcome) and "Remove that file" in str(outcome)
+    assert inflated == [] and sources == []
+    path.unlink()
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    assert outcome is None and inflated == [f.source.artifacts.prefix] and sources == ["archive"]
+
+
+def _keep_with_fingerprints(f, monkeypatch):
+    """Keep the inventory with fingerprints, as a later full Start does."""
+    from launchkit import native_prefix_receipt as kept
+    from launchkit.templates import install_candidate as adapter
+    monkeypatch.setattr(kept, "RACY_NS", 0)
+    monkeypatch.setattr(kept, "local_disk_filesystem", lambda path: True)
+    receipt = deployment.read_receipt(f.directory)
+    proof = receipt["installed_candidate_runtime_proof"]
+    record = {}
+    adapter.verify_meta_toolkit_prefix(f.source.artifacts, deployment_root=f.selected.destination, record=record)
+    named = kept.mint(f.directory, f.source.artifacts, proof=proof,
+        runtime_candidate=receipt["runtime_candidate"], fingerprints=record)
+    assert named and kept.record(f.directory, named, inventory_sha256=proof["prefix_inventory_sha256"],
+        runtime_candidate=receipt["runtime_candidate"])
+    return named
+
+
+def _child_counts(monkeypatch, f):
+    from launchkit import runtime_candidates as candidates
+    from launchkit.templates import install_candidate as adapter
+    # "reads" counts unchanged native files read again; the executed gateway
+    # itself is always hashed and is left out of that count.
+    counts = {"inflated": 0, "reads": 0}
+    prefix = f.selected.destination / ".bin" / f.source.artifacts.prefix
+    gateway = prefix / "bin/toolkit_gateway"
+    original_entries, original_read = candidates.product_prefix_entries, adapter.read_owned
+    def entries(content, name):
+        counts["inflated"] += 1
+        return original_entries(content, name)
+    def read_owned(path, *args, **kwargs):
+        if prefix in Path(path).parents and Path(path) != gateway:
+            counts["reads"] += 1
+        return original_read(path, *args, **kwargs)
+    monkeypatch.setattr(candidates, "product_prefix_entries", entries)
+    monkeypatch.setattr(adapter, "read_owned", read_owned)
+    return counts
+
+
+@pytest.mark.parametrize("bundle", ["current", "historical"])
+async def test_console_start_reads_no_archive_and_no_unchanged_native_file_in_any_process(
+        installed_bootstrap, tmp_path, monkeypatch, bundle):
+    f = installed_bootstrap
+    if bundle == "historical":
+        # A product installed by an earlier Forge: its intake holds owner
+        # bytes A, while this Forge's own bundle is B. Every lane passes A.
+        monkeypatch.setattr(bundles, "product_destination_owner_bytes",
+            lambda: f.selected.source + b"\n# Different current trusted owner bundle B.\n")
+    monkeypatch.setattr(sys, "platform", "linux")
+    deployment.update_receipt(f.directory, interactive_lifecycle_id=None,
+        interactive_cleanup=None, interactive_cleanup_attempt_id=None)
+    _keep_with_fingerprints(f, monkeypatch)
+    counts = _child_counts(monkeypatch, f)
+    service = deployment.DeploymentService(f.selected.custody.home / ".local/state/meta-forge",
+        None, None)
+    launched = []
+    def launch(directory, mode, **options):
+        assert directory == f.directory and mode == "start"
+        launched.append(options)
+    async def status(guide_id, **options):
+        return deployment.read_receipt(f.directory)
+    monkeypatch.setattr(service, "_launch", launch)
+    monkeypatch.setattr(service, "status", status)
+    await service.start_application(f.selected.context["guide_id"],
+        f.selected.context["deployment_id"], application_startup=f.bootstrap.fresh,
+        owner_source=f.selected.source)
+    # Server process: its source opening joins the kept inventory.
+    assert len(launched) == 1 and counts == {"inflated": 0, "reads": 0}
+    f.pin = launched[0]["bootstrap_selection"]
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    # Worker: no archive pass, and every prefix walk skips the unchanged files.
+    assert outcome is None and sources == ["retained"] and counts == {"inflated": 0, "reads": 0}
+    f.lifecycle_id = deployment.read_receipt(f.directory).get("interactive_lifecycle_id")
+    entered = []
+    async def run(spec, args, *, application_startup):
+        entered.append(application_startup)
+    _child_host(f, tmp_path, monkeypatch, run)
+    await asyncio.to_thread(_invoke_child, f)
+    # Application child: the same, in both of its source scopes.
+    assert len(entered) == 1 and counts == {"inflated": 0, "reads": 0}
+
+
+def test_product_child_start_uses_the_kept_inventory_and_reads_no_unchanged_native_file(
+        installed_bootstrap, tmp_path, monkeypatch):
+    f = installed_bootstrap
+    _keep_with_fingerprints(f, monkeypatch)
+    counts = _child_counts(monkeypatch, f)
+    entered = []
+    async def run(spec, args, *, application_startup):
+        entered.append(application_startup)
+    _child_host(f, tmp_path, monkeypatch, run)
+    _invoke_child(f)
+    assert len(entered) == 1 and counts == {"inflated": 0, "reads": 0}
+
+
+def test_product_child_start_refuses_a_changed_native_file_despite_kept_fingerprints(
+        installed_bootstrap, tmp_path, monkeypatch):
+    f = installed_bootstrap
+    _keep_with_fingerprints(f, monkeypatch)
+    readme = f.selected.destination / ".bin" / f.source.artifacts.prefix / "README.md"
+    original = readme.read_bytes()
+    readme.chmod(0o644)
+    readme.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+    readme.chmod(0o444)
+    async def run(spec, args, *, application_startup):
+        pytest.fail("The child started over a changed native prefix.")
+    _child_host(f, tmp_path, monkeypatch, run)
+    with pytest.raises(Exception, match="native prefix file changed"):
+        _invoke_child(f)
+
+
+def test_product_child_start_refuses_a_changed_kept_inventory(installed_bootstrap, tmp_path, monkeypatch):
+    f = installed_bootstrap
+    named = deployment.read_receipt(f.directory)[KEPT_FIELD]
+    path = f.directory / f"native-prefix-receipt-{named}.json"
+    path.write_bytes(path.read_bytes().rstrip(b"\n") + b" \n")
+    async def run(spec, args, *, application_startup):
+        pytest.fail("The child started with a changed kept inventory.")
+    _child_host(f, tmp_path, monkeypatch, run)
+    with pytest.raises(Exception, match="differs from the copy receipt.json names"):
+        _invoke_child(f)
+
+
+def _descriptor_target(descriptor):
+    return os.readlink(f"/proc/self/fd/{descriptor}")
+
+
+async def test_failed_lazy_inventory_write_keeps_the_start_and_the_next_start_is_full(
+        installed_bootstrap, monkeypatch):
+    f = installed_bootstrap
+    _forget_kept_inventory(f)
+    failing = [True]
+    original = os.fsync
+    def fsync(descriptor):
+        if failing[0] and ".native-prefix-receipt-" in _descriptor_target(descriptor):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return original(descriptor)
+    monkeypatch.setattr(os, "fsync", fsync)
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    assert outcome is None and sources == ["archive"]
+    assert KEPT_FIELD not in deployment.read_receipt(f.directory) and _kept_files(f) == []
+    failing[0] = False
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    assert outcome is None and inflated == [f.source.artifacts.prefix] and sources == ["archive"]
+    assert KEPT_FIELD in deployment.read_receipt(f.directory)
+
+
+async def test_lazy_inventory_is_durable_before_the_receipt_names_it(installed_bootstrap, monkeypatch):
+    from launchkit.templates import storage_setup
+    f = installed_bootstrap
+    _forget_kept_inventory(f)
+    events = []
+    original_fsync, original_replace, original_write = os.fsync, os.replace, storage_setup.write_private
+    def fsync(descriptor):
+        target = _descriptor_target(descriptor)
+        if "native-prefix-receipt-" in target:
+            events.append("file fsync")
+        elif target == str(f.directory):
+            events.append("folder fsync")
+        return original_fsync(descriptor)
+    def replace(source, destination):
+        if "native-prefix-receipt-" in str(source):
+            events.append("rename")
+        return original_replace(source, destination)
+    def write_private(path, value):
+        if Path(path).name == "receipt.json" and KEPT_FIELD in value:
+            events.append("receipt names it")
+        return original_write(path, value)
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(storage_setup, "write_private", write_private)
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    assert outcome is None and sources == ["archive"]
+    assert events[:4] == ["file fsync", "rename", "folder fsync", "receipt names it"]
+
+
+def test_lazy_mint_records_the_verified_selection_not_a_later_receipt(installed_bootstrap):
+    from launchkit import native_prefix_receipt as kept
+    f = installed_bootstrap
+    _forget_kept_inventory(f)
+    verified = deployment.read_receipt(f.directory)
+    observation = {"artifacts": f.source.artifacts, "inventory_source": "archive", "fingerprints": {}}
+    # The live receipt changes after the verification ran on `verified`.
+    deployment.update_receipt(f.directory, runtime_candidate={**verified["runtime_candidate"], "replaced": True})
+    worker.Supervisor(f.directory)._settle_native_inventory(None, observation,
+        verified["installed_candidate_runtime_proof"], verified)
+    assert KEPT_FIELD not in deployment.read_receipt(f.directory)
+    [name] = _kept_files(f)
+    document = json.loads((f.directory / name).read_bytes())
+    assert document["runtime_candidate_sha256"] == kept.selection_sha256(verified["runtime_candidate"])
+
+
+def test_product_child_loads_the_kept_inventory_once_for_both_source_scopes(
+        installed_bootstrap, tmp_path, monkeypatch):
+    from launchkit import native_prefix_receipt as kept
+    f = installed_bootstrap
+    loads, handed = [], []
+    original_load = kept.load
+    def load(directory, receipt):
+        value = original_load(directory, receipt)
+        loads.append(value)
+        return value
+    monkeypatch.setattr(kept, "load", load)
+    async def run(spec, args, *, application_startup):
+        return None
+    _child_host(f, tmp_path, monkeypatch, run)
+    observed_open = installed.open_installed_product_source
+    @asynccontextmanager
+    async def observe(*args, **kwargs):
+        handed.append(kwargs.get("retained"))
+        async with observed_open(*args, **kwargs) as source:
+            yield source
+    monkeypatch.setattr(installed, "open_installed_product_source", observe)
+    _invoke_child(f)
+    assert len(loads) == 1 and loads[0] is not None
+    assert len(handed) == 2 and all(value is loads[0] for value in handed)
+
+
+def _child_refusal(f, tmp_path, monkeypatch):
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv("MOBKIT_LAUNCH_READY_FD", str(write_fd))
+    async def run(spec, args, *, application_startup):
+        pytest.fail("The child started over a refused source.")
+    _child_host(f, tmp_path, monkeypatch, run)
+    try:
+        with pytest.raises(Exception) as raised:
+            _invoke_child(f)
+    finally:
+        os.close(write_fd)
+    with os.fdopen(read_fd, "rb") as channel:
+        line = channel.readline()
+    return worker.startup_refusal(line), raised.value
+
+
+def test_product_child_reports_a_changed_kept_inventory_on_its_readiness_channel(
+        installed_bootstrap, tmp_path, monkeypatch):
+    f = installed_bootstrap
+    named = deployment.read_receipt(f.directory)[KEPT_FIELD]
+    path = f.directory / f"native-prefix-receipt-{named}.json"
+    path.write_bytes(path.read_bytes().rstrip(b"\n") + b" \n")
+    refusal, error = _child_refusal(f, tmp_path, monkeypatch)
+    assert refusal == "The application refused to start: " + str(error)
+    assert str(path) in refusal and "Remove that file" in refusal
+
+
+async def test_a_native_file_changed_after_the_worker_check_is_refused_in_the_child(
+        installed_bootstrap, tmp_path, monkeypatch):
+    f = installed_bootstrap
+    _keep_with_fingerprints(f, monkeypatch)
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    assert outcome is None and sources == ["retained"]
+    readme = f.selected.destination / ".bin" / f.source.artifacts.prefix / "README.md"
+    original = readme.read_bytes()
+    readme.chmod(0o644)
+    readme.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+    readme.chmod(0o444)
+    refusal, error = await asyncio.to_thread(_child_refusal, f, tmp_path, monkeypatch)
+    assert refusal == "The application refused to start: " + str(error)
+    assert "native prefix file changed" in refusal
 
 
 @pytest.mark.parametrize("change", ["receipt", "selection", "lifecycle", "source"])
@@ -777,7 +1182,7 @@ def test_trusted_selected_owner_refuses_both_records_removed_at_file_scope_entry
     entered = []
 
     @contextmanager
-    def remove_after_owner_selection(directory, lease, callback, owner_source, application_startup):
+    def remove_after_owner_selection(directory, lease, callback, owner_source, application_startup, *rest):
         # This is the actual worker's __enter__ seam, after on-loop selection
         # authenticated the independently pinned original owner bytes.
         assert owner_source == f.selected.source
@@ -785,7 +1190,7 @@ def test_trusted_selected_owner_refuses_both_records_removed_at_file_scope_entry
         (f.selected.destination / owner.SOURCE_DIRECTORY / "owner.json").unlink()
         shutil.rmtree(f.store)
         entered.append(lease)
-        with original_open(directory, lease, callback, owner_source, application_startup) as source:
+        with original_open(directory, lease, callback, owner_source, application_startup, *rest) as source:
             yield source
 
     monkeypatch.setattr(installed, "_open_files", remove_after_owner_selection)

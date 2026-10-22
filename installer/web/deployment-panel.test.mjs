@@ -7,7 +7,8 @@ import { deploymentCanPrepare, deploymentCanInstall, deploymentCanFreshInstall, 
   deploymentInstalledSettingsCurrent, deploymentReconfiguration, deploymentSettingsReadKey,
   deploymentSettingsReadCurrent, deploymentSettingsResponseCurrent, readDeploymentSettings,
   deploymentConfigurationRevealCurrent, nativeTeamCanInstall, deploymentInstalledSourceKind, deploymentSourceKey, deploymentInstallSelection } from "./deployment-panel.mjs";
-import { deploymentUpdatePreparation, deploymentBackgroundUpdate, deploymentUpdateAction, deploymentCanStageUpdate } from "./deployment-panel.mjs";
+import { deploymentUpdatePreparation, deploymentBackgroundUpdate, deploymentUpdateAction, deploymentCanStageUpdate,
+  deploymentUpdateOwnerStart } from "./deployment-panel.mjs";
 
 const guide = { id: "guide", version: 4, proposal: { target: "mac" } };
 const accepted = { build_id: "build", guide_id: guide.id, guide_version: 4, status: "completed", ready_to_package: true,
@@ -862,5 +863,13 @@ test("UI links reject external or credential URLs, invalid ports, traversal and 
     const result = deploymentExperiences({ ...declared, entries: [{ ...entry, ...changes }] }, installed, guide.id);
     assert.equal(result.entries.length, 0, JSON.stringify(changes));
     assert.ok(result.issue);
+  }
+});
+
+test("after setup an applied update names the owner's Start, never a verified worker start", () => {
+  assert.equal(deploymentUpdateOwnerStart({ status: "completed", setup_restore_sha256: "a".repeat(64) }), true);
+  for (const update of [null, undefined, { status: "completed" }, { setup_restore_sha256: "A".repeat(64) },
+    { setup_restore_sha256: "a".repeat(63) }, { setup_restore_sha256: { path: "/private/restore-selection.json" } }]) {
+    assert.equal(deploymentUpdateOwnerStart(update), false);
   }
 });

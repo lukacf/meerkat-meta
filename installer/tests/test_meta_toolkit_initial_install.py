@@ -1,12 +1,14 @@
 """Inert product initial-install/public-owner tests, not native qualification."""
 import asyncio
 from copy import deepcopy
+import errno
 import json
 import os
 from pathlib import Path
 import re
 import signal
 import socket
+import stat
 import subprocess
 import threading
 from types import SimpleNamespace
@@ -199,12 +201,14 @@ async def worker_fixture(admitted, monkeypatch):
     monkeypatch.setattr(loop, "add_signal_handler", lambda *args: None)
     def proof(destination, version, **kwargs):
         report_progress = kwargs.pop("report_progress")
-        assert callable(report_progress)
+        observation = kwargs.pop("observation")
+        assert callable(report_progress) and observation == {}
         assert kwargs == {"runtime_target": f.target, "sdk_python": f.destination / ".venv/bin/python",
             "site_packages": f.executor.site}
         artifacts = selection.selected_runtime_artifacts(f.target)
         adapter.verify_meta_toolkit_prefix(artifacts, deployment_root=f.destination,
             report_progress=report_progress)
+        observation.update(artifacts=artifacts, inventory_source=artifacts._inventory_source)
         f.events.append("byte-proof")
         return {"source": "meta-toolkit-product", "fixture": "inert-byte-proof-not-SDK-or-native-acceptance"}
     monkeypatch.setattr(dependencies, "verify_runtime", proof)
@@ -228,6 +232,125 @@ async def test_real_worker_initial_lane_installs_exact_prefix_and_settles_stoppe
     assert f.executor.sdk_calls[0][0] == (f.target.meta_wheel.path, f.target.toolkit_wheel.path)
     assert f.events == ["environment", "site", "sdk-pair", "byte-proof", "application-check", "terminated"]
     assert (f.destination / ".bin" / ("meerkat-connect-" + f.target.target) / "bin/toolkit_gateway").stat().st_mode & 0o777 == 0o755
+
+
+KEPT_FIELD = "native_prefix_receipt_sha256"
+
+
+def kept_files(f):
+    return sorted(path.name for path in f.directory.iterdir() if "native-prefix-receipt" in path.name)
+
+
+def digest_proof(f):
+    """The worker's byte proof, with the inventory digest a real proof records."""
+    def proof(destination, version, **kwargs):
+        report_progress, observation = kwargs.pop("report_progress"), kwargs.pop("observation")
+        artifacts = selection.selected_runtime_artifacts(f.target)
+        adapter.verify_meta_toolkit_prefix(artifacts, deployment_root=f.destination,
+            report_progress=report_progress)
+        observation.update(artifacts=artifacts, inventory_source=artifacts._inventory_source)
+        f.events.append("byte-proof")
+        return {"source": "meta-toolkit-product", "assembly_sha256": f.target.assembly.sha256,
+            "archive_sha256": artifacts.archive.sha256,
+            "prefix_inventory_sha256": candidates.prefix_inventory_sha256(artifacts.entries)}
+    return proof
+
+
+async def test_successful_product_install_keeps_its_verified_inventory(worker_fixture, monkeypatch):
+    f = worker_fixture
+    monkeypatch.setattr(dependencies, "verify_runtime", digest_proof(f))
+    assert await worker.run(f.directory, "install") == 0
+    receipt = deployment.read_receipt(f.directory)
+    named = receipt[KEPT_FIELD]
+    path = f.directory / f"native-prefix-receipt-{named}.json"
+    assert kept_files(f) == [path.name] and stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert updates.digest(path.read_bytes()) == named
+    assert (json.loads(path.read_bytes())["inventory_sha256"]
+        == receipt["installed_candidate_runtime_proof"]["prefix_inventory_sha256"])
+    assert receipt["status"] == "stopped" and receipt["phase"] == "configure"
+
+
+@pytest.mark.parametrize("failure", ["verification", "application-check"])
+async def test_failed_product_install_keeps_no_inventory(worker_fixture, monkeypatch, failure):
+    f = worker_fixture
+    proof = digest_proof(f)
+    if failure == "verification":
+        def failing(destination, version, **kwargs):
+            readme = f.destination / ".bin" / ("meerkat-connect-" + f.target.target) / "README.md"
+            content = readme.read_bytes()
+            readme.chmod(0o644)
+            readme.write_bytes(bytes([content[0] ^ 1]) + content[1:])
+            readme.chmod(0o444)
+            return proof(destination, version, **kwargs)
+        monkeypatch.setattr(dependencies, "verify_runtime", failing)
+    else:
+        monkeypatch.setattr(dependencies, "verify_runtime", proof)
+        base = worker.Supervisor
+        class FailedCheck(base):
+            async def command(self, argv, phase, timeout, **kwargs):
+                if phase == "Installed application contract":
+                    raise RuntimeError("The inert application contract check failed.")
+                return await base.command(self, argv, phase, timeout, **kwargs)
+        monkeypatch.setattr(worker, "Supervisor", FailedCheck)
+    assert await worker.run(f.directory, "install") != 0
+    receipt = deployment.read_receipt(f.directory)
+    assert KEPT_FIELD not in receipt and "installed_candidate_runtime_proof" not in receipt
+    assert kept_files(f) == []
+    assert ("byte-proof" in f.events) is (failure == "application-check")
+
+
+def descriptor_target(descriptor):
+    return os.readlink(f"/proc/self/fd/{descriptor}")
+
+
+@pytest.mark.parametrize("failure", ["no-space", "serialization"])
+async def test_a_failed_inventory_write_keeps_the_install_and_names_nothing(worker_fixture, monkeypatch, failure):
+    from launchkit import native_prefix_receipt as kept
+    f = worker_fixture
+    monkeypatch.setattr(dependencies, "verify_runtime", digest_proof(f))
+    if failure == "no-space":
+        original = os.fsync
+        def fsync(descriptor):
+            if ".native-prefix-receipt-" in descriptor_target(descriptor):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return original(descriptor)
+        monkeypatch.setattr(os, "fsync", fsync)
+    else:
+        def unserializable(runtime_candidate):
+            raise ValueError("Out of range float values are not JSON compliant")
+        monkeypatch.setattr(kept, "selection_sha256", unserializable)
+    assert await worker.run(f.directory, "install") == 0
+    receipt = deployment.read_receipt(f.directory)
+    assert receipt["status"] == "stopped" and receipt["phase"] == "configure"
+    assert "installed_candidate_runtime_proof" in receipt and KEPT_FIELD not in receipt
+    assert kept_files(f) == []
+
+
+async def test_the_kept_inventory_is_durable_before_the_install_receipt_names_it(worker_fixture, monkeypatch):
+    f = worker_fixture
+    monkeypatch.setattr(dependencies, "verify_runtime", digest_proof(f))
+    events = []
+    original_fsync, original_replace, original_write = os.fsync, os.replace, deployment.write_private
+    def fsync(descriptor):
+        target = descriptor_target(descriptor)
+        if "native-prefix-receipt-" in target:
+            events.append("file fsync")
+        elif target == str(f.directory):
+            events.append("folder fsync")
+        return original_fsync(descriptor)
+    def replace(source, destination):
+        if "native-prefix-receipt-" in str(source):
+            events.append("rename")
+        return original_replace(source, destination)
+    def write_private(path, value):
+        if Path(path).name == "receipt.json" and KEPT_FIELD in value:
+            events.append("receipt names it")
+        return original_write(path, value)
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(deployment, "write_private", write_private)
+    assert await worker.run(f.directory, "install") == 0
+    assert events[:4] == ["file fsync", "rename", "folder fsync", "receipt names it"]
 
 
 def observe_initial_prefix(monkeypatch, after_write=lambda path: None):

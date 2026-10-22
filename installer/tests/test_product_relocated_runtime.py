@@ -154,6 +154,75 @@ def test_default_local_product_verification_still_reads_the_original_target(inst
     assert _source_bytes(f.selected) == before
 
 
+def test_local_product_verification_with_a_kept_inventory_skips_only_the_archive(installed_source, monkeypatch):
+    from launchkit import runtime_candidates as candidates
+    f = installed_source
+    target = f.selected.custody.plan.origin
+    first = {}
+    proof = runtime.verify_runtime(f.selected.destination, f.version, runtime_target=target,
+        sdk_python=f.python, site_packages=f.site, observation=first)
+    artifacts = first["artifacts"]
+    assert first["inventory_source"] == "archive"
+    retained = candidates.RetainedPrefixInventory(artifacts.entries, artifacts.prefix, target.assembly.sha256,
+        artifacts.archive.sha256, artifacts.archive.size, proof["prefix_inventory_sha256"], "0" * 64,
+        "1" * 64)
+    inflated = []
+    original = candidates.product_prefix_entries
+    def entries(content, prefix):
+        inflated.append(prefix)
+        return original(content, prefix)
+    monkeypatch.setattr(candidates, "product_prefix_entries", entries)
+    second = {}
+    assert runtime.verify_runtime(f.selected.destination, f.version, runtime_target=target,
+        sdk_python=f.python, site_packages=f.site, retained=retained, observation=second) == proof
+    assert inflated == [] and second["inventory_source"] == "retained"
+    readme = f.selected.destination / ".bin" / artifacts.prefix / "README.md"
+    content = readme.read_bytes()
+    readme.chmod(0o644)
+    readme.write_bytes(bytes([content[0] ^ 1]) + content[1:])
+    readme.chmod(0o444)
+    with pytest.raises(candidates.CandidateArtifactError, match="native prefix file changed"):
+        runtime.verify_runtime(f.selected.destination, f.version, runtime_target=target,
+            sdk_python=f.python, site_packages=f.site, retained=retained)
+    assert inflated == []
+    with pytest.raises(runtime.RuntimeDependencyError, match="selected native product only"):
+        runtime.verify_runtime(f.selected.destination, "0.8.48", retained=retained)
+
+
+@pytest.mark.parametrize("local_disk", [True, False])
+def test_local_product_verification_skips_unchanged_files_only_on_a_local_disk(
+        installed_source, monkeypatch, local_disk):
+    from launchkit import native_prefix_receipt as kept
+    from launchkit import runtime_candidates as candidates
+    f = installed_source
+    target = f.selected.custody.plan.origin
+    monkeypatch.setattr(kept, "local_disk_filesystem", lambda path: True)
+    first = {}
+    proof = runtime.verify_runtime(f.selected.destination, f.version, runtime_target=target,
+        sdk_python=f.python, site_packages=f.site, observation=first)
+    artifacts = first["artifacts"]
+    files = sorted(entry.name for entry in artifacts.entries if entry.kind == "file")
+    assert sorted(first["fingerprints"]) == files
+    retained = candidates.RetainedPrefixInventory(artifacts.entries, artifacts.prefix, target.assembly.sha256,
+        artifacts.archive.sha256, artifacts.archive.size, proof["prefix_inventory_sha256"], "0" * 64,
+        "1" * 64, tuple(sorted((name, fingerprint) for name, (fingerprint, _) in first["fingerprints"].items())))
+    monkeypatch.setattr(kept, "local_disk_filesystem", lambda path: local_disk)
+    prefix = f.selected.destination / ".bin" / artifacts.prefix
+    reads = []
+    original = adapter.read_owned
+    def read_owned(path, *args, **kwargs):
+        if prefix in Path(path).parents:
+            reads.append(Path(path).relative_to(prefix.parent).as_posix())
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(adapter, "read_owned", read_owned)
+    second = {}
+    assert runtime.verify_runtime(f.selected.destination, f.version, runtime_target=target,
+        sdk_python=f.python, site_packages=f.site, retained=retained, observation=second) == proof
+    assert second["inventory_source"] == "retained" and second["fingerprints"] == {}
+    # The executed gateway is always hashed; the rest only off a local disk.
+    assert sorted(reads) == ([artifacts.prefix + "/bin/toolkit_gateway"] if local_disk else files)
+
+
 def test_relocated_target_alone_cannot_replace_the_accepted_source_identity(installed_source):
     f = installed_source
     with _source(f) as source:

@@ -203,14 +203,18 @@ def _parse_product_selection(value):
 
 
 def selected_runtime_artifacts(target, *, verified_artifacts=None, source_custody=None,
-        destination=None, files=None):
+        destination=None, files=None, retained=None):
     from . import runtime_candidates
+    if retained is not None and (type(target) is not MetaToolkitRuntimeTarget
+            or source_custody is not None or verified_artifacts is not None):
+        # A carrier holds the reads it made with its own retained inventory.
+        raise ValueError("A retained native inventory only replaces one fresh local product read.")
     if type(target) is MetaToolkitRuntimeTarget:
         if source_custody is not None:
             from .product_runtime_custody import relocated_artifacts
             return relocated_artifacts(target, source_custody=source_custody,
                 verified_artifacts=verified_artifacts, destination=destination, files=files)
-        return (read_meta_toolkit_artifacts(target) if verified_artifacts is None else
+        return (read_meta_toolkit_artifacts(target, retained=retained) if verified_artifacts is None else
             recheck_meta_toolkit_artifacts(verified_artifacts, target))
     if source_custody is not None:
         raise ValueError("Relocated byte custody is only available to its original native product owner.")

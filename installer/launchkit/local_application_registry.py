@@ -18,15 +18,17 @@ import uuid
 
 from .connect_installer_caller import CustodyError, MAX_INPUT_BYTES, _json, _private_directory, _read
 from .deployment import DeploymentService, read_receipt
-from .deployment_application_bootstrap import bootstrap_installation_binding, same_installation_apart_from_staged_update
+from .deployment_application_bootstrap import (FRESH_ENTRY_NAME, bootstrap_installation_binding,
+    require_owner_installation, same_installation_apart_from_staged_update)
 from .deployment_sources import read_package_source
 from .deployment_updates import checked_package, _candidate_source_selection, _same_toml
-from .forge_application_host import ForgeApplicationHost, application_setup_binding
+from .forge_application_host import ForgeApplicationHost, application_setup_binding, owner_choices_match
 from .guide_store import GuideStore
 from .implementation import ImplementationService
 from .implementation_workspace import ImplementationWorkspace
 from .local_application_factory import LocalApplicationFactory, _replacement_supplier
 from .local_application_source import create_local_application_source, _guide, _store_identity
+from .projects import DraftConflict
 from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
 from .ordinary_application_source import OrdinaryApplicationHost, create_ordinary_application_source, ordinary_application
 
@@ -54,6 +56,15 @@ def _installation_binding(receipt, source):
     """Use the existing original source and Restore service interpretation."""
     return {**bootstrap_installation_binding(receipt),
         "accepted_source_digest": source["source_digest"]}
+
+
+def _set_up(directory):
+    """An installation that entered Fresh keeps the owner of its setup custody."""
+    entry = directory / FRESH_ENTRY_NAME
+    return entry.exists() or entry.is_symlink()
+
+
+REDIRECTED = "The original installation cannot be redirected to another build or source owner."
 
 
 class LocalApplicationRegistry:
@@ -309,9 +320,16 @@ class LocalApplicationRegistry:
                 raise CustodyError("The original installed application source kind changed.")
             return None, None
         build_id = _identity(receipt.get("build_id"))
-        chosen = self._builds.get((guide_id, build_id))
-        host = chosen.host if chosen is not None else (
-            self.manual_host if self.manual_host is not None and self.manual_host.applies(guide_id) else None)
+        manual = self.manual_host if self.manual_host is not None and self.manual_host.applies(guide_id) else None
+        if _set_up(directory):
+            # Its retained setup host holds the installation's custody. Another
+            # build's host never becomes its owner, even one built here; without
+            # a retained entry only a claimed recovery rebuilds that owner.
+            chosen = None
+            host = retained[0] if retained is not None else manual
+        else:
+            chosen = self._builds.get((guide_id, build_id))
+            host = chosen.host if chosen is not None else manual
         selection = receipt.get("runtime_candidate")
         target = parse_candidate_selection(selection) if selection is not None else None
         if host is None and (retained is not None or type(target) is MetaToolkitRuntimeTarget):
@@ -327,23 +345,62 @@ class LocalApplicationRegistry:
             raise CustodyError("The canonical package changed its original runtime selection.")
         if host is None:
             return None, None
-        if (json.loads(files["blueprint.json"][0]) != host._blueprint
-                or files["config/mob.toml"][0] != host._definition.encode("utf-8")
-                or any(files.get(name, (None, None))[0] != pin.read() for name, pin in host._protected)):
+        if not owner_choices_match(host, files):
             raise CustodyError("The canonical package differs from this original protected application owner.")
         binding = _installation_binding(receipt, source)
         if retained is not None:
-            # Only Apply compares the staged update pointer itself.
-            same = (same_installation_apart_from_staged_update(retained[1], binding, receipt)
-                if staged_update_allowed else retained[1] == binding)
-            if retained[0] is not host or not same:
-                raise CustodyError("The original installation cannot be redirected to another build or source owner.")
+            if retained[0] is not host:
+                raise CustodyError(REDIRECTED)
+            if not staged_update_allowed:
+                # Only Apply's replacement lookup compares the update pointer itself.
+                if retained[1] != binding:
+                    raise CustodyError(REDIRECTED)
+            elif not same_installation_apart_from_staged_update(retained[1], binding, receipt):
+                # The retained anchor moves only through this installation's
+                # own completed source updates.
+                require_owner_installation(directory, receipt, {name: value for name, value
+                    in retained[1].items() if name != "accepted_source_digest"}, REDIRECTED)
         current = read_receipt(directory)
         if (self.deployment._directory(guide_id) != directory
                 or _installation_binding(current, source) != binding):
             raise CustodyError("The canonical installation changed during original owner lookup.")
         self._require_registry()
         return host, binding
+
+    def continues_installed_source(self, guide_id, deployment_id, build_id, source_digest):
+        """Whether an accepted Build continues the installed Build's own signed source.
+
+        Its signed accepted-baseline chain must reach the installed Build, so it
+        ends at the same initial Build and source owner. The walk is bounded and
+        read-only, and holds no registry lock while it reads Build storage.
+        """
+        from .local_application_recovery import _accepted_build
+        with self._lock:
+            self._require_registry()
+            guide_id, deployment_id = _identity(guide_id), _identity(deployment_id)
+            directory = self.deployment._directory(guide_id, deployment_id)
+            receipt = read_receipt(directory)
+            _, files = checked_package(directory, "package.zip", receipt["package_sha256"])
+            installed = (receipt["build_id"], read_package_source(files, receipt)["source_digest"])
+            blueprint = json.loads(files["blueprint.json"][0])
+            selection = receipt.get("runtime_candidate")
+            target = parse_candidate_selection(selection) if selection is not None else None
+        current, seen = (build_id, source_digest), set()
+        try:
+            while current != installed:
+                if current[0] in seen or current[0] == installed[0] or len(seen) >= 128:
+                    return False
+                seen.add(_identity(current[0]))
+                _, provenance, *_ = _accepted_build(self, guide_id, current[0], current[1], blueprint, target)
+                previous = provenance.get("previous")
+                if (provenance.get("basis") != "accepted-baseline" or not isinstance(previous, dict)
+                        or set(previous) != {"build_id", "source_digest"}):
+                    return False
+                current = (previous["build_id"], previous["source_digest"])
+        except (CustodyError, DraftConflict, OSError, KeyError, TypeError, ValueError):
+            return False
+        self._require_registry()
+        return True
 
     def selected_host(self, guide_id, deployment_id, *, staged_update_allowed=True):
         """Read the exact original installation owner without native effects."""
@@ -501,7 +558,9 @@ class LocalApplicationRegistry:
                 return False
             build_id = _identity(receipt.get("build_id"))
             key, build_key = (guide_id, deployment_id), (guide_id, build_id)
-            if key in self._installations or build_key in self._builds:
+            # A build host retained here never owns a set-up installation.
+            set_up = _set_up(directory)
+            if key in self._installations or not set_up and build_key in self._builds:
                 return False
             selection = receipt.get("runtime_candidate")
             if selection is None or type(parse_candidate_selection(selection)) is not MetaToolkitRuntimeTarget:
@@ -539,7 +598,7 @@ class LocalApplicationRegistry:
                     or recovered.factory.host is not recovered.host
                     or recovered.host._blueprint != recovered.blueprint
                     or recovered.host._target != self._runtime_target_for_blueprint(recovered.blueprint)
-                    or key in self._installations or build_key in self._builds):
+                    or key in self._installations or not set_up and build_key in self._builds):
                 raise CustodyError("The original installation recovery owner changed before retention.")
             recovered.host.require_current()
             current_directory, current, stopped = deployment._stopped_application_owner(guide_id, deployment_id)
@@ -550,8 +609,9 @@ class LocalApplicationRegistry:
                     or _installation_binding(current, source) != recovered.binding):
                 raise CustodyError("The original installed source changed before recovery retention.")
             self._require_registry()
-            self._builds[build_key] = _BuildOwner(guide_id, build_id, recovered.guide_version,
-                deepcopy(recovered.blueprint), recovered.factory, recovered.host)
+            # A build host already retained here stays that build's owner only.
+            self._builds.setdefault(build_key, _BuildOwner(guide_id, build_id, recovered.guide_version,
+                deepcopy(recovered.blueprint), recovered.factory, recovered.host))
             self._installations[key] = (recovered.host, deepcopy(recovered.binding))
             return True
 
@@ -606,7 +666,7 @@ class LocalApplicationRegistry:
                 return None
             build_id = _identity(receipt.get("build_id"))
             if ((guide_id, deployment_id) in self._installations
-                    or (guide_id, build_id) in self._builds):
+                    or not _set_up(directory) and (guide_id, build_id) in self._builds):
                 return None
             selection = receipt.get("runtime_candidate")
             if selection is None or type(parse_candidate_selection(selection)) is not MetaToolkitRuntimeTarget:

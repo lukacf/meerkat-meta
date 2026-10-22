@@ -895,6 +895,21 @@ field declarations. A novice should never have to edit an environment file or so
 """
 
 
+def _package_archive(files):
+    """Hash and zip an exported package. Runs in a worker thread: it reads
+    only the exported in-memory files, never the workspace."""
+    from .generator import PackageFile
+    hashes = "".join(f"{hashlib.sha256(item.as_bytes()).hexdigest()}  {item.path}\n" for item in sorted(files, key=lambda item: item.path))
+    files = [*files, PackageFile("SHA256SUMS", hashes)]
+    result = io.BytesIO()
+    with zipfile.ZipFile(result, "w", zipfile.ZIP_DEFLATED) as archive:
+        for item in files:
+            info = zipfile.ZipInfo(item.path)
+            info.external_attr = (0o100000 | item.mode) << 16
+            archive.writestr(info, item.content)
+    return result.getvalue()
+
+
 class ImplementationService:
     """Background build admission, snapshots, native timelines and checked packages."""
 
@@ -1981,20 +1996,14 @@ class ImplementationService:
         from .generator import PackageFile
         files = [item for item in files if item.path not in ("SHA256SUMS", "implementation-report.json")]
         files.append(PackageFile("implementation-report.json", json.dumps(manifest, indent=2) + "\n"))
-        hashes = "".join(f"{hashlib.sha256(item.as_bytes()).hexdigest()}  {item.path}\n" for item in sorted(files, key=lambda item: item.path))
-        files.append(PackageFile("SHA256SUMS", hashes))
-        result = io.BytesIO()
-        with zipfile.ZipFile(result, "w", zipfile.ZIP_DEFLATED) as archive:
-            for item in files:
-                info = zipfile.ZipInfo(item.path)
-                info.external_attr = (0o100000 | item.mode) << 16
-                archive.writestr(info, item.content)
+        # Hashing and compressing the whole package must not hold the event loop.
+        payload = await asyncio.to_thread(_package_archive, files)
         latest = await self.status(guide_id, state=state) if state is not None else await self.status(guide_id)
         if (latest["build_id"] != status["build_id"] or not latest["current"] or not latest["ready_to_package"]
                 or latest.get("source_digest") != status.get("source_digest")
                 or latest.get("current_guide_version") != status.get("current_guide_version")):
             raise DraftConflict("The setup or its application changed while preparing the package. Reload before downloading.")
-        return result.getvalue(), frozen["blueprint"]["project"]["slug"]
+        return payload, frozen["blueprint"]["project"]["slug"]
 
     async def shutdown(self):
         identities = list(self.tasks)

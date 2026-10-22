@@ -261,13 +261,15 @@ class ProductGatewayFile(ExactFile):
         from .templates.install_candidate import verify_meta_toolkit_prefix
         if type(artifacts) is not MetaToolkitRuntimeArtifacts or type(pin) is not ExactFile:
             raise CustodyError("Product gateway custody needs its original selected artifacts and exact pin.")
+        from .native_prefix_receipt import known_fingerprints
         recheck_meta_toolkit_artifacts(artifacts, artifacts.selection)
         prefix = _path(pin.path).parent.parent
         enclosing = _private_directory(prefix.parent)
+        known = known_fingerprints(artifacts, prefix)
         if (pin.path.name != "toolkit_gateway" or pin.path.parent.name != "bin"
                 or pin.sha256 != artifacts.candidate["binary"]["sha256"]
                 or verify_meta_toolkit_prefix(artifacts, deployment_root=prefix.parent,
-                    prefix_path=prefix) != pin.path):
+                    prefix_path=prefix, **({"known": known} if known is not None else {})) != pin.path):
             raise CustodyError("The original gateway differs from its complete selected native prefix.")
         entries = tuple((prefix.parent / entry.name, cls._identity(prefix.parent / entry.name))
             for entry in artifacts.entries)
@@ -290,12 +292,14 @@ class ProductGatewayFile(ExactFile):
             raise CustodyError("The original selected product prefix or private enclosing custody changed.")
 
     def verify(self, *, executable=False):
+        from .native_prefix_receipt import known_fingerprints
         from .templates.install_candidate import verify_meta_toolkit_prefix
         if executable is not True:
             raise CustodyError("Product gateway custody is for its exact executable only.")
         self.require_current()
+        known = known_fingerprints(self.artifacts, self.path.parent.parent)
         if verify_meta_toolkit_prefix(self.artifacts, deployment_root=self.enclosing[0],
-                prefix_path=self.path.parent.parent) != self.path:
+                prefix_path=self.path.parent.parent, **({"known": known} if known is not None else {})) != self.path:
             raise CustodyError("The selected product gateway changed.")
         self.require_current()
 

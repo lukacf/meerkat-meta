@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import threading
+import time
 import uuid
 import zipfile
 
@@ -1638,3 +1639,30 @@ async def test_organization_bound_application_keeps_framework_export_and_recover
         assert (await service.submit(service.guide.identity, 3, "Keep workplace identity"))["build_id"] == first["build_id"]
     finally:
         await service.shutdown()
+
+
+async def test_package_hashing_and_compression_leave_the_event_loop_free(service, monkeypatch):
+    status = await service.submit(service.guide.identity, 3)
+    await complete(service, status)
+    original = zipfile.ZipFile.writestr
+    def slowed(archive, info, *args, **kwargs):
+        if getattr(info, "filename", info) == "SHA256SUMS":
+            time.sleep(1.0)  # A large package on a small host.
+        return original(archive, info, *args, **kwargs)
+    monkeypatch.setattr(zipfile.ZipFile, "writestr", slowed)
+    stalls, done = [], asyncio.Event()
+    async def other_request():
+        while not done.is_set():
+            started = time.monotonic()
+            await asyncio.sleep(0.01)
+            stalls.append(time.monotonic() - started)
+    probe = asyncio.create_task(other_request())
+    await asyncio.sleep(0)  # The other request is waiting on the loop.
+    try:
+        payload, _ = await service.package(service.guide.identity, status["build_id"])
+    finally:
+        done.set()
+        await probe
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        assert "SHA256SUMS" in archive.namelist()
+    assert stalls and max(stalls) < 0.5

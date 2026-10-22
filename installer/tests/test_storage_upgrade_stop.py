@@ -118,7 +118,8 @@ def checked_start(project, monkeypatch):
         "expected_binding": None, "expected_installation": None, "updates": updates,
         "journal": lambda *args, **kwargs: None, "verify_destination": lambda *args: None,
         "read_receipt": lambda *args: {}, "read_settings": lambda *args: {}, "command": command,
-        "project_lock": held, "native_update": False, "replacement": None, "registry_update": False}
+        "project_lock": held, "native_update": False, "replacement": None, "registry_update": False,
+        "owner_start": False}
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
     files = {"deployment.json": ((project.root / "deployment.json").read_text(), 0o644)}
     return SimpleNamespace(run=lambda: namespace["checked_start"](files, False), supervisor=supervisor,

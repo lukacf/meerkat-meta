@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import plistlib
 import sys
+import time
 import uuid
 
 import pytest
@@ -884,3 +885,30 @@ async def test_required_static_resource_is_exact_private_manifested_and_tamper_r
     with pytest.raises(DraftConflict, match="source changed"):
         verify_service(directory, read_receipt(directory))
     assert not any(call[0] in {"start", "stop"} for call in manager.calls)
+
+
+async def test_options_unpack_leaves_the_event_loop_free(tmp_path, monkeypatch):
+    import launchkit.deployment as deployment_module
+    monkeypatch.setenv("HOME", str(tmp_path))
+    guide = Guide()
+    service = Service(tmp_path / "private", guide, Implementation(guide), service_manager=Manager())
+    original = deployment_module.package_files
+    def slowed(payload):
+        time.sleep(1.0)  # A large package on a small host.
+        return original(payload)
+    monkeypatch.setattr(deployment_module, "package_files", slowed)
+    stalls, done = [], asyncio.Event()
+    async def other_request():
+        while not done.is_set():
+            started = time.monotonic()
+            await asyncio.sleep(0.01)
+            stalls.append(time.monotonic() - started)
+    probe = asyncio.create_task(other_request())
+    await asyncio.sleep(0)  # The other request is waiting on the loop.
+    try:
+        options = await service.options(guide.identity)
+    finally:
+        done.set()
+        await probe
+    assert options["current"] and stalls and max(stalls) < 0.5
+    await service.shutdown()
