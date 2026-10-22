@@ -317,6 +317,8 @@ async def test_product_connect_refuses_an_owner_that_changed_while_its_bundle_wa
         await f.service._connect(GUIDE, 3, BUILD, ENDPOINT, str(f.home / "other project"), product_owner=f.selection)
     assert saved and not saved[0].exists() and not (saved[0].parent / "receipt.json").exists()
     assert f.service.directory(GUIDE).name == f.deployment_id and not f.service.tasks
+    assert sorted(path.name for path in (f.service.root / GUIDE).iterdir()) == sorted([f.deployment_id, "latest.json"])
+    assert not list((f.service.root / ".connecting").iterdir())
 
 
 async def test_hook_control_below_the_product_glibc_floor_refuses_before_any_remote_request(

@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from copy import deepcopy
+import errno
 import fcntl
 import gzip
 import hashlib
 import io
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -30,6 +32,7 @@ from .application_access import application_observation
 from .remote_destination import (ControllerError, PRODUCT_RUNTIME_UNSUPPORTED,
                                  connection_prerequisites, private_settings_input)
 
+LOG = logging.getLogger(__name__)
 PROTOCOL = 1
 HASH = re.compile(r"[a-f0-9]{64}")
 FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{20,90}={0,2}")
@@ -38,6 +41,9 @@ PRIVATE_COMPONENTS = {".env", ".venv", ".bin", ".mobkit", ".git", "__pycache__",
 PRIVATE_ROOTS = {"data", "workspace", "source"}
 NEEDED = {"remote_operations.py", "setup.py", "install.sh", "application_configuration.py", "mcp_connections.py"}
 MAX_CONTROLLER = 512 * 1024
+# A new installation is built here, outside every guide's inventory, and
+# renamed into place only once its record is complete.
+STAGING = ".connecting"
 
 
 class RemoteProductActionNotSent(DraftConflict):
@@ -148,6 +154,51 @@ def update_receipt(directory, **changes):
         value.update(changes, updated_at=now())
         write_private(Path(directory) / "receipt.json", value)
         return value
+
+
+def _sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _staging_lock(path):
+    """Claim one staging entry for this connect's whole life; None if it is held."""
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise DraftConflict("The remote installation store is not an owned directory.")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return descriptor
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _end_staging(entry, lock):
+    """Remove a held staging entry, if still there, and release its claim.
+
+    A copy that cannot be removed is left for the next sweep. This never raises,
+    so it cannot replace the error that ended the connect.
+    """
+    try:
+        if entry.exists() and not entry.is_symlink():
+            for item in entry.iterdir():
+                if item.is_symlink() or not item.is_file():
+                    raise OSError("unexpected entry " + item.name)
+                item.unlink()
+            entry.rmdir()
+        entry.with_name(entry.name + ".lock").unlink(missing_ok=True)
+    except OSError as error:
+        LOG.warning("Left the connect staging entry %s for a later sweep: %s", entry.name, error)
+    finally:
+        os.close(lock)
 
 
 def journal(directory, message, **changes):
@@ -686,72 +737,109 @@ class RemoteDeploymentService:
             if any(item.is_symlink() for item in (self.root, *self.root.parents)):
                 raise DraftConflict("The owned remote installation store contains a link.")
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            for folder in (self.root, self.root / guide_id):
+            for folder in (self.root, self.root / guide_id, self.root / STAGING):
                 folder.mkdir(exist_ok=True, mode=0o700)
                 info = folder.lstat()
                 if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
                     raise DraftConflict("The remote installation store is not an owned directory.")
                 folder.chmod(0o700)
+            self._sweep_staging()
             directory = self.root / guide_id / identity
-            directory.mkdir(parents=True, mode=0o700)
-            directory.parent.chmod(0o700)
-            from .remote_interface_bundle import controller_bytes
-            product_bundle = None
-            if selected.get("product_control") is not None:
-                from .remote_product_control import freeze_product_control
-                from .remote_product_artifacts import _joined
-                product_bundle = await _joined(freeze_product_control, selected["product_control"],
-                    _owner_current=selected["product_control"].require_current)
-            controller = controller_bytes(**({"product_control": product_bundle} if product_bundle is not None else {}))
-            if len(controller) > MAX_CONTROLLER:
-                raise DraftConflict("The trusted remote controller exceeded its original bound.")
-            _, transferred = await await_validation(source_archive, selected["files"])
-            receipt = {"protocol": PROTOCOL, "deployment_id": identity, "guide_id": guide_id,
-                "guide_version": version, "build_id": build_id,
-                "build_guide_version": selected["checked"]["guide_version"],
-                "accepted_source_digest": selected["checked"]["source_digest"],
-                "package_sha256": await await_validation(package_digest, selected["payload"]),
-                "transferred_source_digest": transferred, "controller_sha256": hashlib.sha256(controller).hexdigest(),
-                "endpoint": endpoint, "destination_input": destination, "destination": destination,
-                "status": "connecting", "last_known_status": None, "created_at": now(), "updated_at": now(),
-                "fields": selected["fields"], "console_scope": selected["console_scope"],
-                "preflight": None, "progress": [], "checks": [],
-                "scope": "native-bootstrap-and-console", "custom_interfaces_verified": False,
-                "external_workflows_verified": False, "remote_admission_requested": False,
-                "observation": {"available": False}, "detail": "Checking the chosen Linux computer through its existing trusted SSH connection."}
-            # Writing and syncing the whole package must not hold the event loop.
-            await await_validation(write_bytes, directory / "package.zip", selected["payload"])
-            write_bytes(directory / "controller.py", controller)
-            if product_bundle is not None:
-                from .remote_product_control import _json
-                product_bundle.require_current()
-                control_bytes = _json(product_bundle.manifest)
-                bundle = directory / "control-bundle.zip"
-                # Writing and syncing the whole bundle must not hold the event
-                # loop. Its original owner must still be current afterwards.
-                await await_validation(write_bytes, bundle, product_bundle.content)
-                try:
+            staging = self.root / STAGING / identity
+            lock = _staging_lock(staging.with_name(identity + ".lock"))
+            if lock is None:
+                raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(staging))
+            try:
+                staging.mkdir(mode=0o700)
+                from .remote_interface_bundle import controller_bytes
+                product_bundle = None
+                if selected.get("product_control") is not None:
+                    from .remote_product_control import freeze_product_control
+                    from .remote_product_artifacts import _joined
+                    product_bundle = await _joined(freeze_product_control, selected["product_control"],
+                        _owner_current=selected["product_control"].require_current)
+                controller = controller_bytes(**({"product_control": product_bundle} if product_bundle is not None else {}))
+                if len(controller) > MAX_CONTROLLER:
+                    raise DraftConflict("The trusted remote controller exceeded its original bound.")
+                _, transferred = await await_validation(source_archive, selected["files"])
+                receipt = {"protocol": PROTOCOL, "deployment_id": identity, "guide_id": guide_id,
+                    "guide_version": version, "build_id": build_id,
+                    "build_guide_version": selected["checked"]["guide_version"],
+                    "accepted_source_digest": selected["checked"]["source_digest"],
+                    "package_sha256": await await_validation(package_digest, selected["payload"]),
+                    "transferred_source_digest": transferred, "controller_sha256": hashlib.sha256(controller).hexdigest(),
+                    "endpoint": endpoint, "destination_input": destination, "destination": destination,
+                    "status": "connecting", "last_known_status": None, "created_at": now(), "updated_at": now(),
+                    "fields": selected["fields"], "console_scope": selected["console_scope"],
+                    "preflight": None, "progress": [], "checks": [],
+                    "scope": "native-bootstrap-and-console", "custom_interfaces_verified": False,
+                    "external_workflows_verified": False, "remote_admission_requested": False,
+                    "observation": {"available": False}, "detail": "Checking the chosen Linux computer through its existing trusted SSH connection."}
+                # Writing and syncing the whole package must not hold the event loop.
+                await await_validation(write_bytes, staging / "package.zip", selected["payload"])
+                write_bytes(staging / "controller.py", controller)
+                if product_bundle is not None:
+                    from .remote_product_control import _json
                     product_bundle.require_current()
-                except Exception:
-                    with suppress(OSError):
-                        bundle.unlink(missing_ok=True)
-                    raise
-                write_bytes(directory / "product-control.json", control_bytes)
-                receipt.update(product_runtime=True,
-                    product_control_manifest_sha256=hashlib.sha256(control_bytes).hexdigest(),
-                    product_control_bundle_sha256=product_bundle.manifest["bundle"]["sha256"],
-                    product_control_bundle_size=product_bundle.manifest["bundle"]["size"])
+                    control_bytes = _json(product_bundle.manifest)
+                    # Writing and syncing the whole bundle must not hold the event
+                    # loop. Its original owner must still be current afterwards;
+                    # a refusal discards the staged copy like any other failure.
+                    await await_validation(write_bytes, staging / "control-bundle.zip", product_bundle.content)
+                    product_bundle.require_current()
+                    write_bytes(staging / "product-control.json", control_bytes)
+                    receipt.update(product_runtime=True,
+                        product_control_manifest_sha256=hashlib.sha256(control_bytes).hexdigest(),
+                        product_control_bundle_sha256=product_bundle.manifest["bundle"]["sha256"],
+                        product_control_bundle_size=product_bundle.manifest["bundle"]["size"])
+                    if cloud is not None:
+                        cloud_bytes = _json(cloud)
+                        write_bytes(staging / "product-cloud.json", cloud_bytes)
+                        receipt["product_cloud_sha256"] = hashlib.sha256(cloud_bytes).hexdigest()
                 if cloud is not None:
-                    cloud_bytes = _json(cloud)
-                    write_bytes(directory / "product-cloud.json", cloud_bytes)
-                    receipt["product_cloud_sha256"] = hashlib.sha256(cloud_bytes).hexdigest()
-            if cloud is not None:
-                receipt.update(target="gcp", cloud_operation_id=cloud["operation_id"],
-                    detail="Checking the owned Google Cloud computer through its verified IAP SSH connection.")
-            write_private(directory / "receipt.json", receipt)
+                    receipt.update(target="gcp", cloud_operation_id=cloud["operation_id"],
+                        detail="Checking the owned Google Cloud computer through its verified IAP SSH connection.")
+                write_private(staging / "receipt.json", receipt)
+                _sync_directory(staging)
+                if directory.exists() or directory.is_symlink():
+                    raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(directory))
+                os.rename(staging, directory)
+            except BaseException:
+                # A failed or cancelled connect leaves nothing in the inventory.
+                # Every awaited write has returned before this runs.
+                _end_staging(staging, lock)
+                raise
+            _end_staging(staging, lock)
+            # Past the rename the installation is complete under its own name,
+            # even if naming it as the selection below fails.
+            _sync_directory(directory.parent)
             write_private(directory.parent / "latest.json", {"deployment_id": identity})
             self.start_task(directory, "preflight")
             return self.public(receipt, current=True, current_guide_version=version)
+
+    def _sweep_staging(self):
+        """Remove staging copies that no live connect, in any process, still claims."""
+        root, names, unexpected = self.root / STAGING, set(), set()
+        for entry in list(root.iterdir()):
+            name = entry.name.removesuffix(".lock")
+            try:
+                info = entry.lstat()
+            except FileNotFoundError:
+                continue
+            kind = stat.S_ISREG if entry.name.endswith(".lock") else stat.S_ISDIR
+            if not kind(info.st_mode) or info.st_uid != os.getuid() or not operation_identity(name):
+                LOG.warning("Left an unexpected connect staging entry in place: %s", entry.name)
+                unexpected.add(name)
+            else:
+                names.add(name)
+        for name in sorted(names - unexpected):
+            try:
+                lock = _staging_lock(root / (name + ".lock"))
+            except (OSError, DraftConflict) as error:
+                LOG.warning("Left the connect staging entry %s in place: %s", name, error)
+                continue
+            if lock is not None:
+                _end_staging(root / name, lock)
 
     def start_task(self, directory, action):
         identity = directory.name
