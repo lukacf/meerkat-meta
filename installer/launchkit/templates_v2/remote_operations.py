@@ -469,6 +469,48 @@ def service_stop_timeout(receipt):
     return value
 
 
+STOP_BUDGET_DROP_IN = 'forge-stop-budget.conf'
+
+
+def stop_budget_drop_in(receipt):
+    """The owned drop-in that widens the unit's stop budget; the unit itself never changes."""
+    return Path(receipt['unit_path'] + '.d') / STOP_BUDGET_DROP_IN
+
+
+def drop_in_bytes(stop_timeout):
+    return ('[Service]\nTimeoutStopSec=' + str(stop_timeout) + '\n').encode()
+
+
+def recorded_stop_budget(receipt):
+    """The widened stop budget recorded beside the unit identity, or None."""
+    record = receipt.get('service_stop_budget')
+    if record is None:
+        return None
+    try:
+        horizon_ms = reported_gateway_horizon(record) if isinstance(record, dict) else None
+    except DestinationError:
+        horizon_ms = None
+    if (horizon_ms is None or set(record) != {'gateway_shutdown_horizon_ms', 'stop_timeout_seconds'}
+            or type(record['stop_timeout_seconds']) is not int
+            or record['stop_timeout_seconds'] != shutdown_budget(horizon_ms)['service']):
+        raise DestinationError('The service receipt has an unsupported shutdown budget. No service was controlled.')
+    return record
+
+
+def service_command_timeouts(receipt):
+    """Stop and restart command bounds that outlast the unit's widened stop budget."""
+    record = recorded_stop_budget(receipt)
+    if record is None or record['stop_timeout_seconds'] <= SERVICE_STOP_TIMEOUT:
+        return SERVICE_STOP_COMMAND_TIMEOUT, SERVICE_RESTART_COMMAND_TIMEOUT
+    command_timeout = record['stop_timeout_seconds'] + SHUTDOWN_BUDGET['command_margin']
+    return command_timeout, command_timeout + START_TIMEOUT + 10
+
+
+def drop_in_content(path):
+    no_links(path)
+    return ordinary(path, private=True, maximum=4096) if path.exists() else None
+
+
 def unit_content(receipt, *, legacy_directory=False):
     stop_timeout = service_stop_timeout(receipt)
     def quote(value, *, expand_dollars=True):
@@ -521,7 +563,46 @@ class Operations:
             known_content = content == unit_content(receipt, legacy_directory=True)
         if not known_content or hashlib.sha256(content).hexdigest() != receipt.get('unit_sha256'):
             raise DestinationError('The owned service definition changed. No existing unit was replaced or controlled.')
+        # A widened stop budget is a recorded drop-in, byte-exact, or none yet
+        # after an interrupted write.
+        record = recorded_stop_budget(receipt)
+        widened = drop_in_content(stop_budget_drop_in(receipt))
+        if widened is not None and (record is None or widened != drop_in_bytes(record['stop_timeout_seconds'])):
+            raise DestinationError('The owned service definition changed. No existing unit was replaced or controlled.')
         return receipt
+
+    def widen_unit(self, horizon_ms):
+        """Widen the unit's stop budget to a reported horizon; never narrow it.
+
+        The record is written before the drop-in, so an interrupted write
+        leaves a controllable unit that the next readiness completes.
+        """
+        receipt = self.load()
+        budget = shutdown_budget(horizon_ms)['service']
+        record = recorded_stop_budget(receipt)
+        recorded = 0 if record is None else record['stop_timeout_seconds']
+        drop_in = stop_budget_drop_in(receipt)
+        if budget > max(service_stop_timeout(receipt), recorded):
+            record = {'gateway_shutdown_horizon_ms': horizon_ms, 'stop_timeout_seconds': budget}
+            write_private(self.path, {**receipt, 'service_stop_budget': record})
+        elif record is None or drop_in_content(drop_in) == drop_in_bytes(recorded):
+            return False
+        drop_in.parent.mkdir(mode=0o700, exist_ok=True)
+        drop_in_content(drop_in)
+        import uuid
+        temporary = drop_in.with_name('.' + drop_in.name + '.' + uuid.uuid4().hex)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(descriptor, 'wb') as channel:
+                channel.write(drop_in_bytes(record['stop_timeout_seconds']))
+                channel.flush()
+                os.fsync(channel.fileno())
+            temporary.replace(drop_in)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        self.manager(['daemon-reload'])
+        return True
 
     def prepare(self):
         if self.path.exists() or self.path.is_symlink():
@@ -603,7 +684,7 @@ class Operations:
         self.manager(['daemon-reload'])
         self.manager(['enable', Path(receipt['unit_path']).name])
         self.manager(['restart' if restart else 'start', Path(receipt['unit_path']).name],
-                     **({'timeout': SERVICE_RESTART_COMMAND_TIMEOUT} if restart else {}))
+                     **({'timeout': service_command_timeouts(receipt)[1]} if restart else {}))
         deadline = time.monotonic() + START_TIMEOUT + 10
         while time.monotonic() < deadline:
             result = self.status()
@@ -618,7 +699,7 @@ class Operations:
         receipt = self.load(require_source=False, allow_legacy_directory=True)
         before = self.inspect(receipt)
         stopped, _ = self.manager(['stop', Path(receipt['unit_path']).name], allow_failure=True,
-                                  timeout=SERVICE_STOP_COMMAND_TIMEOUT)
+                                  timeout=service_command_timeouts(receipt)[0])
         observed = self.inspect(receipt)
         def invalid_and_inactive(value):
             return (value.get('LoadState') == 'bad-setting' and value.get('ActiveState') == 'inactive'
@@ -646,6 +727,14 @@ class Operations:
             if self.load(require_source=False, allow_legacy_directory=True) != receipt:
                 raise DestinationError('The owned service receipt changed. Its definition was preserved.')
             Path(receipt['unit_path']).unlink()
+            drop_in = stop_budget_drop_in(receipt)
+            if drop_in_content(drop_in) is not None:
+                drop_in.unlink()
+            try:
+                # Only an empty drop-in directory is removed; other files are not ours.
+                drop_in.parent.rmdir()
+            except OSError:
+                pass
             self.path.unlink()
             self.manager(['daemon-reload'])
             return {'status': 'service-removed', 'ready': False, 'files_and_private_state_preserved': True}
@@ -754,6 +843,12 @@ async def supervise(operations):
         payload = json.loads(ready.result())
         bootstrap = startup(payload, operations.spec, process.pid, port)
         horizon_ms = reported_gateway_horizon(payload)
+        if horizon_ms is not None:
+            try:
+                await asyncio.to_thread(operations.widen_unit, horizon_ms)
+            except (DestinationError, OSError, ValueError, RuntimeError) as error:
+                # A refused widening is reported; it never blocks native readiness.
+                print('The owned service stop budget was not widened: ' + str(error), flush=True)
         while not stop.is_set() and process.returncode is None:
             try:
                 healthy = await asyncio.to_thread(console_healthy, operations.root, operations.spec, payload['console_url'])

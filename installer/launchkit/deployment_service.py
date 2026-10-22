@@ -177,10 +177,94 @@ def unit_gateway_horizon(record):
         raise DraftConflict("The recorded service shutdown budget is unsupported. Its definition is preserved.") from None
 
 
+STOP_BUDGET_DROP_IN = "forge-stop-budget.conf"
+
+
+def stop_budget_drop_in(service):
+    """The owned systemd drop-in that widens a recorded unit's stop budget."""
+    return Path(service["unit_path"] + ".d") / STOP_BUDGET_DROP_IN
+
+
+def drop_in_bytes(stop_timeout):
+    return f"[Service]\nTimeoutStopSec={stop_timeout}\n".encode()
+
+
+def recorded_stop_budget(receipt):
+    """The widened stop budget recorded outside the service identity, or None."""
+    record = receipt.get("service_stop_budget")
+    if record is None:
+        return None
+    if (not isinstance(record, dict) or set(record) != {"gateway_shutdown_horizon_ms", "stop_timeout_seconds"}
+            or unit_gateway_horizon(record) is None or type(record["stop_timeout_seconds"]) is not int
+            or record["stop_timeout_seconds"] != shutdown_budget(record["gateway_shutdown_horizon_ms"])["service"]):
+        raise DraftConflict("The recorded service shutdown budget is unsupported. Its definition is preserved.")
+    return record
+
+
+def _drop_in_content(path):
+    for parent in (path, path.parent):
+        if parent.is_symlink():
+            raise DraftConflict("The service control path cannot contain symbolic links.")
+    return private_file(path) if path.exists() else None
+
+
 def stop_command_timeout(service):
     """Outlast the manager's own stop of this unit, never below the current budget's."""
-    return (max(service.get("stop_timeout_seconds", LEGACY_USER_SERVICE_STOP_TIMEOUT), USER_SERVICE_STOP_TIMEOUT)
-            + SERVICE_STOP_COMMAND_MARGIN)
+    budget = service.get("stop_timeout_seconds", LEGACY_USER_SERVICE_STOP_TIMEOUT)
+    if service["manager"] == "systemd-user":
+        try:
+            content = _drop_in_content(stop_budget_drop_in(service))
+        except (OSError, DraftConflict):
+            content = None
+        widened = re.fullmatch(rb"\[Service\]\nTimeoutStopSec=([0-9]{1,8})\n", content or b"")
+        if widened:
+            budget = max(budget, int(widened[1]))
+    return max(budget, USER_SERVICE_STOP_TIMEOUT) + SERVICE_STOP_COMMAND_MARGIN
+
+
+def widen_service_stop_budget(directory, horizon_ms):
+    """Widen a recorded unit's stop budget to a reported horizon; return the reload to run.
+
+    The unit bytes and the service identity never change: an owned systemd
+    drop-in carries the larger TimeoutStopSec. Its record is written first, so
+    an interrupted write leaves a controllable unit that the next readiness
+    completes. It never narrows a budget. launchd reads ExitTimeOut only when
+    it loads a job, so a recorded plist keeps its own.
+    """
+    from .deployment import now, read_receipt, receipt_lock
+    from .templates.storage_setup import write_private
+    directory = Path(directory)
+    service = verify_service(directory, read_receipt(directory))
+    if service["manager"] != "systemd-user":
+        return None
+    budget = shutdown_budget(horizon_ms)["service"]
+    drop_in = stop_budget_drop_in(service)
+    with receipt_lock(directory):
+        receipt = read_receipt(directory)
+        if service_binding(receipt.get("service") or {}) != service_binding(service):
+            raise DraftConflict("The owned service definition changed. No service was controlled.")
+        record = recorded_stop_budget(receipt)
+        recorded = 0 if record is None else record["stop_timeout_seconds"]
+        if budget > max(service.get("stop_timeout_seconds", LEGACY_USER_SERVICE_STOP_TIMEOUT), recorded):
+            record = {"gateway_shutdown_horizon_ms": horizon_ms, "stop_timeout_seconds": budget}
+            write_private(directory / "receipt.json", {**receipt, "service_stop_budget": record, "updated_at": now()})
+        elif record is None or _drop_in_content(drop_in) == drop_in_bytes(recorded):
+            return None
+        content = drop_in_bytes(record["stop_timeout_seconds"])
+        drop_in.parent.mkdir(mode=0o700, exist_ok=True)
+        _drop_in_content(drop_in)
+        temporary = drop_in.with_name("." + drop_in.name + "." + uuid.uuid4().hex)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, drop_in)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    return [service["manager_executable"], "--user", "daemon-reload"]
 
 
 def verify_service(directory, receipt):
@@ -221,6 +305,16 @@ def verify_service(directory, receipt):
         raise DraftConflict("This recorded owned systemd unit has an invalid quoted WorkingDirectory. Its original definition is preserved; activation requires a verified service-definition migration.")
     if digest(content) != service.get("unit_sha256") or content != unit_bytes(plan):
         raise DraftConflict("The owned service definition changed. No service was controlled.")
+    # A widened stop budget lives outside the service identity: a recorded
+    # drop-in, byte-exact, or none yet after an interrupted write.
+    record = recorded_stop_budget(receipt)
+    if plan["manager"] != "systemd-user":
+        if record is not None:
+            raise DraftConflict("The recorded service shutdown budget is unsupported. Its definition is preserved.")
+    else:
+        widened = _drop_in_content(stop_budget_drop_in(plan))
+        if widened is not None and (record is None or widened != drop_in_bytes(record["stop_timeout_seconds"])):
+            raise DraftConflict("The owned service definition changed. No service was controlled.")
     host = Path(directory) / "service-host"
     manifest = service.get("host_files")
     if not isinstance(manifest, dict) or not manifest or len(manifest) > 256:

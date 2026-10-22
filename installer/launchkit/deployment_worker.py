@@ -177,6 +177,8 @@ def startup_refusal(line):
 class Supervisor:
     # The horizon the current child's gateway advertised, reported at readiness.
     gateway_shutdown_horizon_ms = None
+    # Whether this worker is the recorded operating-system service's own run.
+    service_owned = False
 
     def __init__(self, directory, *, source_custody=None):
         self.directory = Path(directory)
@@ -271,6 +273,16 @@ class Supervisor:
             await asyncio.wait_for(process.wait(), PROCESS_FORCE_REAP_TIMEOUT)
         except asyncio.TimeoutError:
             raise RuntimeError("The owned application process did not confirm exit after bounded force cleanup.") from None
+
+    async def widen_service_stop_budget(self, horizon_ms):
+        """The service's own run widens its unit's stop budget; a failure is only logged."""
+        from .deployment_service import UserServiceManager, widen_service_stop_budget
+        try:
+            reload = widen_service_stop_budget(self.directory, horizon_ms)
+            if reload is not None:
+                await UserServiceManager().command(reload)
+        except (DraftConflict, OSError, ValueError, RuntimeError, TimeoutError) as error:
+            self.record_log("service", f"The owned service stop budget was not widened: {error}")
 
     async def parent_exit(self, process):
         # asyncio Process.wait() can wait for inherited stdout held by a
@@ -1447,6 +1459,8 @@ class Supervisor:
                     process_live=True, health="unknown", health_checked_at=now(),
                     gateway_shutdown_horizon_ms=horizon_ms)
             self.gateway_shutdown_horizon_ms = horizon_ms
+            if horizon_ms is not None and self.service_owned:
+                await self.widen_service_stop_budget(horizon_ms)
             import httpx
             async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
                 await self.startup_console(client, url, definition, process, exited, stopped)
@@ -2392,6 +2406,7 @@ async def run(directory, mode, *, update_selection=None, bootstrap_selection=Non
     require_original()
     try:
         supervisor = Supervisor(directory)
+        supervisor.service_owned = mode == "service"
     except Exception:
         if mode == "service":
             journal(directory, "The service could not read its private installed configuration. No native runtime was started.",
