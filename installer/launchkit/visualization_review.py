@@ -75,6 +75,14 @@ the view PROPOSAL SIMULATION and shows the proposal heading. Request additional
 fictional or illustrative wording only to correct a concrete misleading claim.
 Treat collaboration moments outside the sampled times as unobserved, not omitted.
 Check selected identities, grants and planned capacity where sampled. Acknowledge
+that zero-start class definitions are not initial agents. Source-backed future
+members can be illustrated as distinct non-selectable marks without being added
+to configured counts or presented as real discovered projects. Judge whether the
+visible distinction is clear, and whether later work visibly returns to the same
+continuing context when the captured story claims reuse. Do not demand a new
+member, helper, retirement or schedule that the source does not describe. Do not
+mistake simulated application growth for current Forge installation progress.
+There is no required lifecycle sequence or arrangement. Acknowledge
 limits of these samples. Captions and generated-code descriptions are not proof
 that a mark, relationship or population is actually visible. Do not infer measured
 live activity from illustrative animation. Do not claim unseen times or views pass.
