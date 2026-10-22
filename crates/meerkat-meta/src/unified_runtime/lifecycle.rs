@@ -664,11 +664,107 @@ impl UnifiedRuntime {
     /// work itself, so nothing here cancels member work or re-sends the stop
     /// on a timer; any other refusal is returned as is.
     async fn stop_mob(&self) -> Result<(), MobRuntimeError> {
+        self.stop_mob_with(meerkat_mob::StopOptions::default())
+            .await
+    }
+
+    /// [`Self::stop_mob`] with `options` for the mob's Stop.
+    async fn stop_mob_with(
+        &self,
+        options: meerkat_mob::StopOptions,
+    ) -> Result<(), MobRuntimeError> {
         super::mob_stop::settle_flow_runs_then_stop(
-            &super::mob_stop::HandleStopTarget(&self.mob_handle()),
+            &super::mob_stop::HandleStopTarget(&self.mob_handle(), options),
             super::mob_stop::MOB_STOP_FLOW_SETTLE_BUDGET,
         )
         .await
+    }
+
+    /// Let the mob's in-flight turns finish before a graceful shutdown:
+    /// close this runtime's own ingress, stop the mob leaving every member's
+    /// current run running, then wait until `until` for the run each member
+    /// had ([`meerkat_mob::MobHandle::drain_stopped_runs`]). The
+    /// [`Self::shutdown`] that must follow cancels what is still running, as
+    /// it does without a drain.
+    ///
+    /// In order it closes cross-mob control inbound, identity foreground
+    /// operations (admission closed, bootstrap cancelled, operations
+    /// joined; a wait on a turn's outcome keeps waiting, so a drained turn's
+    /// caller hears how it ended), the actor-loop probe and runtime delivery.
+    /// Each is a step
+    /// [`Self::shutdown`] repeats, so that shutdown finds it done. The
+    /// identity steps are bounded by `until`: a held member add or a roster
+    /// pass still settling at `until` cuts the drain before its Stop
+    /// ([`InFlightDrainOutcome::IdentityForegroundBusy`]), and the shutdown
+    /// settles them inside its own budget. The event router and console
+    /// projection, the continuity mirror, memory, WorkGraph, member MCP and
+    /// the session runtime keep running through the drain.
+    ///
+    /// [`InFlightDrainOutcome::IdentityForegroundBusy`]: super::InFlightDrainOutcome::IdentityForegroundBusy
+    pub async fn drain_in_flight_turns(
+        &self,
+        until: std::time::Instant,
+    ) -> super::InFlightDrainReport {
+        let started = std::time::Instant::now();
+        let report = |outcome| super::InFlightDrainReport {
+            outcome,
+            window: until.saturating_duration_since(started),
+            waited: started.elapsed(),
+        };
+        // Cross-mob control inbound closes first, as in shutdown: no late
+        // wire or inject reaches the stopping mob.
+        if let Some(task) = self.cross_mob_control_task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(identity_runtime) = self.identity_runtime_ref().cloned() {
+            // Waiters on a turn's outcome keep waiting: the drained turns'
+            // waiters report how they ended.
+            identity_runtime.close_foreground_operations_for_drain();
+            // Both waits can outlast the window (a held add holds the
+            // bootstrap controller until it ends). Both are cancel-safe: the
+            // stop requests are set before the controller lock is awaited,
+            // and the join resumes in the shutdown.
+            let settled = tokio::time::timeout_at(tokio::time::Instant::from_std(until), async {
+                identity_runtime.cancel_identity_bootstrap().await;
+                identity_runtime.join_foreground_operations().await;
+            })
+            .await
+            .is_ok();
+            if !settled {
+                return report(super::InFlightDrainOutcome::IdentityForegroundBusy);
+            }
+        }
+        // The liveness probe is observation only: a Stopped mob with long
+        // turns must not page a false ActorLoopStalled.
+        if let Some(task) = self.actor_loop_probe_task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.mob_runtime.stop_runtime_delivery();
+        if let Err(error) = self
+            .stop_mob_with(meerkat_mob::StopOptions::default().leave_runs_running())
+            .await
+        {
+            return report(super::InFlightDrainOutcome::StopFailed {
+                error: error.to_string(),
+            });
+        }
+        tracing::info!(
+            remaining_ms = u64::try_from(
+                until
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis()
+            )
+            .unwrap_or(u64::MAX),
+            "in-flight drain: the mob is stopped with its members' runs left running; waiting for them"
+        );
+        match self.mob_handle().drain_stopped_runs(until).await {
+            Ok(drained) => report(super::InFlightDrainOutcome::Drained(drained)),
+            Err(error) => report(super::InFlightDrainOutcome::DrainFailed {
+                error: error.to_string(),
+            }),
+        }
     }
 
     /// Drain pending agent/module events from the mob event router and

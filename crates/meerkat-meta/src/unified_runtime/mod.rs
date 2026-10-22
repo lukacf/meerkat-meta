@@ -62,6 +62,9 @@ pub mod http;
 #[cfg(test)]
 mod identity_install_phase_tests;
 pub(crate) mod implicit_delegate_retirement;
+pub mod in_flight_drain;
+#[cfg(test)]
+mod in_flight_drain_tests;
 pub mod lifecycle;
 pub mod live_compose;
 pub mod mob_events;
@@ -87,6 +90,7 @@ pub use event_log::{
     EventLogConfig, EventLogError, EventLogStore, EventQuery, NullEventLogStore, PersistedEvent,
 };
 pub use http::DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS;
+pub use in_flight_drain::{InFlightDrainOutcome, InFlightDrainReport};
 pub use mob_ops::MemberTurnAdmission;
 pub use mob_stop::{MOB_STOP_FLOW_SETTLE_BUDGET, MobStopFlowRunsUnsettled};
 pub use types::{

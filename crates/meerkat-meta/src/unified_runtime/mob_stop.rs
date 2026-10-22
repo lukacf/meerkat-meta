@@ -196,8 +196,12 @@ pub(crate) async fn settle_flow_runs_then_stop<T: MobStopTarget>(
     }
 }
 
-/// [`MobStopTarget`] over a live mob handle.
-pub(crate) struct HandleStopTarget<'a>(pub(crate) &'a meerkat_mob::MobHandle);
+/// [`MobStopTarget`] over a live mob handle, stopping it with the given
+/// options.
+pub(crate) struct HandleStopTarget<'a>(
+    pub(crate) &'a meerkat_mob::MobHandle,
+    pub(crate) meerkat_mob::StopOptions,
+);
 
 pub(crate) struct LedgerFlowTerminals(meerkat_mob::MobEventsSubscription);
 
@@ -260,7 +264,7 @@ impl MobStopTarget for HandleStopTarget<'_> {
     }
 
     async fn stop(&self) -> Result<(), MobError> {
-        let report = self.0.stop().await?;
+        let report = self.0.stop_with_options(self.1).await?;
         // A member whose run starts could not be held may still start a turn
         // while the mob is Stopped; teardown proceeds, so say so.
         for (identity, reason) in report.not_holdable() {
