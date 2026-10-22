@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/ci-changes.py"
 SPEC = importlib.util.spec_from_file_location("ci_changes", SCRIPT)
@@ -195,6 +197,9 @@ CROSS_AREA_READS = {
     (".github/", "docs/"): set(),
     (".github/", "skippable"): set(),
     (".github/", "packages/"): set(),
+    # forge.yml's path filters name the crate sources Forge's tests read (a
+    # test below checks them); Forge's jobs are not lanes here.
+    (".github/", "crates/"): set(),
     # make test-python reads sdk/python; the release targets and local
     # hooks are not CI lanes.
     ("Makefile", "sdk/python/"): {"python"},
@@ -226,11 +231,10 @@ CROSS_AREA_READS = {
     ("installer/", "examples/"): set(),
     # installer/tests/test_gateway_shutdown_horizon.py pins the shutdown
     # horizon crates/meerkat-meta/src/rpc_gateway.rs advertises. Forge's
-    # workflow runs it on the pull requests its path filters select and on
-    # the dispatched run a Forge release binds. A pull request that changes
-    # only the gateway source starts no Forge run, so the next one reports
-    # any drift. No lane here runs it. Its read of the Python SDK is like
-    # every installer read of it: Forge's path filters include sdk/python.
+    # workflow runs it, and its path filters name that source, so a pull
+    # request that changes it runs the test; no lane here does. Its read of
+    # the Python SDK is like every installer read of it: Forge's path
+    # filters include sdk/python.
     ("installer/tests/test_gateway_shutdown_horizon.py", "crates/"): set(),
     ("installer/tests/test_gateway_shutdown_horizon.py", "sdk/python/"): set(),
     ("scripts/", "Makefile"): set(),
@@ -483,6 +487,39 @@ def embedded_files(root: Path) -> set[tuple[str, str]]:
                 if found.is_file() and found.suffix != ".rs":
                     pairs.add((source.relative_to(root).as_posix(), found.relative_to(root).as_posix()))
     return pairs
+
+
+FORGE_WORKFLOW = ".github/workflows/forge.yml"
+# Installer files that name another area's files without reading this
+# repository's copies: the web lockfile's examples/* workspace metadata, and
+# the .gitignore every generated application package carries (compiler.py
+# writes it; the deployment source and update lists name it).
+FORGE_NAMED_NOT_READ = ("examples/", ".gitignore")
+
+
+def forge_pull_request_paths(root: Path) -> list[str]:
+    workflow = yaml.safe_load((root / FORGE_WORKFLOW).read_text())
+    # YAML 1.1 reads the bare key `on` as True.
+    return workflow.get("on", workflow.get(True))["pull_request"]["paths"]
+
+
+def path_filter_matches(patterns: list[str], path: str) -> bool:
+    """GitHub's path filter: the last pattern that matches decides, a
+    pattern that starts with ! excludes, ** crosses directories and * and ?
+    do not."""
+    matched = False
+    for pattern in patterns:
+        negative = pattern.startswith("!")
+        tokens = re.findall(r"\*\*|\*|\?|[^*?]+", pattern[1:] if negative else pattern)
+        expression = "".join(".*" if token == "**" else "[^/]*" if token == "*" else "[^/]" if token == "?"
+                             else re.escape(token) for token in tokens)
+        if re.fullmatch(expression, path):
+            matched = not negative
+    return matched
+
+
+def named_not_read(name: str) -> bool:
+    return any(name == entry or (entry.endswith("/") and name.startswith(entry)) for entry in FORGE_NAMED_NOT_READ)
 
 
 class CiChangesTests(unittest.TestCase):
@@ -849,6 +886,41 @@ class CiChangesTests(unittest.TestCase):
         self.assertIn(("crates/*/tests/", "scripts/memory-evals"), reads)
         self.assertIn(("flow-editor/", "Makefile"), reads)
         self.assertIn(("crates/*/Cargo.toml", "examples/"), reads)
+
+    def test_forge_pull_requests_start_for_every_file_forges_tests_read(self):
+        """Forge's tests run only in its own workflow. A pull request that
+        changes a file they read outside installer/ must start that workflow,
+        so forge.yml's pull_request paths name each such file or a directory
+        above it."""
+        patterns = forge_pull_request_paths(ROOT)
+        uncovered = set()
+        for (reader, _), found in cross_area_reads(ROOT).items():
+            if not reader.startswith("installer/"):
+                continue
+            for entry in found:
+                source, target = entry.split(" -> ")
+                for name in tracked_files(ROOT, target):
+                    if not named_not_read(name) and not path_filter_matches(patterns, name):
+                        uncovered.add(f"{source} -> {name}")
+        self.assertEqual(sorted(uncovered), [], "name these files in forge.yml's pull_request paths")
+
+    def test_forge_path_filters_match_as_github_reads_them(self):
+        patterns = ["installer/**", "docs/*.md", "!installer/web/dist/**", "README.md"]
+        for path, matched in (
+            ("installer/launchkit/compiler.py", True),
+            ("installer/web/dist/app.js", False),
+            ("docs/a.md", True),
+            ("docs/nested/a.md", False),
+            ("README.md", True),
+            ("README.mdx", False),
+            ("sdk/python/x.py", False),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(path_filter_matches(patterns, path), matched)
+        self.assertTrue(named_not_read("examples/package.json"))
+        self.assertTrue(named_not_read(".gitignore"))
+        self.assertFalse(named_not_read("knowledge/.gitignore"))
+        self.assertFalse(named_not_read("crates/meerkat-meta/src/rpc_gateway.rs"))
 
     def test_the_scan_catches_a_new_cross_area_read(self):
         with tempfile.TemporaryDirectory() as tmp:

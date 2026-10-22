@@ -8,6 +8,9 @@ on:
       - 'packages/console-core/**'
       - 'packages/console-components/**'
       - 'sdk/python/**'
+      # installer/tests/test_gateway_shutdown_horizon.py reads the shutdown
+      # horizon the gateway advertises from this source.
+      - 'crates/meerkat-meta/src/rpc_gateway.rs'
       - 'README.md'
       - 'LICENSE-MIT'
       - 'LICENSE-APACHE'
