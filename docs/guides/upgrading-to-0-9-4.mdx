@@ -754,6 +754,43 @@ need before you migrate. In 0.9.4 each removed flag refuses:
 `meta_repair --composition-manifests` and the `meta-repair` release archive
 are unchanged.
 
+## Forks of members with activated instructions
+
+A member's activated instructions (everything a host appended with
+`meta/member_activate_instruction`, skill bodies activated that way included)
+reach a fork only as history. The gateway's
+`runtime_options.fork_instruction_policy` decides what happens to them, and its
+default changes what a fork of such a member does:
+
+- In 0.9.3, the fork was committed and the child's first turn failed with
+  `forked session must explicitly activate inherited instruction keys`.
+- In 0.9.4, under the default `require_explicit_activation`, a fork that starts
+  its own first turn (`fork_off`, a delegation fork, a council participant) is
+  refused before anything is committed, with `fork_instruction_refused`; a
+  temporary council ends with the exit reason
+  `participant_fork_instruction_refused`. A fork you
+  drive with `UnifiedRuntime::fork_member` is still committed, and you activate
+  each inherited key on the child before its first turn.
+
+Nothing in your state directory changes. Decide how forks of activated members
+should behave:
+
+1. To let forks keep their source's activations, set the policy to
+   `reactivate_inherited`: `runtime_options.fork_instruction_policy`, Python
+   `.fork_instruction_policy("reactivate_inherited")`, TypeScript
+   `.forkInstructionPolicy("reactivate_inherited")` or Rust
+   `UnifiedRuntimeBuilder::fork_instruction_policy`. Read
+   [what it trusts](/reference/configuration#what-reactivate_inherited-trusts)
+   first: the child runs the copied instructions without your application
+   checking them again.
+2. Otherwise, expect the refusal: an agent's `fork_off` call gets it as a tool
+   error, and nothing is forked.
+3. Set the policy on every boot. The mob does not store it, and it cannot be
+   chosen per fork.
+
+See [Fork instruction policy](/reference/configuration#fork-instruction-policy)
+for what a fork copies and what each value does.
+
 ## Going back to 0.9.3
 
 The migration is one-way. `--apply` converts `runtime.sqlite` in place to

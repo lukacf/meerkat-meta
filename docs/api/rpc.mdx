@@ -1989,6 +1989,11 @@ Errors keep Meerkat's classes distinct in `data.class`:
 Nothing retries inside the gateway. An identity with no member session is
 refused as `admission` / `target_not_materialized`, with nothing appended.
 
+A fork of the member copies its activations only as history: the gateway's
+`runtime_options.fork_instruction_policy` decides whether the child gets its
+own activation of each key, or whether the fork is refused. See
+[Fork instruction policy](/reference/configuration#fork-instruction-policy).
+
 ### `meta/member_instruction_activations`
 
 Host-only. Reads the durable instruction activation records of the member's

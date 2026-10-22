@@ -126,7 +126,7 @@ The stock SDK gateway (`rpc_gateway`) consumes the `runtime_options` object of `
 | `runtime_store` | Object | Declares the runtime store's durability (session resume, archive, retire). With top-level `persistent_state` configured, the runtime store is persistent SQLite at `runtime.sqlite`, where sessions live: a declared in-memory store is refused (`-32014`), and a failed SQLite open is a startup error (`-32014`), never a silent in-memory fallback. Without `persistent_state`, the gateway uses `InMemoryRuntimeStore`, which `{ "storage": "memory" }` declares explicitly (`"in_memory"` is an accepted compatibility alias); `null` is not a supported storage kind here. In-memory runtime-store state does not survive a gateway restart. |
 | `declare_spec_update` | Object | One-shot canonical mob-definition compare-and-swap. `{ "expected_revision": N }` applies the `mob_config` supplied in the same `meta/init` request only when the durable definition is still at `N`. The launch must be authoritative and use persistent mob storage. Exact replay converges; stale revision or successor-content disagreement refuses initialization with typed storage error `-32014`. |
 | `mob_composition` | Object `{authority, candidate_definition?}` | Who speaks for the persistent mob storage's recorded composition (the composition pin). `authority` is `"authoritative"` by default: the launch records the definition it supplies when none is recorded, and a supplied definition that differs from the recorded one is refused with `-32019` (`divergent`); declare such a change with `declare_spec_update`, which needs an authoritative launch. `"candidate"` is for the candidate or certification boot of a candidate-then-promote pipeline on one state directory: the launch neither creates the pin nor is refused by one, but a candidate whose supplied definition differs from the stored one is refused (`-32019`, `candidate_divergent`) unless `candidate_definition` is `"stored"`, which boots the stored definition instead, logs the diverged fields at WARN and reports them in a degraded `mob_composition` storage-health slot. `candidate_definition` is candidate-only: an authoritative launch that sets it is refused when the options are parsed, and so is any other value. |
-| `fork_instruction_policy` | String | What a fork of a member with activated host instructions does with them. `"require_explicit_activation"` (the default when absent, Meerkat's default) leaves the activation to the host: a host-driven fork (the console fork, `UnifiedRuntime::fork_member`) is committed and the host activates each inherited key before the child's first turn, while a fork that starts its own first turn (`fork_off`, a delegation fork, a council participant) is refused with a typed `fork_instruction_refused` before anything is committed. `"reactivate_inherited"` re-activates, in the child and before it is committed, every key that was effective in the source at the fork. `"refuse"` refuses any fork whose child would inherit an activation. Applied to the gateway's mob on create and resume. Any other value refuses initialization. Python `.fork_instruction_policy(policy)`, TypeScript `.forkInstructionPolicy(policy)`; Rust embedders set it with `UnifiedRuntimeBuilder::fork_instruction_policy` (see [the Rust SDK](/sdks/rust#fork-instruction-policy)). `meta_gateway` takes no `runtime_options` and runs Meerkat's default. |
+| `fork_instruction_policy` | String | What a fork of a member with activated host instructions does with them. `"require_explicit_activation"` (the default when absent, Meerkat's default) leaves the activation to the host: a host-driven fork (the console fork, `UnifiedRuntime::fork_member`) is committed and the host activates each inherited key before the child's first turn, while a fork that starts its own first turn (`fork_off`, a delegation fork, a council participant) is refused with a typed `fork_instruction_refused` before anything is committed. `"reactivate_inherited"` re-activates, in the child and before it is committed, every key that was effective in the source at the fork. `"refuse"` refuses any fork whose child would inherit an activation. Applied to the gateway's mob on create and resume. Any other value refuses initialization. Python `.fork_instruction_policy(policy)`, TypeScript `.forkInstructionPolicy(policy)`; Rust embedders set it with `UnifiedRuntimeBuilder::fork_instruction_policy` (see [the Rust SDK](/sdks/rust#fork-instruction-policy)). `meta_gateway` takes no `runtime_options` and runs Meerkat's default. See [Fork instruction policy](#fork-instruction-policy) for what a fork copies, what each value does and what `reactivate_inherited` trusts. |
 | `compaction` | Object | Declares the host-level session-compaction policy for every agent the gateway builds: `auto_compact_threshold` (tokens, non-zero), `recent_turn_budget`, `max_summary_tokens`, `min_turns_between_compactions`, `history_retained_rewrites` (non-zero; how many transcript rewrites keep their bodies, default 64 in Meta, where Meerkat's own default is 4). A declared 4, Meerkat's default, is treated as undeclared and becomes 64; a host that wants a smaller window sets any value other than 4. A compactor is always installed; this declares *when it fires*. **Omitting `auto_compact_threshold` inherits Meerkat's model-aware default - `context_window * 4 / 5`, i.e. ~840,000 tokens on a million-token model such as `gpt-5.6-sol`, which in practice never fires and resends the full transcript every turn.** Declaring the key pins it. A mob profile's own `auto_compact_threshold` still wins per member. Unknown keys and a zero threshold fail initialization. |
 | `meerkat_config_path` | String path | The Meerkat host `config.toml` every agent the gateway builds starts from (the live/realtime door included), loaded once at init, merged over `Config::default()` with Meerkat's own file semantics and validated with Meerkat's own `Config::validate` against the canonical catalog. This is the only door for the `[self_hosted]` and `[realm]` tables, which Meerkat keeps in the host config rather than in `mob.toml`; a host-config `[models]` table reaches the factory too, but does not satisfy the [init model check](#the-init-model-check), which reads the definition's own `[models.<id>]`. The gateway's own overlays (`member_comms_address`, `compaction`) are layered on top. A missing, malformed or non-validating file (a `[self_hosted.models.<id>]` alias naming an undeclared server, for one) refuses init with `-32602` naming the option and the path, never a silent `Config::default()`. Omitted, agents build from Meerkat's default config as before. Python `.meerkat_config(path)`, TypeScript `.meerkatConfig(path)`. `meta_gateway` takes the same file as its top-level `meerkat_config_path` init param and adopts `<workspace>/.rkat/config.toml` when it exists, logging one INFO line naming the adopted file either way; a top-level `meerkat_config_path` sent to `rpc_gateway` is refused with `-32602` naming `runtime_options.meerkat_config_path`. See [Self-hosted models and the Meerkat host config](#self-hosted-models-and-the-meerkat-host-config). |
 | `workgraph` | Boolean or directory string | WorkGraph construction switch, default `true`. `false` disables the store, the member `workgraph_*` tools, the attention overlays and the `meta/workgraph/*` RPCs; a non-empty string is an explicit directory for the durable store (`workgraph.sqlite3` is created inside it); any other value fails initialization. Python `.workgraph(enabled)` and TypeScript `.workgraph(enabled)` take `true`, `false` or the directory string; an unused setter sends nothing and the gateway default applies. Store placement per launch mode, the auto-issued namespace grant and the memory-backed fallback are in [WorkGraph](#workgraph). |
@@ -492,6 +492,246 @@ Declarations that reach neither identity plane arm nothing, because there is no
 identity plane to migrate on. See
 [roster and member lifecycle](/concepts/roster#role-migration) for the operator
 view of the refusal.
+
+## Fork instruction policy
+
+`runtime_options.fork_instruction_policy` decides what happens to a member's
+activated instructions when that member is forked. This section explains what
+a fork copies, what each policy does, what `reactivate_inherited` writes and
+trusts, and how to set the policy.
+
+### Activated instructions
+
+A host changes a member's standing instructions with
+[`meta/member_activate_instruction`](/api/rpc): each new activation appends one
+keyed, immutable activation row to the member's session, for example the body
+of a skill your application keeps under namespace `app.skills` and key
+`calendar`. For each namespace and key, the newest row that the member's own
+session wrote is the instruction in effect. Meerkat treats every namespace
+alike, so a skill, a persona, a standing rule and any other key are all
+activation rows, and the policy applies to every one of them.
+
+Instructions a member gets from its build (its profile, the skills its profile
+preloads included, and its system prompt) are not activation rows. The policy
+does not concern them.
+
+### What a fork copies
+
+A durable fork copies the source member's committed transcript, up to the fork
+boundary, into a new session and seats that session as a new member. The
+durable forks are the agent `fork_off` tool, `UnifiedRuntime::fork_member`, a
+live delegation's fork of the member, and the participants of a temporary
+council. (`meta/fork_helper` is not a durable fork, and this policy does not
+apply to it. It renders the source's transcript as text for a fresh member. A
+helper that runs as an autonomous host gets that text as its first prompt, and
+with the default full-history context it includes the source's system rows, so
+the bodies of the source's activated instructions reach that helper as plain
+context under every policy, `refuse` included.)
+
+| Copied into the child | Not copied |
+|---|---|
+| The conversation up to the fork boundary: messages, tool calls and results, and system rows. | The source's member identity, comms name, runtime binding and roster entry. The child is a new member. |
+| Every activation row in that prefix, as history only (see below). | The source's activations as instructions in effect. |
+| The session configuration: output schema, hook overrides, budget limits, timeouts, application context, additional instructions and callback tool definitions. | Mob operator authority, which belongs to the source's identity, not to a branch of its transcript; the shell environment; MCP attachments. |
+| For `fork_off`, `UnifiedRuntime::fork_member`, the bounded and detached member forks of `MobHandle` and local council participants: the source's application labels, except the standard member labels that name the source, and its per-spawn tool overlay. | For a live delegation's fork and a council participant on a member host: those build inputs. They are built from their own spec. |
+
+`fork_off` also gives the child the source's role profile, its profile and
+model overrides, and the forking member's own tool access policy. The forking
+member needs spawn admission for that role: manage scope over the mob, or
+spawn scope for the profile.
+
+Inherited activation rows stay in the child's transcript with their full text,
+rendered for the child as `[meerkat-inherited-instruction-v1]` with
+`status=historical_only_not_active_in_child`. The child can read what its
+source was told, but none of it is in effect. A child runs no model turn while
+an inherited key has no activation of its own: its first model request fails
+with `forked session must explicitly activate inherited instruction keys`,
+followed by the keys. The policy decides who writes that activation, or
+refuses the fork instead.
+
+### The three policies
+
+| Policy | Host-driven fork (`UnifiedRuntime::fork_member`) | Fork that starts its own first turn (`fork_off`, a live delegation's fork, council participants, the bounded and detached member forks of `MobHandle`) |
+|---|---|---|
+| `require_explicit_activation` (default) | Committed. The host activates each inherited key on the child before its first turn. | Refused before anything is committed (`fork_instruction_refused`, cause `policy_refuses`), because nobody could activate the child before the turn the fork starts. |
+| `reactivate_inherited` | Committed with one re-activation row per inherited key; the child needs no activation from the host. | Committed with the re-activation rows, and the child's first turn runs. |
+| `refuse` | Refused before anything is committed. | Refused before anything is committed. |
+
+A source with no activation rows in the copied prefix forks the same way
+under every policy. The default is the least-privilege choice: no durable
+fork's child runs an instruction that nobody activated for that child.
+
+Under `require_explicit_activation`, a Rust host activates an inherited key on
+the child with `MobHandle::activate_member_instruction(child, request)`
+(`runtime.mob_handle()`). Read the key first with
+`MobHandle::read_member_instruction_activations` and a query that names its
+`namespace` and `key`: for an inherited key, `key_state` reports
+`requires_explicit_child_activation: true`, `next_expectation`
+`{"kind": "absent"}` and `next_supersedes` set to the inherited row's
+`activation_id`. The host may activate the same revision and body, or a
+different one.
+
+### What `reactivate_inherited` writes
+
+Before the child is committed, the fork appends one activation row per
+inherited key, in namespace and key order:
+
+- **Keys:** every key with an activation row in the copied prefix, in every
+  namespace. There is no namespace filter.
+- **Revision and body:** the key's head at the fork boundary, which is its
+  last copied row. The new row carries that row's `revision` (`namespace`,
+  `key`, `revision_id`, `content_sha256`) and its whole body, unchanged. An
+  activation the source wrote after the fork boundary is not in the prefix
+  and is not copied.
+- **Origin:** the child's own session. The key is then in effect for the child
+  exactly as if the host had activated it there. The row `supersedes` the
+  copied head's `activation_id`.
+- **Identity:** `activation_id` is `fork-reactivation:` followed by the first
+  32 hex digits of SHA-256 over the child session id, a zero byte and the
+  head's activation id. It depends only on the child and the head, so the same
+  fork writes the same rows. The prefix is for operators; Meerkat recognizes
+  these rows by reproducing them, not by their ids.
+- **Timestamp:** the last copied message's timestamp.
+- **Rules:** the rows pass the ordinary activation rules: the body digest, 256
+  KiB per body, and the 1 MiB budget of retained activation bodies across the
+  session lineage. Each re-activation adds its body to the lineage again, so
+  forks of forks of a member with large bodies reach that budget after a few
+  generations and are refused with `lineage_body_budget_exceeded`.
+- **Only what the source activated itself:** each head must be an activation the
+  source session wrote itself. A head the source only inherited from an
+  earlier fork, and never activated, refuses the fork with
+  `not_effective_in_source`.
+
+### What `reactivate_inherited` trusts
+
+With `reactivate_inherited`, the child claims its source's activations as its
+own:
+
+- The copied body is the one in effect in the source at the fork boundary.
+  Meerkat does not ask your application whether that revision is still
+  current, still allowed, or meant for this child. A skill revision you have
+  since withdrawn, replaced or narrowed keeps running in a child forked from a
+  transcript that still carried it.
+- Once written, the row is the child's instruction for that key, like one your
+  host activated on the child. An activation is never removed: to change what
+  the child runs, activate a new revision of the key on the child, which
+  supersedes the re-activation row.
+- A fork of the child copies those rows again, so one setting carries an
+  instruction down a chain of forks.
+- The policy is one decision for every member, every key and every fork of the
+  gateway's mob. Choose `reactivate_inherited` only when every instruction your
+  members may carry is safe to run, unchanged, in any fork of them.
+  `require_explicit_activation` keeps that decision with the host for each
+  child (and refuses forks that leave it no chance), and `refuse` rules out
+  durable forks of activated members (an autonomous-host `meta/fork_helper`
+  still sees their text).
+
+### Refusals
+
+A refused fork commits nothing: no child session, no member and no
+transcript. Meerkat classifies the refusal as `FORK_INSTRUCTION_REFUSED`
+(`-32037` on Meerkat's own JSON-RPC, HTTP 422, CLI exit 57). No method of this
+gateway forks a member, so the gateway itself never answers `-32037`: you meet
+the refusal as the agent's `fork_off` tool error, a council exit reason, or
+`MobError::ForkInstructionRefused { source_member_id, refusal }` from the Rust
+API. Its structured data:
+
+```json
+{
+  "kind": "fork_instruction_refused",
+  "source_member_id": "assistant",
+  "fork_instruction_refusal": {
+    "cause": { "kind": "policy_refuses" },
+    "keys": [["app.skills", "calendar"]]
+  }
+}
+```
+
+| `cause.kind` | Meaning |
+|---|---|
+| `policy_refuses` | The policy refuses a child that inherits activation rows: `refuse`, or `require_explicit_activation` for a fork that starts its own first turn. |
+| `not_effective_in_source` | `reactivate_inherited`, but a copied key's head was never activated by the source itself. |
+| `lineage_body_budget_exceeded` (with `max_bytes`) | Re-activating would exceed the lineage's retained activation-body budget. |
+| `activation` (with `code`) | The activation rules refused a re-activation row. |
+| `member_host_unsupported` | `reactivate_inherited`, but the member host that holds a placed source is older than 0.9.4 and cannot apply the policy. Upgrade member hosts before their controller. |
+
+The message names the keys, for example:
+
+```text
+fork of member 'assistant' refused: fork refused: the child would inherit activated instruction keys [app.skills/calendar] and the fork instruction policy refuses them; reactivate_inherited carries them into the child
+```
+
+An agent that called `fork_off` gets a tool error with that message after
+`tool 'fork_off' failed:` and the structured data above. A temporary council
+ends with the exit reason `participant_fork_instruction_refused`, naming the
+participant's order and the refusal; nothing was created for that
+participant, so its cleanup has nothing to revoke.
+
+### Setting the policy
+
+The policy belongs to the host. It is never a tool argument or part of a mob
+definition, and it cannot be chosen per fork: every fork of the gateway's mob
+uses it. The gateway applies it to its mob on every create and resume. It is
+not stored with the mob, so set it on every boot. A fork applies the policy
+the gateway runs at the moment of the fork; changing the policy later does not
+touch children that already exist.
+
+| Surface | Setting |
+|---|---|
+| `meta/init` | `runtime_options.fork_instruction_policy`: `"require_explicit_activation"` (the default when absent), `"reactivate_inherited"` or `"refuse"`. Any other value refuses initialization. |
+| Python | `Meta.builder().fork_instruction_policy("reactivate_inherited")`. Another value raises `ValueError`. |
+| TypeScript | `.forkInstructionPolicy("reactivate_inherited")` (type `ForkInstructionPolicy`). Another value throws `RangeError`. |
+| Rust | `UnifiedRuntimeBuilder::fork_instruction_policy(ForkInstructionPolicy::ReactivateInherited)`, or `MobBootstrapSpec::with_fork_instruction_policy` on a spec you build. |
+| `meta_gateway` | Takes no `runtime_options` and always runs the default. |
+
+Meerkat's own JSON-RPC server forks sessions with `session/fork_at` and
+`session/fork_replace`; those calls take the policy per call as
+`inherited_instructions`. They are not this gateway's member forks.
+
+### Example: a member with an activated skill
+
+The host activates a skill on member `assistant`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "meta/member_activate_instruction",
+  "params": {
+    "identity": "assistant",
+    "activation": {
+      "revision": {
+        "namespace": "app.skills",
+        "key": "calendar",
+        "revision_id": "calendar-v3",
+        "content_sha256": "sha256:<hex of the body>"
+      },
+      "activation_id": "calendar-v3-assistant",
+      "expectation": { "kind": "absent" },
+      "body": "Use the calendar tools to answer scheduling questions."
+    }
+  }
+}
+```
+
+With the default policy, `assistant` calling `fork_off` now gets the
+`fork_instruction_refused` tool error above, and nothing is forked. A host
+that wants forks to keep the skill opts in at boot:
+
+```python
+from meerkat_meta import Meta
+
+runtime = await (
+    Meta.builder()
+    .mob("config/mob.toml")
+    .fork_instruction_policy("reactivate_inherited")
+    .build()
+)
+```
+
+The `fork_off` child then starts with its own activation of
+`app.skills/calendar`, with the body `assistant` had at the fork boundary, and
+its first turn runs.
 
 ## Child mob tool policy and bundles
 

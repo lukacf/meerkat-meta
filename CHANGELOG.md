@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Docs: the configuration reference has a new "Fork instruction policy"
+  section. It covers what a durable fork copies (activation rows only as
+  history, the session configuration, no mob operator authority), what each
+  `runtime_options.fork_instruction_policy` value does for host-driven forks
+  and for forks that start their own first turn, exactly what
+  `reactivate_inherited` writes (every inherited key in every namespace, the
+  head revision and body at the fork boundary, the child as origin) and what
+  it trusts, the `fork_instruction_refused` payload and its causes, and how
+  to set the policy (once per gateway, never per fork). The Python,
+  TypeScript and Rust SDK pages, the `meta/member_activate_instruction`
+  reference and the 0.9.4 upgrade guide point to it.
 - The summary that the customizer publication after an unclean stop logs
   counts each restored member once, by outcome: `held_released` (its run
   starts are released), `not_held` (it was not held, and its tools are

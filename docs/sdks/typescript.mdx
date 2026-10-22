@@ -49,6 +49,33 @@ const results = await handle.memoryQuery({
 
 ```
 
+## Fork instruction policy
+
+A member forked with `fork_off`, a delegation fork or a council does not run
+the instructions its source activated (`meta/member_activate_instruction`,
+skill bodies activated that way included) unless the gateway's fork instruction
+policy says so. Under the default, `"require_explicit_activation"`, such a fork
+is refused with `fork_instruction_refused` before anything is committed. Set
+the policy on the builder; it is sent as
+`runtime_options.fork_instruction_policy`:
+
+```typescript
+import { Meta } from "@rkat/meta-sdk";
+
+const rt = await Meta.builder()
+  .mob("config/mob.toml")
+  .forkInstructionPolicy("reactivate_inherited")
+  .build();
+```
+
+`forkInstructionPolicy` takes a `ForkInstructionPolicy`:
+`"require_explicit_activation"`, `"reactivate_inherited"` or `"refuse"`;
+another value throws `RangeError`. Unset, nothing is sent and the gateway
+default applies. The setting applies to every fork of the gateway's mob and
+cannot be chosen per fork. See
+[Fork instruction policy](/reference/configuration#fork-instruction-policy)
+for what each value does and what `reactivate_inherited` trusts.
+
 ## Waiting for a turn
 
 The recommended completion barrier is a tracked delivery plus its ticket:
