@@ -376,6 +376,26 @@ def test_other_internal_errors_stay_plain(data: dict | None) -> None:
     assert type(err) is RpcError
 
 
+def test_an_owed_held_completion_stays_a_plain_rpc_error_with_its_data() -> None:
+    # An identity a held pass did not publish owes its host a held completion.
+    # The refusal rides -32603 with typed data: an admission still owed, not a
+    # held wake, so it stays a plain RpcError and keeps its data.
+    data = {"kind": "held_completion_owed", "identity": "w"}
+    err = _refusal(-32603, data)
+    assert type(err) is RpcError
+    assert err.code == -32603
+    assert err.data == data
+    assert data["kind"] not in IDENTITY_WAKE_HELD_KINDS
+    progress = IdentityRestoreProgress.from_dict(
+        {"stage": "refused", "code": -32603, "kind": "held_completion_owed"}
+    )
+    assert (progress.stage, progress.code, progress.kind) == (
+        "refused",
+        -32603,
+        "held_completion_owed",
+    )
+
+
 def test_status_reports_runtime_mode_and_pending_customizer_tools() -> None:
     pending = {"reason": "customize_build failed"}
     status = IdentityStatus.from_dict(
