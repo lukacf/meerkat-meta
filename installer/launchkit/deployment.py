@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import io
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import platform
@@ -41,6 +42,7 @@ PRIVATE_RUNTIME_UPDATE_ONLY = "This private runtime candidate is admitted only t
 PRODUCT_CONFIGURE_REQUIRED = "This selected Meta/Toolkit installation needs its original Configure startup inputs. Ordinary Start and background startup are unavailable."
 AGENT_TEAM_PRODUCT_UNAVAILABLE = ("Agent team packages are not available in this Forge: they install the older MobKit 0.8 "
     "runtime. Use Build application to build and install your agents as an application on Meta 0.9.4.")
+LOG = logging.getLogger(__name__)
 
 
 def forge_interpreter():
@@ -271,6 +273,30 @@ def journal(root, message, **changes):
         value.update(changes, updated_at=now(), progress=entries, detail=message)
         write_private(Path(root) / "receipt.json", value)
         return value
+
+
+def refusal_detail(error):
+    """The installer's own typed refusal as one bounded sentence, else its type name.
+
+    CustodyError and DraftConflict carry authored, user-facing text. Any other
+    error may carry private values, so only its type name is shown. The result
+    follows a clause: ": <text>" or " (<TypeName>)."
+    """
+    from .connect_installer_caller import CustodyError
+    text = " ".join(str(error).split())[:2000] if isinstance(error, (CustodyError, DraftConflict)) else ""
+    if not text:
+        return f" ({type(error).__name__})."
+    return ": " + text + ("" if text.endswith((".", "!", "?")) else ".")
+
+
+def _log_install_completion(directory_name):
+    def completed(task):
+        # Retrieve the task's exception without changing its result or custody.
+        if task.cancelled() or task.exception() is None:
+            return
+        LOG.warning("Meta Forge: the Install completion of deployment %s failed%s",
+            directory_name, refusal_detail(task.exception()))
+    return completed
 
 
 def interactive_cleanup_matches(receipt, *, require_worker_exit=True):
@@ -1943,8 +1969,9 @@ class DeploymentService:
         self.tasks[directory.name] = task
         if mode == "install" and self.application_setup_retention is not None:
             # Retention may refuse after the exited handle is retired. Retrieve
-            # that same task's exception without changing its result or custody.
-            task.add_done_callback(lambda completed: None if completed.cancelled() else completed.exception())
+            # that same task's exception without changing its result or custody,
+            # and keep its typed text, or only its type name, in the Forge log.
+            task.add_done_callback(_log_install_completion(directory.name))
 
     async def prepare_supervisor_refresh(self, guide_id, deployment_id, *, expected_service_digest):
         """Prepare host support separately from application update or startup."""
@@ -2328,7 +2355,8 @@ class DeploymentService:
                             self.processes.pop(directory.name)
                             retention(self, latest["guide_id"], directory.name)
                     except Exception as error:
-                        journal(directory, f"Trusted setup inputs were not retained ({type(error).__name__}). Your files are preserved. Check setup status before continuing.")
+                        journal(directory, "Trusted setup inputs were not retained" + refusal_detail(error)
+                            + " Your files are preserved. Check setup status before continuing.")
                         raise
             finally:
                 if self.tasks.get(directory.name) is asyncio.current_task():

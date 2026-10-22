@@ -484,7 +484,9 @@ async def test_managed_host_product_install_retains_inputs_only_with_launcher_mo
             await install_fixture(f, saved, result, monkeypatch)
         refused = deployment.read_receipt(f.service._directory(saved["id"]))
         assert refused["status"] == "stopped" and refused["phase"] == "configure"
-        assert refused["detail"].startswith("Trusted setup inputs were not retained (CustodyError).")
+        assert refused["detail"] == ("Trusted setup inputs were not retained: Managed-host models require "
+            "the original trusted preparation model configuration. Your files are preserved. "
+            "Check setup status before continuing.")
         return
     directory, destination = await install_fixture(f, saved, result, monkeypatch)
     receipt = deployment.read_receipt(directory)
