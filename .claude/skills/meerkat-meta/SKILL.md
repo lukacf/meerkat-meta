@@ -474,8 +474,9 @@ Avoid manual runtime ID extraction for ordinary identity-scoped work. Do not ass
 - `runtime_options.fork_instruction_policy` decides for every fork of the
   gateway's mob, never per fork, and is applied again on every boot (the mob
   does not store it). Python `.fork_instruction_policy(...)`, TypeScript
-  `.forkInstructionPolicy(...)`, Rust `UnifiedRuntimeBuilder::
-  fork_instruction_policy` or `MobBootstrapSpec::with_fork_instruction_policy`:
+  `.forkInstructionPolicy(...)`, Rust
+  `UnifiedRuntimeBuilder::fork_instruction_policy` or
+  `MobBootstrapSpec::with_fork_instruction_policy`:
   - `require_explicit_activation` (default): a host-driven `fork_member` is
     committed and the host activates each key on the child
     (`MobHandle::activate_member_instruction`). A fork that starts its own
@@ -488,8 +489,8 @@ Avoid manual runtime ID extraction for ordinary identity-scoped work. Do not ass
     the host checking them again, and forks of the child carry them on.
   - `refuse`: every fork of an activated member is refused before commit.
 - What a fork copies, the refusal causes, the exact rows
-  `reactivate_inherited` writes and what it trusts: `docs/reference/
-  configuration.mdx`, "Fork instruction policy".
+  `reactivate_inherited` writes and what it trusts:
+  `docs/reference/configuration.mdx`, "Fork instruction policy".
 
 ## Embedding Hooks
 
