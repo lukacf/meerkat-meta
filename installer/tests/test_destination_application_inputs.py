@@ -404,6 +404,7 @@ def test_destination_source_names_the_actual_missing_input_of_an_unsupported_pla
     assert str(refused.value) == expected
     assert (case == "helper") == ("selects a connection setup helper" in str(refused.value))
 
+
 async def test_destination_input_cancel_joins_original_file_read_with_lease_held(inputs_destination, monkeypatch):
     f = inputs_destination
     from launchkit import destination_product_install
