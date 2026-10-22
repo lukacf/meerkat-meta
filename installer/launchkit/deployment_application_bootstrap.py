@@ -540,8 +540,36 @@ def _lineage_journals(directory, in_flight):
     return edges
 
 
+# Edges already verified in this process, keyed by their journal directory.
+# The file identities include ctime, so a changed journal, package or admission
+# is verified again in full.
+_verified_edges = {}
+MAX_VERIFIED_EDGES = 4096
+
+
+def _edge_identities(child):
+    paths = (child / "update.json", child / "candidate.zip", child / "previous.zip",
+        *itertools.islice(sorted(child.glob("admission-*.json")), MAX_LINEAGE_ADMISSIONS))
+    return tuple((str(path), _file_identity(path)) for path in paths)
+
+
 def _require_lineage_edge(directory, child, journal):
     """One walked edge: its exact packages, and this installation's admission of it."""
+    try:
+        observed = _edge_identities(child)
+    except OSError:
+        observed = None
+    key = (str(directory), str(child))
+    if observed is not None and _verified_edges.get(key) == observed:
+        return
+    _verify_lineage_edge(directory, child, journal)
+    if observed is not None and _edge_identities(child) == observed:
+        if len(_verified_edges) >= MAX_VERIFIED_EDGES:
+            _verified_edges.clear()
+        _verified_edges[key] = observed
+
+
+def _verify_lineage_edge(directory, child, journal):
     from .artifact_binding import report_brief_hash
     try:
         if updates.update_directory(directory, journal["update_id"]) != child:

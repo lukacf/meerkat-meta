@@ -471,6 +471,21 @@ async def test_next_start_refuses_a_forged_update_lineage(local_restore, monkeyp
     assert not f.service.launched
 
 
+@pytest.mark.parametrize("forgery", ["foreign-installation", "foreign-report"])
+async def test_a_verified_lineage_edge_is_verified_again_after_it_changes(local_restore, monkeypatch, forgery):
+    f = local_restore
+    await completed_setup(f, monkeypatch)
+    identity = await commit_candidate(f, monkeypatch)
+    await owner_start(f)
+    edge = str(updates.update_directory(f.directory, identity))
+    assert any(key[1] == edge for key in bootstrap._verified_edges)
+    forge(f, identity, forgery)
+    f.service.launched.clear()
+    with pytest.raises((CustodyError, DraftConflict)):
+        await action(f, "finish-setup")
+    assert not f.service.launched
+
+
 async def test_gap_in_a_two_update_chain_refuses(local_restore, monkeypatch):
     f = local_restore
     await completed_setup(f, monkeypatch)
