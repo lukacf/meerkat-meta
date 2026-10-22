@@ -2294,7 +2294,7 @@ impl IdentityFirstRuntimeContext {
     /// member. When the add ends
     /// [`super::held_bootstrap::HeldBootstrapStart::Unsettled`], unlist the
     /// spec, or add it again: the aborted member owes its host a held
-    /// completion, and every pass that a held pass covering it does not run
+    /// completion, and every pass except a held pass that covers it
     /// refuses it ([`IdentityRuntimeError::HeldCompletionOwed`], whose
     /// structured data is `{"kind": "held_completion_owed", "identity"}`).
     /// A caller that goes away while `complete` runs after listing never
