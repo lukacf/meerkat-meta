@@ -28,6 +28,7 @@ from .implementation import ImplementationService
 from .implementation_workspace import ImplementationWorkspace
 from .local_application_factory import LocalApplicationFactory, _replacement_supplier
 from .local_application_source import create_local_application_source, _guide, _store_identity
+from .projects import DraftConflict
 from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
 from .ordinary_application_source import OrdinaryApplicationHost, create_ordinary_application_source, ordinary_application
 
@@ -365,6 +366,41 @@ class LocalApplicationRegistry:
             raise CustodyError("The canonical installation changed during original owner lookup.")
         self._require_registry()
         return host, binding
+
+    def continues_installed_source(self, guide_id, deployment_id, build_id, source_digest):
+        """Whether an accepted Build continues the installed Build's own signed source.
+
+        Its signed accepted-baseline chain must reach the installed Build, so it
+        ends at the same initial Build and source owner. The walk is bounded and
+        read-only, and holds no registry lock while it reads Build storage.
+        """
+        from .local_application_recovery import _accepted_build
+        with self._lock:
+            self._require_registry()
+            guide_id, deployment_id = _identity(guide_id), _identity(deployment_id)
+            directory = self.deployment._directory(guide_id, deployment_id)
+            receipt = read_receipt(directory)
+            _, files = checked_package(directory, "package.zip", receipt["package_sha256"])
+            installed = (receipt["build_id"], read_package_source(files, receipt)["source_digest"])
+            blueprint = json.loads(files["blueprint.json"][0])
+            selection = receipt.get("runtime_candidate")
+            target = parse_candidate_selection(selection) if selection is not None else None
+        current, seen = (build_id, source_digest), set()
+        try:
+            while current != installed:
+                if current[0] in seen or current[0] == installed[0] or len(seen) >= 128:
+                    return False
+                seen.add(_identity(current[0]))
+                _, provenance, *_ = _accepted_build(self, guide_id, current[0], current[1], blueprint, target)
+                previous = provenance.get("previous")
+                if (provenance.get("basis") != "accepted-baseline" or not isinstance(previous, dict)
+                        or set(previous) != {"build_id", "source_digest"}):
+                    return False
+                current = (previous["build_id"], previous["source_digest"])
+        except (CustodyError, DraftConflict, OSError, KeyError, TypeError, ValueError):
+            return False
+        self._require_registry()
+        return True
 
     def selected_host(self, guide_id, deployment_id, *, staged_update_allowed=True):
         """Read the exact original installation owner without native effects."""

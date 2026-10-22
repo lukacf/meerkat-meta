@@ -1967,6 +1967,7 @@ class DeploymentService:
                     guide_id, build_id=build_id, source_digest=report.get("verification", {}).get("digest"))
                 if runtime_target is None:
                     raise DraftConflict("The candidate package has no exact accepted host runtime selection.")
+            setup_blockers = await self._setup_owner_blockers(guide_id, deployment_id, files, report)
             current = await self.implementation.status(guide_id)
             require_accepted(current)
             latest = await self._guide(guide_id)
@@ -1979,37 +1980,80 @@ class DeploymentService:
             # No await separates the final source/design fences and publication.
             from .deployment_updates import stage
             restore_selection = self._setup_update_restore(guide_id, deployment_id)
-            setup = {"restore_selection": restore_selection} if restore_selection is not None else {}
+            setup = ({"restore_selection": restore_selection, "setup_blockers": setup_blockers}
+                if restore_selection is not None else {})
             if runtime_target is None:
                 stage(self._directory(guide_id), payload, report, **setup)
             else:
                 stage(self._directory(guide_id), payload, report, runtime_target=runtime_target, **setup)
             return await self.status(guide_id)
 
-    def _setup_update_restore(self, guide_id, deployment_id):
-        """The trusted owner's published completed Restore pin, after setup.
+    def _setup_owner(self, guide_id, deployment_id):
+        """The selected host that owns a set-up installation's completed setup, or None.
 
-        Only an installation that entered Fresh has one. The pin comes from the
-        selected application host, never from a request. Without a completed
-        Restore, the update path keeps its existing Fresh refusal. A background
-        Restore service keeps that refusal too.
+        Only an installation that entered Fresh has one, and only through the
+        trusted host selection, never a request. A background Restore service
+        keeps the existing Fresh refusal.
         """
-        from .deployment_application_bootstrap import FRESH_ENTRY_NAME, _shape, restored_service
+        from .deployment_application_bootstrap import FRESH_ENTRY_NAME, restored_service
         from .forge_application_host import ForgeApplicationHost
         directory = self._directory(guide_id, deployment_id)
         entry = directory / FRESH_ENTRY_NAME
         if not entry.exists() and not entry.is_symlink() or restored_service(read_receipt(directory)):
             return None
         select = getattr(self, "application_host_selection", None)
+        registry = getattr(select, "__self__", None)
+        from .local_application_registry import LocalApplicationRegistry
+        if (type(registry) is LocalApplicationRegistry and select == registry.selected_host
+                and registry._reconnect_status(self, guide_id, deployment_id) is not None):
+            # Only the claimed setup action recovers the owner after a restart.
+            from .deployment_updates import SETUP_OWNER_RECONNECT
+            raise DraftConflict(SETUP_OWNER_RECONNECT)
         host = (select(guide_id, deployment_id) if callable(select)
             else getattr(getattr(self, "application_setup_selection", None), "__self__", None))
         if type(host) is not ForgeApplicationHost or host._startup_selection is None:
+            return None
+        return host
+
+    def _setup_update_restore(self, guide_id, deployment_id):
+        """The trusted owner's published completed Restore pin, after setup.
+
+        Without a completed Restore, the update path keeps its existing Fresh
+        refusal.
+        """
+        from .deployment_application_bootstrap import _shape
+        host = self._setup_owner(guide_id, deployment_id)
+        if host is None:
             return None
         try:
             pin, value = host._selected_startup_observation(guide_id, deployment_id)
         except FileNotFoundError:
             return None
         return pin.pin() if _shape(value) == "restore" else None
+
+    async def _setup_owner_blockers(self, guide_id, deployment_id, files, report):
+        """Stage refuses, after setup, what the installation's owner would refuse later.
+
+        The candidate must keep the setup owner's protected choices. Under the
+        per-installation registry, its signed source chain must also continue
+        the installed Build. A single selected host owns every Build's source.
+        """
+        from .deployment_updates import SETUP_OWNER_BLOCKER
+        from .forge_application_host import owner_choices_match
+        from .local_application_registry import LocalApplicationRegistry
+        host = self._setup_owner(guide_id, deployment_id)
+        if host is None:
+            return ()
+        if not owner_choices_match(host, files):
+            return (SETUP_OWNER_BLOCKER,)
+        select = getattr(self, "application_host_selection", None)
+        registry = getattr(select, "__self__", None)
+        if type(registry) is LocalApplicationRegistry and select == registry.selected_host:
+            continues = await asyncio.to_thread(registry.continues_installed_source, guide_id, deployment_id,
+                report.get("build_id"), report.get("verification", {}).get("digest"))
+            if not continues:
+                return (SETUP_OWNER_BLOCKER,)
+        return ()
 
     async def _run(self, directory, mode, *, update_selection=None, bootstrap_selection=None,
             install_retention=None, install_binding=None, bootstrap_owner_source=None):

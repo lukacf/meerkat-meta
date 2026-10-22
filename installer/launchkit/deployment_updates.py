@@ -1928,6 +1928,11 @@ def write_archive(path, payload):
 SETUP_REPLACEMENT_BLOCKER = ("This update changes the application's native definition, instructions, tool "
     "policy or runtime. After setup, Forge applies only updates that keep those unchanged. Keep the installed "
     "build, or install the new build into a new folder.")
+SETUP_OWNER_BLOCKER = ("This update is not built from the installed application's own source, or it changes "
+    "its plan, definition, protected settings or runtime. After setup, Forge applies only same-source updates "
+    "that keep them. Keep the installed build, or install the new build into a new folder.")
+SETUP_OWNER_RECONNECT = ("Forge has not reconnected this application's completed setup since it restarted. "
+    "Use Continue setup once, then stage or apply the update again.")
 
 
 SETUP_RESTORE_NAME = "setup-restore.json"
@@ -1961,12 +1966,13 @@ def setup_restore_pin(directory, update):
     return pin
 
 
-def stage(directory, payload, report, *, runtime_target=None, restore_selection=None):
+def stage(directory, payload, report, *, runtime_target=None, restore_selection=None, setup_blockers=()):
     """Stage one accepted package. After setup, only through the owner's completed Restore.
 
     restore_selection is the pin the deployment service read from the trusted
     owner. An update that keeps the Restore's native inputs is staged with that
-    pin; any other change after setup is blocked here.
+    pin; any other change after setup is blocked here. setup_blockers are the
+    owner's own refusals of this candidate, which the deployment service read.
     """
     require_replacement_history_settled(directory)
     from .deployment_application_bootstrap import require_update_bootstrap_history, setup_keeps_candidate
@@ -2010,9 +2016,11 @@ def stage(directory, payload, report, *, runtime_target=None, restore_selection=
         or dependency_update and dependency_update["native_registry_update"])
     host_instruction_update = bool(not maintained and has_host_instruction_carrier(candidate)
         and not has_host_instruction_carrier(previous))
-    if restore is not None and (native_definition_update or host_instruction_update or dependency_update
-            or maintained or not setup_keeps_candidate(directory, restore, candidate)):
-        blockers.append(SETUP_REPLACEMENT_BLOCKER)
+    if restore is not None:
+        blockers.extend(setup_blockers)
+        if (native_definition_update or host_instruction_update or dependency_update
+                or maintained or not setup_keeps_candidate(directory, restore, candidate)):
+            blockers.append(SETUP_REPLACEMENT_BLOCKER)
     transaction = {"update_id": identity, "status": "blocked" if blockers else "staged",
         "from_build_id": receipt["build_id"], "to_build_id": report["build_id"],
         "guide_version": report["guide_version"], "blueprint_hash": report["blueprint_hash"],
@@ -2699,6 +2707,6 @@ def committed(directory, expected_id, *, restored=False, started=True, expected_
             rollback_available = False
             detail += " Previous source and history are retained, but its legacy host cannot restore continuing role instructions. Forward recovery remains available."
     if not started and rollback_available:
-        detail += " If that Start fails, Roll back restores the previous source."
+        detail += " If that Start fails, Restore previous application restores the previous source."
     return checkpoint(directory, root, update, expected_binding=expected_binding, expected_installation=expected_installation, status="rolled-back" if restored else "completed",
         rollback_available=rollback_available, detail=detail)
