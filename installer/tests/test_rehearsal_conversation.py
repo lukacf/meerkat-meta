@@ -677,15 +677,26 @@ async def test_ten_turn_cap_never_waits_or_admits_an_eleventh_request(native_sea
 
 @pytest.mark.parametrize("late_work", [False, True])
 async def test_total_lifetime_is_complete_only_if_the_actual_native_trace_is_settled(native_seam, monkeypatch, late_work):
+    from launchkit.owned_worker import owned_job_deadline
     worker, directory, observed = native_seam
-    monkeypatch.setattr(worker, "REHEARSAL_SECONDS", .15)
+    # Reaching waiting_input takes tens of milliseconds, so a short lifetime
+    # could expire before that state, or right after it and unseen by the
+    # poll. The row ends the trial's lifetime itself once its turn is waiting.
+    monkeypatch.setattr(worker, "REHEARSAL_SECONDS", 30)
     monkeypatch.setattr(asyncio.get_running_loop(), "add_signal_handler", lambda *args: None)
+    deadlines, request = [], worker._native_request
+    async def admitted(*args, **kwargs):
+        deadlines.append(owned_job_deadline.get())
+        return await request(*args, **kwargs)
+    monkeypatch.setattr(worker, "_native_request", admitted)
     task = asyncio.create_task(worker.run(directory))
     await wait_for_worker(directory, "waiting_input")
     if late_work:
         observed.traces[0].record({"type": "console_frame", "frame": {"id": "late-start", "cursor": "console:10",
             "kind": "run_started", "identity": observed.calls[0]["identity"], "run_id": "unfinished-native-run", "payload": {}}})
+    deadlines[0].reschedule(asyncio.get_running_loop().time())
     await asyncio.wait_for(task, 2)
+    assert deadlines[0].expired()
     receipt = read_receipt(directory)
     assert observed.stops == observed.shutdowns == 1 and len(observed.calls) == 1
     if late_work:
