@@ -425,15 +425,15 @@ impl MemberMcpCustody {
     ///
     /// Call it only when the credential itself is gone: after a successful
     /// [`meerkat::HostAuthService::mcp_logout`] for the target (on
-    /// [`crate::GatewayFactoryConstruction::host_auth_service`]), or another
-    /// removal of that credential from the realm's store. Never call it when
-    /// a login attempt, its callback or a transport is only disposed of
-    /// (cancelled, expired or closed): the member's server would then stop
-    /// and wait for a sign-in its account does not need. Pass the identity
-    /// the member's connections report, scoped to the realm whose credential
-    /// slot it is, `host_auth_service()?.mcp_target_in_service_realm(&target)?`
-    /// as Meerkat's RPC logout does; a realm-less identity addresses no
-    /// member.
+    /// [`crate::gateway_mcp_composition::GatewayFactoryConstruction::host_auth_service`]),
+    /// or after another removal of that credential from the realm's store.
+    /// Never call it when a login attempt, its callback or a transport is
+    /// only disposed of (cancelled, expired or closed): the member's server
+    /// would then stop and wait for a sign-in its account does not need.
+    /// Pass the identity the member's connections report, scoped to the
+    /// realm whose credential slot it is,
+    /// `host_auth_service()?.mcp_target_in_service_realm(&target)?`, as
+    /// Meerkat's RPC logout does; a realm-less identity addresses no member.
     ///
     /// It never signs the account out. It does not log out, revoke a token,
     /// or remove or change a stored credential or account: a member's router

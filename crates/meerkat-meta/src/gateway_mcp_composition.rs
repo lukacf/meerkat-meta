@@ -121,10 +121,13 @@ impl<'a> GatewayFactoryConstruction<'a> {
     /// The gateway's member MCP custody: the one owner every member
     /// construction of this gateway adopts its MCP adapter into, before any
     /// server is staged. The host keeps it to tell the gateway's own members
-    /// that a credential landed ([`crate::MemberMcpCustody::credential_landed`]),
-    /// after a login through [`Self::host_auth_service`] completed, so the
-    /// operation awaiting that login continues in the same runtime. It
-    /// grants nothing else.
+    /// that a credential landed or was released, after a login or a logout
+    /// through [`Self::host_auth_service`]
+    /// ([`crate::MemberMcpCustody::credential_landed`],
+    /// [`crate::MemberMcpCustody::credential_released`]), so they follow it in
+    /// the same runtime. Hosts call only `credential_landed` and
+    /// `credential_released` on it; adopting or installing their own adapters
+    /// would put them under this gateway's shutdown settlement.
     pub fn member_mcp_custody(&self) -> Arc<crate::member_mcp_custody::MemberMcpCustody> {
         Arc::clone(self.custody)
     }
