@@ -132,6 +132,11 @@ AREAS = (
     # incident pack) and the console packs console-acceptance runs and the
     # console fixture test greps.
     ("examples/", frozenset({"rust", "integration", "console"})),
+    # A Forge test that pins the shutdown horizon the RPC gateway source
+    # advertises. Forge's own workflow runs it and no lane here does; like
+    # every other installer path, a change to it reaches every lane. Named
+    # here so scripts/test_ci_changes.py audits its read of that source.
+    ("installer/tests/test_gateway_shutdown_horizon.py", EVERY_LANE),
 )
 
 # Single files -> the lanes a change to them can reach. They take precedence
