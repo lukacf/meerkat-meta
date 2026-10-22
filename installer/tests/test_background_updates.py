@@ -706,3 +706,37 @@ async def test_first_update_on_an_earlier_unit_widens_its_stop_budget_without_ro
     # The frozen unit and the service identity the update was staged with hold.
     assert Path(definition["unit_path"]).read_bytes() == unit
     assert services.service_binding(services.verify_service(directory, current)) == services.service_binding(definition)
+
+
+RELOAD = ["/usr/bin/systemctl", "--user", "daemon-reload"]
+
+
+@pytest.mark.parametrize("killed", ["after-record", "before-reload"])
+async def test_an_interrupted_stop_budget_widening_stays_controllable_and_completes(
+        unit_from_earlier_forge, background, monkeypatch, killed):
+    service, directory, target, old, private, identity, manager, definition = background
+    drop_in = Path(definition["unit_path"] + ".d/forge-stop-budget.conf")
+    if killed == "after-record":
+        # The worker dies after recording the widened budget, before the drop-in exists.
+        def killed_writer(stop_timeout):
+            raise RuntimeError("killed")
+        with monkeypatch.context() as patch:
+            patch.setattr(services, "drop_in_bytes", killed_writer)
+            with pytest.raises(RuntimeError, match="killed"):
+                services.widen_service_stop_budget(directory, 432_000)
+        assert read_receipt(directory)["service_stop_budget"]["stop_timeout_seconds"] == 482
+        assert not drop_in.exists()
+    else:
+        # The worker dies after writing the drop-in, before it reloads the manager.
+        assert services.widen_service_stop_budget(directory, 432_000) == RELOAD
+        assert drop_in.exists()
+    # Status, stop and a fresh start keep working on the interrupted state.
+    await services.background_status(directory, manager)
+    await services.stop_background(directory, manager)
+    manager.reported_horizon = 432_000
+    await services.update_background(directory, manager, "update", update_id=identity)
+    assert read_receipt(directory)["update"]["status"] == "completed"
+    # The next readiness completes the step: the drop-in and a manager reload.
+    assert drop_in.read_bytes() == b"[Service]\nTimeoutStopSec=482\n"
+    assert services.widen_service_stop_budget(directory, 432_000) == RELOAD
+

@@ -218,10 +218,11 @@ async def test_an_earlier_unit_gets_a_stop_budget_drop_in_for_the_reported_horiz
     assert reload == ["/usr/bin/systemctl", "--user", "daemon-reload"]
     assert drop_in.read_bytes() == f"[Service]\nTimeoutStopSec={budget}\n".encode()
     assert receipt["service_stop_budget"] == {"gateway_shutdown_horizon_ms": reported, "stop_timeout_seconds": budget}
-    # A shorter or equal report never narrows or rewrites it.
+    # A shorter or equal report never narrows or rewrites it. Each readiness
+    # reloads the manager again, completing a reload an interrupted run missed.
     before = (drop_in.read_bytes(), f.deployment.read_receipt(directory)["service_stop_budget"])
     for again in (392_000, reported):
-        assert widen(directory, again) is None
+        assert widen(directory, again) == reload
     assert (drop_in.read_bytes(), f.deployment.read_receipt(directory)["service_stop_budget"]) == before
 
 

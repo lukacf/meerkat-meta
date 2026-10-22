@@ -1472,11 +1472,16 @@ def test_remote_earlier_unit_gets_a_stop_budget_drop_in_and_reload(package, tmp_
         assert remote_drop_in(earlier).read_bytes() == (
             f"[Service]\nTimeoutStopSec={remote_budget('service', reported)}\n".encode())
         assert operations.calls == [['daemon-reload']]
-    # A shorter or equal report never narrows or rewrites it.
+    # The applied budget leaves the unit bytes and unit_sha256 exactly as recorded.
+    assert operations.load()['unit_sha256'] == earlier['unit_sha256'] == hashlib.sha256(
+        Path(earlier['unit_path']).read_bytes()).hexdigest()
+    # A shorter or equal report never narrows or rewrites it. Each readiness
+    # reloads the manager again, completing a reload an interrupted run missed.
     operations.calls.clear()
     before = (remote_drop_in(earlier).read_bytes(), operations.path.read_bytes())
-    assert widen(392_000) is False and widen(432_000) is False
-    assert operations.calls == [] and (remote_drop_in(earlier).read_bytes(), operations.path.read_bytes()) == before
+    assert widen(392_000) is True and widen(432_000) is True
+    assert operations.calls == [['daemon-reload'], ['daemon-reload']]
+    assert (remote_drop_in(earlier).read_bytes(), operations.path.read_bytes()) == before
 
 
 def test_remote_stop_budget_drop_in_is_verified_byte_exact(package, tmp_path):
@@ -1527,6 +1532,105 @@ def test_remote_service_removal_also_removes_its_stop_budget_drop_in(package, tm
     operations.widen_unit(432_000)
     assert operations.stop(remove=True)['status'] == 'service-removed'
     assert not Path(earlier['unit_path']).exists() and not remote_drop_in(earlier).parent.exists()
+
+
+def failing_once(operations, verb):
+    """Kill the next manager call with this verb, as a crash at that point would."""
+    original = operations.manager
+    state = {'armed': True}
+    def manager(arguments, **kwargs):
+        if state['armed'] and arguments[0] == verb:
+            state['armed'] = False
+            raise RuntimeError('killed')
+        return original(arguments, **kwargs)
+    operations.manager = manager
+    return original
+
+
+@pytest.mark.parametrize('killed', ['after-record', 'before-reload'])
+def test_remote_interrupted_widening_stays_controllable_and_completes(package, tmp_path, monkeypatch, killed):
+    module = load_helper(package / 'remote_operations.py')
+    monkeypatch.setattr(module, 'console_healthy', lambda *args: True)
+    operations = fake_operations(module, package, tmp_path / 'home')
+    earlier, _ = remote_earlier_unit(module, operations)
+    drop_in = remote_drop_in(earlier)
+    if killed == 'after-record':
+        with monkeypatch.context() as patch:
+            def killed_writer(stop_timeout):
+                raise RuntimeError('killed')
+            patch.setattr(module, 'drop_in_bytes', killed_writer)
+            with pytest.raises(RuntimeError, match='killed'):
+                operations.widen_unit(432_000)
+        assert not drop_in.exists()
+    else:
+        original = failing_once(operations, 'daemon-reload')
+        with pytest.raises(RuntimeError, match='killed'):
+            operations.widen_unit(432_000)
+        operations.manager = original
+        assert drop_in.exists()
+    assert operations.load()['service_stop_budget']['stop_timeout_seconds'] == remote_budget('service', 432_000)
+    # Status, stop and restart keep working on the interrupted state.
+    assert operations.status()['definition_verified'] is True
+    operations.current = 'active'
+    assert operations.stop()['ready'] is False
+    assert operations.start(restart=True)['ready'] is True
+    # The next readiness completes the step: the drop-in and a manager reload.
+    operations.calls.clear()
+    assert operations.widen_unit(432_000) is True
+    assert drop_in.read_bytes() == f"[Service]\nTimeoutStopSec={remote_budget('service', 432_000)}\n".encode()
+    assert operations.calls == [['daemon-reload']]
+
+
+@pytest.mark.parametrize('killed', ['before-reload', 'before-record-drop'])
+def test_remote_interrupted_removal_can_be_run_again(package, tmp_path, monkeypatch, killed):
+    module = load_helper(package / 'remote_operations.py')
+    operations = fake_operations(module, package, tmp_path / 'home')
+    earlier, _ = remote_earlier_unit(module, operations)
+    operations.widen_unit(432_000)
+    if killed == 'before-reload':
+        # Killed after the drop-in is deleted, before the manager reloads.
+        original = failing_once(operations, 'daemon-reload')
+        with pytest.raises(RuntimeError, match='killed'):
+            operations.stop(remove=True)
+        operations.manager = original
+    else:
+        # Killed after the reload, before the record is dropped.
+        with monkeypatch.context() as patch:
+            def killed_record(path, value, **kwargs):
+                raise RuntimeError('killed')
+            patch.setattr(module, 'write_private', killed_record)
+            with pytest.raises(RuntimeError, match='killed'):
+                operations.stop(remove=True)
+    assert not remote_drop_in(earlier).exists() and Path(earlier['unit_path']).exists()
+    # The uninstall is run again and completes.
+    operations.calls.clear()
+    assert operations.stop(remove=True)['status'] == 'service-removed'
+    assert not Path(earlier['unit_path']).exists() and not operations.path.exists()
+    assert not remote_drop_in(earlier).parent.exists()
+    assert operations.calls[-1] == ['daemon-reload']
+
+
+def test_remote_removal_deletes_the_drop_in_reloads_then_drops_the_record(package, tmp_path, monkeypatch):
+    module = load_helper(package / 'remote_operations.py')
+    operations = fake_operations(module, package, tmp_path / 'home')
+    earlier, _ = remote_earlier_unit(module, operations)
+    operations.widen_unit(432_000)
+    order = []
+    original_manager, original_write = operations.manager, module.write_private
+    def manager(arguments, **kwargs):
+        if arguments[0] == 'daemon-reload':
+            order.append(('reload', remote_drop_in(earlier).exists(),
+                          'service_stop_budget' in json.loads(operations.path.read_text())))
+        return original_manager(arguments, **kwargs)
+    def write_private(path, value, **kwargs):
+        order.append(('record', 'service_stop_budget' in value))
+        return original_write(path, value, **kwargs)
+    operations.manager = manager
+    monkeypatch.setattr(module, 'write_private', write_private)
+    operations.stop(remove=True)
+    # The first reload follows the drop-in's deletion while the record still
+    # stands; the record is dropped after it.
+    assert order[:2] == [('reload', False, True), ('record', False)]
 
 
 FIXTURE_APP_REPORTING = FIXTURE_APP.replace("payload = {'pid'", "payload = {'gateway_shutdown_horizon_ms': HORIZON, 'pid'", 1)
