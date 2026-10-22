@@ -465,6 +465,7 @@ async def test_actual_execute_retains_initialization_runtime_and_reawaits_shutdo
     draining, release = asyncio.Event(), asyncio.Event()
     class Runtime:
         cleanup_task = None
+        deadline = None
         calls = 0
         finished = False
         async def shutdown(self):
@@ -479,6 +480,7 @@ async def test_actual_execute_retains_initialization_runtime_and_reawaits_shutdo
         async def identity_bootstrap_status(self):
             # Current Meta initializes the identity directly. Cancellation must
             # retain this same runtime and reawait its original cleanup task.
+            self.deadline = owned_worker.owned_job_deadline.get()
             await self.shutdown()
             pytest.fail("Cancelled initialization must not admit a model turn.")
     runtime = Runtime()
@@ -490,15 +492,24 @@ async def test_actual_execute_retains_initialization_runtime_and_reawaits_shutdo
     def register(sig, callback):
         callbacks[sig] = (callback, copy_context())
     monkeypatch.setattr(loop, "add_signal_handler", register)
-    monkeypatch.setattr(worker, "IMPLEMENTATION_SECONDS", .04)
+    # Reaching initialization takes tens of milliseconds, so a short job limit
+    # could expire before the stop this row sends. The row ends the job itself,
+    # once the original cleanup is draining.
+    monkeypatch.setattr(worker, "IMPLEMENTATION_SECONDS", 30)
     task = asyncio.create_task(worker.run(directory))
     try:
         await asyncio.wait_for(draining.wait(), 30)
         if trigger == "signal":
             callback, context = callbacks[signal.SIGTERM]
             loop.call_soon(callback, context=context)
+        else:
+            runtime.deadline.reschedule(loop.time())
         await asyncio.sleep(.08)
         assert not task.done() and not runtime.finished
+        if trigger == "signal":
+            assert runtime.deadline.when() is None  # The stop disarmed the job limit.
+        else:
+            assert runtime.deadline.expired()
         release.set()
         await asyncio.wait_for(task, 1)
         assert runtime.finished and runtime.calls == 2
