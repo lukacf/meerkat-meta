@@ -250,6 +250,16 @@ impl UnifiedRuntime {
     }
 
     pub async fn shutdown(&self) -> UnifiedRuntimeShutdownReport {
+        self.shutdown_with_root_budget(MOB_TERMINAL_SHUTDOWN_BUDGET)
+            .await
+    }
+
+    /// [`Self::shutdown`] with `root_budget` bounding the mob actor's
+    /// terminal teardown in place of [`MOB_TERMINAL_SHUTDOWN_BUDGET`].
+    pub(super) async fn shutdown_with_root_budget(
+        &self,
+        root_budget: Duration,
+    ) -> UnifiedRuntimeShutdownReport {
         // The close begins under the bootstrap completion's gate: a running
         // publication finishes first, and every later one is refused.
         self.close_gate.close();
@@ -403,7 +413,7 @@ impl UnifiedRuntime {
 
         // Durable child mobs share the root's terminal teardown window, so the
         // advertised shutdown horizon gains no new phase.
-        let terminal_window_deadline = std::time::Instant::now() + MOB_TERMINAL_SHUTDOWN_BUDGET;
+        let terminal_window_deadline = std::time::Instant::now() + root_budget;
 
         // `stop` quiesces members but keeps the mob actor - and its
         // `{mob_id}/__mob_supervisor__` in-proc route - alive for resume.
@@ -415,7 +425,7 @@ impl UnifiedRuntime {
         // route registered and is reported loudly rather than failing the
         // report.
         let mob_terminal_shutdown = if mob_stop.is_ok() {
-            self.shutdown_mob_actor().await
+            self.shutdown_mob_actor(root_budget).await
         } else {
             MobTerminalShutdownOutcome::SkippedMobStopFailed
         };
@@ -571,8 +581,8 @@ impl UnifiedRuntime {
     /// `shutdown_with_report` owns its convergence (stuck retirements, held
     /// unregisters and in-flight runs are settled or reported, not retried),
     /// bounded by [`MOB_TERMINAL_SHUTDOWN_BUDGET`].
-    async fn shutdown_mob_actor(&self) -> MobTerminalShutdownOutcome {
-        let deadline = std::time::Instant::now() + MOB_TERMINAL_SHUTDOWN_BUDGET;
+    async fn shutdown_mob_actor(&self, budget: Duration) -> MobTerminalShutdownOutcome {
+        let deadline = std::time::Instant::now() + budget;
         match self
             .mob_handle()
             .shutdown_with_report(meerkat_mob::ShutdownOptions::default().with_deadline(deadline))
