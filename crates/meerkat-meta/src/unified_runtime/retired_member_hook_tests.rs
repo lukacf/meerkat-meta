@@ -38,7 +38,10 @@ use crate::identity_first::{
 };
 use crate::unified_runtime::types::ErrorEvent;
 
-use super::held_identity_test_support::{governed_runtime, member};
+use meerkat_mob::MemberRuntimeRegistrationHook;
+use meerkat_runtime::RuntimeSessionRegistrationWitness;
+
+use super::held_identity_test_support::{SelectingHook, governed_runtime_with, member};
 
 /// An identity runtime over `runtime`'s mob, its session bridge composed as
 /// a gateway composes it: with the mob runtime's session service, so it
@@ -91,8 +94,79 @@ fn recording(seen: &Seen, answer: Result<(), String>) -> RetiredMemberObserver {
     })
 }
 
+/// The host's Core registration hook in the fixture: it selects as the
+/// governed host does ([`SelectingHook`]) and records each distinct
+/// registration a member build was given
+/// (`MemberRuntimeBuildIdentity::registration`), in order.
+#[derive(Default)]
+struct RecordingRegistrationHook {
+    builds: Mutex<Vec<RuntimeSessionRegistrationWitness>>,
+}
+
+impl RecordingRegistrationHook {
+    fn record(&self, identity: &meerkat_mob::MemberRuntimeBuildIdentity) {
+        let mut builds = self.builds.lock().unwrap();
+        if !builds.contains(identity.registration()) {
+            builds.push(identity.registration().clone());
+        }
+    }
+
+    /// The distinct registrations builds on `session` were given, in order.
+    fn registrations_on(
+        &self,
+        session: &meerkat_core::types::SessionId,
+    ) -> Vec<RuntimeSessionRegistrationWitness> {
+        self.builds
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|registration| registration.session_id() == session)
+            .cloned()
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl MemberRuntimeRegistrationHook for RecordingRegistrationHook {
+    async fn select_destination(
+        &self,
+        identity: &meerkat_mob::MemberRuntimeBuildIdentity,
+    ) -> Result<meerkat_mob::MemberDestinationSelection, meerkat_mob::MobError> {
+        self.record(identity);
+        SelectingHook.select_destination(identity).await
+    }
+
+    async fn expected_destination(
+        &self,
+        identity: &meerkat_mob::MemberRuntimeBuildIdentity,
+    ) -> Result<meerkat_mob::MemberDestinationSelection, meerkat_mob::MobError> {
+        self.record(identity);
+        SelectingHook.expected_destination(identity).await
+    }
+
+    async fn verify_member_surface(
+        &self,
+        identity: &meerkat_mob::MemberRuntimeBuildIdentity,
+        surface: &[meerkat_core::ToolDef],
+    ) -> Result<(), meerkat_mob::MobError> {
+        SelectingHook.verify_member_surface(identity, surface).await
+    }
+
+    async fn prepare_member_surface(
+        &self,
+        identity: &meerkat_mob::MemberRuntimeBuildIdentity,
+        surface: &meerkat_core::PreparedToolSurface,
+    ) -> Result<meerkat_core::ToolSurfaceSelection, meerkat_mob::MobError> {
+        SelectingHook
+            .prepare_member_surface(identity, surface)
+            .await
+    }
+}
+
 /// A running roster of two members, bootstrapped held, with the recording
-/// hook installed before the bootstrap.
+/// hook installed before the bootstrap. Its mob also declares a `reviewer`
+/// profile, and its members register through the recording registration
+/// hook.
 struct Fixture {
     runtime: crate::UnifiedRuntime,
     context: Arc<IdentityFirstRuntimeContext>,
@@ -100,6 +174,7 @@ struct Fixture {
     kept: AgentIdentity,
     other: AgentIdentity,
     seen: Seen,
+    builds: Arc<RecordingRegistrationHook>,
 }
 
 impl Fixture {
@@ -107,7 +182,14 @@ impl Fixture {
         let continuity = Arc::new(LocalContinuityStore::in_memory().expect("continuity store"));
         let kept = AgentIdentity::parse(&format!("{prefix}-kept")).unwrap();
         let other = AgentIdentity::parse(&format!("{prefix}-other")).unwrap();
-        let mut runtime = governed_runtime(dir, prefix).await;
+        let builds = Arc::new(RecordingRegistrationHook::default());
+        let mut runtime = governed_runtime_with(
+            dir,
+            prefix,
+            &["reviewer"],
+            Arc::clone(&builds) as Arc<dyn MemberRuntimeRegistrationHook>,
+        )
+        .await;
         let identities = gateway_identity_runtime(
             &runtime,
             Arc::clone(&continuity) as Arc<dyn ContinuityStore>,
@@ -143,6 +225,7 @@ impl Fixture {
             kept,
             other,
             seen,
+            builds,
         }
     }
 
@@ -934,4 +1017,86 @@ async fn only_a_registration_the_retire_ended_is_named() {
     .await;
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert_eq!(calls[0].registration, None, "{calls:?}");
+}
+
+/// End to end with the host's Core registration hook: each retirement hands
+/// the hook the registration the registration hook was given for that
+/// incarnation's build, never another. The still listed identity's successor
+/// resumes on the same session and its build is given a registration of its
+/// own, which the successor's retirement then hands over.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_retirement_hands_over_the_registration_its_build_was_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::start(&dir, "retired-hook-build").await;
+    let session = fixture
+        .status(&fixture.kept)
+        .await
+        .session_id
+        .expect("the member's session");
+    let first = fixture.builds.registrations_on(&session);
+    assert_eq!(first.len(), 1, "the first incarnation's build: {first:?}");
+    fixture
+        .identities()
+        .retire_tracked(&fixture.kept)
+        .await
+        .expect("the member retires");
+    fixture
+        .context
+        .refresh_desired_topology_tracked()
+        .await
+        .expect("the roster pass resumes the still listed identity");
+    let both = fixture.builds.registrations_on(&session);
+    assert_eq!(
+        both.len(),
+        2,
+        "the successor's build on the same session: {both:?}"
+    );
+    assert_ne!(
+        both[1], both[0],
+        "the successor's build was given its own registration"
+    );
+    fixture
+        .identities()
+        .retire_tracked(&fixture.kept)
+        .await
+        .expect("the successor retires");
+    let calls = fixture.seen.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(
+        calls[0].registration.as_ref(),
+        Some(&both[0]),
+        "the first retirement hands over its build's registration"
+    );
+    assert_eq!(
+        calls[1].registration.as_ref(),
+        Some(&both[1]),
+        "the successor's retirement hands over the successor build's registration"
+    );
+    let _ = fixture.runtime.shutdown().await;
+}
+
+/// A reprofile retires the live member in the roster pass, beside the
+/// pass's unlisted retirements, and never reaches the hook: the identity
+/// keeps its place in the roster.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reprofile_never_reaches_the_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::start(&dir, "retired-hook-reprofile").await;
+    let before = fixture.status(&fixture.kept).await;
+    assert_eq!(before.state, IdentityLifecycleState::Active);
+    let mut reprofiled = member(&fixture.kept);
+    reprofiled.profile = "reviewer".into();
+    fixture.roster.upsert(reprofiled);
+    // The pass retires the live member. Whether its resume under the new
+    // profile is refused (no declared role migration) is not this row's
+    // subject.
+    let _ = fixture.context.refresh_desired_topology_tracked().await;
+    let after = fixture.status(&fixture.kept).await;
+    assert!(
+        after.state != IdentityLifecycleState::Active || after.generation != before.generation,
+        "the reprofile retired the member: {before:?} -> {after:?}"
+    );
+    let calls = fixture.seen.calls();
+    assert!(calls.is_empty(), "{calls:?}");
+    let _ = fixture.runtime.shutdown().await;
 }

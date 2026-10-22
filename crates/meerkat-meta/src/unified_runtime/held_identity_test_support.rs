@@ -232,17 +232,33 @@ fn fixture_provider_config() -> meerkat::Config {
 /// A governed runtime whose fresh members can be held, not yet carrying an
 /// identity context.
 pub(crate) async fn governed_runtime(dir: &tempfile::TempDir, mob_prefix: &str) -> UnifiedRuntime {
-    let definition = meerkat_mob::MobDefinition::from_toml(&format!(
-        "[mob]\nid = \"{mob_prefix}-{}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\nruntime_mode = \"turn_driven\"\n\n[profiles.worker.tools]\ncomms = true\n",
+    governed_runtime_with(dir, mob_prefix, &[], Arc::new(SelectingHook)).await
+}
+
+/// [`governed_runtime`] whose mob also declares the turn-driven, comms-enabled
+/// `extra_profiles`, and whose members register through `hook`.
+pub(crate) async fn governed_runtime_with(
+    dir: &tempfile::TempDir,
+    mob_prefix: &str,
+    extra_profiles: &[&str],
+    hook: Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>,
+) -> UnifiedRuntime {
+    let mut toml = format!(
+        "[mob]\nid = \"{mob_prefix}-{}\"\n",
         uuid::Uuid::new_v4().simple()
-    ))
-    .expect("mob definition");
+    );
+    for profile in std::iter::once("worker").chain(extra_profiles.iter().copied()) {
+        toml.push_str(&format!(
+            "\n[profiles.{profile}]\nmodel = \"gpt-5.5\"\nruntime_mode = \"turn_driven\"\n\n[profiles.{profile}.tools]\ncomms = true\n"
+        ));
+    }
+    let definition = meerkat_mob::MobDefinition::from_toml(&toml).expect("mob definition");
     UnifiedRuntime::builder()
         .definition(definition)
         .meerkat_config(fixture_provider_config())
         .persistent_state(dir.path().join("state"))
         .native_grant_work_configuration(host_configuration())
-        .member_runtime_registration_hook(Arc::new(SelectingHook))
+        .member_runtime_registration_hook(hook)
         .tool_consequence_policy_registry(Arc::new(
             meerkat_core::ToolConsequencePolicyRegistry::new(
                 vec![Arc::new(HostPolicy(

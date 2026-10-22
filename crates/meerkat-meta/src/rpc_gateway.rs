@@ -14731,6 +14731,12 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// whatever this returns: an `Err` is reported to the error hook as
     /// `retired_member_release_failed` and is not retried. The default does
     /// nothing.
+    ///
+    /// Fail closed: because the gateway installs it for every host, each
+    /// retire this can announce first reads the retiring incarnation from
+    /// Core's member history, under the identity's lifecycle lock and before
+    /// Core is asked. If that read fails, that retire is refused rather than
+    /// retiring an incarnation the host would not hear of.
     async fn identity_member_retired(
         &self,
         retired: &crate::identity_first::RetiredIdentityMember,
