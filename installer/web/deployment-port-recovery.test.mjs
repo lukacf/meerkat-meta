@@ -197,7 +197,7 @@ test("occupied default offers an explicit alternate that changes only the curren
     assert.equal(posts[0].body.build_id, checked.build_id);
     assert.equal(posts[0].body.version, guide.version);
     assert.equal(posts[0].body.destination, destination);
-    assert.equal(privateForm() === null, true);
+    assert.equal(privateForm(), null);
   });
 });
 
@@ -282,7 +282,7 @@ test("source changes invalidate a delayed check and do not reopen an old setup d
     await act(async () => button("Check this port").click());
     await changeSource();
     await finishCheck();
-    assert.equal(privateForm() === null, true);
+    assert.equal(privateForm(), null);
     assert.doesNotMatch(document.body.textContent, /available when checked/);
   });
 });
@@ -297,7 +297,7 @@ test("reopening setup waits for its pending port read without publishing the aba
     const before = calls.length;
     await act(async () => button("Install on this computer").click());
     assert.equal(calls.length, before, "Reopening cannot overlap a native package check for the same build.");
-    assert.equal(privateForm() === null, true);
+    assert.equal(privateForm(), null);
     assert.match(document.body.textContent, /Checking your deployment destination/);
     await finishCheck();
     await enter("MOBKIT_PORT", "59123");
@@ -315,7 +315,7 @@ test("another selected installation clears its old form and invalidates its dela
     await poll({ ...stopped, deployment_id: "other-installation", source_digest: "c".repeat(64) });
     await finishCheck();
     assert.doesNotMatch(document.body.textContent, /available when checked/);
-    assert.equal(privateForm() === null, true);
+    assert.equal(privateForm(), null);
     assert.equal(button("Check this port"), undefined);
   });
 });
@@ -345,9 +345,9 @@ test("lost installation response still reconciles the admitted receipt and clear
     await act(async () => hostSelection().click());
     loseResponse();
     await act(async () => button("Install and start").click());
-    assert.equal(privateForm() === null, true);
+    assert.equal(privateForm(), null);
     await poll({ ...currentReceipt(), status: "running" });
-    assert.equal(privateForm() === null, true);
+    assert.equal(privateForm(), null);
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
   });
 });

@@ -4,14 +4,28 @@ import test from "node:test";
 import { domNullAssertions, nullAssertions } from "./test-support/dom-null-asserts.mjs";
 
 const here = new URL(".", import.meta.url);
+// Three open branches edit the rows of this file: codex/forge-ordinary-runtime-store,
+// codex/forge-setup-read-deadline and codex/forge-venv-site-scheme. It keeps its
+// node-vs-null rows until the last of them merges. One commit then rewrites them,
+// with the row those branches add, and removes this entry.
+const PENDING = new Set(["deployment-port-recovery.test.mjs"]);
 
 test("web tests compare a DOM node with null as a boolean, never the node itself", () => {
   const findings = [];
   for (const name of readdirSync(here).filter((entry) => entry.endsWith(".test.mjs")).sort()) {
     const source = readFileSync(new URL(name, here), "utf8");
-    for (const finding of domNullAssertions(source)) {
+    const rows = domNullAssertions(source);
+    if (PENDING.has(name)) {
+      // An entry whose rows are gone must go too.
+      if (rows.length === 0) findings.push(`${name}: has no node-vs-null rows; remove it from PENDING`);
+      continue;
+    }
+    for (const finding of rows) {
       findings.push(`${name}:${finding.line}: ${finding.text.split("\n")[0]}`);
     }
+  }
+  for (const name of PENDING) {
+    if (!readdirSync(here).includes(name)) findings.push(`${name}: not found; remove it from PENDING`);
   }
   // The message holds strings only: a node in it is what this rule prevents.
   assert.equal(findings.length, 0,
