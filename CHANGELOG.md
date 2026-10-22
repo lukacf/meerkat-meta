@@ -167,6 +167,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the child root stayed claimed for the rest of the process (a same-process
   successor got `AlreadyClaimed`) and `meta/shutdown` could report
   `runtime_cleanup_completed: false`, even for a runtime with no child mobs.
+- Forge stops a local or destination application within the shutdown horizon
+  its gateway advertised. It used a pinned 347-second budget, which cut the
+  current gateway's 392-second horizon during native cleanup. The generated
+  application reports its runtime's `gateway_shutdown_horizon_ms` at
+  readiness. The application stop, the worker's and the host's waits, the
+  service unit's stop timeout and the service manager's stop and restart
+  commands are derived from it; an application that reports nothing gets this
+  repository's gateway horizon. New services get the derived stop timeout from
+  the start. A Linux user service installed earlier keeps its frozen unit and,
+  when its application reports a longer horizon, gets an owned systemd drop-in
+  with the larger stop timeout; the destination supervisor does the same for
+  its own unit. The Guide's rehearsal, implementation and trial workers wait
+  the derived budget too.
 
 ### Known limitations
 
@@ -190,6 +203,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Toolkit product application that has not finished its setup: the update
   stops as "recovery needed", and its previous package and private data are
   kept. Finish such an application's setup before you apply an update.
+- A macOS LaunchAgent that Forge installed before 0.9.5 keeps its recorded stop
+  timeout until it is reinstalled: launchd reads `ExitTimeOut` only when it
+  loads the job.
+- On Linux, logout and shutdown stop user services within the systemd user
+  manager's own stop timeout (`TimeoutStopSec=120s` by default), whatever Forge
+  sets. The unit's stop timeout governs an explicit Stop or Restart.
 
 ## [0.9.4] - 2026-10-22
 
