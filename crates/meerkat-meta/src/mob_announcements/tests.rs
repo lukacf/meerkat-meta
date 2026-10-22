@@ -2335,6 +2335,9 @@ struct ScriptedNative {
     mob_events: Mutex<BTreeMap<String, Vec<(u64, &'static str)>>>,
     /// The cursors member mob logs were read after, in order.
     log_reads: Mutex<Vec<u64>>,
+    /// What each member's roster records: its role and its labels. A member
+    /// missing here has no roster facts.
+    roster_facts: Mutex<BTreeMap<String, (String, BTreeMap<String, String>)>>,
 }
 
 impl ScriptedNative {
@@ -2360,7 +2363,22 @@ impl ScriptedNative {
             incarnations: Mutex::new(BTreeMap::new()),
             mob_events: Mutex::new(BTreeMap::new()),
             log_reads: Mutex::new(Vec::new()),
+            roster_facts: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Record `identity`'s role and labels on this mob's roster.
+    fn set_roster_facts(&self, identity: &str, role: &str, labels: &[(&str, &str)]) {
+        self.roster_facts.lock().unwrap().insert(
+            identity.to_string(),
+            (
+                role.to_string(),
+                labels
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            ),
+        );
     }
 
     /// Put `identity` on the roster of the mob `mob_id` a member created.
@@ -12501,4 +12519,934 @@ async fn a_gateway_holds_a_bounded_number_of_live_sources_across_its_mobs() {
         .await
         .unwrap();
     store.put_source(&op("over-2"), over, 4).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Announcement sources: who may receive a source's items. Coverage at a
+// subscription's put and at capture, routes, conversation members, and the
+// audit of what was refused or withheld.
+// ---------------------------------------------------------------------------
+
+const AUDIT_LIST: &str = "meta/mob_announcements/audit/list";
+
+/// A grant of this mob's member `identity`.
+fn member_grant(identity: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "member",
+        "member": { "mob_id": OWN_MOB, "identity": identity },
+    })
+}
+
+/// `sources/put` params for "inbox" (topic "mail.received") with this
+/// audience and these routes.
+fn inbox_with(
+    operation: &str,
+    audience: serde_json::Value,
+    routes: serde_json::Value,
+) -> serde_json::Value {
+    with(
+        with(
+            source_params(operation, "inbox", "subject-1", &["mail.received"]),
+            "audience",
+            audience,
+        ),
+        "routes",
+        routes,
+    )
+}
+
+/// A triage route of member `identity` forwarding on "mail.triaged" to
+/// `forward_audience`.
+fn triage_by(identity: &str, forward_audience: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "triage",
+        "member": { "mob_id": OWN_MOB, "identity": identity },
+        "forward_topics": ["mail.triaged"],
+        "forward_audience": forward_audience,
+    })
+}
+
+/// A native owner that serves these members of this mob besides "agent:a".
+fn native_serving(identities: &[&str]) -> ScriptedNative {
+    let mut native = ScriptedNative::new();
+    for identity in identities {
+        native.known.insert((*identity).to_string());
+    }
+    native
+}
+
+/// Subscribe this mob's member `identity` to `topics`, keeping a refusal.
+async fn try_subscribe(
+    service: &AnnouncementService,
+    id: &str,
+    identity: &str,
+    topic: &[&str],
+) -> std::result::Result<serde_json::Value, crate::rpc::JsonRpcError> {
+    try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": format!("subscribe-{id}"),
+            "subscription_id": id,
+            "member": { "mob_id": OWN_MOB, "identity": identity },
+            "topics": topic,
+        }),
+    )
+    .await
+}
+
+/// Take "inbox"'s baseline at `revision`: live at version 1.
+async fn baseline_inbox(service: &AnnouncementService, revision: u64) {
+    let baseline = with(
+        advance_params("baseline", revision, 0, "c1"),
+        "coverage",
+        serde_json::json!("complete"),
+    );
+    try_host_call(service, SOURCES_ADVANCE, baseline)
+        .await
+        .unwrap();
+}
+
+/// Member "agent:t" announces on `topic` as itself, citing `causes`.
+async fn triage_announces(
+    service: &AnnouncementService,
+    key: &str,
+    topic: &[&str],
+    causes: Vec<AnnouncementRef>,
+) -> AnnounceOutcome {
+    service
+        .announce(AnnounceRequest {
+            mob_id: mob(OWN_MOB),
+            announced_by: Announcer::Member {
+                identity: MemberIdentity::new("agent:t").unwrap(),
+            },
+            source_key: SourceKey::new(key).unwrap(),
+            topics: topics(topic),
+            body: "a summary of the invoice".to_string(),
+            correlation_id: None,
+            causes,
+        })
+        .await
+        .unwrap()
+}
+
+/// The rows `audit/list` answers for `params`.
+async fn audit_rows(
+    service: &AnnouncementService,
+    params: serde_json::Value,
+) -> Vec<serde_json::Value> {
+    try_host_call(service, AUDIT_LIST, params).await.unwrap()["audit"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// A member a source's audience does not cover cannot subscribe to the
+/// source's topics, through the host's RPC or through its own tool; a
+/// covered member can, both ways.
+#[tokio::test]
+async fn an_uncovered_member_is_refused_by_rpc_and_tool_alike() {
+    let tools = tool_harness(super::tools::MemberLimits::default());
+    let service = &tools.harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("put", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    let refused = try_subscribe(service, "b-mail", "agent:b", &["mail.received"])
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, super::rpc::ANNOUNCEMENTS_REFUSED_CODE);
+    assert_eq!(
+        refused.data,
+        Some(serde_json::json!({
+            "kind": "audience_not_covered", "source_id": "inbox", "topic": "mail.received"
+        }))
+    );
+    let subscribe = serde_json::json!({
+        "action": "subscribe", "subscription": "mail", "topics": ["mail.received"]
+    });
+    let (failed, result) = tools
+        .call(
+            Some("agent:b"),
+            super::tools::SUBSCRIPTION_TOOL,
+            subscribe.clone(),
+        )
+        .await;
+    assert!(failed, "the tool reaches the same check: {result}");
+    assert!(result.to_string().contains("audience"), "{result}");
+
+    try_subscribe(service, "a-mail", "agent:a", &["mail.received"])
+        .await
+        .unwrap();
+    let (failed, result) = tools
+        .call(Some("agent:a"), super::tools::SUBSCRIPTION_TOOL, subscribe)
+        .await;
+    assert!(!failed, "{result}");
+}
+
+/// Role and label grants match only what the member's roster records: a
+/// member whose role or labels differ is refused, and so is a member with
+/// no roster facts at all.
+#[tokio::test]
+async fn a_missing_role_or_label_fails_coverage_closed() {
+    let native = native_serving(&["agent:b", "agent:c", "agent:d", "agent:e"]);
+    native.set_roster_facts("agent:b", "analyst", &[]);
+    native.set_roster_facts("agent:d", "triage", &[]);
+    native.set_roster_facts("agent:e", "analyst", &[("team", "finance")]);
+    let harness = harness_with(native);
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            serde_json::json!([
+                { "kind": "role", "mob_id": OWN_MOB, "role": "triage" },
+                { "kind": "label", "mob_id": OWN_MOB, "key": "team", "value": "finance" },
+            ]),
+            serde_json::json!([{ "kind": "direct" }]),
+        ),
+    )
+    .await
+    .unwrap();
+    for (identity, why) in [
+        ("agent:b", "another role and no label"),
+        ("agent:c", "no roster facts"),
+    ] {
+        let refused = try_subscribe(service, identity, identity, &["mail.received"])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refusal_kind(&refused).as_deref(),
+            Some("audience_not_covered"),
+            "{identity}: {why}"
+        );
+    }
+    try_subscribe(service, "agent:d", "agent:d", &["mail.received"])
+        .await
+        .unwrap();
+    try_subscribe(service, "agent:e", "agent:e", &["mail.received"])
+        .await
+        .unwrap();
+}
+
+/// A forward topic takes the forward audience: a member the source's
+/// audience covers but the forward audience does not cannot subscribe to it.
+#[tokio::test]
+async fn a_member_outside_the_forward_audience_cannot_subscribe_to_a_forward_topic() {
+    let harness = harness_with(native_serving(&["agent:b", "agent:t"]));
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            serde_json::json!([
+                member_grant("agent:a"),
+                member_grant("agent:b"),
+                member_grant("agent:t")
+            ]),
+            serde_json::json!([
+                { "kind": "direct" },
+                triage_by("agent:t", serde_json::json!([member_grant("agent:a")])),
+            ]),
+        ),
+    )
+    .await
+    .unwrap();
+    let refused = try_subscribe(service, "b-triaged", "agent:b", &["mail.triaged"])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.data,
+        Some(serde_json::json!({
+            "kind": "audience_not_covered", "source_id": "inbox", "topic": "mail.triaged"
+        }))
+    );
+    try_subscribe(service, "a-triaged", "agent:a", &["mail.triaged"])
+        .await
+        .unwrap();
+}
+
+/// A forward reaches only the members its forward audience covers when it is
+/// captured: a subscriber the audience no longer covers is withheld, with an
+/// audit row, and the others capture it.
+#[tokio::test]
+async fn a_forward_is_withheld_from_a_subscriber_outside_the_forward_audience() {
+    let harness = harness_with(native_serving(&["agent:b", "agent:t"]));
+    let service = &harness.service;
+    let routes = |forward_audience: serde_json::Value| serde_json::json!([{ "kind": "direct" }, triage_by("agent:t", forward_audience)]);
+    let audience = serde_json::json!([
+        member_grant("agent:a"),
+        member_grant("agent:b"),
+        member_grant("agent:t")
+    ]);
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            audience.clone(),
+            routes(serde_json::json!([
+                member_grant("agent:a"),
+                member_grant("agent:b")
+            ])),
+        ),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "a-triaged", "agent:a", &["mail.triaged"])
+        .await
+        .unwrap();
+    try_subscribe(service, "b-triaged", "agent:b", &["mail.triaged"])
+        .await
+        .unwrap();
+    // The forward audience narrows after both subscribed.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox_with(
+                "narrow",
+                audience,
+                routes(serde_json::json!([member_grant("agent:a")])),
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    let forwarded = triage_announces(service, "m-forward-1", &["mail.triaged"], Vec::new()).await;
+    assert_eq!(forwarded.captured_for, vec![sid("a-triaged")]);
+    let owed_now = owed(&harness).await;
+    assert_eq!(owed_now.get("agent:a"), Some(&1));
+    assert_eq!(owed_now.get("agent:b"), None, "withheld");
+    let rows = audit_rows(service, serde_json::json!({ "source_id": "inbox" })).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["kind"], serde_json::json!("withheld"));
+    assert_eq!(rows[0]["reason"], serde_json::json!("audience_not_covered"));
+    assert_eq!(
+        rows[0]["member"],
+        serde_json::json!({ "mob_id": OWN_MOB, "identity": "agent:b" })
+    );
+    assert_eq!(rows[0]["topic"], serde_json::json!("mail.triaged"));
+    assert_eq!(rows[0]["subscription_id"], serde_json::json!("b-triaged"));
+    assert_eq!(
+        rows[0]["sequence"],
+        serde_json::json!(forwarded.announcement.sequence)
+    );
+}
+
+/// One member is never reachable both directly and through a forward of the
+/// same source: the second subscription is refused, and so is a route change
+/// that would make an existing subscriber reachable both ways.
+#[tokio::test]
+async fn a_member_reachable_directly_and_through_a_forward_is_refused() {
+    let harness = harness_with(native_serving(&["agent:c", "agent:t"]));
+    let service = &harness.service;
+    let audience = serde_json::json!([
+        member_grant("agent:a"),
+        member_grant("agent:c"),
+        member_grant("agent:t")
+    ]);
+    let forward_audience = serde_json::json!([member_grant("agent:a"), member_grant("agent:c")]);
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            audience.clone(),
+            serde_json::json!([{ "kind": "direct" }, triage_by("agent:t", forward_audience.clone())]),
+        ),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "a-mail", "agent:a", &["mail.received"])
+        .await
+        .unwrap();
+    let refused = try_subscribe(service, "a-triaged", "agent:a", &["mail.triaged"])
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, super::rpc::ANNOUNCEMENTS_REFUSED_CODE);
+    assert_eq!(
+        refused.data,
+        Some(serde_json::json!({
+            "kind": "route_overlap",
+            "source_id": "inbox",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:a" },
+        }))
+    );
+    // "agent:c" takes the source's items directly and a topic no source
+    // owns yet; a route change that makes that topic a forward topic would
+    // reach it both ways.
+    try_subscribe(service, "c-mail", "agent:c", &["mail.received"])
+        .await
+        .unwrap();
+    try_subscribe(service, "c-digest", "agent:c", &["mail.digest"])
+        .await
+        .unwrap();
+    let mut widened = triage_by("agent:t", forward_audience);
+    widened["forward_topics"] = serde_json::json!(["mail.triaged", "mail.digest"]);
+    let refused = try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox_with(
+                "widen",
+                audience,
+                serde_json::json!([{ "kind": "direct" }, widened]),
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        refused.data,
+        Some(serde_json::json!({
+            "kind": "route_overlap",
+            "source_id": "inbox",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:c" },
+        }))
+    );
+}
+
+/// A direct recipient and a distinct triage recipient both receive: the
+/// direct route's members take the source's items, the triage member takes
+/// its topics, and the forward audience takes the forward. A source topic no
+/// direct route names is the triage member's alone.
+#[tokio::test]
+async fn direct_recipient_a_and_distinct_triage_recipient_b_both_receive() {
+    let harness = harness_with(native_serving(&["agent:b", "agent:c", "agent:t"]));
+    let service = &harness.service;
+    let put = with(
+        inbox_with(
+            "put",
+            serde_json::json!([
+                member_grant("agent:a"),
+                member_grant("agent:b"),
+                member_grant("agent:c"),
+                member_grant("agent:t"),
+            ]),
+            serde_json::json!([
+                { "kind": "direct", "topics": ["mail.received"] },
+                {
+                    "kind": "triage",
+                    "member": { "mob_id": OWN_MOB, "identity": "agent:t" },
+                    "topics": ["mail.received", "mail.urgent"],
+                    "forward_topics": ["mail.triaged"],
+                    "forward_audience": [member_grant("agent:b")],
+                },
+            ]),
+        ),
+        "topics",
+        serde_json::json!(["mail.received", "mail.urgent"]),
+    );
+    try_host_call(service, SOURCES_PUT, put).await.unwrap();
+    baseline_inbox(service, 1).await;
+    try_subscribe(service, "a-mail", "agent:a", &["mail.received"])
+        .await
+        .unwrap();
+    let refused = try_subscribe(service, "c-urgent", "agent:c", &["mail.urgent"])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.data,
+        Some(serde_json::json!({
+            "kind": "no_direct_route", "source_id": "inbox", "topic": "mail.urgent"
+        }))
+    );
+    try_subscribe(
+        service,
+        "t-mail",
+        "agent:t",
+        &["mail.received", "mail.urgent"],
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "b-triaged", "agent:b", &["mail.triaged"])
+        .await
+        .unwrap();
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "an invoice arrived")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(advanced["items"][0]["captured"], serde_json::json!(2));
+    let forwarded = triage_announces(service, "m-forward-1", &["mail.triaged"], Vec::new()).await;
+    assert_eq!(forwarded.captured_for, vec![sid("b-triaged")]);
+    let owed_now = owed(&harness).await;
+    assert_eq!(owed_now.get("agent:a"), Some(&1));
+    assert_eq!(owed_now.get("agent:t"), Some(&1));
+    assert_eq!(owed_now.get("agent:b"), Some(&1));
+}
+
+/// A member that owns a live conversation on the source's scope cannot
+/// subscribe to its topics or its forward topics, and a subscription made
+/// before it owned one captures nothing.
+#[tokio::test]
+async fn a_conversation_member_cannot_subscribe_its_own_scope() {
+    let harness = harness_with(native_serving(&["agent:c", "agent:t"]));
+    let service = &harness.service;
+    let audience = serde_json::json!([
+        member_grant("agent:a"),
+        member_grant("agent:c"),
+        member_grant("agent:t")
+    ]);
+    let routes = serde_json::json!([
+        { "kind": "direct" },
+        triage_by("agent:t", serde_json::json!([member_grant("agent:a"), member_grant("agent:c")])),
+    ]);
+    try_subscribe(service, "a-mail", "agent:a", &["mail.received"])
+        .await
+        .unwrap();
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox_with("put", audience, routes),
+            "conversation_members",
+            serde_json::json!([
+                { "mob_id": OWN_MOB, "identity": "agent:c" },
+                { "mob_id": OWN_MOB, "identity": "agent:a" },
+            ]),
+        ),
+    )
+    .await
+    .unwrap();
+    for topic in ["mail.received", "mail.triaged"] {
+        let refused = try_subscribe(service, topic, "agent:c", &[topic])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.data,
+            Some(serde_json::json!({
+                "kind": "route_conflict", "conflict": "conversation", "source_id": "inbox"
+            })),
+            "{topic}"
+        );
+    }
+    baseline_inbox(service, 1).await;
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v1", 1, 1, "c2"),
+            &[upsert(
+                "m-1",
+                "v1",
+                "a reply in a conversation agent:a owns",
+            )],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(advanced["items"][0]["captured"], serde_json::json!(0));
+    assert_eq!(owed(&harness).await.get("agent:a"), None);
+}
+
+/// Every capture a source's audience withholds is an audit row, read back
+/// per source, per member, or both.
+#[tokio::test]
+async fn withheld_captures_are_listed_per_source_and_per_member() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let both = serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]);
+    let calendar = |operation: &str, audience: serde_json::Value| {
+        with(
+            source_params(operation, "calendar", "subject-2", &["cal.events"]),
+            "audience",
+            audience,
+        )
+    };
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "inbox",
+            both.clone(),
+            serde_json::json!([{ "kind": "direct" }]),
+        ),
+    )
+    .await
+    .unwrap();
+    try_host_call(service, SOURCES_PUT, calendar("calendar", both))
+        .await
+        .unwrap();
+    for (identity, topic) in [
+        ("agent:a", "mail.received"),
+        ("agent:b", "mail.received"),
+        ("agent:a", "cal.events"),
+        ("agent:b", "cal.events"),
+    ] {
+        try_subscribe(service, &format!("{identity}-{topic}"), identity, &[topic])
+            .await
+            .unwrap();
+    }
+    // Both audiences narrow to "agent:a".
+    let only_a = serde_json::json!([member_grant("agent:a")]);
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox_with(
+                "inbox-narrow",
+                only_a.clone(),
+                serde_json::json!([{ "kind": "direct" }]),
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            calendar("calendar-narrow", only_a),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    baseline_inbox(service, 2).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 2, 1, "c2"),
+            &[upsert("m-1", "v1", "mail")],
+        ),
+    )
+    .await
+    .unwrap();
+    let calendar_step = |operation: &str, version: u64, items: serde_json::Value| {
+        let mut step = advance_params(operation, 2, version, "k");
+        step["source_id"] = serde_json::json!("calendar");
+        step["principal"] = principal_of("subject-2");
+        step["items"] = items;
+        step
+    };
+    let mut baseline = calendar_step("calendar-baseline", 0, serde_json::json!([]));
+    baseline["coverage"] = serde_json::json!("complete");
+    try_host_call(service, SOURCES_ADVANCE, baseline)
+        .await
+        .unwrap();
+    let mut event = upsert("e-1", "v1", "a meeting moved");
+    event["topics"] = serde_json::json!(["cal.events"]);
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        calendar_step("calendar:v1", 1, serde_json::json!([event])),
+    )
+    .await
+    .unwrap();
+
+    let b = serde_json::json!({ "mob_id": OWN_MOB, "identity": "agent:b" });
+    let per_source = audit_rows(service, serde_json::json!({ "source_id": "inbox" })).await;
+    assert_eq!(per_source.len(), 1, "{per_source:?}");
+    assert_eq!(per_source[0]["member"], b);
+    assert_eq!(per_source[0]["kind"], serde_json::json!("withheld"));
+    let per_member = audit_rows(service, serde_json::json!({ "member": b })).await;
+    let sources: Vec<_> = per_member
+        .iter()
+        .map(|row| row["source_id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(sources, vec!["inbox", "calendar"], "{per_member:?}");
+    let both_ways = audit_rows(
+        service,
+        serde_json::json!({ "source_id": "calendar", "member": b }),
+    )
+    .await;
+    assert_eq!(both_ways.len(), 1, "{both_ways:?}");
+    assert_eq!(both_ways[0]["topic"], serde_json::json!("cal.events"));
+    let after = audit_rows(
+        service,
+        serde_json::json!({ "member": b, "after": per_member[0]["id"] }),
+    )
+    .await;
+    assert_eq!(after, per_member[1..].to_vec(), "a list pages after an id");
+}
+
+/// A forward that cites its source item is an announcement of its own: its
+/// own key and sequence, captured by the forward audience only, while the
+/// item it cites stays with the members its routes gave it to.
+#[tokio::test]
+async fn a_forward_with_causes_is_its_own_announcement() {
+    let harness = harness_with(native_serving(&["agent:b", "agent:t"]));
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            serde_json::json!([
+                member_grant("agent:a"),
+                member_grant("agent:b"),
+                member_grant("agent:t")
+            ]),
+            serde_json::json!([
+                { "kind": "direct" },
+                triage_by("agent:t", serde_json::json!([member_grant("agent:b")])),
+            ]),
+        ),
+    )
+    .await
+    .unwrap();
+    baseline_inbox(service, 1).await;
+    try_subscribe(service, "t-mail", "agent:t", &["mail.received"])
+        .await
+        .unwrap();
+    try_subscribe(service, "b-triaged", "agent:b", &["mail.triaged"])
+        .await
+        .unwrap();
+    let refused = try_subscribe(service, "a-triaged", "agent:a", &["mail.triaged"])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refusal_kind(&refused).as_deref(),
+        Some("audience_not_covered")
+    );
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "an invoice arrived")],
+        ),
+    )
+    .await
+    .unwrap();
+    let item_key = SourceKey::new(advanced["items"][0]["source_key"].as_str().unwrap()).unwrap();
+    let cause = AnnouncementRef {
+        mob_id: mob(OWN_MOB),
+        source_key: item_key.clone(),
+    };
+    let forwarded = triage_announces(
+        service,
+        "m-forward-1",
+        &["mail.triaged"],
+        vec![cause.clone()],
+    )
+    .await;
+    assert!(!forwarded.replayed);
+    assert_ne!(
+        forwarded.announcement.sequence,
+        advanced["items"][0]["sequence"].as_u64().unwrap()
+    );
+    assert_eq!(forwarded.announcement.causes, vec![cause]);
+    assert_eq!(forwarded.captured_for, vec![sid("b-triaged")]);
+    let owed_now = owed(&harness).await;
+    assert_eq!(owed_now.get("agent:t"), Some(&1), "the item");
+    assert_eq!(
+        owed_now.get("agent:b"),
+        Some(&1),
+        "the forward, not the item"
+    );
+    assert_eq!(owed_now.get("agent:a"), None);
+}
+
+/// A triage member of another mob, or a role or label grant naming another
+/// mob, could never act: such a declaration is refused. A member grant may
+/// name a member of another gateway's mob.
+#[tokio::test]
+async fn cross_mob_triage_members_and_role_or_label_grants_are_refused() {
+    let harness = harness_with(native_serving(&["agent:t"]));
+    let service = &harness.service;
+    let routes = |member_mob: &str| {
+        serde_json::json!([
+            { "kind": "direct" },
+            {
+                "kind": "triage",
+                "member": { "mob_id": member_mob, "identity": "agent:t" },
+                "forward_topics": ["mail.triaged"],
+            },
+        ])
+    };
+    let cases = [
+        (
+            "a triage member of another mob",
+            serde_json::json!([member_grant("agent:a")]),
+            routes("events"),
+        ),
+        (
+            "a role grant naming another mob",
+            serde_json::json!([{ "kind": "role", "mob_id": "events", "role": "triage" }]),
+            serde_json::json!([{ "kind": "direct" }]),
+        ),
+        (
+            "a label grant naming another mob",
+            serde_json::json!([{ "kind": "label", "mob_id": "events", "key": "team", "value": "x" }]),
+            serde_json::json!([{ "kind": "direct" }]),
+        ),
+    ];
+    for (index, (case, audience, routes)) in cases.into_iter().enumerate() {
+        let refused = try_host_call(
+            service,
+            SOURCES_PUT,
+            inbox_with(&format!("put-{index}"), audience, routes),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code, -32602, "{case}: {refused:?}");
+    }
+    let mut forward_role = triage_by(
+        "agent:t",
+        serde_json::json!([{ "kind": "role", "mob_id": "events", "role": "triage" }]),
+    );
+    forward_role["forward_audience"] =
+        serde_json::json!([{ "kind": "role", "mob_id": "events", "role": "triage" }]);
+    let refused = try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put-forward",
+            serde_json::json!([member_grant("agent:a"), member_grant("agent:t")]),
+            serde_json::json!([{ "kind": "direct" }, forward_role]),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        refused.code, -32602,
+        "a forward audience role grant of another mob"
+    );
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put-peer",
+            serde_json::json!([
+                member_grant("agent:a"),
+                { "kind": "member", "member": { "mob_id": "mob-b", "identity": "agent:x" } },
+            ]),
+            routes(OWN_MOB),
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+/// A guard that refuses the store's transactions once its allowance runs
+/// out.
+#[derive(Default)]
+struct AllowanceGuard {
+    allowance: Mutex<Option<u32>>,
+}
+
+impl AllowanceGuard {
+    fn allow(&self, transactions: Option<u32>) {
+        *self.allowance.lock().unwrap() = transactions;
+    }
+}
+
+impl super::sqlite::ConnectionGuard for AllowanceGuard {
+    fn acquire(&self) -> Result<Box<dyn Send>> {
+        let mut allowance = self.allowance.lock().unwrap();
+        match allowance.as_mut() {
+            Some(0) => Err(AnnouncementStoreError::Storage(
+                "the guard holds the store".to_string(),
+            )),
+            Some(left) => {
+                *left -= 1;
+                Ok(Box::new(()))
+            }
+            None => Ok(Box::new(())),
+        }
+    }
+}
+
+/// An onboarding refusal answers as itself even when counting it toward the
+/// failure streak fails: the caller learns the refusal, not the store's
+/// trouble.
+#[tokio::test]
+async fn an_onboarding_refusal_survives_a_failure_to_count_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let connection =
+        rusqlite::Connection::open(dir.path().join("mob_announcements.sqlite3")).unwrap();
+    connection.execute_batch(super::sqlite::SCHEMA).unwrap();
+    connection.execute_batch(super::sqlite::SCHEMA_V2).unwrap();
+    let guard = Arc::new(AllowanceGuard::default());
+    let store = SqliteAnnouncementStore::from_connection(
+        connection,
+        Some(Arc::clone(&guard) as Arc<dyn super::sqlite::ConnectionGuard>),
+    );
+    store
+        .put_source(
+            &op("put"),
+            put_source("inbox", "subject-1", &["mail.received"]),
+            1,
+        )
+        .await
+        .unwrap();
+    let step = |version: u64, extra: serde_json::Value| -> super::sources::AdvanceSource {
+        let mut request = serde_json::json!({
+            "mob_id": OWN_MOB,
+            "source_id": "inbox",
+            "expected_revision": 1,
+            "expected_version": version,
+            "principal": principal_of("subject-1"),
+            "next_cursor": "c",
+            "page": null,
+            "coverage": null,
+            "items": [],
+            "streams": [],
+            "rebaseline": null,
+            "observed": null,
+            "collected_at_ms": null,
+        });
+        for (key, value) in extra.as_object().cloned().unwrap_or_default() {
+            request[key] = value;
+        }
+        serde_json::from_value(request).unwrap()
+    };
+    store
+        .advance_source(
+            &op("baseline"),
+            step(0, serde_json::json!({ "coverage": "complete" })),
+            2,
+        )
+        .await
+        .unwrap();
+    // The advance's own transaction runs; the one that would count its
+    // refusal is refused.
+    guard.allow(Some(1));
+    let refused = store
+        .advance_source(
+            &op("run"),
+            step(
+                1,
+                serde_json::json!({ "items": [upsert_in("work", "w-1", "b")] }),
+            ),
+            3,
+        )
+        .await;
+    guard.allow(None);
+    assert_eq!(
+        refused.map(|_| ()),
+        Err(AnnouncementStoreError::StreamNotBaselined {
+            streams: vec!["work".to_string()],
+        })
+    );
+    let source = store
+        .source(&mob(OWN_MOB), &SourceId::new("inbox").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        source.health.consecutive_failures, 0,
+        "the refusal went uncounted"
+    );
 }
