@@ -27,11 +27,12 @@ _CURRENT_TRANSPORT = object()
 # final 130-second wire deadline.
 _PROVIDER_CALLBACK_COMPLETION_SECONDS = 125.0
 
-# The fallback matches the stock gateway's advertised shutdown horizon. It
-# covers two 130-second callback windows, runtime event/mob drains, bounded
-# RPC/HTTP/stdout phases, and response-delivery/process-reap margin.
-# It is also the safe fallback for handshake-capable custom gateways which do
-# not yet advertise an explicit horizon.
+# The wait for a gateway that supports the shutdown handshake but advertises
+# no stdio_shutdown_horizon_ms, such as an older or custom gateway. The stock
+# gateway advertises its own horizon in meta/init, and the transport waits
+# that instead. This fallback covers two 130-second callback windows, runtime
+# event/mob drains, bounded RPC/HTTP/stdout phases, and
+# response-delivery/process-reap margin.
 _GATEWAY_SHUTDOWN_GRACE_SECONDS = 337.0
 _MAX_GATEWAY_SHUTDOWN_HORIZON_MS = 2_147_483_647
 _PROCESS_TERMINATE_GRACE_SECONDS = 5.0

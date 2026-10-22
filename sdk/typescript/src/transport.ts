@@ -79,14 +79,15 @@ export type FetchLike = (
 ) => Promise<FetchLikeResponse>;
 
 /**
- * Grace period for the persistent gateway to finish its own shutdown.
+ * Grace period for a persistent gateway that supports the shutdown handshake
+ * but advertises no `stdio_shutdown_horizon_ms`, such as an older or custom
+ * gateway. The stock Rust gateway advertises its own horizon in `meta/init`,
+ * and the transport waits that instead.
  *
  * Provider operations are publicly required to finish within 120 seconds;
  * the stock Rust gateway gives each callback a hard 130-second wire deadline.
- * Its advertised 335-second horizon covers two such callback windows,
- * runtime event/mob drains, bounded RPC/HTTP/stdout phases, and
- * response-delivery/process-reap margin. The same value is the safe fallback
- * for handshake-capable gateways without the newer explicit capability.
+ * This fallback covers two such callback windows, runtime event/mob drains,
+ * bounded RPC/HTTP/stdout phases, and response-delivery/process-reap margin.
  */
 export const PERSISTENT_TRANSPORT_SHUTDOWN_GRACE_MS = 337_000;
 export const PROVIDER_CALLBACK_COMPLETION_MS = 125_000;
