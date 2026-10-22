@@ -27,12 +27,18 @@ _CURRENT_TRANSPORT = object()
 # final 130-second wire deadline.
 _PROVIDER_CALLBACK_COMPLETION_SECONDS = 125.0
 
-# The wait for a gateway that supports the shutdown handshake but advertises
-# no stdio_shutdown_horizon_ms, such as an older or custom gateway. The stock
-# gateway advertises its own horizon in meta/init, and the transport waits
-# that instead. This fallback covers two 130-second callback windows, runtime
-# event/mob drains, bounded RPC/HTTP/stdout phases, and
-# response-delivery/process-reap margin.
+# The shutdown wait when no valid horizon was advertised. The stock gateway
+# advertises its own stdio_shutdown_horizon_ms (432_000 ms in 0.9.5) in its
+# `accepted` answer to meta/init, before any bootstrap, and the transport
+# waits that value instead. This fallback governs only a stop before that
+# answer (nothing durable has run yet), an older or custom gateway without
+# the shutdown handshake (the stdin EOF protocol), and a handshake gateway
+# that advertises no valid horizon. For those gateways it covers two
+# 130-second callback windows, runtime event/mob drains, bounded
+# RPC/HTTP/stdout phases, and response-delivery/process-reap margin.
+# MetaRuntime.gateway_shutdown_horizon_ms is then None. A supervisor that
+# sizes its stop from it falls back to its own unreported horizon: Meta
+# Forge uses the stock 432_000 ms and widens an earlier systemd unit to fit.
 _GATEWAY_SHUTDOWN_GRACE_SECONDS = 337.0
 _MAX_GATEWAY_SHUTDOWN_HORIZON_MS = 2_147_483_647
 _PROCESS_TERMINATE_GRACE_SECONDS = 5.0

@@ -79,15 +79,23 @@ export type FetchLike = (
 ) => Promise<FetchLikeResponse>;
 
 /**
- * Grace period for a persistent gateway that supports the shutdown handshake
- * but advertises no `stdio_shutdown_horizon_ms`, such as an older or custom
- * gateway. The stock Rust gateway advertises its own horizon in `meta/init`,
- * and the transport waits that instead.
+ * Shutdown wait when no valid horizon was advertised. The stock Rust gateway
+ * advertises its own `stdio_shutdown_horizon_ms` (432_000 ms in 0.9.5) in
+ * its `accepted` answer to `meta/init`, before any bootstrap, and the
+ * transport waits that value instead. This fallback governs only a stop
+ * before that answer (nothing durable has run yet), an older or custom
+ * gateway without the shutdown handshake (the stdin EOF protocol), and a
+ * handshake gateway that advertises no valid horizon.
  *
  * Provider operations are publicly required to finish within 120 seconds;
  * the stock Rust gateway gives each callback a hard 130-second wire deadline.
- * This fallback covers two such callback windows, runtime event/mob drains,
- * bounded RPC/HTTP/stdout phases, and response-delivery/process-reap margin.
+ * For the gateways this fallback serves, it covers two such callback windows,
+ * runtime event/mob drains, bounded RPC/HTTP/stdout phases, and
+ * response-delivery/process-reap margin.
+ *
+ * `MetaRuntime.gatewayShutdownHorizonMs` is then `null`. A supervisor that
+ * sizes its stop from it falls back to its own unreported horizon: Meta
+ * Forge uses the stock 432_000 ms and widens an earlier systemd unit to fit.
  */
 export const PERSISTENT_TRANSPORT_SHUTDOWN_GRACE_MS = 337_000;
 export const PROVIDER_CALLBACK_COMPLETION_MS = 125_000;
