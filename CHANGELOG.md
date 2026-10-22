@@ -129,6 +129,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and installed an application that then failed when it started. The
   refusal names both glibc versions. The generated package README states
   the same declared floor instead of a fixed glibc 2.39.
+- "Stage accepted update" refuses an update to a Meta/Toolkit product that
+  this computer cannot install, before anything is staged: a product that
+  declares a newer glibc than this computer has, or whose packages are
+  built for another CPython than Forge runs on. Forge refused such an update
+  only while applying it, after the current runtime had been set aside.
 
 ### Known limitations
 

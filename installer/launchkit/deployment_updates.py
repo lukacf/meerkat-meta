@@ -1983,6 +1983,14 @@ def stage(directory, payload, report, *, runtime_target=None, restore_selection=
         require_complete(directory, receipt)
     if receipt.get("source_kind") == "native-team":
         raise DraftConflict("Agent-team source updates are not supported. No installed source was changed.")
+    from .runtime_selection import MetaToolkitRuntimeTarget
+    if type(runtime_target) is MetaToolkitRuntimeTarget:
+        # The install worker refuses this too, but only after the update has
+        # retained the current runtime. Nothing is staged here.
+        from .deployment import selected_update_refusal
+        refusal = selected_update_refusal(runtime_target)
+        if refusal is not None:
+            raise DraftConflict(refusal)
     previous_payload, previous = checked_package(directory, "package.zip", receipt["package_sha256"])
     candidate = package_files(payload)
     previous_report = json.loads(previous["implementation-report.json"][0])

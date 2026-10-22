@@ -1596,7 +1596,7 @@ async def _install_selected_product(supervisor, artifacts, require_current, comm
         current()
     # The venv below inherits this interpreter, and the native prefix needs
     # the product's declared glibc: refuse either before anything is installed.
-    refusal = selected_host_refusal(artifacts) or selected_interpreter_refusal(artifacts.selection)
+    refusal = selected_host_refusal(artifacts.glibc_floor) or selected_interpreter_refusal(artifacts.selection)
     if refusal is not None:
         raise DraftConflict(refusal)
     venv = supervisor.destination / ".venv"

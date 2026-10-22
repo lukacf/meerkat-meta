@@ -101,15 +101,15 @@ def selected_interpreter_refusal(target, interpreter=None):
     return f"This product's application packages do not support this computer: {', '.join(refused[:3])}."
 
 
-def selected_host_refusal(artifacts, interpreter=None):
+def selected_host_refusal(glibc_floor, interpreter=None):
     """Why this computer cannot run the selected product's native programs, or None.
 
     A Linux product declares the oldest glibc they run on. Below it every
     package still installs, and the application fails only when it starts.
     """
-    floor = artifacts.glibc_floor
-    if floor is None:
+    if glibc_floor is None:
         return None
+    floor = tuple(glibc_floor)
     host = forge_interpreter() if interpreter is None else interpreter
     found = tuple(host["glibc_minimum"])
     if host["system"] == "Linux" and found >= floor:
@@ -119,6 +119,18 @@ def selected_host_refusal(artifacts, interpreter=None):
     return (f"This product's native programs need {needed} or newer, but this computer has {present}, so the "
         f"application would install and then fail when it starts. Install it on a Linux computer with {needed} "
         "or newer, or upgrade this computer's operating system.")
+
+
+def selected_update_refusal(target, interpreter=None):
+    """Why this computer cannot install an update to the selected product, or None.
+
+    Stage asks before it writes anything. The glibc floor comes from the
+    pinned assembly and resource build record alone; the install worker
+    refuses again on the fully read product.
+    """
+    from .runtime_candidates import declared_glibc_floor
+    return (selected_host_refusal(declared_glibc_floor(target), interpreter)
+        or selected_interpreter_refusal(target, interpreter))
 
 
 def product_runtime_source(files, selected, *, verified_artifacts=None, source_custody=None):
@@ -1543,7 +1555,8 @@ class DeploymentService:
         # The product's glibc floor goes first: the CPython remedy (PYTHON_BIN)
         # cannot lift it.
         return SimpleNamespace(selection=selected, artifacts=artifacts,
-            interpreter_refusal=selected_host_refusal(artifacts) or selected_interpreter_refusal(artifacts.selection))
+            interpreter_refusal=selected_host_refusal(artifacts.glibc_floor)
+                or selected_interpreter_refusal(artifacts.selection))
 
     async def options(self, guide_id, build_id=None, *, console_port=None, source_kind="application", version=None):
         if source_kind not in {"application", "native-team"}:
