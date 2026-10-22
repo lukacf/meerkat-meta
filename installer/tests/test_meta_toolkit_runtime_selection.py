@@ -505,6 +505,26 @@ def test_macos_product_reader_declares_no_glibc_floor(monkeypatch, request, supp
         assert candidates.read_meta_toolkit_artifacts(product.target).glibc_floor is None
 
 
+@pytest.mark.parametrize("supported_host, floor", [
+    (None, None), (LINUX_HOST, (2, 39)), ({**LINUX_HOST, "glibc": "glibc 2"}, "refused")],
+    ids=["undeclared", "glibc-2.39", "no-minor"])
+def test_declared_glibc_floor_reads_only_the_pinned_assembly_and_resource_record(
+        monkeypatch, request, supported_host, floor):
+    # The early read for Stage: the floor without hashing the whole product.
+    linux_product(monkeypatch, supported_host)
+    product = request.getfixturevalue("product")
+    product.archive.path.write_bytes(b"changed archive that this read never opens\n")
+    if floor == "refused":
+        with pytest.raises(candidates.CandidateArtifactError, match="supported host"):
+            candidates.declared_glibc_floor(product.target)
+    else:
+        assert candidates.declared_glibc_floor(product.target) == floor
+    record = product.final / "resource-build-record.json"
+    record.write_bytes(record.read_bytes() + b"\n")
+    with pytest.raises(candidates.CandidateArtifactError):
+        candidates.declared_glibc_floor(product.target)
+
+
 @pytest.mark.parametrize("link", ["prepare.py/../real-file", "missing", "../../../../escape", "/absolute", "python-current"])
 def test_prefix_refuses_file_traversal_dangling_escape_absolute_and_cycle(product, link):
     product.nodes[RESOURCE + "/python"] = ("link", 0o777, link)
