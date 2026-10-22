@@ -374,6 +374,30 @@ fn spawn_arg_records(args: &Value) -> Vec<SpawnArgRecord> {
     records
 }
 
+/// The members a typed batch outcome reports spawned, in its order: Core's
+/// `{"results": [...]}`, one entry per spec, where a spawned entry names its
+/// member and a failed entry spawned nothing. `None` when the outcome is not
+/// that shape.
+fn typed_batch_spawned_members(outcome: &Value) -> Option<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct TypedBatchOutcome {
+        results: Vec<meerkat_contracts::MobSpawnManyResultEntry>,
+    }
+    let typed = <TypedBatchOutcome as serde::Deserialize>::deserialize(outcome).ok()?;
+    Some(
+        typed
+            .results
+            .into_iter()
+            .filter_map(|entry| match entry.result {
+                meerkat_contracts::MobSpawnManyResultPayload::Spawned(spawned) => {
+                    Some(spawned.agent_identity)
+                }
+                meerkat_contracts::MobSpawnManyResultPayload::Failed(_) => None,
+            })
+            .collect(),
+    )
+}
+
 /// One member reported spawned by the tool outcome.
 struct SpawnOutcomeTarget {
     member_id: String,
@@ -428,8 +452,10 @@ pub(crate) fn spawn_seed_console_identity(
 /// `specs`/`members` arrays); `outcome_text` is the tool result payload.
 /// Members reported by the outcome are authoritative (they actually
 /// spawned); argument records enrich them with `initial_message`/`task`,
-/// labels, and identity overrides. When the outcome carries no parsable
-/// member, argument records with explicit member ids are used as fallback.
+/// labels, and identity overrides. A typed batch outcome (`spawn_many_members`)
+/// projects only its spawned entries: a failed entry's argument record never
+/// stands in for it. Otherwise, when the outcome carries no parsable member,
+/// argument records with explicit member ids are used as fallback.
 pub(crate) fn console_spawn_seeds(
     tool_name: &str,
     args: &Value,
@@ -442,9 +468,16 @@ pub(crate) fn console_spawn_seeds(
     let spawned_by = spawner_comms_name.and_then(spawned_by_from_comms_name);
     let arg_records = spawn_arg_records(args);
 
+    let outcome = serde_json::from_str::<Value>(outcome_text).ok();
+    let typed_spawned = outcome.as_ref().and_then(typed_batch_spawned_members);
     let mut outcome_targets = Vec::new();
-    if let Ok(outcome) = serde_json::from_str::<Value>(outcome_text) {
-        collect_outcome_targets(&outcome, None, &mut outcome_targets);
+    if let Some(spawned) = &typed_spawned {
+        outcome_targets.extend(spawned.iter().map(|member_id| SpawnOutcomeTarget {
+            member_id: member_id.clone(),
+            mob_id: None,
+        }));
+    } else if let Some(outcome) = &outcome {
+        collect_outcome_targets(outcome, None, &mut outcome_targets);
     }
 
     let seed_for = |member_id: String,
@@ -469,7 +502,7 @@ pub(crate) fn console_spawn_seeds(
         }
     };
 
-    if !outcome_targets.is_empty() {
+    if typed_spawned.is_some() || !outcome_targets.is_empty() {
         return outcome_targets
             .into_iter()
             .map(|target| {
@@ -1033,6 +1066,77 @@ mod tests {
         );
     }
 
+    /// The outcome `spawn_many_members` returns: Core's typed results, one
+    /// entry per spec, in spec order.
+    fn spawn_many_outcome(results: Vec<meerkat_contracts::MobSpawnManyResultEntry>) -> String {
+        json!({ "results": results }).to_string()
+    }
+
+    fn spawned_row(member_id: &str) -> meerkat_contracts::MobSpawnManyResultEntry {
+        meerkat_contracts::MobSpawnManyResultEntry::spawned(
+            member_id,
+            meerkat_contracts::WireMemberRef::encode("ops", member_id),
+        )
+    }
+
+    fn failed_row() -> meerkat_contracts::MobSpawnManyResultEntry {
+        meerkat_contracts::MobSpawnManyResultEntry::failed(
+            meerkat_contracts::MobSpawnManyFailureCause::ProfileNotFound,
+            "profile person-worker-x is not defined",
+        )
+    }
+
+    /// A failed row spawned nothing: only the members Core reports spawned
+    /// are projected, never a failed row's spec in its place.
+    #[test]
+    fn spawn_many_projects_only_the_rows_that_spawned() {
+        let args = json!({
+            "mob_id": "ops",
+            "specs": [
+                { "profile": "person-worker", "member_id": "worker-a", "initial_message": "task a" },
+                { "profile": "person-worker-x", "member_id": "worker-b", "initial_message": "task b" }
+            ]
+        });
+        let outcome = spawn_many_outcome(vec![spawned_row("worker-a"), failed_row()]);
+
+        let seeds = console_spawn_seeds("spawn_many_members", &args, &outcome, None);
+
+        let projected = seeds
+            .iter()
+            .map(|seed| {
+                (
+                    seed.member_id.as_str(),
+                    seed.mob_id.as_deref(),
+                    seed.initial_message.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected,
+            vec![("worker-a", Some("ops"), Some(json!("task a")))]
+        );
+    }
+
+    /// A batch whose every row failed projects no member at all.
+    #[test]
+    fn spawn_many_with_every_row_failed_projects_nothing() {
+        let args = json!({
+            "mob_id": "ops",
+            "specs": [
+                { "profile": "person-worker-x", "member_id": "worker-a", "initial_message": "task a" }
+            ]
+        });
+        let outcome = spawn_many_outcome(vec![failed_row()]);
+
+        let seeds = console_spawn_seeds("spawn_many_members", &args, &outcome, None);
+
+        let projected = seeds
+            .iter()
+            .map(|seed| seed.member_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(projected, Vec::<&str>::new());
+    }
+
     #[test]
     fn seeds_from_specs_array_enrich_each_member() {
         let args = json!({
@@ -1051,14 +1155,9 @@ mod tests {
                 }
             ]
         });
-        let outcome = json!({
-            "members": [
-                { "agent_identity": "worker-a" },
-                { "agent_identity": "worker-b" }
-            ]
-        });
+        let outcome = spawn_many_outcome(vec![spawned_row("worker-a"), spawned_row("worker-b")]);
 
-        let seeds = console_spawn_seeds("spawn_many_members", &args, &outcome.to_string(), None);
+        let seeds = console_spawn_seeds("spawn_many_members", &args, &outcome, None);
 
         assert_eq!(seeds.len(), 2);
         let worker_a = seeds

@@ -232,6 +232,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the computer's clock. A clock set forward between the polls could clear
   the chat after two polls a few seconds apart, and a clock set back could
   keep a finished member's chat "working" until the clock caught up.
+- The Console no longer projects members that a `spawn_many_members` call
+  failed to create. It looked for the spawned members in a shape Core does
+  not emit and then fell back to the call's specs, so a failed row got a
+  kickoff frame and spawned-by registrations for a member that never
+  existed. It now reads Core's typed per-member results and projects only
+  the rows that spawned.
 
 ### Known limitations
 
