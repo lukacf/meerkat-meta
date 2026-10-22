@@ -8866,6 +8866,102 @@ shell = true
         Ok(())
     }
 
+    /// An identity whose held member a held pass did not publish owes its
+    /// host a held completion. `meta/reconcile_identity` reports it refused
+    /// with typed data on the internal-error code, so a host reads the
+    /// pending admission without parsing the message.
+    #[tokio::test]
+    async fn reconcile_identity_reports_an_owed_held_completion_with_typed_data()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = Box::pin(
+            UnifiedRuntime::builder()
+                .mob_spec(rpc_test_mob_spec(&temp_dir)?)
+                .module_config(MetaConfig {
+                    modules: Vec::new(),
+                    discovery: DiscoverySpec {
+                        namespace: "rpc-reconcile-owed-test".to_string(),
+                        modules: Vec::new(),
+                    },
+                    pre_spawn: Vec::new(),
+                })
+                .timeout(Duration::from_secs(1))
+                .build(),
+        )
+        .await?;
+        let identity_rt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "rpc-reconcile-owed-test".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(Arc::new(CoreReadsBridge::default())),
+            default_timeout: None,
+        }));
+        let owed = AgentIdentity::parse("owed-member")?;
+        // Its held pass ended without publishing it: Core never spawned it,
+        // and the identity owes its host a fresh held completion.
+        identity_rt.record_held_completion(&owed, false);
+        let roster_provider = Arc::new(ContextRequiredStaticRosterProvider::new(vec![
+            DurableAgentSpec {
+                identity: owed.clone(),
+                profile: meerkat_mob::ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            },
+        ]));
+        let identity_ctx = IdentityFirstContext {
+            runtime: crate::identity_first::PublicIdentityRuntime::new(
+                identity_rt,
+                runtime.mob_runtime().clone(),
+            ),
+            roster_provider: roster_provider.clone(),
+            topology_provider: None,
+            customizer: None,
+            agent_memory_provider: None,
+            mob_definition: Some(runtime.mob_handle().definition().clone()),
+            transcript_edit_service: None,
+            compaction_floors: None,
+        };
+
+        let response: Value = serde_json::from_str(
+            &handle_unified_rpc_json(
+                &runtime,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "meta/reconcile_identity",
+                    "params": {},
+                })
+                .to_string(),
+                Duration::from_secs(1),
+                None,
+                Some(&identity_ctx),
+            )
+            .await,
+        )?;
+
+        assert!(response["error"].is_null(), "{response:#?}");
+        assert_eq!(roster_provider.missing_definition_calls(), 0);
+        let outcome = &response["result"]["outcomes"]["owed-member"];
+        assert_eq!(outcome["outcome"], json!("refused"), "{response:#?}");
+        assert_eq!(outcome["error"]["code"], json!(-32603), "{response:#?}");
+        assert_eq!(
+            outcome["error"]["data"],
+            json!({"kind": "held_completion_owed", "identity": "owed-member"}),
+            "{response:#?}"
+        );
+        Ok(())
+    }
+
     fn member_observation_contention() -> meerkat_mob::MobError {
         meerkat_mob::MobError::LifecycleOperationAdmissionPending {
             intent: "member_status_observation".to_string(),

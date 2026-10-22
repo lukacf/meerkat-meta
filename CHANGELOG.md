@@ -67,6 +67,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   gateway composed none or drops the composed one. A gateway without an
   identity roster never asks.
 
+- An identity that owes its host a held completion (a held roster pass or a
+  held member add did not publish its member) is refused with structured
+  data on the same `-32603`: `{kind: "held_completion_owed", identity}`. It
+  rides every wake, reset and delivery refusal outside a held pass that
+  covers the identity, a refused `meta/reconcile_identity` outcome
+  (`error.data`) and, after an eager roster pass, the identity's bootstrap
+  status entry (`restore.kind`). A host can now read such an identity as an
+  admission still owed rather than a failed member without parsing the
+  message; before, the refusal carried no data. The held member add's docs
+  also name `IdentityRuntime::restore_flow` as a path outside the bootstrap
+  controller, and say that a listed, owed member can be added again without
+  unlisting it first.
+
 ## [0.9.4] - 2026-10-22
 
 ### Breaking

@@ -407,7 +407,14 @@ does), and it clears the mark when it publishes the member. A member whose
 add aborted never got a Core binding, so it can be added again. Until a held
 pass (that re-add, or a held roster pass) publishes it, every other wake or
 reset refuses it (`HeldCompletionOwed`), across a restart too; a delete finds
-nothing to delete, since Core never spawned it, and the mark stays.
+nothing to delete, since Core never spawned it, and the mark stays. On the
+wire this refusal keeps the internal-error code `-32603` with structured data
+`{kind: "held_completion_owed", identity}`, in an RPC error and in a refused
+`meta/reconcile_identity` outcome alike. After an eager roster pass the
+identity's bootstrap status entry is `broken`, with `restore`
+`{stage: "refused", code: -32603, kind: "held_completion_owed"}`. Read it as
+an admission still owed to the host, not as a failed member: only a held
+pass that publishes the member clears it.
 
 List the member from inside the completion, as above, never before the add.
 Until the add ends it holds the bootstrap controller, so no pass of the
@@ -420,19 +427,21 @@ it unheld. The add then refuses with `ExistingContinuity`, after the member
 has run without the host's completion. Once the add has ended without
 publishing the member, every other wake refuses it (`HeldCompletionOwed`).
 
-Two paths run outside the controller, and so outside that guarantee:
+Three paths run outside the controller, and so outside that guarantee:
 `meta/reconcile_identity` on an RPC context that is not attached to the
-unified runtime, which reads the roster and restores it with no controller,
-and the host's own `bootstrap_roster(roster)`, which applies the roster it
-is given: a roster resolved before the add and applied after it retires the
-member.
+unified runtime, which reads the roster and restores it with no controller;
+`IdentityRuntime::restore_flow(roster, ...)`, which registers and wakes the
+roster its caller gives with no controller (it retires nothing); and the
+host's own `bootstrap_roster(roster)`, which applies the roster it is given:
+a roster resolved before the add and applied after it retires the member.
 
 When the add ends `Unsettled`, unlist the member, or add it again. Until a
 held pass publishes it, a pass that reads the listing refuses it
-(`HeldCompletionOwed`). A caller that goes away while the completion runs
-after listing never sees `Unsettled`: the add aborts and the member stays
-listed and owed, so the host unlists it, or adds it again, on its recovery
-path.
+(`HeldCompletionOwed`), and the re-add's own held pass covers it, so a
+listed, owed member can be added again without unlisting it first. A caller
+that goes away while the completion runs after listing never sees
+`Unsettled`: the add aborts and the member stays listed and owed, so the
+host unlists it, or adds it again, on its recovery path.
 
 The add publishes no bootstrap generation. Until the next roster pass,
 `identity_bootstrap_status` does not list the added member, and its counts

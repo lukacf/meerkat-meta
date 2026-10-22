@@ -274,6 +274,16 @@ durable hold Core names in `durable_resume_hold` or
 out. The lease codes `-32003` (no active lease) and `-32005` (lease lost) are
 no longer answered; `-32005` is never reused.
 
+An identity whose held member a held pass did not publish (a held roster
+bootstrap or a held member add that aborted, or whose activation expired)
+owes its host a held completion. Every wake, reset or delivery outside a held
+pass that covers it answers `-32603` with structured data
+`{kind: "held_completion_owed", identity}`, and a refused
+`meta/reconcile_identity` outcome carries the same `error.data`. The identity
+waits for a held pass to publish it; it has not failed. Both SDKs surface the
+data on a plain `RpcError` (see
+[Adding one held member to a running roster](/guides/unified-runtime#adding-one-held-member-to-a-running-roster)).
+
 The `-32010` constant is exported from both SDKs as
 `MOB_EVENTS_STALE_CURSOR_CODE`. The Python and TypeScript SDKs auto-
 reify `-32010` errors into `MobEventsStaleError` (a typed subclass of
