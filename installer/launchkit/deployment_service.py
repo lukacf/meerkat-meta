@@ -20,7 +20,7 @@ import sys
 import uuid
 
 from .projects import DraftConflict
-from .deployment_deadlines import (USER_SERVICE_STOP_TIMEOUT, SERVICE_STOP_COMMAND_MARGIN,
+from .deployment_deadlines import (UNREPORTED_GATEWAY_SHUTDOWN_HORIZON_MS, USER_SERVICE_STOP_TIMEOUT, SERVICE_STOP_COMMAND_MARGIN,
                                    LEGACY_USER_SERVICE_STOP_TIMEOUT, reported_gateway_horizon,
                                    service_stop_budgets, shutdown_budget)
 
@@ -238,6 +238,9 @@ def stop_command_timeout(service):
 def widen_service_stop_budget(directory, horizon_ms):
     """Widen a recorded unit's stop budget to a reported horizon; return the reload to run.
 
+    An application that reports nothing (None) is sized for the unreported
+    horizon, which the record names explicitly.
+
     The unit bytes and the service identity never change: an owned systemd
     drop-in carries the larger TimeoutStopSec. Its record is written first, so
     an interrupted write leaves a controllable unit with the earlier drop-in or
@@ -252,7 +255,8 @@ def widen_service_stop_budget(directory, horizon_ms):
     service = verify_service(directory, read_receipt(directory))
     if service["manager"] != "systemd-user":
         return None
-    budget = shutdown_budget(horizon_ms)["service"]
+    sized_for = UNREPORTED_GATEWAY_SHUTDOWN_HORIZON_MS if horizon_ms is None else horizon_ms
+    budget = shutdown_budget(sized_for)["service"]
     drop_in = stop_budget_drop_in(service)
     with receipt_lock(directory):
         receipt = read_receipt(directory)
@@ -261,7 +265,7 @@ def widen_service_stop_budget(directory, horizon_ms):
         record = recorded_stop_budget(receipt)
         recorded = 0 if record is None else record["stop_timeout_seconds"]
         if budget > max(service.get("stop_timeout_seconds", LEGACY_USER_SERVICE_STOP_TIMEOUT), recorded):
-            record = {"gateway_shutdown_horizon_ms": horizon_ms, "stop_timeout_seconds": budget}
+            record = {"gateway_shutdown_horizon_ms": sized_for, "stop_timeout_seconds": budget}
             write_private(directory / "receipt.json", {**receipt, "service_stop_budget": record, "updated_at": now()})
         elif record is None:
             return None

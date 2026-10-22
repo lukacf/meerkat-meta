@@ -56,6 +56,14 @@ PERMISSIONS = (
 IAP_PERMISSION = "iap.tunnelInstances.accessViaIAP"
 
 
+# The destination helper Forge 0.9.4 rendered into the packages it accepted.
+# A destination deployed from such a package keeps that helper and its stop
+# budgets until the package is rebuilt; no other form is accepted.
+RETAINED_DESTINATION_HELPER_SHA256 = frozenset({
+    "6c92410bf651c415cd903f03b2c99aec16f799e369f0b37f139a1676d3d9a216",
+})
+
+
 class ProbeUnavailable(RuntimeError):
     """A bounded observation could not prove its result; private errors stay local."""
 
@@ -345,10 +353,15 @@ class GcpPreflightService:
         # Retained accepted packages may use the earlier fixed export. Neither
         # form grants arbitrary agent-authored scripts this adapter's authority.
         deploy_versions = {deploy.encode(), render_manual_prerequisites(deploy, definition).encode()}
+        # A package Forge 0.9.4 accepted keeps that release's exact helper.
+        destination_helper = files.get("remote_operations.py", (None,))[0]
+        helper_supported = destination_helper is not None and (
+            destination_helper == render_destination_shutdown_budget((TEMPLATES_V2 / "remote_operations.py").read_text()).encode()
+            or hashlib.sha256(destination_helper).hexdigest() in RETAINED_DESTINATION_HELPER_SHA256)
         supported = bool(files.get("deploy/deploy-gcp.sh", (None,))[0] in deploy_versions
             and files.get("deploy/tunnel-gcp.sh", (None,))[0] == tunnel.encode()
             and files.get("deploy/install-service.sh", (None,))[0] == (TEMPLATES / "install-service.sh").read_bytes()
-            and files.get("remote_operations.py", (None,))[0] == render_destination_shutdown_budget((TEMPLATES_V2 / "remote_operations.py").read_text()).encode())
+            and helper_supported)
         binding = {"guide_id": guide_id, "guide_version": state["version"], "build_id": build_id,
             "blueprint_hash": proposal_hash(state.get("proposal") or state.get("blueprint")),
             "source_digest": status["source_digest"], "package_sha256": hashlib.sha256(payload).hexdigest()}

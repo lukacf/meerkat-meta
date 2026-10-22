@@ -381,8 +381,17 @@ def reported_gateway_horizon(payload):
     return value
 
 
-async def stop_supervised_application(process, *, horizon_ms=None):
+def application_stop_window(horizon_ms=None, *, stop_budget=None):
+    """The application's stop window, inside the unit budget the manager enforces."""
     window = STOP_TIMEOUT if horizon_ms is None else shutdown_budget(horizon_ms)['application']
+    if stop_budget is not None:
+        window = min(window, stop_budget - SHUTDOWN_BUDGET['force_reap'] - SHUTDOWN_BUDGET['worker_margin']
+                     - SHUTDOWN_BUDGET['service_margin'])
+    return window
+
+
+async def stop_supervised_application(process, *, horizon_ms=None, stop_budget=None):
+    window = application_stop_window(horizon_ms, stop_budget=stop_budget)
     if process.returncode is None:
         try:
             # The SDK's gateway inherits this group. Let the application keep
@@ -800,6 +809,9 @@ def startup(payload, spec, pid, port):
 
 async def supervise(operations):
     receipt = operations.load()
+    # The manager enforces the unit's own stop budget until a widening and its
+    # reload succeed.
+    stop_budget = service_stop_timeout(receipt)
     settings = private_settings(operations.root)
     port = int(settings.get('MOBKIT_PORT') or operations.spec['port'])
     stop = asyncio.Event()
@@ -867,13 +879,15 @@ async def supervise(operations):
         payload = json.loads(ready.result())
         bootstrap = startup(payload, operations.spec, process.pid, port)
         horizon_ms = reported_gateway_horizon(payload)
-        if horizon_ms is not None:
-            try:
-                await asyncio.to_thread(operations.widen_unit, horizon_ms)
-            except Exception as error:
-                # A refused or failed widening, including a manager reload
-                # past its bound, is reported; it never blocks native readiness.
-                print('The owned service stop budget was not widened: ' + str(error), flush=True)
+        # An application that reports nothing is sized for the unreported horizon.
+        sized_for = SHUTDOWN_BUDGET['unreported_horizon_ms'] if horizon_ms is None else horizon_ms
+        try:
+            if await asyncio.to_thread(operations.widen_unit, sized_for):
+                stop_budget = max(stop_budget, shutdown_budget(sized_for)['service'])
+        except Exception as error:
+            # A refused or failed widening, including a manager reload past
+            # its bound, is reported; it never blocks native readiness.
+            print('The owned service stop budget was not widened: ' + str(error), flush=True)
         while not stop.is_set() and process.returncode is None:
             try:
                 healthy = await asyncio.to_thread(console_healthy, operations.root, operations.spec, payload['console_url'])
@@ -896,7 +910,7 @@ async def supervise(operations):
                     os.close(write_fd)
                 transport.close()
                 if process is not None:
-                    await stop_supervised_application(process, horizon_ms=horizon_ms)
+                    await stop_supervised_application(process, horizon_ms=horizon_ms, stop_budget=stop_budget)
                     cleanup_confirmed = True
             finally:
                 for task in tasks:

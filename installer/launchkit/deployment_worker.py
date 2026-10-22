@@ -22,7 +22,8 @@ from .deployment import (MAX_PACKAGE_BYTES, await_validation, journal, materiali
                          parse_setting, update_receipt, verify_destination)
 from .projects import DraftConflict
 from .templates.storage_setup import project_lock
-from .deployment_deadlines import (APPLICATION_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOUT,
+from .deployment_deadlines import (APPLICATION_STOP_TIMEOUT, LEGACY_USER_SERVICE_STOP_TIMEOUT,
+                                   PROCESS_FORCE_REAP_TIMEOUT, USER_SERVICE_STOP_MARGIN, WORKER_STOP_MARGIN,
                                    reported_gateway_horizon, shutdown_budget)
 from .deployment_ports import require_available_console_port, LocalConsolePortUnavailable
 from .native_definition_continuity import valid_continuity_projection
@@ -179,6 +180,9 @@ class Supervisor:
     gateway_shutdown_horizon_ms = None
     # Whether this worker is the recorded operating-system service's own run.
     service_owned = False
+    # The stop budget its manager enforces on that run: the unit's own until
+    # this run's widening and manager reload succeed. None outside a service.
+    enforced_stop_budget = None
 
     def __init__(self, directory, *, source_custody=None):
         self.directory = Path(directory)
@@ -243,8 +247,7 @@ class Supervisor:
 
     async def terminate(self, timeout=None):
         if timeout is None:
-            horizon_ms = self.gateway_shutdown_horizon_ms
-            timeout = STOP_TIMEOUT if horizon_ms is None else shutdown_budget(horizon_ms)["application"]
+            timeout = self.application_stop_window()
         process = self.child
         if not process:
             return
@@ -274,6 +277,27 @@ class Supervisor:
         except asyncio.TimeoutError:
             raise RuntimeError("The owned application process did not confirm exit after bounded force cleanup.") from None
 
+    def own_service(self):
+        """Run as the recorded operating-system service's own worker."""
+        self.service_owned = True
+        service = read_receipt(self.directory).get("service") or {}
+        budget = service.get("stop_timeout_seconds", LEGACY_USER_SERVICE_STOP_TIMEOUT)
+        self.enforced_stop_budget = budget if service and type(budget) is int else None
+
+    def application_stop_window(self):
+        """The application's stop window, inside the stop budget its manager enforces.
+
+        The force reap, this worker's margin and the service margin must fit
+        too, so that the worker can record its cleanup before the manager
+        kills the unit: 367 seconds under an earlier 397-second unit.
+        """
+        horizon_ms = self.gateway_shutdown_horizon_ms
+        window = STOP_TIMEOUT if horizon_ms is None else shutdown_budget(horizon_ms)["application"]
+        if self.enforced_stop_budget is not None:
+            window = min(window, self.enforced_stop_budget - PROCESS_FORCE_REAP_TIMEOUT - WORKER_STOP_MARGIN
+                         - USER_SERVICE_STOP_MARGIN)
+        return window
+
     async def widen_service_stop_budget(self, horizon_ms):
         """The service's own run widens its unit's stop budget; any failure is only logged."""
         from .deployment_service import UserServiceManager, widen_service_stop_budget
@@ -281,6 +305,9 @@ class Supervisor:
             reload = widen_service_stop_budget(self.directory, horizon_ms)
             if reload is not None:
                 await UserServiceManager().command(reload)
+                # The manager enforces the widened budget once its reload succeeded.
+                if self.enforced_stop_budget is not None:
+                    self.enforced_stop_budget = max(self.enforced_stop_budget, shutdown_budget(horizon_ms)["service"])
         except Exception as error:
             # The widening never blocks native readiness.
             self.record_log("service", f"The owned service stop budget was not widened: {error}")
@@ -1460,7 +1487,9 @@ class Supervisor:
                     process_live=True, health="unknown", health_checked_at=now(),
                     gateway_shutdown_horizon_ms=horizon_ms)
             self.gateway_shutdown_horizon_ms = horizon_ms
-            if horizon_ms is not None and self.service_owned:
+            if self.service_owned:
+                # An application that reports nothing is sized for the
+                # unreported horizon.
                 await self.widen_service_stop_budget(horizon_ms)
             import httpx
             async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
@@ -2407,7 +2436,8 @@ async def run(directory, mode, *, update_selection=None, bootstrap_selection=Non
     require_original()
     try:
         supervisor = Supervisor(directory)
-        supervisor.service_owned = mode == "service"
+        if mode == "service":
+            supervisor.own_service()
     except Exception:
         if mode == "service":
             journal(directory, "The service could not read its private installed configuration. No native runtime was started.",
