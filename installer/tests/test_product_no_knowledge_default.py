@@ -100,9 +100,9 @@ async def test_original_selected_bootstrap_start_keeps_source_proof_and_closes_p
             opened.append((source, kwargs["project_lease"]))
             yield source
 
-    def verify(supervisor, files, *, source_custody=None):
+    def verify(supervisor, files, *, source_custody=None, **options):
         assert source_custody is opened[-1][0] and not source_custody._closed
-        result = original_verify(supervisor, files, source_custody=source_custody)
+        result = original_verify(supervisor, files, source_custody=source_custody, **options)
         verified.append(result)
         return result
 

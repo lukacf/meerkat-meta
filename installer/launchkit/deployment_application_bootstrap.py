@@ -835,7 +835,7 @@ class BootstrapFactory:
 
 @asynccontextmanager
 async def installed_bootstrap_source(directory, selection, *, require_current=None,
-        owner_source=None, owner_source_sha256=None):
+        owner_source=None, owner_source_sha256=None, retained=None):
     """Hold one temporary source/project scope before its original handoff."""
     from .deployment import await_validation
     from .templates.storage_setup import project_lock
@@ -861,7 +861,7 @@ async def installed_bootstrap_source(directory, selection, *, require_current=No
         async with open_installed_product_source(directory, project_lease=lease,
                 require_current=current, owner_source=owner_source,
                 owner_source_sha256=owner_source_sha256,
-                application_startup=selected["application_startup"]) as source:
+                application_startup=selected["application_startup"], retained=retained) as source:
             yield source
             current()
     current()

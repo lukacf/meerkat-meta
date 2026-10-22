@@ -215,7 +215,7 @@ def _verify_candidate_runtime(destination, expected_version, runtime_target):
 
 
 def verify_runtime(destination, expected_version, *, runtime_target=None, sdk_python=None,
-        site_packages=None, source_custody=None, report_progress=None):
+        site_packages=None, source_custody=None, report_progress=None, retained=None, observation=None):
     """Check an explicit candidate or the unchanged ordinary native receipts.
 
     Ordinary SDK proof remains caller-owned. An independently held candidate
@@ -227,9 +227,12 @@ def verify_runtime(destination, expected_version, *, runtime_target=None, sdk_py
         if type(runtime_target) is MetaToolkitRuntimeTarget:
             return _verify_meta_toolkit_runtime(destination, expected_version, runtime_target,
                 sdk_python=sdk_python, site_packages=site_packages, source_custody=source_custody,
-                report_progress=report_progress)
+                report_progress=report_progress, retained=retained, observation=observation)
         if source_custody is not None:
             raise RuntimeDependencyError("Relocated custody cannot select an ordinary or private candidate runtime.")
+    if retained is not None:
+        raise RuntimeDependencyError("A retained native inventory belongs to a selected native product only.")
+    if runtime_target is not None:
         return _verify_candidate_runtime(destination, expected_version, runtime_target)
     if source_custody is not None:
         raise RuntimeDependencyError("Relocated custody needs its original admitted native product selection.")
@@ -313,14 +316,20 @@ def _require_product_installed_observation(observed, artifacts, native_root, sit
 
 def _verify_meta_toolkit_runtime(destination, expected_version, target, *, sdk_python=None, site_packages=None,
                                 previous_source=None, native_root=None, sdk_root=None, source_custody=None,
-                                report_progress=None):
-    """Read exact SDK and full prefix bytes; native startup keeps its authority."""
+                                report_progress=None, retained=None, observation=None):
+    """Read exact SDK and full prefix bytes; native startup keeps its authority.
+
+    ``retained`` (a Start without a carrier) replaces only the archive inflate.
+    ``observation`` receives the verified artifacts for a later inventory mint.
+    """
     from dataclasses import asdict
+    from .runtime_candidates import prefix_inventory_sha256
     from .runtime_selection import (candidate_selection, selected_runtime_artifacts,
         selected_runtime_marker, selected_runtime_platform)
     from .sdk_wheel_integrity import WheelIntegrityFacts
     from .templates import install_candidate as adapter
-    artifacts = selected_runtime_artifacts(target, source_custody=source_custody, destination=destination)
+    artifacts = selected_runtime_artifacts(target, source_custody=source_custody, destination=destination,
+        **({"retained": retained} if retained is not None else {}))
     selected = candidate_selection(target, verified_artifacts=artifacts,
         source_custody=source_custody, destination=destination)
     if expected_version != target.meta.version or selected_runtime_platform(target) != platform_target():
@@ -355,8 +364,7 @@ def _verify_meta_toolkit_runtime(destination, expected_version, target, *, sdk_p
     selected_runtime_artifacts(target, verified_artifacts=artifacts, source_custody=source_custody,
         destination=destination)
     # These are the existing transaction's readback fields, not a new receipt.
-    inventory = hashlib.sha256(json.dumps([asdict(entry) for entry in artifacts.entries],
-        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    inventory = prefix_inventory_sha256(artifacts.entries)
     from .runtime_selection import _json_paths
     sdk = _json_paths({"meta": asdict(actual[0]), "toolkit": asdict(actual[1])})
     result = {"source": "meta-toolkit-product", "version": expected_version,
@@ -366,6 +374,8 @@ def _verify_meta_toolkit_runtime(destination, expected_version, target, *, sdk_p
         "binaries": {"toolkit_gateway": {"binary_sha256": artifacts.candidate["binary"]["sha256"]}},
         "sdk": sdk}
     _require_product_installed_observation(observed, artifacts, native_root, site, facts, source_paths)
+    if observation is not None:
+        observation.update(artifacts=artifacts, inventory_source=artifacts._inventory_source)
     return result
 
 

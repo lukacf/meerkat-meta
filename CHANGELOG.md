@@ -14,6 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   starts are released), `not_held` (it was not held, and its tools are
   republished) and, in the WARN, `still_pending_count` beside the
   `still_pending` names. It logged `owed` and `released` before.
+- Meta Forge no longer reads and unpacks a Meta/Toolkit product's whole
+  native runtime archive on every Start. After an installation's full
+  verification succeeds, Forge keeps the verified list of the native runtime's
+  files (names, kinds, modes, sizes, links and SHA-256 digests) in a private
+  file in the installation's folder, and the installation record names that
+  file by its SHA-256. Each Start still checks every installed native runtime
+  file against the list before the application launches, and refuses a
+  changed, added or removed file or a changed mode as before. A kept list that
+  differs from the copy the installation record names is refused, and the
+  refusal names the file: remove it, and the next Start runs the full
+  verification and keeps a new list. An installation from 0.9.4 or earlier
+  gets its list at its first Start. Forge 0.9.4 ignores the new installation
+  record field.
 
 ### Fixed
 
