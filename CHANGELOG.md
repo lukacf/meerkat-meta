@@ -45,6 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   also name `IdentityRuntime::restore_flow` as a path outside the bootstrap
   controller, and say that a listed, owed member can be added again without
   unlisting it first.
+- `GatewayHostComposition::compose_agent_customizer` (defaulted to returning
+  the given customizer): on the identity-first path, a host-composed gateway
+  offers its host the agent customizer it composed (the SDK's customizer
+  callback, wrapped by agent memory when that is configured, or `None`),
+  once, after `bind_runtime` and before the identity context is installed.
+  The answer is installed as the one customizer, the same `Arc`, of the
+  identity runtime, the identity-first context and the RPC context, so a
+  host wrapper runs for the roster bootstrap's builds and for the builds
+  outside it, such as a reset's fresh life. `Err` refuses init before the
+  identity bootstrap, as does an answer that adds a customizer where the
+  gateway composed none or drops the composed one. A gateway without an
+  identity roster never asks.
 
 ### Changed
 
