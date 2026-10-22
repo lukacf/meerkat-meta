@@ -787,6 +787,9 @@ impl From<meerkat_core::event::CompactionPreservedHistoryFit> for CompactionPres
 /// - `IdentityMaterializationFailure` — identity-first peer/fleet hydration skipped a member
 /// - `MobStopProceededWithoutInterrupt` — `lifecycle.rs` teardown gave up
 ///   waiting for runtime-attach readiness and continued without interrupting
+/// - `RetiredMemberReleaseFailed` - `identity_first/runtime.rs`: a gateway
+///   host's retirement hook (`GatewayHostComposition::identity_member_retired`)
+///   answered an error for a retired incarnation; the retirement stands
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "category", rename_all = "snake_case")]
@@ -903,6 +906,22 @@ pub enum ErrorEvent {
         member: Option<String>,
         error: String,
     },
+    /// A durable identity's member incarnation was retired, and the gateway
+    /// host's retirement hook (`GatewayHostComposition::identity_member_retired`)
+    /// answered an error.
+    ///
+    /// The retirement itself stands: Core retired the incarnation, and the
+    /// retire's caller saw its own outcome. Only the host's release of what
+    /// it keeps for that incarnation failed, and Meta does not retry it.
+    /// `cause` is `unlisted`, `retire` or `scoped`.
+    RetiredMemberReleaseFailed {
+        identity: String,
+        agent_runtime_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        cause: String,
+        error: String,
+    },
 }
 
 impl Display for ErrorEvent {
@@ -1008,6 +1027,23 @@ impl Display for ErrorEvent {
                     "mob_stop_proceeded_without_interrupt: teardown proceeded after {waited_ms}ms \
                      WITHOUT a successful interrupt{subject}; a turn may have been admitted and \
                      may still be running: {error}"
+                )
+            }
+            Self::RetiredMemberReleaseFailed {
+                identity,
+                agent_runtime_id,
+                session_id,
+                cause,
+                error,
+            } => {
+                let session = match session_id {
+                    Some(session_id) => format!(" on session {session_id}"),
+                    None => String::new(),
+                };
+                write!(
+                    f,
+                    "retired_member_release_failed: {identity} ({agent_runtime_id}{session}) \
+                     was retired ({cause}), and the host's release failed: {error}"
                 )
             }
         }

@@ -14699,6 +14699,39 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         let _ = (members, completion);
         Err(GatewayHostError::Unavailable)
     }
+    /// One incarnation of a durable identity's member was retired: Core's
+    /// retire returned, and the incarnation's runtime and session
+    /// registration were released. `retired` names that incarnation (its
+    /// member id, role, runtime id, generation and session, read from Core
+    /// before the retire) and why it was retired.
+    ///
+    /// What ended depends on [`crate::identity_first::RetiredIdentityCause`]:
+    /// every cause ends that one incarnation, so state the host keeps for it
+    /// alone may go. Only `Unlisted` ends the identity's place in the roster,
+    /// so only then may state the host keeps for the identity itself go.
+    /// After `Retire` or `Scoped` the identity stays registered and dormant,
+    /// and while the roster lists it the next roster pass, boot or wake
+    /// resumes it at the next generation on the same session.
+    ///
+    /// Called once per retired incarnation, after the retire, with no Meta
+    /// lock held (no identity lifecycle lock, no bootstrap controller), so it
+    /// may call back into the runtime. The gateway installs it right after
+    /// [`Self::bind_identity_runtime`], so the identity bootstrap's own
+    /// retirements of members the roster no longer lists reach it too (from
+    /// the init task); later ones run in the retiring operation's tracked
+    /// task, which a shutdown joins. Never called for a reload, a reprofile,
+    /// a compaction rebuild, a respawn, a reset or delete successor, a held
+    /// or refused spawn, or a shutdown or restart. The retirement stands
+    /// whatever this returns: an `Err` is reported to the error hook as
+    /// `retired_member_release_failed` and is not retried. The default does
+    /// nothing.
+    async fn identity_member_retired(
+        &self,
+        retired: &crate::identity_first::RetiredIdentityMember,
+    ) -> Result<(), GatewayHostError> {
+        let _ = retired;
+        Ok(())
+    }
     /// Publish the exact SDK Ready response and start its HTTP surface while
     /// serialized against the native owner's actual close transition. The
     /// one-use publication is synchronous and cannot wait for queue capacity.
@@ -14955,6 +14988,22 @@ async fn select_prepared_application(
             "the native host composition did not authenticate the prepared_application".to_string(),
         ),
     }
+}
+
+/// The identity runtime's retirement hook for a host-composed gateway: each
+/// retired incarnation goes to the host's
+/// [`GatewayHostComposition::identity_member_retired`].
+fn host_retired_member_observer(
+    host: Arc<dyn GatewayHostComposition>,
+) -> crate::identity_first::runtime::RetiredMemberObserver {
+    Arc::new(move |retired| {
+        let host = Arc::clone(&host);
+        Box::pin(async move {
+            host.identity_member_retired(&retired)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    })
 }
 
 /// The agent customizer the gateway installs: the one it composed, as its host
@@ -18112,6 +18161,9 @@ external_addressable = true
             host.bind_identity_runtime(runtime)
                 .await
                 .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?;
+            // Before the identity bootstrap, so a boot pass's retirements of
+            // members the roster no longer lists reach the host too.
+            irt.set_retired_member_observer(Some(host_retired_member_observer(Arc::clone(host))));
         }
         // A host that completes its application from the roster's finished
         // members holds their fresh creations until it has.

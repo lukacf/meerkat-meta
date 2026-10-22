@@ -69,6 +69,8 @@ pub mod mob_ops;
 pub(crate) mod mob_stop;
 pub mod module_ops;
 #[cfg(test)]
+mod retired_member_hook_tests;
+#[cfg(test)]
 mod shutdown_settlement_tests;
 pub mod types;
 
