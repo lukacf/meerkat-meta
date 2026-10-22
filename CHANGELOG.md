@@ -84,12 +84,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     source both directly and through a forward (`route_overlap`, also
     refused at `sources/put` for a route change that would do this to an
     existing subscriber).
-  - Capture follows the same audience: an uncovered subscription, or a
-    conversation member's, does not capture the item, and the withholding
-    is an audit row.
-  - New method `meta/mob_announcements/audit/list` reads the refusals and
-    withholdings of a mob's sources, per source, per member, or both,
-    kept for the retention window.
+  - Capture follows the same audience and routes: an uncovered
+    subscription, a conversation member's, or one to a source topic that no
+    direct route names, held by a member that does not triage it, does not
+    capture the item. Routes bind every subscriber: removing a direct route
+    stops capture for the subscriptions made before the change too.
+  - New method `meta/mob_announcements/audit/list` reads a mob's audit
+    entries, one counted entry per source, generation, member, action
+    (`subscription_refused`, `capture_withheld`) and reason, with its count
+    and its first and last times. It reads per source, per member, per
+    action, or any of them, pages after an entry id, and keeps an entry
+    for the retention window from its last count.
   - A triage member of another mob, and a role or label grant naming
     another mob, are refused at `sources/put`; a member grant may name a
     member of another gateway's mob. A grant names exact values: "*" is

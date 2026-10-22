@@ -73,11 +73,11 @@ pub use owner::{
 };
 pub use remote::{KeyedInjectServer, RemoteMemberDelivery};
 pub use sources::{
-    AdvanceSource, AnnouncementSource, AudienceGrant, AuditKind, AuditQuery, AuditReason, AuditRow,
-    BaselineCapability, CollectionPhase, ConnectionKind, Coverage, CoverageGap, DeletionCapability,
-    FailureClass, ItemChange, ItemOutcome, ItemOutcomeKind, MemberFacts, ObservationCapability,
-    Observed, OnboardingMode, Principal, PutSource, Rebaseline, RebaselineReason,
-    RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceConfig,
+    AdvanceSource, AnnouncementSource, AudienceGrant, AuditAction, AuditQuery, AuditReason,
+    AuditRow, BaselineCapability, CollectionPhase, ConnectionKind, Coverage, CoverageGap,
+    DeletionCapability, FailureClass, ItemChange, ItemOutcome, ItemOutcomeKind, MemberFacts,
+    ObservationCapability, Observed, OnboardingMode, Principal, PutSource, Rebaseline,
+    RebaselineReason, RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceConfig,
     SourceConflictRecord, SourceConnection, SourceCursor, SourceDelivery, SourceFailure,
     SourceFailureRecord, SourceHealth, SourceHealthPolicy, SourceHealthStatus, SourceIdentity,
     SourceItem, SourcePage, SourcePriority, SourceQuery, SourceRoute, SourceRunner, SourceScope,
