@@ -508,6 +508,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   identity to `host_auth_service()`'s MCP login (including the registered
   https callback) and calls `credential_landed` with the completion's target,
   after answering the callback.
+- `MemberMcpCustody::credential_released`, the logout twin of
+  `credential_landed`. After the host's MCP logout
+  (`host_auth_service()`'s `mcp_logout`) it removes, from every member at
+  once, the server that used exactly that credential (the custody applies
+  the member's MCP boundary): its connection closes, its tools leave the
+  member's catalog, and it awaits a sign-in, so a later login and
+  `credential_landed` add it back. It never signs anything out: no logout,
+  no token revocation, and no change to a stored credential or account.
+  Call it only when the credential is gone, never when a login attempt, its
+  callback or a transport is disposed of, and pass the realm-scoped identity
+  the members' connections report (`mcp_target_in_service_realm`).
 
 ### Changed
 

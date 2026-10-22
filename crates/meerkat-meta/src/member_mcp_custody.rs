@@ -334,7 +334,8 @@ impl MemberMcpCustody {
 }
 
 /// One member adapter's answer when the host reports a credential change for
-/// an MCP target ([`MemberMcpCustody::credential_landed`]).
+/// an MCP target ([`MemberMcpCustody::credential_landed`],
+/// [`MemberMcpCustody::credential_released`]).
 #[derive(Debug)]
 pub struct MemberMcpCredentialOutcome<T> {
     /// What the member's MCP router recorded for exactly that target.
@@ -364,7 +365,10 @@ impl MemberMcpCustody {
     /// attachment applies an add. The reconnect then runs in the background
     /// and reads the stored credential itself (nothing is copied from the
     /// login); the member's agent sees the server's tools when it next polls
-    /// its tools, between model calls.
+    /// its tools, between model calls. Pass the completion's `target`
+    /// ([`meerkat::McpOAuthLoginComplete`]), which is scoped to the realm
+    /// whose credential slot the login filled: the identity the member's
+    /// connections report.
     ///
     /// [`MemberMcpCredentialOutcome::recorded`] is the router's
     /// [`meerkat::AuthorizedRetry`]:
@@ -405,6 +409,98 @@ impl MemberMcpCustody {
                 Ok(meerkat::AuthorizedRetry::AfterRelease) => 2,
                 Ok(
                     meerkat::AuthorizedRetry::NotAwaiting | meerkat::AuthorizedRetry::RouterClosed,
+                )
+                | Err(_) => 0,
+            };
+            let applied = apply_boundaries(&adapter, boundaries).await;
+            outcomes.push(MemberMcpCredentialOutcome { recorded, applied });
+        }
+        outcomes
+    }
+
+    /// After the credential for `target` is gone, stop offering the server
+    /// that used exactly that credential in every member adapter this
+    /// custody holds whose own shutdown has not reported, in the same
+    /// runtime.
+    ///
+    /// Call it only when the credential itself is gone: after a successful
+    /// [`meerkat::HostAuthService::mcp_logout`] for the target (on
+    /// [`crate::GatewayFactoryConstruction::host_auth_service`]), or another
+    /// removal of that credential from the realm's store. Never call it when
+    /// a login attempt, its callback or a transport is only disposed of
+    /// (cancelled, expired or closed): the member's server would then stop
+    /// and wait for a sign-in its account does not need. Pass the identity
+    /// the member's connections report, scoped to the realm whose credential
+    /// slot it is, `host_auth_service()?.mcp_target_in_service_realm(&target)?`
+    /// as Meerkat's RPC logout does; a realm-less identity addresses no
+    /// member.
+    ///
+    /// It never signs the account out. It does not log out, revoke a token,
+    /// or remove or change a stored credential or account: a member's router
+    /// holds its credential owner only as a [`meerkat::McpAuthResolver`],
+    /// which reads a credential or starts a login and has no way to remove
+    /// one, and neither the router nor this custody calls a logout. (The
+    /// logout itself removes the stored credential and revokes nothing at
+    /// the provider.)
+    ///
+    /// Per adapter, in adoption order, the member's router finds each
+    /// connected server whose identity (server name, URL, account selection,
+    /// and the realm its credential owner serves) equals `target` exactly,
+    /// stages its removal and records it as awaiting a sign-in with the
+    /// config it connected with ([`McpRouterAdapter::credential_released`],
+    /// the call Meerkat's RPC logout makes), and the custody applies the
+    /// member's MCP boundary at once, as [`Self::credential_landed`] does.
+    /// The boundary removes the server: its connection closes (which ends
+    /// its MCP session at the server, a transport action, not an account
+    /// one) and its tools leave the member's catalog; the member's agent
+    /// sees that when it next polls its tools. A later login and
+    /// [`Self::credential_landed`] for the same target add the server back.
+    ///
+    /// A call in flight is not cancelled: the record waits for it to return.
+    /// A request that a call sends once the credential has left the store,
+    /// and any call the member makes before the boundary, finds no usable
+    /// credential: for an account-selected target it is refused before
+    /// anything is sent; for an unselected one it is sent without a
+    /// credential and the server's `401` refuses it. Either way the member's
+    /// tool call fails as awaiting authorization; it is never retried and
+    /// never sent with the old credential.
+    ///
+    /// [`MemberMcpCredentialOutcome::recorded`] is the router's
+    /// [`meerkat::ReleasedCredential`]:
+    /// - `Unpublished`: a connected server used exactly that credential; its
+    ///   removal was staged, then applied by one boundary.
+    /// - `AlreadyPending`: a newer staged intent or an operation in flight
+    ///   owns the server; one boundary applies whatever is staged.
+    /// - `NotActive`: no connected server in that member uses exactly this
+    ///   credential (absent, another URL, account or realm, or not
+    ///   connected).
+    /// - `RouterClosed`: that member's router was shut down.
+    ///
+    /// The last two, and an `Err` (the router's typed refusal to stage the
+    /// removal), apply nothing. Calling it again for the same target finds
+    /// the server already removed: `NotActive`, nothing applied.
+    ///
+    /// It takes the locks [`Self::credential_landed`] takes: each record and
+    /// boundary waits for the member's in-flight MCP calls, one adapter after
+    /// another, so run it as owned work, never inside a response the host
+    /// owes; and a boundary refuses a call the member planned before it and
+    /// dispatches after it.
+    pub async fn credential_released(
+        &self,
+        target: &meerkat::McpServerIdentity,
+    ) -> Vec<MemberMcpCredentialOutcome<meerkat::ReleasedCredential>> {
+        let adapters = self.live_adapters();
+        let mut outcomes = Vec::with_capacity(adapters.len());
+        for adapter in adapters {
+            let recorded = adapter.credential_released(target).await;
+            let boundaries = match &recorded {
+                Ok(
+                    meerkat::ReleasedCredential::Unpublished
+                    | meerkat::ReleasedCredential::AlreadyPending,
+                ) => 1,
+                Ok(
+                    meerkat::ReleasedCredential::NotActive
+                    | meerkat::ReleasedCredential::RouterClosed,
                 )
                 | Err(_) => 0,
             };
@@ -1140,24 +1236,45 @@ mod tests {
     }
 
     /// The native credential owner of a host without a browser: the test
-    /// stores and removes the credential (a login and a logout), and an
-    /// interactive login needs a human.
-    struct StoredCredential(Mutex<Option<String>>);
+    /// stores and removes the credential (a login and a logout), an
+    /// interactive login needs a human (and is counted), and it serves
+    /// `realm`'s credential slot when it has one.
+    struct StoredCredential {
+        token: Mutex<Option<String>>,
+        realm: Option<meerkat_core::RealmId>,
+        logins: std::sync::atomic::AtomicUsize,
+    }
 
     impl StoredCredential {
         fn new(token: Option<&str>) -> Arc<Self> {
-            Arc::new(Self(Mutex::new(token.map(str::to_owned))))
+            Self::serving(token, None)
+        }
+
+        fn in_realm(token: Option<&str>, realm: meerkat_core::RealmId) -> Arc<Self> {
+            Self::serving(token, Some(realm))
+        }
+
+        fn serving(token: Option<&str>, realm: Option<meerkat_core::RealmId>) -> Arc<Self> {
+            Arc::new(Self {
+                token: Mutex::new(token.map(str::to_owned)),
+                realm,
+                logins: std::sync::atomic::AtomicUsize::new(0),
+            })
         }
 
         fn set(&self, token: Option<&str>) {
-            *self.0.lock().unwrap_or_else(PoisonError::into_inner) = token.map(str::to_owned);
+            *self.token.lock().unwrap_or_else(PoisonError::into_inner) = token.map(str::to_owned);
         }
 
-        fn is_stored(&self) -> bool {
-            self.0
+        fn stored(&self) -> Option<String> {
+            self.token
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .is_some()
+                .clone()
+        }
+
+        fn logins(&self) -> usize {
+            self.logins.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1167,37 +1284,59 @@ mod tests {
             &self,
             _target: &meerkat::McpServerIdentity,
         ) -> Result<Option<String>, meerkat::McpOAuthError> {
-            Ok(self
-                .0
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone())
+            Ok(self.stored())
         }
         async fn interactive_login(
             &self,
             target: &meerkat::McpServerIdentity,
             _www_authenticate: Option<&str>,
         ) -> Result<String, meerkat::McpOAuthError> {
+            self.logins
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(meerkat::McpOAuthError::HumanAuthorizationRequired {
                 server_name: target.server_name().to_owned(),
             })
         }
+        fn credential_realm(&self) -> Option<meerkat_core::RealmId> {
+            self.realm.clone()
+        }
+    }
+
+    /// The configured `guarded` server at `url`, for `account` when one is
+    /// named.
+    fn guarded_config(url: &str, account: Option<&str>) -> meerkat_core::McpServerConfig {
+        let mut config = meerkat_core::McpServerConfig::streamable_http(
+            "guarded",
+            url.to_owned(),
+            std::collections::HashMap::new(),
+        );
+        if let meerkat_core::mcp_config::McpTransportConfig::Http(http) = &mut config.transport {
+            http.oauth_account = account.map(str::to_owned);
+        }
+        config
     }
 
     /// A member adapter for the `guarded` server at `url` under `credential`,
     /// once its first connect settled: connected while a credential is
-    /// stored, else waiting for a login to exactly its target.
+    /// stored, else waiting for a login. Returns the adapter and the identity
+    /// its connection reports (scoped to the credential owner's realm).
     async fn member_adapter(
         url: String,
         credential: Arc<StoredCredential>,
     ) -> (Arc<McpRouterAdapter>, meerkat::McpServerIdentity) {
-        let config = meerkat_core::McpServerConfig::streamable_http(
-            "guarded",
-            url,
-            std::collections::HashMap::new(),
-        );
-        let target = meerkat::McpServerIdentity::from_config(&config).expect("identity");
-        let connects = credential.is_stored();
+        member_adapter_for(guarded_config(&url, None), credential).await
+    }
+
+    async fn member_adapter_for(
+        config: meerkat_core::McpServerConfig,
+        credential: Arc<StoredCredential>,
+    ) -> (Arc<McpRouterAdapter>, meerkat::McpServerIdentity) {
+        let configured = meerkat::McpServerIdentity::from_config(&config).expect("identity");
+        let target = match &credential.realm {
+            Some(realm) => configured.in_realm(realm.clone()),
+            None => configured,
+        };
+        let connects = credential.stored().is_some();
         let mut router = meerkat_mcp::McpRouter::new_with_surface_handle_and_stdio_profile(
             Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
             meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
@@ -1336,5 +1475,170 @@ mod tests {
                 .is_empty(),
             "an empty custody addresses nothing"
         );
+    }
+
+    /// A credential released through the custody after its logout removes,
+    /// at once and with no other boundary, the member's server that used
+    /// exactly it: the member's catalog no longer offers its tool and the
+    /// server awaits a sign-in to exactly its target. Members serve their
+    /// realm's credential slot, so only the realm-scoped identity addresses
+    /// them. A later login and landing add the server back.
+    #[tokio::test]
+    async fn a_released_credential_removes_the_members_server_at_once() {
+        use meerkat::AuthorizedRetry::Staged;
+        use meerkat::ReleasedCredential::{NotActive, Unpublished};
+        let url = authorized_endpoint().await;
+        let realm = meerkat_core::RealmId::parse("gateway-realm").expect("realm");
+        let credential = StoredCredential::in_realm(Some("member-token"), realm);
+        let (member, target) = member_adapter(url.clone(), Arc::clone(&credential)).await;
+        let realm_less =
+            meerkat::McpServerIdentity::from_config(&guarded_config(&url, None)).expect("identity");
+        let custody = MemberMcpCustody::new();
+        custody.adopt(&member).expect("adopted");
+        assert!(offers(&member, "echo"));
+
+        // The logout removed the credential; the host reports it.
+        credential.set(None);
+        let unscoped = custody.credential_released(&realm_less).await;
+        assert_eq!(
+            answers(&unscoped),
+            vec![(Some(NotActive), vec![])],
+            "a realm-less identity addresses no member: {unscoped:?}"
+        );
+        assert!(offers(&member, "echo"));
+        let released = custody.credential_released(&target).await;
+        assert_eq!(
+            answers(&released),
+            vec![(Some(Unpublished), vec![true])],
+            "{released:?}"
+        );
+        assert!(member.active_server_names().await.is_empty());
+        assert!(!offers(&member, "echo"));
+        assert_eq!(
+            member.servers_awaiting_authorization().await,
+            vec![target.clone()]
+        );
+
+        // A later login stores a credential again and the host lands it.
+        credential.set(Some("member-token"));
+        let landed = custody.credential_landed(&target).await;
+        assert_eq!(
+            answers(&landed),
+            vec![(Some(Staged), vec![true])],
+            "{landed:?}"
+        );
+        until_member_serves(&member, &["guarded"]).await;
+        assert!(offers(&member, "echo"));
+        member.shutdown().await;
+    }
+
+    /// A credential released through the custody answers for every member
+    /// adapter it holds, in adoption order, and applies a boundary only where
+    /// the record staged something: another URL's credential touches
+    /// nothing, the member using exactly that credential is unpublished and
+    /// applied, a second release finds the server already removed, and an
+    /// adapter whose own shutdown reported is no longer addressed.
+    #[tokio::test]
+    async fn a_released_credential_answers_per_member_and_applies_what_it_staged() {
+        use meerkat::ReleasedCredential::{NotActive, Unpublished};
+        let credential = StoredCredential::new(Some("member-token"));
+        let (member, target) =
+            member_adapter(authorized_endpoint().await, Arc::clone(&credential)).await;
+        let idle = adapter();
+        let custody = MemberMcpCustody::new();
+        custody.adopt(&member).expect("adopted");
+        custody.adopt(&idle).expect("adopted");
+        credential.set(None);
+
+        let elsewhere =
+            meerkat::McpServerIdentity::from_server_config("guarded", "http://127.0.0.1:9/mcp");
+        let untouched = custody.credential_released(&elsewhere).await;
+        assert_eq!(
+            answers(&untouched),
+            vec![(Some(NotActive), vec![]), (Some(NotActive), vec![])],
+            "{untouched:?}"
+        );
+        assert_eq!(
+            member.active_server_names().await,
+            vec!["guarded".to_string()]
+        );
+
+        let released = custody.credential_released(&target).await;
+        assert_eq!(
+            answers(&released),
+            vec![(Some(Unpublished), vec![true]), (Some(NotActive), vec![])],
+            "{released:?}"
+        );
+        let again = custody.credential_released(&target).await;
+        assert_eq!(
+            answers(&again),
+            vec![(Some(NotActive), vec![]), (Some(NotActive), vec![])],
+            "a second release finds the server already removed: {again:?}"
+        );
+
+        member.shutdown().await;
+        let after = custody.credential_released(&target).await;
+        assert_eq!(
+            answers(&after),
+            vec![(Some(NotActive), vec![])],
+            "only the live adapter is addressed: {after:?}"
+        );
+        assert!(
+            MemberMcpCustody::new()
+                .credential_released(&target)
+                .await
+                .is_empty(),
+            "an empty custody addresses nothing"
+        );
+    }
+
+    /// A release only tells the members; it never signs the account out.
+    /// Reported while the credential is still stored (as if a ceremony's
+    /// disposal were mistaken for a logout), it removes the member's server,
+    /// but the stored credential and the account it was stored for stay and
+    /// no login is asked: landing the same account's target reconnects the
+    /// server with that very credential.
+    #[tokio::test]
+    async fn a_release_never_signs_the_account_out() {
+        use meerkat::AuthorizedRetry::Staged;
+        use meerkat::ReleasedCredential::Unpublished;
+        let credential = StoredCredential::new(Some("member-token"));
+        let (member, target) = member_adapter_for(
+            guarded_config(&authorized_endpoint().await, Some("subject-7")),
+            Arc::clone(&credential),
+        )
+        .await;
+        assert!(target.is_selected(), "the target names its account");
+        let custody = MemberMcpCustody::new();
+        custody.adopt(&member).expect("adopted");
+
+        let released = custody.credential_released(&target).await;
+        assert_eq!(
+            answers(&released),
+            vec![(Some(Unpublished), vec![true])],
+            "{released:?}"
+        );
+        assert!(member.active_server_names().await.is_empty());
+        // The stored credential and its account are untouched, and nothing
+        // asked for a login.
+        assert_eq!(credential.stored().as_deref(), Some("member-token"));
+        assert_eq!(credential.logins(), 0);
+        assert_eq!(
+            member.servers_awaiting_authorization().await,
+            vec![target.clone()],
+            "the server waits for exactly that account's target"
+        );
+
+        let landed = custody.credential_landed(&target).await;
+        assert_eq!(
+            answers(&landed),
+            vec![(Some(Staged), vec![true])],
+            "{landed:?}"
+        );
+        // The endpoint serves only the stored credential: the reconnect used it.
+        until_member_serves(&member, &["guarded"]).await;
+        assert_eq!(credential.stored().as_deref(), Some("member-token"));
+        assert_eq!(credential.logins(), 0, "no login was asked");
+        member.shutdown().await;
     }
 }
