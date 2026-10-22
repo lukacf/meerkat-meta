@@ -238,6 +238,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   kickoff frame and spawned-by registrations for a member that never
   existed. It now reads Core's typed per-member results and projects only
   the rows that spawned.
+- Meta Forge's "Check cloud access" step for a Google Cloud destination no
+  longer gives up after 30 s. Forge reads and checks the accepted package
+  before and after it lists the signed-in accounts, which can take longer
+  than 30 s on a small machine, and it bounds the whole check at 180 s. The
+  page stopped waiting after 30 s and said the server was taking too long,
+  and checking again was refused until the first check had finished. The
+  page now waits up to 240 s, so it shows the check's result, or Forge's own
+  refusal when the check runs out of time.
 
 ### Known limitations
 

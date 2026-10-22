@@ -5,6 +5,14 @@ import { createGcpPreflightGate, gcpPreflightAvailable, gcpPreflightScope, gcpPr
   gcpBindingMatches, gcpOptionsValid, gcpProjectsValid, gcpCheckValid, gcpCheckFresh, GCP_PREFLIGHT_FRESH_MS } from "./gcp-preflight.mjs";
 import "./gcp-preflight.css";
 
+// The server bounds one whole cloud access check at 180 s (PROBE_TIMEOUT in
+// launchkit/gcp_preflight.py): it reads and checks the accepted package before
+// and after the account reads. It refuses another check until this one ends,
+// and past its bound it answers with its own refusal. Keep the read open a
+// minute longer than that bound, not the ordinary 30 s, so the page shows the
+// server's answer instead of giving up on a check that is still running.
+const CLOUD_ACCESS_READ_TIMEOUT_MS = 240000;
+
 function CloudChecks({ checks = [] }) {
   return checks.length ? <ul className="gcp-preflight-checks">{checks.map((check) => <li key={check.id} data-check-status={check.status}>
     <div><strong>{check.label}</strong><span>{check.status === "checked" ? "Checked" : check.status === "blocked" ? "Needs attention" : "Not verified"}</span></div>
@@ -95,7 +103,8 @@ export function GcpPreflight({ state, build, blocked = false, onChooseProject, o
     setOptions(null); setProjects(null);
     const selected = begin("options", { account: "", project: "" });
     try {
-      const value = await request(`${gcpPreflightUrl(selected.state.id, "options")}?${new URLSearchParams({ build_id: selected.build.build_id })}`);
+      const value = await request(`${gcpPreflightUrl(selected.state.id, "options")}?${new URLSearchParams({ build_id: selected.build.build_id })}`,
+        { timeoutMs: CLOUD_ACCESS_READ_TIMEOUT_MS });
       if (!accept(selected, value)) return;
       if (!gcpOptionsValid(value)) throw new Error("Cloud access returned incomplete account information. Check again.");
       setOptions({ scope: selected.scope, revision: selected.revision, value });
