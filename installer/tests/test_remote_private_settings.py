@@ -11,7 +11,7 @@ from launchkit.remote_deployment import read_receipt, update_receipt, write_priv
 from launchkit.ssh_transport import SshTransportError
 from launchkit.templates_v2.console_configuration import CONSOLE_FIELDS
 from test_remote_destination import bundle, completed_service, destination, install as destination_install
-from test_remote_deployment import connect, install as host_install, service
+from test_remote_deployment import connect, install as host_install, longest_loop_gap, service, slow_package_hashing
 
 
 OPTIONAL_FIELD = {"key": "REPLY_STYLE", "label": "Reply style", "description": "An optional preference.",
@@ -481,3 +481,15 @@ async def test_host_private_post_rechecks_current_version_and_refuses_busy_guide
         for key in ("operation_id", "install_operation_id", "pending_operation", "guide_version"):
             assert saved.get(key) == original_receipt.get(key)
     assert all(NEW_PASSWORD.encode() not in content for content in disk_bytes(service.root).values())
+
+
+async def test_host_settings_and_configure_hash_the_package_off_the_event_loop(private_service, monkeypatch):
+    service = private_service
+    deployment_id = read_receipt(service.directory(service.guide.identity))["deployment_id"]
+    slow_package_hashing(monkeypatch)
+    async def configured():
+        options = await service.settings_options(service.guide.identity, deployment_id)
+        return await configure_host(service, options, {"CONSOLE_LOGIN_PASSWORD": NEW_PASSWORD})
+    result, gap = await longest_loop_gap(configured())
+    assert result["configuration_saved"] is True and result["status"] == "stopped"
+    assert gap < 0.5

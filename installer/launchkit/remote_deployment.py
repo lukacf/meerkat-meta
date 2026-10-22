@@ -82,6 +82,10 @@ def source_archive(files):
     return output.getvalue(), digest.hexdigest()
 
 
+def package_digest(payload):
+    return hashlib.sha256(payload).hexdigest()
+
+
 def private_file(path, maximum=MAX_PACKAGE_BYTES):
     path = Path(path)
     if any(item.is_symlink() for item in (path, *path.parents)):
@@ -564,19 +568,20 @@ class RemoteDeploymentService:
                 "console_scope": package_console_scope(files, fields, state),
                 **({"product_control": selected} if product else {})}
 
-    def selection_matches(self, receipt, selected):
+    async def selection_matches(self, receipt, selected):
         return (selected["state"]["id"] == receipt["guide_id"]
             and selected["checked"]["guide_version"] == build_guide_version(receipt)
             and selected["checked"]["build_id"] == receipt["build_id"]
             and selected["checked"]["source_digest"] == receipt["accepted_source_digest"]
-            and hashlib.sha256(selected["payload"]).hexdigest() == receipt["package_sha256"])
+            # Hashing the whole package must not hold the event loop.
+            and await await_validation(package_digest, selected["payload"]) == receipt["package_sha256"])
 
     async def current_state(self, receipt, *, state=None):
         try:
             snapshot = state if state is not None else await self.local._guide(receipt["guide_id"])
             options = {"target": receipt.get("target", "linux"), "state": snapshot, "admission": False}
             selected = await self.accepted(receipt["guide_id"], snapshot["version"], receipt["build_id"], **options)
-            if not self.selection_matches(receipt, selected):
+            if not await self.selection_matches(receipt, selected):
                 return None
             if state is None:
                 latest = await self.local._guide(receipt["guide_id"])
@@ -648,7 +653,8 @@ class RemoteDeploymentService:
                 cloud_version = (cloud.get("binding") or {}).get("guide_version")
                 expected = {"guide_id": guide_id, "guide_version": cloud_version, "build_id": build_id,
                     "blueprint_hash": proposal_hash(selected["state"].get("proposal") or selected["state"].get("blueprint")),
-                    "source_digest": selected["checked"]["source_digest"], "package_sha256": hashlib.sha256(selected["payload"]).hexdigest()}
+                    "source_digest": selected["checked"]["source_digest"],
+                    "package_sha256": await await_validation(package_digest, selected["payload"])}
                 proposal = selected["state"].get("proposal") or selected["state"].get("blueprint")
                 if (type(cloud_version) is not int or not 1 <= cloud_version <= version
                         or cloud.get("binding") != expected or endpoint != cloud.get("endpoint")
@@ -704,7 +710,7 @@ class RemoteDeploymentService:
                 "guide_version": version, "build_id": build_id,
                 "build_guide_version": selected["checked"]["guide_version"],
                 "accepted_source_digest": selected["checked"]["source_digest"],
-                "package_sha256": hashlib.sha256(selected["payload"]).hexdigest(),
+                "package_sha256": await await_validation(package_digest, selected["payload"]),
                 "transferred_source_digest": transferred, "controller_sha256": hashlib.sha256(controller).hexdigest(),
                 "endpoint": endpoint, "destination_input": destination, "destination": destination,
                 "status": "connecting", "last_known_status": None, "created_at": now(), "updated_at": now(),
@@ -1003,7 +1009,7 @@ class RemoteDeploymentService:
         selected = await self.accepted(guide_id, state["version"], receipt["build_id"],
             target=receipt.get("target", "linux"), state=state,
             **({"product_owner": product_owner} if receipt.get("product_runtime") is True else {}))
-        if not self.selection_matches(receipt, selected):
+        if not await self.selection_matches(receipt, selected):
             raise DraftConflict("The accepted application changed. Preserve this installation before changing private settings.")
         await self._probe(directory, "status")
         receipt = read_receipt(directory)
@@ -1281,7 +1287,7 @@ class RemoteDeploymentService:
                 raise DraftConflict("Start only the current accepted installed source. The older installation can still be stopped.")
             selected = await self.accepted(receipt["guide_id"], snapshot["version"], receipt["build_id"],
                 target=receipt.get("target", "linux"), state=snapshot, product_owner=product_owner)
-            if not self.selection_matches(receipt, selected):
+            if not await self.selection_matches(receipt, selected):
                 raise DraftConflict("The accepted product changed before its runtime action.")
             await self.require_current_request(receipt["guide_id"], snapshot["version"], files=selected["files"])
         capability = {"prepare-setup": "can_prepare_setup", "finish-setup": "can_finish_setup",
@@ -1376,7 +1382,7 @@ class RemoteDeploymentService:
                 if self.directory(guide_id) != directory:
                     raise DraftConflict("Choose the selected remote installation before entering private setup.")
                 selected = await self.accepted(guide_id, version, build_id, target=receipt.get("target", "linux"), product_owner=product_owner)
-                if not self.selection_matches(receipt, selected):
+                if not await self.selection_matches(receipt, selected):
                     raise DraftConflict("The application changed. Connect its current accepted source before installing.")
                 continuing_product = selected.get("product_control") is not None and product_transfer_pending(receipt)
                 retry = receipt.get("remote_admission_requested") and receipt["status"] == "not-installed" and receipt.get("admitted") is False
@@ -1527,7 +1533,7 @@ class RemoteDeploymentService:
                 if self.directory(guide_id) != directory:
                     raise DraftConflict("Choose the selected remote installation before retrying private setup.")
                 selected = await self.accepted(guide_id, version, build_id, target=receipt.get("target", "linux"))
-                if not self.selection_matches(receipt, selected):
+                if not await self.selection_matches(receipt, selected):
                     raise DraftConflict("The application changed. Retry only its exact accepted installed source.")
                 # A POST replay is an observation until the predecessor is proven
                 # eligible now. It never turns an expired response into fresh work.
