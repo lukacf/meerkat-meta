@@ -245,7 +245,7 @@ fn initialize_for_shutdown(gateway: &mut Gateway, state_dir: &tempfile::TempDir)
         "init failed: {init}"
     );
     assert_eq!(init["result"]["stdio_shutdown_handshake"], true);
-    assert_eq!(init["result"]["stdio_shutdown_horizon_ms"], 392_000);
+    assert_eq!(init["result"]["stdio_shutdown_horizon_ms"], 432_000);
 }
 
 #[test]

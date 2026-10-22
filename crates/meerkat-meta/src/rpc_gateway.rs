@@ -8202,10 +8202,13 @@ comms = true
                 // Uncounted, the outer timeout could fire inside it and drop
                 // the whole report, per-member mob outcomes included.
                 + crate::unified_runtime::lifecycle::MOB_TERMINAL_SHUTDOWN_BUDGET
+                // The durable child-mob stand-down, in a window of its own
+                // after the root's terminal teardown returned.
+                + crate::unified_runtime::lifecycle::CHILD_MOB_STAND_DOWN_BUDGET
                 // The member MCP settlement after that teardown: the stdio
                 // close bound of the members' routers plus a join allowance.
                 + crate::member_mcp_custody::MEMBER_MCP_SETTLEMENT_BUDGET,
-            "runtime budget must exactly cover both provider callbacks, event drain, mob quiesce, scheduler overhead, the retired-supervisor join, and the mob terminal shutdown"
+            "runtime budget must exactly cover both provider callbacks, event drain, mob quiesce, scheduler overhead, the retired-supervisor join, the mob terminal shutdown, the child-mob stand-down, and the member MCP settlement"
         );
         let gateway_phase_budget = GATEWAY_RPC_DRAIN_TIMEOUT
             + crate::gateway_composition::GATEWAY_HTTP_DRAIN_TIMEOUT
@@ -8215,10 +8218,10 @@ comms = true
             + crate::member_mcp_custody::MEMBER_MCP_SETTLEMENT_BUDGET
             + GATEWAY_STDOUT_DRAIN_TIMEOUT
             + crate::console_voice::CONSOLE_VOICE_SHUTDOWN_TIMEOUT;
-        assert_eq!(gateway_phase_budget, Duration::from_secs(382));
+        assert_eq!(gateway_phase_budget, Duration::from_secs(422));
         assert_eq!(
             Duration::from_millis(GATEWAY_SHUTDOWN_HORIZON_MS),
-            Duration::from_secs(392)
+            Duration::from_secs(432)
         );
         assert_eq!(
             Duration::from_millis(GATEWAY_SHUTDOWN_HORIZON_MS).saturating_sub(gateway_phase_budget),
@@ -10833,25 +10836,26 @@ const GATEWAY_SHUTDOWN_METHOD: &str = "meta/shutdown";
 // open while identity-owned cleanup runs. The runtime budget deliberately
 // covers two complete callback windows: one for an already-admitted identity
 // operation which shutdown must join, and one for the final batched lease
-// release. The 337-second runtime budget is exactly two 130-second provider
+// release. The 377-second runtime budget is exactly two 130-second provider
 // callback windows, the runtime's 30-second event drain, its 10-second mob
 // quiesce window, 10 seconds of scheduler overhead, the 2-second
-// retired-supervisor join, the 5-second mob terminal shutdown that produces
-// the per-member shutdown report, and the 20-second member MCP settlement
-// that closes the members' MCP servers and waits for each native outcome.
+// retired-supervisor join, the 35-second mob terminal shutdown that produces
+// the per-member shutdown report, the 10-second durable child-mob
+// stand-down, and the 20-second member MCP settlement that closes the
+// members' MCP servers and waits for each native outcome.
 const PROVIDER_CALLBACK_TIMEOUT: Duration = Duration::from_secs(130);
 const GATEWAY_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const GATEWAY_RUNTIME_EVENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_STDOUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-// The bounded gateway phases total at most 382 seconds (5 + 5 + 10 + 337 + 20
+// The bounded gateway phases total at most 422 seconds (5 + 5 + 10 + 377 + 20
 // + 5): the runtime observation, then the 20-second member MCP settlement at
 // the executor-exit boundary, which runs after it whatever ended it. That
 // settlement waits for each close's native outcome even past its deadline,
 // so it outlasts its 20 seconds only when Meerkat breaks its own close bound.
 // Advertise another 10 seconds for response delivery and process reaping so
 // an SDK never races the gateway's own deadline and preempts a valid callback.
-const GATEWAY_SHUTDOWN_HORIZON_MS: u64 = 392_000;
+const GATEWAY_SHUTDOWN_HORIZON_MS: u64 = 432_000;
 
 // -- meta/init: accepted, then settled (#550) ------------------------------
 //

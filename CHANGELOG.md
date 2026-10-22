@@ -67,6 +67,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   identity members, with host tools composed over the member's own, and
   across a restart: with and without a hook that narrows the restore build,
   and after a hook disabled the mob tools on the first build only.
+- The mob's terminal teardown in `UnifiedRuntime::shutdown` is bounded by 35
+  seconds (`MOB_TERMINAL_SHUTDOWN_BUDGET`, 5 before), and durable child mobs
+  stand down in a 10-second window of their own
+  (`CHILD_MOB_STAND_DOWN_BUDGET`), taken when the root's teardown has
+  returned. The teardown still returns as soon as its last member is
+  unregistered, so a normal shutdown takes no longer. The runtime shutdown
+  timeout rises from 337 to 377 seconds, and the advertised
+  `stdio_shutdown_horizon_ms` from 392000 to 432000; hosts that honor the
+  advertised value need no change.
 
 ### Fixed
 
@@ -140,6 +149,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   control's glibc minimum is below the product's declared floor. The remote
   check compared the computer's glibc only with that minimum. The refusal
   names both glibc versions.
+- A shutdown of a mob with hundreds of members no longer reports the members
+  whose runtime unregister was still running at 5 seconds as
+  `UnregisterPending` with a "could not settle" warning, leaving their
+  registrations to finish after the report: the teardown waits for them.
+- A root teardown that used its whole budget no longer starves the durable
+  child-mob stand-down. It ran on the deadline the root had already used, so
+  the child root stayed claimed for the rest of the process (a same-process
+  successor got `AlreadyClaimed`) and `meta/shutdown` could report
+  `runtime_cleanup_completed: false`, even for a runtime with no child mobs.
 
 ### Known limitations
 

@@ -383,12 +383,13 @@ impl GatewayComposition<ActiveGateway> {
 
 pub const GATEWAY_HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Covers every bounded phase inside `UnifiedRuntime::shutdown`, including
-/// `RETIRED_SUPERVISOR_JOIN_BUDGET`, `MOB_TERMINAL_SHUTDOWN_BUDGET` and
-/// `MEMBER_MCP_SETTLEMENT_BUDGET`, so this outer timeout can never cut the
-/// runtime off before its per-member mob shutdown report or its member MCP
-/// settlement. Asserted component-by-component in
+/// `RETIRED_SUPERVISOR_JOIN_BUDGET`, `MOB_TERMINAL_SHUTDOWN_BUDGET`,
+/// `CHILD_MOB_STAND_DOWN_BUDGET` and `MEMBER_MCP_SETTLEMENT_BUDGET`, so this
+/// outer timeout can never cut the runtime off before its per-member mob
+/// shutdown report, its child-mob stand-down or its member MCP settlement.
+/// Asserted component-by-component in
 /// `advertised_shutdown_horizon_covers_every_bounded_gateway_phase`.
-pub const GATEWAY_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(337);
+pub const GATEWAY_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(377);
 
 /// The address a gateway HTTP listener binds when nothing selects another:
 /// loopback, ephemeral port. Every shipped release before the `bind` door

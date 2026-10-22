@@ -1113,9 +1113,9 @@ The stock persistent gateway also advertises a private shutdown handshake and
 its bounded `stdio_shutdown_horizon_ms` in the `meta/init` result. SDK hosts
 keep stdin and provider callbacks open until that handshake completes, then
 close the process. Honor the advertised `stdio_shutdown_horizon_ms` rather than
-hard-coding it. The current stock 392-second horizon covers an already-admitted
+hard-coding it. The current stock 432-second horizon covers an already-admitted
 provider callback, runtime event and mob drains, the mob's terminal shutdown
-report, the member MCP settlement (in
+report, the durable child-mob stand-down, the member MCP settlement (in
 the runtime shutdown and again at the gateway's executor-exit boundary), and
 bounded response-delivery/reaping margin. At the executor-exit boundary the
 gateway answers only after every member MCP server's close returned its

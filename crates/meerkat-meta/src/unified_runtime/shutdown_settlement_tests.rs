@@ -240,3 +240,35 @@ async fn a_root_that_spends_its_whole_budget_leaves_the_child_root_its_own_windo
         .expect("the held saga is released")
         .expect("the release task");
 }
+
+/// The same slow root with a durable child root that holds no child mobs, the
+/// shape a production shutdown hit: the child root is released.
+///
+/// GREEN-only row. Before the child stand-down had its own window this shape
+/// raced the root actor's exit (a close sent while the actor was still
+/// dropping its command channel went unanswered under the expired deadline),
+/// so it is not a RED; the one-child row above pins the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_root_that_spends_its_whole_budget_releases_an_empty_child_root() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let (runtime, adapter) = persistent_runtime(dir.path(), true).await;
+    let _ = coordinator(&runtime).await;
+    let released = hold_next_unregister(&adapter, Duration::from_secs(2));
+
+    let report = runtime
+        .shutdown_with_root_budget(Duration::from_secs(1))
+        .await;
+
+    assert_eq!(
+        report.child_mob_stand_down,
+        ChildMobStandDownOutcome::Released { child_mobs: 0 },
+        "{report:?}"
+    );
+    assert!(report.cleanup_completed(), "{report:?}");
+    ChildMobRootClaim::acquire(&child_mob_root(dir.path()))
+        .expect("the released root is claimable in the same process");
+    tokio::time::timeout(RELEASE_BOUND, released)
+        .await
+        .expect("the held saga is released")
+        .expect("the release task");
+}
