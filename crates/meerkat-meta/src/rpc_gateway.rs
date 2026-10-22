@@ -14613,6 +14613,34 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// On the identity-first path the identity view does not exist yet here;
     /// bind it in [`Self::bind_identity_runtime`].
     async fn bind_runtime(&self, runtime: &mut UnifiedRuntime) -> Result<(), GatewayHostError>;
+    /// Compose the agent customizer the gateway installs. Called once, on the
+    /// identity-first path only, after `bind_runtime` and before the identity
+    /// context is installed (so before [`Self::bind_identity_runtime`]), with
+    /// the customizer the gateway composed: the SDK's customizer callback when
+    /// the init registers one, wrapped by agent memory when that is
+    /// configured, or `None` when neither is. The answer is the one
+    /// customizer, the same `Arc`, that the identity runtime (members built
+    /// outside the roster bootstrap, such as a reset's fresh life), the
+    /// identity-first context (the roster bootstrap and reconcile) and the
+    /// RPC context hold, so it runs for every build the composed customizer
+    /// would have run for. A wrapper delegates `customize_build` and
+    /// `after_create` to keep what it wraps. The default returns the given
+    /// customizer unchanged.
+    ///
+    /// - `Some` -> `Ok(Some)`: the returned customizer is installed; it may
+    ///   wrap the given one.
+    /// - `None` -> `Ok(None)`: no customizer, as without this hook.
+    /// - `Some` -> `Ok(None)`, `None` -> `Ok(Some)`, or any `Err`: init is
+    ///   refused before the identity bootstrap. Whether a customizer runs is
+    ///   settled before this call, because the registry that carries
+    ///   `customize_build` tools across member rebuilds follows it, so a host
+    ///   can neither add a customizer nor drop the composed one.
+    fn compose_agent_customizer(
+        &self,
+        customizer: Option<Arc<dyn crate::identity_first::AgentCustomizer>>,
+    ) -> Result<Option<Arc<dyn crate::identity_first::AgentCustomizer>>, GatewayHostError> {
+        Ok(customizer)
+    }
     /// Bind the same native owners to the installed identity runtime. Called
     /// once, on the identity-first path only, after `bind_runtime`: the
     /// identity context is installed, so `runtime.identity_runtime()` is the
