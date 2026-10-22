@@ -1699,6 +1699,10 @@ async def test_actual_supervisor_widens_at_readiness_and_stops_within_the_report
     module = load_helper()
     operations = fixture_supervisor(package, tmp_path, module,
         FIXTURE_APP_REPORTING.replace('HORIZON', repr(reported)))
+    if reported != '432000':
+        # An earlier 397-second unit: a widening that succeeds raises the stop
+        # budget, and one that fails keeps the unit's own.
+        remote_earlier_unit(module, operations)
     widened, stops = [], []
     # No operating-system manager is reached: the unit widening is recorded only.
     def widen(horizon_ms):
