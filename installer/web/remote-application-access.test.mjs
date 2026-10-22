@@ -316,7 +316,7 @@ test("malformed metadata and unowned listeners never offer connection, including
   const entry = { ...entries[0], listener_owned: false, listener_token: null,
     reason: "The declared listener is not currently owned by this service." };
   await mountedAccess({ workshop: closed(entry) }, async ({ document, button, link, calls }) => {
-    assert.equal(button("workshop", "Connect to Workshop"), undefined); assert.equal(link("workshop") === null, true);
+    assert.equal(button("workshop", "Connect to Workshop") === undefined, true); assert.equal(link("workshop") === null, true);
     assert.match(document.body.textContent, /declared listener is not currently owned/);
     assert.equal(calls.filter((call) => call.method === "POST").length, 0);
   }, { receipt: { ...receipt, application_experiences: { ...receipt.application_experiences, entries: [entry] } } });
@@ -334,7 +334,7 @@ test("same-port close hides every alias immediately while unrelated port access 
       });
       await click("workshop", "Close connection");
       assert.equal(link("workshop") === null, true); assert.equal(link("admin") === null, true); assert.ok(link("reports"));
-      assert.equal(button("admin", "Connect to Workshop settings"), undefined);
+      assert.equal(button("admin", "Connect to Workshop settings") === undefined, true);
       assert.deepEqual(calls.find((call) => call.method === "POST").body,
         { deployment_id: receipt.deployment_id, access_id: ids[0] });
       await act(async () => pending.resolve(closed(entries[0], {
@@ -360,7 +360,7 @@ test("a delayed alias open admitted before shared close cannot restore any close
       await click("workshop", "Close connection");
       assert.equal(link("workshop") === null, true); assert.equal(link("admin") === null, true);
       await act(async () => pendingOpen.resolve(ready(entries[1])));
-      assert.equal(link("admin") === null, true); assert.equal(button("admin", "Connect to Workshop settings"), undefined);
+      assert.equal(link("admin") === null, true); assert.equal(button("admin", "Connect to Workshop settings") === undefined, true);
       assert.ok(link("reports"));
       setAccess("admin", closed(entries[1], { access_id: ids[1], status: "cleanup-needed", cleanup_confirmed: false }));
       await act(async () => pendingClose.resolve(closed(entries[0], { access_id: ids[0],
@@ -387,14 +387,14 @@ test("observation loss hides ready links without asserting the Linux application
     setRead("reports", () => { throw new Error("Synthetic observation loss."); });
     await click("reports", "Recheck connection");
     assert.equal(link("reports") === null, true); assert.ok(button("reports", "Close connection"));
-    assert.equal(button("reports", "Connect to Reports"), undefined);
+    assert.equal(button("reports", "Connect to Reports") === undefined, true);
     assert.match(document.body.textContent, /Linux application may still be running/);
     setRead("reports", null); await click("reports", "Recheck connection"); assert.ok(link("reports"));
     assert.equal(calls.filter((call) => call.method === "POST").length, 0);
   });
   await mountedAccess({}, async ({ button, setRead, click, calls }) => {
     setRead("reports", () => { throw new Error("Synthetic closed observation loss."); });
-    await click("reports", "Recheck connection"); assert.equal(button("reports", "Connect to Reports"), undefined);
+    await click("reports", "Recheck connection"); assert.equal(button("reports", "Connect to Reports") === undefined, true);
     setRead("reports", null); await click("reports", "Recheck connection"); assert.ok(button("reports", "Connect to Reports"));
     assert.equal(calls.filter((call) => call.method === "POST").length, 0);
   });

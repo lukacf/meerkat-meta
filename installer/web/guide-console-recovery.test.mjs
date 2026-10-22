@@ -135,7 +135,7 @@ test('saved conversation Reload replaces old unavailable runtime before its exac
     await click(button('Reload saved conversation'));
     assert.ok(calls.some(call => call.url === '/api/architect/status'), 'Reload observes current runtime instead of retaining stale unavailable configuration.');
     assert.equal(document.querySelector('.setup-provider-model').textContent.includes('Provider setup needed'), false);
-    assert.equal(document.querySelector('#setup-message'), editor);
+    assert.equal(document.querySelector('#setup-message') === editor, true);
     assert.equal(editor.value, draft);
     assert.equal(window.localStorage.getItem(inputKey(guide)), before);
     assert.deepEqual(calls.filter(call => call.method === 'POST'), [], 'Reload is read-only and retains the exact draft.');
@@ -177,7 +177,7 @@ test('a delayed Reload runtime body cannot replace the newer current owner or th
       await act(async () => { body.resolve({ available: false, status: 'idle', console_url: null, browser_console_url: null }); await settle(); });
       assert.equal(link()?.href, new URL(current.browser_console_url, 'http://offline.test/').href, 'The old Reload read cannot retire the newer confirmed owner.');
       assert.equal(document.querySelector('.setup-provider-model').textContent.includes('Provider setup needed'), false);
-      assert.equal(document.querySelector('#setup-message'), editor);
+      assert.equal(document.querySelector('#setup-message') === editor, true);
       assert.equal(editor.value, draft);
       assert.equal(window.localStorage.getItem(inputKey(guide)), before);
       assert.deepEqual(calls.filter(call => call.method === 'POST'), []);

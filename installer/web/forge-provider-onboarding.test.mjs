@@ -197,7 +197,7 @@ test("provider starting context: raw words stay separate and exact during unavai
     assert.equal(document.querySelector(".setup-provider-return p").textContent,
       "Next: send your idea and starting point. Both are still unsent.");
     const handoff = document.querySelector(".setup-provider-return");
-    assert.equal(document.querySelector(".setup-provider-idea").nextElementSibling, handoff,
+    assert.equal(document.querySelector(".setup-provider-idea").nextElementSibling === handoff, true,
       "The ready handoff follows the retained idea before configuration details.");
     assert.ok(handoff.compareDocumentPosition(document.querySelector(".setup-provider-model-settings")) &
       document.defaultView.Node.DOCUMENT_POSITION_FOLLOWING);
@@ -230,7 +230,7 @@ test("first-run provider handoff retains an unsent idea, treats it as text and f
     return settings();
   } }, async ({ document, calls, button }) => {
     const heading = document.querySelector(".setup-provider-heading h2");
-    assert.equal(document.activeElement, heading);
+    assert.equal(document.activeElement === heading, true);
     assert.equal(heading.textContent, "A model for your guide");
     assert.equal(document.querySelector(".setup-provider-idea p").textContent, idea);
     assert.match(document.querySelector(".setup-provider-idea").textContent, /Not sent/);
@@ -428,7 +428,7 @@ test("first-run focused Save hands keyboard focus to the incoming Start heading"
     await enter("synthetic-focus-key");
     const initiating = button("Save locally");
     initiating.focus();
-    assert.equal(document.activeElement, initiating);
+    assert.equal(document.activeElement === initiating, true);
     await click("Save locally");
     assert.equal(initiating.isConnected, false, "The visible Save control is replaced by the next step.");
     const heading = document.querySelector("h2");
@@ -489,14 +489,14 @@ test("first-run action completion preserves newer focus even after navigation bl
         : document.querySelector(".setup-provider-routine-controls summary");
       if (destination === "outside") document.body.append(newer);
       newer.focus();
-      assert.equal(document.activeElement, newer, `${destination} receives the user's newer focus.`);
+      assert.equal(document.activeElement === newer, true, `${destination} receives the user's newer focus.`);
       newer.blur();
-      assert.equal(document.activeElement, document.body);
+      assert.equal(document.activeElement === document.body, true);
       configured = true; active = action === "start";
       await act(async () => release(action === "save" ? settings({ configured, active }) : { status: "ready", available: true }));
       await settle();
       assert.equal(document.querySelector(".setup-provider").dataset.providerStep, action === "save" ? "start" : "ready");
-      assert.equal(document.activeElement, document.body, `${action} cannot reclaim focus after ${destination} navigation.`);
+      assert.equal(document.activeElement === document.body, true, `${action} cannot reclaim focus after ${destination} navigation.`);
     });
   }
 });
@@ -514,7 +514,7 @@ test("first-run model-key replacement with the same final step keeps focus on it
     await click("Save locally");
     assert.equal(document.querySelector(".setup-provider").dataset.providerStep, "start");
     assert.equal(initiating.isConnected, true);
-    assert.equal(document.activeElement, initiating, "Saving an edited key does not create a new first-run step.");
+    assert.equal(document.activeElement === initiating, true, "Saving an edited key does not create a new first-run step.");
   });
 });
 
@@ -527,7 +527,7 @@ test("first-run observed readiness without a local action preserves the user's o
     document.body.append(outside); outside.focus();
     await observeReady(true);
     assert.equal(document.querySelector("h2").textContent, "Ready for your first message");
-    assert.equal(document.activeElement, outside, "A prop observation cannot arm a local-action focus transition.");
+    assert.equal(document.activeElement === outside, true, "A prop observation cannot arm a local-action focus transition.");
   });
 });
 
@@ -546,7 +546,7 @@ test("first-run unmounted Save response cannot reclaim focus or refresh the disc
     document.body.append(outside); outside.focus();
     await act(async () => release(settings({ configured: true })));
     await settle();
-    assert.equal(document.activeElement, outside);
+    assert.equal(document.activeElement === outside, true);
     assert.equal(document.querySelector(".setup-provider") === null, true);
     assert.equal(calls.length, 2, "The stale response does not read runtime state or start work.");
   });

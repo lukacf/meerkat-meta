@@ -270,7 +270,7 @@ test('observed preparation phases update concrete progress without admitting app
       await click('Recheck original cloud setup');
       assert.equal(progress().dataset.preparationPhase, phase);
       assert.equal(progress().textContent.trim(), `Current step: ${label}`);
-      assert.equal(button('Continue to application setup'), undefined);
+      assert.equal(button('Continue to application setup') === undefined, true);
     }
     setStatus(cloud()); await click('Recheck original cloud setup');
     assert.equal(progress().textContent.trim(), 'Completed step: Cloud computer preparation verified');
@@ -288,7 +288,7 @@ test('paused or unavailable preparation shows its last step without claiming act
     setStatus({ ...cloud('resume-required'), phase: 'creating-vm' });
     await click('Recheck original cloud setup');
     assert.equal(progress().textContent.trim(), 'Last recorded step: Creating and checking your cloud computer');
-    assert.equal(button('Continue to application setup'), undefined);
+    assert.equal(button('Continue to application setup') === undefined, true);
     setStatus(() => { throw new Error('Offline cloud observation is unavailable.'); });
     await click('Recheck original cloud setup');
     assert.equal(progress().textContent.trim(), 'Last observed step: Creating and checking your cloud computer');
@@ -503,7 +503,7 @@ test('a successful cloud handoff reveals an exact private-setup link and focuses
     const destinationView = document.getElementById(`remote-cloud-${GUIDE}`); assert.ok(destinationView);
     assert.equal(destinationView.tabIndex, -1);
     assert.match(next.parentElement.textContent, /Application access checks have started/);
-    await act(async () => next.click()); assert.equal(document.activeElement, destinationView);
+    await act(async () => next.click()); assert.equal(document.activeElement === destinationView, true);
     assert.equal(calls.filter(item => item.target.endsWith('/connect')).length, 1);
     assert.equal(calls.filter(item => item.target.endsWith('/install')).length, 0);
     assert.equal(document.querySelector('.remote-private-form') === null, true);
@@ -529,7 +529,7 @@ test('the actual parent keeps cloud creation primary and package instructions on
     const manual = document.querySelector('.remote-manual-deployment'); assert.ok(manual);
     assert.equal(manual.open, false); assert.match(manual.querySelector('summary').textContent, /Manual Google Cloud.*advanced/);
     const downloads = [...document.querySelectorAll('button')].filter(node => node.textContent.includes('Download accepted GCP package'));
-    assert.equal(downloads.length, 1); assert.equal(downloads[0].closest('details'), manual);
+    assert.equal(downloads.length, 1); assert.equal(downloads[0].closest('details') === manual, true);
     assert.ok(button('Create this cloud computer')); assert.equal(button('Create this cloud computer').closest('details') === null, true);
     assert.ok([...document.querySelectorAll('.gcp-guided button')].every(node => !node.textContent.includes('Download accepted GCP package')));
     assert.equal(calls.filter(item => item.method === 'POST' && item.target.includes('/gcp-deployment/')).length, 0);
@@ -626,7 +626,7 @@ test('the actual parent retains saved cloud observation and stop when the propos
     assert.ok(button('Stop owned application'));
     for (const label of ['Create this cloud computer', 'Continue to application setup', 'Recheck and continue this setup',
       'Connect and check destination', 'Continue to private setup', 'Restart accepted application'])
-      assert.equal(button(label), undefined, label);
+      assert.equal(button(label) === undefined, true, label);
     assert.equal(document.querySelector('.remote-private-form') === null, true);
     assert.equal(document.querySelector('.remote-destination-form') === null, true);
     await click('Stop owned application');
@@ -649,7 +649,7 @@ test('the actual parent retains saved cloud stop while Agent team is selected', 
     assert.ok(button('Stop owned application'));
     for (const label of ['Check cloud access', 'Create this cloud computer', 'Continue to application setup',
       'Recheck and continue this setup', 'Connect and check destination', 'Continue to private setup', 'Restart accepted application'])
-      assert.equal(button(label), undefined, label);
+      assert.equal(button(label) === undefined, true, label);
     assert.equal(document.querySelector('.remote-private-form') === null, true);
     assert.equal(document.querySelector('.remote-destination-form') === null, true);
     await click('Stop owned application');
@@ -672,8 +672,8 @@ test('Agent team selection withdraws previously available cloud private setup an
       await act(async () => document.querySelector('input[name="deployment-source"][value="native-team"]').click());
       assert.ok(document.querySelector('.gcp-provisioning'));
       assert.ok(document.querySelector('.remote-deployment .gcp-resource-guidance'));
-      assert.equal(button(availableAction), undefined);
-      assert.equal(button('Continue to application setup'), undefined);
+      assert.equal(button(availableAction) === undefined, true);
+      assert.equal(button('Continue to application setup') === undefined, true);
       assert.equal(document.querySelector('.remote-private-form') === null, true);
       assert.equal(document.querySelector('.remote-destination-form') === null, true);
       assert.equal(calls.filter((call) => call.method === 'POST').length, 0);
@@ -691,8 +691,8 @@ test('the actual parent preserves cloud and remote custody through a Mac pivot a
     await change({ ...state, version: 5, proposal: { ...state.proposal, target: 'mac',
       project: { name: 'Local alternative', slug: 'local-alternative' } } });
     assert.equal(document.querySelector('input[name="deployment-source"]') === null, true, 'The local installation block is closed for the stale build.');
-    assert.equal(document.querySelector('.gcp-provisioning'), preparation);
-    assert.equal(document.querySelector('.remote-deployment'), application);
+    assert.equal(document.querySelector('.gcp-provisioning') === preparation, true);
+    assert.equal(document.querySelector('.remote-deployment') === application, true);
     assert.equal(calls.filter((call) => call.method === 'GET' &&
       /\/(?:gcp-deployment|remote-deployment)$/.test(new URL(call.target, 'http://localhost').pathname)).length, readsBeforePivot,
     'The same guide retains its cloud and application observers rather than remounting them.');
@@ -700,8 +700,8 @@ test('the actual parent preserves cloud and remote custody through a Mac pivot a
     setRemoteStatusFailure(new Error('Offline remote status unavailable.'));
     await click('Recheck original cloud setup');
     await click('Recheck remote status');
-    assert.equal(document.querySelector('.gcp-provisioning'), preparation);
-    assert.equal(document.querySelector('.remote-deployment'), application);
+    assert.equal(document.querySelector('.gcp-provisioning') === preparation, true);
+    assert.equal(document.querySelector('.remote-deployment') === application, true);
     assert.equal(application.dataset.remoteStatus, 'running');
     assert.match(application.textContent, /Remote observation is unavailable/);
     assert.match(document.body.textContent, /Cloud observation is unavailable/);
@@ -709,7 +709,7 @@ test('the actual parent preserves cloud and remote custody through a Mac pivot a
     assert.deepEqual([...document.querySelectorAll('.gcp-resource-guidance a')].map((link) => link.href), originalLinks);
     assert.ok(button('Stop owned application'));
     for (const label of ['Create this cloud computer', 'Continue to application setup', 'Continue to private setup', 'Restart accepted application'])
-      assert.equal(button(label), undefined, label);
+      assert.equal(button(label) === undefined, true, label);
     await click('Stop owned application');
     assert.equal(application.dataset.remoteStatus, 'stopped');
     assert.deepEqual(calls.filter((call) => call.method === 'POST'), [{
@@ -798,12 +798,12 @@ test('a durable removal request immediately withdraws sibling controls before an
     await act(async () => document.querySelector('.gcp-removal input').click());
     pendingClick('Remove VM, disk and access rule');
     assert.equal(typeof resolve, 'function');
-    assert.equal(button('Stop owned application'), undefined);
-    assert.equal(button('Continue to application setup'), undefined);
+    assert.equal(button('Stop owned application') === undefined, true);
+    assert.equal(button('Continue to application setup') === undefined, true);
     assert.equal(document.querySelector('.remote-installed-use') === null, true);
     assert.match(document.querySelector('.remote-deployment').textContent, /Application access, installation and restart are withdrawn/);
     await change({ ...state, version: 5, proposal: { ...state.proposal, target: 'mac' } });
-    assert.equal(button('Stop owned application'), undefined);
+    assert.equal(button('Stop owned application') === undefined, true);
     setStatus(removalCloud());
     await act(async () => resolve(removalCloud()));
     assert.equal(document.querySelector('[data-cloud-status]').dataset.cloudStatus, 'removing');
@@ -819,14 +819,14 @@ test('a lost removal reply and failed reads preserve identity through reload and
     await act(async () => document.querySelector('.gcp-removal input').click());
     setStatus(() => { throw new Error('Offline resource status unavailable.'); });
     await click('Remove VM, disk and access rule');
-    assert.equal(button('Stop owned application'), undefined);
+    assert.equal(button('Stop owned application') === undefined, true);
     assert.match(document.body.textContent, /cloud charges may continue/);
     await remount();
     assert.equal(gcpLoadRemovalIntent(store, GUIDE).request_id, OTHER_REQUEST);
     assert.equal(calls.filter((call) => call.method === 'POST').length, 1);
-    assert.equal(button('Create this cloud computer'), undefined);
+    assert.equal(button('Create this cloud computer') === undefined, true);
     setStatus(cloud()); await click('Recheck removal');
-    assert.equal(button('Continue to application setup'), undefined);
+    assert.equal(button('Continue to application setup') === undefined, true);
     setHandler(() => removalCloud('removal-required', OTHER_REQUEST, { vm: { status: 'absent' }, disk: { status: 'absent' }, firewall: { status: 'checking' } }));
     await click('Continue removal');
     assert.equal(document.querySelectorAll('[data-removal-resource]').length, 3);
@@ -844,7 +844,7 @@ test('completed removal keeps its original receipt without installation, restart
     assert.equal(document.querySelector('.remote-private-form') === null, true);
     assert.equal(document.querySelector('.remote-installed-use') === null, true);
     for (const label of ['Create this cloud computer', 'Review cloud removal', 'Continue removal', 'Continue to application setup',
-      'Continue to private setup', 'Restart accepted application', 'Stop owned application']) assert.equal(button(label), undefined, label);
+      'Continue to private setup', 'Restart accepted application', 'Stop owned application']) assert.equal(button(label) === undefined, true, label);
     setStatus(() => { throw new Error('Offline recheck failed.'); }); await click('Recheck removal');
     assert.equal(document.querySelector('[data-cloud-status]').dataset.cloudStatus, 'removed');
     assert.match(document.body.textContent, /Last observed: Confirmed absent/);

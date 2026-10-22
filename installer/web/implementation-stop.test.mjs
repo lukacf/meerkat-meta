@@ -375,7 +375,7 @@ test('checker preparation response recovery follows an existing preparation unti
     host.value = { status: 'preparing', can_prepare: false, detail: 'The original task is still preparing.' };
     await ui.flush(() => ui.button('Check preparation status').click());
     assert.equal(host.settled, false); assert.equal(ui.button('Build application').disabled, true);
-    assert.equal(ui.button('Prepare app checks'), undefined);
+    assert.equal(ui.button('Prepare app checks') === undefined, true);
     host.value = { status: 'ready', can_prepare: false, detail: 'The same task finished.' };
     await ui.pollChecker();
     assert.equal(host.settled, false); assert.equal(ui.button('Build application').disabled, false);
@@ -504,7 +504,7 @@ test("mounted running feedback survives review, reconnect and terminal remount u
       /not sent to the running build/);
     await ui.edit(note);
     assert.equal(ui.savedDraft(), note);
-    assert.equal(ui.button(/Resume saved build|Build application|Continue implementation/), undefined);
+    assert.equal(ui.button(/Resume saved build|Build application|Continue implementation/) === undefined, true);
     await ui.poll(receipt(initial.build_id, { phase: "independent_review" }));
     assert.equal(ui.text(), note);
     ui.failNextRead();
@@ -541,7 +541,7 @@ test("an unavailable first build read offers status recovery rather than a new b
   await mounted({ initial: saved, initialStatusResponse: { ok: false, status: 503,
     json: async () => ({ detail: "Build status is temporarily unavailable." }) } }, async ui => {
     assert.match(ui.dom.window.document.querySelector("h2").textContent, /Build status is unavailable/);
-    assert.equal(ui.button("Build application"), undefined);
+    assert.equal(ui.button("Build application") === undefined, true);
     const refresh = ui.button("Refresh build status");
     assert.ok(refresh && !refresh.disabled);
     assert.ok(refresh.classList.contains("primary"));
@@ -560,7 +560,7 @@ test("an unavailable first build read offers status recovery rather than a new b
 test("the first pending status read cannot start a build; a checked absence enables the explicit action", async () => {
   const pending = deferred();
   await mounted({ initialStatusResponse: pending.promise }, async ui => {
-    assert.equal(ui.button("Build application"), undefined);
+    assert.equal(ui.button("Build application") === undefined, true);
     const checking = ui.button("Checking build status...");
     assert.ok(checking && checking.disabled);
     await ui.flush(() => checking.click());
@@ -604,7 +604,7 @@ test("a delayed failed first read cannot replace the new selected guide's checke
     await ui.flush(() => pending.resolve({ ok: false, status: 503,
       json: async () => ({ detail: "Old guide is unavailable." }) }));
     assert.ok(ui.button("Build application") && !ui.button("Build application").disabled);
-    assert.equal(ui.button("Refresh build status"), undefined);
+    assert.equal(ui.button("Refresh build status") === undefined, true);
     assert.equal(ui.text(), otherDraft);
     assert.equal(ui.calls.filter(call => call.method === "POST").length, 0);
   });
@@ -762,7 +762,7 @@ for (const changes of [{ current: false }, { guide_id: otherState.id }, { guide_
   { status: "failed", cleanup_custody_lost: true }]) {
   test(`mounted runtime refresh is absent for an unavailable checked build ${JSON.stringify(changes)}`, async () => {
     await mounted({ initial: { ...acceptedRuntimeBuild(), ...changes }, onPost: () => assert.fail("Unavailable runtime refresh") }, async (ui) => {
-      assert.equal(ui.button("Rebuild with updated runtime"), undefined);
+      assert.equal(ui.button("Rebuild with updated runtime") === undefined, true);
       assert.equal(ui.calls.filter((call) => call.method === "POST").length, 0);
     });
   });
@@ -780,7 +780,7 @@ test("mounted Stop sends the exact selected version/build once on double activat
     await ui.flush(() => { stop.click(); stop.click(); });
     assert.equal(ui.calls.filter((call) => call.method === "POST").length, 1);
     assert.ok(ui.button(/Stopping/).disabled);
-    assert.equal(ui.button(/Resume saved build|Build application|Continue implementation/), undefined);
+    assert.equal(ui.button(/Resume saved build|Build application|Continue implementation/) === undefined, true);
     assert.equal(ui.savedDraft(), initialDraft);
     await ui.flush(() => pending.resolve(response(receipt(initial.build_id,
       { status: "interrupted", worker_stop_confirmed: true, cleanup_pending: false }))));
@@ -804,7 +804,7 @@ for (const status of ["interrupted", "completed"]) test(`mounted terminal ${stat
   } }, async (ui) => {
     const retry = ui.button("Retry cleanup");
     assert.ok(retry && !retry.disabled, "A terminal pending cleanup needs a usable retry, not a permanently disabled Stop");
-    assert.equal(ui.button(/Resume saved build|Build application|Continue implementation|Review and improve|Download checked|Try saved|Install saved/), undefined);
+    assert.equal(ui.button(/Resume saved build|Build application|Continue implementation|Review and improve|Download checked|Try saved|Install saved/) === undefined, true);
     assert.equal([...ui.dom.window.document.querySelectorAll("a")].some((item) => item.textContent.includes("Open installed console")), false);
     assert.equal(ui.savedDraft(), initialDraft);
     await ui.flush(() => retry.click());
@@ -818,9 +818,9 @@ for (const status of ["interrupted", "completed"]) test(`mounted terminal ${stat
 test("mounted admitted cleanup in progress prevents duplicate cleanup and Resume", async () => {
   await mounted({ initial: receipt("closing-A", { status: "interrupted", cleanup_pending: true,
     cleanup_in_progress: true, stop_requested: true }), onPost: () => assert.fail("Closing cleanup cannot be re-admitted") }, async (ui) => {
-    assert.equal(ui.button("Retry cleanup"), undefined);
+    assert.equal(ui.button("Retry cleanup") === undefined, true);
     assert.ok(ui.button(/Stopping|Closing|Cleaning/).disabled);
-    assert.equal(ui.button(/Resume saved build|Build application|Continue implementation/), undefined);
+    assert.equal(ui.button(/Resume saved build|Build application|Continue implementation/) === undefined, true);
     assert.equal(ui.savedDraft(), initialDraft);
   });
 });
@@ -899,13 +899,13 @@ for (const outcome of ["admission", "error"]) test(`saved-build response recover
     await ui.edit(latestDraft);
     const show = ui.button("Show saved build");
     assert.ok(show && !show.disabled, "A known current newer terminal build offers explicit recovery from the pending response.");
-    assert.equal(ui.button("Try saved application"), undefined, "The original pending presentation still gates follow-on navigation.");
+    assert.equal(ui.button("Try saved application") === undefined, true, "The original pending presentation still gates follow-on navigation.");
     await ui.flush(() => show.click());
     assert.equal(ui.current().build_id, newer.build_id);
     assert.equal(ui.text(), latestDraft);
     assert.equal(ui.savedDraft(), latestDraft);
-    assert.equal(ui.button("Show saved build"), undefined);
-    assert.equal(ui.button("Starting builder..."), undefined);
+    assert.equal(ui.button("Show saved build") === undefined, true);
+    assert.equal(ui.button("Starting builder...") === undefined, true);
     assert.ok(ui.button("Try saved application") && !ui.button("Try saved application").disabled);
     assert.equal(ui.calls.filter(call => call.method === "POST").length, 1, "Showing a saved build sends no retry, stop or new build.");
     const finalNote = latestDraft + "\n  Edited after showing the saved build.  ";
@@ -947,7 +947,7 @@ test("saved-build response recovery excludes active, predecessor, stale, unconfi
       await ui.flush(() => ui.button("Resume saved build").click());
       if (variant.readFailure) ui.failNextRead();
       await ui.poll(variant.value);
-      assert.equal(ui.button("Show saved build"), undefined, `${variant.name} must not release an original pending admission.`);
+      assert.equal(ui.button("Show saved build") === undefined, true, `${variant.name} must not release an original pending admission.`);
       assert.equal(ui.text(), initialDraft);
       assert.equal(ui.savedDraft(), initialDraft);
       assert.equal(ui.calls.filter(call => call.method === "POST").length, 1);
@@ -966,7 +966,7 @@ test("saved-build response recovery cannot transfer to another guide or a revise
       assert.ok(ui.button("Show saved build"));
       await ui.navigate(next);
       await ui.edit(otherDraft);
-      assert.equal(ui.button("Show saved build"), undefined);
+      assert.equal(ui.button("Show saved build") === undefined, true);
       await ui.flush(() => pendingBody.resolve(receipt("drift-old-response", { status: "queued" })));
       assert.equal(ui.text(), otherDraft);
       assert.equal(ui.savedDraft(next.id), otherDraft);
@@ -1000,7 +1000,7 @@ test("saved-build response recovery checks the original selection owner even bef
     assert.equal(ui.text(), initialDraft);
     gate.finish(nextSelection);
     await ui.rerender();
-    assert.equal(ui.button("Show saved build"), undefined, "A later selection token cannot acquire the original response owner.");
+    assert.equal(ui.button("Show saved build") === undefined, true, "A later selection token cannot acquire the original response owner.");
     assert.equal(ui.calls.filter(call => call.method === "POST").length, 1);
     await ui.flush(() => pendingBody.resolve(receipt("selection-old-response", { status: "queued" })));
     assert.equal(ui.current().build_id, newer.build_id);
@@ -1073,8 +1073,8 @@ test("mounted cleanup custody loss blocks retry and new actions while retaining 
   await mounted({ initial, onPost: () => assert.fail("Lost custody cannot authorize a build or cleanup") }, async (ui) => {
     const unavailable = ui.button("Cleanup unavailable");
     assert.ok(unavailable && unavailable.disabled);
-    assert.equal(ui.button("Retry cleanup"), undefined);
-    assert.equal(ui.button(/Resume saved build|Build application|Continue implementation|Review and improve|Download checked|Try saved|Install saved/), undefined);
+    assert.equal(ui.button("Retry cleanup") === undefined, true);
+    assert.equal(ui.button(/Resume saved build|Build application|Continue implementation|Review and improve|Download checked|Try saved|Install saved/) === undefined, true);
     assert.equal([...ui.dom.window.document.querySelectorAll("a")].some((item) =>
       item.textContent.includes("Open installed console")), false);
     assert.ok(ui.button("Inspect 1 source files"), "Lost cleanup custody must retain inspection of saved source");

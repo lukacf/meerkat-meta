@@ -388,7 +388,7 @@ test('explicit provider onboarding retains save and startup handoffs in the moun
       input.dispatchEvent(new document.defaultView.Event('change', { bubbles: true }));
     });
     await act(async () => { buttonNamed(pane(), 'Save locally').click(); await settle(); });
-    assert.equal(pane(), original, 'Saved credentials do not retire the mounted onboarding owner.');
+    assert.equal(pane() === original, true, 'Saved credentials do not retire the mounted onboarding owner.');
     assert.match(pane().textContent, /Saved privately on the computer running Forge/);
     assert.equal(pane().querySelector('input').value, '');
     assert.equal(buttonNamed(pane(), 'Start guide').disabled, false);
@@ -397,16 +397,16 @@ test('explicit provider onboarding retains save and startup handoffs in the moun
     await act(async () => { buttonNamed(pane(), 'Start guide').click(); await settle(); });
     assert.equal(buttonNamed(pane(), 'Back to my idea').disabled, true);
     await pollProvider();
-    assert.equal(pane(), original, 'An available but starting observation preserves the startup owner.');
+    assert.equal(pane() === original, true, 'An available but starting observation preserves the startup owner.');
     assert.ok(buttonNamed(pane(), 'Starting guide...'));
     await act(async () => { headerProvider.click(); await settle(); });
-    assert.equal(pane(), original, 'The header action cannot retire an owned startup operation.');
+    assert.equal(pane() === original, true, 'The header action cannot retire an owned startup operation.');
     assert.equal(buttonNamed(pane(), 'Back to my idea').disabled, true);
     assert.equal(calls.filter(call => call.url === '/api/architect/start').length, 1);
     runtime = { available: true, status: 'ready' };
     await act(async () => { finishStart(structuredClone(runtime)); await settle(); });
     await act(async () => settle());
-    assert.equal(pane(), original, 'The confirmed-ready message remains available until explicit close.');
+    assert.equal(pane() === original, true, 'The confirmed-ready message remains available until explicit close.');
     assert.match(pane().textContent, /Setup team ready/);
     assert.equal(buttonNamed(pane(), 'Back to my idea').disabled, false);
     assert.equal(calls.filter(call => call.url === '/api/architect/start').length, 1);
@@ -557,7 +557,7 @@ test('optional starting context stays separate from writing and is consumed only
     await clickStarting(document, 'Repetitive work');
     assert.equal(textarea().value, '', 'No stock prose is inserted into the composer.');
     assert.equal(helper().dataset.open, 'false');
-    assert.equal(document.activeElement, document.querySelector('#setup-send'), 'A choices-only start exposes Send without opening the native editor.');
+    assert.equal(document.activeElement === document.querySelector('#setup-send'), true, 'A choices-only start exposes Send without opening the native editor.');
     assert.match(document.querySelector('.forge-starting-context__sentence').textContent, /For a team, help with repetitive work\./);
     const saved = JSON.parse(values.get(inputKey(anonymous)));
     assert.equal(saved.draft, '');
@@ -581,7 +581,7 @@ test('first-minute mobile choices-only completion focuses Send while explicit Wr
     await clickStarting(document, 'Answer two questions'); await clickStarting(document, 'My household'); await clickStarting(document, 'Keeping track of things');
     const send = document.querySelector('#setup-send'), helper = document.querySelector('.forge-starting-conversation');
     const saved = JSON.parse(values.get(inputKey(anonymous)));
-    assert.equal(document.activeElement, send, 'Completing mobile choices avoids opening the editor keyboard.');
+    assert.equal(document.activeElement === send, true, 'Completing mobile choices avoids opening the editor keyboard.');
     assert.equal(send.disabled, false); assert.equal(send.textContent.trim(), 'Send to guide');
     assert.equal(editor.value, ''); assert.equal(document.querySelectorAll('textarea').length, 1);
     assert.equal(helper.dataset.open, 'false'); assert.equal(helper.dataset.route, 'choose');
@@ -589,9 +589,9 @@ test('first-minute mobile choices-only completion focuses Send while explicit Wr
     assert.equal(document.getElementById('setup-idea-shortcuts') === null, true, 'Mobile retains ordinary multiline writing rather than desktop Enter guidance.');
     assert.deepEqual(saved.starting_help, { version: 2, audience_id: 'household', kind_id: 'organizing' });
     await clickStarting(document, 'In my own words');
-    assert.equal(document.activeElement, editor, 'Only explicit Write focuses the native editor after a choices-only start.');
+    assert.equal(document.activeElement === editor, true, 'Only explicit Write focuses the native editor after a choices-only start.');
     assert.equal(helper.dataset.route, 'write'); assert.equal(helper.dataset.open, 'false');
-    assert.equal(document.querySelector('#setup-message'), editor);
+    assert.equal(document.querySelector('#setup-message') === editor, true);
     assert.deepEqual(JSON.parse(values.get(inputKey(anonymous))), saved, 'Changing route preserves the exact draft and committed choices.');
     assert.deepEqual(calls.filter(call => call.method !== 'GET'), [], 'Completion and explicit Write never send a turn or start runtime work.');
   }, { available: true, narrow: true, runAnimationFrames: true });
@@ -617,7 +617,7 @@ test('the native editor and optional thinking helper never replace or send the e
     await typeStarting(document, ' \n\t ');
     await clickStarting(document, 'Answer two questions');
     assert.equal(helper.querySelector('.forge-starting-conversation__draft') === null, true, 'Whitespace-only writing has no draft excerpt.');
-    assert.equal(document.querySelector('#setup-message'), editor);
+    assert.equal(document.querySelector('#setup-message') === editor, true);
     assert.equal(writeRoute.getAttribute('aria-pressed'), 'false');
     assert.equal(chooseRoute.getAttribute('aria-pressed'), 'true');
     assert.equal(writeRoute.closest('[hidden]') === null, true, 'Writing remains available while choices are open.');
@@ -625,14 +625,14 @@ test('the native editor and optional thinking helper never replace or send the e
     assert.equal(helper.dataset.open, 'false');
     assert.equal(writeRoute.getAttribute('aria-pressed'), 'true');
     assert.equal(chooseRoute.getAttribute('aria-pressed'), 'false');
-    assert.equal(document.activeElement, editor, 'The Write route returns focus through the guarded native editor handoff.');
-    assert.equal(document.querySelector('#setup-message'), editor, 'Switching routes keeps the original native editor mounted.');
+    assert.equal(document.activeElement === editor, true, 'The Write route returns focus through the guarded native editor handoff.');
+    assert.equal(document.querySelector('#setup-message') === editor, true, 'Switching routes keeps the original native editor mounted.');
     await typeStarting(document, written);
     editor.focus();
-    assert.equal(document.activeElement, editor, 'Writing deliberately returns focus to the existing editor.');
+    assert.equal(document.activeElement === editor, true, 'Writing deliberately returns focus to the existing editor.');
     assert.equal(document.querySelectorAll('textarea').length, 1, 'The opening has one user-owned editor.');
     assert.equal(editor.value, written);
-    assert.equal(document.querySelector('.forge-starting-conversation'), helper);
+    assert.equal(document.querySelector('.forge-starting-conversation') === helper, true);
     assert.equal(helper.dataset.open, 'false', 'Writing does not open or answer the context questions.');
     assert.equal(JSON.parse(values.get(inputKey(guide))).starting_help, undefined);
     assert.deepEqual(calls.filter(call => call.method !== 'GET'), []);
@@ -642,41 +642,41 @@ test('the native editor and optional thinking helper never replace or send the e
     const contentId = think.getAttribute('aria-controls');
     assert.equal(document.getElementById(contentId).hidden, true);
     await clickStarting(document, 'Answer two questions');
-    assert.equal(document.querySelector('.forge-starting-conversation'), helper, 'Thinking opens the same mounted helper.');
+    assert.equal(document.querySelector('.forge-starting-conversation') === helper, true, 'Thinking opens the same mounted helper.');
     assert.equal(helper.dataset.open, 'true');
     assert.equal(document.getElementById(contentId).hidden, false, 'The invitation opens the controlled questions.');
     const excerpt = helper.querySelector('.forge-starting-conversation__draft');
     assert.equal(excerpt.querySelector('span').textContent, 'Your idea - not sent');
     assert.equal(excerpt.querySelector('p').textContent, written, 'The excerpt renders every draft character as literal React text.');
     assert.equal(excerpt.querySelector('button, input, textarea, [contenteditable], script') === null, true, 'The excerpt is read-only and creates no extra editor or executable markup.');
-    assert.equal(document.querySelector('#setup-message'), editor);
+    assert.equal(document.querySelector('#setup-message') === editor, true);
     assert.equal(helper.querySelector('h3').textContent, 'Who is it for?');
-    assert.equal(document.activeElement, helper.querySelector('h3'));
+    assert.equal(document.activeElement === helper.querySelector('h3'), true);
     assert.equal(startingContextButton(document, 'A team').getAttribute('aria-pressed'), 'false');
     await clickStarting(document, 'A team');
     assert.equal(helper.querySelector('h3').textContent, 'What would help most?');
     await clickStarting(document, 'Answer two questions');
     assert.equal(helper.querySelector('h3').textContent, 'What would help most?', 'Selecting the already open Choose route does not reset staged answers.');
     assert.equal(invitation.querySelectorAll('button').length, 2);
-    assert.equal(helper.querySelector('.forge-starting-conversation__draft'), excerpt, 'Moving between questions retains the same read-only excerpt.');
+    assert.equal(helper.querySelector('.forge-starting-conversation__draft') === excerpt, true, 'Moving between questions retains the same read-only excerpt.');
     assert.equal(excerpt.querySelector('p').textContent, written);
-    assert.equal(document.querySelector('#setup-message'), editor);
+    assert.equal(document.querySelector('#setup-message') === editor, true);
     assert.equal(editor.value, written, 'The first choice never inserts context prose.');
     assert.equal(JSON.parse(values.get(inputKey(guide))).starting_help, undefined);
     await clickStarting(document, 'Repetitive work');
     const context = document.querySelector('.forge-starting-context');
     assert.equal(context.querySelector('.forge-starting-context__heading').textContent, 'Starting pointNot sent',
       'The committed choices visibly remain unsent context.');
-    assert.equal(document.querySelector('.forge-starting-conversation'), helper);
-    assert.equal(document.querySelector('#setup-message'), editor);
+    assert.equal(document.querySelector('.forge-starting-conversation') === helper, true);
+    assert.equal(document.querySelector('#setup-message') === editor, true);
     assert.equal(document.querySelectorAll('textarea').length, 1);
     assert.equal(editor.value, written);
-    assert.equal(document.activeElement, editor);
+    assert.equal(document.activeElement === editor, true);
     const saved = JSON.parse(values.get(inputKey(guide)));
     assert.equal(saved.draft, written);
     assert.deepEqual(saved.starting_help, { version: 2, audience_id: 'team', kind_id: 'repetitive' });
     assert.equal(helper.querySelector('.forge-starting-conversation__draft') === null, true, 'Closing choices removes the excerpt when the editor returns.');
-    assert.equal(helper.querySelector('.forge-starting-conversation__invitation'), invitation, 'Applied context retains both mounted route controls.');
+    assert.equal(helper.querySelector('.forge-starting-conversation__invitation') === invitation, true, 'Applied context retains both mounted route controls.');
     assert.equal(writeRoute.getAttribute('aria-pressed'), 'false');
     assert.equal(chooseRoute.getAttribute('aria-pressed'), 'true');
     assert.equal(chooseRoute.closest('[hidden]') === null, true);
@@ -690,9 +690,9 @@ test('the native editor and optional thinking helper never replace or send the e
     assert.equal(helper.querySelector('.forge-starting-conversation__draft p').textContent, written);
     await clickStarting(document, 'In my own words');
     assert.equal(helper.querySelector('.forge-starting-conversation__draft') === null, true);
-    assert.equal(document.querySelector('#setup-message'), editor, 'Cancelling a choice edit keeps the same native textarea.');
+    assert.equal(document.querySelector('#setup-message') === editor, true, 'Cancelling a choice edit keeps the same native textarea.');
     assert.equal(editor.value, written);
-    assert.equal(document.activeElement, editor);
+    assert.equal(document.activeElement === editor, true);
     assert.deepEqual(JSON.parse(values.get(inputKey(guide))), saved, 'The read-only excerpt and cancelled choice edit do not change saved writing or context.');
     assert.deepEqual(calls.filter(call => call.method !== 'GET'), [], 'Neither starting path sends the idea or changes provider settings.');
   }, { available: true, runAnimationFrames: true });
@@ -861,11 +861,11 @@ test('opening the desktop proposal selects its retained mobile pane while closin
     assert.ok(shell.classList.contains('setup-mobile-plan'),'The existing responsive CSS must keep the expanded descendant visible on a later narrow viewport');
     assert.equal(document.querySelector('.setup-mobile-tabs button[aria-pressed="true"]').textContent.trim(),'Your team 1');
     assert.equal(expand.getAttribute('aria-expanded'),'true');
-    assert.equal(document.querySelector('[data-proposal-snapshot]'),preview,'Selecting the pane does not remount its preview');
+    assert.equal(document.querySelector('[data-proposal-snapshot]') === preview, true,'Selecting the pane does not remount its preview');
     await act(async()=>{expand.click();await settle();});
     assert.equal(expand.getAttribute('aria-expanded'),'false');assert.ok(shell.classList.contains('setup-mobile-plan'));
-    assert.equal(document.querySelector('[data-proposal-snapshot]'),preview);
-    assert.equal(document.querySelector('#setup-message'),draft);assert.equal(draft.value,'  Keep this thought unsent\nfor later  ');
+    assert.equal(document.querySelector('[data-proposal-snapshot]') === preview, true);
+    assert.equal(document.querySelector('#setup-message') === draft, true);assert.equal(draft.value,'  Keep this thought unsent\nfor later  ');
     assert.deepEqual(calls.filter(call=>call.method!=='GET'),writes,'Opening and closing admit no work; pending read-only observations may settle');assert.equal(publications.length,publicationCount);
     assert.equal(JSON.stringify(current()),source,'Presentation selection does not change saved guide state');
   });
@@ -912,12 +912,12 @@ test('starting context field edit: answered review stays closed while individual
     assert.equal(helper().querySelector('.forge-starting-conversation__progress-marks') === null, true, 'A single-field edit does not promise two questions.');
     await clickStarting(document, 'Cancel change');
     assert.deepEqual(stored(), { version: 2, audience_id: 'team', kind_id: 'repetitive' }, 'Cancelling before a field choice keeps both applied answers.');
-    assert.equal(document.activeElement, audienceTrigger, 'Cancelling returns to the owned review field instead of opening the editor.');
+    assert.equal(document.activeElement === audienceTrigger, true, 'Cancelling returns to the owned review field instead of opening the editor.');
     await clickStarting(document, 'Change who this helps: A team'); await clickStarting(document, 'My household');
     assert.equal(helper().dataset.open, 'false', 'One audience selection completes the audience-only edit.');
     assert.deepEqual(stored(), { version: 2, audience_id: 'household', kind_id: 'repetitive' });
     assert.equal(context.querySelector('.forge-starting-context__sentence').textContent, 'For my household, help with repetitive work.');
-    assert.equal(document.activeElement, audienceTrigger, 'An audience-only commit returns to its original review field.');
+    assert.equal(document.activeElement === audienceTrigger, true, 'An audience-only commit returns to its original review field.');
     assert.equal(editor.value, written);
     assert.match(helper().querySelector('[role="status"]').textContent, /Starting point updated/);
     await clickStarting(document, 'Your two answers');
@@ -933,7 +933,7 @@ test('starting context field edit: answered review stays closed while individual
     await clickStarting(document, 'Keeping track of things');
     assert.deepEqual(stored(), { version: 2, audience_id: 'personal', kind_id: 'organizing' }, 'A kind edit preserves the applied audience.');
     assert.equal(helper().dataset.open, 'false');
-    assert.equal(document.activeElement, kindTrigger);
+    assert.equal(document.activeElement === kindTrigger, true);
     assert.equal(editor.value, written);
     await clickStarting(document, 'Change who this helps: Just me'); await clickStarting(document, "I'm still exploring");
     await clickStarting(document, 'Change the kind of work: Keeping track of things'); await clickStarting(document, 'Still exploring');
@@ -970,7 +970,7 @@ for (const scenario of ['ordinary handoff', 'focus elsewhere', 'selected guide c
         await reload(other.id); retainedFocus = document.activeElement;
       }
       await flushAnimationFrames();
-      assert.equal(document.activeElement, scenario === 'ordinary handoff' ? editTrigger : retainedFocus,
+      assert.equal(document.activeElement === (scenario === 'ordinary handoff' ? editTrigger : retainedFocus), true,
         'An audience-only commit restores its captured review trigger only while deferred focus custody remains owned.');
       assert.deepEqual(calls.filter(call => call.method !== 'GET'), []);
     }, { available: true, holdAnimationFrames: true, savedGuides: [guide, other] });
@@ -1000,13 +1000,13 @@ test('starting context reload: exact choices restore independently and revision 
     assert.deepEqual(JSON.parse(values.get(inputKey(anonymous))).starting_help, { version: 2, audience_id: 'many', kind_id: 'organizing' },
       'An audience-only edit keeps the previously chosen kind of work.');
     assert.equal(document.querySelector('.forge-starting-conversation').dataset.open, 'false');
-    assert.equal(document.activeElement, audienceTrigger);
+    assert.equal(document.activeElement === audienceTrigger, true);
     const kindTrigger = startingContextButton(document, 'Change the kind of work: Keeping track of things');
     await clickStarting(document, 'Change the kind of work: Keeping track of things'); await clickStarting(document, 'Repetitive work');
     assert.equal(editor.value, written);
     assert.equal(JSON.parse(values.get(inputKey(anonymous))).draft, written);
     assert.deepEqual(JSON.parse(values.get(inputKey(anonymous))).starting_help, { version: 2, audience_id: 'many', kind_id: 'repetitive' });
-    assert.equal(document.activeElement, kindTrigger);
+    assert.equal(document.activeElement === kindTrigger, true);
     assert.equal(document.querySelectorAll('textarea').length, 1);
     assert.equal(document.querySelector('script') === null, true);
     assert.deepEqual(calls.filter(call => call.method !== 'GET'), []);
@@ -1030,12 +1030,12 @@ test('starting context: cancel restores applied choices and removal never change
     await clickStarting(document, 'Change who this helps: A team');
     await act(async () => { document.querySelector('.forge-starting-conversation').dispatchEvent(new document.defaultView.KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); await settle(); });
     assert.match(document.querySelector('.forge-starting-context__sentence').textContent, /For a team, help with keeping track/);
-    assert.equal(document.activeElement, editTrigger, 'Escape returns to the same committed field without applying a replacement answer.');
-    assert.equal(document.querySelector('.forge-starting-example'), example, 'Cancelling a staged edit retains the applied inspiration.');
+    assert.equal(document.activeElement === editTrigger, true, 'Escape returns to the same committed field without applying a replacement answer.');
+    assert.equal(document.querySelector('.forge-starting-example') === example, true, 'Cancelling a staged edit retains the applied inspiration.');
     assert.match(example.textContent, /Keep track of decisions and deadlines for a project/);
     assert.equal(document.querySelector('#setup-message').value, written);
     await clickStarting(document, 'Change the kind of work: Keeping track of things'); await clickStarting(document, 'Repetitive work');
-    assert.equal(document.querySelector('.forge-starting-example'), example, 'Changing context updates the retained example in place.');
+    assert.equal(document.querySelector('.forge-starting-example') === example, true, 'Changing context updates the retained example in place.');
     assert.match(example.textContent, /Turn scattered notes into a clear weekly update/);
     assert.equal(document.querySelector('#setup-message').value, written, 'Updated inspiration leaves exact user writing untouched.');
     await clickStarting(document, 'Remove starting point');
@@ -1439,7 +1439,7 @@ test('first-minute editor descriptions follow context, provider visibility and m
     await clickStarting(document, 'Answer two questions'); await clickStarting(document, 'A team'); await clickStarting(document, 'Keeping track of things');
     assert.match(descriptions(['setup-idea-optional', 'setup-message-starting-example', 'setup-after-send', 'setup-idea-shortcuts']),
       /Optional.*Keep track of decisions and deadlines.*Your two answers stay here until you send/s);
-    assert.equal(document.activeElement, document.querySelector('#setup-send'));
+    assert.equal(document.activeElement === document.querySelector('#setup-send'), true);
     assert.equal(editor.placeholder, 'For example: Keep track of decisions and deadlines for a project.');
     await clickStarting(document, 'Change the kind of work: Keeping track of things'); await clickStarting(document, 'Repetitive work');
     assert.match(descriptions(['setup-idea-optional', 'setup-message-starting-example', 'setup-after-send', 'setup-idea-shortcuts']), /Turn scattered notes into a clear weekly update/);
@@ -1450,12 +1450,12 @@ test('first-minute editor descriptions follow context, provider visibility and m
     await act(async () => { settings.click(); await settle(); });
     assert.ok(document.querySelector('.setup-provider'));
     descriptions([]);
-    assert.equal(document.querySelector('#setup-message'), editor);
+    assert.equal(document.querySelector('#setup-message') === editor, true);
     assert.equal(editor.value, written);
     await act(async () => { buttonNamed(document.querySelector('.setup-provider'), 'Back to my idea').click(); await settle(); await settle(); });
     assert.match(descriptions(['setup-idea-optional', 'setup-message-starting-example', 'setup-after-send', 'setup-idea-shortcuts']), /Optional.*Turn scattered notes.*Nothing is sent until/s);
     assert.equal(editor.value, written);
-    assert.equal(document.activeElement, editor);
+    assert.equal(document.activeElement === editor, true);
     await clickStarting(document, 'Remove starting point');
     descriptions(['setup-after-send', 'setup-idea-shortcuts']);
     assert.equal(document.querySelector('.forge-starting-example') === null, true);
@@ -1500,12 +1500,12 @@ for (const scenario of ['ordinary handoff', 'hidden choice body fallback', 'focu
       let retainedFocus;
       if (scenario === 'hidden choice body fallback') {
         chosen.blur();
-        assert.equal(document.activeElement, document.body, 'The browser may drop focus when the chosen helper control becomes hidden.');
+        assert.equal(document.activeElement === document.body, true, 'The browser may drop focus when the chosen helper control becomes hidden.');
       } else if (scenario === 'focus elsewhere') {
         retainedFocus = [...document.querySelectorAll('button')].find(button => button.textContent.trim().startsWith('Guide settings'));
         assert.ok(retainedFocus, 'Another real keyboard action remains available.');
         retainedFocus.focus();
-        assert.equal(document.activeElement, retainedFocus);
+        assert.equal(document.activeElement === retainedFocus, true);
       } else if (scenario === 'new draft') {
         await typeStarting(document, written + ' Newer user writing.');
         retainedFocus = [...document.querySelectorAll('button')].find(button => button.textContent.trim().startsWith('Guide settings'));
@@ -1515,7 +1515,7 @@ for (const scenario of ['ordinary handoff', 'hidden choice body fallback', 'focu
         retainedFocus = document.activeElement;
       }
       await flushAnimationFrames();
-      if (scenario === 'ordinary handoff' || scenario === 'hidden choice body fallback') assert.equal(document.activeElement, editor,
+      if (scenario === 'ordinary handoff' || scenario === 'hidden choice body fallback') assert.equal(document.activeElement === editor, true,
         'The accepted context transfers focus to the original composer after commit.');
       else assert.ok(document.activeElement === retainedFocus,
         'An old deferred context handoff must not take focus after the user moves elsewhere.');
@@ -1543,27 +1543,27 @@ for (const scenario of ['ordinary handoff', 'hidden cancel body fallback', 'focu
       await clickStarting(document, 'Back to my words');
       assert.equal(helper.dataset.open, 'false', 'Cancellation commits the closed helper before the focus frame.');
       assert.equal(cancel.closest('[hidden]')?.hidden, true, 'The old Back action is now inside the hidden question region.');
-      assert.equal(document.querySelector('#setup-message'), editor, 'The exact native editor remains mounted through cancellation.');
+      assert.equal(document.querySelector('#setup-message') === editor, true, 'The exact native editor remains mounted through cancellation.');
       assert.equal(document.querySelectorAll('textarea').length, 1);
       assert.equal(editor.value, written);
       assert.equal(JSON.parse(values.get(inputKey(guide))).starting_help, undefined,
         'A partly answered helper does not commit separate context when cancelled.');
-      assert.equal(document.activeElement, cancel, 'Returning to the editor waits until the queued visibility handoff.');
+      assert.equal(document.activeElement === cancel, true, 'Returning to the editor waits until the queued visibility handoff.');
 
       let retainedFocus;
       if (scenario === 'hidden cancel body fallback') {
         cancel.blur();
-        assert.equal(document.activeElement, document.body, 'Closing the questions may drop browser focus to body.');
+        assert.equal(document.activeElement === document.body, true, 'Closing the questions may drop browser focus to body.');
       } else if (scenario === 'focus elsewhere') {
         retainedFocus = [...document.querySelectorAll('button')].find(button => button.textContent.trim().startsWith('Guide settings'));
         assert.ok(retainedFocus, 'Another real keyboard action remains available.');
         retainedFocus.focus();
-        assert.equal(document.activeElement, retainedFocus);
+        assert.equal(document.activeElement === retainedFocus, true);
       } else if (scenario === 'new draft') {
         cancel.blur();
         await typeStarting(document, written + ' Newer user writing.');
         retainedFocus = document.body;
-        assert.equal(document.activeElement, retainedFocus,
+        assert.equal(document.activeElement === retainedFocus, true,
           'Exercise the changed-draft guard even when the hidden-control body fallback would otherwise permit focus.');
       } else if (scenario === 'selected guide changed') {
         await reload(other.id);
@@ -1572,12 +1572,12 @@ for (const scenario of ['ordinary handoff', 'hidden cancel body fallback', 'focu
       }
 
       await flushAnimationFrames();
-      if (scenario === 'ordinary handoff' || scenario === 'hidden cancel body fallback') assert.equal(document.activeElement, editor,
+      if (scenario === 'ordinary handoff' || scenario === 'hidden cancel body fallback') assert.equal(document.activeElement === editor, true,
         'The closed helper transfers focus to its original editor after the visibility commit.');
-      else assert.equal(document.activeElement, retainedFocus,
+      else assert.equal(document.activeElement === retainedFocus, true,
         'A deferred cancellation must not reclaim focus after newer navigation, writing or a selected-guide change.');
       if (scenario !== 'selected guide changed') {
-        assert.equal(document.querySelector('#setup-message'), editor);
+        assert.equal(document.querySelector('#setup-message') === editor, true);
         assert.equal(editor.value, scenario === 'new draft' ? written + ' Newer user writing.' : written);
         assert.equal(JSON.parse(values.get(inputKey(guide))).draft, editor.value);
       } else {

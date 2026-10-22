@@ -52,8 +52,8 @@ test("ordinary Meta readback permits Start without preparation or background cla
 test("ordinary Meta renders one Start action through the existing command owner", async () => {
   await mounted(async ({ button, actions, click }) => {
     assert.ok(button("Start installed application"));
-    assert.equal(button("Prepare application setup"), undefined);
-    assert.equal(button("Run in background"), undefined);
+    assert.equal(button("Prepare application setup") === undefined, true);
+    assert.equal(button("Run in background") === undefined, true);
     await click("Start installed application");
     assert.deepEqual(actions, ["finish-setup"]);
   }, { responses: [readback(receiptFor(), guide(), { kind: "ordinary" })] });
@@ -159,11 +159,11 @@ test("preparation uses the existing action owner and needs a new readback before
   const state = guide(), receipt = receiptFor(state);
   await mounted(async ({ document, calls, actions, click, button }) => {
     assert.match(document.body.textContent, /keep the application stopped/);
-    assert.equal(button("Set up and start application"), undefined);
+    assert.equal(button("Set up and start application") === undefined, true);
     await click("Prepare application setup");
     assert.deepEqual(actions, ["prepare-setup"]);
     assert.equal(calls.length, 1, "Effects still belong to the existing parent action owner.");
-    assert.equal(button("Set up and start application"), undefined);
+    assert.equal(button("Set up and start application") === undefined, true);
   }, { responses: [readback(receipt, state, { action: "prepare-setup" })] });
 });
 
@@ -211,7 +211,7 @@ test("absent, malformed and unavailable background hints cannot unlock conversio
     { available: true, detail: "x".repeat(501) }, { available: true, persistence: " " },
     { available: true, private_selection_path: "/private/never-send" }]) {
     await mounted(async ({ actions, button, click }) => {
-      assert.equal(button("Run in background"), undefined);
+      assert.equal(button("Run in background") === undefined, true);
       await click("Start installed application");
       assert.deepEqual(actions, ["finish-setup"]);
     }, { responses: [readback(receipt, state, { kind: "restore", background })] });
@@ -221,7 +221,7 @@ test("absent, malformed and unavailable background hints cannot unlock conversio
 test("Fresh and preparation do not offer background startup even with a true hint", async () => {
   for (const patch of [{}, { action: "prepare-setup" }]) {
     await mounted(async ({ actions, button }) => {
-      assert.equal(button("Run in background"), undefined);
+      assert.equal(button("Run in background") === undefined, true);
       assert.deepEqual(actions, []);
     }, { responses: [readback(receiptFor(), guide(), { ...patch, background: { available: true } })] });
   }
@@ -345,8 +345,8 @@ for (const [kind, title, label] of [["fresh", "Set up Synthetic Reading", "Set u
 test("missing settings offers the relevant existing settings action without starting or collecting private values", async () => {
   await mounted(async ({ document, calls, actions, settings, click, button }) => {
     assert.match(document.body.textContent, /Needed: Runtime provider, Console login\./);
-    assert.equal(button("Set up and start application"), undefined);
-    assert.equal(button("Start installed application"), undefined);
+    assert.equal(button("Set up and start application") === undefined, true);
+    assert.equal(button("Start installed application") === undefined, true);
     assert.equal(button("Review private settings").disabled, false);
     await click("Review private settings");
     assert.deepEqual(settings, ["settings"]); assert.deepEqual(actions, []); assert.equal(calls.length, 1);
@@ -363,9 +363,9 @@ test("a confirmed unavailable host explains the missing setup integration and on
     assert.match(document.body.textContent, /Setup is not available yet/);
     assert.match(document.body.textContent, /Connecting the guide or changing private settings will not enable it/);
     assert.match(document.body.textContent, /Application setupNot available yet/);
-    assert.equal(button("Change private settings"), undefined);
-    assert.equal(button("Review private settings"), undefined);
-    assert.equal(button("Set up and start application"), undefined);
+    assert.equal(button("Change private settings") === undefined, true);
+    assert.equal(button("Review private settings") === undefined, true);
+    assert.equal(button("Set up and start application") === undefined, true);
     assert.deepEqual(actions, []); assert.deepEqual(settings, []); assert.equal(calls.length, 1);
     await click("Check setup status");
     assert.equal(calls.length, 2); assert.deepEqual(actions, []); assert.deepEqual(settings, []);
@@ -390,7 +390,7 @@ for (const [kind, label] of [["fresh", "Set up and start application"],
       assert.equal(document.querySelector("section").getAttribute("aria-busy"), "false");
       for (const action of ["Prepare application setup", "Set up and start application",
         "Start installed application", "Change private settings", "Review private settings"])
-        assert.equal(button(action), undefined, action);
+        assert.equal(button(action) === undefined, true, action);
       assert.equal(document.querySelectorAll("button").length, 1);
       assert.deepEqual(actions, []); assert.deepEqual(settings, []); assert.equal(calls.length, 1);
       await click("Check setup status");
@@ -417,8 +417,8 @@ test("previous setup recovery describes the recorded attempt and offers only a r
     assert.match(document.body.textContent, /Private settingsNot checked/);
     assert.equal(document.querySelector("section").getAttribute("aria-busy"), "false");
     assert.doesNotMatch(document.body.textContent, /finish reporting|Waiting|Saving settings|Ready to start|Ready to set up/);
-    assert.equal(button("Change private settings"), undefined);
-    assert.equal(button("Review private settings"), undefined);
+    assert.equal(button("Change private settings") === undefined, true);
+    assert.equal(button("Review private settings") === undefined, true);
     assert.equal(document.querySelectorAll("button").length, 1);
     assert.equal(document.querySelectorAll(".deployment-setup-preserved").length, 1);
     assert.equal(document.querySelector(".deployment-setup-preserved").textContent,
@@ -434,7 +434,7 @@ test("previous setup recovery describes the recorded attempt and offers only a r
 
 test("previous setup recovery recheck only enables an explicitly returned saved restore", async () => {
   await mounted(async ({ document, calls, actions, settings, click, button }) => {
-    assert.equal(button("Start installed application"), undefined);
+    assert.equal(button("Start installed application") === undefined, true);
     await click("Check setup status");
     assert.equal(document.querySelector("h3").textContent, "Start Synthetic Reading");
     assert.equal(button("Start installed application").disabled, false);
@@ -462,8 +462,8 @@ for (const [name, value] of [["unknown availability", readback(receiptFor(), gui
   ["failed host read", new Error("Synthetic setup availability unavailable")]]) {
   test(`${name} offers no enabled setup or ordinary start`, async () => {
     await mounted(async ({ document, calls, actions, button }) => {
-      assert.equal(button("Set up and start application"), undefined);
-      assert.equal(button("Start installed application"), undefined);
+      assert.equal(button("Set up and start application") === undefined, true);
+      assert.equal(button("Start installed application") === undefined, true);
       assert.equal(button("Check setup status").disabled, false);
       assert.match(document.body.textContent, /cannot finish setup/);
       assert.deepEqual(actions, []); assert.equal(calls.length, 1);
@@ -478,7 +478,7 @@ for (const flag of ["confirmed", "pending"]) {
       await refresh(flag === "confirmed" ? { confirmed: false } : { pending: true });
       assert.match(document.body.textContent, /Result not confirmed/);
       assert.doesNotMatch(document.body.textContent, /Nothing is running|InstallationChecked|Ready to continue/);
-      assert.equal(button("Set up and start application"), undefined);
+      assert.equal(button("Set up and start application") === undefined, true);
       await invoke(stale);
       assert.deepEqual(actions, []); assert.equal(calls.length, 1);
     });
@@ -489,7 +489,7 @@ test("initial unconfirmed status does not read availability, assert stopped runt
   await mounted(async ({ document, calls, actions, button }) => {
     assert.match(document.body.textContent, /Result not confirmed/);
     assert.doesNotMatch(document.body.textContent, /Nothing is running/);
-    assert.equal(button("Set up and start application"), undefined);
+    assert.equal(button("Set up and start application") === undefined, true);
     assert.deepEqual(calls, []); assert.deepEqual(actions, []);
   }, { props: { confirmed: false } });
 });
@@ -498,7 +498,7 @@ for (const changed of ["guide", "installation"]) {
   test(`a delayed old ${changed} read cannot attach after the current selection changes`, async () => {
     await mounted(async ({ document, calls, actions, button, refresh, release }) => {
       assert.match(document.body.textContent, /Checking setup/);
-      assert.equal(button("Set up and start application"), undefined);
+      assert.equal(button("Set up and start application") === undefined, true);
       const nextState = changed === "guide" ? { id: "synthetic-next-guide", version: 9 } : guide();
       const nextReceipt = receiptFor(nextState, { deployment_id: "synthetic-next-installation", package_sha256: "1".repeat(64) });
       await refresh(changed === "guide" ? { state: nextState, receipt: nextReceipt } : { receipt: nextReceipt });

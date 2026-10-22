@@ -258,14 +258,14 @@ test("a client removal intent immediately hides ready links but retains delibera
     assert.ok(link());
     await rerender({ removalPending: true });
     assert.equal(link() === null, true);
-    assert.equal(button("Connect browser to native Console"), undefined);
+    assert.equal(button("Connect browser to native Console") === undefined, true);
     assert.ok(button("Close browser connection"));
     assert.match(document.body.textContent, /Opening Console is withdrawn/);
     setClose(() => ({ ...closed, access_id: accessId, cleanup_confirmed: false, status: "cleanup-needed" }));
     await act(async () => button("Close browser connection").click());
     assert.equal(link() === null, true);
     assert.ok(button("Close browser connection"));
-    assert.equal(button("Connect browser to native Console"), undefined);
+    assert.equal(button("Connect browser to native Console") === undefined, true);
     assert.deepEqual(calls.filter((call) => call.method === "POST"), [{
       target: remoteBrowserUrl(guide.id, receipt.deployment_id, "close"), method: "POST",
       body: { deployment_id: receipt.deployment_id, access_id: accessId },
@@ -282,7 +282,7 @@ test("a deliberate close immediately withdraws the link and only closes the exac
     assert.deepEqual(calls.at(-1).body, { deployment_id: receipt.deployment_id, access_id: accessId });
     await act(async () => resolveClose({ ...closed, access_id: accessId }));
     assert.equal(link() === null, true); assert.ok(button("Connect browser to native Console"));
-    assert.equal(button("Close browser connection"), undefined);
+    assert.equal(button("Close browser connection") === undefined, true);
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
   });
 });
@@ -305,7 +305,7 @@ test("observation loss withdraws the link and retains exact close without assert
     setRead(() => { throw new Error("Synthetic observation transport loss."); });
     await poll();
     assert.equal(link() === null, true); assert.ok(button("Close browser connection"));
-    assert.equal(button("Connect browser to native Console"), undefined);
+    assert.equal(button("Connect browser to native Console") === undefined, true);
     assert.match(document.body.textContent, /does not prove the remote application failed or stopped/);
     setRead(null); await poll(ready); assert.ok(link());
     assert.equal(calls.filter((call) => call.method === "POST").length, 0);
@@ -316,7 +316,7 @@ test("lost observation of a previously closed connection requires recheck before
   await mountedAccess(closed, async ({ button, setRead, poll, calls }) => {
     setRead(() => { throw new Error("Synthetic browser status outage."); });
     await poll();
-    assert.equal(button("Connect browser to native Console"), undefined);
+    assert.equal(button("Connect browser to native Console") === undefined, true);
     assert.ok(button("Recheck browser connection"));
     setRead(null); await poll(closed);
     assert.ok(button("Connect browser to native Console"));
@@ -341,10 +341,10 @@ test("cleanup uncertainty permits exact close only; clean blocked attempts can b
   await mountedAccess({ ...ready, status: "cleanup-needed", local_url: null, native_ready: false },
     async ({ document, button, link, poll, calls }) => {
       assert.equal(link() === null, true); assert.ok(button("Close browser connection"));
-      assert.equal(button("Connect browser to native Console"), undefined);
+      assert.equal(button("Connect browser to native Console") === undefined, true);
       assert.match(document.body.textContent, /cleanup is uncertain/);
       await poll({ ...closed, access_id: accessId, status: "blocked" });
-      assert.ok(button("Connect browser to native Console")); assert.equal(button("Close browser connection"), undefined);
+      assert.ok(button("Connect browser to native Console")); assert.equal(button("Close browser connection") === undefined, true);
       assert.match(document.body.textContent, /port may already be in use/);
       await act(async () => button("Connect browser to native Console").click());
       assert.ok(link()); assert.equal(calls.filter((call) => call.method === "POST").length, 1);
@@ -378,7 +378,7 @@ test("late open replies cannot restore links while owned observation survives so
     await rerender({ receipt: { ...receipt, source_current: false } });
     assert.ok(document.querySelector(".remote-browser-access"));
     assert.ok(button("Close browser connection"));
-    assert.equal(button("Connect browser to native Console"), undefined);
+    assert.equal(button("Connect browser to native Console") === undefined, true);
     await act(async () => resolveRead(ready)); assert.equal(link() === null, true);
   });
   await mountedAccess(ready, async ({ link, rerender, setAccess }) => {
@@ -402,7 +402,7 @@ test("draft destination and application source selection changes retain only own
     await rerender(patch);
     assert.equal(calls.length, 1, "Draft changes keep the same owned observer lifetime.");
     assert.equal(link() === null, true);
-    assert.equal(button("Connect browser to native Console"), undefined);
+    assert.equal(button("Connect browser to native Console") === undefined, true);
     assert.ok(button("Close browser connection"));
     assert.ok(button("Recheck browser connection"));
     assert.match(document.body.textContent, /matching accepted application and current destination checks/);
@@ -412,8 +412,8 @@ test("draft destination and application source selection changes retain only own
       target: remoteBrowserUrl(guide.id, receipt.deployment_id, "close"), method: "POST",
       body: { deployment_id: receipt.deployment_id, access_id: accessId },
     }]);
-    assert.equal(button("Close browser connection"), undefined);
-    assert.equal(button("Connect browser to native Console"), undefined);
+    assert.equal(button("Close browser connection") === undefined, true);
+    assert.equal(button("Connect browser to native Console") === undefined, true);
   });
 });
 
@@ -424,7 +424,7 @@ test("foreign replies after a destination change preserve the prior owned close 
       { controller_sha256: "e".repeat(64) }, { service_name: `mobkit-launch.${accessId}.service` }]) {
       await poll({ ...ready, ...changed, access_id: otherId });
       assert.equal(link() === null, true); assert.ok(button("Close browser connection"));
-      assert.equal(button("Connect browser to native Console"), undefined);
+      assert.equal(button("Connect browser to native Console") === undefined, true);
     }
     await act(async () => button("Close browser connection").click());
     assert.deepEqual(calls.at(-1).body, { deployment_id: receipt.deployment_id, access_id: accessId });
@@ -452,8 +452,8 @@ test("an exact close completion remains usable when the draft changes during clo
     await act(async () => button("Close browser connection").click());
     await rerender({ state: { ...guide, version: 5, proposal: { target: "mac" } }, options: null });
     await act(async () => resolveClose({ ...closed, access_id: accessId }));
-    assert.equal(link() === null, true); assert.equal(button("Close browser connection"), undefined);
-    assert.equal(button("Connect browser to native Console"), undefined);
+    assert.equal(link() === null, true); assert.equal(button("Close browser connection") === undefined, true);
+    assert.equal(button("Connect browser to native Console") === undefined, true);
     assert.ok(button("Recheck browser connection"));
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
   });
@@ -468,7 +468,7 @@ test("a late close of an earlier access cannot replace a newer access observed i
     await act(async () => resolveClose({ ...closed, access_id: accessId }));
     assert.equal(document.querySelector(".remote-browser-access").dataset.browserStatus, "ready");
     assert.ok(button("Close browser connection"));
-    assert.equal(button("Connect browser to native Console"), undefined);
+    assert.equal(button("Connect browser to native Console") === undefined, true);
   });
 });
 
@@ -521,7 +521,7 @@ test("native browser open after harmless chat submits the current version and re
     const next = { ...guide, version: 5 };
     await rerender({ state: next, build: { ...build, current_guide_version: 5 },
       options: { ...options, current_guide_version: 5 }, receipt: { ...receipt, current_guide_version: 5 } });
-    assert.equal(button("Connect browser to native Console"), undefined);
+    assert.equal(button("Connect browser to native Console") === undefined, true);
     await poll({ ...closed, current_guide_version: 5 });
     setOpen(() => ({ ...ready, current_guide_version: 5 }));
     await act(async () => button("Connect browser to native Console").click());

@@ -247,20 +247,20 @@ test("a held background poll preserves the focused build action and compact labe
   await mounted(() => ++reads === 1 ? receipt() : reads === 2 ? held : checked(),
     async ({ document, calls, intents, button, poll, render, settle, click, polls }) => {
       const original = button("Return to build");
-      original.focus(); assert.equal(document.activeElement, original);
+      original.focus(); assert.equal(document.activeElement === original, true);
       await poll();
-      assert.equal(button("Return to build"), original, "background refresh must retain the known action node");
-      assert.equal(document.activeElement, original, "background refresh must preserve keyboard focus");
+      assert.equal(button("Return to build") === original, true, "background refresh must retain the known action node");
+      assert.equal(document.activeElement === original, true, "background refresh must preserve keyboard focus");
       assert.match(document.body.textContent, /Building your application/);
       assert.doesNotMatch(document.body.textContent, /Checking application build/);
       assert.equal(original.getAttribute("aria-label"), "Return to build for Observing club");
       await click("Return to build"); assert.equal(intents.length, 1); assert.equal(calls.length, 2);
       await render({ compact: true });
-      assert.equal(button("Open build"), original); assert.equal(document.activeElement, original);
+      assert.equal(button("Open build") === original, true); assert.equal(document.activeElement === original, true);
       assert.equal(original.getAttribute("aria-label"), "Return to build for Observing club");
       await act(async () => { finishPoll({ httpStatus: 503 }); await settle(); });
       assert.match(document.body.textContent, /Build status unavailable/);
-      assert.equal(button("Open build"), undefined, "a real failed observation retires the navigation action");
+      assert.equal(button("Open build") === undefined, true, "a real failed observation retires the navigation action");
       assert.equal(button("Check status").getAttribute("aria-label"), "Check build status for Observing club");
       assert.equal(polls.size, 0); assert.equal(intents.length, 1);
       await click("Check status"); assert.match(document.body.textContent, /Checked build ready to review/);

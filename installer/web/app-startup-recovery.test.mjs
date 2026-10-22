@@ -636,7 +636,7 @@ for (const dismissal of ['Close', 'Escape', 'backdrop']) test(`revision history 
     await openHistory(document, { advanced: false });
     const reopened = historyModal(document), writes = state.draftWrites().length;
     await finish(older, revisionResult(projectA, 1));
-    assert.equal(historyModal(document), reopened, 'An older modal cannot dismiss the new instance');
+    assert.equal(historyModal(document) === reopened, true, 'An older modal cannot dismiss the new instance');
     assertCurrentDraft(document, state, savedPlan());
     assert.equal(state.draftWrites().length, writes);
     assert.equal(document.querySelector('.toast') === null, true, 'Stale restoration cannot announce success');

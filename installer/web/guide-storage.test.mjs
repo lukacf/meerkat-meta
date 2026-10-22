@@ -962,7 +962,7 @@ for(const outcome of ['success','failure'])test(`same-owner plan ${outcome} rele
     if(outcome==='success'){
       assert.match(document.body.textContent,/ACCEPTED PLAN/);
       assert.equal(document.querySelector('.setup-error') === null,true);
-      assert.equal(usePlanButton(document),undefined);
+      assert.equal(usePlanButton(document) === undefined, true);
     }else{
       assert.match(document.querySelector('.setup-error').textContent,/Current plan acceptance refused/);
       assert.ok(usePlanButton(document) && !usePlanButton(document).disabled);
@@ -1210,10 +1210,10 @@ test(`plan acceptance deliberate retry requires an exact saved check and retains
     const retry=()=>[...document.querySelectorAll('button')].find(button=>button.textContent==='Try saving this plan again');
     const status=()=>document.querySelector('[aria-label="Plan save status"]');
     await clickGuideButton(document,'Use this plan');
-    assert.equal(retry(),undefined,'admission alone does not authorize a duplicate acceptance');
+    assert.equal(retry() === undefined, true,'admission alone does not authorize a duplicate acceptance');
     await act(async()=>{t.mock.timers.tick(30000);await settle();});
     assert.ok(status());
-    assert.equal(retry(),undefined,'an elapsed response deadline does not prove the original plan remains current');
+    assert.equal(retry() === undefined, true,'an elapsed response deadline does not prove the original plan remains current');
     assert.equal(composer().value,inputs[0].draft);
     assert.equal(composer().disabled,false);
     assert.equal(send().disabled,true);
@@ -1222,14 +1222,14 @@ test(`plan acceptance deliberate retry requires an exact saved check and retains
 
     readFails=true;
     await clickGuideButton(document,'Check saved plan');
-    assert.equal(retry(),undefined,'a failed check cannot authorize the explicit retry');
+    assert.equal(retry() === undefined, true,'a failed check cannot authorize the explicit retry');
     assert.equal(send().disabled,true);
     assert.equal(posts().length,1);
     readFails=false;
     server={...structuredClone(before),proposal:{...structuredClone(before.proposal),
       project:{...before.proposal.project,name:'Different proposal at the same version'}}};
     await clickGuideButton(document,'Check saved plan');
-    assert.equal(retry(),undefined,'a same-version read must preserve the exact reviewed proposal');
+    assert.equal(retry() === undefined, true,'a same-version read must preserve the exact reviewed proposal');
     assert.equal(send().disabled,true);
     assert.equal(posts().length,1);
 
@@ -1245,7 +1245,7 @@ test(`plan acceptance deliberate retry requires an exact saved check and retains
     assert.deepEqual(posts(),Array.from({length:2},()=>({url:applyUrl,method:'POST',body:{version:before.version}})),
       'the deliberate retry repeats only the original version-CAS acceptance body');
     assert.equal(send().disabled,true);
-    assert.equal(retry(),undefined,'the fresh response owner requires its own check before any further retry');
+    assert.equal(retry() === undefined, true,'the fresh response owner requires its own check before any further retry');
     const published=structuredClone(blueprints);
     await act(async()=>{
       if(outcome==='success')releaseOriginal(acceptedGuide(before));

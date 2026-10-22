@@ -148,7 +148,7 @@ test("the actual builder panel keeps actions ahead of its folded exact summary a
     assert.equal(disclosure.querySelector("p").textContent, summary);
     assert.equal(disclosure.querySelector("script") === null, true);
     disclosure.firstElementChild.focus();
-    assert.equal(document.activeElement, disclosure.firstElementChild);
+    assert.equal(document.activeElement === disclosure.firstElementChild, true);
     await act(async () => disclosure.firstElementChild.click());
     assert.equal(disclosure.open, true);
     assert.equal(disclosure.querySelector("p").textContent, summary);
@@ -238,7 +238,7 @@ test("retained builder activity shows the current checking and review phase, the
     await render({ ...receipt, status: "running", phase: "independent_review",
       timing: { ...receipt.timing, elapsed_ms: 70123 } });
     assert.match(notice().textContent, /Independent review in progress.*Recorded so far: 1m 10s/);
-    assert.equal(transcript(), retainedTranscript);
+    assert.equal(transcript() === retainedTranscript, true);
     assert.match(transcript().textContent, /The saved application source is ready for its checks\./);
     for (const status of ["completed", "failed", "interrupted"]) {
       await render({ ...receipt, status, phase: "independent_review" });

@@ -281,7 +281,7 @@ test('a historical completed build opens only its same canonical saved build wit
     await flushFrames();
     assert.deepEqual(scrolls, [{ selectedGuide: b.id, connected: true }]);
     assert.match(document.querySelector('#setup-implementation').textContent, /proposal has changed since this build/);
-    assert.equal(button(document, 'Download checked application'), undefined,
+    assert.equal(button(document, 'Download checked application') === undefined, true,
       'Returning to historical source is not a package or installation grant.');
   }, { historical: true });
 });
@@ -306,7 +306,7 @@ test('the compact menu build action moves unchanged source-button focus to the n
     assert.ok(source, 'The actual menu names the full build action and exact setup accessibly.');
     assert.equal(source.textContent.trim(), 'Open build', 'Compact menu copy stays distinct from opening the conversation.');
     await act(async () => { source.focus(); await settle(); });
-    assert.equal(document.activeElement, source);
+    assert.equal(document.activeElement === source, true);
     await click(source);
     await selectB();
     assert.equal(source.isConnected, false, 'The original focused menu control is detached by its own selection.');
@@ -315,7 +315,7 @@ test('the compact menu build action moves unchanged source-button focus to the n
     const target = document.querySelector('[role="region"][aria-label="Application build"]');
     assert.ok(target, 'The existing implementation area has a focusable name.');
     assert.deepEqual(scrolls, [{ selectedGuide: b.id, connected: true }]);
-    assert.equal(document.activeElement, target, 'An unchanged or naturally detached source focus reaches that same build area.');
+    assert.equal(document.activeElement === target, true, 'An unchanged or naturally detached source focus reaches that same build area.');
     assert.equal(target.querySelector('#setup-implementation')?.isConnected, true);
   });
 });
@@ -339,10 +339,10 @@ test('moving focus while the selected build read or navigation frame is held can
     const editor = document.querySelector('#setup-message');
     assert.ok(editor, 'The current guide retains its real composer.');
     await act(async () => { editor.focus(); await settle(); });
-    assert.equal(document.activeElement, editor);
+    assert.equal(document.activeElement === editor, true);
     if (boundary === 'read') await finish(freshBuild, response(original));
     await flushFrames();
     assert.equal(scrolls.length, 0, `New focus cancels the ${boundary}-pending scroll as well as focus transfer.`);
-    assert.equal(document.activeElement, editor, 'Return navigation cannot steal a newer user focus.');
+    assert.equal(document.activeElement === editor, true, 'Return navigation cannot steal a newer user focus.');
   });
 });

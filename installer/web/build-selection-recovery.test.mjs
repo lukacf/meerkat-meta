@@ -108,14 +108,14 @@ test("multiple retained builds require an explicit exact choice without rebuildi
   ? ok({ guide_id: guide.id, version: 8, build_id: row(2).build_id, selection_restored: true }) : ok(page([row(1), row(2)])) }));
 
 test("partial saved work is preserved without an offered restore or build", async () => mounted(async ui => {
-  assert.equal(ui.restore(), undefined);
+  assert.equal(ui.restore() === undefined, true);
   assert.match(ui.document.body.textContent, /No complete saved build/);
   assert.match(ui.document.body.textContent, /lacks the information.*preserved/);
   assert.equal(ui.calls.some(call => call.value.method === "POST"), false);
 }, { transport: async () => ok(page([], { unavailable_count: 2 })) }));
 
 test("a stale or crossed candidate projection cannot be selected", async () => mounted(async ui => {
-  assert.equal(ui.restore(), undefined);
+  assert.equal(ui.restore() === undefined, true);
   assert.match(ui.document.querySelector('[role="alert"]').textContent, /saved build list changed/);
   assert.equal(ui.calls.length, 1);
 }, { transport: async () => ok(page([row(1)], { version: 7 })) }));
@@ -129,7 +129,7 @@ test("a held restore admits one write and an unknown outcome needs a fresh read"
   held.resolve({ ok: false, status: 502, json: async () => ({ detail: "Outcome unconfirmed." }) });
   await ui.settle();
   assert.equal(ui.refreshes(), 1);
-  assert.equal(ui.restore(), undefined);
+  assert.equal(ui.restore() === undefined, true);
   assert.match(ui.document.body.textContent, /Outcome unconfirmed/);
   ui.setTransport(async () => ok(page([row(1, { selection_token: "f".repeat(64) })])));
   await ui.click(ui.buttons().find(button => button.textContent === "Check saved work again"));
@@ -156,7 +156,7 @@ for (const phase of ["headers", "body"]) {
       assert.equal(ui.calls.find(call => call.value.method === "POST").value.signal.aborted, true);
       assert.equal(ui.refreshes(), 1, "The parent checks the ordinary selected-build status.");
       assert.equal(ui.calls.filter(call => call.value.method === "POST").length, 1);
-      assert.equal(ui.restore(), undefined, "An uncertain response cannot offer another write before a read.");
+      assert.equal(ui.restore() === undefined, true, "An uncertain response cannot offer another write before a read.");
       await ui.click(ui.buttons().find(button => button.textContent === "Check saved work again"));
       await ui.settle();
       assert.match(ui.document.body.textContent, /Fresh saved work/);
@@ -188,7 +188,7 @@ test("guide departure and return retire a held restore before DOM rerender", asy
 
 test("blocked or unmounted recovery cannot admit or present a late selection", async () => mounted(async ui => {
   await ui.render({ blocked: true });
-  assert.equal(ui.restore(), undefined);
+  assert.equal(ui.restore() === undefined, true);
   await ui.render({ blocked: false });
   const held = deferred(); ui.setTransport(async () => held.promise);
   await ui.click(ui.restore()); await ui.unmount();
@@ -200,7 +200,7 @@ test("blocked saved-work recovery describes a pause and begins one read when ava
   assert.equal(ui.calls.length, 0);
   assert.match(ui.document.querySelector('[role="status"]').textContent, /Checking saved work is paused/);
   assert.doesNotMatch(ui.document.body.textContent, /Checking saved work\.\.\.|No complete saved build|Selection restored/);
-  assert.equal(ui.restore(), undefined);
+  assert.equal(ui.restore() === undefined, true);
   await ui.render({ blocked: false }); await ui.settle();
   assert.equal(ui.calls.length, 1);
   assert.equal(ui.restore().disabled, false);
@@ -216,7 +216,7 @@ test("pausing a held saved-work read hides its late result without treating it a
     assert.equal(ui.calls[0].value.signal.aborted, true);
     assert.match(ui.document.body.textContent, /Checking saved work is paused/);
     held.resolve(ok(page([row(2, { project_name: "Retired result" })]))); await ui.settle();
-    assert.equal(ui.restore(), undefined);
+    assert.equal(ui.restore() === undefined, true);
     assert.doesNotMatch(ui.document.body.textContent, /Retired result|No complete saved build|Checking saved work\.\.\./);
     ui.setTransport(async () => ok(page([row(1, { project_name: "Current result" })])));
     await ui.render({ blocked: false }); await ui.settle();
@@ -261,7 +261,7 @@ test("the actual implementation panel keeps recovery mounted through its status 
     assert.ok(recovery);
     assert.match(ui.document.body.textContent, /Your saved build needs attention/);
     heldStatus = deferred(); await ui.expire(3000); await ui.settle();
-    assert.equal(ui.document.querySelector(".implementation-selection-recovery"), recovery);
+    assert.equal(ui.document.querySelector(".implementation-selection-recovery") === recovery, true);
     assert.equal(ui.calls.filter(call => call.url.endsWith("/saved-selection")).length, 1);
     assert.equal(note.value, "Keep this builder note");
     assert.equal(ui.calls.some(call => call.value.method === "POST"), false);

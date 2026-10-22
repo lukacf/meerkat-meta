@@ -480,7 +480,7 @@ for (const [status, cloud, title, label] of [['running', true, 'Your installed c
       await click(card, label);
       await advance(20);
       assert.equal(revealed.length, 1, 'The parent action must reveal one existing remote destination control');
-      assert.equal(revealed[0], target, 'The original remote section owns the navigation target');
+      assert.equal(revealed[0] === target, true, 'The original remote section owns the navigation target');
       assert.equal(document.querySelector('.setup-proposal-actions').open, true);
       assert.deepEqual(state.receipts.remote.get(A), before);
       assert.equal(state.posts().length, 0, 'Narration/navigation cannot install, restart or send a job');
@@ -2073,7 +2073,7 @@ test('installed progress management preserves the native A source and exact priv
     await click(applicationStatus(document), 'Manage agent team');
     assert.equal(deployment(document).querySelector('[name="deployment-source"]:checked').value, 'native-team',
       'Managing an existing installation must not choose a separate checked custom application');
-    assert.equal(document.querySelector('.deployment-form'), form, 'Management navigation preserves the actual mounted private form');
+    assert.equal(document.querySelector('.deployment-form') === form, true, 'Management navigation preserves the actual mounted private form');
     assert.equal(form.dataset.configurationKey, settingsKey);
     assert.deepEqual([...form.querySelectorAll('input')].map(input => ({ name: input.name, value: input.value, checked: input.checked })), draft);
     assert.deepEqual([...state.storage.values.entries()], storage);

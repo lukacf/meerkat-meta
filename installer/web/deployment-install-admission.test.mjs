@@ -342,7 +342,7 @@ test("mounted completed Restore background choice posts only the exact journal I
     assert.equal(posts[0].body.action, "start-background");
     assert.equal(posts[0].body.deployment_id, productStopped.deployment_id);
     assert.equal(window.sessionStorage.getItem("meta-forge-deployment-action-v1:" + guide.id), null);
-    assert.equal(button("Run in background"), undefined);
+    assert.equal(button("Run in background") === undefined, true);
     assert.ok(calls.some(call => call.method === "GET" && call.target === installUrl));
   }, { startAction: "start-background" });
 });
@@ -361,7 +361,7 @@ test("lost completed Restore background response retains the exact intent across
     actionReadback({ phase: "pending", outcome: null });
     await remount();
     assert.equal(window.sessionStorage.getItem(key), retained);
-    assert.equal(button("Run in background"), undefined);
+    assert.equal(button("Run in background") === undefined, true);
     assert.equal(calls.filter(call => call.method === "POST").length, 1);
     assert.ok(calls.some(call => call.method === "GET" && call.target ===
       `${installUrl}/action/${productStopped.deployment_id}/${post.body.action_request_id}`));
@@ -376,11 +376,11 @@ const refreshAvailability = value => ({ ...value, fresh_install: value.build_id 
 test("private runtime refresh without an installed target hides fresh setup and an ordinary source restores it", async () => {
   await mountedDeployment(null, async ({ document, calls, button, privateForm, revise }) => {
     assert.match(document.body.textContent, /private runtime candidate.*checked update.*existing stopped installation/);
-    assert.equal(button("Install on this computer"), undefined);
-    assert.equal(button("Install into another folder"), undefined);
-    assert.equal(button("Install and start"), undefined);
+    assert.equal(button("Install on this computer") === undefined, true);
+    assert.equal(button("Install into another folder") === undefined, true);
+    assert.equal(button("Install and start") === undefined, true);
     assert.equal(privateForm() === null, true);
-    assert.equal(button("Stage accepted update"), undefined, "No installed target is fabricated for update staging.");
+    assert.equal(button("Stage accepted update") === undefined, true, "No installed target is fabricated for update staging.");
     assert.ok(calls.every(call => call.method === "GET"), "Checking availability cannot install or update.");
 
     await revise(guide, checked);
@@ -398,8 +398,8 @@ test("private runtime refresh preserves installed settings drafts and explicitly
   await mountedDeployment(stopped, async ({ document, calls, button, privateForm, enter, poll,
     holdStageResponse, stageBodyPending, finishStageResponse }) => {
     assert.match(document.body.textContent, /private runtime candidate.*checked update.*existing stopped installation/);
-    assert.equal(button("Install into another folder"), undefined);
-    assert.equal(button("Install on this computer"), undefined);
+    assert.equal(button("Install into another folder") === undefined, true);
+    assert.equal(button("Install on this computer") === undefined, true);
     assert.equal(privateForm() === null, true);
     assert.ok(button("Stage accepted update"));
     assert.equal(button("Stage accepted update").disabled, false, "Local update compatibility stays available despite fresh-install refusal.");
@@ -407,7 +407,7 @@ test("private runtime refresh preserves installed settings drafts and explicitly
     await act(async () => button("Change private settings").click());
     assert.ok(privateForm());
     assert.ok(button("Save private settings"));
-    assert.equal(button("Install and start"), undefined, "The only mounted form edits the existing installation.");
+    assert.equal(button("Install and start") === undefined, true, "The only mounted form edits the existing installation.");
     const draft = "  Preserve my exact installed organiser draft.  ";
     await enter("APP_USER", draft);
     await poll(stopped);
@@ -415,7 +415,7 @@ test("private runtime refresh preserves installed settings drafts and explicitly
     assert.ok(calls.every(call => call.method === "GET"), "Reading status does not save, stage or install the private draft.");
     await act(async () => button("Cancel").click());
     assert.equal(privateForm() === null, true);
-    assert.equal(button("Install into another folder"), undefined);
+    assert.equal(button("Install into another folder") === undefined, true);
 
     holdStageResponse();
     await act(async () => button("Stage accepted update").click());
@@ -425,8 +425,8 @@ test("private runtime refresh preserves installed settings drafts and explicitly
       deployment_id: stopped.deployment_id, version: guide.version, build_id: privateRefreshCandidate.build_id } }]);
     await finishStageResponse();
     assert.equal(document.querySelector(".deployment-update")?.dataset.updateStatus, "staged");
-    assert.equal(button("Install into another folder"), undefined);
-    assert.equal(button("Install and start"), undefined);
+    assert.equal(button("Install into another folder") === undefined, true);
+    assert.equal(button("Install and start") === undefined, true);
     assert.equal(calls.filter(call => call.method === "POST").length, 1, "Explicit staging never applies an update or fresh installation.");
   }, { build: privateRefreshCandidate, options: refreshAvailability });
 });
@@ -434,9 +434,9 @@ test("private runtime refresh preserves installed settings drafts and explicitly
 for (const mismatch of ["stale", "wrong-source"]) test(`private runtime refresh restriction ignores ${mismatch} options`, async () => {
   await mountedDeployment(null, async ({ document, calls, button, privateForm }) => {
     assert.equal(document.body.textContent.includes(privateRefreshReason), false, "Only the current selected source may explain its restriction.");
-    assert.equal(button("Install on this computer"), undefined);
-    assert.equal(button("Install into another folder"), undefined);
-    assert.equal(button("Install and start"), undefined);
+    assert.equal(button("Install on this computer") === undefined, true);
+    assert.equal(button("Install into another folder") === undefined, true);
+    assert.equal(button("Install and start") === undefined, true);
     assert.equal(privateForm() === null, true);
     assert.ok(calls.every(call => call.method === "GET"));
   }, { build: privateRefreshCandidate, options: value => ({ ...refreshAvailability(value),
@@ -467,7 +467,7 @@ test(`staging wait explains the pending response without replay or readback rele
     assert.equal(stageBodyPending(), true, "A committed stage observation does not settle its original request.");
     assert.equal(document.querySelector(".deployment-update").dataset.updateStatus, "staged");
     assert.ok(waiting(), "The original pending response explanation remains after status readback.");
-    assert.equal(button("Return to checked installation"), undefined, "Stage has no exact request-id settlement authority.");
+    assert.equal(button("Return to checked installation") === undefined, true, "Stage has no exact request-id settlement authority.");
     if (scenario.receipt.status === "stopped") {
       assert.equal(button("Apply and verify update").disabled, true);
       assert.equal(button("Change private settings").disabled, true);
@@ -531,7 +531,7 @@ for (const failure of [false, true]) test(`installed command response recovery l
     holdStartResponse();
     await act(async () => button("Start installed application").click());
     assert.equal(startBodyPending(), true);
-    assert.equal(button("Return to checked installation"), undefined, "A pending command has no recovery authority.");
+    assert.equal(button("Return to checked installation") === undefined, true, "A pending command has no recovery authority.");
     actionReadback({ phase: "settled", outcome: "returned" });
     restoreStatusReads(recoverableBackgroundStopped);
     const before = calls.length;
@@ -547,7 +547,7 @@ for (const failure of [false, true]) test(`installed command response recovery l
     assert.equal(calls.filter(call => call.method === "POST").length, 1);
     assert.equal(task().value, savedTask);
     assert.equal(button("Start installed application").disabled, false);
-    assert.equal(button("Return to checked installation"), undefined);
+    assert.equal(button("Return to checked installation") === undefined, true);
     await act(async () => button("Change private settings").click());
     await enter("APP_USER", "Keep this exact new private draft");
     const callsBeforeLateReply = calls.length;
@@ -569,19 +569,19 @@ test("installed command response recovery requires its exact command and a curre
       { phase: "settled", outcome: "returned", deployment_id: "another-installation" }]) {
       actionReadback(evidence);
       await act(async () => button("Check installation status").click());
-      assert.equal(button("Return to checked installation"), undefined);
+      assert.equal(button("Return to checked installation") === undefined, true);
     }
     actionReadback({ phase: "settled", outcome: "returned" });
     loseStatusReads();
     await act(async () => button("Check installation status").click());
-    assert.equal(button("Return to checked installation"), undefined, "Settled command alone cannot replace a failed receipt read.");
+    assert.equal(button("Return to checked installation") === undefined, true, "Settled command alone cannot replace a failed receipt read.");
     restoreStatusReads({ ...healthyApplication, deployment_id: "another-installation" });
     await act(async () => button("Check installation status").click());
-    assert.equal(button("Return to checked installation"), undefined, "A fresh foreign installation cannot release this owner.");
+    assert.equal(button("Return to checked installation") === undefined, true, "A fresh foreign installation cannot release this owner.");
     replaceActionRequest({ action_request_id: "22222222-2222-4222-8222-222222222222" });
     restoreStatusReads({ ...healthyApplication, execution_mode: "background" });
     await poll({ ...healthyApplication, execution_mode: "background" });
-    assert.equal(button("Return to checked installation"), undefined, "Another settled command cannot release this pending command's owner.");
+    assert.equal(button("Return to checked installation") === undefined, true, "Another settled command cannot release this pending command's owner.");
     assert.equal(button("Stop application").disabled, true);
     assert.equal(calls.filter(call => call.method === "POST").length, 1);
     const beforeLateReply = calls.length;
@@ -624,7 +624,7 @@ test("installed command response recovery never lets a remounted old response re
     await act(async () => button("Check installation status").click());
     assert.ok(button("Return to checked installation"));
     await remount();
-    assert.equal(button("Return to checked installation"), undefined, "The new mount does not inherit the previous local response owner.");
+    assert.equal(button("Return to checked installation") === undefined, true, "The new mount does not inherit the previous local response owner.");
     await act(async () => button("Start installed application").click());
     assert.equal(startBodyPending(0), true); assert.equal(startBodyPending(1), true);
     const before = calls.length;
@@ -677,9 +677,9 @@ test("a lost committed background Start and failed observation block another mut
       .map((call) => call.target), [calls.find((call) => call.target.includes("/action/")).target, installUrl],
       "The fresh installation receipt is read only after the exact command has settled.");
     assert.equal(document.querySelector(".deployment-panel").dataset.deploymentStatus, "running");
-    assert.equal(button("Start installed application"), undefined);
+    assert.equal(button("Start installed application") === undefined, true);
     assert.equal(button("Stop application").disabled, false);
-    assert.equal(button("Check installation status"), undefined);
+    assert.equal(button("Check installation status") === undefined, true);
     assert.equal(document.querySelector('.deployment-use-field textarea').value, savedTask);
     // Error display was retained throughout readback. A remount starts a fresh display.
     assert.equal(calls.filter((call) => call.method === "POST").length, 1,
@@ -851,13 +851,13 @@ for (const failure of [false, true]) test(`fresh installation response recovery 
     holdInstallResponse();
     await act(async () => button("Install and start").click());
     assert.equal(installBodyPending(), true);
-    assert.equal(button("Return to checked installation"), undefined);
+    assert.equal(button("Return to checked installation") === undefined, true);
     const admitted = { ...currentReceipt(), ...healthyApplication };
     for (const changed of [{ build_id: "another-build" }, { source_digest: "f".repeat(64) },
       { destination: "/synthetic-owned/another-project" }, { execution_mode: "background" },
       { guide_version: guide.version + 1 }]) {
       await poll({ ...admitted, ...changed });
-      assert.equal(button("Return to checked installation"), undefined,
+      assert.equal(button("Return to checked installation") === undefined, true,
         "A different source, destination, lifecycle or proposal cannot release this installation presentation.");
     }
     await poll(admitted);
@@ -874,7 +874,7 @@ for (const failure of [false, true]) test(`fresh installation response recovery 
     await act(async () => recover.click());
     assert.equal(installBodyPending(), true);
     assert.equal(button("Stop application").disabled, false);
-    assert.equal(button("Return to checked installation"), undefined);
+    assert.equal(button("Return to checked installation") === undefined, true);
     assert.equal(calls.filter(call => call.method === "POST").length, 1);
     assert.equal(draft().value, task);
     await poll({ ...admitted, status: "stopped", process_live: false });
@@ -926,7 +926,7 @@ test("fresh installation response recovery uses the server home for tilde and do
       folder.dispatchEvent(new window.Event("input", { bubbles: true })); });
     holdInstallResponse(); await act(async () => button("Install and start").click());
     await poll({ ...currentReceipt(), ...healthyApplication, destination: "/synthetic-home/src/team" });
-    assert.equal(button("Return to checked installation"), undefined, "An unsupported named home cannot be guessed from another user or the host default.");
+    assert.equal(button("Return to checked installation") === undefined, true, "An unsupported named home cannot be guessed from another user or the host default.");
     assert.equal(calls.filter(call => call.method === "POST").length, 1);
   }, { options: (value) => ({ ...value, home_directory: "/synthetic-home" }) });
 });
@@ -946,7 +946,7 @@ test("fresh installation response recovery cannot revive after source selection 
     await revise(guide, otherBuild);
     await revise(guide, checked);
     await poll(admitted);
-    assert.equal(button("Return to checked installation"), undefined,
+    assert.equal(button("Return to checked installation") === undefined, true,
       "Returning to equal source values cannot revive a retired response owner.");
     const beforeLateReply = calls.length;
     await act(async () => previousReturn.click());
@@ -981,13 +981,13 @@ test("mounted private setup closes after a lost install response and stays clear
       use_host_provider_credentials: true, execution_mode: "interactive" });
     assert.equal(document.querySelector(".deployment-panel").dataset.deploymentStatus, "queued");
     assert.equal(privateForm() === null, true);
-    assert.equal(button("Install and start"), undefined);
+    assert.equal(button("Install and start") === undefined, true);
     for (const status of ["installing", "running", "stopped"]) {
       await poll({ ...currentReceipt(), status });
       assert.equal(privateForm() === null, true, `${status} must not reopen the previously submitted private form.`);
       if (status === "running") {
         assert.match(document.body.textContent, /stop the application first/);
-        assert.equal(button("Change private settings"), undefined);
+        assert.equal(button("Change private settings") === undefined, true);
       }
     }
     await act(async () => button("Install into another folder").click());
@@ -1011,8 +1011,8 @@ test("unavailable custom application selection keeps its prerequisite and lets a
     assert.ok(selector("application"), "The selected unavailable source retains the installation selector.");
     assert.equal(selector("application").checked, true);
     assert.match(document.body.textContent, /must pass independent acceptance before installation\. Build or improve it first/);
-    assert.equal(button("Install on this computer"), undefined);
-    assert.equal(button("Install and start"), undefined);
+    assert.equal(button("Install on this computer") === undefined, true);
+    assert.equal(button("Install and start") === undefined, true);
     assert.equal(privateForm() === null, true);
     assert.equal(calls.filter(call => call.target.startsWith(`${installUrl}/options?`)).length, optionsBefore,
       "Selecting an unavailable application admits no destination preparation.");
@@ -1064,7 +1064,7 @@ test("native private setup admits its exact source once and exposes its checked 
     assert.ok(button("Start installed agent team"), "Installed lifecycle remains available after the guide changes");
     assert.ok(button("Change private settings"));
     assert.equal(document.querySelector('section[aria-label="Use your agent team"] a') === null, true);
-    assert.equal(button("Install on this computer"), undefined);
+    assert.equal(button("Install on this computer") === undefined, true);
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
   }, { guide: nativeGuide, build: null, sourceKind: "native-team" });
 });
@@ -1304,7 +1304,7 @@ test("failed installed settings revalidation offers an explicit retry without lo
     ui.stopHoldingReads();
     assertDraft();
     assert.equal(button("Save private settings").disabled, false);
-    assert.equal(button("Recheck private settings"), undefined);
+    assert.equal(button("Recheck private settings") === undefined, true);
     assert.equal(calls.filter((call) => call.method !== "GET").length, 0,
       "Revalidation must not configure, deploy or start the application");
     for (const storage of [ui.window.sessionStorage, ui.window.localStorage])
@@ -1428,7 +1428,7 @@ test("installed source export remains available in the real panel after a newer 
     assert.ok(download);
     assert.equal(download.disabled, false);
     assert.match(details.textContent, /even if a newer build needs repair/);
-    assert.equal(button("Download accepted Mac package"), undefined);
+    assert.equal(button("Download accepted Mac package") === undefined, true);
     assert.ok(calls.every(call => call.method === "GET"), "Rendering recovery never submits a build or installation command.");
   }, { build: failed });
 });

@@ -173,7 +173,7 @@ for (const [name, path] of [['raw Unicode', '/café'], ['already escaped equival
     await mountedUse(experiences, async ({ document, chooseIdea, edit, taskField, draft, withdrawHealth, calls }) => {
       assert.equal(appLink(document)?.getAttribute('href'), expectedUrl);
       assert.equal(appLink(document)?.textContent.trim(), `Open ${entryLabel}`);
-      assert.equal(taskLink(document), undefined, 'An empty draft is not handed off');
+      assert.equal(taskLink(document) === undefined, true, 'An empty draft is not handed off');
       await chooseIdea();
       assert.equal(taskField().value, idea.request);
       assert.deepEqual(taskPayload(taskLink(document)), { version: 1, task: idea.request });
@@ -193,7 +193,7 @@ for (const [name, path] of [['raw Unicode', '/café'], ['already escaped equival
       await withdrawHealth();
       assert.ok(calls.length > readsBeforeWithdrawal, 'Native health loss rechecks installed-source details');
       assert.equal(appLink(document) === null, true, 'Unavailable native health withdraws the ordinary application link');
-      assert.equal(taskLink(document), undefined, 'Unavailable native health withdraws the task handoff');
+      assert.equal(taskLink(document) === undefined, true, 'Unavailable native health withdraws the task handoff');
       assert.equal(taskField().value, editedTask);
       assert.deepEqual(draft(), { task: editedTask, outcome: '', improvement: '' });
     });
@@ -207,13 +207,13 @@ test('local installed application refuses a different declared path while retain
   assert.ok(projected.issue, 'Unicode normalization cannot admit a different path');
   await mountedUse(experiences, async ({ document, chooseIdea, edit, taskField, draft }) => {
     assert.equal(appLink(document) === null, true);
-    assert.equal(taskLink(document), undefined);
+    assert.equal(taskLink(document) === undefined, true);
     assert.match(document.body.textContent, /Retry UI links/);
     await chooseIdea();
     assert.equal(taskField().value, idea.request);
     await edit(editedTask);
     assert.equal(appLink(document) === null, true);
-    assert.equal(taskLink(document), undefined);
+    assert.equal(taskLink(document) === undefined, true);
     assert.equal(taskField().value, editedTask);
     assert.deepEqual(draft(), { task: editedTask, outcome: '', improvement: '' });
   });

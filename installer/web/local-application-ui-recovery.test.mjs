@@ -311,7 +311,7 @@ test('local application UI recovery manually refreshes held null links and both 
     await writeDrafts(document, window, A);
     await finish(initial, experiencesFor(A, false));
     assert.equal(appLink(document) === null, true);
-    assert.equal(taskLink(document), undefined);
+    assert.equal(taskLink(document) === undefined, true);
     await healthyParentPoll(document, fixture, tick);
     const retry = await beginRetry(document, fixture);
     assertDrafts(document, window, A);
@@ -328,14 +328,14 @@ test('local application UI recovery is offered when first-use native health alon
   await mountedPanel(t, fixture, async ({ document, window, tick }) => {
     await writeDrafts(document, window, A);
     assert.equal(appLink(document) === null, true);
-    assert.equal(taskLink(document), undefined);
+    assert.equal(taskLink(document) === undefined, true);
     assert.equal([...useView(document).querySelectorAll('a')].some(link => link.textContent.trim().startsWith('Open native Console')), false);
     assert.equal(button(document, 'Retry UI links').disabled, false, 'Recovery is not conditional on a first-use Console URL');
     await healthyParentPoll(document, fixture, tick);
     const retry = await beginRetry(document, fixture);
     await finish(retry.experiences, experiencesFor(A));
     assert.equal(button(document, 'Retry UI links').disabled, true, 'Healthy UI metadata cannot unblock a still-pending independent first-use read');
-    assert.equal(taskLink(document), undefined);
+    assert.equal(taskLink(document) === undefined, true);
     await finish(retry.use, metadataFor(A));
     assertLinks(document, A);
     assertDrafts(document, window, A);
@@ -352,7 +352,7 @@ test('local application UI recovery retains reports after a failed retry until a
     assert.match(useView(document).textContent, /Declared application UI links could not be loaded/);
     assert.equal(button(document, 'Retry UI links').disabled, false);
     assert.equal(appLink(document) === null, true);
-    assert.equal(taskLink(document), undefined);
+    assert.equal(taskLink(document) === undefined, true);
     assertDrafts(document, window, A);
     await healthyParentPoll(document, fixture, tick);
     const next = await beginRetry(document, fixture);

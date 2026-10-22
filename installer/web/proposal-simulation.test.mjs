@@ -78,9 +78,9 @@ test('expanded regeneration keeps actual activity/source summaries after Explore
     const forward=new dom.window.KeyboardEvent('keydown',{key:'Tab',cancelable:true});
     assert.equal(trapExpandedAnimationFocus(forward,root),true);
     assert.equal(forward.defaultPrevented,true);
-    assert.equal(document.activeElement,document.getElementById('close'));
+    assert.equal(document.activeElement === document.getElementById('close'), true);
     assert.equal(trapExpandedAnimationFocus(new dom.window.KeyboardEvent('keydown',{key:'Tab',shiftKey:true,cancelable:true}),root),true);
-    assert.equal(document.activeElement,sourceSummary);
+    assert.equal(document.activeElement === sourceSummary, true);
     assert.equal(trapExpandedAnimationFocus(new dom.window.KeyboardEvent('keydown',{key:'Escape',cancelable:true}),root),false);
   }finally{dom.window.close();}
 });
@@ -743,7 +743,7 @@ test('an adopted execution failure discloses only bounded host details and prese
       await ui.waitForAdoption(count);
     };
     await ui.generate();const previous=ui.instances[0];await ui.settle(()=>previous.first());
-    assert.equal(diagnostic(),undefined);
+    assert.equal(diagnostic() === undefined, true);
     const original=structuredClone([...ui.receipts.values()][0]);
     const saved=await newerSavedFixture(original);ui.setLatest(saved);
     await adopt();const selected=ui.instances.at(-1);await ui.settle(()=>selected.first());
@@ -758,9 +758,9 @@ test('an adopted execution failure discloses only bounded host details and prese
     assert.equal(ui.posts.length,1);assert.equal(ui.adoptionPosts.length,1);
     assert.deepEqual(ui.adoptionPosts[0],attached,'Diagnostics do not redeclare or alter the attached intent');
     assert.deepEqual([...ui.receipts.values()][0],original,'The native source receipt stays immutable');
-    await adopt();assert.equal(diagnostic(),undefined,'A fresh saved-source retry clears the old diagnostic');
+    await adopt();assert.equal(diagnostic() === undefined, true,'A fresh saved-source retry clears the old diagnostic');
     const retry=ui.instances.at(-1);assert.equal(retry.options.code,saved.artifact.code);
-    await ui.settle(()=>retry.first());assert.equal(diagnostic(),undefined,'Successful first paint has no failure disclosure');
+    await ui.settle(()=>retry.first());assert.equal(diagnostic() === undefined, true,'Successful first paint has no failure disclosure');
     assert.equal(ui.posts.length,1);assert.equal(ui.adoptionPosts.length,2);
     assert.equal(ui.adoptionPosts[1].publication.code_hash,attached.publication.code_hash);
     await ui.settle(()=>retry.fail({kind:'timeout',phase:'draw',exception:'TypeError',message:'Private authored text',
@@ -779,7 +779,7 @@ test('an adopted execution failure discloses only bounded host details and prese
     assert.equal(ui.posts.length,1,'Failure observations do not start another generation');
     assert.deepEqual(ui.visible(),[previous],'Observations preserve the previously painted scene');
     await ui.settle(()=>button('Retry agent').click());
-    assert.equal(diagnostic(),undefined,'Ordinary generation retry clears the old execution detail');
+    assert.equal(diagnostic() === undefined, true,'Ordinary generation retry clears the old execution detail');
   });
 });
 
@@ -798,9 +798,9 @@ test('a pending saved candidate failure is sanitized and its diagnostic cannot f
     assert.deepEqual(ui.visible(),[previous],'Startup failure does not replace the displayed owner');
     assert.equal(ui.posts.length,1);assert.deepEqual(ui.adoptionPosts[0],attached);
     await ui.mount(ownedPlan('changed',2));
-    assert.equal(diagnostic(),undefined,'An earlier proposal cannot disclose a failure under new facts');
+    assert.equal(diagnostic() === undefined, true,'An earlier proposal cannot disclose a failure under new facts');
     await ui.settle(()=>pending.options.onError({kind:'timeout',phase:'startup'}));
-    assert.equal(diagnostic(),undefined,'A late failure from the old candidate cannot reattach diagnostics');
+    assert.equal(diagnostic() === undefined, true,'A late failure from the old candidate cannot reattach diagnostics');
     assert.equal(ui.adoptionPosts.length,1);assert.equal(ui.posts.length,1);
   });
 });
@@ -907,7 +907,7 @@ test('large owner inspection puts exact source access first and reaches every al
       peers.querySelector('ul').scrollTop=100;
       await ui.settle(()=>next.click());
       assert.equal(peers.querySelector('ul').scrollTop,0);
-      assert.equal(document.activeElement,peers.querySelector('ul'));
+      assert.equal(document.activeElement === peers.querySelector('ul'), true);
     }
     assert.deepEqual(seen,expected);assert.equal(new Set(seen).size,633);
     assert.match(peers.textContent,/Showing 601-633 of 633 matching relationships/);
@@ -957,7 +957,7 @@ test('relationship navigation inspects an exact late peer and returns to the des
     const inspector=document.querySelector('.ps-inspector');
     assert.equal(inspector.querySelector('h4').textContent,late.name);
     assert.equal(inspector.querySelector('details code').textContent,late.id);
-    assert.equal(document.activeElement,inspector,'The existing selection callback focuses the new exact identity');
+    assert.equal(document.activeElement === inspector, true,'The existing selection callback focuses the new exact identity');
     assert.equal(scene.selectedId,late.id);assert.equal(scene.paused,true);
     const returning=document.querySelector('.ps-owner-relationships details');
     assert.match(returning.querySelector('summary').textContent,/Allowed communication \(1 relationship\)/);

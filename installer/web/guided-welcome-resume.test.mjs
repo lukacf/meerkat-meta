@@ -166,7 +166,7 @@ for (const change of ['none', 'new edit', 'focus elsewhere']) test(`restored wel
     await click(choice('A team'));
     editor.setSelectionRange(0, 0);
     await click(choice('Repetitive work'));
-    assert.equal(document.activeElement, editor, 'The choice retains immediate composer focus.');
+    assert.equal(document.activeElement === editor, true, 'The choice retains immediate composer focus.');
     assert.equal(editor.value, draft, 'Selecting the same restored context does not change any draft byte.');
     assert.equal(JSON.parse(values.get(inputKey(a))).draft, draft);
     if (change === 'new edit') {
@@ -185,7 +185,7 @@ for (const change of ['none', 'new edit', 'focus elsewhere']) test(`restored wel
       for (const callback of pending) callback(0);
       await settle();
     });
-    assert.equal(document.activeElement, focus, 'A deferred caret handoff never takes focus back.');
+    assert.equal(document.activeElement === focus, true, 'A deferred caret handoff never takes focus back.');
     assert.equal(editor.selectionStart, change === 'none' ? draft.length : change === 'new edit' ? 4 : 0);
     assert.equal(editor.selectionEnd, editor.selectionStart);
     assert.equal(editor.value, change === 'new edit' ? `${draft}\nKeep this newer thought.` : draft);

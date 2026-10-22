@@ -177,7 +177,7 @@ for(const [status,narrow,mode] of [['failed',false,'answer'],['interrupted',true
       button.focus();
       await act(async()=>button.click());
       await flushReviewFrames(frames);
-      assert.equal(document.activeElement,editor,'The actual connected composer receives focus');
+      assert.equal(document.activeElement === editor, true,'The actual connected composer receives focus');
       assert.ok(focuses.includes(editor));
       assert.equal(editor.value,input.draft,'Saved request prose never replaces newer writing');
       assert.deepEqual(storageSnapshot(storage),before,'Text, choices, context, mode, combination and journals stay exact');
@@ -588,7 +588,7 @@ test('an initial design question leads while optional build readiness stays in t
       const disclosure = document.querySelector('.setup-proposal-actions');
       if (!build) {
         assert.equal(disclosure.open, false);
-        assert.equal(progress.closest('details'), disclosure);
+        assert.equal(progress.closest('details') === disclosure, true);
         assert.equal(question.querySelector('h1')?.textContent, state.question.title);
         assert.equal(document.querySelector('.setup-chat-top small')?.textContent, 'One decision at a time');
         assert.deepEqual([...document.querySelectorAll('.setup-stage-shortcuts a')].map(link => link.textContent), ['Try, build and run']);
@@ -613,7 +613,7 @@ test('a saved design refinement without a question keeps an unstarted build opti
   await mountedGuide({ value: storage }, async (document, calls) => {
     const disclosure = document.querySelector('.setup-proposal-actions');
     assert.equal(disclosure.open, false);
-    assert.equal(document.querySelector('.setup-progress-card').closest('details'), disclosure);
+    assert.equal(document.querySelector('.setup-progress-card').closest('details') === disclosure, true);
     assert.equal(document.querySelector('#setup-message').value, input.draft);
     assert.equal(calls.some(call => call.method === 'POST'), false);
   }, packageReads(state, null));
@@ -1059,7 +1059,7 @@ test(`retained selected export uses source-only fallback ${navigation?'without s
     const retainedClick=button[propsKey].onClick;
     build={...build,ready_to_package:false};
     await act(async()=>{for(const poll of polls.splice(0))await poll();await settle();});
-    assert.equal(packageAction(document,'checked'),undefined,
+    assert.equal(packageAction(document,'checked') === undefined, true,
       'this preserves an existing retained handler, not a newly visible legacy export control');
     await act(async()=>{retainedClick();await settle();});
     if(navigation){
@@ -1180,7 +1180,7 @@ test('a decision-blocked, questioned or running refinement cannot offer acceptan
   ]) {
     const state = { ...structuredClone(readyRefinement), ...changed };
     await mountedGuide({ value: packageStorage(state) }, async (document, calls) => {
-      assert.equal(usePlan(document), undefined);
+      assert.equal(usePlan(document) === undefined, true);
       assert.deepEqual(calls.filter(call => call.method === 'POST'), []);
     }, packageReads(state));
   }
@@ -1209,7 +1209,7 @@ test('a retained ready-refinement click cannot accept after the saved version be
     switched = true;
     const reload = [...document.querySelectorAll('.setup-history-menu button')].find(item => item.textContent.includes('Current refinement'));
     await act(async () => { reload.click(); await settle(); });
-    assert.equal(usePlan(document), undefined);
+    assert.equal(usePlan(document) === undefined, true);
     await act(async () => { retainedClick(); await settle(); });
     assert.deepEqual(calls.filter(call => call.method === 'POST'), []);
   }, packageReads(state, null, {

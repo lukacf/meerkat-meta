@@ -359,7 +359,7 @@ for (const kind of ["local", "remote"]) {
       await click("Choose the next job");
       assert.equal(document.activeElement.querySelector("strong")?.textContent, firstUse.tasks[0].label);
       await click("Write your own next job");
-      assert.equal(document.activeElement, document.querySelector(".deployment-use-field textarea"));
+      assert.equal(document.activeElement === document.querySelector(".deployment-use-field textarea"), true);
       assert.equal(document.querySelector(".deployment-use-field textarea").value, task);
     });
   });
@@ -477,7 +477,7 @@ for (const kind of ["local", "remote"]) {
       assert.equal(uuidCount(), 1); assert.equal(builds.length, 0);
       assert.match(document.querySelector(".deployment-use-success").textContent, /earlier success report was not saved/);
       assert.doesNotMatch(document.body.textContent, /PRIVATE_HOST_DETAIL|Your success report is saved/);
-      assert.equal(button("Retry success confirmation"), undefined); assert.equal(button("It worked").disabled, false);
+      assert.equal(button("Retry success confirmation") === undefined, true); assert.equal(button("It worked").disabled, false);
       assert.equal(document.querySelector(".deployment-use-field textarea").value, "Current task B");
       assert.equal(document.querySelector(".deployment-use-feedback textarea").value, "Unsent improvement");
       await reload();
@@ -512,7 +512,7 @@ for (const kind of ["local", "remote"]) {
       await click("Clear unsaved confirmation");
       assert.equal(calls.filter((call) => call.method === "POST").length, 2); assert.equal(uuidCount(), 1);
       await reload();
-      assert.equal(button("Clear unsaved confirmation"), undefined);
+      assert.equal(button("Clear unsaved confirmation") === undefined, true);
       await click("Retry success confirmation");
       assert.deepEqual(calls.filter((call) => call.method === "POST")[2].body, original);
       failRemoval = false; await click("Clear unsaved confirmation");
@@ -544,10 +544,10 @@ for (const kind of ["local", "remote"]) {
         await act(async () => document.querySelector('.deployment-use-feedback input[value="worked"]').click());
       }
       await act(async () => late.resolve({ ok: false, status: 409, json: async () => ({ code: "installed_success_not_admitted" }) }));
-      assert.equal(button("It worked"), undefined);
+      assert.equal(button("It worked") === undefined, true);
       if (change !== "source") assert.match(document.querySelector(".deployment-use-success").textContent, /draft changed before success was confirmed/);
       assert.equal(document.querySelector(".deployment-use-field textarea").value, "Task A");
-      assert.equal(button("Clear unsaved confirmation"), undefined);
+      assert.equal(button("Clear unsaved confirmation") === undefined, true);
       assert.doesNotMatch(document.querySelector(".deployment-use-success").textContent, /earlier success report was not saved|Your success report is saved/);
       assert.equal(calls.filter((call) => call.method === "POST").length, 1); assert.equal(uuidCount(), 1);
       await click("Retry success confirmation");
@@ -642,7 +642,7 @@ for (const kind of ["local", "remote"]) {
       assert.equal([...success().querySelectorAll(".deployment-use-reported-job")].find(node =>
         node.querySelector("summary").textContent === "View the earlier reported job").querySelector("p").textContent, "Pending task A");
       assert.equal(success().querySelector('[aria-label="Task awaiting success confirmation"]') === null, true);
-      assert.equal(button("Retry success confirmation"), undefined);
+      assert.equal(button("Retry success confirmation") === undefined, true);
     }, { initialMetadata: { success_report: savedB }, post: async (body, count) => {
       if (count === 1) throw new Error("AMBIGUOUS_DELIVERY");
       return { ok: true, json: async () => response(body) };
@@ -736,8 +736,8 @@ for (const kind of ["local", "remote"]) {
       assert.match(success().textContent, /An earlier success report is saved for this job/);
       assert.equal(success().querySelector(".deployment-use-reported-job p").textContent, taskA);
       assert.equal([...success().querySelectorAll(".deployment-use-reported-job summary")].find(node =>
-        node.textContent === "View the earlier reported job"), undefined, "The same saved record is not repeated as another job");
-      assert.equal(button("It worked"), undefined);
+        node.textContent === "View the earlier reported job") === undefined, true, "The same saved record is not repeated as another job");
+      assert.equal(button("It worked") === undefined, true);
       await edit(taskB); assertEarlier();
       assert.equal(calls.length, kind === "local" ? 3 : 5,
         "The unchanged local read key hides mismatched metadata; remote binding changes trigger fresh reads");
@@ -788,9 +788,9 @@ for (const kind of ["local", "remote"]) {
       assert.ok(ownJob); assert.equal(ownJob.disabled, false);
       assert.ok(details.compareDocumentPosition(nextJob) & window.Node.DOCUMENT_POSITION_FOLLOWING);
       await act(async () => nextJob.click());
-      assert.equal(document.activeElement, document.querySelector(".deployment-use-ideas button"));
+      assert.equal(document.activeElement === document.querySelector(".deployment-use-ideas button"), true);
       await act(async () => ownJob.click());
-      assert.equal(document.activeElement, document.querySelector(".deployment-use-field textarea"));
+      assert.equal(document.activeElement === document.querySelector(".deployment-use-field textarea"), true);
       assertDrafts();
       assert.equal(calls.length, beforeCalls, "Expanding history and choosing next-job actions send no request");
       assert.ok(calls.every(call => call.method === "GET"));

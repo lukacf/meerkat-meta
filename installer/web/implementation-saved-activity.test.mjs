@@ -157,7 +157,7 @@ test("mounted receipt updates replace saved/check/recovery facts and preserve ho
     assert.match(notice.textContent, /source change saved/);
     saved = { ...saved, status: "checking", progress: [...saved.progress, event("Running isolated syntax and application tests.", 2)] };
     await render(saved);
-    assert.equal(dom.window.document.querySelector('[role="status"]'), notice);
+    assert.equal(dom.window.document.querySelector('[role="status"]') === notice, true);
     assert.match(notice.textContent, /Checking the saved source/);
     saved = { ...saved, status: "running", progress: [...saved.progress, event("Application checks passed.", 3), event("Editing application/private-new-path.py", 4)] };
     await render(saved);

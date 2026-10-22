@@ -167,7 +167,7 @@ test("failed clipboard exposes manual selection of the exact retained task", asy
     assert.match(document.body.textContent, /could not be copied/);
     await click("Select task to copy");
     const field = document.querySelector("textarea");
-    assert.equal(document.activeElement, field);
+    assert.equal(document.activeElement === field, true);
     assert.equal(field.value.slice(field.selectionStart, field.selectionEnd), task);
     assert.ok(document.querySelector('a[href="http://127.0.0.1:18880/console"]'));
   }, { clipboard: { writeText: async () => { throw Error("Clipboard permission refused"); } } });

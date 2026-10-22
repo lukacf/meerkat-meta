@@ -88,7 +88,7 @@ test('returning-user status: actual guide keeps current navigation outside its l
     const document = dom.window.document, scroll = document.querySelector('.setup-chat-scroll');
     const anchor = document.querySelector('.setup-current-status');
     assert.ok(anchor, 'The actual mounted guide renders the current projection.');
-    assert.equal(anchor.parentNode, scroll.parentNode);
+    assert.equal(anchor.parentNode === scroll.parentNode, true);
     assert.equal(scroll.contains(anchor), false);
     assert.ok(anchor.compareDocumentPosition(scroll) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING);
     assert.match(anchor.textContent, /Your installed custom application is running/);
@@ -96,7 +96,7 @@ test('returning-user status: actual guide keeps current navigation outside its l
     assert.ok(scroll.textContent.includes('This is a retained historical explanation. '.repeat(45).trim()));
     assert.equal(guide.messages[1].text, oldReply, 'Historical source text stays exact.');
     assert.ok(scroll.querySelector('.setup-progress-card'), 'The full current status card remains available.');
-    assert.equal(document.querySelector('.setup-conversation-history-boundary').parentNode, scroll.parentNode);
+    assert.equal(document.querySelector('.setup-conversation-history-boundary').parentNode === scroll.parentNode, true);
     const button = anchor.querySelector('button');
     assert.equal(button.textContent.trim(), 'Use your application');
     assert.equal(button.disabled, false);

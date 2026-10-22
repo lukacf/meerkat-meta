@@ -217,7 +217,7 @@ test("unknown destination checks show useful blockers without a plan or download
     await chooseDestination(ui); await ui.click("Check destination");
     assert.match(ui.document.body.textContent, /Billing could not be observed/); assert.match(ui.document.body.textContent, /Not verified/);
     assert.match(ui.document.body.textContent, /Ask the project owner/); assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true);
-    assert.equal(ui.button("Download accepted GCP package"), undefined); assert.equal(ui.document.querySelector('[role="alert"]') === null, true);
+    assert.equal(ui.button("Download accepted GCP package") === undefined, true); assert.equal(ui.document.querySelector('[role="alert"]') === null, true);
   });
 });
 
@@ -228,9 +228,9 @@ test("a CLI missing at Launch startup keeps the required restart step visible af
         action: "Install Google Cloud CLI on this computer and sign in, then restart Launch and reopen this saved setup before checking cloud access again." }] }));
     await ui.click("Check cloud access"); assert.match(ui.document.body.textContent, /Install Google Cloud CLI/);
     assert.match(ui.document.body.textContent, /restart Launch and reopen this saved setup/);
-    assert.equal(ui.button("First account"), undefined);
+    assert.equal(ui.button("First account") === undefined, true);
     await ui.click("Check cloud access again");
-    assert.equal(ui.button("First account"), undefined);
+    assert.equal(ui.button("First account") === undefined, true);
     assert.match(ui.document.body.textContent, /restart Launch and reopen this saved setup/);
     assert.equal(ui.calls.filter((call) => call.target.includes("gcp-preflight/options")).length, 2);
   });
@@ -314,7 +314,7 @@ test("changing account twice rejects the first account's late project response",
     let resolve, reads = 0; ui.setHandler("projects", (body) => ++reads === 1 ? new Promise((done) => { resolve = done; }) : { ...projects(body.account), projects: [] });
     await ui.click("Check cloud access"); ui.pendingClick("First account"); await ui.click("Second account"); await ui.click("First account");
     await act(async () => resolve(projects()));
-    assert.equal(ui.button("Observatory"), undefined); assert.ok(ui.button("Use the proposed project"));
+    assert.equal(ui.button("Observatory") === undefined, true); assert.ok(ui.button("Use the proposed project"));
   });
 });
 
@@ -357,7 +357,7 @@ test("expiry removes readiness while keeping the observed checks and their captu
     try { Date.now = () => checkedAt + GCP_PREFLIGHT_FRESH_MS; await act(async () => timer.callback());
       assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true); assert.match(ui.document.body.textContent, /These checks need a refresh/);
       assert.match(ui.document.body.textContent, /Synthetic verified access/); assert.match(ui.document.body.textContent, /Checked/);
-      assert.equal(ui.button("Download accepted GCP package"), undefined);
+      assert.equal(ui.button("Download accepted GCP package") === undefined, true);
     } finally { Date.now = originalNow; }
   });
 });
@@ -408,7 +408,7 @@ test("editing a project ID discards an old ready result before another project i
   await mounted(async (ui) => {
     await chooseDestination(ui); await ui.click("Check destination"); assert.ok(ui.document.querySelector(".gcp-preflight-plan"));
     await ui.enter("other-project"); assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true);
-    assert.equal(ui.button("Download accepted GCP package"), undefined); assert.equal(ui.button("Check destination"), undefined);
+    assert.equal(ui.button("Download accepted GCP package") === undefined, true); assert.equal(ui.button("Check destination") === undefined, true);
     assert.equal(ui.calls.length, 3); await ui.click("Choose this project"); assert.ok(ui.button("Check destination")); assert.equal(ui.calls.length, 3);
   });
 });

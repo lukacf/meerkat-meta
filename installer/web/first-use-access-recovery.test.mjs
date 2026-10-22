@@ -260,10 +260,10 @@ test('a stalled application first-use body exposes Check first-use details and p
   await mounted(t, fixture, async ({ document, window, tick }) => {
     assert.equal(held.started, true);
     assert.match(useView(document).textContent, /Loading this installed application's first-use details/);
-    assert.equal(findButton(document, 'Check first-use details'), undefined);
+    assert.equal(findButton(document, 'Check first-use details') === undefined, true);
     await editTask(document, window);
     await tick(29999);
-    assert.equal(findButton(document, 'Check first-use details'), undefined);
+    assert.equal(findButton(document, 'Check first-use details') === undefined, true);
     await tick(1);
     assert.equal(button(document, 'Check first-use details').disabled, false, 'A stalled first-use body must expose its existing recovery action');
     assert.match(useView(document).textContent, /first-use details could not be checked/);
@@ -288,10 +288,10 @@ test('a stalled agent-team first-use body exposes explicit recheck and only the 
   await mounted(t, fixture, async ({ document, tick }) => {
     assert.equal(held.started, true);
     assert.match(useView(document).textContent, /Checking this installed team's conversation owner/);
-    assert.equal(findButton(document, 'Recheck agent team details'), undefined);
+    assert.equal(findButton(document, 'Recheck agent team details') === undefined, true);
     assert.equal(useView(document).querySelector('a[href]') === null, true);
     await tick(29999);
-    assert.equal(findButton(document, 'Recheck agent team details'), undefined);
+    assert.equal(findButton(document, 'Recheck agent team details') === undefined, true);
     await tick(1);
     assert.equal(button(document, 'Recheck agent team details').disabled, false, 'A stalled native-team metadata read must become explicitly recheckable');
     assert.match(useView(document).textContent, /conversation owner could not be checked/);

@@ -211,7 +211,7 @@ focused('private prompt only, exact offered recovery choice, More only when offe
   const body = { kind: 'forge_recovery', choices: [{ choice_id: 'offered:one', application_id: 'Reading', change_id: 'saved-change', origin: 'http://127.0.0.1:4510' }], more: false, skipped_entries: 0 };
   f.emit({ type: 'prompt', id: 'p:one', scope: f.host.scope, prompt: body }, false);
   assert.equal(f.container.querySelector('.forge-setup__protected').hidden, true);
-  f.prompt(body); assert.ok(f.button('Reading')); assert.equal(f.button('More saved setups'), undefined);
+  f.prompt(body); assert.ok(f.button('Reading')); assert.equal(f.button('More saved setups') === undefined, true);
   f.button('Reading').click(); await flush();
   assert.deepEqual(f.requests.find(call => call.path === '/answer').body, { prompt_id: 'p:one', answer: { kind: 'forge_recovery', choice: { kind: 'existing', choice_id: 'offered:one' } } });
   assert.match(f.container.textContent, /no effect is confirmed yet/);
@@ -254,7 +254,7 @@ focused('complete proposal and warnings remain selectable and inert with visible
   assert.equal(proposal.textContent, visibleText(JSON.stringify(body, null, 2)));
   assert.match(proposal.textContent, /LAST COMPLETE WARNING/); assert.match(proposal.textContent, /\[U\+202E\]\[U\+007F\]/);
   assert.equal(proposal.tabIndex, 0); assert.equal(f.container.querySelector('script') === null, true);
-  assert.equal(f.button('Approve this exact change'), undefined);
+  assert.equal(f.button('Approve this exact change') === undefined, true);
   f.button('Do not approve').click(); await flush();
   assert.deepEqual(f.requests.find(call => call.path === '/answer').body, { prompt_id: 'p:one', answer: { kind: 'approval', decision: 'deny' } });
   view.dispose(); f.dom.window.close();
@@ -345,7 +345,7 @@ focused('expired or undisplayable proposal cannot be approved and Escape closes 
   assert.equal(f.button('Approve this exact change').disabled, true); assert.equal(f.button('Do not approve').disabled, true);
   f.button('Close').focus();
   f.button('Close').dispatchEvent(new f.dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-  assert.equal(f.container.children.length, 0); assert.equal(f.dom.window.document.activeElement, trigger);
+  assert.equal(f.container.children.length, 0); assert.equal(f.dom.window.document.activeElement === trigger, true);
   assert.equal(f.requests.some(call => ['/cancel', '/answer'].includes(call.path)), false);
   view.dispose(); f.dom.window.close();
 });
@@ -604,7 +604,7 @@ focused('v3 initialization offers only exact protected provider targets before a
     assert.equal(f.port.scope, ''); assert.equal(f.port.available, false); assert.equal(f.port.canSend, false);
     assert.equal(f.container.querySelector('.toolkit-conversation') === null, true);
     assert.match(f.container.querySelector('.forge-setup__status-text').textContent, /private provider setup/i);
-    assert.equal(f.button('Cancel this setup interaction'), undefined);
+    assert.equal(f.button('Cancel this setup interaction') === undefined, true);
     f.button('model-example').click(); await flush();
     assert.deepEqual(f.requests.find(call => call.path === '/answer').body, { prompt_id: 'p:provider', answer: { kind: 'provider_target', choice_id: 'native-choice' } });
     assert.equal(f.requests.some(call => call.path === '/send'), false);
@@ -651,7 +651,7 @@ focused('v3 provider actions and answers cannot inject unoffered targets or auth
   try {
     await flush(); f.provider({ kind: 'provider_action', target: providerTarget(), actions: ['use', 'back'] });
     assert.ok(f.button('Use this connection')); assert.ok(f.button('Choose another connection'));
-    assert.equal(f.button('Enter an API key privately'), undefined); assert.equal(f.button('Sign in to this provider'), undefined);
+    assert.equal(f.button('Enter an API key privately') === undefined, true); assert.equal(f.button('Sign in to this provider') === undefined, true);
     for (const answer of [{ kind: 'provider_action', action: 'sign_in' }, { kind: 'provider_action', action: 'use', realm: 'injected' }, { kind: 'cancel' }]) {
       assert.equal(await f.port.answer('p:provider', answer), false);
     }
@@ -676,7 +676,7 @@ focused('v3 browser and device sign-in show exact inert information and only aut
       if (prompt.user_code) assert.ok([...f.container.querySelectorAll('code')].some(node => node.textContent === visibleText(prompt.user_code)));
       assert.equal(f.container.querySelector('a') === null, true);
       assert.equal(f.container.querySelector('tag') === null, true);
-      assert.equal(f.button('I have signed in'), undefined);
+      assert.equal(f.button('I have signed in') === undefined, true);
       assert.equal(await f.port.answer('p:provider', { kind: prompt.kind, success: true }), false);
       f.button('Cancel provider sign-in').click(); await flush();
       assert.deepEqual(f.requests.find(call => call.path === '/answer').body, { prompt_id: 'p:provider', answer: { kind: 'cancel' } });
@@ -752,7 +752,7 @@ focused('v3 approval is complete inert data and forwards no approval or target i
     f.provider({ kind: 'approval', approval_id: 'owner-approval', summary: 'Exact <change>\u202E', body: { proposed: '<script>bad</script>', warnings: ['All retained warnings'] }, allowed_decisions: ['approve', 'deny'], expires_at: null });
     assert.match(f.container.querySelector('pre').textContent, /All retained warnings/);
     assert.equal(f.container.querySelector('script') === null, true);
-    assert.equal(f.button('Cancel this setup interaction'), undefined);
+    assert.equal(f.button('Cancel this setup interaction') === undefined, true);
     assert.equal(await f.port.answer('p:provider', { kind: 'approval', decision: 'approve', approval_id: 'owner-approval' }), false);
     f.button('Do not approve').click(); await flush();
     assert.deepEqual(f.requests.find(call => call.path === '/answer').body, { prompt_id: 'p:provider', answer: { kind: 'approval', decision: 'deny' } });

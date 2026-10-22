@@ -115,7 +115,7 @@ test('the mounted inspector browses all 611 identities, announces exact ranges a
       if (page < 10) {
         const container = ui.dom.window.document.querySelector('.ps-member-results'); container.scrollTop = 200;
         await ui.click('Next identities');
-        assert.equal(ui.dom.window.document.activeElement, ui.results()[0], 'Paging moves keyboard focus to the new result page');
+        assert.equal(ui.dom.window.document.activeElement === ui.results()[0], true, 'Paging moves keyboard focus to the new result page');
         assert.equal(container.scrollTop, 0);
       }
     }
@@ -131,9 +131,9 @@ test('the mounted inspector browses all 611 identities, announces exact ranges a
     assert.equal(inspector.querySelector('h4').textContent, 'old beta case 305');
     assert.equal(inspector.querySelector('details code').textContent, 'beta:case_305');
     assert.equal(inspector.querySelectorAll('.ps-relationships li').length, 2, 'Final member retains its exact peer and notes grant');
-    assert.equal(ui.dom.window.document.activeElement, inspector);
+    assert.equal(ui.dom.window.document.activeElement === inspector, true);
     await ui.click('Close inspector');
-    assert.equal(ui.dom.window.document.activeElement, ui.button('Explore identities'), 'A removed result button has a visible close-focus fallback');
+    assert.equal(ui.dom.window.document.activeElement === ui.button('Explore identities'), true, 'A removed result button has a visible close-focus fallback');
   });
 });
 
@@ -222,6 +222,6 @@ test('updating a custom scene keeps inspection on its displayed historical model
     assert.match(ui.text(), /Showing 1-60 of 65 matching identities/);
     assert.equal(ui.results()[0].querySelector('strong').textContent, 'new coordinator');
     assert.ok(ui.results().every(item => !item.querySelector('strong').textContent.startsWith('old ')));
-    assert.equal(ui.dom.window.document.activeElement, ui.results()[0], 'Replacing a removed historical result preserves a usable keyboard target');
+    assert.equal(ui.dom.window.document.activeElement === ui.results()[0], true, 'Replacing a removed historical result preserves a usable keyboard target');
   });
 });

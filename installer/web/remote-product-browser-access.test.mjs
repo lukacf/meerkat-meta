@@ -250,7 +250,7 @@ for (const kind of ["console", "custom"]) test(`mounted ${kind} retains original
     setRead(() => { throw Error("synthetic unavailable observation"); });
     await rerender({ receipt: lost, observationUnavailable: true });
     assert.equal(links().length, 0); assert.ok(button(kind === "console" ? "Close browser connection" : "Close connection"));
-    assert.equal(button(kind === "console" ? "Connect browser to native Console" : "Connect to Workspace"), undefined);
+    assert.equal(button(kind === "console" ? "Connect browser to native Console" : "Connect to Workspace") === undefined, true);
     setClose(body => { assert.equal(body.access_id, ready.access_id); return { ...ready, status: "closed", local_url: null, native_ready: false, cleanup_confirmed: true }; });
     await act(async () => button(kind === "console" ? "Close browser connection" : "Close connection").click());
     assert.equal(calls.filter(call => call.method === "POST").length, 1);
@@ -294,7 +294,7 @@ test("mounted custom port change withdraws the old link but closes its captured 
     changedEntry.destination_port = 8793; changedEntry.listener_token = "0".repeat(64);
     await rerender({ receipt: changed });
     assert.equal(links().length, 0); assert.ok(button("Close connection"));
-    assert.equal(button("Connect to Workspace"), undefined);
+    assert.equal(button("Connect to Workspace") === undefined, true);
     setClose(body => { assert.equal(body.access_id, original.access_id);
       return { ...original, status: "closed", local_url: null, native_ready: false, cleanup_confirmed: true }; });
     await act(async () => button("Close connection").click());
@@ -372,13 +372,13 @@ test("mounted RemoteDeployment retains the exact custom Close through producer o
     observed.product_scope = "byte-install-stopped";
     for (const key of ["can_stop", "can_restart", "can_configure", "can_prepare_setup", "can_finish_setup", "can_start_background", "private_settings_supported"]) observed[key] = false;
     await act(async () => button("Recheck remote status").click());
-    assert.equal(panel(), originalPanel); assert.equal(panel().querySelector('a[href]') === null, true);
-    assert.ok(button("Close connection")); assert.equal(button("Connect to Workspace"), undefined);
+    assert.equal(panel() === originalPanel, true); assert.equal(panel().querySelector('a[href]') === null, true);
+    assert.ok(button("Close connection")); assert.equal(button("Connect to Workspace") === undefined, true);
     assert.equal(dom.window.document.body.textContent.includes("Your application is running in interactive mode."), false);
     for (const status of ["stopped", "recovery-needed"]) {
       observed.status = status; observed.product_control = null; observed.observation = { available: true };
       await act(async () => button("Recheck remote status").click());
-      assert.equal(panel(), originalPanel); assert.ok(button("Close connection"));
+      assert.equal(panel() === originalPanel, true); assert.ok(button("Close connection"));
       assert.equal(panel().querySelector('a[href]') === null, true);
       assert.equal(dom.window.document.body.textContent.includes("Your application is running in interactive mode."), false);
     }
@@ -386,12 +386,12 @@ test("mounted RemoteDeployment retains the exact custom Close through producer o
     // status changes. It must not dispose of the admitted local forward.
     cloudRemoval = { guideId: guide.id, operationId: cloudOperation, pending: true, status: "removing" };
     await render();
-    assert.equal(panel(), originalPanel); assert.ok(button("Close connection"));
-    assert.equal(button("Connect to Workspace"), undefined);
+    assert.equal(panel() === originalPanel, true); assert.ok(button("Close connection"));
+    assert.equal(button("Connect to Workspace") === undefined, true);
     await act(async () => button("Close connection").click());
     assert.equal(calls.filter(call => call.method === "POST").length, 1);
     assert.equal(panel().querySelector('a[href]') === null, true);
-    assert.equal(button("Close connection"), undefined);
+    assert.equal(button("Close connection") === undefined, true);
   } finally {
     await act(async () => root.unmount()); dom.window.close(); Date.now = originalNow;
     Object.assign(globalThis, timers);

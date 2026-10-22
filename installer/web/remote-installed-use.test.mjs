@@ -763,7 +763,7 @@ test("mounted remote pending clipboard copy offers selection of the current task
     assert.doesNotMatch(document.body.textContent, /Task copied|could not be copied/);
     assert.equal(task().disabled, false);
     await edit(task(), current); await click("Select task to copy");
-    assert.equal(document.activeElement, task());
+    assert.equal(document.activeElement === task(), true);
     assert.equal(task().value, current);
     assert.equal(task().selectionStart, 0); assert.equal(task().selectionEnd, current.length);
     assert.equal(completed, false, "Manual selection leaves the original clipboard write pending");
@@ -774,8 +774,8 @@ test("mounted remote pending clipboard copy offers selection of the current task
     assert.equal(completed, true);
     assert.equal(task().value, current);
     assert.equal(button("Copy task").disabled, false);
-    assert.equal(button("Copying task..."), undefined);
-    assert.equal(button("Select task to copy"), undefined);
+    assert.equal(button("Copying task...") === undefined, true);
+    assert.equal(button("Select task to copy") === undefined, true);
     assert.doesNotMatch(document.body.textContent, /Task copied|Clipboard copy is still pending|could not be copied/);
     assert.deepEqual(copied, [original]);
   }, { write: async (value) => { copied.push(value); await pending.promise; completed = true; } });
@@ -971,7 +971,7 @@ test("valid stale remote guidance rechecks after unchanged status and restores t
       await edit(taskNode, edited); await fill("blocked", problem);
       disclosure.open = true; reportNode.focus(); reportNode.setSelectionRange(5, 12);
       const selectedRange = [reportNode.selectionStart, reportNode.selectionEnd];
-      assert.equal(window.document.activeElement, reportNode);
+      assert.equal(window.document.activeElement === reportNode, true);
       assert.equal(published.at(-1), null);
       assert.equal(calls.length, 1);
       setRead(() => refreshed.promise);
@@ -985,11 +985,11 @@ test("valid stale remote guidance rechecks after unchanged status and restores t
       assert.equal(published.at(-1), null, "Pending guidance cannot authorize an editable handoff.");
       for (const phase of ["pending", "recovered"]) {
         if (phase === "recovered") await settle(() => refreshed.resolve(handoffMetadata()));
-        assert.equal(task(), taskNode); assert.equal(form().querySelector("textarea"), reportNode);
-        assert.equal(document.querySelector(".deployment-use-feedback-disclosure"), disclosure);
+        assert.equal(task() === taskNode, true); assert.equal(form().querySelector("textarea") === reportNode, true);
+        assert.equal(document.querySelector(".deployment-use-feedback-disclosure") === disclosure, true);
         assert.equal(taskNode.value, edited); assert.equal(reportNode.value, problem);
         assert.equal(outcomeNode.checked, true); assert.equal(disclosure.open, true);
-        assert.equal(window.document.activeElement, reportNode);
+        assert.equal(window.document.activeElement === reportNode, true);
         assert.deepEqual([reportNode.selectionStart, reportNode.selectionEnd], selectedRange);
       }
       assert.deepEqual(published.at(-1), {

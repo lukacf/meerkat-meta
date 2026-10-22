@@ -541,7 +541,7 @@ test("installed remote settings save only explicit changes and never restart the
     assert.equal(document.querySelector('[name="APP_USER"]').value, "");
     assert.equal(document.querySelector('[name="APP_TOKEN"]').value, "");
     assert.equal(document.querySelector('[name="APP_TOKEN"]').required, false);
-    assert.equal(button("Restart accepted application"), undefined,
+    assert.equal(button("Restart accepted application") === undefined, true,
       "Close or save the settings form before starting this application.");
     assert.equal(button("Save private settings").disabled, true);
     await enter("APP_TOKEN", "  exact synthetic replacement  ");
@@ -566,7 +566,7 @@ test("installed remote settings save only explicit changes and never restart the
 test("legacy remote settings support and uncertain observations never offer a fake recovery form", async () => {
   await mountedRemote({ ...settingsInstallation, private_settings_supported: false, can_configure: false },
     async ({ document, calls, button, poll }) => {
-      assert.equal(button("Change private settings"), undefined);
+      assert.equal(button("Change private settings") === undefined, true);
       assert.match(document.body.textContent, /does not support settings changes in Forge/);
       assert.equal(document.querySelector('[name="APP_TOKEN"]') === null, true);
       await poll({ ...settingsInstallation, private_settings_supported: false, can_configure: false,
@@ -587,7 +587,7 @@ test("cloud removal closes installed settings and restores the parent's status r
   await mountedRemote(cloudReceipt, async ({ document, button, enter, poll, calls }) => {
     await act(async () => button("Change private settings").click());
     await enter("APP_TOKEN", "synthetic unsent cloud edit");
-    assert.equal(button("Restart accepted application"), undefined);
+    assert.equal(button("Restart accepted application") === undefined, true);
     await poll({ ...cloudReceipt, cloud_status: "removing" });
     assert.equal(document.querySelector(".remote-private-form") === null, true);
     assert.equal(button("Recheck remote status").disabled, false,
@@ -605,7 +605,7 @@ test("a lost remote settings response preserves the draft without converting sta
     await act(async () => button("Save private settings").click());
     assert.match(document.body.textContent, /could not confirm this save/);
     assert.equal(document.querySelector('[name="APP_TOKEN"]').value, "synthetic uncertain replacement");
-    assert.equal(button("Save private settings"), undefined);
+    assert.equal(button("Save private settings") === undefined, true);
     await poll(settingsInstallation);
     await act(async () => button("Reload private settings").click());
     assert.match(document.body.textContent, /checking status does not confirm that these exact values were saved/);
@@ -807,7 +807,7 @@ test("closed or superseded private forms ignore late port checks and never resto
       else await poll({ ...initialPortSetup, status: "observation-unavailable", last_known_status: "configuration-required", observation: { available: false } });
       await act(async () => finish(localPortOptions(18088, "occupied", 18089)));
       assert.equal(document.querySelector(".remote-private-form") === null, true);
-      assert.equal(button("Use port 18089"), undefined);
+      assert.equal(button("Use port 18089") === undefined, true);
       assert.equal(calls.some((call) => call.method === "POST"), false);
       assert.equal(document.body.innerHTML.includes("private-port-test-token"), false);
     }, { options: portOptions });
@@ -863,7 +863,7 @@ test("cloud private setup uses the same port choice and withdraws stale checks w
     await poll({ ...cloudReceipt, cloud_status: "removing" });
     await act(async () => finish({ ...localPortOptions(18088, "occupied", 18089), target: "gcp" }));
     assert.equal(document.querySelector(".remote-private-form") === null, true);
-    assert.equal(button("Use port 18089"), undefined);
+    assert.equal(button("Use port 18089") === undefined, true);
     assert.equal(calls.some((call) => call.method === "POST"), false);
     assert.equal(document.body.innerHTML.includes("private-port-test-token"), false);
   }, { guide: cloudGuide, options: cloudOptions });
@@ -895,7 +895,7 @@ test("an updated accepted build offers a deliberate same-destination check witho
     assert.equal(JSON.stringify(posts).includes("fixture-only-old-private-token"), false);
     assert.equal(document.body.innerHTML.includes("fixture-only-old-private-token"), false);
     assert.equal(window.localStorage.length, 0); assert.equal(window.sessionStorage.length, 0);
-    assert.equal(button("Check the updated application here"), undefined);
+    assert.equal(button("Check the updated application here") === undefined, true);
   });
 });
 
@@ -924,14 +924,14 @@ test("unavailable observation and design edits withhold the pending handoff with
   await mountedRemote(pendingEarlierBuild, async ({ calls, button, changeSelection, changeBlocked, poll }) => {
     await changeSelection(guide, updatedBuild, updatedOptions);
     assert.ok(button("Check the updated application here"));
-    await changeBlocked(true); assert.equal(button("Check the updated application here"), undefined);
+    await changeBlocked(true); assert.equal(button("Check the updated application here") === undefined, true);
     await changeBlocked(false); assert.ok(button("Check the updated application here"));
-    await poll(pendingEarlierBuild, true); assert.equal(button("Check the updated application here"), undefined);
+    await poll(pendingEarlierBuild, true); assert.equal(button("Check the updated application here") === undefined, true);
     await poll(pendingEarlierBuild); assert.ok(button("Check the updated application here"));
     await poll({ ...pendingEarlierBuild, status: "observation-unavailable", observation: { available: false } });
-    assert.equal(button("Check the updated application here"), undefined);
+    assert.equal(button("Check the updated application here") === undefined, true);
     await poll({ ...pendingEarlierBuild, remote_admission_requested: true, admitted: true });
-    assert.equal(button("Check the updated application here"), undefined);
+    assert.equal(button("Check the updated application here") === undefined, true);
     assert.equal(calls.some((call) => call.method === "POST"), false);
   });
 });
@@ -1012,7 +1012,7 @@ test("unaccepted or stale builds without an owned receipt withhold SSH fields un
     assert.equal(document.querySelector(".remote-destination-form") === null, true);
     for (const name of ["host", "user", "destination", "ssh_port"])
       assert.equal(document.querySelector(`[name="${name}"]`) === null, true);
-    assert.equal(button("Connect and check destination"), undefined);
+    assert.equal(button("Connect and check destination") === undefined, true);
     assert.ok(calls.every((call) => call.method === "GET" && call.target === remoteDeploymentUrl(guide.id)));
     await changeSelection(guide, checked, options);
     assert.ok(document.querySelector(".remote-destination-form"));
@@ -1218,7 +1218,7 @@ test("older same-guide source remains inspectable with exact-owned stop and no r
     await changeSelection(guide, candidate, null);
     assert.match(document.body.textContent, /earlier proposal or build/);
     assert.equal(document.querySelector(".remote-private-form") === null, true);
-    assert.equal(button("Restart accepted application"), undefined);
+    assert.equal(button("Restart accepted application") === undefined, true);
     assert.ok(button("Stop owned application"));
     await act(async () => button("Stop owned application").click());
     const posts = calls.filter((call) => call.method === "POST");
@@ -1353,7 +1353,7 @@ test("an older status GET cannot restore private setup after lost-response admis
     await act(async () => resolveOldRead(structuredClone(ready)));
     assert.equal(document.querySelector(".remote-deployment").dataset.remoteStatus, "installing");
     assert.equal(document.querySelector(".remote-private-form") === null, true);
-    assert.equal(button("Continue to private setup"), undefined);
+    assert.equal(button("Continue to private setup") === undefined, true);
   });
 });
 
@@ -1365,7 +1365,7 @@ test("recovery-needed stays uncertain and only the backend's exact-owned stop ca
     assert.match(document.body.textContent, /cleanup needs to be verified/);
     assert.match(document.body.textContent, /missing SSH connection does not establish a stopped application/);
     assert.equal(document.querySelector(".remote-private-form") === null, true);
-    assert.equal(button("Restart accepted application"), undefined);
+    assert.equal(button("Restart accepted application") === undefined, true);
     assert.equal(button("Connect and check destination").disabled, true);
     assert.ok(button("Stop owned application"));
     assert.equal(calls.some((call) => call.method === "POST"), false);
@@ -1385,8 +1385,8 @@ test("mounted control-state observations close private setup, lock the endpoint 
       assert.equal(document.querySelector('[name="user"]').disabled, true);
       assert.equal(document.querySelector('[name="destination"]').disabled, true);
       assert.equal(button("Connect and check destination").disabled, true);
-      assert.equal(button("Restart accepted application"), undefined);
-      assert.equal(button("Continue to private setup"), undefined);
+      assert.equal(button("Restart accepted application") === undefined, true);
+      assert.equal(button("Continue to private setup") === undefined, true);
       const activity = [...document.querySelectorAll("details")].find((node) => node.querySelector("summary").textContent === "Remote deployment activity");
       assert.equal(activity.open, true);
     }
@@ -1465,7 +1465,7 @@ test("an altered-source running service never presents verified readiness and pr
     assert.equal(document.querySelector(".remote-first-use h4").textContent, "Check your installed runtime");
     assert.doesNotMatch(document.body.textContent, /Use your installed application/);
     assert.equal(document.querySelector(".remote-private-form") === null, true);
-    assert.equal(button("Restart accepted application"), undefined);
+    assert.equal(button("Restart accepted application") === undefined, true);
     await act(async () => button("Stop owned application").click());
     assert.deepEqual(calls.filter((call) => call.method === "POST").map((call) => call.body),
       [{ deployment_id: altered.deployment_id, action: "stop" }]);
@@ -1503,11 +1503,11 @@ test("not-installed retries require authoritative nonadmission and fresh explici
     assert.equal(document.querySelector(".remote-deployment").dataset.remoteStatus, "installing");
     assert.equal(calls.filter((call) => call.method === "POST").length, 2);
     await poll({ ...notInstalled, admitted: undefined });
-    assert.equal(button("Retry private setup"), undefined);
+    assert.equal(button("Retry private setup") === undefined, true);
     await poll({ ...notInstalled, can_install: false });
-    assert.equal(button("Retry private setup"), undefined);
+    assert.equal(button("Retry private setup") === undefined, true);
     await poll({ ...notInstalled, admitted: true });
-    assert.equal(button("Retry private setup"), undefined);
+    assert.equal(button("Retry private setup") === undefined, true);
   });
 });
 
@@ -1571,9 +1571,9 @@ test("a confirmed failed initial destination check returns to private setup thro
     assert.equal(checks.open, true);
     assert.match(checks.textContent, /systemd-user: failed/);
     assert.equal(document.querySelector(".remote-private-form") === null, true);
-    assert.equal(button("Continue to private setup"), undefined);
-    assert.equal(button("Stop owned application"), undefined);
-    assert.equal(button("Prepare another install attempt"), undefined);
+    assert.equal(button("Continue to private setup") === undefined, true);
+    assert.equal(button("Stop owned application") === undefined, true);
+    assert.equal(button("Prepare another install attempt") === undefined, true);
     const beforeRecheck = calls.length;
     setReceipt({ ...ready, remote_admission_requested: false });
     await act(async () => button("Recheck remote status").click());
@@ -1606,7 +1606,7 @@ test("uncertain initial checks and contradictory installation custody preserve c
       assert.equal(document.querySelector(".remote-recovery h4").textContent, "Recover this installation");
       assert.doesNotMatch(document.querySelector(".remote-recovery").textContent, /checks on this same Linux computer/);
       assert.equal(document.querySelector(".remote-private-form") === null, true);
-      assert.equal(button("Continue to private setup"), undefined);
+      assert.equal(button("Continue to private setup") === undefined, true);
       assert.ok(button("Recheck remote status"));
     }
     await poll(failedDestinationCheck, true);
@@ -1631,7 +1631,7 @@ test("initial cloud destination checks keep the same VM and cloud removal takes 
     const location = document.querySelector(".deployment-location").textContent;
     assert.equal(document.querySelector(".remote-deployment h3").textContent, "Destination checks need attention");
     assert.match(document.querySelector(".remote-recovery").textContent, /Destination checks on this same cloud VM, then choose Recheck remote status/);
-    assert.equal(button("Connect and check destination"), undefined);
+    assert.equal(button("Connect and check destination") === undefined, true);
     setReceipt({ ...cloudReceipt, status: "configuration-required", can_install: true, preflight: ready.preflight });
     await act(async () => button("Recheck remote status").click());
     assert.equal(document.querySelector(".deployment-location").textContent, location);
@@ -1640,7 +1640,7 @@ test("initial cloud destination checks keep the same VM and cloud removal takes 
     await poll({ ...cloudReceipt, cloud_status: "removing" });
     assert.equal(document.querySelector(".remote-deployment h3").textContent, "Cloud removal is requested");
     assert.equal(document.querySelector(".remote-recovery") === null, true);
-    assert.equal(button("Continue to private setup"), undefined);
+    assert.equal(button("Continue to private setup") === undefined, true);
     assert.ok(calls.every((call) => call.method === "GET" && call.target === remoteDeploymentUrl(guide.id)));
   }, { guide: cloudGuide, options: cloudOptions });
 });
@@ -1780,7 +1780,7 @@ test("lost retry response is observed without repeating submission or accepting 
     await act(async () => resolveOldRead(structuredClone(retryableFailure)));
     assert.equal(document.querySelector(".remote-deployment").dataset.remoteStatus, "installing");
     assert.equal(document.querySelector(".remote-private-form") === null, true);
-    assert.equal(button("Prepare another install attempt"), undefined);
+    assert.equal(button("Prepare another install attempt") === undefined, true);
     assert.doesNotMatch(document.body.textContent, /could not confirm the retry response/);
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
   });
@@ -1795,7 +1795,7 @@ test("lost retry observation preserves the known failed attempt while withholdin
     await act(async () => button("Retry installation on this Linux computer").click());
     assert.equal(document.querySelector(".remote-deployment").dataset.remoteStatus, "failed");
     assert.equal(document.querySelector(".remote-private-form") === null, true);
-    assert.equal(button("Prepare another install attempt"), undefined);
+    assert.equal(button("Prepare another install attempt") === undefined, true);
     assert.match(document.querySelector(".remote-recovery").textContent, /cannot verify its current state/);
     assert.match(document.body.textContent, /does not prove the application failed or stopped/);
     setRead(null);
@@ -1846,7 +1846,7 @@ test("retry private setup belongs to one failed operation and clears when operat
       "Repeated observation of the same eligible failed operation preserves this newly opened form.");
     await poll({ ...nextFailure, source_binding_current: false });
     assert.equal(document.querySelector(".remote-private-form") === null, true);
-    assert.equal(button("Prepare another install attempt"), undefined);
+    assert.equal(button("Prepare another install attempt") === undefined, true);
     assert.match(document.querySelector(".remote-recovery").textContent, /matching accepted build/);
     assert.equal(calls.some((call) => call.method === "POST"), false);
   });
@@ -1861,8 +1861,8 @@ test("uncertain cleanup, lost observation and generic failed install permission 
       { can_retry_install: false }, { status: "recovery-needed" }, { status: "observation-unavailable" }]) {
       await poll({ ...retryableFailure, can_install: true, can_stop: true, ...changed });
       assert.equal(document.querySelector(".remote-private-form") === null, true);
-      assert.equal(button("Prepare another install attempt"), undefined);
-      assert.equal(button("Continue to private setup"), undefined);
+      assert.equal(button("Prepare another install attempt") === undefined, true);
+      assert.equal(button("Continue to private setup") === undefined, true);
       assert.ok(button("Recheck remote status"));
       assert.ok(button("Stop owned application"));
     }
@@ -1894,7 +1894,7 @@ test("a delayed retry reply cannot replace a newer failed operation or follow a 
       operation_id: retryOperation, previous_operation_id: otherOperation, worker_live: true }));
     assert.equal(document.querySelector(".remote-deployment").dataset.remoteStatus, "failed");
     assert.equal(document.querySelector(".remote-private-form") === null, true);
-    assert.equal(button("Prepare another install attempt"), undefined);
+    assert.equal(button("Prepare another install attempt") === undefined, true);
   });
 });
 

@@ -377,19 +377,19 @@ for (const kind of ['local', 'remote']) {
         await edit(); await click(improvementLabel(kind));
         assert.equal(button('Check Build status').disabled, false);
         await click('Check Build status');
-        assert.equal(button('Prepare another report'), undefined, 'The original continuation Build cannot release the report');
+        assert.equal(button('Prepare another report') === undefined, true, 'The original continuation Build cannot release the report');
         observeBuild(() => { throw Error('PRIVATE_REFUSAL_DETAIL'); });
         await click('Check Build status');
         assert.match(document.body.textContent, /Build status could not be checked/);
-        assert.equal(button('Prepare another report'), undefined);
+        assert.equal(button('Prepare another report') === undefined, true);
         assert.equal(button('Check Build status').disabled, false);
         observeBuild({ ...finishedImprovement, guide_id: 'foreign-guide' });
         await click('Check Build status');
-        assert.equal(button('Prepare another report'), undefined);
+        assert.equal(button('Prepare another report') === undefined, true);
         await selectBuild(finishedImprovement);
         for (const patch of [{ cleanup_pending: true }, { source_verified: false }, { status: 'running' }, { build_id: 'unselected-new-build' }]) {
           observeBuild({ ...finishedImprovement, ...patch }); await click('Check Build status');
-          assert.equal(button('Prepare another report'), undefined, 'Only the exact selected, terminal, checked and cleaned source can prepare a new report');
+          assert.equal(button('Prepare another report') === undefined, true, 'Only the exact selected, terminal, checked and cleaned source can prepare a new report');
         }
         const before = structuredClone(publications), finalRead = heldJson();
         observeBuild(() => finalRead.response); await click('Check Build status');
@@ -422,7 +422,7 @@ for (const kind of ['local', 'remote']) {
         await act(async () => { reading.resolve(finishedImprovement); await settle(); });
         await idle();
         assert.deepEqual(publications, []);
-        assert.equal(button('Prepare another report'), undefined);
+        assert.equal(button('Prepare another report') === undefined, true);
         current = true;
         observeBuild(checked);
         await select('B'); await edit(otherDraft);
@@ -455,7 +455,7 @@ for (const kind of ['local', 'remote']) {
       assertDrafts(document);
       assert.match(document.body.textContent, /did not receive this report/);
       assert.match(document.body.textContent, /Browser draft storage is unavailable/);
-      assert.equal(button('Retry clearing report tracking'), undefined);
+      assert.equal(button('Retry clearing report tracking') === undefined, true);
       assert.equal(button(improvementLabel(kind)).disabled, false);
       assert.equal(postsFor(calls, kind, 'feedback').length, 1);
       await idle(); assert.equal(postsFor(calls, kind, 'feedback').length, 1, 'A host refusal never automatically resends');
@@ -479,8 +479,8 @@ for (const kind of ['local', 'remote']) {
       await edit(); assert.equal(button('It worked').disabled, false);
       await click('It worked'); assertDrafts(document);
       assert.match(document.querySelector('.deployment-use-success').textContent, /earlier success report was not saved/);
-      assert.equal(button('Clear unsaved confirmation'), undefined);
-      assert.equal(button('Retry success confirmation'), undefined);
+      assert.equal(button('Clear unsaved confirmation') === undefined, true);
+      assert.equal(button('Retry success confirmation') === undefined, true);
       assert.equal(button('It worked').disabled, false);
       await idle(); assert.equal(postsFor(calls, kind, 'success').length, 1);
       await click('It worked');
@@ -503,14 +503,14 @@ for (const kind of ['local', 'remote']) {
     }, async ({ document, button, click, edit, calls, idle }) => {
       await edit(); await click(improvementLabel(kind));
       assertDrafts(document); assert.equal(button(improvementLabel(kind)).disabled, true);
-      assert.equal(button('Retry clearing report tracking'), undefined);
+      assert.equal(button('Retry clearing report tracking') === undefined, true);
       await click('Check Build status');
       assert.equal(button(improvementLabel(kind)).disabled, true, 'Unchanged old Build cannot release an unknown report');
       await click(improvementLabel(kind));
       assert.equal(postsFor(calls, kind, 'feedback').length, 1);
       await click('It worked');
       assert.equal(button('Retry success confirmation').disabled, false);
-      assert.equal(button('Clear unsaved confirmation'), undefined);
+      assert.equal(button('Clear unsaved confirmation') === undefined, true);
       assert.equal(document.querySelector('[aria-label="Task awaiting success confirmation"]')?.textContent, draft.task.trim());
       const original = postsFor(calls, kind, 'success')[0].body;
       await click('Recheck success reports'); await idle();
