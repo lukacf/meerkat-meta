@@ -277,14 +277,20 @@ async def test_reserved_correction_with_retained_native_custody_never_uses_repla
 
 @pytest.mark.asyncio
 async def test_automatic_lease_expiry_retires_waiting_work_without_native_terminality(coordinators):
-    operations, service = coordinators(consumer_lease_seconds=.025), ContinuousService()
+    # The lease clock stands still until the scene is submitted, so a busy host
+    # cannot let the lease lapse first. The host's own lease task then expires
+    # the intent once the clock passes its lease.
+    now = [0.0]
+    operations = coordinators(consumer_lease_seconds=.025, consumer_clock=lambda: now[0])
+    service = ContinuousService()
     await operations.generation_lock.acquire()
     intent = body(await operations.declare_intent(str(uuid.uuid4()), 1, 'setup', 'overview'))
     receipt = await operations.submit(service, {'version': 1}, {}, setup_id='setup', stream_id='overview', consumer_intent=intent)
+    now[0] = 1.0
     async def expired():
         while operations.consumers.records[intent['consumer_id']]['status'] != 'expired':
             await asyncio.sleep(.005)
-    await asyncio.wait_for(expired(), .5)
+    await asyncio.wait_for(expired(), 5)
     assert receipt['status'] == 'queued' and receipt['scheduling']['status'] == 'withdrawn'
     assert not operations.tasks and not operations.jobs and 'started_at' not in receipt
     operations.generation_lock.release()
