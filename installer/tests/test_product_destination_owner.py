@@ -15,6 +15,7 @@ from pathlib import Path
 import platform
 import stat
 import sys
+import time
 from types import SimpleNamespace
 import uuid
 import zipfile
@@ -34,6 +35,7 @@ from test_product_artifact_transfer import (
     frame, send_complete,
 )
 from test_product_artifact_transport import ENDPOINT, FINGERPRINT
+from test_remote_deployment import longest_loop_gap
 
 
 MAX_SOURCE = 64 * 1024 * 1024
@@ -755,3 +757,43 @@ async def test_unaccepted_source_never_opens_destination_or_local_intake(destina
         await owner.stage_product_destination_source(implementation, GUIDE, **arguments)
     assert transport.calls == [] and not arguments["transaction_directory"].exists()
     assert not selected.destination.exists()
+
+
+def slow_host_package_staging(monkeypatch, transport, intake):
+    """Slow the host's own package work until it first contacts the destination."""
+    original_hashlib, original_retain, original_read = owner.hashlib, artifacts._retain_file, owner._Inputs.read
+    class Hashing:
+        def __getattr__(self, name):
+            return getattr(original_hashlib, name)
+        def sha256(self, data=b""):
+            if bytes(data[:4]) == b"PK\x03\x04":
+                time.sleep(1.0)  # Hashing a large package on a small host.
+            return original_hashlib.sha256(data)
+    def retain(path, content):
+        if path == intake / "package.zip":
+            time.sleep(1.0)  # Writing and syncing its copy.
+        return original_retain(path, content)
+    def read(self, path, *args, **kwargs):
+        if path == intake / "package.zip":
+            time.sleep(1.0)  # Reading the copy back.
+        return original_read(self, path, *args, **kwargs)
+    monkeypatch.setattr(owner, "hashlib", Hashing())
+    monkeypatch.setattr(artifacts, "_retain_file", retain)
+    monkeypatch.setattr(owner._Inputs, "read", read)
+    original_request = transport.request
+    async def request(*args, **kwargs):
+        owner.hashlib = original_hashlib  # The inert destination runs in this process.
+        return await original_request(*args, **kwargs)
+    transport.request = request
+
+
+async def test_host_package_staging_leaves_the_event_loop_free(destination_source, tmp_path, monkeypatch):
+    selected = destination_source
+    implementation, transport = AcceptedImplementation(selected), SourceFramedTransport(selected)
+    arguments = staging_arguments(selected, tmp_path, transport)
+    slow_host_package_staging(monkeypatch, transport, arguments["transaction_directory"])
+    result, gap = await longest_loop_gap(owner.stage_product_destination_source(implementation, GUIDE, **arguments))
+    assert_stage_only(result)
+    assert transport.calls == ["begin", "package", "finish"]
+    assert (arguments["transaction_directory"] / "package.zip").read_bytes() == selected.package
+    assert gap < 0.5

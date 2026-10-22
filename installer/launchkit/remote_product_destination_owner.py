@@ -652,9 +652,12 @@ async def stage_product_destination_source(implementation, guide_id, *, build_id
     payload, _ = await implementation.package(guide_id, build_id)
     _current(require_current)
     source = product_destination_owner_bytes()
+    # Hashing, retaining and rereading the whole package must not hold the
+    # event loop.
+    package_sha256 = await _joined(lambda: hashlib.sha256(payload).hexdigest())
     context = {"schema": 1, "deployment_id": deployment_id, "guide_id": guide_id,
         "build_id": build_id, "guide_version": guide_version, "source_digest": source_digest,
-        "package_sha256": hashlib.sha256(payload).hexdigest(), "package_size": len(payload),
+        "package_sha256": package_sha256, "package_size": len(payload),
         "host": deepcopy(destination_host), "artifact_transaction_id": custody.transaction_id,
         "artifact_manifest_sha256": custody.manifest_sha256, "artifact_receiver_sha256": custody.receiver_sha256,
         "artifact_selection_sha256": custody.selection_sha256, "owner_sha256": hashlib.sha256(source).hexdigest()}
@@ -670,13 +673,16 @@ async def stage_product_destination_source(implementation, guide_id, *, build_id
         _owner_current=require_current)
     directory = Path(transaction_directory)
     _private_directory(directory)
-    _retain_file(directory / "package.zip", payload)
-    _retain_file(directory / "source-owner.py", source)
-    _retain_file(directory / "intent.json", _json(context))
-    retained = _Inputs(directory)
-    for name, content in (("package.zip", payload), ("source-owner.py", source), ("intent.json", _json(context))):
-        retained.read(directory / name, hashlib.sha256(content).hexdigest(), len(content), size=len(content), keep=False)
-    retained.finish()
+    def retained_inputs():
+        _retain_file(directory / "package.zip", payload)
+        _retain_file(directory / "source-owner.py", source)
+        _retain_file(directory / "intent.json", _json(context))
+        retained = _Inputs(directory)
+        for name, content in (("package.zip", payload), ("source-owner.py", source), ("intent.json", _json(context))):
+            retained.read(directory / name, hashlib.sha256(content).hexdigest(), len(content), size=len(content), keep=False)
+        retained.finish()
+        return retained
+    retained = await _joined(retained_inputs)
     program = _receiver_program(source)
     package = ArtifactFile(directory / "package.zip", len(payload), context["package_sha256"])
     def files_current():
