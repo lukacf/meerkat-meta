@@ -25,12 +25,13 @@ use super::native::{
     NativeStatus, NativeStatusError, NativeSubmitError, OwnerRefusal, PrepareError,
     route_contradiction,
 };
+use super::sources::{AnnouncementSource, PutSource, SourceChange, SourceQuery};
 use super::store::AnnouncementStore;
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
     BatchGap, BatchId, BatchPosition, BatchQuery, BatchState, BatchStateTag, ChildMemberLimits,
     GapReason, LateOutcome, Member, MemberRouteRecord, MobId, MobIncarnation, MobLineage,
-    NativeReceipt, OperationId, PutSubscription, SealingPolicy, SourceKey, Subscription,
+    NativeReceipt, OperationId, PutSubscription, SealingPolicy, SourceId, SourceKey, Subscription,
     SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
     SubscriptionState, SuccessorBatch, merge_gaps, render_item, successor_batch, wire_budget,
 };
@@ -673,6 +674,66 @@ impl AnnouncementService {
         source_key: &SourceKey,
     ) -> Result<Option<Announcement>, AnnouncementError> {
         Ok(self.inner.store.announcement(mob_id, source_key).await?)
+    }
+
+    /// Declare a source of a mob hosted here, replace its declaration at its
+    /// revision, or start its next generation. The source verbs are public
+    /// so a collector in this process calls them directly, never through
+    /// its own gateway's RPC.
+    pub async fn put_source(
+        &self,
+        operation: &OperationId,
+        request: PutSource,
+    ) -> Result<AnnouncementSource, AnnouncementError> {
+        self.ensure_hosted(&BTreeSet::from([request.mob_id.clone()]))
+            .await?;
+        Ok(self
+            .inner
+            .store
+            .put_source(operation, request, self.now())
+            .await?)
+    }
+
+    /// Pause, resume or end a source at its revision.
+    pub async fn change_source(
+        &self,
+        operation: &OperationId,
+        mob_id: &MobId,
+        source_id: &SourceId,
+        expected_revision: u64,
+        change: SourceChange,
+    ) -> Result<AnnouncementSource, AnnouncementError> {
+        Ok(self
+            .inner
+            .store
+            .change_source(
+                operation,
+                mob_id,
+                source_id,
+                expected_revision,
+                change,
+                self.now(),
+            )
+            .await?)
+    }
+
+    /// A source whole, with its cursor's token: what a collector reads
+    /// before it collects.
+    pub async fn source(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<Option<AnnouncementSource>, AnnouncementError> {
+        Ok(self.inner.store.source(mob_id, source_id).await?)
+    }
+
+    /// Sources in `(mob_id, source_id)` order, with their cursor tokens
+    /// (the RPC list strips them).
+    pub async fn sources(
+        &self,
+        query: &SourceQuery,
+    ) -> Result<Vec<AnnouncementSource>, AnnouncementError> {
+        Ok(self.inner.store.sources(query).await?)
     }
 
     pub async fn put_subscription(

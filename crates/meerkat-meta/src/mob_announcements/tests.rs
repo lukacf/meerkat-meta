@@ -7911,6 +7911,7 @@ fn every_public_announcement_enum_is_non_exhaustive() {
         ("owner", include_str!("owner.rs")),
         ("remote", include_str!("remote.rs")),
         ("rpc", include_str!("rpc.rs")),
+        ("sources", include_str!("sources.rs")),
         ("sqlite", include_str!("sqlite.rs")),
         ("store", include_str!("store.rs")),
         ("tools", include_str!("tools.rs")),
@@ -10114,4 +10115,379 @@ async fn a_version_one_store_migrates_to_version_two_in_place() {
         )
         .unwrap();
     assert_eq!(tables, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Announcement sources through the store and the service.
+// ---------------------------------------------------------------------------
+
+/// A source declaration as a store takes it.
+fn source_config(subject: &str, topic: &[&str]) -> super::sources::SourceConfig {
+    let mut params = source_params("unused", "unused", subject, topic);
+    let object = params.as_object_mut().unwrap();
+    object.remove("operation_id");
+    object.remove("source_id");
+    object.insert("routes".into(), serde_json::json!([{ "kind": "direct" }]));
+    serde_json::from_value(params).unwrap()
+}
+
+fn put_source(source_id: &str, subject: &str, topic: &[&str]) -> super::sources::PutSource {
+    super::sources::PutSource {
+        mob_id: mob(OWN_MOB),
+        source_id: SourceId::new(source_id).unwrap(),
+        expected_revision: None,
+        new_generation: false,
+        config: source_config(subject, topic),
+    }
+}
+
+fn source_item(source_id: &str, key: &str, topic: &[&str]) -> AnnounceRequest {
+    AnnounceRequest {
+        mob_id: mob(OWN_MOB),
+        announced_by: Announcer::Source {
+            source_id: SourceId::new(source_id).unwrap(),
+        },
+        source_key: SourceKey::new(key).unwrap(),
+        topics: topics(topic),
+        body: "From: someone".to_string(),
+        correlation_id: None,
+        causes: Vec::new(),
+    }
+}
+
+/// A source's own item reaches its own topic, and no other source's does:
+/// the announcer and the topic's owner must agree.
+#[tokio::test]
+async fn a_sources_own_item_reaches_its_own_topic_and_no_other_sources() {
+    let (_dir, store) = temp_store();
+    store
+        .put_source(
+            &op("o1"),
+            put_source("inbox", "subject-1", &["mail.received"]),
+            1,
+        )
+        .await
+        .unwrap();
+    let outcome = store
+        .announce(
+            source_item("inbox", "source:inbox:0001", &["mail.received"]),
+            2,
+        )
+        .await
+        .unwrap();
+    assert!(!outcome.replayed);
+    assert_eq!(
+        store
+            .announce(
+                source_item("calendar", "source:calendar:0001", &["mail.received"]),
+                3,
+            )
+            .await,
+        Err(AnnouncementStoreError::TopicOwnedBySource {
+            topic: Topic::new("mail.received").unwrap(),
+            source_id: SourceId::new("inbox").unwrap(),
+        })
+    );
+}
+
+/// The content digest names a source announcer apart from the host and from
+/// every other source.
+#[test]
+fn a_source_announcer_enters_the_content_digest() {
+    let host = announce_request(OWN_MOB, "k", &["t"], "b");
+    let mut inbox = host.clone();
+    inbox.announced_by = Announcer::Source {
+        source_id: SourceId::new("inbox").unwrap(),
+    };
+    let mut calendar = host.clone();
+    calendar.announced_by = Announcer::Source {
+        source_id: SourceId::new("calendar").unwrap(),
+    };
+    assert_ne!(host.digest(), inbox.digest());
+    assert_ne!(inbox.digest(), calendar.digest());
+    assert_eq!(inbox.digest(), inbox.clone().digest());
+}
+
+/// Pause and resume move a source at its revision; a repeated pause changes
+/// nothing; a resume can rebaseline; an ended source takes no change; and
+/// only a resume takes `rebaseline`.
+#[tokio::test]
+async fn a_source_pauses_resumes_and_ends_at_its_revision() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("o1", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    let change = |operation: &str, method: &str, revision: u64| {
+        let params = serde_json::json!({
+            "operation_id": operation, "source_id": "inbox", "expected_revision": revision
+        });
+        let method = format!("meta/mob_announcements/sources/{method}");
+        async move { try_host_call(service, &method, params).await }
+    };
+    let paused = change("o2", "pause", 1).await.unwrap();
+    assert_eq!(paused["source"]["state"], serde_json::json!("paused"));
+    assert_eq!(paused["source"]["revision"], serde_json::json!(2));
+    assert_eq!(
+        paused["source"]["health"]["status"],
+        serde_json::json!("paused")
+    );
+    let again = change("o3", "pause", 2).await.unwrap();
+    assert_eq!(
+        again["source"]["revision"],
+        serde_json::json!(2),
+        "nothing moved"
+    );
+
+    let refused = try_host_call(
+        service,
+        "meta/mob_announcements/sources/pause",
+        serde_json::json!({
+            "operation_id": "o4", "source_id": "inbox", "expected_revision": 2,
+            "rebaseline": true
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, -32602, "{refused:?}");
+
+    let resumed = try_host_call(
+        service,
+        "meta/mob_announcements/sources/resume",
+        serde_json::json!({
+            "operation_id": "o5", "source_id": "inbox", "expected_revision": 2,
+            "rebaseline": true
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed["source"]["state"], serde_json::json!("active"));
+    assert_eq!(resumed["source"]["revision"], serde_json::json!(3));
+    assert_eq!(
+        resumed["source"]["collection"],
+        serde_json::json!("baselining")
+    );
+    assert_eq!(
+        resumed["source"]["cursor"]["token"],
+        serde_json::Value::Null
+    );
+
+    let ended = change("o6", "end", 3).await.unwrap();
+    assert_eq!(ended["source"]["state"], serde_json::json!("ended"));
+    let refused = change("o7", "pause", 4).await.unwrap_err();
+    assert_eq!(refusal_kind(&refused).as_deref(), Some("source_ended"));
+    let stale = change("o8", "end", 1).await.unwrap_err();
+    assert_eq!(refusal_kind(&stale).as_deref(), Some("source_ended"));
+}
+
+/// A topic a source stops naming stays reserved to it: ownership is never
+/// released by a declaration.
+#[tokio::test]
+async fn a_topic_a_source_stops_naming_stays_reserved_to_it() {
+    let harness = harness_with(ScriptedNative::new());
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("o1", "inbox", "subject-1", &["mail.received", "mail.old"]),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        with(
+            source_params("o2", "inbox", "subject-1", &["mail.received"]),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    let claimed = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("o3", "other", "subject-2", &["mail.old"]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal_kind(&claimed).as_deref(), Some("topic_owned"));
+}
+
+/// A source survives reopening its store, whole.
+#[tokio::test]
+async fn a_source_survives_reopening_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mob_announcements.sqlite3");
+    let first = {
+        let store = super::storage::open_disk_store(path.clone()).unwrap();
+        store
+            .put_source(
+                &op("o1"),
+                put_source("inbox", "subject-1", &["mail.received"]),
+                5,
+            )
+            .await
+            .unwrap()
+    };
+    let store = super::storage::open_disk_store(path).unwrap();
+    assert_eq!(
+        store
+            .source(&mob(OWN_MOB), &SourceId::new("inbox").unwrap())
+            .await
+            .unwrap(),
+        Some(first)
+    );
+}
+
+/// A list pages sources in (mob, source) order and filters by state.
+#[tokio::test]
+async fn a_list_pages_sources_in_order_and_filters_by_state() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("o1", "b-src", "subject-1", &["mail.b"]),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("o2", "a-src", "subject-2", &["mail.a"]),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SOURCES_END,
+        serde_json::json!({ "operation_id": "o3", "source_id": "b-src", "expected_revision": 1 }),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            source_params("o4", "c-src", "subject-3", &["mail.c"]),
+            "mob_id",
+            serde_json::json!("events"),
+        ),
+    )
+    .await
+    .unwrap();
+    let ids = |listed: serde_json::Value| -> Vec<String> {
+        listed["sources"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|source| source["source_id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let list = |params: serde_json::Value| async move {
+        ids(try_host_call(service, SOURCES_LIST, params).await.unwrap())
+    };
+    assert_eq!(
+        list(serde_json::json!({})).await,
+        vec!["a-src", "b-src"],
+        "a list reads the gateway's own mob unless it names another"
+    );
+    assert_eq!(
+        list(serde_json::json!({ "mob_id": "events" })).await,
+        vec!["c-src"]
+    );
+    assert_eq!(list(serde_json::json!({ "limit": 1 })).await, vec!["a-src"]);
+    assert_eq!(
+        list(serde_json::json!({ "after": "a-src" })).await,
+        vec!["b-src"]
+    );
+    assert_eq!(
+        list(serde_json::json!({ "state": "ended" })).await,
+        vec!["b-src"]
+    );
+    assert_eq!(
+        list(serde_json::json!({ "state": "active" })).await,
+        vec!["a-src"]
+    );
+}
+
+/// A change at a stale revision names where the source stands: its
+/// revision, its generation and its cursor, with the cursor's version beside
+/// them, so the caller retries without another read.
+#[tokio::test]
+async fn a_stale_source_revision_names_where_the_source_stands() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("o1", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    let stale = try_host_call(
+        service,
+        "meta/mob_announcements/sources/pause",
+        serde_json::json!({ "operation_id": "o2", "source_id": "inbox", "expected_revision": 7 }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale.code, super::rpc::ANNOUNCEMENTS_CONFLICT_CODE);
+    assert_eq!(
+        stale.data,
+        Some(serde_json::json!({
+            "kind": "stale_revision",
+            "current_revision": 1,
+            "current_version": 0,
+            "generation": 1,
+            "cursor": { "version": 0, "token": null, "advanced_at_ms": null },
+        }))
+    );
+}
+
+/// A mob holds a bounded number of live sources: the next one is refused
+/// typed with the bound and the mob, and an ended source frees its place.
+#[tokio::test]
+async fn a_mob_holds_a_bounded_number_of_live_sources() {
+    let (_dir, store) = temp_store();
+    for index in 0..super::sources::MAX_SOURCES_PER_MOB {
+        let topic = format!("mail.{index}");
+        store
+            .put_source(
+                &op(&format!("o{index}")),
+                put_source(
+                    &format!("s{index}"),
+                    &format!("subject-{index}"),
+                    &[topic.as_str()],
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+    }
+    let over = || put_source("over", "subject-over", &["mail.over"]);
+    assert_eq!(
+        store.put_source(&op("over-1"), over(), 2).await,
+        Err(AnnouncementStoreError::SourceLimit {
+            limit: super::sources::MAX_SOURCES_PER_MOB,
+            mob_id: Some(mob(OWN_MOB)),
+        })
+    );
+    store
+        .change_source(
+            &op("end"),
+            &mob(OWN_MOB),
+            &SourceId::new("s0").unwrap(),
+            1,
+            super::sources::SourceChange::End,
+            3,
+        )
+        .await
+        .unwrap();
+    store.put_source(&op("over-2"), over(), 4).await.unwrap();
 }

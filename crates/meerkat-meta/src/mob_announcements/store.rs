@@ -4,11 +4,13 @@ use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 
+use super::sources::{AnnouncementSource, PutSource, SourceChange, SourceQuery};
 use super::types::{
-    AnnounceOutcome, AnnounceRequest, Announcement, Batch, BatchEvent, BatchId, BatchPosition,
-    BatchQuery, BatchStateTag, ExpiryReport, Member, MemberBacklog, MemberRouteRecord, MobId,
-    MobLineage, OperationId, PruneReport, PutSubscription, Result, SealingPolicy, SourceKey,
-    Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
+    AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
+    BatchId, BatchPosition, BatchQuery, BatchStateTag, ExpiryReport, Member, MemberBacklog,
+    MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport, PutSubscription, Result,
+    SealingPolicy, SourceId, SourceKey, Subscription, SubscriptionChange,
+    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
 };
 
 /// Durable mob announcements, member subscriptions and delivery batches.
@@ -28,10 +30,13 @@ use super::types::{
 ///   the state the caller observed, and settles or moves the batch's owed
 ///   announcements in the same transaction.
 ///
-/// Mutations of subscriptions carry an operation id: a replay with the same
-/// request returns the original result, and the same id with another request
-/// is refused. Implementations must keep those receipts at least as long as
-/// the retention window.
+/// Mutations of subscriptions and sources carry an operation id: a replay
+/// with the same request returns the original result, and the same id with
+/// another request is refused. Implementations must keep those receipts at
+/// least as long as the retention window.
+///
+/// The source methods have default bodies that refuse, so a store written
+/// before sources existed still compiles and says it keeps none.
 #[async_trait]
 pub trait AnnouncementStore: Send + Sync {
     async fn announce(&self, request: AnnounceRequest, now_ms: u64) -> Result<AnnounceOutcome>;
@@ -241,4 +246,60 @@ pub trait AnnouncementStore: Send + Sync {
     /// ended before the window and that no live record names as parent.
     /// [`PruneReport::more`] says whether another pass has work.
     async fn prune(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<PruneReport>;
+
+    /// Declare a source, replace its declaration at its revision, or start
+    /// its next generation, in one transaction with the claim of every topic
+    /// it owns. A source of another live source's principal and scope is
+    /// refused ([`AnnouncementStoreError::SourceIdentityTaken`]), and so is
+    /// a topic another source owns, live or ended
+    /// ([`AnnouncementStoreError::TopicOwned`]).
+    async fn put_source(
+        &self,
+        operation: &OperationId,
+        request: PutSource,
+        now_ms: u64,
+    ) -> Result<AnnouncementSource> {
+        let _ = (operation, request, now_ms);
+        Err(no_sources())
+    }
+
+    /// Pause, resume or end a source at its revision.
+    async fn change_source(
+        &self,
+        operation: &OperationId,
+        mob_id: &MobId,
+        source_id: &SourceId,
+        expected_revision: u64,
+        change: SourceChange,
+        now_ms: u64,
+    ) -> Result<AnnouncementSource> {
+        let _ = (
+            operation,
+            mob_id,
+            source_id,
+            expected_revision,
+            change,
+            now_ms,
+        );
+        Err(no_sources())
+    }
+
+    async fn source(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<Option<AnnouncementSource>> {
+        let _ = (mob_id, source_id);
+        Err(no_sources())
+    }
+
+    /// Sources in `(mob_id, source_id)` order.
+    async fn sources(&self, query: &SourceQuery) -> Result<Vec<AnnouncementSource>> {
+        let _ = query;
+        Err(no_sources())
+    }
+}
+
+fn no_sources() -> AnnouncementStoreError {
+    AnnouncementStoreError::Storage("this announcement store keeps no sources".to_string())
 }

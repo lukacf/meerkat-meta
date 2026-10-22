@@ -11,9 +11,14 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use super::owner::{AnnouncementError, AnnouncementService};
+use super::sources::{
+    AnnouncementSource, AudienceGrant, ObservationCapability, PutSource, SourceChange,
+    SourceConfig, SourceConnection, SourceDelivery, SourceHealthPolicy, SourceIdentity,
+    SourceQuery, SourceRoute, SourceRunner, SourceStart, SourceState,
+};
 use super::types::{
     AnnounceRequest, AnnouncementRef, AnnouncementStoreError, Announcer, BatchId, BatchQuery,
-    ChildMemberLimits, Member, MobId, OperationId, PutSubscription, Selector, SourceKey,
+    ChildMemberLimits, Member, MobId, OperationId, PutSubscription, Selector, SourceId, SourceKey,
     StartFrontier, SubscriptionChange, SubscriptionId, Topic,
 };
 use crate::rpc::JsonRpcError;
@@ -45,6 +50,12 @@ pub const ANNOUNCEMENT_METHODS: &[&str] = &[
     "meta/mob_announcements/deliveries/list",
     "meta/mob_announcements/deliveries/observe",
     "meta/mob_announcements/deliveries/reconcile",
+    "meta/mob_announcements/sources/put",
+    "meta/mob_announcements/sources/pause",
+    "meta/mob_announcements/sources/resume",
+    "meta/mob_announcements/sources/end",
+    "meta/mob_announcements/sources/get",
+    "meta/mob_announcements/sources/list",
 ];
 
 pub fn is_announcement_method(method: &str) -> bool {
@@ -60,6 +71,10 @@ pub const ANNOUNCEMENT_MUTATE_METHODS: &[&str] = &[
     "meta/mob_announcements/subscriptions/resume",
     "meta/mob_announcements/subscriptions/cancel",
     "meta/mob_announcements/deliveries/reconcile",
+    "meta/mob_announcements/sources/put",
+    "meta/mob_announcements/sources/pause",
+    "meta/mob_announcements/sources/resume",
+    "meta/mob_announcements/sources/end",
 ];
 
 pub fn is_announcement_mutating_method(method: &str) -> bool {
@@ -222,6 +237,81 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
                 message,
                 json!({ "limit": limit, "mob_id": mob_id }),
             ),
+            AnnouncementStoreError::UnknownSource => typed(
+                ANNOUNCEMENTS_NOT_FOUND_CODE,
+                "unknown_source",
+                message,
+                Value::Null,
+            ),
+            AnnouncementStoreError::SourceEnded => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "source_ended",
+                message,
+                Value::Null,
+            ),
+            AnnouncementStoreError::SourcePaused => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "source_paused",
+                message,
+                Value::Null,
+            ),
+            AnnouncementStoreError::SourceIdentityTaken { source_id } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "source_identity_taken",
+                message,
+                json!({ "source_id": source_id }),
+            ),
+            AnnouncementStoreError::IdentityImmutable => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "identity_immutable",
+                message,
+                Value::Null,
+            ),
+            AnnouncementStoreError::TopicOwned { topic, source_id } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "topic_owned",
+                message,
+                json!({ "topic": topic, "source_id": source_id }),
+            ),
+            AnnouncementStoreError::TopicOwnedBySource { topic, source_id } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "topic_owned_by_source",
+                message,
+                json!({ "topic": topic, "source_id": source_id }),
+            ),
+            AnnouncementStoreError::PrincipalNotAllowed { kind } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "principal_not_allowed",
+                message,
+                json!({ "principal_kind": kind }),
+            ),
+            AnnouncementStoreError::RouteSelectorUnsupported { selector } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "route_selector_unsupported",
+                message,
+                json!({ "selector": selector }),
+            ),
+            AnnouncementStoreError::SourceStaleRevision {
+                revision,
+                generation,
+                cursor,
+            } => typed(
+                ANNOUNCEMENTS_CONFLICT_CODE,
+                "stale_revision",
+                message,
+                json!({
+                    "current_revision": revision,
+                    "current_version": cursor.version,
+                    "generation": generation,
+                    "cursor": cursor,
+                }),
+            ),
+            AnnouncementStoreError::SourceLimit { limit, mob_id } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "source_limit",
+                message,
+                json!({ "limit": limit, "mob_id": mob_id }),
+            ),
             AnnouncementStoreError::IllegalTransition { .. } => JsonRpcError::new(-32000, message),
             AnnouncementStoreError::TooLarge(_) | AnnouncementStoreError::Invalid(_) => {
                 invalid_params(message)
@@ -332,6 +422,87 @@ struct ListDeliveriesParams {
 #[serde(deny_unknown_fields)]
 struct DeliveryParams {
     batch_id: BatchId,
+}
+
+/// `meta/mob_announcements/sources/put`: declare a source, replace its
+/// declaration at its revision, or start its next generation.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutSourceParams {
+    operation_id: OperationId,
+    #[serde(default)]
+    mob_id: Option<MobId>,
+    source_id: SourceId,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+    #[serde(default)]
+    new_generation: bool,
+    identity: SourceIdentity,
+    #[serde(default)]
+    connection: Option<SourceConnection>,
+    observation: ObservationCapability,
+    topics: BTreeSet<Topic>,
+    audience: Vec<AudienceGrant>,
+    #[serde(default)]
+    routes: Option<Vec<SourceRoute>>,
+    #[serde(default)]
+    conversation_members: Vec<Member>,
+    #[serde(default)]
+    start: Option<SourceStart>,
+    #[serde(default)]
+    delivery: Option<SourceDelivery>,
+    #[serde(default)]
+    health_policy: Option<SourceHealthPolicy>,
+    #[serde(default)]
+    runner: Option<SourceRunner>,
+}
+
+/// `meta/mob_announcements/sources/{pause,resume,end}`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChangeSourceParams {
+    operation_id: OperationId,
+    #[serde(default)]
+    mob_id: Option<MobId>,
+    source_id: SourceId,
+    expected_revision: u64,
+    /// `resume` only: resume from a fresh baseline instead of the kept
+    /// cursor.
+    #[serde(default)]
+    rebaseline: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceParams {
+    #[serde(default)]
+    mob_id: Option<MobId>,
+    source_id: SourceId,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListSourcesParams {
+    /// The mob whose sources are listed: this gateway's own when absent.
+    #[serde(default)]
+    mob_id: Option<MobId>,
+    /// Start after this source of the listed mob.
+    #[serde(default)]
+    after: Option<SourceId>,
+    #[serde(default)]
+    state: Option<SourceState>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// A source as a list shows it: everything but its cursor token, which only
+/// `sources/get` returns.
+fn listed_source(source: &AnnouncementSource) -> Result<Value, JsonRpcError> {
+    let mut value = to_value(source)?;
+    if let Some(cursor) = value.get_mut("cursor").and_then(Value::as_object_mut) {
+        cursor.remove("token");
+    }
+    Ok(value)
 }
 
 const DEFAULT_LIMIT: usize = 100;
@@ -492,6 +663,96 @@ pub async fn handle_announcement_method(
                 .await
                 .map_err(rpc_error)?;
             to_value(observation)
+        }
+        "meta/mob_announcements/sources/put" => {
+            let request: PutSourceParams = params(raw)?;
+            let config = SourceConfig {
+                identity: request.identity,
+                connection: request.connection,
+                observation: request.observation,
+                topics: request.topics,
+                audience: request.audience,
+                routes: request.routes.unwrap_or_else(|| {
+                    vec![SourceRoute::Direct {
+                        topics: None,
+                        streams: None,
+                    }]
+                }),
+                conversation_members: request.conversation_members,
+                start: request.start.unwrap_or_default(),
+                delivery: request.delivery.unwrap_or_default(),
+                health_policy: request.health_policy.unwrap_or_default(),
+                runner: request.runner,
+            };
+            let source = service
+                .put_source(
+                    &request.operation_id,
+                    PutSource {
+                        mob_id: request.mob_id.unwrap_or_else(|| own_mob.clone()),
+                        source_id: request.source_id,
+                        expected_revision: request.expected_revision,
+                        new_generation: request.new_generation,
+                        config,
+                    },
+                )
+                .await
+                .map_err(rpc_error)?;
+            Ok(json!({ "source": to_value(source)? }))
+        }
+        "meta/mob_announcements/sources/pause"
+        | "meta/mob_announcements/sources/resume"
+        | "meta/mob_announcements/sources/end" => {
+            let request: ChangeSourceParams = params(raw)?;
+            let change = match (method, request.rebaseline) {
+                ("meta/mob_announcements/sources/resume", rebaseline) => SourceChange::Resume {
+                    rebaseline: rebaseline.unwrap_or(false),
+                },
+                (_, Some(_)) => {
+                    return Err(invalid_params("only sources/resume takes rebaseline"));
+                }
+                ("meta/mob_announcements/sources/pause", None) => SourceChange::Pause,
+                (_, None) => SourceChange::End,
+            };
+            let source = service
+                .change_source(
+                    &request.operation_id,
+                    &request.mob_id.unwrap_or_else(|| own_mob.clone()),
+                    &request.source_id,
+                    request.expected_revision,
+                    change,
+                )
+                .await
+                .map_err(rpc_error)?;
+            Ok(json!({ "source": to_value(source)? }))
+        }
+        "meta/mob_announcements/sources/get" => {
+            let request: SourceParams = params(raw)?;
+            let source = service
+                .source(
+                    &request.mob_id.unwrap_or_else(|| own_mob.clone()),
+                    &request.source_id,
+                )
+                .await
+                .map_err(rpc_error)?;
+            Ok(json!({ "source": to_value(source)? }))
+        }
+        "meta/mob_announcements/sources/list" => {
+            let request: ListSourcesParams = params(raw)?;
+            let mob_id = request.mob_id.unwrap_or_else(|| own_mob.clone());
+            let sources = service
+                .sources(&SourceQuery {
+                    after: request.after.map(|source_id| (mob_id.clone(), source_id)),
+                    mob_id: Some(mob_id),
+                    state: request.state,
+                    limit: request.limit.unwrap_or(DEFAULT_LIMIT),
+                })
+                .await
+                .map_err(rpc_error)?;
+            let listed = sources
+                .iter()
+                .map(listed_source)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(json!({ "sources": listed }))
         }
         _ => Err(JsonRpcError::new(-32601, "Method not found")),
     }
