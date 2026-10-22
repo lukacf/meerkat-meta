@@ -713,13 +713,16 @@ async def test_readiness_refuses_a_malformed_gateway_horizon(fixture, horizon):
     assert not published and read_receipt(supervisor.directory).get("gateway_shutdown_horizon_ms") is None
 
 
+@pytest.mark.parametrize("reported", [432_000, None], ids=["reported", "unreported"])
 @pytest.mark.parametrize("service_owned", [True, False], ids=["service", "interactive"])
-async def test_service_worker_widens_its_unit_to_the_reported_horizon_at_readiness(fixture, monkeypatch, service_owned):
+async def test_service_worker_widens_its_unit_to_the_reported_horizon_at_readiness(fixture, monkeypatch, service_owned,
+                                                                                   reported):
     # The service-run worker is the owner that observes readiness while Forge
     # may be closed; it widens its own unit before any stop needs the budget.
+    # An application that reports nothing is sized for the unreported horizon.
     from launchkit import deployment_service
     supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})],
-        readiness_extra={"gateway_shutdown_horizon_ms": 432_000})
+        readiness_extra={} if reported is None else {"gateway_shutdown_horizon_ms": reported})
     supervisor.service_owned = service_owned
     widened, reloads = [], []
     def widen(directory, horizon_ms):
@@ -733,8 +736,46 @@ async def test_service_worker_widens_its_unit_to_the_reported_horizon_at_readine
     monkeypatch.setattr(deployment_service, "UserServiceManager", Manager)
     await asyncio.wait_for(supervisor.start(definition, on_ready=supervisor.stop.set), 3)
     # Only the service-run worker owns the unit; an interactive run has none.
-    assert widened == ([(supervisor.directory, 432_000)] if service_owned else [])
+    assert widened == ([(supervisor.directory, reported)] if service_owned else [])
     assert reloads == ([["/usr/bin/systemctl", "--user", "daemon-reload"]] if service_owned else [])
+
+
+@pytest.mark.parametrize("manager, widening", [("launchd", "none"), ("systemd-user", "refused"),
+                                               ("systemd-user", "reload-failed"), ("systemd-user", "widened")])
+async def test_a_service_run_stops_within_the_budget_its_manager_enforces(fixture, monkeypatch, manager, widening):
+    # A unit an earlier Forge wrote enforces 397 seconds until this run's own
+    # widening and manager reload succeed: the application stop, the force
+    # reap and the worker's margin fit inside it.
+    from launchkit import deployment_service
+    from test_gateway_shutdown_horizon import gateway_horizon_ms, TRANSPORT_AND_ADAPTER_MARGIN
+    supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})])
+    update_receipt(supervisor.directory, service={"manager": manager, "stop_timeout_seconds": 397})
+    supervisor.own_service()
+    def widen(directory, horizon_ms):
+        if widening == "refused":
+            raise deployment_service.DraftConflict("The owned service definition changed. No service was controlled.")
+        return None if manager == "launchd" else ["/usr/bin/systemctl", "--user", "daemon-reload"]
+    class Manager:
+        async def command(self, arguments, **kwargs):
+            if widening == "reload-failed":
+                raise RuntimeError("The service manager could not reload its units.")
+            return 0, ""
+    monkeypatch.setattr(deployment_service, "widen_service_stop_budget", widen)
+    monkeypatch.setattr(deployment_service, "UserServiceManager", Manager)
+    import launchkit.deployment_worker as module
+    actual_wait = asyncio.wait_for
+    windows = []
+    async def observe(awaitable, timeout):
+        if getattr(getattr(awaitable, "cr_code", None), "co_name", None) == "parent_exit":
+            windows.append(timeout)
+        return await actual_wait(awaitable, timeout)
+    monkeypatch.setattr(module.asyncio, "wait_for", observe)
+    await actual_wait(supervisor.start(definition, on_ready=supervisor.stop.set), 3)
+    unreported = gateway_horizon_ms() // 1000 + TRANSPORT_AND_ADAPTER_MARGIN
+    assert windows and set(windows) == {unreported if widening == "widened" else 397 - 10 - 5 - 15}
+    # An interactive run has no unit to fit.
+    supervisor.service_owned, supervisor.enforced_stop_budget = False, None
+    assert supervisor.application_stop_window() == unreported
 
 
 @pytest.mark.parametrize("failure", ["refused", "unexpected", "reload-timed-out"])

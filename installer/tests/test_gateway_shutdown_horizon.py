@@ -197,7 +197,7 @@ def earlier_unit(f, directory):
 
 
 @pytest.mark.parametrize("background", ["darwin", "linux"], indirect=True)
-@pytest.mark.parametrize("reported", [392_000, 432_000], ids=["meta-0.9.4", "meta-0.9.5"])
+@pytest.mark.parametrize("reported", [392_000, 432_000, None], ids=["meta-0.9.4", "meta-0.9.5", "unreported"])
 async def test_an_earlier_unit_gets_a_stop_budget_drop_in_for_the_reported_horizon(background, reported):
     f = background
     directory = await f.prepared()
@@ -216,10 +216,13 @@ async def test_an_earlier_unit_gets_a_stop_budget_drop_in_for_the_reported_horiz
         # drop-in: an earlier plist keeps the stop timeout it was installed with.
         assert reload is None and not drop_in.parent.exists() and "service_stop_budget" not in receipt
         return
-    budget = service_budget(reported)
+    # An application that reports nothing is sized for the unreported
+    # horizon, which the record names explicitly.
+    sized_for = gateway_horizon_ms() if reported is None else reported
+    budget = service_budget(sized_for)
     assert reload == ["/usr/bin/systemctl", "--user", "daemon-reload"]
     assert drop_in.read_bytes() == f"[Service]\nTimeoutStopSec={budget}\n".encode()
-    assert receipt["service_stop_budget"] == {"gateway_shutdown_horizon_ms": reported, "stop_timeout_seconds": budget}
+    assert receipt["service_stop_budget"] == {"gateway_shutdown_horizon_ms": sized_for, "stop_timeout_seconds": budget}
     # A shorter or equal report never narrows or rewrites it. Each readiness
     # reloads the manager again, completing a reload an interrupted run missed.
     before = (drop_in.read_bytes(), f.deployment.read_receipt(directory)["service_stop_budget"])
@@ -233,7 +236,8 @@ async def test_a_unit_at_the_derived_budget_needs_no_drop_in(background):
     f = background
     directory = await f.prepared()
     service = f.service.prepare_service(directory, f.deployment.read_receipt(directory))
-    assert f.service.widen_service_stop_budget(directory, gateway_horizon_ms()) is None
+    for unreported in (gateway_horizon_ms(), None):
+        assert f.service.widen_service_stop_budget(directory, unreported) is None
     assert not Path(service["unit_path"] + ".d").exists()
     assert "service_stop_budget" not in f.deployment.read_receipt(directory)
 

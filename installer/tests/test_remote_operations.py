@@ -1512,6 +1512,27 @@ def test_remote_stop_budget_drop_in_is_verified_byte_exact(package, tmp_path):
             operations.load()
 
 
+@pytest.mark.parametrize('horizon_ms', [None, 432_000])
+def test_remote_application_stop_fits_the_budget_its_manager_enforces(package, horizon_ms):
+    module = load_helper(package / 'remote_operations.py')
+    derived = remote_budget('application', horizon_ms or gateway_horizon_ms())
+    assert module.application_stop_window(horizon_ms) == derived
+    # An earlier unit enforces 397 seconds until a widening and its reload
+    # succeed; a legacy one 45.
+    for enforced in (397, 45):
+        assert module.application_stop_window(horizon_ms, stop_budget=enforced) == enforced - 10 - 5 - 15
+    assert module.application_stop_window(horizon_ms, stop_budget=remote_budget('service', 432_000)) == derived
+
+
+def test_remote_unit_at_the_unreported_budget_gets_no_drop_in(package, tmp_path):
+    module = load_helper(package / 'remote_operations.py')
+    operations = fake_operations(module, package, tmp_path / 'home')
+    receipt = operations.prepare()
+    assert operations.widen_unit(gateway_horizon_ms()) is False and operations.calls == []
+    assert not remote_drop_in(receipt).parent.exists()
+    assert 'service_stop_budget' not in json.loads(operations.path.read_text())
+
+
 def test_remote_earlier_owned_drop_in_below_its_record_stays_controllable(package, tmp_path):
     module = load_helper(package / 'remote_operations.py')
     operations = fake_operations(module, package, tmp_path / 'home')
@@ -1670,8 +1691,8 @@ FIXTURE_APP_REPORTING = FIXTURE_APP.replace("payload = {'pid'", "payload = {'gat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('reported, widening', [(432_000, 'widened'), (432_000, 'refused'), (432_000, 'timed-out'),
-                                                ('432000', 'widened')],
-                         ids=['reported', 'widening-refused', 'widening-timed-out', 'malformed'])
+                                                (None, 'widened'), ('432000', 'widened')],
+                         ids=['reported', 'widening-refused', 'widening-timed-out', 'unreported', 'malformed'])
 async def test_actual_supervisor_widens_at_readiness_and_stops_within_the_reported_horizon(
         package, tmp_path, monkeypatch, capsys, reported, widening):
     assert FIXTURE_APP_REPORTING != FIXTURE_APP
@@ -1690,8 +1711,10 @@ async def test_actual_supervisor_widens_at_readiness_and_stops_within_the_report
         return True
     monkeypatch.setattr(operations, 'widen_unit', widen, raising=False)
     owned_stop = module.stop_supervised_application
+    budgets = []
     async def recorded_stop(process, **options):
         stops.append(options.get('horizon_ms'))
+        budgets.append(options.get('stop_budget'))
         await owned_stop(process)
     monkeypatch.setattr(module, 'stop_supervised_application', recorded_stop)
     task = asyncio.create_task(module.supervise(operations))
@@ -1709,6 +1732,10 @@ async def test_actual_supervisor_widens_at_readiness_and_stops_within_the_report
         assert (widened, stops) == ([], [None])
     else:
         # A refused or failed widening is reported and never blocks readiness.
+        # An application that reports nothing is widened for the unreported
+        # horizon. The stop fits the unit's own budget until a widening succeeds.
         assert isinstance(outcome, asyncio.CancelledError)
-        assert (widened, stops) == ([432_000], [432_000])
+        assert (widened, stops) == ([reported or gateway_horizon_ms()], [reported])
+        unit = module.service_stop_timeout(json.loads(operations.path.read_text()))
+        assert budgets == [max(unit, remote_budget('service', widened[0])) if widening == 'widened' else unit]
         assert ('stop budget' in capsys.readouterr().out) is (widening != 'widened')

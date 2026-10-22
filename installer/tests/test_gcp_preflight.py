@@ -456,6 +456,20 @@ async def test_package_cannot_borrow_fixed_cloud_plan_after_source_or_scope_chan
         assert cli.calls == [] and cloud.calls == []
 
 
+@pytest.mark.parametrize("tampered", [False, True])
+async def test_package_accepted_by_forge_094_keeps_its_destination_helper(harness, tampered):
+    # Forge 0.9.4 rendered this exact destination helper into the packages it
+    # accepted. It is recognized by its digest and never rewritten.
+    from launchkit import gcp_preflight
+    _, local, cli, cloud = harness
+    retained = (Path(__file__).parent / "fixtures/retained_destination_helper/remote_operations_094.py").read_bytes()
+    assert hashlib.sha256(retained).hexdigest() in gcp_preflight.RETAINED_DESTINATION_HELPER_SHA256
+    local.files["remote_operations.py"] = retained + (b"\n# unrelated host modification\n" if tampered else b"")
+    local.package_bytes = local.archive()
+    result = await checked(harness)
+    assert row(result, "package-deployer")["status"] == ("blocked" if tampered else "checked")
+
+
 @pytest.mark.parametrize('retained', [False, True])
 @pytest.mark.parametrize('tampered', [False, True])
 async def test_selected_knowledge_export_matches_fixed_cloud_adapter_including_retained_packages(harness, monkeypatch, retained, tampered):

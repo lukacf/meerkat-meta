@@ -34,6 +34,15 @@ describe("gateway shutdown horizon", () => {
     }
   });
 
+  it("does not let a replacement gateway inherit the previous horizon", async () => {
+    const transport = await initialized({ stdio_shutdown_handshake: true, stdio_shutdown_horizon_ms: 432_000 });
+    assert.equal((runtimeWith(transport) as any).gatewayShutdownHorizonMs, 432_000);
+    // The replacement child has negotiated nothing yet (this one cannot start).
+    transport.start();
+    assert.equal((runtimeWith(transport) as any).gatewayShutdownHorizonMs, null);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+
   it("reports no horizon before a gateway is negotiated", () => {
     assert.equal((runtimeWith() as any).gatewayShutdownHorizonMs, null);
     assert.equal(
