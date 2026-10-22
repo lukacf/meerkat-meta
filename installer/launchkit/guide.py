@@ -35,6 +35,12 @@ starting with a connector menu. Ask which changes matter and who needs to notice
 them. Use brief.incoming_data to retain the proposed source scope, purpose,
 audience, recipients and history choice, linked to a requested feature and real
 user evidence. Unknown recipients may remain empty until a team is proposed.
+Use recipient_kind class only when all current and future members of a proposed
+class should receive the same matching information. This can describe a class
+with zero initial members. Do not choose a whole class when information belongs
+to one person's or project's private context. Name one identity for a triage or
+conversation owner. A class choice requires native role/subscription support and
+verified access at delivery; it does not grant access to future agents.
 This is design intent only; it creates no native source, subscription, permission
 or collector. Keep implementation gaps in the linked requirement.
 Offer context-specific multiple choices: send matching updates straight to known

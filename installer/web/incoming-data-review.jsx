@@ -1,6 +1,10 @@
 import React from "react";
 
-function recipientName(plan, identity) {
+function recipientName(plan, identity, kind) {
+  if (kind === "class") {
+    const role = plan?.agent_classes?.find(item => item.id === identity);
+    return `${role?.name || identity} - all current and future members`;
+  }
   const [classId, memberKey] = identity.split(":");
   const role = plan?.agent_classes?.find(item => item.id === classId);
   const member = role?.members?.find(item => item.key === memberKey);
@@ -18,14 +22,14 @@ export function IncomingDataReview({ brief, plan, disabled = false, onRequestCha
         const requirement = requirements.get(source.requirement_id);
         const postponed = ["cancelled", "deferred", "handoff"].includes(requirement?.disposition);
         return <details key={source.id} className="ep-source-intent">
-          <summary><strong>{source.name}</strong><span>{postponed ? "Outside this version" : source.routes.length ? `${source.routes.length} ${source.routes.length === 1 ? "recipient" : "recipients"}` : "Recipient to decide"}</span></summary>
+          <summary><strong>{source.name}</strong><span>{postponed ? "Outside this version" : source.routes.some(route => route.recipient_kind === "class") ? "Includes an agent class" : source.routes.length ? `${source.routes.length} ${source.routes.length === 1 ? "recipient" : "recipients"}` : "Recipient to decide"}</span></summary>
           <p>{source.purpose}</p>
           <dl className="ep-facts">
             <div><dt>Which information</dt><dd>{source.scope}</dd></div>
             <div><dt>Who may see it</dt><dd>{source.audience || "Still to decide"}</dd></div>
             <div><dt>Existing history</dt><dd>{source.history === "new_only" ? "Start with new changes" : source.history === "bounded_history" ? source.history_window : "Still to decide"}</dd></div>
-            <div><dt>Who receives it</dt><dd>{source.routes.length ? <ul>{source.routes.map(route => <li key={route.recipient}>
-              <strong>{recipientName(plan, route.recipient)}</strong>{" - "}
+            <div><dt>Who receives it</dt><dd>{source.routes.length ? <ul>{source.routes.map(route => <li key={`${route.recipient_kind || "identity"}:${route.recipient}`}>
+              <strong>{recipientName(plan, route.recipient, route.recipient_kind)}</strong>{" - "}
               {{direct: "receives matching updates directly", triage: "judges relevance and routes updates", conversation: "participates in the conversation"}[route.delivery]}
             </li>)}</ul> : "Still to decide"}</dd></div>
           </dl>

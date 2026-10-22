@@ -14,7 +14,10 @@ subscriptions. Require the selected Meta announcement-source and Connect
 observation contracts; an application-owned polling engine, cursor store or
 replacement inbox is not an acceptable substitute for missing shared support.
 Check the selected history boundary, private audience, failed handling and known
-frontend/direct/triage route overlaps. Keep unavailable capabilities and live
+frontend/direct/triage route overlaps. Class recipients include future members: verify the
+actual native selector mapping and audience at admission, including a zero-start
+class. Do not accept application-owned per-member subscription reconciliation.
+Keep unavailable capabilities and live
 provider coverage explicit. Offline source checks do not prove live collection,
 exactly-once semantic work or native authorization.
 Your task is to test whether this particular generated application fulfills the

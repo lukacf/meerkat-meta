@@ -34,6 +34,18 @@ test("source review explains desired recipients and keeps access and implementat
   assert.deepEqual(value, before);
 });
 
+
+test("a zero-start class is explicit about future members without claiming a connected population", () => {
+  const value = props({routes: [{recipient: "owner", recipient_kind: "class", delivery: "direct"}]});
+  value.plan = {agent_classes: [{id: "owner", name: "Project specialists", instances: 0}]};
+  const before = structuredClone(value), html = render(value);
+  assert.ok(html.includes("Project specialists - all current and future members"));
+  assert.ok(html.includes("Includes an agent class"));
+  assert.ok(html.includes("Collection and access still need their setup and checks"));
+  assert.equal(html.includes("1 recipient"), false);
+  assert.deepEqual(value, before);
+});
+
 test("unknown scope decisions remain visible and deferred sources are not presented as active", () => {
   const html = render(props({audience: "", routes: [], history: "undecided"}, "deferred"));
   assert.ok(html.includes("Outside this version"));

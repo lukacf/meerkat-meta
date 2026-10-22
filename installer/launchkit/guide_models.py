@@ -85,6 +85,21 @@ class IncomingDataRoute(StrictModel):
 
     recipient: str = Field(min_length=3, max_length=60)
     delivery: Literal["direct", "triage", "conversation"]
+    recipient_kind: Literal["identity", "class"] = Field(default="identity",
+        description="A proposed identity, or a whole proposed class including future members. A class is desired scope, not a native role selector or access grant.")
+
+    @model_serializer(mode="wrap")
+    def omit_default_recipient_kind(self, handler):
+        data = handler(self)
+        if self.recipient_kind == "identity":
+            data.pop("recipient_kind", None)
+        return data
+
+    @model_validator(mode="after")
+    def single_conversation_or_triage_owner(self):
+        if self.recipient_kind == "class" and self.delivery != "direct":
+            raise ValueError("Choose one identity for triage or conversation ownership; class routes describe direct awareness.")
+        return self
 
 
 class IncomingDataIntent(StrictModel):
@@ -103,7 +118,7 @@ class IncomingDataIntent(StrictModel):
 
     @model_validator(mode="after")
     def coherent_intent(self):
-        recipients = [route.recipient for route in self.routes]
+        recipients = [(route.recipient_kind, route.recipient) for route in self.routes]
         if len(recipients) != len(set(recipients)):
             raise ValueError("Choose one incoming route per source and recipient; conversation and awareness routes must not overlap.")
         if self.history == "bounded_history" and not self.history_window:
@@ -276,7 +291,7 @@ def validate_guide_publication(args: dict, context: dict, proposal: dict | None,
             if not any(positions[identity] > requested_at for identity in requirement.decision_message_ids):
                 raise ValueError("The feature request itself cannot authorize its deferral, cancellation or handoff. Ask for the user's choice.")
     selected = proposal if proposal is not None else current_blueprint
-    route_identities = None
+    route_plan = None
     for source in value.brief.incoming_data:
         if any(identity not in evidence for identity in source.source_message_ids):
             raise ValueError("Incoming data cites missing or non-user evidence.")
@@ -286,10 +301,23 @@ def validate_guide_publication(args: dict, context: dict, proposal: dict | None,
             from .blueprint import Blueprint
             if not selected:
                 raise ValueError("Propose the team before assigning incoming data recipients.")
-            if route_identities is None:
-                route_identities = set(Blueprint.model_validate(selected).identities())
-            if any(route.recipient not in route_identities for route in source.routes):
-                raise ValueError("Incoming data routes must name an existing identity in the proposed team.")
+            if route_plan is None:
+                route_plan = Blueprint.model_validate(selected)
+            classes = {item.id: item for item in route_plan.agent_classes}
+            identities = set(route_plan.identities())
+            selected_identities = set()
+            for route in source.routes:
+                if route.recipient_kind == "class":
+                    if route.recipient not in classes:
+                        raise ValueError("Incoming data class routes must name an existing class in the proposed team.")
+                    recipients = set(classes[route.recipient].identities())
+                else:
+                    if route.recipient not in identities:
+                        raise ValueError("Incoming data routes must name an existing identity in the proposed team.")
+                    recipients = {route.recipient}
+                if selected_identities & recipients:
+                    raise ValueError("Choose one incoming route per source and recipient; class and identity routes must not overlap.")
+                selected_identities.update(recipients)
     outcome = value.brief.facts.get("outcome")
     if (context.get("current_user_message", {}).get("intent_only")
             and (not outcome or outcome.status != "confirmed")

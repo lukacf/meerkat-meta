@@ -46,6 +46,50 @@ def test_guided_publication_retains_mixed_routes_as_intent_and_open_implementati
     assert value == before
 
 
+def test_class_route_can_start_empty_and_survives_reopen_without_placeholder_members(tmp_path):
+    from launchkit.guide_store import GuideStore
+
+    plan = starter_blueprint().model_dump(mode="json")
+    plan["agent_classes"][1]["instances"] = 0
+    plan["flows"] = []
+    value = brief()
+    source = value["incoming_data"][0]
+    source["routes"] = [{"recipient": "review", "recipient_kind": "class", "delivery": "direct"}]
+    before = copy.deepcopy(plan)
+    result = publish(value, plan)
+    saved = GuideStore(tmp_path).create({"brief": result["brief"], "proposal": plan})
+    reopened = GuideStore(tmp_path).get(saved["id"])
+    assert reopened["brief"]["incoming_data"][0]["routes"] == source["routes"]
+    assert reopened["proposal"]["agent_classes"][1]["instances"] == 0
+    assert reopened["brief"]["requirements"][0]["disposition"] == "open"
+    assert plan == before
+
+
+@pytest.mark.parametrize("delivery", ["triage", "conversation"])
+def test_class_cannot_be_an_ambiguous_triage_or_conversation_owner(delivery):
+    value = brief()
+    value["incoming_data"][0]["routes"] = [{"recipient": "review", "recipient_kind": "class", "delivery": delivery}]
+    with pytest.raises(ValueError, match="one identity"):
+        publish(value)
+
+
+@pytest.mark.parametrize("class_first", [True, False])
+def test_class_and_known_member_cannot_receive_overlapping_routes(class_first):
+    value = brief()
+    routes = [{"recipient": "lead", "recipient_kind": "class", "delivery": "direct"},
+              {"recipient": "lead:main", "delivery": "conversation"}]
+    value["incoming_data"][0]["routes"] = routes if class_first else routes[::-1]
+    with pytest.raises(ValueError, match="class and identity routes must not overlap"):
+        publish(value)
+
+
+def test_removed_class_cannot_remain_a_recipient():
+    value = brief()
+    value["incoming_data"][0]["routes"] = [{"recipient": "removed", "recipient_kind": "class", "delivery": "direct"}]
+    with pytest.raises(ValueError, match="existing class"):
+        publish(value)
+
+
 @pytest.mark.parametrize("change,error", [
     (lambda s: s["routes"].append({"recipient": "lead:main", "delivery": "conversation"}), "one incoming route"),
     (lambda s: s["routes"].append({"recipient": "lead:main", "delivery": "triage"}), "one incoming route"),
