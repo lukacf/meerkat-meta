@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from copy import deepcopy
 import fcntl
 import gzip
@@ -726,7 +726,16 @@ class RemoteDeploymentService:
                 from .remote_product_control import _json
                 product_bundle.require_current()
                 control_bytes = _json(product_bundle.manifest)
-                write_bytes(directory / "control-bundle.zip", product_bundle.content)
+                bundle = directory / "control-bundle.zip"
+                # Writing and syncing the whole bundle must not hold the event
+                # loop. Its original owner must still be current afterwards.
+                await await_validation(write_bytes, bundle, product_bundle.content)
+                try:
+                    product_bundle.require_current()
+                except Exception:
+                    with suppress(OSError):
+                        bundle.unlink(missing_ok=True)
+                    raise
                 write_bytes(directory / "product-control.json", control_bytes)
                 receipt.update(product_runtime=True,
                     product_control_manifest_sha256=hashlib.sha256(control_bytes).hexdigest(),
