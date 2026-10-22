@@ -15,6 +15,17 @@
   flex-direction: column;
   gap: 24px;
 }
+.ep-source-intent {
+  padding: 16px 20px;
+  overflow-wrap: anywhere;
+}
+.ep-source-intent + .ep-source-intent { border-top: 1px solid var(--ep-line); }
+.ep-source-intent summary { display: flex; align-items: baseline; gap: 16px; justify-content: space-between; cursor: pointer; }
+.ep-source-intent summary span { font-size: 12px; color: var(--ep-muted); flex-shrink: 0; margin-left: auto; }
+.ep-source-intent summary::after { content: ""; width: 6px; height: 6px; border-right: 1px solid currentColor; border-bottom: 1px solid currentColor; transform: rotate(45deg); flex-shrink: 0; }
+.ep-source-intent[open] summary::after { transform: rotate(225deg); }
+.ep-source-intent .ep-facts ul { padding-left: 18px; margin: 0; }
+.ep-source-intent .ep-facts li + li { margin-top: 6px; }
 .ep-header {
   display: flex;
   align-items: flex-end;

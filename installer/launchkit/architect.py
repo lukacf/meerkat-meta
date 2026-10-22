@@ -1318,7 +1318,8 @@ class ArchitectService:
             return {"valid": False, "issue": "No guided setup turn is active."}
         try:
             result = validate_guide_publication(args, self.guide_context,
-                                               self.proposal["blueprint"] if self.proposal else None)
+                                               self.proposal["blueprint"] if self.proposal else None,
+                                               current_blueprint=self.context)
         except ValueError as error:
             return {"valid": False, "issue": str(error)[:8000]}
         self.guide_result = result

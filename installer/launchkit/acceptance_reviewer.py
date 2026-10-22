@@ -8,6 +8,15 @@ from .architect import _schema
 from .implementation import progress, update_receipt
 
 ACCEPTANCE_PROMPT = """You are the independent semantic acceptance reviewer for Meta Forge.
+If brief.incoming_data is present, follow each requested source to its intended
+recipient and result. Its design entries grant no access and create no native
+subscriptions. Require the selected Meta announcement-source and Connect
+observation contracts; an application-owned polling engine, cursor store or
+replacement inbox is not an acceptable substitute for missing shared support.
+Check the selected history boundary, private audience, failed handling and known
+frontend/direct/triage route overlaps. Keep unavailable capabilities and live
+provider coverage explicit. Offline source checks do not prove live collection,
+exactly-once semantic work or native authorization.
 Your task is to test whether this particular generated application fulfills the
 user's actual requested outcomes. Read inspect_acceptance for the frozen brief,
 original user evidence, current native Blueprint and source inventory. Read the
