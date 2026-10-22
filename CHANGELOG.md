@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- The summary that the customizer publication after an unclean stop logs
+  counts each restored member once, by outcome: `held_released` (its run
+  starts are released), `not_held` (it was not held, and its tools are
+  republished) and, in the WARN, `still_pending_count` beside the
+  `still_pending` names. It logged `owed` and `released` before.
+
+### Fixed
+
+- A first boot whose early customizer publication failed (a customizer whose
+  tools need the mob handle) no longer calls the customizer an extra time for
+  each member before the member exists, or logs that summary for members that
+  were never restored. The failure stays pending until the member's
+  materialization publishes its tools.
+
 ## [0.9.4] - 2026-10-22
 
 ### Breaking
