@@ -117,9 +117,10 @@ class FakeManager:
 
 @pytest.fixture
 def unit_from_earlier_forge(monkeypatch):
-    """The background fixture's unit carries the 397-second budget an earlier Forge wrote."""
+    """An earlier systemd unit, independent of the test runner's operating system."""
     plan = services.service_plan
     def earlier(*args, **kwargs):
+        kwargs["platform"] = "linux"
         return {**plan(*args, **kwargs), "stop_timeout_seconds": 397}
     monkeypatch.setattr(services, "service_plan", earlier)
 
