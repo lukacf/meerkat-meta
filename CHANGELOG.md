@@ -193,6 +193,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   does the same for its own unit from the next package the destination runs.
   The Guide's rehearsal, implementation and trial workers wait the derived
   budget too.
+- Meta Forge no longer leaves a partial remote installation behind when a
+  connect is cancelled or refused partway, so removing the cloud computer
+  afterwards no longer fails on it.
 
 ### Known limitations
 
