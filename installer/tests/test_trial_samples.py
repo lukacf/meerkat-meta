@@ -145,3 +145,27 @@ def test_correction_contract_records_an_outcome_without_a_feasible_choice():
     assert ("Where findings recommend among options,\nexercise a correction that leaves no feasible option, "
             "or an underdetermined decision") in ACCEPTANCE_PROMPT
     assert "check for an authoritative saved outcome and corrected readback after restart" in ACCEPTANCE_PROMPT
+
+
+def test_natural_language_guidance_preserves_agent_judgment_and_typed_edits():
+    import ast
+    from pathlib import Path
+    from launchkit import implementation_worker
+
+    assert "Use the responsible native agents, their context and tools to interpret free-form" in IMPLEMENTATION_PROMPT
+    assert "explicit typed edits; application code validates authority, identifiers, revisions" in IMPLEMENTATION_PROMPT
+    assert "matching review examples cannot replace agent judgment over natural language" in IMPLEMENTATION_PROMPT
+    assert "fixtures may supply labelled agent outputs to test the real typed edit boundary" in IMPLEMENTATION_PROMPT
+    assert "phrase matching, keyword classifiers or regex negation windows substituting for" in ACCEPTANCE_PROMPT
+    assert "Do not require a deterministic free-text\nemulator" in ACCEPTANCE_PROMPT
+    assert "unproven until an actual agent handles varied wording and context successfully" in ACCEPTANCE_PROMPT
+    source = ast.parse(Path(implementation_worker.__file__).read_text())
+    repair = next(node.args[1].left.value for node in ast.walk(source)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "invoke"
+        and len(node.args) > 1 and isinstance(node.args[1], ast.BinOp)
+        and isinstance(node.args[1].left, ast.Constant)
+        and isinstance(node.args[1].left.value, str)
+        and node.args[1].left.value.startswith("The independent reviewer found"))
+    assert "Treat counterexamples as evidence of a general defect, not phrases to recognize" in repair
+    assert "native agent judgment over free text and repair its context/tools and typed edit path" in repair
+    assert "do not substitute keyword or regex classification to satisfy a review fixture" in repair
