@@ -588,7 +588,9 @@ inherited key, in namespace and key order:
 - **Timestamp:** the last copied message's timestamp.
 - **Rules:** the rows pass the ordinary activation rules: the body digest, 256
   KiB per body, and the 1 MiB budget of retained activation bodies across the
-  session lineage.
+  session lineage. Each re-activation adds its body to the lineage again, so
+  forks of forks of a member with large bodies reach that budget after a few
+  generations and are refused with `lineage_body_budget_exceeded`.
 - **Only what the source ran under:** each head must be an activation the
   source session wrote itself. A head the source only inherited from an
   earlier fork, and never activated, refuses the fork with
