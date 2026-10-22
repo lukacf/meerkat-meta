@@ -1,15 +1,22 @@
-"""Apply refuses a product runtime update this Forge's interpreter cannot install.
+"""A staged product runtime update against this Forge's interpreter at Apply.
 
-The update worker retains the current runtime before it installs the selected
-product, so its own interpreter refusal would come only after the installed
-runtime has moved. Inert registry, product and package fixtures only; no
-worker, application, SDK, provider or native program runs.
+The update worker moves the installed runtime aside before it installs the
+selected product, so an interpreter that product cannot use must be refused at
+admission. On the shipping entry (the launchers' registry, which selects no
+replacement supplier), Apply of a Meta Toolkit application that has not
+finished its setup refuses first, and after setup Stage blocks a runtime change.
+staged_runtime_refusal is the admission check for the replacement path. Inert
+registry, product and package fixtures only; no worker, application, SDK,
+provider or native program runs.
 """
+import re
+from uuid import uuid4
+
 import pytest
 
 from launchkit import deployment, deployment_updates as updates
-from launchkit.local_application_registry import LocalApplicationRegistry
-from launchkit.projects import DraftConflict
+from launchkit.local_application_registry import FIRST_SETUP_UPDATE, LocalApplicationRegistry
+from launchkit.runtime_selection import candidate_selection
 from test_local_application_registry import (registry, new_guide, build, accept_source_fixture,
     install_fixture, no_processes)
 from test_meta_toolkit_initial_install import CP312_LINUX, ORIGINAL_INTERPRETER_REFUSAL, closure
@@ -39,29 +46,46 @@ async def staged_product_refresh(f, products, monkeypatch):
     return saved["id"], directory, update
 
 
-async def test_apply_refuses_a_runtime_update_this_interpreter_cannot_install(registry, products, monkeypatch):
+def changed_interpreter(target, interpreter=None):
+    """Forge restarted on another CPython: a cp311 closure under a cp312 Forge."""
+    return ORIGINAL_INTERPRETER_REFUSAL(closure(
+        "pydantic_core-2.27.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "httpx-0.28.1-py3-none-any.whl"), CP312_LINUX)
+
+
+async def test_apply_before_first_setup_refuses_on_the_shipping_entry(registry, products, monkeypatch):
     f = registry
     guide_id, directory, update = await staged_product_refresh(f, products, monkeypatch)
-    # Forge restarted on another CPython after Stage: the selected product's
-    # compiled closure no longer fits this interpreter.
-    def changed_interpreter(target, interpreter=None):
-        return ORIGINAL_INTERPRETER_REFUSAL(closure(
-            "pydantic_core-2.27.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-            "httpx-0.28.1-py3-none-any.whl"), CP312_LINUX)
     monkeypatch.setattr(deployment, "selected_interpreter_refusal", changed_interpreter)
     journal = updates.update_directory(directory, update["update_id"]) / "update.json"
     before = (directory / "receipt.json").read_bytes(), journal.read_bytes()
     f.service.launched.clear()
-    with pytest.raises(DraftConflict, match=r"built for CPython 3\.11, but this Forge runs CPython 3\.12.*PYTHON_BIN"):
-        await f.service.action(guide_id, directory.name, "apply-update", update["update_id"])
+    # The browser always sends an action request. The application never
+    # entered its setup, so no update worker could start it.
+    with pytest.raises(ValueError, match=re.escape(FIRST_SETUP_UPDATE)):
+        await f.service.action(guide_id, directory.name, "apply-update", update["update_id"],
+            action_request_id=str(uuid4()))
     assert f.service.launched == [] and not f.service.tasks
     assert ((directory / "receipt.json").read_bytes(), journal.read_bytes()) == before
 
 
-async def test_apply_admits_a_runtime_update_this_interpreter_can_install(registry, products, monkeypatch):
-    f = registry
-    guide_id, directory, update = await staged_product_refresh(f, products, monkeypatch)
-    f.service.launched.clear()
-    await f.service.action(guide_id, directory.name, "apply-update", update["update_id"])
-    launched_directory, mode, options = f.service.launched[-1]
-    assert (launched_directory, mode) == (directory, "update") and options["update_selection"]
+def staged_product_update(target):
+    return {"runtime_dependency_update": {"runtime_candidate": candidate_selection(target)}}
+
+
+def test_staged_runtime_refusal_names_the_cpython_a_selected_product_needs(product, monkeypatch):
+    monkeypatch.setattr(deployment, "selected_interpreter_refusal", changed_interpreter)
+    refusal = deployment.staged_runtime_refusal(staged_product_update(product.target))
+    assert re.search(r"built for CPython 3\.11, but this Forge runs CPython 3\.12.*PYTHON_BIN", refusal)
+
+
+def test_staged_runtime_refusal_admits_an_interpreter_the_product_supports(product):
+    # The inert product's dependency closure is pure Python, so this Forge's
+    # own interpreter can install it.
+    assert deployment.staged_runtime_refusal(staged_product_update(product.target)) is None
+
+
+@pytest.mark.parametrize("update", [{}, {"runtime_dependency_update": None},
+    {"runtime_dependency_update": {"runtime_candidate": None}}], ids=["no-update", "source-only", "no-product"])
+def test_staged_runtime_refusal_ignores_an_update_without_a_selected_product(update):
+    assert deployment.staged_runtime_refusal(update) is None
