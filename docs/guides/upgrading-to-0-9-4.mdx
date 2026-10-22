@@ -52,7 +52,7 @@ Do these while 0.9.3 is still installed:
    directory (the file you pass as `--mob-store`, see
    [Embedded builder apps](#embedded-builder-apps)). The migration is
    one-way, and this copy is the way back to 0.9.3 (see
-   [Going back to 0.9.3](#going-back-to-093)). Rehearsing the migration on a
+   [Going back to 0.9.3](#going-back-to-0-9-3)). Rehearsing the migration on a
    clone of the directory first is a good idea; on another machine, or as
    another user, copy the comms identity keys with it (see
    [Session comms identity keys](#session-comms-identity-keys)).
@@ -162,7 +162,7 @@ refusal, 2 a usage error.
 **`--apply`** refuses while the census refuses any row, so a refused directory
 stays usable by 0.9.3. Otherwise it writes
 `storage-migrate-native.journal.json` into the state directory before its first
-write, keeps backups (see [Going back to 0.9.3](#going-back-to-093)),
+write, keeps backups (see [Going back to 0.9.3](#going-back-to-0-9-3)),
 converts `runtime.sqlite` in place onto Core's head-canonical profile,
 imports the sessions only the projection holds into Core's session store,
 writes the first-boot manifest (see [The first boot](#the-first-boot)),
