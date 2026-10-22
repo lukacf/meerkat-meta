@@ -8,7 +8,6 @@
       "project": "meerkat",
       "version": "0.9.4",
       "commit": "e91835c5fea0170d0dfc1d297d70269234fd4a16",
-      "path": "crates/meerkat-schedule/src/tools.rs",
       "sha256": "ded19f496e2debd22b67c7ec81f2d0b14b774168a870967add6be06d85975e0c",
       "url": "https://github.com/lukacf/meerkat/blob/e91835c5fea0170d0dfc1d297d70269234fd4a16/crates/meerkat-schedule/src/tools.rs",
       "anchors": "schedule_tools_list; add_current_session_to_schema; run_schedule_tools_call"
@@ -17,7 +16,6 @@
       "project": "meerkat",
       "version": "0.9.4",
       "commit": "e91835c5fea0170d0dfc1d297d70269234fd4a16",
-      "path": "crates/meerkat-schedule/src/types.rs",
       "sha256": "bbf77e43ebfb0cad814308675395c276a3255b32d7fc6d0c86e666341935646f",
       "url": "https://github.com/lukacf/meerkat/blob/e91835c5fea0170d0dfc1d297d70269234fd4a16/crates/meerkat-schedule/src/types.rs",
       "anchors": "ScheduleSerdeWire; ScheduleConfig; CalendarTriggerSpec"
@@ -26,7 +24,6 @@
       "project": "meerkat",
       "version": "0.9.4",
       "commit": "e91835c5fea0170d0dfc1d297d70269234fd4a16",
-      "path": "crates/meerkat/src/surface/schedule_host.rs",
       "sha256": "f7f93fdab5f5cd138b606a8beca67a6ab2660e18f233394b934381fef5c3b825",
       "url": "https://github.com/lukacf/meerkat/blob/e91835c5fea0170d0dfc1d297d70269234fd4a16/crates/meerkat/src/surface/schedule_host.rs",
       "anchors": "MobMemberCurrentSessionScheduleResolver; mob_member_schedule_identity"
@@ -35,7 +32,6 @@
       "project": "meerkat-meta",
       "version": "0.9.4",
       "commit": "3c3af34f0a12bfab3d33183f65da9fd2578d58e3",
-      "path": "Cargo.lock",
       "sha256": "eb60173ef808581508289e628bea4d3685690b72aaea8c3f7de37468c7001072",
       "url": "https://github.com/lukacf/meerkat-meta/blob/3c3af34f0a12bfab3d33183f65da9fd2578d58e3/Cargo.lock",
       "anchors": "meerkat 0.9.4"
@@ -44,7 +40,6 @@
       "project": "meerkat-meta",
       "version": "0.9.4",
       "commit": "3c3af34f0a12bfab3d33183f65da9fd2578d58e3",
-      "path": "crates/meerkat-meta/src/schedule_wiring.rs",
       "sha256": "012e33a736adca960826823764da4dea2d656fd33464487525eee3efc61c4027",
       "url": "https://github.com/lukacf/meerkat-meta/blob/3c3af34f0a12bfab3d33183f65da9fd2578d58e3/crates/meerkat-meta/src/schedule_wiring.rs",
       "anchors": "rewrite_resumable_session_target_to_mob_member"
