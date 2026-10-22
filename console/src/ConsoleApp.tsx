@@ -2786,10 +2786,15 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   // The scope whose access read has completed at least once (success,
   // refusal or failure). Until then every read blocks edits.
   const accessSettledScope = React.useRef<string | null>(null);
+  // The newest access revision of this scope that the Console has read or
+  // that the owner signalled (access_changed); an older or equal signal
+  // reads nothing.
+  const accessRevisionRef = React.useRef<number | undefined>(undefined);
   const visibleAccessData = accessData.scope === accessScope ? accessData : null;
   React.useEffect(() => {
     accessRefreshVersion.current += 1;
     accessSettledScope.current = null;
+    accessRevisionRef.current = undefined;
     setAccessData({ scope: accessScope, loading: false, status: null, config: null, error: null });
   }, [accessScope, experience?.access?.can_administer]);
   // An explicit read (Refresh, the read after a save) disables edits from the
@@ -2829,6 +2834,9 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         }
         if (!isCurrent()) return;
         accessSettledScope.current = accessScope;
+        if (typeof status?.revision === "number") {
+          accessRevisionRef.current = Math.max(accessRevisionRef.current ?? status.revision, status.revision);
+        }
         setAccessData({ scope: accessScope, loading: false, status, config, error: null });
       } catch (err) {
         if (!isCurrent()) return;
@@ -3275,7 +3283,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     }
   }), [panelRefreshFlight, consoleTransport]);
 
-  const refreshPanelData = React.useCallback(async () => {
+  // Access is read when its panel opens or its scope changes, on Refresh and
+  // after a save, and when the owner signals a newer access revision
+  // (access_changed); a refresh caused by activity leaves it out.
+  const refreshPanelData = React.useCallback(async ({ access = true }: { access?: boolean } = {}) => {
     const openPanels = visiblePanelTargets;
     const inspects = openPanels.filter(
       (t): t is Extract<MetaDockTarget, { kind: "identity-inspect" }> =>
@@ -3303,7 +3314,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         );
       }));
     }
-    if (openPanels.some((t) => t.kind === "access")) refreshes.push(refreshAccessData("background"));
+    if (access && openPanels.some((t) => t.kind === "access")) refreshes.push(refreshAccessData("background"));
     if (openPanels.some((t) => t.kind === "memory")) refreshes.push(refreshMemoryData());
     if (openPanels.some((t) => t.kind === "workgraph")) refreshes.push(refreshWorkGraphData());
     if (openPanels.some((t) => t.kind === "topology")) refreshes.push(refreshTopologyData());
@@ -3336,9 +3347,27 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       // and each panel kind coalesce separately, so a slow panel (topology
       // on a loaded server) never holds back the others.
       void panelRefreshFlight("experience-events", () => loadExperience().then(() => {}, () => {}));
-      void refreshPanelDataRef.current().catch(() => {});
+      void refreshPanelDataRef.current({ access: false }).catch(() => {});
     }, 150);
   }, [loadExperience, panelRefreshFlight]);
+
+  // The timeline stream names the owner's access revision when it goes live
+  // and again after each committed access change (access_changed). A
+  // revision newer than any this Console has read or been told, or the first
+  // one it hears, reads Access again when its panel is open, and the roster,
+  // whose visibility the change may have moved.
+  const handleAccessChangedRef = React.useRef<(revision: number | undefined) => void>(() => {});
+  handleAccessChangedRef.current = (revision) => {
+    const known = accessRevisionRef.current;
+    if (typeof revision === "number") {
+      if (typeof known === "number" && revision <= known) return;
+      accessRevisionRef.current = revision;
+    }
+    if (visiblePanelTargets.some((target) => target.kind === "access")) {
+      void refreshAccessData("background").catch(() => {});
+    }
+    scheduleExperienceRefresh();
+  };
 
   // =========================================================================
   // HISTORY REFRESH — server is the single source of truth
@@ -3534,6 +3563,11 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     // filter as SSE. The activity rail is its own concern; it doesn't
     // share state with the per-identity logs.
     const handleLiveFrame = (incomingFrame: ConsoleFrame) => {
+      if (incomingFrame.event === "access_changed") {
+        const signalled = (incomingFrame.data as { revision?: unknown } | null | undefined)?.revision;
+        handleAccessChangedRef.current(typeof signalled === "number" ? signalled : undefined);
+        return;
+      }
       const canonicalIdentity = canonicalConsoleIdentityFromMap(
         incomingFrame.identity,
         identityAliasesRef.current,

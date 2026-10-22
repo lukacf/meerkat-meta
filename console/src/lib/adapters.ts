@@ -830,6 +830,9 @@ const HIDDEN_EVENTS = new Set([
   "frame_updated",
   "snapshot_complete",
   "snapshot_started",
+  // The owner's access revision signal: it re-reads access views and is
+  // never a transcript or activity entry.
+  "access_changed",
   "run_failed",
   "keep-alive",
   "server_tool_content",

@@ -108,6 +108,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   timeout rises from 337 to 377 seconds, and the advertised
   `stdio_shutdown_horizon_ms` from 392000 to 432000; hosts that honor the
   advertised value need no change.
+- The Console reads its Access view again only when the access
+  configuration changes. With Console access control configured,
+  `/console/timeline/stream` now sends an `access_changed` event naming the
+  configuration's committed revision when the live part of the stream
+  starts and after each committed change, and the Console reads Access
+  (when its panel is open) and the roster again on a newer revision. It
+  used to read Access again on 16 kinds of activity event, such as tool
+  calls and run starts, none of which can change it.
 
 ### Fixed
 

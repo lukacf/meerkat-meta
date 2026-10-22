@@ -3060,6 +3060,8 @@ async fn console_timeline_stream_handler(
     let identity = timeline_query.identity.clone();
     let conversation_id = timeline_query.conversation_id.clone();
     let snapshot_after = timeline_query.after.clone();
+    // The owner's access revision this stream last named (access_changed).
+    let mut signalled_revision: Option<u64> = None;
     let stream = stream! {
         if let Some(event) = sse_event_from_timeline_event(&ConsoleTimelineEvent::SnapshotStarted { after: snapshot_after }) {
             yield Ok::<Event, Infallible>(event);
@@ -3108,6 +3110,11 @@ async fn console_timeline_stream_handler(
         if let Some(event) = sse_event_from_timeline_event(&ConsoleTimelineEvent::SnapshotComplete { cursor: latest_cursor.clone() }) {
             yield Ok::<Event, Infallible>(event);
         }
+        // The access revision as the stream goes live, then each newer one
+        // the owner commits: the Console reads its Access view again on it.
+        if let Some(event) = access_changed_event(live_view.as_ref(), &mut signalled_revision) {
+            yield Ok::<Event, Infallible>(event);
+        }
         loop {
             let (policy_changed, received) = match crate::http_sse::wake_or_policy_change(
                 live_view.as_mut(),
@@ -3127,6 +3134,12 @@ async fn console_timeline_stream_handler(
                     reprime_stream_access_cache(reprime_runtime.as_ref(), reprime_access.as_ref())
                         .await;
                 }
+            }
+            if let Some(event) = access_changed_event(live_view.as_ref(), &mut signalled_revision) {
+                if !crate::http_sse::still_authenticated(authentication.as_mut()) {
+                    break;
+                }
+                yield Ok::<Event, Infallible>(event);
             }
             let Some(received) = received else {
                 continue;
@@ -3171,6 +3184,9 @@ async fn console_timeline_stream_handler(
                     }
                     if !crate::http_sse::still_authenticated(authentication.as_mut()) {
                         break;
+                    }
+                    if let Some(signal) = access_changed_event(live_view.as_ref(), &mut signalled_revision) {
+                        yield Ok::<Event, Infallible>(signal);
                     }
                     // Decided on the broadcast frame as stored, with its
                     // captured member provenance, before it is projected.
@@ -5400,6 +5416,25 @@ fn cursor_is_after(candidate: &ConsoleCursor, current: &ConsoleCursor) -> bool {
         (Some(candidate), Some(current)) => candidate > current,
         _ => candidate > current,
     }
+}
+
+/// `access_changed` naming the owner's access revision, when it is the
+/// first this stream names or newer than the last one it named. `None` for a
+/// stream that follows no access owner, or when nothing newer was
+/// committed. Activity frames carry no access change, so the Console reads
+/// its Access view again on this event instead.
+fn access_changed_event(
+    live_view: Option<&LiveAccessView>,
+    signalled: &mut Option<u64>,
+) -> Option<Event> {
+    let revision = live_view?.revision();
+    if signalled.is_some_and(|sent| revision <= sent) {
+        return None;
+    }
+    *signalled = Some(revision);
+    let data =
+        serde_json::to_string(&json!({"type": "access_changed", "revision": revision})).ok()?;
+    Some(Event::default().event("access_changed").data(data))
 }
 
 fn sse_event_from_timeline_event(event: &ConsoleTimelineEvent) -> Option<Event> {

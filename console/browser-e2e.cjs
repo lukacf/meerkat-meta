@@ -907,6 +907,15 @@ function startMockConsoleServer(options = {}) {
           }
           return streamClients.size;
         },
+        // Writes the owner's access_changed signal, as the timeline stream
+        // sends it after a committed access change, to every open timeline
+        // stream; returns how many streams received it.
+        emitAccessChanged: (revision) => {
+          for (const res of streamClients) {
+            res.write(`event: access_changed\ndata: ${JSON.stringify({ type: "access_changed", revision })}\n\n`);
+          }
+          return streamClients.size;
+        },
         close: () => new Promise((done, closeError) => {
           server.close((error) => error ? closeError(error) : done());
         }),
@@ -3702,9 +3711,10 @@ async function runAccessTabClickDuringRefreshProof() {
   }
 }
 
-// A stream event refreshes a settled Access panel in the background. While
-// that read is in flight the panel keeps its edits: no "Refreshing owner
-// state" notice, and a press and release on Edit admins opens the editor. The
+// The owner's access_changed signal refreshes a settled Access panel in the
+// background. While that read is in flight the panel keeps its edits: no
+// "Refreshing owner state" notice, and a press and release on Edit admins
+// opens the editor. The
 // configuration read is held open so the background read is visibly in
 // flight; the owner's edit token, not a disabled form, protects a save.
 async function runAccessEditDuringBackgroundRefreshProof() {
@@ -3760,14 +3770,10 @@ async function runAccessEditDuringBackgroundRefreshProof() {
     // until it lands.
     await refreshing.waitFor({ state: "detached" });
     holdConfigReads = true;
-    const streams = server.emitTimelineStreamFrames([{
-      id: "background-tool-call-1", kind: "tool_call", identity: "identity:luka",
-      timestamp_ms: Date.now(), cursor: "console:background-tool-call:1",
-      payload: { id: "call-background-1", name: "noop", arguments: {} },
-    }], "background-tool-call");
-    assert.ok(streams > 0, "no timeline stream was open for the tool call");
+    const streams = server.emitAccessChanged(metadata.revision + 1);
+    assert.ok(streams > 0, "no timeline stream was open for the access signal");
     for (let wait = 0; heldReads.length === 0; wait += 1) {
-      assert.ok(wait < 200, "the tool call did not start a background configuration read");
+      assert.ok(wait < 200, "the access signal did not start a background configuration read");
       await page.waitForTimeout(25);
     }
     await page.screenshot({ path: path.join(evidence, "background-read-in-flight.png"), fullPage: true });

@@ -1470,6 +1470,71 @@ describe("access async scope isolation", () => {
   });
 });
 
+describe("access revalidation follows the owner's access revision", () => {
+  // The Console reads Access again when the owner commits an access change
+  // (the timeline stream's access_changed signal), not on activity events
+  // that cannot change it.
+  async function openAccess() {
+    const fake = transport(vi.fn());
+    const initial = await fake.loadExperience();
+    const state = { revision: 1, receive: undefined as ((frame: never) => void) | undefined };
+    const experienceLoads = vi.fn();
+    const statusReads = vi.fn();
+    fake.loadExperience = async () => {
+      experienceLoads();
+      return ({ ...initial, access: { available: true, enabled: true, can_administer: true, subject: "first-admin" } }) as never;
+    };
+    fake.subscribeTimeline = (_input, next) => { state.receive = next; return () => {}; };
+    fake.capabilities = async () => ({ version: "test", methods: ["meta/console/timeline", "meta/access/status", "meta/access/get"] }) as never;
+    fake.executeCommand = vi.fn(async input => {
+      if (input.command === "accessStatus") {
+        statusReads();
+        return { command: input.command, accepted: true, result: { available: true, enabled: true, can_administer: true, subject: "first-admin", revision: state.revision, actions: [] } } as never;
+      }
+      if (input.command === "getAccessConfig") {
+        return { command: input.command, accepted: true, result: { config: { enabled: true, admins: ["first-admin"], rules: [], groups: {} }, revision: state.revision } } as never;
+      }
+      throw new Error(`unexpected ${input.command}`);
+    });
+    render(<ConsoleApp baseUrl="" transport={fake} />);
+    fireEvent.click(await screen.findByText("Access", { exact: true }));
+    await screen.findByText("first-admin", { exact: true });
+    await waitFor(() => expect(state.receive).toBeTypeOf("function"));
+    await settle(400);
+    expect(statusReads).toHaveBeenCalled();
+    const push = (frame: unknown) => act(async () => { state.receive?.(frame as never); });
+    return { state, experienceLoads, statusReads, push };
+  }
+  const settle = (ms: number) => act(async () => { await new Promise((resolve) => window.setTimeout(resolve, ms)); });
+
+  it("does not read Access again for activity that cannot change it", async () => {
+    const { experienceLoads, statusReads, push } = await openAccess();
+    const readsBefore = statusReads.mock.calls.length;
+    const loadsBefore = experienceLoads.mock.calls.length;
+    await push({ id: "unrelated-tool", event: "tool_execution_completed", identity, interactionId: "unrelated-turn", timestampMs: 2, data: {} });
+    // The activity still refreshes the roster.
+    await waitFor(() => expect(experienceLoads.mock.calls.length).toBeGreaterThan(loadsBefore));
+    await settle(400);
+    expect(statusReads).toHaveBeenCalledTimes(readsBefore);
+  });
+
+  it("reads Access once for each newer revision the owner signals", async () => {
+    const { state, statusReads, push } = await openAccess();
+    const readsBefore = statusReads.mock.calls.length;
+    state.revision = 2;
+    await push({ id: "", event: "access_changed", data: { type: "access_changed", revision: 2 } });
+    await waitFor(() => expect(statusReads).toHaveBeenCalledTimes(readsBefore + 1));
+    await settle(400);
+    expect(statusReads).toHaveBeenCalledTimes(readsBefore + 1);
+    // A revision the Console has already read changes nothing.
+    await push({ id: "", event: "access_changed", data: { type: "access_changed", revision: 2 } });
+    await push({ id: "", event: "access_changed", data: { type: "access_changed", revision: 1 } });
+    await settle(400);
+    expect(statusReads).toHaveBeenCalledTimes(readsBefore + 1);
+    expect(screen.getByText("first-admin", { exact: true })).toBeVisible();
+  });
+});
+
 // These are actual ConsoleApp/HTTP-adapter tests with mocked RPC responses.
 // They do not substitute for the real AccessController mutex/TOML tests.
 describe("checked access saves", () => {
@@ -1900,15 +1965,17 @@ describe("checked access saves", () => {
       }));
       return control;
     }
-    /// A tool_call frame on the timeline, which schedules a background refresh.
-    function toolCalls(fake: MetaConsoleTransport) {
+    /// The owner's access_changed signal on the timeline, which schedules a
+    /// background read. Each one names a revision newer than any the
+    /// fixture's owner reports, so each one reads Access.
+    function accessChanges(fake: MetaConsoleTransport) {
       let receive: ((frame: never) => void) | undefined;
       fake.subscribeTimeline = (_input, next) => { receive = next; return () => {}; };
       let sequence = 0;
       return async () => {
         sequence += 1;
         await act(async () => {
-          receive?.({ id: `tool-${sequence}`, event: "tool_call", identity, interactionId: `tool-${sequence}`, timestampMs: sequence, data: {} } as never);
+          receive?.({ id: "", event: "access_changed", data: { type: "access_changed", revision: 1_000 + sequence } } as never);
         });
       };
     }
@@ -1917,10 +1984,10 @@ describe("checked access saves", () => {
 
     it("keeps a settled Access editable while a background read is in flight", async () => {
       const { fake } = await fixture("checked_v1");
-      const toolCall = toolCalls(fake);
+      const accessChange = accessChanges(fake);
       await openAccess(fake);
       const reads = holdReads(["meta/access/get"]);
-      await toolCall();
+      await accessChange();
       await waitFor(() => expect(reads.held).toHaveLength(1));
       expect(refreshNotice()).toBeNull();
       expect(screen.getByTestId("access-edit-admins")).toBeEnabled();
@@ -1931,14 +1998,14 @@ describe("checked access saves", () => {
 
     it("saves during a background read, whose older answer never lands after the save", async () => {
       const { fake, state, writes } = await fixture("checked_v1");
-      const toolCall = toolCalls(fake);
+      const accessChange = accessChanges(fake);
       await openAccess(fake);
       fireEvent.click(screen.getByTestId("access-edit-admins"));
       fireEvent.change(screen.getByTestId("access-admins-input"), { target: { value: draftText } });
       // The background read answers with a marker no later read carries.
       state.config = { ...originalConfig, rules: [markerRule("held-answer")] };
       const reads = holdReads(["meta/access/get"]);
-      await toolCall();
+      await accessChange();
       await waitFor(() => expect(reads.held).toHaveLength(1));
       state.config = { ...originalConfig };
       expect(screen.getByTestId("access-save-admins")).toBeEnabled();
@@ -1967,13 +2034,13 @@ describe("checked access saves", () => {
 
     it("keeps the draft's own base when a background read brings a newer revision", async () => {
       const { fake, state, writes } = await fixture("checked_v1");
-      const toolCall = toolCalls(fake);
+      const accessChange = accessChanges(fake);
       await openAccess(fake);
       fireEvent.click(screen.getByTestId("access-edit-admins"));
       fireEvent.change(screen.getByTestId("access-admins-input"), { target: { value: draftText } });
       state.revision = 11;
       state.config = { ...originalConfig, rules: [newerRule] };
-      await toolCall();
+      await accessChange();
       fireEvent.click(screen.getByTestId("access-tab:rules"));
       expect(await screen.findByTestId("access-rule:b-newer-rule")).toBeVisible();
       fireEvent.click(screen.getByTestId("access-tab:overview"));
@@ -1992,7 +2059,7 @@ describe("checked access saves", () => {
 
     it("drops the view and the draft when a background read is refused", async () => {
       const { fake } = await fixture("checked_v1");
-      const toolCall = toolCalls(fake);
+      const accessChange = accessChanges(fake);
       await openAccess(fake);
       fireEvent.click(screen.getByTestId("access-edit-admins"));
       fireEvent.change(screen.getByTestId("access-admins-input"), { target: { value: draftText } });
@@ -2002,7 +2069,7 @@ describe("checked access saves", () => {
         if (body.method !== "meta/access/status") return originalFetch(url, init);
         return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error: { code: -32030, message: "PRIVATE_DENIED", data: { kind: "access_denied" } } }), { status: 200 });
       }));
-      await toolCall();
+      await accessChange();
       expect(await screen.findByText("Current administrator access is required to view this configuration.")).toBeVisible();
       expect(screen.queryByText("alice@example.test", { exact: true })).toBeNull();
       expect(screen.queryByTestId("access-admins-input")).toBeNull();
@@ -2010,16 +2077,16 @@ describe("checked access saves", () => {
 
     it("fails closed on a background failure without dropping the alert, until a read succeeds", async () => {
       const { fake } = await fixture("checked_v1");
-      const toolCall = toolCalls(fake);
+      const accessChange = accessChanges(fake);
       await openAccess(fake);
       const reads = holdReads(["meta/access/get"]);
-      await toolCall();
+      await accessChange();
       await waitFor(() => expect(reads.held).toHaveLength(1));
       await act(async () => { reads.held[0].fail(new Response("upstream unavailable", { status: 500 })); });
       expect(await screen.findByTestId("access-error")).toBeVisible();
       expect(screen.getByText("alice@example.test", { exact: true })).toBeVisible();
       expect(screen.queryByTestId("access-edit-admins")).toBeNull();
-      await toolCall();
+      await accessChange();
       await waitFor(() => expect(reads.held).toHaveLength(2));
       expect(screen.getByTestId("access-error")).toBeVisible();
       expect(screen.queryByTestId("access-edit-admins")).toBeNull();
@@ -2031,11 +2098,11 @@ describe("checked access saves", () => {
 
     it("blocks from an explicit Refresh until a read issued after it lands", async () => {
       const { fake, state } = await fixture("checked_v1");
-      const toolCall = toolCalls(fake);
+      const accessChange = accessChanges(fake);
       await openAccess(fake);
       state.config = { ...originalConfig, rules: [markerRule("held-answer")] };
       const reads = holdReads(["meta/access/get"]);
-      await toolCall();
+      await accessChange();
       await waitFor(() => expect(reads.held).toHaveLength(1));
       state.revision = 11;
       state.config = { ...originalConfig, rules: [markerRule("trailing-answer")] };
@@ -2048,7 +2115,7 @@ describe("checked access saves", () => {
       let experienceLoads = 0;
       const loadExperience = fake.loadExperience;
       fake.loadExperience = async () => { experienceLoads += 1; return loadExperience(); };
-      await toolCall();
+      await accessChange();
       await waitFor(() => expect(experienceLoads).toBeGreaterThan(0));
       await act(async () => { reads.held[0].release(); });
       await waitFor(() => expect(reads.held).toHaveLength(2));
@@ -2062,7 +2129,7 @@ describe("checked access saves", () => {
 
     it("still blocks edits during the first read of a scope", async () => {
       const { fake } = await fixture("checked_v1");
-      const toolCall = toolCalls(fake);
+      const accessChange = accessChanges(fake);
       render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
       const accessNav = await screen.findByText("Access", { exact: true });
       // The first read after opening Access.
@@ -2083,7 +2150,7 @@ describe("checked access saves", () => {
       const nextExperience = { ...experience, access: { ...(experience as { access: object }).access, subject: "alice@example.test" } };
       const experienceLoads: Array<() => void> = [];
       fake.loadExperience = () => new Promise(resolve => { experienceLoads.push(() => resolve(nextExperience as never)); });
-      await toolCall();
+      await accessChange();
       await waitFor(() => expect(statuses.held).toHaveLength(1));
       await waitFor(() => expect(experienceLoads.length).toBeGreaterThan(0));
       await act(async () => { experienceLoads.forEach(load => load()); });
@@ -2097,7 +2164,7 @@ describe("checked access saves", () => {
 
     it("lands the first read of a scope while stream events queue more reads behind it", async () => {
       const { fake } = await fixture("checked_v1");
-      const toolCall = toolCalls(fake);
+      const accessChange = accessChanges(fake);
       const loadExperience = fake.loadExperience.bind(fake);
       let experienceLoads = 0;
       fake.loadExperience = () => { experienceLoads += 1; return loadExperience(); };
@@ -2108,7 +2175,7 @@ describe("checked access saves", () => {
       await waitFor(() => expect(reads.held).toHaveLength(1));
       // The event's read is requested while the first one is in flight.
       const loadsBefore = experienceLoads;
-      await toolCall();
+      await accessChange();
       await waitFor(() => expect(experienceLoads).toBeGreaterThan(loadsBefore));
       expect(screen.getByText("Loading Console access...")).toBeVisible();
       await act(async () => { reads.held[0].release(); });
@@ -2121,7 +2188,7 @@ describe("checked access saves", () => {
 
     it("settles a scope on a failed first read, so stream events do not return it to loading", async () => {
       const { fake } = await fixture("checked_v1");
-      const toolCall = toolCalls(fake);
+      const accessChange = accessChanges(fake);
       render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
       const accessNav = await screen.findByText("Access", { exact: true });
       const reads = holdReads(["meta/access/status"]);
@@ -2130,7 +2197,7 @@ describe("checked access saves", () => {
       expect(screen.getByText("Loading Console access...")).toBeVisible();
       await act(async () => { reads.held[0].fail(new Response("upstream unavailable", { status: 500 })); });
       await waitFor(() => expect(screen.queryByText("Loading Console access...")).toBeNull());
-      await toolCall();
+      await accessChange();
       await waitFor(() => expect(reads.held).toHaveLength(2));
       expect(screen.queryByText("Loading Console access...")).toBeNull();
       await act(async () => { reads.held[1].release(); });

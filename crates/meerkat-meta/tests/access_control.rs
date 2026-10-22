@@ -5648,6 +5648,66 @@ mod streams_follow_the_committed_policy {
         let _ = runtime.mob_handle().stop().await;
     }
 
+    /// The Console reads its Access view again on the owner's access
+    /// revision, not on activity: the timeline stream names the revision as
+    /// it goes live and again after each committed change, once per commit.
+    /// A refused edit and an activity frame name nothing.
+    #[tokio::test]
+    async fn timeline_stream_names_each_committed_access_revision() {
+        let (_temp_dir, runtime, controller, app) = fixture().await;
+        let start = controller.snapshot().1;
+        let mut caller = SseReader::open(&app, "/console/timeline/stream", None).await;
+        let access_changed = |event: &SseEvent| event.name == "access_changed";
+        let read = caller.until("live access revision", access_changed).await;
+        assert_eq!(
+            read.last().map(SseEvent::json),
+            Some(json!({"type": "access_changed", "revision": start}))
+        );
+
+        commit_view_deny(&controller, "router");
+        let read = caller
+            .until("access revision after the commit", access_changed)
+            .await;
+        assert_eq!(
+            read.last().map(SseEvent::json),
+            Some(json!({"type": "access_changed", "revision": start + 1}))
+        );
+
+        assert!(
+            controller.delete_rule("missing").is_err(),
+            "a refused edit commits nothing"
+        );
+        admin_send(&app, "delivery", "activity-after-the-change").await;
+        let mut read = caller
+            .until(
+                "delivery's frame after the change",
+                frame_with("delivery", "activity-after-the-change"),
+            )
+            .await;
+        read.extend(caller.quiet_window().await);
+        let named: Vec<Value> = read
+            .iter()
+            .filter(|event| access_changed(event))
+            .map(SseEvent::json)
+            .collect();
+        assert!(
+            named.is_empty(),
+            "a refused edit or activity named an access revision: {named:#?}"
+        );
+
+        controller
+            .upsert_rule(secret_label_deny())
+            .expect("commit the label deny");
+        let read = caller
+            .until("access revision after the next commit", access_changed)
+            .await;
+        assert_eq!(
+            read.last().map(SseEvent::json),
+            Some(json!({"type": "access_changed", "revision": start + 2}))
+        );
+        let _ = runtime.mob_handle().stop().await;
+    }
+
     /// A label rule committed while the stream is open judges a member that
     /// joined after the stream opened by that member's own labels.
     #[tokio::test]

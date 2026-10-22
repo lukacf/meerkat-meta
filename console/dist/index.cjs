@@ -23973,6 +23973,9 @@ var HIDDEN_EVENTS = /* @__PURE__ */ new Set([
   "frame_updated",
   "snapshot_complete",
   "snapshot_started",
+  // The owner's access revision signal: it re-reads access views and is
+  // never a transcript or activity entry.
+  "access_changed",
   "run_failed",
   "keep-alive",
   "server_tool_content",
@@ -44677,6 +44680,9 @@ var HIDDEN_EVENTS2 = /* @__PURE__ */ new Set([
   "frame_updated",
   "snapshot_complete",
   "snapshot_started",
+  // The owner's access revision signal: it re-reads access views and is
+  // never a transcript or activity entry.
+  "access_changed",
   "run_failed",
   "keep-alive",
   "server_tool_content",
@@ -64469,10 +64475,12 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   accessScopeRef.current = accessScope;
   const accessRefreshVersion = import_react49.default.useRef(0);
   const accessSettledScope = import_react49.default.useRef(null);
+  const accessRevisionRef = import_react49.default.useRef(void 0);
   const visibleAccessData = accessData.scope === accessScope ? accessData : null;
   import_react49.default.useEffect(() => {
     accessRefreshVersion.current += 1;
     accessSettledScope.current = null;
+    accessRevisionRef.current = void 0;
     setAccessData({ scope: accessScope, loading: false, status: null, config: null, error: null });
   }, [accessScope, experience?.access?.can_administer]);
   const refreshAccessData = import_react49.default.useCallback((mode = "explicit") => {
@@ -64508,6 +64516,9 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         }
         if (!isCurrent()) return;
         accessSettledScope.current = accessScope;
+        if (typeof status?.revision === "number") {
+          accessRevisionRef.current = Math.max(accessRevisionRef.current ?? status.revision, status.revision);
+        }
         setAccessData({ scope: accessScope, loading: false, status, config: config2, error: null });
       } catch (err) {
         if (!isCurrent()) return;
@@ -64858,7 +64869,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       throw error49;
     }
   }), [panelRefreshFlight, consoleTransport]);
-  const refreshPanelData = import_react49.default.useCallback(async () => {
+  const refreshPanelData = import_react49.default.useCallback(async ({ access = true } = {}) => {
     const openPanels = visiblePanelTargets;
     const inspects = openPanels.filter(
       (t) => t.kind === "identity-inspect"
@@ -64883,7 +64894,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         );
       }));
     }
-    if (openPanels.some((t) => t.kind === "access")) refreshes.push(refreshAccessData("background"));
+    if (access && openPanels.some((t) => t.kind === "access")) refreshes.push(refreshAccessData("background"));
     if (openPanels.some((t) => t.kind === "memory")) refreshes.push(refreshMemoryData());
     if (openPanels.some((t) => t.kind === "workgraph")) refreshes.push(refreshWorkGraphData());
     if (openPanels.some((t) => t.kind === "topology")) refreshes.push(refreshTopologyData());
@@ -64909,10 +64920,24 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       void panelRefreshFlight("experience-events", () => loadExperience().then(() => {
       }, () => {
       }));
-      void refreshPanelDataRef.current().catch(() => {
+      void refreshPanelDataRef.current({ access: false }).catch(() => {
       });
     }, 150);
   }, [loadExperience, panelRefreshFlight]);
+  const handleAccessChangedRef = import_react49.default.useRef(() => {
+  });
+  handleAccessChangedRef.current = (revision) => {
+    const known = accessRevisionRef.current;
+    if (typeof revision === "number") {
+      if (typeof known === "number" && revision <= known) return;
+      accessRevisionRef.current = revision;
+    }
+    if (visiblePanelTargets.some((target) => target.kind === "access")) {
+      void refreshAccessData("background").catch(() => {
+      });
+    }
+    scheduleExperienceRefresh();
+  };
   const scheduleHistoryRefresh = import_react49.default.useCallback(
     (identity) => {
       clearTimeout(refreshTimersRef.current[identity]);
@@ -65038,6 +65063,11 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const workGraphRefreshTimerRef = import_react49.default.useRef(null);
   import_react49.default.useEffect(() => {
     const handleLiveFrame = (incomingFrame) => {
+      if (incomingFrame.event === "access_changed") {
+        const signalled = incomingFrame.data?.revision;
+        handleAccessChangedRef.current(typeof signalled === "number" ? signalled : void 0);
+        return;
+      }
       const canonicalIdentity = canonicalConsoleIdentityFromMap(
         incomingFrame.identity,
         identityAliasesRef.current
