@@ -4749,11 +4749,17 @@ impl IdentityRuntime {
     /// The roster entries whose customizer tools a bootstrap with no lift
     /// staged still owes: the mob resumed Running (an unclean stop left its
     /// log Running), so meerkat's own resume revived its persisted members
-    /// while the mob was built, before any activation step. Each entry is
-    /// still pending (the mob build's early publication failed, so meerkat
-    /// holds its member's run starts) or names a member Core already holds
-    /// live. A freshly created mob holds none: its members are created by the
-    /// roster pass, which publishes their tools itself.
+    /// while the mob was built, before any activation step. Each entry names
+    /// a member Core already holds live, or one Core holds a binding for
+    /// that is still pending (the mob build's early publication failed, so
+    /// meerkat holds its member's run starts).
+    ///
+    /// A first boot creates the mob, so no lift is staged there either, but
+    /// Core holds no binding yet: it owes nothing, even when the mob build's
+    /// early publication failed. Its members are created by the roster pass,
+    /// which publishes their tools itself, and the early failure stays
+    /// pending until that publication. Without a readable binding history
+    /// every pending entry stays owed.
     pub(crate) async fn roster_owing_customizer_tools_after_resume(
         &self,
         roster: &[DurableAgentSpec],
@@ -4772,8 +4778,10 @@ impl IdentityRuntime {
         roster
             .iter()
             .filter(|spec| {
-                pending.contains(&spec.identity)
-                    || CoreViewFacts::of(history.as_ref(), &spec.identity).live
+                let facts = CoreViewFacts::of(history.as_ref(), &spec.identity);
+                facts.live
+                    || pending.contains(&spec.identity)
+                        && (history.is_none() || facts.member_id.is_some())
             })
             .cloned()
             .collect()

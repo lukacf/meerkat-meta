@@ -16,6 +16,10 @@
 //!   takes effect when meerkat's own resume revives the member first, a mob
 //!   log left Running; the release itself is unit-tested in the identity
 //!   runtime.)
+//! - A first boot (a freshly created mob, so no lift either) owes no
+//!   publication before its member exists: the customizer is called no extra
+//!   time, and the early failure stays pending until the materialization
+//!   publishes.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -628,5 +632,68 @@ async fn a_member_restored_after_an_unclean_stop_lists_its_customizer_tools_befo
         resolved_tools(&runtime).await,
         scope_visible_tools(&runtime).await
     );
+    runtime.shutdown().await;
+}
+
+/// A first boot creates the mob, so no lift is staged: the bootstrap takes
+/// the same no-lift path as a resume that found the mob Running. The mob
+/// build's early publication still fails for a customizer whose tools need
+/// the mob handle, so the identity is pending. Core holds no binding for it
+/// yet, so the bootstrap owes no publication and calls the customizer no
+/// extra time: the member does not exist until its materialization, which
+/// publishes its tools itself, and the early failure stays pending until
+/// then.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_boot_owes_no_customizer_publication_before_its_member_exists() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let capture = CaptureClient::default();
+    let customizer = Arc::new(HandleToolCustomizer::default());
+    let runtime = boot(
+        "customizer-tools-restart-e",
+        &state,
+        capture.clone(),
+        customizer.clone(),
+        IdentityBootstrapMode::LazyMaterialize,
+    )
+    .await;
+    let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+    assert_eq!(
+        customizer.calls.load(Ordering::SeqCst),
+        1,
+        "only the mob build's early publication (no handle yet); a first boot owes none"
+    );
+    let status = identity_runtime.status(&id(MEMBER)).await.expect("status");
+    let pending = status
+        .customizer_tools_pending
+        .expect("the early failure stays pending until the materialization publishes");
+    assert!(
+        pending
+            .reason
+            .contains("pre-activation customize_build failed")
+            && pending.reason.contains("mob handle missing"),
+        "{pending:?}"
+    );
+    assert_eq!(
+        member_run_starts_held(&runtime).await,
+        None,
+        "a lazy first boot registers no member before its first send"
+    );
+    assert_eq!(capture.count(), 0, "no turn has run yet");
+
+    // The first send materializes the member, and that materialization
+    // publishes its tools with the runtime's services.
+    identity_runtime
+        .send(
+            &id(MEMBER),
+            &meerkat_core::ContentInput::Text("first".to_string()),
+        )
+        .await
+        .expect("send materializes");
+    wait_for_turn(&capture, 1, "the materializing turn").await;
+    assert!(capture.last().expect("captured request").contains(TOOL));
+    let status = identity_runtime.status(&id(MEMBER)).await.expect("status");
+    assert!(status.customizer_tools_pending.is_none(), "{status:?}");
+    assert!(resolved_tools(&runtime).await.contains(&TOOL.to_string()));
     runtime.shutdown().await;
 }

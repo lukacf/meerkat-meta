@@ -664,6 +664,17 @@ async fn publish_customizer_tools_after_resume(
     if owed.is_empty() {
         return;
     }
+    // Pending before the pass: the mob build's early publication failed, so
+    // meerkat holds the member's run starts.
+    let held_before = owed
+        .iter()
+        .map(|spec| {
+            context
+                .runtime
+                .customizer_tools_pending_for(&spec.identity)
+                .is_some()
+        })
+        .collect::<Vec<_>>();
     context
         .runtime
         .ensure_customizer_tool_dispatchers(owed)
@@ -677,30 +688,39 @@ async fn publish_customizer_tools_after_resume(
         .release_customizer_tool_holds(&release_owed)
         .await;
     // A publication and a release that succeed log nothing per identity, so
-    // the pass reports itself once. A member still pending stays held until
-    // its wake or delivery publishes: that is a WARN, naming them (each
-    // failure's reason is logged above).
-    let still_pending = owed
-        .iter()
-        .filter(|spec| {
-            context
-                .runtime
-                .customizer_tools_pending_for(&spec.identity)
-                .is_some()
-        })
-        .map(|spec| spec.identity.to_string())
-        .collect::<Vec<_>>();
+    // the pass reports itself once, counting each owed member once:
+    // held_released (its hold is released), not_held (Core held it live
+    // without a hold and its tools are republished) or still_pending. A
+    // member still pending stays held until its wake or delivery publishes:
+    // that is a WARN, naming them (each failure's reason is logged above).
+    let mut held_released = 0_usize;
+    let mut not_held = 0_usize;
+    let mut still_pending = Vec::new();
+    for (spec, held) in owed.iter().zip(held_before) {
+        if context
+            .runtime
+            .customizer_tools_pending_for(&spec.identity)
+            .is_some()
+        {
+            still_pending.push(spec.identity.to_string());
+        } else if held {
+            held_released += 1;
+        } else {
+            not_held += 1;
+        }
+    }
     if still_pending.is_empty() {
         tracing::info!(
-            owed = owed.len(),
-            released = release_owed.len(),
+            held_released,
+            not_held,
             "published the customizer tools of the members restored while the mob resumed \
              Running"
         );
     } else {
         tracing::warn!(
-            owed = owed.len(),
-            released = release_owed.len(),
+            held_released,
+            not_held,
+            still_pending_count = still_pending.len(),
             still_pending = %still_pending.join(","),
             "the customizer tools of members restored while the mob resumed Running are not \
              published; each starts no run until its wake or delivery publishes them"
