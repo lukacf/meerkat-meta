@@ -389,7 +389,7 @@ test("the mounted replay cannot offer manual continuation, can End, and keeps or
     uiRef = ui;
     await ui.click("Try the same job again");
     assert.equal(ui.button("Continue this trial"), undefined);
-    assert.equal(ui.dom.window.document.querySelector('textarea[id^="trial-follow-up-"]'), null);
+    assert.equal(ui.dom.window.document.querySelector('textarea[id^="trial-follow-up-"]') === null, true);
     assert.match(ui.dom.window.document.body.textContent, /1 of 3 requests have settled/);
     assert.match(ui.dom.window.document.body.textContent, /next saved request is sent automatically/);
     assert.doesNotMatch(ui.dom.window.document.body.textContent, /Follow-up window/);

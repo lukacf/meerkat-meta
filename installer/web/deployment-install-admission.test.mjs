@@ -379,7 +379,7 @@ test("private runtime refresh without an installed target hides fresh setup and 
     assert.equal(button("Install on this computer"), undefined);
     assert.equal(button("Install into another folder"), undefined);
     assert.equal(button("Install and start"), undefined);
-    assert.equal(privateForm(), null);
+    assert.equal(privateForm() === null, true);
     assert.equal(button("Stage accepted update"), undefined, "No installed target is fabricated for update staging.");
     assert.ok(calls.every(call => call.method === "GET"), "Checking availability cannot install or update.");
 
@@ -400,7 +400,7 @@ test("private runtime refresh preserves installed settings drafts and explicitly
     assert.match(document.body.textContent, /private runtime candidate.*checked update.*existing stopped installation/);
     assert.equal(button("Install into another folder"), undefined);
     assert.equal(button("Install on this computer"), undefined);
-    assert.equal(privateForm(), null);
+    assert.equal(privateForm() === null, true);
     assert.ok(button("Stage accepted update"));
     assert.equal(button("Stage accepted update").disabled, false, "Local update compatibility stays available despite fresh-install refusal.");
     assert.equal(button("Change private settings").disabled, false, "The restriction belongs to the candidate, not installed settings.");
@@ -414,7 +414,7 @@ test("private runtime refresh preserves installed settings drafts and explicitly
     assert.equal(privateForm().querySelector('[name="APP_USER"]').value, draft);
     assert.ok(calls.every(call => call.method === "GET"), "Reading status does not save, stage or install the private draft.");
     await act(async () => button("Cancel").click());
-    assert.equal(privateForm(), null);
+    assert.equal(privateForm() === null, true);
     assert.equal(button("Install into another folder"), undefined);
 
     holdStageResponse();
@@ -437,7 +437,7 @@ for (const mismatch of ["stale", "wrong-source"]) test(`private runtime refresh 
     assert.equal(button("Install on this computer"), undefined);
     assert.equal(button("Install into another folder"), undefined);
     assert.equal(button("Install and start"), undefined);
-    assert.equal(privateForm(), null);
+    assert.equal(privateForm() === null, true);
     assert.ok(calls.every(call => call.method === "GET"));
   }, { build: privateRefreshCandidate, options: value => ({ ...refreshAvailability(value),
     ...(mismatch === "stale" ? { guide_version: guide.version - 1 }
@@ -475,7 +475,7 @@ test(`staging wait explains the pending response without replay or readback rele
     if (scenario.receipt.status === "stopped") {
       loseStatusReads();
       await act(async () => waiting().querySelector("button").click());
-      assert.equal(waiting().querySelector("button"), null, "Reconnect guidance supplies the existing status action.");
+      assert.equal(waiting().querySelector("button") === null, true, "Reconnect guidance supplies the existing status action.");
       assert.equal([...document.querySelectorAll("button")].filter(node => node.textContent === "Check installation status").length, 1);
       assert.equal(stageBodyPending(), true);
       restoreStatusReads();
@@ -485,7 +485,7 @@ test(`staging wait explains the pending response without replay or readback rele
       assert.equal(calls.filter(call => call.method === "POST").length, 1);
     }
     await finishStageResponse(0, scenario.failure);
-    assert.equal(waiting(), null, "The presentation marker clears only when the original response settles.");
+    assert.equal(waiting() === null, true, "The presentation marker clears only when the original response settles.");
     assert.equal(calls.filter(call => call.method === "POST").length, 1);
     if (scenario.receipt.status === "stopped") assert.equal(button("Apply and verify update").disabled, false);
     else assert.equal(button("Stop application").disabled, false);
@@ -512,10 +512,10 @@ test("staging wait retires with guide selection and ignores a late response fail
     assert.equal(calls.length, before, "A retained status button cannot read a retired guide selection.");
     assert.equal(stageBodyPending(), true, "Navigation does not abort the original staging response.");
     await revise(guide, candidate);
-    assert.equal(document.querySelector('[data-stage-response="pending"]'), null);
+    assert.equal(document.querySelector('[data-stage-response="pending"]') === null, true);
     const beforeLateReply = calls.length;
     await finishStageResponse(0, true);
-    assert.equal(document.querySelector(".deployment-panel > .deployment-error"), null);
+    assert.equal(document.querySelector(".deployment-panel > .deployment-error") === null, true);
     assert.equal(calls.length, beforeLateReply, "An old failure cannot observe or mutate the retired selection.");
     assert.equal(calls.filter(call => call.method === "POST").length, 1);
   }, { build: candidate, selectionScope: scope });
@@ -555,7 +555,7 @@ for (const failure of [false, true]) test(`installed command response recovery l
     assert.equal(document.querySelector('[name="APP_USER"]').value, "Keep this exact new private draft");
     assert.equal(task().value, savedTask);
     assert.equal(document.querySelector(".deployment-panel").dataset.deploymentStatus, "stopped");
-    assert.equal(document.querySelector(".deployment-panel > .deployment-error"), null);
+    assert.equal(document.querySelector(".deployment-panel > .deployment-error") === null, true);
     assert.equal(calls.length, callsBeforeLateReply, "The detached response cannot trigger another status read or mutation.");
   }, { applicationUse: true });
 });
@@ -612,7 +612,7 @@ test("installed command response recovery cannot adopt a retired selection befor
     assert.equal(button("Stop application").disabled, true);
     await finishStartResponse(0, true);
     assert.equal(calls.length, before, "Retired selection cannot adopt or publish the late failure.");
-    assert.equal(document.querySelector(".deployment-panel > .deployment-error"), null);
+    assert.equal(document.querySelector(".deployment-panel > .deployment-error") === null, true);
   }, { selectionScope: scope });
 });
 
@@ -724,7 +724,7 @@ test("a directly returned exact settled Start retires its transport intent witho
     "The exact host action observation confirms the returned response before enabling another action.");
     assert.ok(calls.some((call, index) => index > calls.indexOf(submitted) && call.method === "GET" && call.target === installUrl),
       "Command settlement still needs a fresh installation status observation.");
-    assert.equal(document.querySelector(".deployment-panel > .deployment-error"), null);
+    assert.equal(document.querySelector(".deployment-panel > .deployment-error") === null, true);
     const readsBeforeRemount = calls.filter(call => call.target.includes("/action/")).length;
     await remount();
     assert.equal(document.querySelector(".deployment-panel").dataset.deploymentStatus, "running");
@@ -788,21 +788,21 @@ test("reload identifies an installed native team even when the proposed default 
     assert.equal(document.querySelector('input[name="deployment-source"][value="native-team"]').checked, true);
     assert.equal(document.querySelector(".deployment-panel h2").textContent, "Your agent team is running");
     assert.ok(document.querySelector('section[aria-label="Use your agent team"] a'));
-    assert.equal(document.querySelector('section[aria-label="Use your application"]'), null);
+    assert.equal(document.querySelector('section[aria-label="Use your application"]') === null, true);
   }, { guide: nativeGuide, sourceKind: "application" });
 });
 
 test("an installed choice cannot borrow readiness or entry links from an unmatched or unhealthy receipt", async () => {
   await mountedDeployment({ ...healthyApplication, guide_id: "another-guide" }, async ({ document, calls }) => {
     assert.equal(document.querySelector('input[name="deployment-source"][value="native-team"]').checked, true);
-    assert.equal(document.querySelector('section[aria-label="Use your application"]'), null);
+    assert.equal(document.querySelector('section[aria-label="Use your application"]') === null, true);
     assert.doesNotMatch(document.querySelector(".deployment-panel h2").textContent, /is running/);
     assert.equal(calls.some((call) => /\/(use|experiences)$/.test(call.target)), false);
   }, { guide: nativeGuide, sourceKind: "native-team", applicationUse: true });
   await mountedDeployment({ ...healthyApplication, process_live: false }, async ({ document }) => {
     assert.equal(document.querySelector('input[name="deployment-source"][value="application"]').checked, true);
     assert.match(document.querySelector(".deployment-panel h2").textContent, /health check/);
-    assert.equal(document.querySelector('section[aria-label="Use your application"] a'), null);
+    assert.equal(document.querySelector('section[aria-label="Use your application"] a') === null, true);
   }, { guide: nativeGuide, sourceKind: "native-team", applicationUse: true });
 });
 
@@ -815,7 +815,7 @@ test("stopped applications lead with Start and keep their draft through a runnin
       assert.equal(app().querySelector(".deployment-use-interfaces h4").textContent, "Open after starting the application");
       assert.match(app().textContent, /Start the installed application to open its interfaces/);
       assert.doesNotMatch(app().textContent, /Sign in if asked|Open the application UI/);
-      assert.equal(app().querySelector("a"), null);
+      assert.equal(app().querySelector("a") === null, true);
       assert.match(document.body.textContent, /The application is stopped\. Closing this page leaves it stopped\./);
       assert.doesNotMatch(document.body.textContent, /Closing this page keeps the application running|can keep running after Forge closes/);
       const draft = app().querySelector(".deployment-use-field textarea");
@@ -865,7 +865,7 @@ for (const failure of [false, true]) test(`fresh installation response recovery 
     assert.ok(recover, "A fresh exact admission offers an explicit return while the original POST body is held.");
     assert.match(document.body.textContent, /installation has been admitted.*original installation response is still pending/i);
     assert.doesNotMatch(document.body.textContent, /command has finished/);
-    assert.equal(privateForm(), null, "Observed admission clears private inputs before returning.");
+    assert.equal(privateForm() === null, true, "Observed admission clears private inputs before returning.");
     assert.equal(button("Stop application").disabled, true, "Polling alone does not release this local presentation owner.");
     const draft = () => document.querySelector('.deployment-use-field textarea');
     const task = "Keep my unsent first useful task while recovering the saved installation.";
@@ -885,7 +885,7 @@ for (const failure of [false, true]) test(`fresh installation response recovery 
     assert.equal(document.querySelector('[name="APP_USER"]').value, "Keep this newer private draft");
     assert.equal(draft().value, task);
     assert.equal(document.querySelector(".deployment-panel").dataset.deploymentStatus, "stopped");
-    assert.equal(document.querySelector(".deployment-panel > .deployment-error"), null);
+    assert.equal(document.querySelector(".deployment-panel > .deployment-error") === null, true);
     assert.equal(calls.length, beforeLateReply, "The detached body cannot publish old status, read again or resend installation.");
   }, { applicationUse: true });
 });
@@ -954,7 +954,7 @@ test("fresh installation response recovery cannot revive after source selection 
     assert.equal(button("Stop application").disabled, true);
     await finishInstallResponse(0, true);
     assert.equal(calls.length, beforeLateReply);
-    assert.equal(document.querySelector(".deployment-panel > .deployment-error"), null);
+    assert.equal(document.querySelector(".deployment-panel > .deployment-error") === null, true);
     assert.equal(calls.filter(call => call.method === "POST").length, 1);
   });
 });
@@ -980,11 +980,11 @@ test("mounted private setup closes after a lost install response and stays clear
         OPTIONAL_NOTE: "synthetic-customization", MOBKIT_PORT: "18088" },
       use_host_provider_credentials: true, execution_mode: "interactive" });
     assert.equal(document.querySelector(".deployment-panel").dataset.deploymentStatus, "queued");
-    assert.equal(privateForm(), null);
+    assert.equal(privateForm() === null, true);
     assert.equal(button("Install and start"), undefined);
     for (const status of ["installing", "running", "stopped"]) {
       await poll({ ...currentReceipt(), status });
-      assert.equal(privateForm(), null, `${status} must not reopen the previously submitted private form.`);
+      assert.equal(privateForm() === null, true, `${status} must not reopen the previously submitted private form.`);
       if (status === "running") {
         assert.match(document.body.textContent, /stop the application first/);
         assert.equal(button("Change private settings"), undefined);
@@ -1013,7 +1013,7 @@ test("unavailable custom application selection keeps its prerequisite and lets a
     assert.match(document.body.textContent, /must pass independent acceptance before installation\. Build or improve it first/);
     assert.equal(button("Install on this computer"), undefined);
     assert.equal(button("Install and start"), undefined);
-    assert.equal(privateForm(), null);
+    assert.equal(privateForm() === null, true);
     assert.equal(calls.filter(call => call.target.startsWith(`${installUrl}/options?`)).length, optionsBefore,
       "Selecting an unavailable application admits no destination preparation.");
     assert.ok(calls.every(call => call.method === "GET"));
@@ -1025,7 +1025,7 @@ test("unavailable custom application selection keeps its prerequisite and lets a
     assert.equal(button("Install on this computer").disabled, false);
     await act(async () => button("Install on this computer").click());
     assert.ok(privateForm(), "The user can return to the eligible team's ordinary private setup.");
-    assert.equal(privateForm().querySelector('[name="APP_USER"]'), null);
+    assert.equal(privateForm().querySelector('[name="APP_USER"]') === null, true);
     assert.equal(button("Install and start").disabled, true, "Provider prerequisites still block admission.");
     assert.ok(calls.every(call => call.method === "GET"), "No installation or other mutation was admitted.");
     assert.ok(calls.filter(call => call.target.startsWith(`${installUrl}/options?`))
@@ -1038,7 +1038,7 @@ test("native private setup admits its exact source once and exposes its checked 
     assert.match(document.body.textContent, /No custom application build is needed/);
     await act(async () => button("Install on this computer").click());
     assert.ok(privateForm());
-    assert.equal(privateForm().querySelector('[name="APP_USER"]'), null);
+    assert.equal(privateForm().querySelector('[name="APP_USER"]') === null, true);
     await act(async () => hostSelection().click());
     assert.equal(button("Install and start").disabled, false);
     loseResponse();
@@ -1049,13 +1049,13 @@ test("native private setup admits its exact source once and exposes its checked 
       source_digest: nativeOptions.source_digest, destination: stopped.destination, settings: { MOBKIT_PORT: "18088" },
       use_host_provider_credentials: true, execution_mode: "interactive" });
     assert.equal(Object.hasOwn(posts[0].body, "build_id"), false);
-    assert.equal(privateForm(), null);
+    assert.equal(privateForm() === null, true);
     await poll({ ...currentReceipt(), status: "running", process_live: true, health: "ready",
       console_url: "http://127.0.0.1:18088/console", bootstrap: { complete: true, ready: true, counts: { broken: 0 }, identities: {} } });
     assert.equal(document.querySelector('section[aria-label="Use your agent team"] a').href, "http://127.0.0.1:18088/console");
     assert.match(document.querySelector('section[aria-label="Use your agent team"]').textContent, /Study companion.*study:main/);
     assert.ok(button("Stop agent team"));
-    assert.equal(document.querySelector('section[aria-label="Use your application"]'), null);
+    assert.equal(document.querySelector('section[aria-label="Use your application"]') === null, true);
     assert.equal(calls.some((call) => /\/experiences$/.test(call.target)), false);
     assert.ok(calls.some((call) => /\/use$/.test(call.target) && call.method === "GET"));
     assert.equal(calls.some((call) => /implementation|rehearsal|update-stage/.test(call.target)), false);
@@ -1063,7 +1063,7 @@ test("native private setup admits its exact source once and exposes its checked 
     await revise({ ...nativeGuide, version: 5, status: "refining", proposal: { target: "linux" }, readiness: { ready: false } }, null);
     assert.ok(button("Start installed agent team"), "Installed lifecycle remains available after the guide changes");
     assert.ok(button("Change private settings"));
-    assert.equal(document.querySelector('section[aria-label="Use your agent team"] a'), null);
+    assert.equal(document.querySelector('section[aria-label="Use your agent team"] a') === null, true);
     assert.equal(button("Install on this computer"), undefined);
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
   }, { guide: nativeGuide, build: null, sourceKind: "native-team" });
@@ -1078,10 +1078,10 @@ test("switching native and application sources clears private drafts and retires
     ui.holdReads();
     await act(async () => button("Check this port").click());
     await act(async () => document.querySelector('input[name="deployment-source"][value="application"]').click());
-    assert.equal(privateForm(), null);
+    assert.equal(privateForm() === null, true);
     await act(async () => oldSubmit({ preventDefault() {} }));
     await ui.releaseRead();
-    assert.equal(privateForm(), null, "A retired native port response cannot reopen its private form");
+    assert.equal(privateForm() === null, true, "A retired native port response cannot reopen its private form");
     await ui.releaseRead();
     ui.stopHoldingReads();
     await act(async () => button("Install on this computer").click());
@@ -1100,7 +1100,7 @@ test("a changed accepted native plan clears its private draft and cannot reuse t
     await enter("OPENAI_API_KEY", "fictional-native-draft");
     const oldSubmit = privateForm()[Object.keys(privateForm()).find((key) => key.startsWith("__reactProps$"))].onSubmit;
     await revise({ ...nativeGuide, version: 5, brief: { purpose: "A changed accepted purpose" } }, null);
-    assert.equal(privateForm(), null);
+    assert.equal(privateForm() === null, true);
     await act(async () => oldSubmit({ preventDefault() {} }));
     assert.equal(calls.filter((call) => call.method === "POST").length, 0);
     await act(async () => button("Install on this computer").click());
@@ -1121,9 +1121,9 @@ test("an authoritative active receipt closes installed settings and clears optio
     assert.equal(hostSelection().checked, true);
     assert.equal(privateForm().querySelector('[name="OPTIONAL_NOTE"]').disabled, true);
     await poll({ ...stopped, status: "starting" });
-    assert.equal(privateForm(), null);
+    assert.equal(privateForm() === null, true);
     await poll(stopped);
-    assert.equal(privateForm(), null);
+    assert.equal(privateForm() === null, true);
     await act(async () => button("Change private settings").click());
     assert.ok(privateForm());
     assert.equal(privateForm().querySelector('[name="APP_USER"]').value, "");
@@ -1194,7 +1194,7 @@ test("a guide clarification retains typed installation settings until fresh opti
     assert.deepEqual(posts[0].body, { version: 5, build_id: checked.build_id, destination: "/synthetic-owned/chosen-folder",
       settings: { APP_USER: "synthetic-organiser", OPTIONAL_NOTE: "Keep these exact unsent details", MOBKIT_PORT: "19089" },
       use_host_provider_credentials: true, execution_mode: "background" });
-    assert.equal(privateForm(), null, "An admitted installation consumes the private draft even if its response is lost");
+    assert.equal(privateForm() === null, true, "An admitted installation consumes the private draft even if its response is lost");
   });
 });
 
@@ -1219,7 +1219,7 @@ test("a changed canonical proposal keeps the old form inactive and a changed sou
     assert.doesNotMatch(privateForm().textContent, /This port was available/);
     const replacement = { ...checked, build_id: "synthetic-replacement", source_digest: "c".repeat(64), current_guide_version: 5 };
     await ui.revise({ ...guide, version: 5 }, replacement);
-    assert.equal(privateForm(), null);
+    assert.equal(privateForm() === null, true);
     await act(async () => button("Install on this computer").click());
     assert.equal(privateForm().querySelector('[name="APP_USER"]').value, "");
     assert.equal(hostSelection().checked, false);
@@ -1250,7 +1250,7 @@ test("installed settings survive a clarification only after an exact refreshed i
     assert.equal(privateForm().querySelector('.deployment-remove input[type="checkbox"]').checked, true);
     assert.equal(hostSelection().checked, true);
     await ui.poll({ ...stopped, deployment_id: "synthetic-other-installation", destination: "/synthetic-owned/other-folder" });
-    assert.equal(privateForm(), null, "A different installation must retire the private draft");
+    assert.equal(privateForm() === null, true, "A different installation must retire the private draft");
     await act(async () => button("Change private settings").click());
     assert.equal(privateForm().querySelector('[name="APP_USER"]').value, "");
     assert.equal(hostSelection().checked, false);
@@ -1351,7 +1351,7 @@ test("a held private-settings save explains reopening without claiming settlemen
       await ui.enter("APP_USER", "Synthetic new unsent draft");
       await ui.finishSettingsResponse(0, lateFailure);
       assert.equal(ui.privateForm().querySelector('[name="APP_USER"]').value, "Synthetic new unsent draft");
-      assert.equal(notice(), null);
+      assert.equal(notice() === null, true);
       assert.equal(ui.button("Save private settings").disabled, false);
       assert.doesNotMatch(ui.document.body.textContent, /Synthetic late settings body failure/);
       assert.equal(writes().length, 1, "Status checks and reopening do not resend settings or start the application.");

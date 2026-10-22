@@ -92,8 +92,8 @@ test("the source entry's deployment panel offers the agent team choice", async (
 
 test("a product-launched Forge's deployment panel hides the agent team and never reads its options", async () => {
   await mounted({ agentTeamAvailable: false }, async ({ document, calls }) => {
-    assert.equal(agentTeamChoice(document), null, "no agent team choice");
-    assert.equal(document.querySelector("fieldset.deployment-run-mode"), null, "no source chooser");
+    assert.equal(agentTeamChoice(document) === null, true, "no agent team choice");
+    assert.equal(document.querySelector("fieldset.deployment-run-mode") === null, true, "no source chooser");
     assert.doesNotMatch(document.body.textContent, /agent team/i);
     assert.equal(nativeOptionsRead(calls), false, "no agent team options are requested");
   });

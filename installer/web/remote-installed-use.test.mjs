@@ -289,7 +289,7 @@ async function mountedUse(initial, verify, handlers = {}) {
 test("production mount only reads explicit remote guidance; choosing and copying an authored job does not send or open it", async () => {
   await mountedUse({}, async ({ document, calls, copied, task, click }) => {
     assert.deepEqual(calls.map((call) => [call.method, call.target]), [["GET", remoteInstalledUseUrl(state.id, receipt.deployment_id)]]);
-    assert.equal(document.querySelector("a,iframe"), null);
+    assert.equal(document.querySelector("a,iframe") === null, true);
     assert.match(document.body.textContent, /Suggestions from this installed version/);
     const idea = document.querySelector(".deployment-use-ideas button");
     await act(async () => idea.click());
@@ -410,9 +410,9 @@ test("the exact admitted remote improvement survives candidate refresh and expos
     assert.ok(handoff().querySelector("a"));
     await rerender({ build: { ...candidate, build_id: "another-report-candidate" } });
     assert.doesNotMatch(handoff().textContent, /ready to review|needs more work/);
-    assert.equal(handoff().querySelector("a"), null);
+    assert.equal(handoff().querySelector("a") === null, true);
     await rerender({ receipt: { ...receipt, host_key_fingerprint: "SHA256:" + "B".repeat(43) } });
-    assert.equal(handoff(), null, "Another destination must not inherit this report's admission.");
+    assert.equal(handoff() === null, true, "Another destination must not inherit this report's admission.");
   });
 });
 
@@ -432,7 +432,7 @@ test("polling the admitted remote candidate before its POST reply retains comple
     assert.deepEqual(admissions, [], "The older queued reply must not replace the completed candidate.");
     assert.equal(buttonDisabled(form()), true);
     assert.doesNotMatch(document.body.textContent, /could not be confirmed|not confirmed|setup changed/);
-    assert.equal(document.querySelector(".deployment-error"), null);
+    assert.equal(document.querySelector(".deployment-error") === null, true);
     assert.equal(calls.filter(call => call.method === "POST").length, 1);
   }, { post: () => pending.promise });
 });
@@ -487,7 +487,7 @@ test("remote reload tracking cannot confirm a replacement, wrong host report or 
     { guide_version: state.version + 1 }, { guide_id: "foreign" }, null]) {
     const candidate = { ...build, build_id: admitted.build_id, request: admitted.request, ...change };
     await mountedUse({ build: candidate }, async ({ document, calls, form, window }) => {
-      assert.equal(document.querySelector(".installed-improvement-handoff"), null);
+      assert.equal(document.querySelector(".installed-improvement-handoff") === null, true);
       assert.doesNotMatch(document.body.textContent, /ready to review|request for proposal \d+ was admitted/);
       assert.equal(buttonDisabled(form()), true);
       assert.equal(form().querySelector("textarea").value, report.request);
@@ -526,7 +526,7 @@ test("a pending remote POST retains its exact late confirmation without publishi
     await settle(() => pending.resolve({ guide_id: state.id, guide_version: state.version,
       build_id: "old-mounted-reply", current: true, status: "queued", request: "A saved host request." }));
     assert.match(document.body.textContent, /Admission.*unconfirmed/);
-    assert.equal(document.querySelector(".installed-improvement-handoff"), null);
+    assert.equal(document.querySelector(".installed-improvement-handoff") === null, true);
     assert.equal(buttonDisabled(form()), true);
     await act(async () => form().dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true })));
     assert.equal(calls.filter(call => call.method === "POST").length, 0);
@@ -546,8 +546,8 @@ test("a changed remote destination cannot consume a delayed recovery read or inh
   await mountedUse({ build: candidate }, async ({ document, admissions, calls, rerender, settle, form }) => {
     await rerender({ receipt: { ...receipt, host_key_fingerprint: "SHA256:" + "B".repeat(43) } });
     await settle(() => pending.resolve(candidate));
-    assert.equal(document.querySelector(".installed-improvement-handoff"), null);
-    assert.equal(document.querySelector(".deployment-use-submitted"), null);
+    assert.equal(document.querySelector(".installed-improvement-handoff") === null, true);
+    assert.equal(document.querySelector(".deployment-use-submitted") === null, true);
     assert.equal(form().querySelector("textarea").value, "");
     assert.equal(admissions.length, 0);
     assert.equal(calls.filter(call => call.method === "POST").length, 0);
@@ -614,7 +614,7 @@ test("a remote parent display callback failure cannot turn a confirmed feedback 
       assert.equal(document.querySelector(".installed-improvement-handoff").dataset.buildId, "synthetic-builder-improvement");
       assert.match(document.body.textContent, /was admitted/);
       assert.doesNotMatch(document.body.textContent, /could not be confirmed|not confirmed/);
-      assert.equal(document.querySelector(".deployment-error"), null);
+      assert.equal(document.querySelector(".deployment-error") === null, true);
       assert.equal(buttonDisabled(form()), true);
       await click("Ask builder to improve it");
       assert.equal(calls.filter(call => call.method === "POST").length, 1);
@@ -626,7 +626,7 @@ test("stopped, failed and unavailable destinations keep frozen suggestions and a
     const selected = { ...receipt, status, ready: false, observation: { available: status !== "observation-unavailable" }, last_known_status: "failed" };
     await mountedUse({ receipt: selected }, async ({ document, calls, fill, click, admissions }) => {
       assert.ok(document.querySelector(".deployment-use-ideas button"));
-      assert.equal(document.querySelector("a"), null);
+      assert.equal(document.querySelector("a") === null, true);
       await fill("blocked", "The setup stopped before I could sign in.");
       assert.match(document.body.textContent, /report a blocked setup even if you could not try the job/);
       await click("Ask builder to improve it");
@@ -692,7 +692,7 @@ test("receipt and unrelated candidate changes retain a known admission without p
     const handoff = document.querySelector(".installed-improvement-handoff");
     assert.equal(handoff.dataset.buildId, "late-admission");
     assert.match(handoff.textContent, /was admitted/);
-    assert.equal(handoff.querySelector("a"), null);
+    assert.equal(handoff.querySelector("a") === null, true);
     assert.doesNotMatch(document.body.textContent, /ready to review|could not be confirmed|setup changed/);
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
   }, { post: () => pending.promise });
@@ -815,12 +815,12 @@ test("production first-job panel does not mount or read authored jobs before a r
   for (const status of ["connecting", "configuration-required", "not-installed", "failed"]) {
     const selected = { ...noDeclaredUiReceipt, status, admitted: false, ready: false };
     await mountedUse({ receipt: selected }, async ({ document, calls }) => {
-      assert.equal(document.querySelector(".remote-installed-use"), null);
+      assert.equal(document.querySelector(".remote-installed-use") === null, true);
       assert.equal(document.body.textContent, ""); assert.deepEqual(calls, []);
     });
   }
   await mountedUse({ receipt: { ...noDeclaredUiReceipt, status: "configuration-required", admitted: undefined } },
-    async ({ document, calls }) => { assert.equal(document.querySelector(".remote-installed-use"), null); assert.deepEqual(calls, []); });
+    async ({ document, calls }) => { assert.equal(document.querySelector(".remote-installed-use") === null, true); assert.deepEqual(calls, []); });
 });
 
 test("source-joined missing optional interface declarations expose a native contact without identifying the application's human channel", () => {
@@ -847,7 +847,7 @@ test("missing optional links keep native chat guidance conditional and preserve 
     assert.match(document.body.textContent, /No application links are declared in this package/);
     assert.match(document.body.textContent, /Native contact: Observing lead lead:main/);
     const help = [...document.querySelectorAll(".deployment-use-help")].find((node) => node.textContent.includes("Native contact:"));
-    assert.equal(help.closest("details"), null, "The remote contact remains visible without opening administration");
+    assert.equal(help.closest("details") === null, true, "The remote contact remains visible without opening administration");
     assert.ok(help.compareDocumentPosition(document.querySelector(".deployment-use-copy")) & document.defaultView.Node.DOCUMENT_POSITION_FOLLOWING,
       "The remote contact precedes optional request preparation");
     const paragraphs = [...help.querySelectorAll("p")];
@@ -864,7 +864,7 @@ test("missing optional links keep native chat guidance conditional and preserve 
     assert.deepEqual(copied, ["Try my real task."]);
     assert.match(document.body.textContent, /Task copied\. Use the application's everyday UI or native chat, if that is its everyday interface/);
     assert.equal(calls.length, 1); assert.equal(calls[0].method, "GET");
-    assert.equal(document.querySelector("a,iframe"), null);
+    assert.equal(document.querySelector("a,iframe") === null, true);
     assert.doesNotMatch(document.body.innerHTML, /[?&](task|draft|identity|session_id|token)=/);
     assert.match(document.body.textContent, /has not observed this application job or verified its result/);
   });
@@ -877,7 +877,7 @@ test("custom remote apps retain their own task and result controls rather than r
     assert.doesNotMatch(document.body.textContent, /Native contact:|choose lead:main|Paste your copied task or type a job|same conversation for replies/);
     await edit(task(), "A task for the custom workspace."); await click("Copy task");
     assert.match(document.body.textContent, /Task copied\. Use it in your application/);
-    assert.equal(calls.length, 1); assert.equal(document.querySelector("a,iframe"), null);
+    assert.equal(calls.length, 1); assert.equal(document.querySelector("a,iframe") === null, true);
   });
 });
 
@@ -903,7 +903,7 @@ test("a stopped installation without declared links retains conditional future c
     assert.match(document.body.textContent, /Native contact: Observing lead lead:main/);
     assert.match(document.body.textContent, /If this app uses native chat for everyday work/);
     assert.match(document.body.textContent, /If this app uses its own UI/);
-    assert.equal(document.querySelector("a,iframe"), null, "A stopped remote owner does not expose a fabricated direct Console link");
+    assert.equal(document.querySelector("a,iframe") === null, true, "A stopped remote owner does not expose a fabricated direct Console link");
     await edit(task(), "Keep this task for later.");
     assert.equal(task().value, "Keep this task for later."); assert.ok(calls.every((call) => call.method === "GET"));
   });

@@ -90,7 +90,7 @@ test('mounted early topology excludes older context until the checked pair arriv
     assert.equal(props().designBrief,null);assert.equal(props().interfaceFact,undefined);
     assert.match(document.body.textContent,/Provisional topology - guide context still in progress/);
     assert.doesNotMatch(document.body.textContent,/Accepted plan - ready to package|Saved earlier understanding|Saved earlier interface|Earlier permission preference/);
-    assert.equal(document.querySelector('.ep-brief'),null);
+    assert.equal(document.querySelector('.ep-brief') === null,true);
     assert.equal(document.querySelector('.ep-status-dot').classList.contains('is-ready'),false);
     const facts=[...document.querySelectorAll('.ep-facts > div')];
     for(const row of facts.filter(row=>row.querySelector('dt').textContent!=='Current access'))

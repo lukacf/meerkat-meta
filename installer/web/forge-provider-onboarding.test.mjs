@@ -120,7 +120,7 @@ test("first-run ready provider without an idea returns to Forge to describe a ne
   } }, async ({ document, calls, runtimes, button, click, closes }) => {
     assert.equal(document.querySelector(".setup-provider").dataset.providerStep, "ready");
     assert.equal(document.querySelector("h2").textContent, "Ready for your first message");
-    assert.equal(document.querySelector(".setup-provider-idea"), null);
+    assert.equal(document.querySelector(".setup-provider-idea") === null, true);
     assert.equal(document.querySelector(".setup-provider-return p").textContent,
       "Return to Forge to describe what you need. A rough idea is enough.");
     assert.doesNotMatch(document.body.textContent, /Your idea has not been sent|Back to my draft|Next: send your idea/);
@@ -157,7 +157,7 @@ test("provider starting context: context-only handoff retains unsent choices and
     assert.deepEqual([...summary.querySelectorAll(".setup-provider-starting-context__answers span")].map(node => node.textContent),
       ["A team", "Keeping track of things"]);
     assert.match(summary.textContent, /Not sent/);
-    assert.equal(document.querySelector(".setup-provider-idea"), null, "Choices are not synthesized into user prose.");
+    assert.equal(document.querySelector(".setup-provider-idea") === null, true, "Choices are not synthesized into user prose.");
     assert.match(document.querySelector(".setup-provider-intro").textContent, /Connecting does not send your starting point\./);
     assert.equal(document.querySelector(".setup-provider-return p").textContent,
       "Next: send your starting point, or add your own words. Your choices are still unsent.");
@@ -186,8 +186,8 @@ test("provider starting context: raw words stay separate and exact during unavai
     const choices = () => [...document.querySelectorAll(".setup-provider-starting-context__answers span")].map(node => node.textContent);
     assert.equal(words(), idea);
     assert.deepEqual(choices(), ["My household", "Repetitive work"]);
-    assert.equal(document.querySelector("script"), null);
-    assert.equal(document.querySelector(".setup-provider-return"), null, "A summary is not runtime readiness.");
+    assert.equal(document.querySelector("script") === null, true);
+    assert.equal(document.querySelector(".setup-provider-return") === null, true, "A summary is not runtime readiness.");
     assert.match(document.querySelector('[role="alert"]').textContent, /settings could not be read/i);
     assert.match(document.querySelector(".setup-provider-intro").textContent, /Connecting does not send your draft or starting point\./);
     readable = true;
@@ -214,7 +214,7 @@ test("provider starting context: malformed choices do not invent a retained star
   await mounted({ props: { firstRun: true, idea: "", guideReady: true,
     startingContext: { version: 2, audience_id: "unknown", kind_id: "organizing" } }, read: () => settings({ configured: true, active: true }) },
   async ({ document, calls, button }) => {
-    assert.equal(document.querySelector(".setup-provider-starting-context"), null);
+    assert.equal(document.querySelector(".setup-provider-starting-context") === null, true);
     assert.equal(document.querySelector(".setup-provider-return p").textContent,
       "Return to Forge to describe what you need. A rough idea is enough.");
     assert.ok(button("Return to Forge"));
@@ -234,7 +234,7 @@ test("first-run provider handoff retains an unsent idea, treats it as text and f
     assert.equal(heading.textContent, "A model for your guide");
     assert.equal(document.querySelector(".setup-provider-idea p").textContent, idea);
     assert.match(document.querySelector(".setup-provider-idea").textContent, /Not sent/);
-    assert.equal(document.querySelector("script"), null);
+    assert.equal(document.querySelector("script") === null, true);
     assert.equal(button("Start guide").disabled, true);
     assert.equal(button("Check saved settings").disabled, false);
     assert.equal(outsideClosedDetails(button("Save locally")), true);
@@ -256,7 +256,7 @@ test("configured credentials do not imply a started guide, and the observed read
       const heading = document.querySelector("h2");
       if (!active) {
         assert.equal(heading.textContent, "Start your setup guide");
-        assert.equal(document.querySelector(".setup-provider-return"), null);
+        assert.equal(document.querySelector(".setup-provider-return") === null, true);
         assert.equal(outsideClosedDetails(document.querySelector("input")), false);
         assert.equal(outsideClosedDetails([...document.querySelectorAll("button")].find(item => item.textContent === "Start guide")), true);
         assert.match(document.querySelector(".setup-provider-configured").textContent, /OpenAI.*Configured in Forge/);
@@ -339,7 +339,7 @@ test("uncertain first-run saves expose readback, keep the idea and hide private 
     assert.equal(button("Check saved settings").classList.contains("setup-provider-primary"), true);
     assert.equal(button("Save locally").disabled, true);
     assert.equal(document.querySelector(".setup-provider-idea p").textContent, "A shared family reading assistant.");
-    assert.equal(document.querySelector(".setup-provider-return"), null);
+    assert.equal(document.querySelector(".setup-provider-return") === null, true);
     assert.equal(calls.filter(call => call.method === "PUT").length, 1);
     assert.equal(calls.filter(call => call.method === "POST").length, 0);
   });
@@ -403,7 +403,7 @@ test("configured model readback takes precedence and absent readback stays label
       assert.equal(call.method, "GET");
       return { ...settings({ configured: true }), effective_model: currentModel };
     } }, async ({ document, calls }) => {
-      assert.equal(document.querySelector(".setup-provider-key-help"), null);
+      assert.equal(document.querySelector(".setup-provider-key-help") === null, true);
       const model = document.querySelector(".setup-provider-configured-label");
       assert.equal(model.querySelector("span").textContent, currentModel ? "Current model" : "Default model");
       assert.equal(model.querySelector("strong").textContent, currentModel || "gpt-6.1-sol");
@@ -547,7 +547,7 @@ test("first-run unmounted Save response cannot reclaim focus or refresh the disc
     await act(async () => release(settings({ configured: true })));
     await settle();
     assert.equal(document.activeElement, outside);
-    assert.equal(document.querySelector(".setup-provider"), null);
+    assert.equal(document.querySelector(".setup-provider") === null, true);
     assert.equal(calls.length, 2, "The stale response does not read runtime state or start work.");
   });
 });
@@ -642,7 +642,7 @@ test("first-run check-ready focus is discarded with the unmounted provider", asy
     await act(async () => releaseRead({ ...settings({ configured: true, active: true }), runtime_status: "ready" }));
     await settle();
     assert.equal(document.activeElement === newer, true);
-    assert.equal(document.querySelector(".setup-provider"), null);
+    assert.equal(document.querySelector(".setup-provider") === null, true);
     assert.equal(calls.filter(call => call.url === "/api/architect/status").length, 0, "Unmount retires the status reader before the second read.");
     await act(async () => releaseStart({ status: "ready", available: true }));
     await settle();

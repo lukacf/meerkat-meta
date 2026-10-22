@@ -130,7 +130,7 @@ test('removing one rejected file leaves an explicit retry for the remaining atta
     assert.equal(document.querySelectorAll('.setup-attachments li').length, 2);
     assert.equal(document.querySelector('#setup-send').disabled, true);
     await act(async () => { document.querySelector('[aria-label="Remove attachment bad.md"]').click(); await pause(); });
-    assert.equal(document.querySelector('.setup-attachments [role="alert"]'), null, 'Removing the rejected file keeps existing error-clearing semantics.');
+    assert.equal(document.querySelector('.setup-attachments [role="alert"]') === null, true, 'Removing the rejected file keeps existing error-clearing semantics.');
     assert.equal(document.querySelectorAll('.setup-attachments li').length, 1);
     assert.equal(document.querySelector('.setup-attachments li span').textContent, 'keep.md');
     assert.equal(document.querySelector('#setup-send').disabled, true, 'Unuploaded remaining evidence still cannot be silently omitted.');
@@ -149,7 +149,7 @@ test('removing one rejected file leaves an explicit retry for the remaining atta
     assert.equal(document.querySelector('#setup-send').disabled, true);
     await act(async () => { finishRetry(); await pause(); });
     assert.equal(document.querySelector('.setup-attachments a').textContent, 'keep.md');
-    assert.equal(document.querySelector('.setup-attachments li span'), null, 'Only checked refs replace the remaining pending File.');
+    assert.equal(document.querySelector('.setup-attachments li span') === null, true, 'Only checked refs replace the remaining pending File.');
     assert.equal(retry(), undefined);
     assert.equal(document.querySelector('#setup-send').disabled, false);
     assert.equal(document.querySelector('#setup-message').value, input.draft);

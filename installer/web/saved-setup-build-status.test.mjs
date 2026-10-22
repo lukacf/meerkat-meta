@@ -210,7 +210,7 @@ test("captured navigation handlers lose authority on disable, setup replacement 
       await render({ disabled: true }); await invoke(); assert.deepEqual(intents, []);
       await render({ disabled: false, setup: setupB }); await invoke(); assert.deepEqual(intents, []);
       await render({ isCurrent: () => false });
-      assert.equal(document.querySelector(".saved-setup-build-status"), null);
+      assert.equal(document.querySelector(".saved-setup-build-status") === null, true);
       assert.equal(calls.length, 2, "withdrawn eligibility never admits another read");
       assert.deepEqual(intents, []);
     });
@@ -218,9 +218,9 @@ test("captured navigation handlers lose authority on disable, setup replacement 
 
 test("only eligible visible rows read build status and an absent build adds no misleading label or action", async () => {
   await mounted(() => ({ httpStatus: 404 }), async ({ document, calls, render, polls, intents }) => {
-    assert.equal(calls.length, 0); assert.equal(document.querySelector(".saved-setup-build-status"), null);
+    assert.equal(calls.length, 0); assert.equal(document.querySelector(".saved-setup-build-status") === null, true);
     await render({ active: true }); assert.equal(calls.length, 1);
-    assert.equal(document.querySelector(".saved-setup-build-status"), null);
+    assert.equal(document.querySelector(".saved-setup-build-status") === null, true);
     assert.equal(polls.size, 0); assert.deepEqual(intents, []);
     await render({ active: false }); assert.equal(calls.length, 1);
   }, { active: false });

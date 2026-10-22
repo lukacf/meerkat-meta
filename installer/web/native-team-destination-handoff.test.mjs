@@ -119,7 +119,7 @@ test("Linux agent team on Mac shows its manual destination steps and downloads t
     assert.ok(document.querySelector(".remote-manual-deployment"));
     assert.match(document.querySelector(".remote-manual-deployment").textContent, /Install this agent team on your Linux computer.*bash install.sh/);
     assert.equal(button("Install on this computer"), undefined);
-    assert.equal(document.querySelector(".deployment-form"), null);
+    assert.equal(document.querySelector(".deployment-form") === null, true);
     assert.equal(button("Check and connect"), undefined);
     await act(async () => button("Download agent team package").click());
     assert.deepEqual(downloads, [{ href: "blob:fixture-download", filename: "study-team-agent-team.zip" }]);
@@ -131,7 +131,7 @@ test("Linux agent team on Mac shows its manual destination steps and downloads t
 
 test("a matching Mac agent team still opens the original private setup instead of manual handoff", async () => {
   await mounted(fixture("mac"), async ({ document, button, calls }) => {
-    assert.equal(document.querySelector(".remote-manual-deployment"), null);
+    assert.equal(document.querySelector(".remote-manual-deployment") === null, true);
     assert.equal(button("Download agent team package"), undefined);
     assert.ok(button("Install on this computer"));
     await act(async () => button("Install on this computer").click());

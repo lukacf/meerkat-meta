@@ -190,7 +190,7 @@ test("closing during POST makes late completion inert without claiming the task 
     await view.click("Prepare app checks");
     assert.match(view.document.body.textContent, /download may continue if you close/);
     await view.click("Close");
-    assert.equal(view.closes(), 1); assert.equal(view.document.querySelector("section"), null);
+    assert.equal(view.closes(), 1); assert.equal(view.document.querySelector("section") === null, true);
     pending.resolve(status("ready", false)); await view.tick();
     assert.equal(view.readiness.length, 2);
     assert.equal(view.timers.size, 0);

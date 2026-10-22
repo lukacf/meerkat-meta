@@ -807,7 +807,7 @@ test("failed trial correction stays unavailable until terminal current source an
     { application_source: { build_id: build.build_id, source_digest: "b".repeat(64) } }]) {
     await mountedInitialTrial({ initialLatest: { ...failed, ...changes }, onRepairReceipt() {},
       onPost() { assert.fail("An ineligible trial cannot admit a correction"); } }, async (ui) => {
-      assert.equal(ui.dom.window.document.querySelector('[aria-label="What should work better after this trial?"]'), null);
+      assert.equal(ui.dom.window.document.querySelector('[aria-label="What should work better after this trial?"]') === null, true);
       assert.equal(ui.button("Fix this trial"), undefined);
       assert.equal(ui.button("Improve from this trial"), undefined);
       assert.equal(ui.requests.filter((call) => call.method === "POST").length, 0);
@@ -1116,7 +1116,7 @@ test("a delayed original start cannot clear or publish after a guide switch and 
       await ui.mount(nextGuide, null);
       await ui.settle(() => delayed.resolve(initialReceipt(action)));
       assert.equal(ui.text().value, "");
-      assert.equal(ui.dom.window.document.querySelector('[role="alert"]'), null);
+      assert.equal(ui.dom.window.document.querySelector('[role="alert"]') === null, true);
       assert.equal(fresh(saved).read(owner).sample, original);
       assert.equal(fresh(saved).initial(guide.id).body.start_request_id, actionId);
       await ui.mount(guide, null);

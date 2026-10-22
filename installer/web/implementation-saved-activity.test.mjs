@@ -169,7 +169,7 @@ test("mounted receipt updates replace saved/check/recovery facts and preserve ho
     assert.match(notice.textContent, /earlier design/);
     assert.doesNotMatch(notice.textContent, /private-|passed|Checking the saved source/);
     await render(saved, { id: "different-guide", version: 4 });
-    assert.equal(dom.window.document.querySelector('[role="status"]'), null);
+    assert.equal(dom.window.document.querySelector('[role="status"]') === null, true);
   } finally {
     await act(async () => root.unmount());
     dom.window.close();

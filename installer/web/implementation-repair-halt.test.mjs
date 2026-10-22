@@ -98,7 +98,7 @@ test("a trusted current unchanged repair opens actual findings without another a
     await act(async () => repair.click());
     assert.equal(calls.filter((call) => call.method === "POST").length, 1,
       "Only the user's explicit repair click may send another build request.");
-    assert.equal(document.querySelector(".implementation-repair-halt"), null);
+    assert.equal(document.querySelector(".implementation-repair-halt") === null, true);
   });
 });
 
@@ -157,7 +157,7 @@ test("historical findings remain collapsed and running repairs keep their normal
   for (const change of [(r) => { r.repair_halt.source_digest = "e".repeat(64); }, (r) => { r.status = "running"; }]) {
     const receipt = failedBuild(); change(receipt);
     await mountedPanel(receipt, async (document, calls) => {
-      assert.equal(document.querySelector(".implementation-repair-halt"), null);
+      assert.equal(document.querySelector(".implementation-repair-halt") === null, true);
       assert.equal(document.querySelector(".implementation-acceptance")?.open, false);
       assert.equal(calls.filter((call) => call.method === "POST").length, 0);
       if (receipt.status === "running") {

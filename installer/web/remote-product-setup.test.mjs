@@ -196,7 +196,7 @@ async function rejectedSaveJourney(response, knownNotSent) {
       assert.equal(posts.length, 2);
       assert.notEqual(posts[0].action_request_id, posts[1].action_request_id);
       assert.match(document.body.textContent, /Private settings saved/);
-      assert.equal(document.querySelector("form"), null);
+      assert.equal(document.querySelector("form") === null, true);
       assert.equal(document.body.textContent.includes("inert-unsent-value"), false);
     }
   } finally {
@@ -248,7 +248,7 @@ test("a lost product save reply waits for the same settled UUID without another 
       deployment_id: receipt.deployment_id, action: "configure", phase: "settled", outcome: "returned" };
     await render();
     assert.match(document.body.textContent, /original private settings save is confirmed/);
-    assert.equal(document.querySelector("form"), null); assert.equal(posts.length, 1);
+    assert.equal(document.querySelector("form") === null, true); assert.equal(posts.length, 1);
     assert.equal(document.body.textContent.includes("inert-synthetic-secret"), false);
   } finally {
     if (root) await act(async () => root.unmount()); dom.window.close();

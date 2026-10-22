@@ -192,7 +192,7 @@ for (const [name, path] of [['raw Unicode', '/café'], ['already escaped equival
       const readsBeforeWithdrawal = calls.length;
       await withdrawHealth();
       assert.ok(calls.length > readsBeforeWithdrawal, 'Native health loss rechecks installed-source details');
-      assert.equal(appLink(document), null, 'Unavailable native health withdraws the ordinary application link');
+      assert.equal(appLink(document) === null, true, 'Unavailable native health withdraws the ordinary application link');
       assert.equal(taskLink(document), undefined, 'Unavailable native health withdraws the task handoff');
       assert.equal(taskField().value, editedTask);
       assert.deepEqual(draft(), { task: editedTask, outcome: '', improvement: '' });
@@ -206,13 +206,13 @@ test('local installed application refuses a different declared path while retain
   assert.deepEqual(projected.entries, []);
   assert.ok(projected.issue, 'Unicode normalization cannot admit a different path');
   await mountedUse(experiences, async ({ document, chooseIdea, edit, taskField, draft }) => {
-    assert.equal(appLink(document), null);
+    assert.equal(appLink(document) === null, true);
     assert.equal(taskLink(document), undefined);
     assert.match(document.body.textContent, /Retry UI links/);
     await chooseIdea();
     assert.equal(taskField().value, idea.request);
     await edit(editedTask);
-    assert.equal(appLink(document), null);
+    assert.equal(appLink(document) === null, true);
     assert.equal(taskLink(document), undefined);
     assert.equal(taskField().value, editedTask);
     assert.deepEqual(draft(), { task: editedTask, outcome: '', improvement: '' });

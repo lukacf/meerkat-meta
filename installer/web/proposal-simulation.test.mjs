@@ -849,7 +849,7 @@ test('closing an authored identity restores its overview caption and later chapt
     assert.equal(caption(),'Frame the question');
     await select(previous,'earlier:main','Earlier owner details');
     await click('[aria-label="Close inspector"]');
-    assert.equal(ui.dom.window.document.querySelector('.ps-inspector'),null);
+    assert.equal(ui.dom.window.document.querySelector('.ps-inspector') === null,true);
     assert.equal(caption(),'Frame the question');
     assert.equal(context(),null);
     await ui.settle(()=>previous.options.onInspect('resource:local:notes'));
@@ -1013,7 +1013,7 @@ test('relationship navigation keeps missing counterparts nonselectable and suppo
     await ui.mountRelationships(selected,model,(id,event)=>selections.push({id,target:event.currentTarget}));
     const {document}=ui.dom.window,missing=document.querySelector('[data-relationship-id="missing-peer"]');
     assert.match(missing.textContent,/missing:owner/);assert.match(missing.textContent,/Original unresolved counterpart/);
-    assert.equal(missing.querySelector('button'),null,'An absent model node cannot become an inspection target');
+    assert.equal(missing.querySelector('button') === null,true,'An absent model node cannot become an inspection target');
     const workflow=document.querySelector('[data-relationship-id="known-workflow"]'),button=workflow.querySelector('button');
     assert.equal(button.type,'button');assert.match(button.getAttribute('aria-label'),/specialist:2/);
     await ui.settle(()=>{button.focus();button.click();});
@@ -1063,7 +1063,7 @@ test('inspection search and disclosure belong to the displayed source and reset 
     await ui.settle(()=>previous.options.onInspect('desk:main'));
     assert.equal(peers().open,false);assert.equal(peers().querySelector('input').value,'');
     const changed=structuredClone(plan);changed.agent_classes[0].instructions='A newer source with distinct responsibilities.';
-    await ui.mount(changed);assert.equal(peers(),null,'Changing proposal source clears selected inspection');
+    await ui.mount(changed);assert.equal(peers() === null,true,'Changing proposal source clears selected inspection');
     await ui.settle(()=>previous.options.onInspect('desk:main'));
     await writeRelationshipSearch(ui,peers().querySelector('input'),'specialist:633');
     assert.equal(ui.dom.window.document.querySelector('.ps-refine').disabled,true);
@@ -1072,7 +1072,7 @@ test('inspection search and disclosure belong to the displayed source and reset 
     assert.equal(ui.dom.window.document.querySelector('.ps-refine').disabled,false);
     await ui.settle(()=>{peers().open=true;});
     await writeRelationshipSearch(ui,peers().querySelector('input'),'specialist:633');
-    await ui.mount(changed,'another-inspection-setup');assert.equal(peers(),null);
+    await ui.mount(changed,'another-inspection-setup');assert.equal(peers() === null,true);
     await ui.generate();const other=ui.instances.at(-1);await ui.settle(()=>other.first());
     await ui.settle(()=>other.options.onInspect('desk:main'));
     assert.equal(peers().open,false);assert.equal(peers().querySelector('input').value,'');

@@ -164,7 +164,7 @@ async function downloadJourney(route, Panels) {
     assert.equal(downloads.length, 1);
     assert.equal(downloads[0].filename, "observing-plans-application.zip");
     assert.equal(await downloads[0].blob.text(), "exact inert checked package bytes");
-    assert.equal(document.querySelector('[role="alert"]'), null);
+    assert.equal(document.querySelector('[role="alert"]') === null, true);
     assert.equal(deadlines.size, 0);
     assert.deepEqual(calls.filter(call => call.target === packageUrl).map(call => call.method), ["GET", "GET", "GET", "GET"]);
     if (route === "checked") assert.equal(document.querySelector("textarea").value, note);

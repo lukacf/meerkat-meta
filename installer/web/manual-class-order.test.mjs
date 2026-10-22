@@ -152,7 +152,7 @@ test('a reviewed pipeline class reorder reaches the guide with the exact edited 
     assert.deepEqual(publications.at(-1), edited);
     assert.deepEqual(JSON.parse(document.querySelector('[data-class-order-preview]').dataset.classOrderPreview), edited,
       'The actual guide supplies the edited plan to its preview; generated animation stays inert.');
-    assert.equal(document.querySelector('[aria-labelledby="setup-config-title"]'), null);
+    assert.equal(document.querySelector('[aria-labelledby="setup-config-title"]') === null, true);
     assert.equal(document.querySelector('#setup-message').value, input.draft);
     assert.deepEqual(JSON.parse(values.get(input.key)), input);
     assert.deepEqual(original, untouched);

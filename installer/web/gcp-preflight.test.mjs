@@ -214,8 +214,8 @@ test("unknown destination checks show useful blockers without a plan or download
       checks: [{ ...check, status: "unknown", detail: "Billing could not be observed.", action: "Ask the project owner to check billing." }] }));
     await chooseDestination(ui); await ui.click("Check destination");
     assert.match(ui.document.body.textContent, /Billing could not be observed/); assert.match(ui.document.body.textContent, /Not verified/);
-    assert.match(ui.document.body.textContent, /Ask the project owner/); assert.equal(ui.document.querySelector(".gcp-preflight-plan"), null);
-    assert.equal(ui.button("Download accepted GCP package"), undefined); assert.equal(ui.document.querySelector('[role="alert"]'), null);
+    assert.match(ui.document.body.textContent, /Ask the project owner/); assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true);
+    assert.equal(ui.button("Download accepted GCP package"), undefined); assert.equal(ui.document.querySelector('[role="alert"]') === null, true);
   });
 });
 
@@ -254,9 +254,9 @@ test("changing project clears ready output synchronously and A-B-A cannot revive
     await chooseDestination(ui); ui.pendingClick("Check destination");
     await ui.click("Another project"); await ui.click("Observatory");
     await act(async () => resolve(result()));
-    assert.equal(ui.document.querySelector(".gcp-preflight-result"), null); assert.ok(ui.button("Check destination"));
+    assert.equal(ui.document.querySelector(".gcp-preflight-result") === null, true); assert.ok(ui.button("Check destination"));
     ui.setHandler("check", (body) => result(body.account, body.project)); await ui.click("Check destination"); assert.ok(ui.document.querySelector(".gcp-preflight-plan"));
-    ui.pendingClick("Another project"); assert.equal(ui.document.querySelector(".gcp-preflight-plan"), null);
+    ui.pendingClick("Another project"); assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true);
   });
 });
 
@@ -276,7 +276,7 @@ test("source or guide changes invalidate delayed cloud observations even after r
       let resolve; ui.setHandler("check", () => new Promise((done) => { resolve = done; }));
       await chooseDestination(ui); ui.pendingClick("Check destination"); await ui.change(nextState, nextBuild, blocked); await ui.change();
       await act(async () => resolve(result()));
-      assert.equal(ui.document.querySelector(".gcp-preflight-result"), null); assert.ok(ui.button("Check cloud access"));
+      assert.equal(ui.document.querySelector(".gcp-preflight-result") === null, true); assert.ok(ui.button("Check cloud access"));
     });
   }
 });
@@ -286,7 +286,7 @@ test("a delayed failed read cannot replace the current account choice with an er
     let reject; ui.setHandler("projects", (body) => body.account === accounts[0].id ? new Promise((_, fail) => { reject = fail; }) : projects(body.account));
     await ui.click("Check cloud access"); ui.pendingClick("First account"); await ui.click("Second account");
     await act(async () => reject(new Error("Old account request failed.")));
-    assert.equal(ui.document.querySelector('[role="alert"]'), null); assert.ok(ui.button("Observatory"));
+    assert.equal(ui.document.querySelector('[role="alert"]') === null, true); assert.ok(ui.button("Observatory"));
   });
 });
 
@@ -295,7 +295,7 @@ test("a response for another accepted package is rejected and no plan is shown",
     ui.setHandler("check", () => ({ ...result(), binding: { ...binding, package_sha256: "d".repeat(64) } }));
     await chooseDestination(ui); await ui.click("Check destination");
     assert.match(ui.document.querySelector('[role="alert"]').textContent, /do not match this accepted package/);
-    assert.equal(ui.document.querySelector(".gcp-preflight-plan"), null);
+    assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true);
   });
 });
 
@@ -306,7 +306,7 @@ test("expiry removes readiness while keeping the observed checks and their captu
     const [token, timer] = ui.timers.entries().next().value; ui.timers.delete(token);
     const originalNow = Date.now;
     try { Date.now = () => checkedAt + GCP_PREFLIGHT_FRESH_MS; await act(async () => timer.callback());
-      assert.equal(ui.document.querySelector(".gcp-preflight-plan"), null); assert.match(ui.document.body.textContent, /These checks need a refresh/);
+      assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true); assert.match(ui.document.body.textContent, /These checks need a refresh/);
       assert.match(ui.document.body.textContent, /Synthetic verified access/); assert.match(ui.document.body.textContent, /Checked/);
       assert.equal(ui.button("Download accepted GCP package"), undefined);
     } finally { Date.now = originalNow; }
@@ -319,10 +319,10 @@ test("the production deployment panel makes guided cloud setup primary and keeps
     assert.ok(manual); assert.equal(manual.open, false);
     assert.match(manual.querySelector("summary").textContent, /Manual Google Cloud.*advanced/);
     assert.ok(ui.button("Check cloud access"));
-    assert.equal(ui.document.querySelector(".gcp-preflight-next"), null);
+    assert.equal(ui.document.querySelector(".gcp-preflight-next") === null, true);
     await chooseDestination(ui); await ui.click("Check destination");
     const next = ui.document.querySelector(".gcp-preflight-next button");
-    assert.equal(next.textContent, "Create this cloud computer"); assert.equal(next.closest("details"), null); assert.equal(next.disabled, false);
+    assert.equal(next.textContent, "Create this cloud computer"); assert.equal(next.closest("details") === null, true); assert.equal(next.disabled, false);
     assert.ok(ui.calls.some(call => call.target.endsWith("/check-guided")));
     assert.ok([...ui.document.querySelectorAll(".gcp-guided button")].every(node => !node.textContent.includes("Download accepted GCP package")));
     assert.equal([...manual.querySelectorAll("button")].filter(node => node.textContent.includes("Download accepted GCP package")).length, 1);
@@ -358,7 +358,7 @@ test("rapid duplicate clicks share each explicit cloud read without retrying it"
 test("editing a project ID discards an old ready result before another project is submitted", async () => {
   await mounted(async (ui) => {
     await chooseDestination(ui); await ui.click("Check destination"); assert.ok(ui.document.querySelector(".gcp-preflight-plan"));
-    await ui.enter("other-project"); assert.equal(ui.document.querySelector(".gcp-preflight-plan"), null);
+    await ui.enter("other-project"); assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true);
     assert.equal(ui.button("Download accepted GCP package"), undefined); assert.equal(ui.button("Check destination"), undefined);
     assert.equal(ui.calls.length, 3); await ui.click("Choose this project"); assert.ok(ui.button("Check destination")); assert.equal(ui.calls.length, 3);
   });
@@ -401,7 +401,7 @@ test("account and project reversals retire the standalone checked callback even 
       const selected = ui.downloads[0]; assert.ok(selected); assert.equal(selected.isCurrent(), true);
       await change(ui);
       assert.equal(selected.isCurrent(), false); assert.deepEqual(selected.binding, binding);
-      assert.equal(ui.savedPackages.length, 0); assert.equal(ui.document.querySelector(".gcp-preflight-plan"), null);
+      assert.equal(ui.savedPackages.length, 0); assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true);
     });
   }
 });

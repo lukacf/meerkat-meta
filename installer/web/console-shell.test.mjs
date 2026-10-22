@@ -44,8 +44,8 @@ function fixture(narrow = false, width = null, setup = true) {
 test('base authenticated shell shows ordinary sign-out without setup modules or requests', () => {
   const f = fixture(false, null, false);
   try {
-    assert.equal(f.open, null); assert.equal(f.drawer, null);
-    assert.equal(f.doc.querySelector('.forge-console-shell__hint'), null);
+    assert.equal(f.open === null, true); assert.equal(f.drawer === null, true);
+    assert.equal(f.doc.querySelector('.forge-console-shell__hint') === null, true);
     const form = f.doc.querySelector('.forge-console-shell__toolbar form');
     assert.equal(form.method, 'post'); assert.equal(form.getAttribute('action'), '/logout');
     const button = form.querySelector('button');
@@ -105,7 +105,7 @@ test('disposing during optional module loading prevents a late setup mount', asy
     f.open.click(); f.shell.dispose();
     resolve({ mountSetupConversation, mountConsoleSetup: () => { mounts++; throw new Error('Late mount must not run'); } });
     await flush(); assert.equal(mounts, 0); assert.equal(f.calls.length, 0);
-    assert.equal(f.native.parentNode, f.doc.body); assert.equal(f.doc.querySelector('.forge-console-shell'), null);
+    assert.equal(f.native.parentNode, f.doc.body); assert.equal(f.doc.querySelector('.forge-console-shell') === null, true);
   } finally { f.shell.dispose(); f.dom.window.close(); }
 });
 
@@ -172,7 +172,7 @@ test('closing modal clears private password presentation, preserving native DOM 
   const f = fixture(true); f.open.click(); await flush();
   f.streams.find(source => source.url.endsWith('/private')).emit({ type: 'prompt', id: 'p:private', scope: 'fixture-private-scope', prompt: { kind: 'forge_password', origin: 'http://127.0.0.1:4510', mode: 'initial', min_chars: 12, max_chars: 4096 } });
   const password = f.drawer.querySelector('input'); password.value = 'never-submitted-private-fixture';
-  f.shell.dispose(); assert.equal(password.value, ''); assert.equal(f.doc.querySelector('input'), null);
+  f.shell.dispose(); assert.equal(password.value, ''); assert.equal(f.doc.querySelector('input') === null, true);
   assert.equal(f.native.parentNode, f.doc.body); assert.equal(f.doc.body.classList.contains('forge-console-shell-page'), false);
   assert.equal(f.calls.some(call => call.url.endsWith('/answer') || call.url.endsWith('/cancel')), false);
   f.dom.window.close();

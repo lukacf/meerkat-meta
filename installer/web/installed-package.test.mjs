@@ -134,7 +134,7 @@ test("a source switch and return retires the original read even if its body arri
   held.resolve(payload); await ui.settle();
   assert.equal(ui.downloads.length, 0);
   assert.equal(ui.calls[0].options.signal.aborted, true);
-  assert.equal(ui.document.querySelector('[role="alert"]'), null);
+  assert.equal(ui.document.querySelector('[role="alert"]') === null, true);
   ui.setTransport(async () => ({ ok: true, blob: async () => payload }));
   await ui.click(); await ui.settle(); assert.equal(ui.downloads.length, 1);
 }));

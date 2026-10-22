@@ -343,7 +343,7 @@ for (const kind of ["local", "remote"]) {
       assert.match(walkthrough.textContent, /A configured forecast connection/);
       assert.match(walkthrough.textContent, /An observing window with suitable targets/);
       assert.match(walkthrough.textContent, /session card in your observing workspace/);
-      assert.equal(walkthrough.querySelector("a"), null);
+      assert.equal(walkthrough.querySelector("a") === null, true);
       const task = "  A customized real job\n\u{1f9ed}  ", improvement = "Unsent improvement text stays here.";
       await edit(task); await edit(improvement, ".deployment-use-feedback textarea");
       assert.match(document.querySelector(".deployment-use-walkthrough").textContent, /instructions describe the original suggested job/);
@@ -367,7 +367,7 @@ for (const kind of ["local", "remote"]) {
   test(`${kind} absent or malformed authored walkthrough leaves a useful editable own-job path`, async () => {
     for (const first_use of [null, { ...firstUse, tasks: [{ ...firstUse.tasks[0], inputs: "invalid" }] }]) {
       await mounted(kind, async ({ document, edit, click, calls }) => {
-        assert.equal(document.querySelector(".deployment-use-ideas"), null);
+        assert.equal(document.querySelector(".deployment-use-ideas") === null, true);
         assert.match(document.querySelector(".deployment-use-walkthrough").textContent, /Your own first job/);
         assert.match(document.querySelector(".deployment-use-walkthrough").textContent, /information the agents should use/);
         assert.doesNotMatch(document.querySelector(".deployment-use-walkthrough").textContent, /configured forecast|session card/);
@@ -641,7 +641,7 @@ for (const kind of ["local", "remote"]) {
       assert.match(success().textContent, /Your earlier success report was confirmed/);
       assert.equal([...success().querySelectorAll(".deployment-use-reported-job")].find(node =>
         node.querySelector("summary").textContent === "View the earlier reported job").querySelector("p").textContent, "Pending task A");
-      assert.equal(success().querySelector('[aria-label="Task awaiting success confirmation"]'), null);
+      assert.equal(success().querySelector('[aria-label="Task awaiting success confirmation"]') === null, true);
       assert.equal(button("Retry success confirmation"), undefined);
     }, { initialMetadata: { success_report: savedB }, post: async (body, count) => {
       if (count === 1) throw new Error("AMBIGUOUS_DELIVERY");
@@ -769,7 +769,7 @@ for (const kind of ["local", "remote"]) {
       assert.equal(details.querySelector("p").textContent, taskA);
       assert.equal(details.parentElement.querySelector(":scope > p").textContent,
         "Your earlier success report was confirmed. Your current task draft remains unchanged.");
-      assert.equal(success.querySelector("q"), null, "No long task is quoted inline");
+      assert.equal(success.querySelector("q") === null, true, "No long task is quoted inline");
       assert.doesNotMatch(success.textContent, /Your success report is saved|An earlier success report is saved for this job/);
       const assertDrafts = () => {
         assert.equal(document.querySelector(".deployment-use-field textarea").value, taskB);

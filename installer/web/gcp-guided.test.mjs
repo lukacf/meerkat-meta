@@ -303,7 +303,7 @@ test('paused or unavailable preparation shows its last step without claiming act
     await click('Recheck original cloud setup');
     assert.equal(progress().textContent.trim(), 'Completed step: Cloud computer preparation verified');
     assert.equal(button('Continue to application setup').disabled, false);
-    assert.equal(document.querySelector('[role="alert"]'), null);
+    assert.equal(document.querySelector('[role="alert"]') === null, true);
     assert.equal(document.querySelector('.gcp-resource-location').textContent, `${destination.project} / ${destination.zone} / ${destination.instance}`);
     for (const call of calls.filter(call => call.method === 'GET' && new URL(call.target, 'http://localhost').pathname.endsWith('/gcp-deployment')).slice(1))
       assert.equal(new URL(call.target, 'http://localhost').searchParams.get('operation_id'), REQUEST);
@@ -338,7 +338,7 @@ for (const action of ['create', 'connect', 'resume', 'remove']) {
       setStatus(original);
       await click(recheck);
       assert.deepEqual(alerts(), [actionError]);
-      assert.equal(document.querySelector('.deployment-warning'), null);
+      assert.equal(document.querySelector('.deployment-warning') === null, true);
       assert.deepEqual(calls.filter(call => call.method === 'POST' && call.target.includes('/gcp-deployment/')), posts);
       for (const call of calls.filter(call => call.method === 'GET' && new URL(call.target, 'http://localhost').pathname.endsWith('/gcp-deployment')).slice(-2))
         assert.equal(new URL(call.target, 'http://localhost').searchParams.get('operation_id'), REQUEST);
@@ -490,7 +490,7 @@ test('current VM can connect only an exact cloud endpoint and owned application 
     assert.deepEqual(calls.find(item => item.target.endsWith('/connect')).body,
       { operation_id: REQUEST, version: 4, build_id: accepted.build_id });
     assert.match(document.body.textContent, /does not match the verified cloud computer/);
-    assert.equal(document.querySelector('.gcp-application-handoff'), null);
+    assert.equal(document.querySelector('.gcp-application-handoff') === null, true);
   }, { cloud: cloud() });
 });
 
@@ -506,7 +506,7 @@ test('a successful cloud handoff reveals an exact private-setup link and focuses
     await act(async () => next.click()); assert.equal(document.activeElement, destinationView);
     assert.equal(calls.filter(item => item.target.endsWith('/connect')).length, 1);
     assert.equal(calls.filter(item => item.target.endsWith('/install')).length, 0);
-    assert.equal(document.querySelector('.remote-private-form'), null);
+    assert.equal(document.querySelector('.remote-private-form') === null, true);
   }, { cloud: cloud(), combined: true });
 });
 
@@ -516,7 +516,7 @@ test('cloud handoff acknowledgements require the exact accepted source and curre
     await mounted(async ({ click, setHandler, document, calls }) => {
       setHandler(async action => { assert.equal(action, 'connect'); return { ...remote(), ...changed }; });
       await click('Continue to application setup');
-      assert.equal(document.querySelector('.gcp-application-handoff'), null);
+      assert.equal(document.querySelector('.gcp-application-handoff') === null, true);
       assert.match(document.body.textContent, /does not match the verified cloud computer/);
       assert.equal(calls.filter(item => item.target.endsWith('/connect')).length, 1);
       assert.equal(calls.filter(item => item.target.endsWith('/install')).length, 0);
@@ -530,7 +530,7 @@ test('the actual parent keeps cloud creation primary and package instructions on
     assert.equal(manual.open, false); assert.match(manual.querySelector('summary').textContent, /Manual Google Cloud.*advanced/);
     const downloads = [...document.querySelectorAll('button')].filter(node => node.textContent.includes('Download accepted GCP package'));
     assert.equal(downloads.length, 1); assert.equal(downloads[0].closest('details'), manual);
-    assert.ok(button('Create this cloud computer')); assert.equal(button('Create this cloud computer').closest('details'), null);
+    assert.ok(button('Create this cloud computer')); assert.equal(button('Create this cloud computer').closest('details') === null, true);
     assert.ok([...document.querySelectorAll('.gcp-guided button')].every(node => !node.textContent.includes('Download accepted GCP package')));
     assert.equal(calls.filter(item => item.method === 'POST' && item.target.includes('/gcp-deployment/')).length, 0);
   }, { panel: true });
@@ -627,8 +627,8 @@ test('the actual parent retains saved cloud observation and stop when the propos
     for (const label of ['Create this cloud computer', 'Continue to application setup', 'Recheck and continue this setup',
       'Connect and check destination', 'Continue to private setup', 'Restart accepted application'])
       assert.equal(button(label), undefined, label);
-    assert.equal(document.querySelector('.remote-private-form'), null);
-    assert.equal(document.querySelector('.remote-destination-form'), null);
+    assert.equal(document.querySelector('.remote-private-form') === null, true);
+    assert.equal(document.querySelector('.remote-destination-form') === null, true);
     await click('Stop owned application');
     assert.equal(document.querySelector('.remote-deployment').dataset.remoteStatus, 'stopped');
     assert.deepEqual(calls.filter((call) => call.method === 'POST'), [{
@@ -650,8 +650,8 @@ test('the actual parent retains saved cloud stop while Agent team is selected', 
     for (const label of ['Check cloud access', 'Create this cloud computer', 'Continue to application setup',
       'Recheck and continue this setup', 'Connect and check destination', 'Continue to private setup', 'Restart accepted application'])
       assert.equal(button(label), undefined, label);
-    assert.equal(document.querySelector('.remote-private-form'), null);
-    assert.equal(document.querySelector('.remote-destination-form'), null);
+    assert.equal(document.querySelector('.remote-private-form') === null, true);
+    assert.equal(document.querySelector('.remote-destination-form') === null, true);
     await click('Stop owned application');
     assert.equal(document.querySelector('.remote-deployment').dataset.remoteStatus, 'stopped');
     assert.deepEqual(calls.filter((call) => call.method === 'POST'), [{
@@ -674,8 +674,8 @@ test('Agent team selection withdraws previously available cloud private setup an
       assert.ok(document.querySelector('.remote-deployment .gcp-resource-guidance'));
       assert.equal(button(availableAction), undefined);
       assert.equal(button('Continue to application setup'), undefined);
-      assert.equal(document.querySelector('.remote-private-form'), null);
-      assert.equal(document.querySelector('.remote-destination-form'), null);
+      assert.equal(document.querySelector('.remote-private-form') === null, true);
+      assert.equal(document.querySelector('.remote-destination-form') === null, true);
       assert.equal(calls.filter((call) => call.method === 'POST').length, 0);
     }, { panel: true, cloud: cloud(), remoteReceipt: receipt });
   }
@@ -690,7 +690,7 @@ test('the actual parent preserves cloud and remote custody through a Mac pivot a
       /\/(?:gcp-deployment|remote-deployment)$/.test(new URL(call.target, 'http://localhost').pathname)).length;
     await change({ ...state, version: 5, proposal: { ...state.proposal, target: 'mac',
       project: { name: 'Local alternative', slug: 'local-alternative' } } });
-    assert.equal(document.querySelector('input[name="deployment-source"]'), null, 'The local installation block is closed for the stale build.');
+    assert.equal(document.querySelector('input[name="deployment-source"]') === null, true, 'The local installation block is closed for the stale build.');
     assert.equal(document.querySelector('.gcp-provisioning'), preparation);
     assert.equal(document.querySelector('.remote-deployment'), application);
     assert.equal(calls.filter((call) => call.method === 'GET' &&
@@ -732,8 +732,8 @@ test('a local parent with no saved cloud receipt, request or remote installation
     assert.equal(panel.textContent.trim(), '');
     assert.equal(panel.childElementCount, 0);
     assert.equal(document.defaultView.getComputedStyle(panel).display, 'none');
-    assert.equal(document.querySelector('.gcp-guided'), null);
-    assert.equal(document.querySelector('.remote-deployment'), null);
+    assert.equal(document.querySelector('.gcp-guided') === null, true);
+    assert.equal(document.querySelector('.remote-deployment') === null, true);
     assert.equal(calls.filter((call) => call.method === 'POST').length, 0);
   }, { panel: true, cloud: null, remoteReceipt: null });
 });
@@ -747,14 +747,14 @@ test('review removal keeps original names after a source pivot and Keep admits n
     assert.doesNotMatch(review.textContent, /mac-alternative/);
     assert.equal(button('Remove VM, disk and access rule').disabled, true);
     assert.match(review.textContent, /permanently deletes.*Forge does not make a backup/);
-    assert.equal(document.querySelector('.gcp-provisioning-step'), null);
-    assert.equal(document.querySelector('.gcp-provisioning .gcp-resource-guidance'), null);
+    assert.equal(document.querySelector('.gcp-provisioning-step') === null, true);
+    assert.equal(document.querySelector('.gcp-provisioning .gcp-resource-guidance') === null, true);
     assert.doesNotMatch(document.querySelector('.gcp-provisioning').textContent, /earlier accepted setup|computer preparation/);
     assert.equal(review.querySelector('details').open, false);
     await act(async () => review.querySelector('input[type=checkbox]').click());
     assert.equal(button('Remove VM, disk and access rule').disabled, false);
     await click('Keep cloud resources');
-    assert.equal(document.querySelector('.gcp-removal'), null);
+    assert.equal(document.querySelector('.gcp-removal') === null, true);
     assert.equal(gcpLoadRemovalIntent(store, GUIDE), null);
     assert.equal(calls.filter((call) => call.method === 'POST').length, 0);
     await click('Review cloud removal');
@@ -800,7 +800,7 @@ test('a durable removal request immediately withdraws sibling controls before an
     assert.equal(typeof resolve, 'function');
     assert.equal(button('Stop owned application'), undefined);
     assert.equal(button('Continue to application setup'), undefined);
-    assert.equal(document.querySelector('.remote-installed-use'), null);
+    assert.equal(document.querySelector('.remote-installed-use') === null, true);
     assert.match(document.querySelector('.remote-deployment').textContent, /Application access, installation and restart are withdrawn/);
     await change({ ...state, version: 5, proposal: { ...state.proposal, target: 'mac' } });
     assert.equal(button('Stop owned application'), undefined);
@@ -841,8 +841,8 @@ test('completed removal keeps its original receipt without installation, restart
   await mounted(async ({ document, button, setStatus, click, calls }) => {
     assert.match(document.querySelector('.gcp-provisioning').textContent, /Original cloud resources confirmed absent/);
     assert.equal([...document.querySelectorAll('[data-removal-resource]')].filter((row) => row.textContent.includes('Confirmed absent')).length, 3);
-    assert.equal(document.querySelector('.remote-private-form'), null);
-    assert.equal(document.querySelector('.remote-installed-use'), null);
+    assert.equal(document.querySelector('.remote-private-form') === null, true);
+    assert.equal(document.querySelector('.remote-installed-use') === null, true);
     for (const label of ['Create this cloud computer', 'Review cloud removal', 'Continue removal', 'Continue to application setup',
       'Continue to private setup', 'Restart accepted application', 'Stop owned application']) assert.equal(button(label), undefined, label);
     setStatus(() => { throw new Error('Offline recheck failed.'); }); await click('Recheck removal');
@@ -948,7 +948,7 @@ test('a delayed cloud connection acknowledgement cannot regain authority after a
     pendingClick('Continue to application setup');
     await change({ ...state, version: 5 }, { ...accepted, current_guide_version: 5 });
     await act(async () => resolve(remote()));
-    assert.equal(document.querySelector('.gcp-application-handoff'), null);
+    assert.equal(document.querySelector('.gcp-application-handoff') === null, true);
     assert.equal(calls.filter(call => call.method === 'POST').length, 1);
   }, { cloud: cloud() });
 });

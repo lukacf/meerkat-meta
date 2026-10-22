@@ -79,7 +79,7 @@ test('explicit startup refusal is readable, stops passive observation and recove
       assert.match(f.container.querySelector('.forge-setup__footer').textContent, /Checking status does not restart the agent/);
       assert.equal(f.port.snapshot.startupRefusal, code);
       assert.equal(f.port.available, false);
-      assert.equal(f.container.querySelector('.toolkit-conversation'), null);
+      assert.equal(f.container.querySelector('.toolkit-conversation') === null, true);
       assert.equal(f.timers.size, 0, 'A refused original initialization must not schedule passive GETs');
       assert.equal(f.sources.filter(source => !source.closed).length, 0, 'Private observation must stop for the refused original initialization');
       assert.doesNotMatch(f.container.querySelector('.forge-setup__footer').textContent, /leaves the setup agent running/);

@@ -283,8 +283,8 @@ test('fresh welcome mobile Advanced editor preserves an unsent idea without crea
     assert.equal(document.querySelector('#setup-message').value, idea);
     assert.deepEqual(values, savedDrafts, 'Opening the editor preserves the exact unsent draft bytes.');
     assert.deepEqual(current(), anonymous);
-    assert.equal(document.querySelector('[data-proposal-snapshot]'), null);
-    assert.equal(document.querySelector('.setup-provider'), null);
+    assert.equal(document.querySelector('[data-proposal-snapshot]') === null, true);
+    assert.equal(document.querySelector('.setup-provider') === null, true);
     assert.deepEqual(calls, requests, 'Opening the editor sends no guide, provider or animation request.');
     assert.ok(calls.every(call => call.method === 'GET'));
   });
@@ -339,7 +339,7 @@ test('opening context crosses the provider handoff without sending or rewriting 
     assert.ok(summary, 'The actual guide passes its context to provider setup.');
     assert.match(summary.textContent, /A team.*Keeping track of things/s);
     assert.match(summary.textContent, /Not sent/);
-    assert.equal(document.querySelector('.setup-provider-idea'), null);
+    assert.equal(document.querySelector('.setup-provider-idea') === null, true);
     await act(async () => { buttonNamed(document.querySelector('.setup-provider'), 'Back to my idea').click(); await settle(); });
     assert.equal(document.querySelector('#setup-message').value, '');
     assert.equal(document.querySelector('.forge-starting-context').textContent, context);
@@ -374,7 +374,7 @@ test('explicit provider onboarding retains save and startup handoffs in the moun
   };
   await mounted(freshGuide(), async ({ document, calls, pollProvider }) => {
     const pane = () => document.querySelector('.setup-provider');
-    assert.equal(pane(), null, 'The initial guide lets the user describe an idea before provider setup.');
+    assert.equal(pane() === null, true, 'The initial guide lets the user describe an idea before provider setup.');
     const headerProvider = document.querySelector('#setup-header-menu button');
     assert.match(headerProvider.textContent, /Guide settings/);
     await act(async () => { headerProvider.click(); await settle(); });
@@ -411,23 +411,23 @@ test('explicit provider onboarding retains save and startup handoffs in the moun
     assert.equal(buttonNamed(pane(), 'Back to my idea').disabled, false);
     assert.equal(calls.filter(call => call.url === '/api/architect/start').length, 1);
     assert.ok(document.querySelector('.ep-empty-facts'));
-    assert.equal(document.querySelector('[data-proposal-snapshot]'), null);
+    assert.equal(document.querySelector('[data-proposal-snapshot]') === null, true);
     assert.ok(calls.every(call => !call.url.startsWith('/api/visualization') && !call.url.endsWith('/respond')));
     await act(async () => { buttonNamed(pane(), 'Back to my idea').click(); await settle(); });
-    assert.equal(pane(), null, 'Explicit close retires the completed onboarding.');
+    assert.equal(pane() === null, true, 'Explicit close retires the completed onboarding.');
   }, { providerRead });
 });
 
 test('explicit provider onboarding honors close while the initial guide remains unconfigured', async () => {
   await mounted(freshGuide(), async ({ document, calls }) => {
-    assert.equal(document.querySelector('.setup-provider'), null);
+    assert.equal(document.querySelector('.setup-provider') === null, true);
     const headerProvider = document.querySelector('#setup-header-menu button');
     assert.match(headerProvider.textContent, /Guide settings/);
     await act(async () => { headerProvider.click(); await settle(); });
     const pane = document.querySelector('.setup-provider');
     assert.ok(pane);
     await act(async () => { buttonNamed(pane, 'Back to my idea').click(); await settle(); });
-    assert.equal(document.querySelector('.setup-provider'), null);
+    assert.equal(document.querySelector('.setup-provider') === null, true);
     const input = document.querySelector('#setup-message');
     await act(async () => {
       Object.getOwnPropertyDescriptor(document.defaultView.HTMLTextAreaElement.prototype, 'value')
@@ -436,7 +436,7 @@ test('explicit provider onboarding honors close while the initial guide remains 
       await settle();
     });
     assert.equal(input.value, 'My unfinished description');
-    assert.equal(document.querySelector('.setup-provider'), null, 'Later renders do not reopen explicitly dismissed onboarding.');
+    assert.equal(document.querySelector('.setup-provider') === null, true, 'Later renders do not reopen explicitly dismissed onboarding.');
     assert.match(document.body.textContent, /Provider setup needed/);
     assert.ok(document.querySelector('.ep-empty-facts'));
     assert.ok(calls.every(call => call.method === 'GET'), 'Closing and drafting admit no work.');
@@ -477,7 +477,7 @@ test('initial guide connection retains the idea through explicit provider setup 
     const message = () => document.querySelector('#setup-message');
     assert.ok(document.querySelector('.setup-welcome'));
     assert.ok(document.querySelector('.setup-welcome-intro h1, .setup-welcome-intro h2'));
-    assert.equal(pane(), null, 'The technical provider form does not precede the initial idea.');
+    assert.equal(pane() === null, true, 'The technical provider form does not precede the initial idea.');
     assert.equal(calls.some(call => call.url === '/api/provider-settings'), false);
     await act(async () => {
       Object.getOwnPropertyDescriptor(document.defaultView.HTMLTextAreaElement.prototype, 'value')
@@ -491,7 +491,7 @@ test('initial guide connection retains the idea through explicit provider setup 
     assert.ok(example, 'The existing starting-point preview remains available.');
     await act(async () => { example.click(); await settle(); });
     assert.equal(message().value, idea, 'An example does not replace an already written idea.');
-    assert.equal(pane(), null);
+    assert.equal(pane() === null, true);
     assert.equal(guidePosts().length, 0, 'Typing and previewing an example send no model turn.');
     const primary = document.querySelector('#setup-send');
     assert.ok(primary.classList.contains('setup-welcome-continue'));
@@ -528,7 +528,7 @@ test('initial guide connection retains the idea through explicit provider setup 
     assert.equal(message().value, idea);
     assert.equal(guidePosts().length, 0, 'Start does not send the retained idea.');
     await act(async () => { buttonNamed(pane(), 'Back to my idea').click(); await settle(); });
-    assert.equal(pane(), null);
+    assert.equal(pane() === null, true);
     assert.equal(message().value, idea);
     assert.equal(document.querySelector('#setup-send').disabled, false);
     assert.equal(document.querySelector('#setup-send').textContent.trim(), 'Send to guide');
@@ -539,7 +539,7 @@ test('initial guide connection retains the idea through explicit provider setup 
     assert.deepEqual(guidePosts().map(call => call.url), ['/api/guide/start', `/api/guide/${id}/respond`]);
     assert.deepEqual(guidePosts()[1].body, { version: 1, action: 'answer', selected: [], text: idea });
     assert.equal(calls.filter(call => call.url === '/api/architect/start').length, 1);
-    assert.equal(document.querySelector('.setup-welcome'), null, 'An admitted running guide leaves the initial welcome.');
+    assert.equal(document.querySelector('.setup-welcome') === null, true, 'An admitted running guide leaves the initial welcome.');
   }, { providerRead });
 });
 
@@ -586,7 +586,7 @@ test('first-minute mobile choices-only completion focuses Send while explicit Wr
     assert.equal(editor.value, ''); assert.equal(document.querySelectorAll('textarea').length, 1);
     assert.equal(helper.dataset.open, 'false'); assert.equal(helper.dataset.route, 'choose');
     assert.equal(startingContextButton(document, 'Your two answers').getAttribute('aria-pressed'), 'true');
-    assert.equal(document.getElementById('setup-idea-shortcuts'), null, 'Mobile retains ordinary multiline writing rather than desktop Enter guidance.');
+    assert.equal(document.getElementById('setup-idea-shortcuts') === null, true, 'Mobile retains ordinary multiline writing rather than desktop Enter guidance.');
     assert.deepEqual(saved.starting_help, { version: 2, audience_id: 'household', kind_id: 'organizing' });
     await clickStarting(document, 'In my own words');
     assert.equal(document.activeElement, editor, 'Only explicit Write focuses the native editor after a choices-only start.');
@@ -605,7 +605,7 @@ test('the native editor and optional thinking helper never replace or send the e
     const editor = document.querySelector('#setup-message');
     const invitation = helper.querySelector('.forge-starting-conversation__invitation');
     assert.equal(invitation.getAttribute('role'), 'group', 'The starting routes use an ordinary group rather than tabs.');
-    assert.equal(invitation.querySelector('[role="tab"]'), null);
+    assert.equal(invitation.querySelector('[role="tab"]') === null, true);
     assert.equal(invitation.querySelectorAll('button').length, 2, 'Both routes remain available beside the one native editor.');
     const writeRoute = startingContextButton(document, 'In my own words');
     const chooseRoute = startingContextButton(document, 'Answer two questions');
@@ -616,11 +616,11 @@ test('the native editor and optional thinking helper never replace or send the e
     assert.equal(helper.querySelector('.forge-starting-conversation__lead').textContent, 'Two ways to begin. Switch any time - your words are kept.');
     await typeStarting(document, ' \n\t ');
     await clickStarting(document, 'Answer two questions');
-    assert.equal(helper.querySelector('.forge-starting-conversation__draft'), null, 'Whitespace-only writing has no draft excerpt.');
+    assert.equal(helper.querySelector('.forge-starting-conversation__draft') === null, true, 'Whitespace-only writing has no draft excerpt.');
     assert.equal(document.querySelector('#setup-message'), editor);
     assert.equal(writeRoute.getAttribute('aria-pressed'), 'false');
     assert.equal(chooseRoute.getAttribute('aria-pressed'), 'true');
-    assert.equal(writeRoute.closest('[hidden]'), null, 'Writing remains available while choices are open.');
+    assert.equal(writeRoute.closest('[hidden]') === null, true, 'Writing remains available while choices are open.');
     await clickStarting(document, 'In my own words');
     assert.equal(helper.dataset.open, 'false');
     assert.equal(writeRoute.getAttribute('aria-pressed'), 'true');
@@ -648,7 +648,7 @@ test('the native editor and optional thinking helper never replace or send the e
     const excerpt = helper.querySelector('.forge-starting-conversation__draft');
     assert.equal(excerpt.querySelector('span').textContent, 'Your idea - not sent');
     assert.equal(excerpt.querySelector('p').textContent, written, 'The excerpt renders every draft character as literal React text.');
-    assert.equal(excerpt.querySelector('button, input, textarea, [contenteditable], script'), null, 'The excerpt is read-only and creates no extra editor or executable markup.');
+    assert.equal(excerpt.querySelector('button, input, textarea, [contenteditable], script') === null, true, 'The excerpt is read-only and creates no extra editor or executable markup.');
     assert.equal(document.querySelector('#setup-message'), editor);
     assert.equal(helper.querySelector('h3').textContent, 'Who is it for?');
     assert.equal(document.activeElement, helper.querySelector('h3'));
@@ -675,11 +675,11 @@ test('the native editor and optional thinking helper never replace or send the e
     const saved = JSON.parse(values.get(inputKey(guide)));
     assert.equal(saved.draft, written);
     assert.deepEqual(saved.starting_help, { version: 2, audience_id: 'team', kind_id: 'repetitive' });
-    assert.equal(helper.querySelector('.forge-starting-conversation__draft'), null, 'Closing choices removes the excerpt when the editor returns.');
+    assert.equal(helper.querySelector('.forge-starting-conversation__draft') === null, true, 'Closing choices removes the excerpt when the editor returns.');
     assert.equal(helper.querySelector('.forge-starting-conversation__invitation'), invitation, 'Applied context retains both mounted route controls.');
     assert.equal(writeRoute.getAttribute('aria-pressed'), 'false');
     assert.equal(chooseRoute.getAttribute('aria-pressed'), 'true');
-    assert.equal(chooseRoute.closest('[hidden]'), null);
+    assert.equal(chooseRoute.closest('[hidden]') === null, true);
     assert.equal(chooseRoute.querySelector('strong').textContent, 'Your two answers');
     assert.equal(chooseRoute.querySelector('small').textContent, 'A team / Repetitive work');
     await clickStarting(document, 'Your two answers');
@@ -689,7 +689,7 @@ test('the native editor and optional thinking helper never replace or send the e
     assert.equal(startingContextButton(document, 'A team').getAttribute('aria-pressed'), 'true', 'The individual review field opens its applied answer for editing.');
     assert.equal(helper.querySelector('.forge-starting-conversation__draft p').textContent, written);
     await clickStarting(document, 'In my own words');
-    assert.equal(helper.querySelector('.forge-starting-conversation__draft'), null);
+    assert.equal(helper.querySelector('.forge-starting-conversation__draft') === null, true);
     assert.equal(document.querySelector('#setup-message'), editor, 'Cancelling a choice edit keeps the same native textarea.');
     assert.equal(editor.value, written);
     assert.equal(document.activeElement, editor);
@@ -724,13 +724,13 @@ test('saved understanding and pending work do not become a fresh welcome merely 
     const guide = freshGuide();
     change(guide);
     await mounted(guide, async ({ document, calls, current, values }) => {
-      assert.equal(document.querySelector('.setup-welcome'), null, `${name} remains in the continuing guide.`);
+      assert.equal(document.querySelector('.setup-welcome') === null, true, `${name} remains in the continuing guide.`);
       const send = document.querySelector('.setup-welcome-continue');
       if (guide.operation?.status === 'running') {
         assert.ok(send, 'Retained first-turn work keeps its disabled waiting control.');
         assert.equal(send.disabled, true);
         assert.match(send.textContent, /Waiting for guide/);
-      } else assert.equal(send, null);
+      } else assert.equal(send === null, true);
       assert.ok(document.querySelector('.setup-plan-pane'), 'The existing plan and understanding surface stays mounted.');
       assert.deepEqual(current(), guide, 'Rendering welcome boundaries does not rewrite the saved setup.');
       if (['failed', 'interrupted'].includes(guide.operation?.status)) {
@@ -757,10 +757,10 @@ for (const narrow of [false, true]) test(`first response retains the circular il
     assert.ok(pane.querySelector('animateTransform'), 'The accepted circular illustration starts animated.');
     await act(async () => motion().click());
     assert.equal(motion().getAttribute('aria-pressed'), 'true');
-    assert.equal(pane.querySelector('animateTransform, animate'), null, 'Pausing removes indefinite animation from the desktop illustration.');
-    assert.equal(document.querySelector('.forge-welcome-mobile-art animateTransform, .forge-welcome-mobile-art animate'), null,
+    assert.equal(pane.querySelector('animateTransform, animate') === null, true, 'Pausing removes indefinite animation from the desktop illustration.');
+    assert.equal(document.querySelector('.forge-welcome-mobile-art animateTransform, .forge-welcome-mobile-art animate') === null, true,
       'The phone miniature shares the same motion preference.');
-    assert.equal(document.querySelector('.forge-welcome-dialog animateTransform, .forge-welcome-dialog animate'), null,
+    assert.equal(document.querySelector('.forge-welcome-dialog animateTransform, .forge-welcome-dialog animate') === null, true,
       'The phone illustration sheet shares the same motion preference.');
     const textarea = document.querySelector('#setup-message');
     await act(async () => {
@@ -775,12 +775,12 @@ for (const narrow of [false, true]) test(`first response retains the circular il
     assert.ok(document.querySelector('.setup-native-chat'), 'The real native activity surface remains mounted during admission.');
     assert.equal(document.querySelector('.setup-guide-wait [role="status"]').textContent, 'Sending to your guide');
     assert.equal(document.querySelector('#setup-message').disabled, false, 'The existing editable composer remains usable.');
-    assert.equal(document.querySelector('.setup-current-question'), null, 'Only the obsolete first question is suppressed.');
+    assert.equal(document.querySelector('.setup-current-question') === null, true, 'Only the obsolete first question is suppressed.');
     await act(async () => { admitFirstResponse(); await settle(); });
     assert.ok(shell.classList.contains('setup-first-turn'), 'The actual saved running receipt retains the same presentation canvas.');
     assert.match(document.querySelector('.setup-native-chat .setup-native-phase').textContent, /Working through your agent design/);
     assert.equal(document.querySelector('.setup-guide-wait [role="status"]').textContent, 'Saved - your guide is working');
-    assert.equal(document.querySelector('.setup-guide-wait small'), null, 'The confirmed first request has one waiting status.');
+    assert.equal(document.querySelector('.setup-guide-wait small') === null, true, 'The confirmed first request has one waiting status.');
     assert.equal(document.querySelector('#setup-message').value, '', 'The sent idea clears from the owned composer.');
     assert.equal(textarea.placeholder, 'Write your next message - you can send it after the reply.');
     assert.equal(document.querySelector('#setup-send').textContent.trim(), 'Waiting for guide');
@@ -789,7 +789,7 @@ for (const narrow of [false, true]) test(`first response retains the circular il
     assert.equal(!!document.querySelector('.forge-mobile-journey'), narrow);
     if (narrow) assert.match(document.querySelector('.forge-mobile-journey [aria-current="step"]').textContent, /Idea/);
     assert.equal(document.querySelector('#setup-send').disabled, true);
-    assert.equal(document.querySelector('.setup-composer-mode'), null, 'The obsolete opening question offers no competing message modes.');
+    assert.equal(document.querySelector('.setup-composer-mode') === null, true, 'The obsolete opening question offers no competing message modes.');
     const nextDraft = 'Please keep a separate note for the next reply.';
     await act(async () => {
       Object.getOwnPropertyDescriptor(document.defaultView.HTMLTextAreaElement.prototype, 'value')
@@ -798,15 +798,15 @@ for (const narrow of [false, true]) test(`first response retains the circular il
     });
     assert.equal(document.querySelector('#setup-send').disabled, true, 'A next draft never joins the running request.');
     assert.equal(motion().getAttribute('aria-pressed'), 'true', 'Sending and the next draft never restart a paused illustration.');
-    assert.equal(pane.querySelector('animateTransform, animate'), null);
+    assert.equal(pane.querySelector('animateTransform, animate') === null, true);
     await act(async () => motion().click());
     assert.equal(motion().getAttribute('aria-pressed'), 'false');
     assert.ok(pane.querySelector('animateTransform'), 'Motion resumes only after an explicit action.');
     assert.ok(pane.querySelector('.forge-welcome-portrait'), 'Native guide activity does not blank the right pane.');
     assert.ok(pane.querySelector('.ep-illustrated'));
     assert.equal(pane.querySelector('.forge-portrait-caption small').textContent, 'Preview illustration. Your proposal appears as we talk.');
-    assert.equal(pane.querySelector('[data-proposal-snapshot]'), null);
-    assert.equal(pane.querySelector('.ep-stats'), null, 'The illustration invents no agents or progress.');
+    assert.equal(pane.querySelector('[data-proposal-snapshot]') === null, true);
+    assert.equal(pane.querySelector('.ep-stats') === null, true, 'The illustration invents no agents or progress.');
     assert.equal(calls.filter(call => call.url === `/api/guide/${id}/respond`).length, 1);
     const running = current();
     save({ ...running, version: 2, operation: { ...running.operation, status: 'completed' },
@@ -820,7 +820,7 @@ for (const narrow of [false, true]) test(`first response retains the circular il
     assert.equal(textarea.value, nextDraft, 'The guide reply leaves the next draft exactly as written.');
     assert.equal(document.querySelector('#setup-send').disabled, false);
     assert.notEqual(document.querySelector('#setup-send').textContent.trim(), 'Waiting for guide');
-    assert.equal(document.querySelector('.forge-next-draft-hint'), null);
+    assert.equal(document.querySelector('.forge-next-draft-hint') === null, true);
     assert.match(document.querySelector('.setup-header .forge-welcome-orientation [aria-current="step"]').textContent, /Shape/);
     if (narrow) assert.match(document.querySelector('.forge-mobile-journey [aria-current="step"]').textContent, /Shape/);
     assert.equal(calls.filter(call => call.url === `/api/guide/${id}/respond`).length, 1, 'The completed reply never sends the next draft automatically.');
@@ -837,7 +837,7 @@ for (const narrow of [false, true]) test(`first response retains the circular il
     await act(async () => { document.querySelector('#setup-send').click(); await settle(); });
     save({ ...current(), version: 3, proposal: planFor('Neighbourhood tool library') });
     await poll();
-    assert.equal(pane.querySelector('.forge-welcome-portrait'), null);
+    assert.equal(pane.querySelector('.forge-welcome-portrait') === null, true);
     assert.equal(JSON.parse(pane.querySelector('[data-proposal-snapshot]').dataset.proposalSnapshot).project.name,
       'Neighbourhood tool library');
   }, { narrow, available: true, respondRead: async (server, request) => {
@@ -909,7 +909,7 @@ test('starting context field edit: answered review stays closed while individual
     await clickStarting(document, 'Change who this helps: A team');
     assert.equal(helper().querySelector('.forge-starting-conversation__progress').textContent, 'Change who this helps');
     assert.match(helper().querySelector('.forge-starting-conversation__answered').textContent, /Keeping Repetitive work/);
-    assert.equal(helper().querySelector('.forge-starting-conversation__progress-marks'), null, 'A single-field edit does not promise two questions.');
+    assert.equal(helper().querySelector('.forge-starting-conversation__progress-marks') === null, true, 'A single-field edit does not promise two questions.');
     await clickStarting(document, 'Cancel change');
     assert.deepEqual(stored(), { version: 2, audience_id: 'team', kind_id: 'repetitive' }, 'Cancelling before a field choice keeps both applied answers.');
     assert.equal(document.activeElement, audienceTrigger, 'Cancelling returns to the owned review field instead of opening the editor.');
@@ -1008,7 +1008,7 @@ test('starting context reload: exact choices restore independently and revision 
     assert.deepEqual(JSON.parse(values.get(inputKey(anonymous))).starting_help, { version: 2, audience_id: 'many', kind_id: 'repetitive' });
     assert.equal(document.activeElement, kindTrigger);
     assert.equal(document.querySelectorAll('textarea').length, 1);
-    assert.equal(document.querySelector('script'), null);
+    assert.equal(document.querySelector('script') === null, true);
     assert.deepEqual(calls.filter(call => call.method !== 'GET'), []);
   }, { available: true, retainedValues: retained, runAnimationFrames: true });
 });
@@ -1024,7 +1024,7 @@ test('starting context: cancel restores applied choices and removal never change
     assert.equal(example.id, 'setup-message-starting-example');
     assert.equal(example.querySelector('.forge-starting-example__label').textContent, 'For example');
     assert.match(example.textContent, /Keep track of decisions and deadlines for a project/);
-    assert.equal(example.querySelector('button, input, textarea, a'), null, 'Inspiration has no insertion or submission controls.');
+    assert.equal(example.querySelector('button, input, textarea, a') === null, true, 'Inspiration has no insertion or submission controls.');
     assert.equal(document.querySelector('#setup-message').value, written, 'The example never enters the user-owned draft.');
     const editTrigger = startingContextButton(document, 'Change who this helps: A team'); editTrigger.focus();
     await clickStarting(document, 'Change who this helps: A team');
@@ -1040,7 +1040,7 @@ test('starting context: cancel restores applied choices and removal never change
     assert.equal(document.querySelector('#setup-message').value, written, 'Updated inspiration leaves exact user writing untouched.');
     await clickStarting(document, 'Remove starting point');
     assert.equal(document.querySelector('.forge-starting-context') === null, true, '.forge-starting-context stays absent');
-    assert.equal(document.querySelector('.forge-starting-example'), null, 'Removing the context removes its inspiration.');
+    assert.equal(document.querySelector('.forge-starting-example') === null, true, 'Removing the context removes its inspiration.');
     assert.equal(document.querySelector('#setup-message').value, written);
     assert.equal(JSON.parse(values.get(inputKey(guide))).starting_help, undefined);
     assert.deepEqual(calls.filter(call => call.method !== 'GET'), []);
@@ -1152,7 +1152,7 @@ function assertProposalNotice(document, expected, detail) {
     assert.equal(dot.getAttribute('aria-hidden'), 'true', 'The dot is decorative; the tab supplies its accessible meaning.');
   } else {
     assert.notEqual(button.getAttribute('aria-label'), proposalNoticeName, detail);
-    assert.equal(dot, null, detail);
+    assert.equal(dot === null, true, detail);
   }
 }
 async function selectNoticePane(document, pane) {
@@ -1299,7 +1299,7 @@ test('first proposal recovery remains visible in the mobile team pane and return
     assert.match(status.textContent, /Live updates interrupted/);
     assert.doesNotMatch(status.textContent, /Your guide is working/);
     assert.ok(pane.querySelector('.forge-welcome-portrait'), 'Recovery preserves the circular illustration.');
-    assert.equal(pane.querySelector('[data-proposal-snapshot]'), null, 'Recovery invents no proposal.');
+    assert.equal(pane.querySelector('[data-proposal-snapshot]') === null, true, 'Recovery invents no proposal.');
     const before = calls.length;
     const returnButton = status.querySelector('button');
     assert.match(returnButton?.textContent || '', /Return to conversation/);
@@ -1458,10 +1458,10 @@ test('first-minute editor descriptions follow context, provider visibility and m
     assert.equal(document.activeElement, editor);
     await clickStarting(document, 'Remove starting point');
     descriptions(['setup-after-send', 'setup-idea-shortcuts']);
-    assert.equal(document.querySelector('.forge-starting-example'), null);
+    assert.equal(document.querySelector('.forge-starting-example') === null, true);
     await setNarrow(true);
     descriptions(['setup-after-send']);
-    assert.equal(document.getElementById('setup-idea-shortcuts'), null, 'Mobile Return does not inherit desktop shortcut guidance.');
+    assert.equal(document.getElementById('setup-idea-shortcuts') === null, true, 'Mobile Return does not inherit desktop shortcut guidance.');
     assert.equal(editor.value, written);
     assert.deepEqual(calls.filter(call => call.method !== 'GET'), [], 'Description and provider navigation never submit or start work.');
   }, { available: true, runAnimationFrames: true });
@@ -1475,7 +1475,7 @@ test('first-minute editor descriptions clear after explicit submission enters th
     await act(async () => { document.querySelector('#setup-send').click(); await settle(); });
     assert.equal(document.querySelector('#setup-message').getAttribute('aria-describedby'), null,
       'A continuing conversation does not reference opening-only guidance.');
-    assert.equal(document.getElementById('setup-after-send'), null);
+    assert.equal(document.getElementById('setup-after-send') === null, true);
     assert.equal(calls.filter(call => call.method !== 'GET').length, 1, 'Only the explicit guide Send admits a turn.');
   }, { available: true, runAnimationFrames: true });
 });
@@ -1667,7 +1667,7 @@ test('mobile response handoff: a saved context question is visible from Your tea
     await writeNoticeDraft(document, responseNextDraft);
     await selectNoticePane(document, 'plan');
     await flushAnimationFrames();
-    assert.equal(visibleMobileResponse(document), null, 'A running request is not a saved response publication.');
+    assert.equal(visibleMobileResponse(document) === null, true, 'A running request is not a saved response publication.');
     save(responsePublication(current())); await poll(); await flushAnimationFrames();
     const shell = document.querySelector('.setup-shell');
     assert.ok(shell.classList.contains('setup-mobile-plan'), 'The real plan pane stays selected while context is published.');
@@ -1675,9 +1675,9 @@ test('mobile response handoff: a saved context question is visible from Your tea
     const notice = visibleMobileResponse(document);
     assert.ok(notice, 'The actual saved response must be discoverable outside hidden Conversation.');
     assert.equal(band.getAttribute('aria-label'), 'Guide response available');
-    assert.equal(band.closest('.setup-conversation'), null, 'The control belongs to the visible outer mobile flow.');
+    assert.equal(band.closest('.setup-conversation') === null, true, 'The control belongs to the visible outer mobile flow.');
     assert.equal(document.querySelectorAll('.setup-mobile-tabs > button').length, 2);
-    assert.equal(document.querySelector('.setup-plan-pane [data-proposal-snapshot]'), null);
+    assert.equal(document.querySelector('.setup-plan-pane [data-proposal-snapshot]') === null, true);
     assert.ok(document.querySelector('.setup-plan-pane .forge-welcome-portrait'), 'Context gathering preserves the circular preview.');
     const conversation = document.querySelector('.setup-conversation'), scroll = document.querySelector('.setup-chat-scroll');
     assert.equal(scroll.clientHeight, 0, 'The selected plan has the ordinary hidden Conversation state.');
@@ -1692,7 +1692,7 @@ test('mobile response handoff: a saved context question is visible from Your tea
     assert.match(assistant.textContent, /We can keep shared lending history/);
     assert.equal(assistant.getBoundingClientRect().top, 116, 'Explicit reveal opens the saved reply, not the choices or transcript footer.');
     assert.match(document.querySelector('.setup-current-question').textContent, /Who will use this/);
-    assert.equal(document.querySelector('.setup-new-response'), null, 'Only viewing that exact reply consumes the notice.');
+    assert.equal(document.querySelector('.setup-new-response') === null, true, 'Only viewing that exact reply consumes the notice.');
     assert.equal(document.querySelector('#setup-message').value, responseNextDraft);
     assert.ok(calls.every(call => call.method === 'GET'), 'Opening, publication and navigation submit no guide or provider work.');
   }, nativeResponseOptions);
@@ -1717,7 +1717,7 @@ test('mobile response handoff: a delayed original reveal cannot open a newly sel
     assert.ok(shell.classList.contains('setup-mobile-plan'), 'The old response cannot select another guide\'s Conversation.');
     assert.ok(document.activeElement === focusBefore, 'The old frame cannot focus the newly selected guide.');
     assert.equal(scroll.scrollTop, scrollBefore, 'The old frame cannot scroll another guide\'s transcript.');
-    assert.equal(visibleMobileResponse(document), null, 'The other guide has no saved response to borrow.');
+    assert.equal(visibleMobileResponse(document) === null, true, 'The other guide has no saved response to borrow.');
     await reload(guide.id);
     assert.equal(document.querySelector('#setup-message').value, responseNextDraft, 'The original unsent draft remains owned by its saved setup.');
     assert.ok(calls.every(call => call.method === 'GET'));
@@ -1729,7 +1729,7 @@ test('mobile response handoff: desktop does not add a mobile response band for a
   await mounted(guide, async ({ document, calls, current, save, poll, flushAnimationFrames }) => {
     await flushAnimationFrames();
     save(responsePublication(current())); await poll(); await flushAnimationFrames();
-    assert.equal(document.querySelector('.setup-shell > .setup-mobile-response'), null);
+    assert.equal(document.querySelector('.setup-shell > .setup-mobile-response') === null, true);
     assert.ok(document.querySelector('.setup-chat-scroll').clientHeight > 0, 'Desktop keeps the actual native transcript available.');
     assert.match(document.querySelector('.setup-native-chat').textContent, /We can keep shared lending history/);
     assert.ok(calls.every(call => call.method === 'GET'));
@@ -1748,7 +1748,7 @@ for (const [label, corrupt] of [
     await flushAnimationFrames();
     await selectNoticePane(document, 'plan'); await flushAnimationFrames();
     assert.ok(document.querySelector('.setup-shell').classList.contains('setup-mobile-plan'));
-    assert.equal(visibleMobileResponse(document), null);
+    assert.equal(visibleMobileResponse(document) === null, true);
     assert.ok(calls.every(call => call.method === 'GET'));
   }, nativeResponseOptions);
 });

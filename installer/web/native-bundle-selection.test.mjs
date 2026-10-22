@@ -101,7 +101,7 @@ test('mounted class tool details retain exact native selections through an unrel
     assert.deepEqual(changes,[{tools:{...c.tools,read_only:true}}]);
     await render('ClassInspector',{...props,c:{...c,tools:changes[0].tools}});
     disclosure(document);assert.deepEqual(bp,before);
-    assert.equal(document.querySelector('.native-bundle-selection button'),null,'No acquisition/invocation control is invented');
+    assert.equal(document.querySelector('.native-bundle-selection button') === null,true,'No acquisition/invocation control is invented');
   });
 });
 

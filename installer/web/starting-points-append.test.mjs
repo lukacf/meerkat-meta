@@ -82,7 +82,7 @@ test("starting-point inspiration appends only deliberately to the latest exact d
     await click(button("Add inspiration to my idea"));
     assert.deepEqual(choices, [prefix + "\n\n" + firstText]);
     assert.equal(document.getElementById("owned-idea").value, prefix + "\n\n" + firstText);
-    assert.equal(document.querySelector("details"), null);
+    assert.equal(document.querySelector("details") === null, true);
 
     const revised = "\n  A revised direction\n with exact trailing spaces  ";
     await edit(revised);
@@ -100,7 +100,7 @@ test("starting-point inspiration appends only deliberately to the latest exact d
     assert.equal(document.querySelector("details > p").textContent, secondText);
     await act(async () => owner.setDisabled(false));
     await click(button("Keep my idea"));
-    assert.equal(document.querySelector("details"), null);
+    assert.equal(document.querySelector("details") === null, true);
     assert.equal(document.getElementById("owned-idea").value, latest);
     assert.equal(choices.length, 1);
 
@@ -110,7 +110,7 @@ test("starting-point inspiration appends only deliberately to the latest exact d
     await click(button("Add inspiration to my idea"));
     assert.deepEqual(choices, [prefix + "\n\n" + firstText, newest + "\n\n" + secondText]);
     assert.equal(document.getElementById("owned-idea").value, newest + "\n\n" + secondText);
-    assert.equal(document.querySelector("details"), null);
+    assert.equal(document.querySelector("details") === null, true);
   } finally {
     if (root) await act(async () => root.unmount());
     dom.window.close();

@@ -321,7 +321,7 @@ async function openFallback(document, state, poll) {
   const control = button(document.querySelector('.setup-error'), 'Configure manually');
   assert.equal(control.disabled, false, 'Recovery permits Advanced access while the saved operation is still running');
   await act(async () => { control.click(); await settle(); });
-  assert.equal(document.querySelector('.setup-shell'), null, 'GuidedSetup is hidden without being replaced by a test stub');
+  assert.equal(document.querySelector('.setup-shell') === null, true, 'GuidedSetup is hidden without being replaced by a test stub');
   assert.equal(document.querySelector('.app-shell').style.display, '');
 }
 function completed(state, plan) {
@@ -684,7 +684,7 @@ test('a real newClass manual request binds its normalized running receipt and cl
       proposal: normalized, operation: { ...admitted.operation, status: 'completed' } });
     await poll();
     assert.equal(state.manual(), null, 'Its exact completed request clears the bound note despite normalized blueprint defaults');
-    assert.equal(document.querySelector('.setup-manual-note'), null);
+    assert.equal(document.querySelector('.setup-manual-note') === null, true);
     assert.deepEqual(visibleProposal(document), normalized);
     assert.equal(reviews().length, 1);
     assertUnsent(document, state);
@@ -827,10 +827,10 @@ test('guide read deadlines release the mounted timeline and its startup recovery
       assert.equal(status.signal?.aborted, true, 'The recovery catch has its own bounded read');
       await act(async () => { t.mock.timers.tick(2500); await settle(); });
       assert.equal(timelineReads, 2, 'The same timeline owner reconnects after both reads settle');
-      assert.equal(document.querySelector('.setup-stream-status'), null);
+      assert.equal(document.querySelector('.setup-stream-status') === null, true);
       timeline.resolve(emptyPage); status.resolve(failedStatus);
       await act(async () => { await settle(); });
-      assert.equal(document.querySelector('.setup-stream-status'), null, 'Late expired observations cannot restore a failed startup latch');
+      assert.equal(document.querySelector('.setup-stream-status') === null, true, 'Late expired observations cannot restore a failed startup latch');
       assert.equal([...document.querySelectorAll('button')].some(node => node.textContent.trim() === 'Retry setup team'), false);
       assertUnsent(document, state);
       assert.deepEqual(posts(state), [], 'Read recovery never retries start or the admitted answer');
@@ -870,12 +870,12 @@ test('guide read deadlines release a mounted running-operation poll and ignore i
       state.setServer(next);
       await poll();
       assert.equal(visibleProposal(document).project.name, next.proposal.project.name);
-      assert.equal(document.querySelector('.setup-native-phase'), null, 'Completion clears the retained running presentation');
-      assert.equal(document.querySelector('.setup-error'), null);
+      assert.equal(document.querySelector('.setup-native-phase') === null, true, 'Completion clears the retained running presentation');
+      assert.equal(document.querySelector('.setup-error') === null, true);
       stalled.resolve(oldReply);
       await act(async () => { await settle(); });
       assert.equal(visibleProposal(document).project.name, next.proposal.project.name);
-      assert.equal(document.querySelector('.setup-native-phase'), null);
+      assert.equal(document.querySelector('.setup-native-phase') === null, true);
       assertUnsent(document, state);
       assert.deepEqual(posts(state), [], 'Observation timeout and recovery do not admit another turn');
     });

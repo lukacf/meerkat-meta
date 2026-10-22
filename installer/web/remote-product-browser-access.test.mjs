@@ -372,14 +372,14 @@ test("mounted RemoteDeployment retains the exact custom Close through producer o
     observed.product_scope = "byte-install-stopped";
     for (const key of ["can_stop", "can_restart", "can_configure", "can_prepare_setup", "can_finish_setup", "can_start_background", "private_settings_supported"]) observed[key] = false;
     await act(async () => button("Recheck remote status").click());
-    assert.equal(panel(), originalPanel); assert.equal(panel().querySelector('a[href]'), null);
+    assert.equal(panel(), originalPanel); assert.equal(panel().querySelector('a[href]') === null, true);
     assert.ok(button("Close connection")); assert.equal(button("Connect to Workspace"), undefined);
     assert.equal(dom.window.document.body.textContent.includes("Your application is running in interactive mode."), false);
     for (const status of ["stopped", "recovery-needed"]) {
       observed.status = status; observed.product_control = null; observed.observation = { available: true };
       await act(async () => button("Recheck remote status").click());
       assert.equal(panel(), originalPanel); assert.ok(button("Close connection"));
-      assert.equal(panel().querySelector('a[href]'), null);
+      assert.equal(panel().querySelector('a[href]') === null, true);
       assert.equal(dom.window.document.body.textContent.includes("Your application is running in interactive mode."), false);
     }
     // Pending origin removal withdraws opening before the receipt's cloud
@@ -390,7 +390,7 @@ test("mounted RemoteDeployment retains the exact custom Close through producer o
     assert.equal(button("Connect to Workspace"), undefined);
     await act(async () => button("Close connection").click());
     assert.equal(calls.filter(call => call.method === "POST").length, 1);
-    assert.equal(panel().querySelector('a[href]'), null);
+    assert.equal(panel().querySelector('a[href]') === null, true);
     assert.equal(button("Close connection"), undefined);
   } finally {
     await act(async () => root.unmount()); dom.window.close(); Date.now = originalNow;

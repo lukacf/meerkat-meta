@@ -238,7 +238,7 @@ async function click(document, label) {
   await act(async () => { await settle(); });
 }
 async function assertGuide(document, name) {
-  assert.equal(document.querySelector('.loading-page'), null);
+  assert.equal(document.querySelector('.loading-page') === null, true);
   const editor = document.querySelector('.app-shell');
   assert.ok(editor, 'The actual App editor retains the current startup draft.');
   if (editor.style.display === 'none') {
@@ -263,7 +263,7 @@ test('failed initial workbench read preserves exact saved draft bytes and explic
     assert.equal(state.values.get(DRAFT_KEY), raw);
     assert.deepEqual(state.draftWrites(), []);
     assert.equal(state.importCalls().length, 0);
-    assert.equal(document.querySelector('.setup-plan-pane'), null);
+    assert.equal(document.querySelector('.setup-plan-pane') === null, true);
     await click(document, 'Try again');
     await assertGuide(document, 'Saved observing draft');
     assert.equal(state.importCalls().length, 1);
@@ -285,7 +285,7 @@ test('failed draft import retains bytes and a deferred explicit retry excludes s
     assert.equal(state.workbenchCalls().length, 2, 'Only one deliberate retry is admitted synchronously');
     assert.equal(state.importCalls().length, 2);
     assert.equal(state.values.get(DRAFT_KEY), raw);
-    assert.equal(document.querySelector('.setup-plan-pane'), null);
+    assert.equal(document.querySelector('.setup-plan-pane') === null, true);
     assert.equal(button(document, 'Use a fresh draft instead').disabled, true);
     await finish(waiting, { blueprint: savedPlan() });
     await assertGuide(document, 'Saved observing draft');
@@ -309,13 +309,13 @@ for (const held of ['response headers', 'JSON body']) test(`saved draft import d
     assert.equal(state.importSignals[0]?.aborted, false);
     assert.equal(button(document, 'Use a fresh draft instead').disabled, true);
     await act(async () => { t.mock.timers.tick(29999); await settle(); });
-    assert.equal(document.querySelector('[role="alert"]'), null, 'The selected deadline has not elapsed');
+    assert.equal(document.querySelector('[role="alert"]') === null, true, 'The selected deadline has not elapsed');
     await act(async () => { t.mock.timers.tick(1); await settle(); });
     assert.match(document.querySelector('[role="alert"]').textContent, /taking too long to respond\. Try again\./);
     assert.equal(state.importSignals[0].aborted, true);
     assert.equal(button(document, 'Try again').disabled, false, 'The original startup latch is released at the read deadline');
     assert.equal(button(document, 'Use a fresh draft instead').disabled, false);
-    assert.equal(document.querySelector('.setup-plan-pane'), null);
+    assert.equal(document.querySelector('.setup-plan-pane') === null, true);
     assert.equal(state.values.get(DRAFT_KEY), raw);
     assert.deepEqual(state.draftWrites(), []);
     await act(async () => { t.mock.timers.tick(30000); await settle(); });
@@ -332,8 +332,8 @@ for (const held of ['response headers', 'JSON body']) test(`saved draft import d
     assert.equal(button(document, 'Use a fresh draft instead').disabled, true);
     const retired = savedPlan(); retired.project.name = 'Expired import must not appear';
     await finish(expired, { blueprint: retired });
-    assert.equal(document.querySelector('.setup-plan-pane'), null, 'The expired reply cannot publish while the explicit retry is pending');
-    assert.equal(document.querySelector('[role="alert"]'), null, 'The expired request cannot restore an old error');
+    assert.equal(document.querySelector('.setup-plan-pane') === null, true, 'The expired reply cannot publish while the explicit retry is pending');
+    assert.equal(document.querySelector('[role="alert"]') === null, true, 'The expired request cannot restore an old error');
     assert.equal(button(document, 'Use a fresh draft instead').disabled, true, 'The expired request cannot release the newer startup latch');
     assert.equal(state.values.get(DRAFT_KEY), raw);
     assert.deepEqual(state.draftWrites(), []);
@@ -389,7 +389,7 @@ test('a stored draft changed during import is preserved and must be opened by a 
     assert.match(document.querySelector('[role="alert"]').textContent, /changed while it was opening/);
     assert.equal(state.values.get(DRAFT_KEY), newerRaw);
     assert.deepEqual(state.draftWrites(), []);
-    assert.equal(document.querySelector('.setup-plan-pane'), null);
+    assert.equal(document.querySelector('.setup-plan-pane') === null, true);
     await click(document, 'Try again');
     await assertGuide(document, 'Newer human draft');
     assert.deepEqual(state.importCalls()[1].body, newer);
@@ -419,7 +419,7 @@ for (const late of ['success', 'failure']) test(`an unmounted pending startup ${
   const waiting = deferred(), raw = rawSaved();
   const state = fixture({ raw, workbenchReplies: [waiting.promise, workbench()] });
   await mountedApp(t, state, async ({ document, finish, remount }) => {
-    assert.equal(document.querySelector('.setup-plan-pane'), null);
+    assert.equal(document.querySelector('.setup-plan-pane') === null, true);
     assert.equal(state.values.get(DRAFT_KEY), raw);
     await remount();
     await assertGuide(document, 'Saved observing draft');
@@ -444,7 +444,7 @@ test('a known retained draft stays recoverable when browser storage becomes unre
     assert.equal(state.values.get(DRAFT_KEY), raw);
     assert.deepEqual(state.draftWrites(), []);
     assert.equal(state.workbenchCalls().length, 1, 'An unreadable known draft cannot silently start a fallback');
-    assert.equal(document.querySelector('.setup-plan-pane'), null);
+    assert.equal(document.querySelector('.setup-plan-pane') === null, true);
     await click(document, 'Download saved draft');
     assert.equal(await state.blobs.get(state.downloads[0].href).text(), raw);
     state.setStorageFailure(null);
@@ -587,13 +587,13 @@ test('revision history newer Restore wins after older response settles and its m
     await restoreRevision(document, 1);
     assert.equal(state.calls.filter(call => call.url === `/api/projects/${projectA.slug}?revision=1`).length, 1);
     await restoreRevision(document, 2);
-    assert.equal(historyModal(document), null, 'The newer successful restoration closes its own modal');
+    assert.equal(historyModal(document) === null, true, 'The newer successful restoration closes its own modal');
     assertCurrentDraft(document, state, revisionBlueprint(projectA, 2));
     const writes = state.draftWrites().length;
     await finish(older, revisionResult(projectA, 1));
     assertCurrentDraft(document, state, revisionBlueprint(projectA, 2));
     assert.equal(state.draftWrites().length, writes, 'The old reply cannot persist a replacement draft');
-    assert.equal(historyModal(document), null);
+    assert.equal(historyModal(document) === null, true);
     assert.match(document.querySelector('.toast').textContent, /Project loaded/);
   });
 });
@@ -631,7 +631,7 @@ for (const dismissal of ['Close', 'Escape', 'backdrop']) test(`revision history 
       else document.querySelector('.modal-backdrop').dispatchEvent(new window.MouseEvent('mousedown', { bubbles: true }));
       await settle();
     });
-    assert.equal(historyModal(document), null);
+    assert.equal(historyModal(document) === null, true);
     assertCurrentDraft(document, state, savedPlan());
     await openHistory(document, { advanced: false });
     const reopened = historyModal(document), writes = state.draftWrites().length;
@@ -639,7 +639,7 @@ for (const dismissal of ['Close', 'Escape', 'backdrop']) test(`revision history 
     assert.equal(historyModal(document), reopened, 'An older modal cannot dismiss the new instance');
     assertCurrentDraft(document, state, savedPlan());
     assert.equal(state.draftWrites().length, writes);
-    assert.equal(document.querySelector('.toast'), null, 'Stale restoration cannot announce success');
+    assert.equal(document.querySelector('.toast') === null, true, 'Stale restoration cannot announce success');
     await restoreRevision(document, 2);
     assertCurrentDraft(document, state, revisionBlueprint(projectA, 2));
   });
@@ -658,7 +658,7 @@ test('revision history current Restore refusal remains explicit and retry preser
     assert.match(historyModal(document).textContent, /Current revision read refused/);
     await restoreRevision(document, 2);
     assert.equal(attempts, 2);
-    assert.equal(historyModal(document), null);
+    assert.equal(historyModal(document) === null, true);
     assertCurrentDraft(document, state, revisionBlueprint(projectA, 2));
     await clickNode(document.querySelector('[aria-label="Undo last change"]'));
     assertCurrentDraft(document, state, savedPlan());

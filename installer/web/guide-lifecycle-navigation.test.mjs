@@ -474,7 +474,7 @@ for (const [status, cloud, title, label] of [['running', true, 'Your installed c
       assert.equal(card.querySelector('h1,h2').textContent, title);
       assert.deepEqual([...card.querySelectorAll('button')].map(node => node.textContent.trim()),
         [label, 'Ask the guide what is next']);
-      assert.equal(card.querySelector('a'), null, 'Remote service status cannot create browser access');
+      assert.equal(card.querySelector('a') === null, true, 'Remote service status cannot create browser access');
       const target = document.querySelector('.remote-deployment'), revealed = [];
       target.scrollIntoView = () => revealed.push(target);
       await click(card, label);
@@ -576,7 +576,7 @@ test('remote lifecycle narration masks a held cloud removal without changing the
     assert.equal(applicationStatus(document).querySelector('h1,h2').textContent, 'Checking your remote installation status');
     assert.doesNotMatch(applicationStatus(document).textContent, /is running|Use your remote application/);
     assert.equal(document.querySelector('.remote-deployment').dataset.remoteStatus, 'running');
-    assert.equal(document.querySelector('.remote-deployment a[href="http://127.0.0.1:8791/console"]'), null);
+    assert.equal(document.querySelector('.remote-deployment a[href="http://127.0.0.1:8791/console"]') === null, true);
     await fail(removal, 'SYNTHETIC UNKNOWN REMOVAL DETAIL');
     assert.doesNotMatch(applicationStatus(document).textContent, /is running|Use your remote application/);
     assert.deepEqual(state.receipts.remote.get(A), receipt);
@@ -604,7 +604,7 @@ function assertInstallationObservation(document, phase) {
   const parent = applicationStatus(document);
   assert.equal(parent.querySelector('h1, h2').textContent,
     phase === 'loading' ? 'Checking your installation status' : 'Installation status is unavailable');
-  assert.equal(parent.querySelector('a[href$="/console"]'), null, 'Saved health cannot become a currently checked Console link');
+  assert.equal(parent.querySelector('a[href$="/console"]') === null, true, 'Saved health cannot become a currently checked Console link');
   assert.ok(button(parent, 'Review installation status'));
   assert.ok(![...parent.querySelectorAll('button')].some(node => /^(?:Install agent team|Set up and run|Try the application)$/.test(node.textContent.trim())));
 }
@@ -658,7 +658,7 @@ test('installation panel health copy labels the saved running receipt during a p
     assert.match(health(), /Checking current installation status/);
     assert.doesNotMatch(health(), /The process and native MobKit Console are available/);
     assert.equal(deployment(document).getAttribute('data-deployment-status'), 'running');
-    assert.equal(deployment(document).querySelector('a[href="http://127.0.0.1:18840/console"]'), null,
+    assert.equal(deployment(document).querySelector('a[href="http://127.0.0.1:18840/console"]') === null, true,
       'A retained running receipt cannot publish live links while Stop is unconfirmed');
     const cachedConsole = deployment(document).querySelector('.deployment-interface-scope a');
     assert.equal(cachedConsole?.getAttribute('aria-disabled'), 'true');
@@ -676,7 +676,7 @@ test('installation panel health copy labels the saved running receipt during a p
     await finish(commandRead, { action_request: actionRequest });
     assert.equal(fresh.started, true); assert.match(health(), /Last checked:/);
     await finish(fresh, stopped);
-    assert.equal(deployment(document).querySelector('.deployment-health'), null);
+    assert.equal(deployment(document).querySelector('.deployment-health') === null, true);
     assert.equal(button(deployment(document), 'Start installed application').disabled, false);
     assert.equal(state.posts().length, 1, 'Health wording never repeats Stop or starts the installation');
     assertComposer(document, state);
@@ -691,7 +691,7 @@ test('installation panel health copy uses a successful receipt read despite unre
     const health = deployment(document).querySelector('.deployment-health').textContent;
     assert.match(health, /The process and native MobKit Console are available/);
     assert.doesNotMatch(health, /Last checked:|Current installation status could not be checked/);
-    assert.equal(deployment(document).querySelector('a[href="http://127.0.0.1:18840/console"]'), null,
+    assert.equal(deployment(document).querySelector('a[href="http://127.0.0.1:18840/console"]') === null, true,
       'Checked health does not establish readable command custody');
     const cachedConsole = deployment(document).querySelector('.deployment-interface-scope a');
     assert.equal(cachedConsole?.getAttribute('aria-disabled'), 'true');
@@ -1097,7 +1097,7 @@ test('actual saved-setup selection synchronously holds captured Build, Try, runt
     assert.equal(state.posts().length, 0, 'Captured A callbacks must not admit outgoing work after selection begins');
     assert.equal(state.calls.slice(readsBefore).some(call => call.url.includes('/deployment/settings?')), false,
       'Captured private staging must not read A settings after selection begins');
-    assert.equal(document.querySelector('.deployment-form'), null);
+    assert.equal(document.querySelector('.deployment-form') === null, true);
     for (const control of controls) assert.equal(control.disabled, true, 'Rendered A lifecycle controls visibly pause while B loads');
     assertComposer(document, state);
     await finish(waiting, state.guides.get(B));
@@ -1190,11 +1190,11 @@ test('a private settings read started on A cannot open its form after B selectio
     stale.fields[0].label = 'STALE PRIVATE SETTINGS FROM A';
     await finish(options, stale);
     assert.equal(selected(document), A);
-    assert.equal(document.querySelector('.deployment-form'), null, 'A late settings response must not mount its private form');
+    assert.equal(document.querySelector('.deployment-form') === null, true, 'A late settings response must not mount its private form');
     assert.doesNotMatch(deployment(document).textContent, /STALE PRIVATE SETTINGS FROM A/);
     await finish(waiting, state.guides.get(B));
     assert.equal(selected(document), B);
-    assert.equal(document.querySelector('.deployment-form'), null);
+    assert.equal(document.querySelector('.deployment-form') === null, true);
     assert.equal(state.posts().length, 0);
     assert.equal(state.composer(A), unsent);
   });
@@ -1563,10 +1563,10 @@ test('a pending A Try neither blocks B Try nor releases B sample ownership when 
       turns: [{ identity: 'planner:main', status: 'completed', result: 'CURRENT B TRIAL ANSWER' }] });
     state.receipts.rehearsal.set(B, acceptedB);
     await finish(ownB, acceptedB);
-    assert.equal(document.getElementById(`trial-${B}`), null, 'B own exact admission opens its retained follow-up area');
+    assert.equal(document.getElementById(`trial-${B}`) === null, true, 'B own exact admission opens its retained follow-up area');
     assert.ok(document.getElementById('trial-follow-up-new-admitted-trial-b'));
     assert.equal(state.session.getItem(savedB[0]), null, 'Only B own exact admission consumes its submitted sample');
-    assert.equal(document.getElementById('trial-follow-up-late-trial-a-while-b-pending'), null);
+    assert.equal(document.getElementById('trial-follow-up-late-trial-a-while-b-pending') === null, true);
     for (const [key, value] of savedA) assert.equal(state.session.getItem(key), value);
     assert.equal(state.posts().length, 2, 'Neither navigation nor stale settlement resends or ends either trial');
     assertComposer(document, state, B, composerB);
@@ -1606,7 +1606,7 @@ test('real saved remote browser Close is held during selection and its earlier r
     assertComposer(document, state);
     await finish(retry, state.guides.get(B));
     assert.equal(selected(document), B);
-    assert.equal(remotePanel(), null, 'B does not inherit A owned browser connection');
+    assert.equal(remotePanel() === null, true, 'B does not inherit A owned browser connection');
     assert.equal(state.posts().length, 1);
     assert.equal(state.feedback(A), feedback);
     assert.equal(state.composer(A), unsent);
@@ -1650,7 +1650,7 @@ for (const remote of [false, true]) {
       assert.equal(retained.key, pending.key, 'Confirmation retains the original local or remote source namespace');
       assert.deepEqual(retained.saved.hint, { ...pending.saved.hint, buildId: accepted.build_id, hostRequest: accepted.request });
       assert.equal(selected(document), B);
-      assert.equal(document.querySelector('.installed-improvement-handoff'), null);
+      assert.equal(document.querySelector('.installed-improvement-handoff') === null, true);
       assert.doesNotMatch(implementation(document).textContent, /ADMITTED (?:LOCAL|REMOTE) INSTALLED IMPROVEMENT A/);
       assertComposer(document, state, B, composerB);
       state.receipts.implementation.set(A, accepted);
@@ -1685,14 +1685,14 @@ test('local installed feedback remounted before confirmation recovers its exact 
     const returnA = await beginSelection(document, state, A);
     await finish(returnA, state.guides.get(A));
     assert.equal(selected(document), A);
-    assert.equal(installedOwner(document, false).querySelector('.installed-improvement-handoff'), null);
+    assert.equal(installedOwner(document, false).querySelector('.installed-improvement-handoff') === null, true);
     assert.match(installedOwner(document, false).textContent, /Admission of your improvement request is unconfirmed/);
     const accepted = admittedImprovement(false);
     state.receipts.implementation.set(A, accepted);
     await finish(admission, accepted);
     assert.deepEqual(improvementTracking(state, false).saved.hint,
       { ...pending.saved.hint, buildId: accepted.build_id, hostRequest: accepted.request });
-    assert.equal(installedOwner(document, false).querySelector('.installed-improvement-handoff'), null,
+    assert.equal(installedOwner(document, false).querySelector('.installed-improvement-handoff') === null, true,
       'The retired response confirms storage without publishing into the newly mounted A view');
     const readsBefore = state.calls.length;
     await click(installedOwner(document, false), 'Check Build status');
@@ -1727,12 +1727,12 @@ for (const replacement of ['newer', 'corrupt']) {
       assert.equal(state.session.getItem(pending.key), changed,
         'Fresh captured-namespace read prevents an older response from overwriting newer or damaged tracking');
       assert.equal(selected(document), B);
-      assert.equal(document.querySelector('.installed-improvement-handoff'), null);
+      assert.equal(document.querySelector('.installed-improvement-handoff') === null, true);
       const returnA = await beginSelection(document, state, A);
       await finish(returnA, state.guides.get(A));
       assert.equal(selected(document), A);
       assert.equal(state.session.getItem(pending.key), changed);
-      assert.equal(installedOwner(document, false).querySelector('.installed-improvement-handoff'), null);
+      assert.equal(installedOwner(document, false).querySelector('.installed-improvement-handoff') === null, true);
       assert.equal(button(installedOwner(document, false), 'Improve this behavior').disabled, true,
         'Retained uncertainty does not release an accidental duplicate improvement request');
       assertInstalledDrafts(document, state, false);
@@ -2092,7 +2092,7 @@ test('new-install progress explicitly selects checked custom B without admitting
     await click(applicationStatus(document), 'Set up and run');
     assert.equal(deployment(document).querySelector('[name="deployment-source"]:checked').value, 'application',
       'A new custom application install action must still choose its explicit checked source');
-    assert.equal(document.querySelector('.deployment-form'), null, 'Source navigation does not open or submit private setup automatically');
+    assert.equal(document.querySelector('.deployment-form') === null, true, 'Source navigation does not open or submit private setup automatically');
     assert.equal(state.posts().length, 0);
   });
 });
@@ -2274,7 +2274,7 @@ function assertPendingAdmission(document) {
   assert.equal(implementation(document).querySelector('h2').textContent, 'Build request in progress');
   assert.equal(applicationStatus(document).querySelector('h1,h2').textContent, 'Build request in progress');
   assert.equal(button(implementation(document), 'Starting builder...').disabled, true);
-  assert.equal(document.querySelector('.implementation-selection-recovery'), null);
+  assert.equal(document.querySelector('.implementation-selection-recovery') === null, true);
   assert.doesNotMatch(implementation(document).textContent,
     /Build status is unavailable|saved work.*selected build|Checking saved work|Synthetic status failure/);
 }
@@ -2302,7 +2302,7 @@ test('pending initial Build retains its own request presentation across missing 
       assert.doesNotMatch(applicationStatus(document).textContent, /Build request in progress/);
       await finish(priorRead, lateStatus === 'absence' ? absent('Old absence.') : missingBuildSelection());
       assert.match(implementation(document).textContent, /ACTUAL SELECTED SYNTHETIC BUILD/);
-      assert.equal(document.querySelector('.implementation-selection-recovery'), null);
+      assert.equal(document.querySelector('.implementation-selection-recovery') === null, true);
       assert.doesNotMatch(applicationStatus(document).textContent, /unavailable|needs to be built/);
       assert.equal(state.calls.some(call => call.url.endsWith('/saved-selection')), false);
       assert.deepEqual(state.posts().map(call => ({ url: call.url, body: call.body })), [{
@@ -2322,7 +2322,7 @@ test('pending initial Build yields to a current selected receipt while its POST 
     await tick(15000);
     assert.match(implementation(document).textContent, /ACTUAL SELECTED SYNTHETIC BUILD/);
     assert.doesNotMatch(applicationStatus(document).textContent, /Build request in progress/);
-    assert.equal(document.querySelector('.implementation-selection-recovery'), null);
+    assert.equal(document.querySelector('.implementation-selection-recovery') === null, true);
     assert.equal(state.posts().length, 1);
     await finish(admission, accepted);
     assert.equal(state.posts().length, 1);

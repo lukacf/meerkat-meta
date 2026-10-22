@@ -314,7 +314,7 @@ for (const kind of ['local', 'remote']) {
         await selectBuild(finishedImprovement); observeBuild(finishedImprovement);
         await click('Check Build status');
         assertDrafts(document);
-        assert.equal(document.querySelector('.installed-improvement-handoff'), null, 'A newer unrelated Build is not admission of this report');
+        assert.equal(document.querySelector('.installed-improvement-handoff') === null, true, 'A newer unrelated Build is not admission of this report');
         assert.match(document.body.textContent, /does not confirm whether your earlier report was admitted/);
         assert.equal(button('Prepare another report')?.disabled, false);
         assert.equal(document.querySelector('.deployment-use-feedback button[type="submit"]').disabled, true);
@@ -333,7 +333,7 @@ for (const kind of ['local', 'remote']) {
         });
         await idle();
         assertDrafts(document, newerDraft);
-        assert.equal(document.querySelector('.installed-improvement-handoff'), null);
+        assert.equal(document.querySelector('.installed-improvement-handoff') === null, true);
         assert.deepEqual(publications, beforeLate);
         assert.equal(calls.filter(call => call.method === 'GET').length, beforeReads);
         assert.equal(postsFor(calls, kind, 'feedback').length, 1);
@@ -363,7 +363,7 @@ for (const kind of ['local', 'remote']) {
           await idle(); assertDrafts(document);
           assert.deepEqual([...storage.values], bytes, 'A late reply cannot overwrite or remove newer retained tracking');
           assert.deepEqual(publications, before);
-          assert.equal(document.querySelector('.installed-improvement-handoff'), null);
+          assert.equal(document.querySelector('.installed-improvement-handoff') === null, true);
           assert.doesNotMatch(document.body.textContent, /The builder did not receive this report/);
           assert.equal(postsFor(calls, kind, 'feedback').length, 1);
         }, { storage });
@@ -397,7 +397,7 @@ for (const kind of ['local', 'remote']) {
         await act(async () => { original.reject(Error('PRIVATE_REFUSAL_DETAIL')); await settle(); });
         await idle(); assertDrafts(document);
         assert.deepEqual(publications, before);
-        assert.equal(document.querySelector('.installed-improvement-handoff'), null);
+        assert.equal(document.querySelector('.installed-improvement-handoff') === null, true);
         assert.equal(postsFor(calls, kind, 'feedback').length, 1);
         assert.equal(button('Checking Build status...').disabled, true, 'The original POST finally cannot release the entered GET');
         await act(async () => { finalRead.resolve(finishedImprovement); await settle(); });
@@ -432,7 +432,7 @@ for (const kind of ['local', 'remote']) {
         await act(async () => { original.resolve({ ...finishedImprovement, build_id: 'late-remounted-build', request: 'Late original report.' }); await settle(); });
         await idle(); assertDrafts(document, newerDraft);
         assert.deepEqual(publications, before, 'Retired original publication cannot replace the remounted owner');
-        assert.equal(document.querySelector('.installed-improvement-handoff'), null);
+        assert.equal(document.querySelector('.installed-improvement-handoff') === null, true);
         assert.equal(button(improvementLabel(kind)).disabled, true);
         assert.equal(postsFor(calls, kind, 'feedback').length, 1);
         await select('B'); assertDrafts(document, otherDraft);
@@ -628,9 +628,9 @@ for (const kind of ['local', 'remote']) {
       assert.equal(button(improvementLabel(kind)).disabled, true);
       observeBuild(admitted);
       await select('B');
-      assert.equal(document.querySelector('.installed-improvement-handoff'), null,
+      assert.equal(document.querySelector('.installed-improvement-handoff') === null, true,
         'A different installed source or exact remote destination cannot inherit the confirmed link');
-      assert.equal(document.querySelector('.deployment-use-submitted'), null);
+      assert.equal(document.querySelector('.deployment-use-submitted') === null, true);
       assert.equal(document.querySelector('.deployment-use-field textarea').value, '');
       await edit(otherDraft);
       const readsBeforeReturn = calls.filter(call => call.method === 'GET' && call.target === `/api/guide/${state.id}/implementation`).length;
@@ -646,7 +646,7 @@ for (const kind of ['local', 'remote']) {
       assert.equal(postsFor(calls, kind, 'success').length, 0);
       assert.match(document.body.textContent, /open page only/);
       await select('B'); assertDrafts(document, otherDraft);
-      assert.equal(document.querySelector('.installed-improvement-handoff'), null);
+      assert.equal(document.querySelector('.installed-improvement-handoff') === null, true);
       await select('A'); assertDrafts(document);
       assert.equal(document.querySelector('.installed-improvement-handoff')?.dataset.buildId, admitted.build_id);
       assert.equal(postsFor(calls, kind, 'feedback').length, 1);
@@ -682,7 +682,7 @@ for (const kind of ['local', 'remote']) {
         const originalSuccess = postsFor(calls, kind, 'success')[0].body;
         await select('B');
         assert.equal(button(improvementLabel(kind)).disabled, true, 'An empty separate draft is not a report');
-        assert.equal(document.querySelector('[aria-label="Task awaiting success confirmation"]'), null);
+        assert.equal(document.querySelector('[aria-label="Task awaiting success confirmation"]') === null, true);
         await select('A');
         assert.equal(document.querySelector('[aria-label="Task awaiting success confirmation"]')?.textContent, draft.task.trim(),
           'The exact entered success report remains pending after its first owner unmounted');
@@ -717,7 +717,7 @@ for (const kind of ['local', 'remote']) {
     await mounted(kind, t, () => { throw Error('No new report was requested.'); }, async ({ document, calls }) => {
       assert.equal(document.querySelector('.deployment-use-field textarea').value, '');
       assert.equal(document.querySelector('.deployment-use-feedback textarea').value, '');
-      assert.equal(document.querySelector('[aria-label="Task awaiting success confirmation"]'), null);
+      assert.equal(document.querySelector('[aria-label="Task awaiting success confirmation"]') === null, true);
       assert.equal(document.querySelector('.deployment-use-walkthrough')?.getAttribute('aria-label'), 'Prepare your own first job');
       assert.equal(calls.filter(call => call.method === 'POST').length, 0);
     });

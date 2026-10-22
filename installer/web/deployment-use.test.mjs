@@ -814,7 +814,7 @@ test("first-use availability recovery rechecks valid unavailable application det
     };
     assert.match(document.body.textContent, /saved installation status is running/);
     assert.doesNotMatch(document.body.textContent, /Start the installed application|Paste your copied task/);
-    assert.equal(document.querySelector('a[href]'), null);
+    assert.equal(document.querySelector('a[href]') === null, true);
     assert.ok(check(), "Verified metadata without Console availability still has a scoped recheck");
     assert.equal(check().disabled, false, "Command custody pauses mutations, not the existing metadata read");
     assert.equal(reportSubmit(document).disabled, true);
@@ -829,7 +829,7 @@ test("first-use availability recovery rechecks valid unavailable application det
       json: async () => ({ detail: "Synthetic first-use metadata temporarily unavailable." }) }));
     assert.match(document.body.textContent, /first-use details could not be checked/);
     assert.ok(check());
-    assert.equal(document.querySelector('a[href]'), null);
+    assert.equal(document.querySelector('a[href]') === null, true);
     verifyDrafts();
 
     await act(async () => check().click());
@@ -864,7 +864,7 @@ test("first-use availability recovery rechecks the verified native owner through
     assert.match(document.body.textContent, /checked installed conversation owner is Observing-program owner/);
     assert.match(document.body.textContent, /saved installation status is running/);
     assert.doesNotMatch(document.body.textContent, /Start this installed team|Open the Console and select/);
-    assert.equal(document.querySelector('a[href]'), null);
+    assert.equal(document.querySelector('a[href]') === null, true);
     assert.ok(check(), "A verified owner with unavailable Console must remain recheckable");
     assert.equal(check().disabled, false);
 
@@ -877,7 +877,7 @@ test("first-use availability recovery rechecks the verified native owner through
       json: async () => ({ detail: "Synthetic native first-use metadata temporarily unavailable." }) }));
     assert.match(document.body.textContent, /conversation owner could not be checked/);
     assert.ok(check());
-    assert.equal(document.querySelector('a[href]'), null);
+    assert.equal(document.querySelector('a[href]') === null, true);
 
     await act(async () => check().click());
     assert.match(document.body.textContent, /Checking this installed team's conversation owner/);
@@ -893,7 +893,7 @@ test("first-use availability recovery rechecks the verified native owner through
       await rerender(null, { receipt: { ...receipt, status } });
       assert.match(document.body.textContent, instruction);
       assert.ok(check());
-      assert.equal(document.querySelector('a[href]'), null);
+      assert.equal(document.querySelector('a[href]') === null, true);
       if (status === "stopped") assert.match(document.body.textContent, /Your agent team is stopped/);
       else assert.doesNotMatch(document.body.textContent, /Start this installed team/);
     }
@@ -1034,7 +1034,7 @@ test("the exact local improvement completes visibly without a manual Build check
     assertInstalledReportDraft(ui);
     await ui.rerender(noUi, { build: { ...improvedBuild, build_id: "unrelated-candidate" } });
     assert.doesNotMatch(handoff().textContent, /ready to review/);
-    assert.equal(handoff().querySelector("a"), null);
+    assert.equal(handoff().querySelector("a") === null, true);
   });
 });
 
@@ -1102,7 +1102,7 @@ test("local reload hints cannot borrow a replacement build, different host repor
     { guide_version: guide.version + 1 }, { guide_id: "foreign" }, null]) {
     const candidate = { ...improvedBuild, request: admitted.request, ...change };
     await mountedInstalledReport(noUi, async ui => {
-      assert.equal(ui.document.querySelector(".installed-improvement-handoff"), null);
+      assert.equal(ui.document.querySelector(".installed-improvement-handoff") === null, true);
       assert.doesNotMatch(ui.document.body.textContent, /ready to review|request for proposal \d+ was admitted/);
       assert.equal(reportSubmit(ui.document).disabled, true); assertInstalledReportDraft(ui);
       await act(async () => ui.document.querySelector("form").dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true })));
@@ -1125,7 +1125,7 @@ test("local reload waits for checked installed metadata when its receipt omits t
   const { source_digest, ...ordinaryReceipt } = installed;
   assert.equal(source_digest, source);
   await mountedInstalledReport(noUi, async ui => {
-    assert.equal(ui.document.querySelector(".installed-improvement-handoff"), null);
+    assert.equal(ui.document.querySelector(".installed-improvement-handoff") === null, true);
     assert.doesNotMatch(ui.document.body.textContent, /ready to review/);
     await act(async () => finishSource(feedbackResponse({ ...metadata, continuation: {
       build_id: candidate.build_id, source_digest: candidate.source_digest, available: true, requires_acknowledgement: true } })));
@@ -1167,7 +1167,7 @@ test("a stale automatic local recovery read cannot overwrite a new proposal revi
     version++;
     await ui.rerender(noUi, { state: { ...guide, version }, build: { ...candidate, current_guide_version: version } });
     await act(async () => finish(feedbackResponse(candidate)));
-    assert.equal(ui.document.querySelector(".installed-improvement-handoff"), null);
+    assert.equal(ui.document.querySelector(".installed-improvement-handoff") === null, true);
     assert.equal(reportSubmit(ui.document).disabled, true);
     assert.equal(ui.admissions.length, 0);
     assert.equal(ui.calls.filter(call => call.method === "POST").length, 0);
@@ -1596,14 +1596,14 @@ test("mounted UI discovery retry preserves task and report drafts across unresol
     assert.equal(handoff.querySelector(".deployment-use-contact strong").textContent, metadata.entrypoint.name);
     assert.equal(handoff.querySelector(".deployment-use-contact code").textContent, metadata.entrypoint.identity);
     assert.equal(handoff.querySelectorAll(".deployment-use-console-send li").length, 3);
-    assert.equal(document.querySelector(".deployment-use-admin a"), null);
+    assert.equal(document.querySelector(".deployment-use-admin a") === null, true);
     assert.match(document.body.textContent, /Open application conversation|Paste your copied task/);
     assert.doesNotMatch(document.body.textContent, /Retry UI links/);
     await rerender(declaredUi);
     verifyDrafts();
     assert.match(document.body.textContent, /Open Project workspace/);
     assert.equal(document.querySelector(".deployment-use-entry a").href, declaredUi.entries[0].url);
-    assert.equal(document.querySelector(".deployment-use-console-handoff"), null);
+    assert.equal(document.querySelector(".deployment-use-console-handoff") === null, true);
     assert.equal(document.querySelector(".deployment-use-admin a").href, installed.console_url);
     assert.doesNotMatch(document.body.textContent, /Open application conversation|Paste your copied task/);
   });
@@ -1638,7 +1638,7 @@ test("mounted oversized first-job edits show the limit and retain the exact prev
     assert.equal(field.value, "\u{1f9ed}".repeat(3000));
     assert.equal(field.value.length, 6000);
     assert.equal(field.getAttribute("aria-invalid"), "false");
-    assert.equal(document.querySelector('[role="alert"]'), null);
+    assert.equal(document.querySelector('[role="alert"]') === null, true);
     await edit(field, "\u{1f9ed}".repeat(3001));
     assert.equal(field.value, "\u{1f9ed}".repeat(3000));
     assert.equal(document.querySelector('[role="alert"]').textContent, INSTALLED_USE_TASK_LIMIT_MESSAGE);
@@ -1647,7 +1647,7 @@ test("mounted oversized first-job edits show the limit and retain the exact prev
     assert.equal(document.querySelector('[role="alert"]').textContent, INSTALLED_USE_TASK_LIMIT_MESSAGE);
     await act(async () => [...document.querySelectorAll("button")].find((button) => button.textContent === "Use this idea").click());
     assert.equal(field.value, catalogue.tasks[0].request);
-    assert.equal(document.querySelector('[role="alert"]'), null);
+    assert.equal(document.querySelector('[role="alert"]') === null, true);
     assert.equal(reportField.value, improvement);
     assert.equal(document.querySelector('input[value="blocked"]').checked, true);
     assert.equal(calls.filter((call) => call.method === "POST").length, 0);

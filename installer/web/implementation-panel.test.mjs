@@ -146,7 +146,7 @@ test("the actual builder panel keeps actions ahead of its folded exact summary a
     assert.ok(actions.querySelector("button"), "The existing next action remains outside optional builder prose");
     assert.ok(actions.compareDocumentPosition(disclosure) & document.defaultView.Node.DOCUMENT_POSITION_FOLLOWING);
     assert.equal(disclosure.querySelector("p").textContent, summary);
-    assert.equal(disclosure.querySelector("script"), null);
+    assert.equal(disclosure.querySelector("script") === null, true);
     disclosure.firstElementChild.focus();
     assert.equal(document.activeElement, disclosure.firstElementChild);
     await act(async () => disclosure.firstElementChild.click());
@@ -168,7 +168,7 @@ test("waiting presentation shows the actual saved runtime startup step before na
     const document = textarea.ownerDocument;
     const notice = document.querySelector(".implementation-host-progress");
     assert.ok(notice, "The ordinary waiting view must expose the saved host startup step");
-    assert.equal(notice.closest("details"), null, "Startup status must not require expanding diagnostics or progress");
+    assert.equal(notice.closest("details") === null, true, "Startup status must not require expanding diagnostics or progress");
     assert.match(notice.textContent, /Last saved host step/);
     assert.ok(notice.textContent.includes(message));
     assert.equal(notice.querySelector("time").dateTime, at);
@@ -242,7 +242,7 @@ test("retained builder activity shows the current checking and review phase, the
     assert.match(transcript().textContent, /The saved application source is ready for its checks\./);
     for (const status of ["completed", "failed", "interrupted"]) {
       await render({ ...receipt, status, phase: "independent_review" });
-      assert.equal(notice(), null, `The retained phase must not look active after ${status}`);
+      assert.equal(notice() === null, true, `The retained phase must not look active after ${status}`);
       assert.match(transcript().textContent, /The saved application source is ready for its checks\./);
     }
     assert.equal(calls.length, 1, "Receipt phase changes reuse the same native activity without a new timeline subscription");
@@ -1280,11 +1280,11 @@ test("actual builder check disclosure keeps saved rows without current-success s
       assert.equal(rows[0].querySelector("strong").textContent, checks[0].name);
       assert.equal(rows[0].querySelector("small").textContent, saved ? "Previously passed" : "Passed");
       assert.equal(rows[0].querySelector("p").textContent, checks[0].detail);
-      assert.equal(rows[0].querySelector("script"), null);
+      assert.equal(rows[0].querySelector("script") === null, true);
       const warning = [...document.querySelectorAll(".implementation-detail")]
         .find((item) => item.textContent === "Current source is not yet verified. These are saved check results.");
       assert.equal(!!warning, saved);
-      if (saved) assert.equal(warning.closest("details"), null);
+      if (saved) assert.equal(warning.closest("details") === null, true);
       assert.equal(disclosure.open, false);
     }, { savedDetails: { checks, source_verified: !saved, source_digest: saved ? null : "current-source",
       checked_digest: saved ? "earlier-source" : "current-source",

@@ -119,7 +119,7 @@ test('explicit chat hides held answer labels and sends only the chat while prese
   const text = 'Please explain the privacy tradeoff before I decide.';
   await mounted({ selected: ['shared', 'personal'], combine_options: true, draft: text }, async ({ document, calls, button, click, saved }) => {
     await click(button('Ask or suggest a change'));
-    assert.equal(document.querySelector('.setup-selected-answer'), null);
+    assert.equal(document.querySelector('.setup-selected-answer') === null, true);
     await click(button('Send message'));
     const posts = calls.filter(call => call.method === 'POST');
     assert.equal(posts.length, 1);
@@ -142,7 +142,7 @@ test('a late admitted answer keeps a newer explicit chat draft through a changed
       await act(async () => { resolveBody(); await settle(); });
       assert.equal(editor().value, nextText);
       assert.equal(button('Ask or suggest a change').getAttribute('aria-pressed'), 'true');
-      assert.equal(document.querySelector('.setup-selected-answer'), null);
+      assert.equal(document.querySelector('.setup-selected-answer') === null, true);
       const saved = JSON.parse(window.localStorage.getItem(inputKey({ ...guide, question: nextQuestion })));
       assert.equal(saved.draft, nextText); assert.equal(saved.mode, 'chat');
       assert.deepEqual(calls.filter(call => call.method === 'POST').map(call => call.body),
@@ -158,7 +158,7 @@ const nextQuestion = { ...guide.question, id: 'interfaces', title: 'How would yo
 test('an allowed free-text answer remains valid without selecting a card', async () => {
   const text = 'Something else: one private research project.';
   await mounted({ draft: text }, async ({ document, calls, button, click }) => {
-    assert.equal(document.querySelector('.setup-selected-answer'), null);
+    assert.equal(document.querySelector('.setup-selected-answer') === null, true);
     assert.equal(button('Send answer').disabled, false);
     await click(button('Send answer'));
     assert.deepEqual(calls.filter(call => call.method === 'POST').map(call => call.body),

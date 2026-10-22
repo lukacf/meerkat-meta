@@ -103,7 +103,7 @@ test("optional help starts collapsed and shows one audience question with native
     const group = content.querySelector('[role="group"]');
     assert.equal(document.getElementById(group.getAttribute("aria-labelledby")), heading);
     assert.deepEqual([...group.querySelectorAll("button")].map(node => node.querySelector("strong").textContent), ["Just me", "My household", "A team", "Many people", "I'm still exploring"]);
-    assert.equal(sections()[0].querySelector("textarea, input, [contenteditable]"), null);
+    assert.equal(sections()[0].querySelector("textarea, input, [contenteditable]") === null, true);
     assert.deepEqual(choices, []);
     await click("Back to typing");
     assert.equal(content.hidden, true); assert.equal(document.activeElement, toggle);
@@ -133,10 +133,10 @@ test("two answers make a short human context and change the parent only through 
       await click(kind);
       const preview = content.querySelector(".forge-starting-help__suggestion").textContent;
       assert.equal(preview, expected);
-      assert.equal(content.querySelector('[role="group"]'), null, "Only the context review remains after both questions.");
+      assert.equal(content.querySelector('[role="group"]') === null, true, "Only the context review remains after both questions.");
       assert.equal(document.activeElement, content.querySelector("h3"));
       assert.doesNotMatch(preview, /please|ask me|agents?|provider|tools?|topology|api|deployment/i);
-      assert.equal(sections()[0].querySelector("textarea, input, [contenteditable]"), null);
+      assert.equal(sections()[0].querySelector("textarea, input, [contenteditable]") === null, true);
       assert.deepEqual(choices, [], "Neither answer may call the parent draft action.");
       await click("Use this starting point");
       assert.deepEqual(choices, [{ index: 0, text: expected }]);
@@ -173,7 +173,7 @@ test("Add preserves the exact current draft prefix and uses the revised selectio
       const add = button("Add to my idea");
       await render({ draft });
       assert.equal(button("Add to my idea"), add, "Draft edits keep the current action node.");
-      assert.deepEqual(choices, []); assert.equal(document.querySelector("script"), null);
+      assert.deepEqual(choices, []); assert.equal(document.querySelector("script") === null, true);
       await click("Back to questions"); await click("Back"); await click("A team"); await click("Figuring something out");
       const preview = sections()[0].querySelector(".forge-starting-help__suggestion").textContent;
       await click("Add to my idea");
@@ -286,7 +286,7 @@ test("step navigation focuses and reveals the visible heading while draft and bu
     for (const item of scrolls) {
       assert.equal(item.node, item.focus); assert.equal(item.node.tagName, "H3");
       assert.deepEqual(item.options, { block: "nearest", behavior: "auto" });
-      assert.equal(item.node.closest("[hidden]"), null);
+      assert.equal(item.node.closest("[hidden]") === null, true);
     }
     const back = button("Back to questions"); back.focus();
     await render({ draft: "Later deliberate writing" }); await render({ disabled: true }); await render({ disabled: false });
@@ -357,7 +357,7 @@ test("the second inline choice hands the exact draft to the sole composer with a
   for (const prefix of ["", "  Keep my exact idea\r\n<script>remain literal text</script>\n\t  "]) {
     await mounted({ inlineStart: true, composerId: "existing-composer", draft: prefix }, async ({ document, sections, button, click, render, choices, composer }) => {
       const section = sections()[0], toggle = button("Help me get started");
-      assert.equal(visibleTaskPrompt(section, prompt), null);
+      assert.equal(visibleTaskPrompt(section, prompt) === null, true);
       await click("Help me get started"); await click("A team");
       assert.deepEqual(choices, [], "The audience choice must not update or send the parent draft.");
       assert.equal(composer.value, editorText(prefix));
@@ -372,14 +372,14 @@ test("the second inline choice hands the exact draft to the sole composer with a
       assert.ok(hint, "Closing the questions must keep the task prompt visible beside the draft.");
       assert.equal(hint.tagName, "LABEL");
       assert.equal(hint.htmlFor, composer.id, "The task prompt labels the sole existing composer.");
-      assert.equal(section.querySelector(".forge-starting-help__task-marker"), null);
+      assert.equal(section.querySelector(".forge-starting-help__task-marker") === null, true);
       assert.equal(section.querySelector(".forge-starting-help__summary").textContent, "A team - Keeping track of things");
       assert.equal(section.querySelector(".forge-starting-help__task-example").textContent, "For example: " + example + " Add one task, or send this draft and your guide will help you find one.");
       assert.match(section.textContent, /Add one task, or send this draft and your guide will help you find one\./);
       assert.ok(hint.compareDocumentPosition(composer) & 4, "The handoff prompt belongs above the existing composer.");
       assert.equal(document.querySelectorAll("textarea, input, [contenteditable]").length, 1);
-      assert.equal(section.querySelector("textarea, input, [contenteditable]"), null);
-      assert.equal(document.querySelector("script"), null);
+      assert.equal(section.querySelector("textarea, input, [contenteditable]") === null, true);
+      assert.equal(document.querySelector("script") === null, true);
       const edited = inserted + "\n\nAn actual task with its own wording.  \r\n";
       await render({ draft: edited }); await render({ disabled: true });
       assert.equal(composer.value, editorText(edited));
@@ -390,8 +390,8 @@ test("the second inline choice hands the exact draft to the sole composer with a
       assert.equal(toggle.getAttribute("aria-expanded"), "false");
       assert.equal(choices.length, 1);
       await render({ disabled: false }); await render({ draft: "" });
-      assert.equal(visibleTaskPrompt(section, prompt), null, "An emptied draft clears the local handoff.");
-      assert.equal(section.querySelector(".forge-starting-help__task-example"), null);
+      assert.equal(visibleTaskPrompt(section, prompt) === null, true, "An emptied draft clears the local handoff.");
+      assert.equal(section.querySelector(".forge-starting-help__task-example") === null, true);
       assert.equal(composer.value, "");
       assert.equal(choices.length, 1, "Editing and clearing do not invoke the apply action.");
     }, { withComposer: true });
@@ -415,7 +415,7 @@ test("Change choices is navigation and the second revised choice updates only un
     assert.equal(section.querySelector("h3").textContent, "Who would this help?");
     assert.equal(toggle.getAttribute("aria-expanded"), "true");
     assert.equal(composer.value, editorText(written));
-    assert.equal(section.querySelector(".forge-starting-help__task-example"), null, "Reopening choices does not expose a tentative example as applied context.");
+    assert.equal(section.querySelector(".forge-starting-help__task-example") === null, true, "Reopening choices does not expose a tentative example as applied context.");
     assert.equal(choices.length, 1, "Opening choice revision is navigation, not a draft action.");
     await click("Many people");
     assert.equal(choices.length, 1, "Changing audience alone must not rewrite the draft.");
@@ -438,7 +438,7 @@ test("Change choices is navigation and the second revised choice updates only un
       "For example: Turn our weekly project notes into a clear update. Add one task, or send this draft and your guide will help you find one.");
     assert.equal(document.activeElement, composer);
     assert.equal(document.querySelectorAll("textarea, input, [contenteditable]").length, 1);
-    assert.equal(document.querySelector("script"), null);
+    assert.equal(document.querySelector("script") === null, true);
   }, { withComposer: true });
 });
 
@@ -452,8 +452,8 @@ test("edited inserted wording invalidates the handoff, and a different guide mou
     await click("Help me get started"); await click("A team"); await click("Keeping track of things");
     const changed = prefix + "\n\n" + context.replace("organizing", "sorting") + suffix;
     await render({ draft: changed });
-    assert.equal(visibleTaskPrompt(section, prompt), null, "The helper must not claim that edited context still matches its snapshot.");
-    assert.equal(section.querySelector(".forge-starting-help__task-example"), null, "Editing inserted context clears its example too.");
+    assert.equal(visibleTaskPrompt(section, prompt) === null, true, "The helper must not claim that edited context still matches its snapshot.");
+    assert.equal(section.querySelector(".forge-starting-help__task-example") === null, true, "Editing inserted context clears its example too.");
     assert.equal(composer.value, editorText(changed));
     assert.equal(choices.length, 1, "Invalidation does not repair, replace or submit the user's writing.");
     await click("Help me get started");
@@ -472,8 +472,8 @@ test("edited inserted wording invalidates the handoff, and a different guide mou
   const differentGuideDraft = "An unrelated guide's saved draft.  \n";
   await mounted({ inlineStart: true, draft: differentGuideDraft }, async ({ sections, button, click, choices, composer }) => {
     const section = sections()[0];
-    assert.equal(visibleTaskPrompt(section, prompt), null, "A freshly mounted guide must not inherit the previous guide's handoff.");
-    assert.equal(section.querySelector(".forge-starting-help__task-example"), null);
+    assert.equal(visibleTaskPrompt(section, prompt) === null, true, "A freshly mounted guide must not inherit the previous guide's handoff.");
+    assert.equal(section.querySelector(".forge-starting-help__task-example") === null, true);
     assert.equal(button("Help me get started").getAttribute("aria-expanded"), "false");
     assert.equal(composer.value, editorText(differentGuideDraft));
     assert.deepEqual(choices, []);
@@ -510,7 +510,7 @@ test("starting context restore: an explicit snapshot restores known choices and 
   }, { withComposer: true });
   for (const invalid of [{ ...appliedContext, kind_id: "unknown" }, { ...appliedContext, inserted: prefix + "Unexpected prose" }]) {
     await mounted({ inlineStart: true, draft: appliedContext.inserted + suffix, appliedContext: invalid }, async ({ sections, button, choices }) => {
-      assert.equal(sections()[0].querySelector(".forge-starting-help__handoff"), null, "Only exact explicit known context can restore applied choices.");
+      assert.equal(sections()[0].querySelector(".forge-starting-help__handoff") === null, true, "Only exact explicit known context can restore applied choices.");
       assert.ok(button("Help me get started")); assert.deepEqual(choices, []);
     });
   }
@@ -536,7 +536,7 @@ test("v2 answered Choose returns to committed review without restarting question
     const questionText = question.textContent;
     const summary = document.getElementById(choose.getAttribute("aria-controls"));
     assert.ok(summary); assert.equal(summary.tagName, "H2"); assert.equal(summary.tabIndex, -1);
-    assert.equal(summary.closest("[hidden]"), null);
+    assert.equal(summary.closest("[hidden]") === null, true);
     assert.equal(summary.closest(".forge-starting-context"), section.nextElementSibling);
     const summaryText = summary.textContent, scrolls = [];
     assert.equal(summaryText, "For a team, help with keeping track of things.");
@@ -595,7 +595,7 @@ test("v2 single-field cancellation restores committed review and the owned field
       assert.equal(composer.value, editorText(draft));
       assert.match(document.querySelector(".forge-starting-context").textContent, /For a team, help with keeping track of things\./);
       assert.equal(returns, 0); assert.deepEqual(contextChoices, []); assert.deepEqual(choices, []);
-      assert.equal(document.querySelector("script"), null);
+      assert.equal(document.querySelector("script") === null, true);
     }, { withComposer: true, withStartingContext: true });
   }
 });

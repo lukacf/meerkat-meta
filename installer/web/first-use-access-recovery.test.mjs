@@ -289,13 +289,13 @@ test('a stalled agent-team first-use body exposes explicit recheck and only the 
     assert.equal(held.started, true);
     assert.match(useView(document).textContent, /Checking this installed team's conversation owner/);
     assert.equal(findButton(document, 'Recheck agent team details'), undefined);
-    assert.equal(useView(document).querySelector('a[href]'), null);
+    assert.equal(useView(document).querySelector('a[href]') === null, true);
     await tick(29999);
     assert.equal(findButton(document, 'Recheck agent team details'), undefined);
     await tick(1);
     assert.equal(button(document, 'Recheck agent team details').disabled, false, 'A stalled native-team metadata read must become explicitly recheckable');
     assert.match(useView(document).textContent, /conversation owner could not be checked/);
-    assert.equal(useView(document).querySelector('a[href]'), null);
+    assert.equal(useView(document).querySelector('a[href]') === null, true);
     await click(button(document, 'Recheck agent team details'));
     assert.equal(fixture.count('/use'), 2);
     assert.equal(useView(document).querySelector('a[href]')?.href, nativeReceipt().console_url);

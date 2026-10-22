@@ -232,7 +232,7 @@ test('mobile New response sits above the conversation and only opening the exact
     assert.ok(notice(), 'Automatic decision arrival does not claim the off-screen reply was read');
     assert.equal(notice().parentElement.className, 'setup-mobile-response');
     assert.ok(notice().parentElement.compareDocumentPosition(scroll) & window.Node.DOCUMENT_POSITION_FOLLOWING);
-    assert.equal(document.querySelector('.setup-composer-area .setup-new-response'), null);
+    assert.equal(document.querySelector('.setup-composer-area .setup-new-response') === null, true);
     await act(async () => {
       document.querySelector('#setup-message').focus();
       scroll.dispatchEvent(new window.Event('scroll', { bubbles: true }));
@@ -240,7 +240,7 @@ test('mobile New response sits above the conversation and only opening the exact
     assert.ok(notice(), 'Typing and seeing the choices leave the actual reply unseen');
     await act(async () => notice().click());
     assert.equal(scroll.querySelector('.cc-message--assistant').getBoundingClientRect().top, 116);
-    assert.equal(notice(), null, 'Only the opened native reply clears its exact publication notice');
+    assert.equal(notice() === null, true, 'Only the opened native reply clears its exact publication notice');
     assert.equal(document.querySelector('#setup-message').value, input.draft);
     assert.equal(local.get(input.key), before);
     assert.deepEqual(calls.filter(call => call.method === 'POST'), []);
@@ -265,7 +265,7 @@ test('the real composer uploads multipart files, previews and removes them, then
     assert.equal(document.querySelector('.setup-attachments a').textContent, 'image.png');
     assert.equal(calls.filter(call => call.method === 'POST').length, 0, 'reload never uploads or sends');
     await act(async () => document.querySelector('[aria-label="Remove attachment image.png"]').click());
-    assert.equal(document.querySelector('.setup-attachments a'), null);
+    assert.equal(document.querySelector('.setup-attachments a') === null, true);
   });
   assert.equal(session.size, 0);
 });
@@ -276,10 +276,10 @@ test('a fresh anonymous setup keeps Saved tools closed and never reads a null gu
     assert.ok(button);
     assert.equal(button.disabled, true);
     assert.equal(button.getAttribute('aria-expanded'), 'false');
-    assert.equal(document.querySelector('.setup-saved-tools'), null);
+    assert.equal(document.querySelector('.setup-saved-tools') === null, true);
     await act(async () => { button.click(); await pause(); });
     assert.equal(button.getAttribute('aria-expanded'), 'false');
-    assert.equal(document.querySelector('.setup-saved-tools'), null);
+    assert.equal(document.querySelector('.setup-saved-tools') === null, true);
     assert.equal(calls.some(call => call.url.includes('/toolkit-saved')), false);
     assert.equal(document.querySelector('#setup-message').value, input.draft);
     assert.equal(calls.some(call => call.method === 'POST'), false);
@@ -425,7 +425,7 @@ for (const admission of ['immediate', 'running']) test(`direct ${admission} admi
     }
   } }, async ({ document, choose, local }) => {
     await act(async () => document.querySelector('#setup-send').click());
-    assert.equal(document.querySelector('.setup-attachments a'), null, 'Direct acceptance consumes the first use');
+    assert.equal(document.querySelector('.setup-attachments a') === null, true, 'Direct acceptance consumes the first use');
     await choose('notes.md');
     assert.equal(document.querySelector('.setup-attachments a').textContent, 'notes.md');
     retainedLocal = local;
@@ -519,7 +519,7 @@ test('attachment-only send discusses neutral evidence without confirming an offe
     assert.equal(send.body.text, 'Consider the attached evidence.');
     assert.equal(send.body.action, 'chat'); assert.deepEqual(send.body.selected, []);
     assert.deepEqual(send.body.attachments, [ref()]);
-    assert.equal(document.querySelector('.setup-attachments a'), null);
+    assert.equal(document.querySelector('.setup-attachments a') === null, true);
   });
 });
 
@@ -549,7 +549,7 @@ test('actual pending upload announces progress and disables send until its check
     assert.equal(document.querySelector('#setup-send').disabled, true);
     assert.equal(calls.filter(call => call.url.endsWith('/respond')).length, 0);
     await act(async () => { finish(); await pause(); });
-    assert.equal(document.querySelector('.setup-attachments [role="status"]'), null);
+    assert.equal(document.querySelector('.setup-attachments [role="status"]') === null, true);
     assert.equal(document.querySelector('#setup-send').disabled, false);
   });
 });
@@ -581,9 +581,9 @@ for (const stage of ['headers', 'body']) for (const outcome of ['success', 'erro
       assert.ok(stop, 'The current upload must have an explicit escape while headers or its body are held.');
       await act(async () => { stop.click(); await pause(); });
       assert.equal(oldUpload.signal.aborted, true, 'Only the entered client upload is aborted.');
-      assert.equal(document.querySelector('.setup-attachment-wait'), null);
+      assert.equal(document.querySelector('.setup-attachment-wait') === null, true);
       assert.match(document.querySelector('.setup-attachment-recovery[role="status"]').textContent, /Upload not confirmed.*server may still finish.*Retry the upload or remove the files/i);
-      assert.equal(document.querySelector('.setup-attachments [role="alert"]'), null, 'Stopping the browser wait is a calm recovery state, not an upload failure.');
+      assert.equal(document.querySelector('.setup-attachments [role="alert"]') === null, true, 'Stopping the browser wait is a calm recovery state, not an upload failure.');
       assert.equal(document.querySelector('[aria-label="Remove attachment waiting.png"]').disabled, false);
       assert.ok([...document.querySelectorAll('.setup-attachments button')].some(button => button.textContent === 'Retry upload'));
       assert.equal(document.querySelector('#setup-send').disabled, true, 'Retained pending files still need removal or an explicit retry.');
@@ -615,12 +615,12 @@ for (const stage of ['headers', 'body']) for (const outcome of ['success', 'erro
       });
       assert.equal(newUpload.signal.aborted, false);
       assert.match(document.querySelector('.setup-attachments [role="status"]').textContent, /Uploading files/);
-      assert.equal(document.querySelector('.setup-attachments [role="alert"]'), null);
+      assert.equal(document.querySelector('.setup-attachments [role="alert"]') === null, true);
       assert.deepEqual(createGuideAttachmentStore(() => storage(session)).read(guide.id), [kept],
         'The abandoned response cannot publish refs or consume the new owner pending files.');
       assert.equal(document.querySelector(`[aria-label="Remove attachment ${newName}"]`).disabled, true);
       await act(async () => { releaseNew({ attachments: [ref(newName, 2)] }); await pause(); });
-      assert.equal(document.querySelector('.setup-attachments [role="status"]'), null);
+      assert.equal(document.querySelector('.setup-attachments [role="status"]') === null, true);
       assert.deepEqual(createGuideAttachmentStore(() => storage(session)).read(guide.id), [kept, ref(newName, 2)]);
       assert.equal(editor.value, written);
       assert.equal(JSON.parse(local.get(input.key)).draft, written);
@@ -638,7 +638,7 @@ test('unavailable pixel analysis is disclosed during image upload and after it w
     onPost: ({ url }) => url.endsWith('/attachments')
       ? new Promise(resolve => { finish = () => resolve({ attachments: [ref('image.png')] }); }) : null },
   async ({ document, calls, choose }) => {
-    assert.equal(document.querySelector('.setup-attachment-analysis-note'), null, 'no image means no notice');
+    assert.equal(document.querySelector('.setup-attachment-analysis-note') === null, true, 'no image means no notice');
     assert.match(document.querySelector('#setup-attachments-picker').accept, /image\/png/);
     await choose('image.png');
     assert.equal(document.querySelector('.setup-attachment-analysis-note').textContent, detail);
@@ -649,7 +649,7 @@ test('unavailable pixel analysis is disclosed during image upload and after it w
     assert.equal(document.querySelector('#setup-send').disabled, false);
     await act(async () => document.querySelector('#setup-send').click());
     assert.deepEqual(calls.find(call => call.url.endsWith('/respond')).body.attachments, [ref('image.png')]);
-    assert.equal(document.querySelector('.setup-attachment-analysis-note'), null, 'admitted files no longer belong to the next message');
+    assert.equal(document.querySelector('.setup-attachment-analysis-note') === null, true, 'admitted files no longer belong to the next message');
   });
 });
 
@@ -659,7 +659,7 @@ test('only positively available image analysis suppresses the notice, and docume
     await mount({ state: { ...structuredClone(guide), input_surface: { image_analysis: capability, image_analysis_detail: detail } } },
     async ({ document, choose }) => {
       await choose('notes.md');
-      assert.equal(document.querySelector('.setup-attachment-analysis-note'), null);
+      assert.equal(document.querySelector('.setup-attachment-analysis-note') === null, true);
       await choose('image.png');
       const notice = document.querySelector('.setup-attachment-analysis-note');
       assert.equal(notice?.textContent ?? null, capability === true ? null : detail);
@@ -687,9 +687,9 @@ test('actual navigation cancels the old upload, hides its late failure and allow
     await act(async () => { [...document.querySelectorAll('.setup-history-menu button')].find(node => node.textContent.includes('Other saved setup')).click(); await pause(); });
     assert.match(document.body.textContent, /Other saved question/);
     assert.equal(oldUpload.signal.aborted, true);
-    assert.equal(document.querySelector('.setup-attachments [role="status"]'), null);
-    assert.equal(document.querySelector('.setup-attachments [role="alert"]'), null);
-    assert.equal(document.querySelector('.setup-attachments a'), null);
+    assert.equal(document.querySelector('.setup-attachments [role="status"]') === null, true);
+    assert.equal(document.querySelector('.setup-attachments [role="alert"]') === null, true);
+    assert.equal(document.querySelector('.setup-attachments a') === null, true);
     await choose('new.md');
     assert.equal(document.querySelector('.setup-attachments a').getAttribute('href'), ref('new.md', 2, other.id).url);
     await act(async () => { failOld(); await pause(); });
@@ -737,7 +737,7 @@ test('guide submission waits for anonymous startup and response confirmation whi
       assert.equal(row()?.querySelector('[role="status"]')?.textContent, 'Sending to your guide');
       assert.match(row().textContent, /Waiting for confirmation\. You can keep writing below\./);
       assert.doesNotMatch(row().textContent, /saved|Guide request running|elapsed|Using tool|Last tool/i);
-      assert.equal(row().querySelector('.setup-guide-wait-clock'), null);
+      assert.equal(row().querySelector('.setup-guide-wait-clock') === null, true);
       assert.equal(row().hasAttribute('data-request-id'), false, 'Local sending cannot invent a saved request binding.');
       assert.equal(document.querySelector('#setup-send').disabled, true);
       assert.equal(document.querySelector('#setup-message').disabled, false);
@@ -755,7 +755,7 @@ test('guide submission waits for anonymous startup and response confirmation whi
     await edit(duringResponse);
     await act(async () => { document.querySelector('#setup-send').click(); releaseResponse(); await pause(); });
     assert.equal(row().querySelector('[role="status"]').textContent, 'Saved - your guide is working');
-    assert.equal(row().querySelector('small'), null, 'The first idea does not repeat the saved-answer hint.');
+    assert.equal(row().querySelector('small') === null, true, 'The first idea does not repeat the saved-answer hint.');
     assert.equal(document.querySelector('.forge-next-draft-hint').textContent,
       'Your next draft stays here. Send it when your guide replies.');
     assert.doesNotMatch(row().textContent, /Sending to your guide|Waiting for confirmation/);
@@ -792,7 +792,7 @@ test('guide submission lost acknowledgement preserves the edited draft without c
     await act(async () => { rejectResponse(new Error('Offline acknowledgement lost; acceptance could not be confirmed.')); await pause(); });
     const delivery = document.querySelector('[aria-label="Message delivery status"]');
     assert.equal(delivery.querySelector('[role="status"]').textContent, 'Message delivery is not confirmed');
-    assert.equal(document.querySelector('.setup-error'), null, 'Unconfirmed delivery uses its honest status instead of exposing the transport error.');
+    assert.equal(document.querySelector('.setup-error') === null, true, 'Unconfirmed delivery uses its honest status instead of exposing the transport error.');
     assert.doesNotMatch(delivery.textContent, /Your submitted answer is saved|Guide request running|Sending to your guide/);
     assert.doesNotMatch(document.querySelector('.setup-native-chat').textContent, /Guide request running|Your submitted answer is saved|Sending to your guide/);
     assert.equal(document.querySelector('#setup-message').value, next);
@@ -980,7 +980,7 @@ test('first turn transition restores the initial question after refusal or inter
       assert.match(document.querySelector('.setup-error').textContent, /Offline first answer refused before admission/);
       assert.equal(document.querySelector('.setup-current-question') !== null, true, 'Refused admission restores the original question.');
       assert.equal(document.querySelector('.setup-starting-points') !== null, true);
-      assert.equal(document.querySelector('.setup-guide-wait'), null);
+      assert.equal(document.querySelector('.setup-guide-wait') === null, true);
       assert.equal(document.querySelector('#setup-message').value, next);
       assert.equal(JSON.parse(local.get(input.key)).draft, next);
       assert.equal(calls.filter(call => call.method === 'POST').length, 1, 'Refusal never automatically retries the first turn.');
@@ -994,7 +994,7 @@ test('first turn transition restores the initial question after refusal or inter
       assert.equal(document.querySelector('.setup-current-question') !== null, true, 'An interrupted saved operation is not a current waiting binding.');
       assert.ok(document.querySelector('.setup-current-question').textContent.includes(initial.question.title));
       assert.equal(document.querySelector('.setup-starting-points') !== null, true);
-      assert.equal(document.querySelector('.setup-guide-wait'), null);
+      assert.equal(document.querySelector('.setup-guide-wait') === null, true);
       assert.equal(document.querySelector('#setup-message').value, next);
       assert.equal(calls.filter(call => call.method === 'POST').length, 0);
     });

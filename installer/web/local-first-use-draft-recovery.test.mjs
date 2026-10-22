@@ -356,12 +356,12 @@ function assertUnchecked(document, draft) {
   assert.equal(view.querySelector('h3')?.textContent, 'Use your application');
   assert.match(view.textContent, /first-use details could not be checked/);
   assertDrafts(document, draft);
-  assert.equal(view.querySelector('a'), null, 'Unchecked metadata cannot publish application, native or task links');
-  assert.equal(view.querySelector('.deployment-use-ideas'), null);
-  assert.equal(view.querySelector('.deployment-use-walkthrough'), null);
-  assert.equal(view.querySelector('.deployment-use-success'), null);
+  assert.equal(view.querySelector('a') === null, true, 'Unchecked metadata cannot publish application, native or task links');
+  assert.equal(view.querySelector('.deployment-use-ideas') === null, true);
+  assert.equal(view.querySelector('.deployment-use-walkthrough') === null, true);
+  assert.equal(view.querySelector('.deployment-use-success') === null, true);
   assert.equal(view.querySelector('.deployment-use-feedback')?.tagName, 'FORM', 'The report editor keeps its original guarded container');
-  assert.equal(view.querySelector('button[type="submit"]'), null);
+  assert.equal(view.querySelector('button[type="submit"]') === null, true);
   assert.equal([...view.querySelectorAll('button')].some(button =>
     ['It worked', 'Improve this behavior'].includes(button.textContent.trim())), false);
   assert.doesNotMatch(view.textContent, /UNCHECKED NAME|UNCHECKED IDEA/);
@@ -660,8 +660,8 @@ function assertCachedEntriesPaused(document, originalLabels) {
     assert.equal(link.getAttribute('aria-disabled'), 'true');
     assert.equal(link.tabIndex, -1, 'A paused live entry is removed from sequential keyboard navigation');
   }
-  assert.equal(document.querySelector(`a[href="${entryUrl(A)}"]`), null);
-  assert.equal(document.querySelector(`a[href="${receiptFor(A).console_url}"]`), null);
+  assert.equal(document.querySelector(`a[href="${entryUrl(A)}"]`) === null, true);
+  assert.equal(document.querySelector(`a[href="${receiptFor(A).console_url}"]`) === null, true);
   assert.equal(taskLink(document), undefined, 'Unknown command custody cannot publish a task handoff');
 }
 function assertCachedEntriesLive(document, expectedUrls) {
@@ -763,8 +763,8 @@ for (const variant of ['application UI', 'application Console', 'native team']) 
       assert.equal(window.sessionStorage.getItem(storedKey), null);
       assert.equal(document.querySelector('.deployment-panel').dataset.deploymentStatus, 'stopped');
       assert.equal(receipts.filter(Boolean).at(-1)?.deployment_id, enteredCommand.deployment_id);
-      assert.equal(document.querySelector(`a[href="${entryUrl(A)}"]`), null);
-      assert.equal(document.querySelector(`a[href="${receiptFor(A).console_url}"]`), null);
+      assert.equal(document.querySelector(`a[href="${entryUrl(A)}"]`) === null, true);
+      assert.equal(document.querySelector(`a[href="${receiptFor(A).console_url}"]`) === null, true);
       assert.equal(taskField(document), originalEditors.task);
       assert.equal(taskField(document).value, taskFor(A));
       if (!nativeTeam) assertDrafts(document, draftFor(A));

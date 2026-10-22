@@ -225,7 +225,7 @@ test(`mounted A -> B -> A builder notes survive ${storageFailure} storage failur
     ui.restoreFeedbackPersistence();
     await ui.flush(() => ui.button('Retry saving builder note').click());
     assert.equal(ui.savedDraft(), noteA);
-    assert.equal(ui.dom.window.document.querySelector('.implementation-feedback [role="status"]'), null);
+    assert.equal(ui.dom.window.document.querySelector('.implementation-feedback [role="status"]') === null, true);
     await ui.navigate(otherState);
     assert.equal(ui.text(), noteB);
     await ui.flush(() => ui.button('Retry saving builder note').click());
@@ -244,7 +244,7 @@ test('mounted unread builder note retry recovers its older saved text before any
     await ui.flush(() => ui.button('Retry saving builder note').click());
     assert.equal(ui.text(), initialDraft, 'Retry reads the unknown stored note instead of writing the unread empty view.');
     assert.equal(ui.savedDraft(), initialDraft);
-    assert.equal(ui.dom.window.document.querySelector('.implementation-feedback [role="status"]'), null);
+    assert.equal(ui.dom.window.document.querySelector('.implementation-feedback [role="status"]') === null, true);
     assert.equal(ui.calls.filter(call => call.method === 'POST').length, 0);
   });
 });
@@ -359,7 +359,7 @@ for (const outcome of ['success', 'error']) test(`checker preparation response r
     assert.equal(ui.button('Build application').disabled, false);
     assert.match(ui.dom.window.document.querySelector('.setup-checker').textContent, /App checks ready/);
     assert.doesNotMatch(ui.dom.window.document.body.textContent, /OLD POST|Preparation was not confirmed/);
-    assert.equal(ui.dom.window.document.querySelector('.setup-checker [role="alert"]'), null);
+    assert.equal(ui.dom.window.document.querySelector('.setup-checker [role="alert"]') === null, true);
     assert.equal(ui.text(), latestDraft); assert.equal(ui.savedDraft(), latestDraft);
     assert.equal(ui.calls.length, calls, 'A late POST response starts no refresh, retry or build.');
     assert.equal(host.posts, 1);
@@ -382,7 +382,7 @@ test('checker preparation response recovery follows an existing preparation unti
     assert.equal(host.posts, 1); assert.equal(ui.text(), initialDraft);
     await ui.flush(() => host.finish(new Error('Late response lost after actual readiness.')));
     assert.equal(ui.button('Build application').disabled, false);
-    assert.equal(ui.dom.window.document.querySelector('.setup-checker [role="alert"]'), null);
+    assert.equal(ui.dom.window.document.querySelector('.setup-checker [role="alert"]') === null, true);
     assert.equal(host.posts, 1);
   });
 });
@@ -436,7 +436,7 @@ test('checker preparation response recovery keeps visible uncertainty after fail
     host.value = { status: 'ready', can_prepare: false, detail: 'A fresh explicit read verifies current readiness.' };
     await ui.flush(() => ui.button('Check status').click());
     assert.equal(ui.button('Build application').disabled, false);
-    assert.equal(ui.dom.window.document.querySelector('.setup-checker [role="alert"]'), null);
+    assert.equal(ui.dom.window.document.querySelector('.setup-checker [role="alert"]') === null, true);
     assert.equal(ui.text(), latestDraft); assert.equal(ui.savedDraft(), latestDraft);
     assert.equal(host.posts, 1);
     assert.equal(ui.calls.filter(call => call.method === 'POST' && call.target !== '/api/checker-setup').length, 0);
@@ -465,7 +465,7 @@ test('checker preparation response recovery respects the real mutable guide sele
     assert.equal(ui.text(), initialDraft); assert.equal(ui.savedDraft(), initialDraft);
     await ui.flush(() => host.finish(new Error('Old preparation response after navigation.')));
     assert.equal(ui.button('Build application').disabled, false); assert.equal(host.posts, 1);
-    assert.equal(ui.dom.window.document.querySelector('.setup-checker [role="alert"]'), null);
+    assert.equal(ui.dom.window.document.querySelector('.setup-checker [role="alert"]') === null, true);
   });
 });
 
@@ -515,7 +515,7 @@ test("mounted running feedback survives review, reconnect and terminal remount u
     assert.equal(ui.savedDraft(), note);
     assert.equal(ui.calls.filter((call) => call.method === "POST").length, 0);
     await ui.poll(receipt(initial.build_id, { phase: "automatic_repair" }));
-    assert.equal(ui.dom.window.document.querySelector('[role="alert"]'), null);
+    assert.equal(ui.dom.window.document.querySelector('[role="alert"]') === null, true);
     assert.equal(ui.text(), note);
     await ui.remount();
     assert.equal(ui.text(), note);
@@ -918,7 +918,7 @@ for (const outcome of ["admission", "error"]) test(`saved-build response recover
     assert.equal(ui.savedDraft(), finalNote);
     assert.equal(ui.reported.length, callbacks, "The detached original result invokes no parent receipt callback.");
     assert.equal(ui.calls.length, requests, "A detached result must not refresh or submit any request.");
-    assert.equal(ui.dom.window.document.querySelector('[role="alert"]'), null);
+    assert.equal(ui.dom.window.document.querySelector('[role="alert"]') === null, true);
     assert.equal(ui.dom.window.document.body.textContent.includes(oldError), false);
     assert.ok(ui.button("Try saved application") && !ui.button("Try saved application").disabled);
   });
@@ -971,7 +971,7 @@ test("saved-build response recovery cannot transfer to another guide or a revise
       assert.equal(ui.text(), otherDraft);
       assert.equal(ui.savedDraft(next.id), otherDraft);
       assert.equal(ui.calls.filter(call => call.method === "POST").length, 1);
-      assert.equal(ui.dom.window.document.querySelector('[role="alert"]'), null);
+      assert.equal(ui.dom.window.document.querySelector('[role="alert"]') === null, true);
     });
   }
 });
@@ -1044,7 +1044,7 @@ for (const outcome of ["admission", "error"]) test(`mounted delayed Build ${outc
     assert.equal(ui.text(), latestDraft);
     assert.equal(ui.savedDraft(), latestDraft);
     assert.equal(ui.savedDraft(otherState.id), otherDraft);
-    assert.equal(ui.dom.window.document.querySelector('[role="alert"]'), null,
+    assert.equal(ui.dom.window.document.querySelector('[role="alert"]') === null, true,
       "The old action's error must not appear in the returned guide");
     assert.equal(ui.dom.window.document.body.textContent.includes(oldError), false);
 

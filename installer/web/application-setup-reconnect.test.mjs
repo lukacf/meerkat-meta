@@ -84,7 +84,7 @@ async function mounted(verify, fixture = {}) {
   const button = label => [...dom.window.document.querySelectorAll("button")].find(node => node.textContent === label);
   const assertReadOnly = () => {
     assert.ok(calls.every(call => call.method === "GET" && call.body === undefined));
-    assert.equal(dom.window.document.querySelector("input, textarea, form"), null,
+    assert.equal(dom.window.document.querySelector("input, textarea, form") === null, true,
       "The setup handoff never solicits private Configure values in the browser.");
   };
   try {

@@ -88,7 +88,7 @@ test('selecting a second request removes the first completed review and renews a
   await mount(completed(rows[0]), () => prior(rows[1]), async ({ click, discussed }) => {
     assert.match(document.querySelector('h3').textContent, /gmail/);
     await click('slackservicesRequest 22222222');
-    assert.equal(document.querySelector('.setup-saved-tools-current'), null);
+    assert.equal(document.querySelector('.setup-saved-tools-current') === null, true);
     assert.match(document.querySelector('pre').textContent, /slack/);
     assert.equal(document.querySelector('input[type=checkbox]').checked, false);
     assert.equal([...document.querySelectorAll('button')].find(node => node.textContent === 'Review current settings').disabled, true);
