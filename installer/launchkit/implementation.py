@@ -567,6 +567,15 @@ Finish the user's requested application around the ACTUAL proposed MobKit system
 Read inspect_implementation and the seeded app.py before writing code. The context
 contains the frozen brief, original user evidence, exact agents, tools, native flows,
 peer relationships and unmet requirements. Preserve the user's scope and choices.
+If organization is present, it is the exact visible organization context saved with
+this guide, not the currently installed plugin or authorization. Carry its relevant
+identity, deployment and integration constraints into the application and tests.
+Starting examples remain optional; the actual brief and user corrections decide
+which outcome is being built. References to private packages, authentication or
+installation contracts do not supply those files or grant access. Use only source
+adopted into the workspace by the host, check declared dependencies against the
+selected runtime, and report missing or incompatible references as dependencies.
+Do not import a plugin, install a package or widen grants from a context hint.
 Original messages also include comments about Forge and its proposal animation.
 Those refine the setup experience. Do not turn them into installed application
 features unless the current brief or an explicit application implementation request
@@ -1022,7 +1031,8 @@ class ImplementationService:
             receipt_bytes = (directory / "receipt.json").read_bytes()
             frozen = json.loads(input_bytes)
             scope = {"id": guide_id, "version": frozen.get("guide_version"),
-                     "blueprint": frozen.get("blueprint"), "brief": frozen.get("brief")}
+                     "blueprint": frozen.get("blueprint"), "brief": frozen.get("brief"),
+                     "organization": frozen.get("organization")}
             snapshot = self._accepted_framework(guide_id, build_id, source_digest, scope, frozen["blueprint"])
             selection = self._retained_runtime_candidate(directory, frozen)
             if snapshot.runtime_candidate != selection:
@@ -1066,7 +1076,8 @@ class ImplementationService:
             # Its retained acceptance proves its own original brief/source;
             # the new application must earn fresh acceptance for today's brief.
             frozen_scope = {"id": guide_id, "version": frozen.get("guide_version"),
-                            "blueprint": frozen.get("blueprint"), "brief": frozen.get("brief")}
+                            "blueprint": frozen.get("blueprint"), "brief": frozen.get("brief"),
+                     "organization": frozen.get("organization")}
             if (receipt.get("build_id") != build_id or receipt.get("status") != "completed"
                     or receipt.get("cleanup_pending") or receipt.get("cleanup_in_progress")
                     or build_id in self.tasks or build_id in self.processes
@@ -1194,6 +1205,9 @@ class ImplementationService:
             trial_replay_capsule = deepcopy(trial_replay_capsule)
         async with self.lock:
             state = await self._guide(guide_id)
+            if state.get("organization") is not None:
+                from .organization import organization_snapshot
+                state["organization"] = organization_snapshot(state["organization"])
             if state["version"] != version:
                 raise DraftConflict("This setup changed. Reload before building the application.")
             if state.get("operation", {}).get("status") == "running":
@@ -1280,10 +1294,12 @@ class ImplementationService:
                 and fingerprint(previous_candidate) == fingerprint(runtime_candidate))
             same_specification = bool(previous_input
                 and previous_input["blueprint"] == proposal
-                and previous_input.get("brief", {}) == state.get("brief", {}))
+                and previous_input.get("brief", {}) == state.get("brief", {})
+                and fingerprint(previous_input.get("organization")) == fingerprint(state.get("organization")))
             if preserve_design and same_specification:
                 same_specification = (fingerprint(previous_input["blueprint"]) == fingerprint(proposal)
-                    and fingerprint(previous_input.get("brief", {})) == fingerprint(state.get("brief", {})))
+                    and fingerprint(previous_input.get("brief", {})) == fingerprint(state.get("brief", {}))
+                    and fingerprint(previous_input.get("organization")) == fingerprint(state.get("organization")))
             framework_baseline = None
             if framework_override:
                 if not same_specification:
@@ -1507,6 +1523,8 @@ class ImplementationService:
                           "previous_implementation": previous_context,
                           "framework": framework_provenance,
                           "application_contract": APPLICATION_CONTRACT}
+                if state.get("organization") is not None:
+                    frozen["organization"] = deepcopy(state["organization"])
                 if runtime_candidate is not None:
                     if fingerprint(framework_provenance.get("runtime_candidate")) != fingerprint(runtime_candidate):
                         raise DraftConflict("The selected candidate changed while preparing its framework.")
@@ -1560,12 +1578,15 @@ class ImplementationService:
                            "cleanup_in_progress": False, "worker_stop_confirmed": False,
                            "progress": [{"at": now(), "message": "Created an isolated application workspace."}],
                            "created_at": now(), "updated_at": now()}
+                if frozen.get("organization") is not None:
+                    initial["organization_hash"] = fingerprint(frozen["organization"])
                 latest_state = await self._guide(guide_id)
                 latest_proposal = latest_state.get("proposal") or latest_state.get("blueprint")
                 if (latest_state["version"] != version or latest_state.get("operation", {}).get("status") == "running"
                         or fingerprint(latest_proposal) != fingerprint(state.get("proposal") or state.get("blueprint"))
                         or latest_state.get("brief", {}) != frozen["brief"]
-                        or latest_state.get("messages", []) != frozen["messages"]):
+                        or latest_state.get("messages", []) != frozen["messages"]
+                        or fingerprint(latest_state.get("organization")) != fingerprint(frozen.get("organization"))):
                     raise DraftConflict("The setup changed while preparing this build. Reload before starting the application builder.")
 
                 def publish_admission():
@@ -1949,6 +1970,8 @@ class ImplementationService:
             files.extend(independent_files)
         manifest = {key: status[key] for key in ("build_id", "guide_version", "blueprint_hash", "summary", "checks", "unresolved")}
         manifest["brief_hash"] = fingerprint(frozen.get("brief") or {})
+        if frozen.get("organization") is not None:
+            manifest["organization_hash"] = fingerprint(frozen["organization"])
         manifest["verification"] = await asyncio.to_thread(workspace.verification)
         framework = await asyncio.to_thread(workspace.framework_provenance)
         if framework:

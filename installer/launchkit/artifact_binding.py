@@ -19,7 +19,9 @@ def proposal_hash(value):
 
 def inputs(state):
     return {"blueprint_hash": proposal_hash(state.get("proposal") or state.get("blueprint")),
-            "brief_hash": fingerprint(state.get("brief") or {})}
+            "brief_hash": fingerprint(state.get("brief") or {}),
+            **({"organization_hash": fingerprint(state["organization"])}
+               if state.get("organization") is not None else {})}
 
 
 def matches(receipt, state, *, brief_hash=None):
@@ -28,6 +30,7 @@ def matches(receipt, state, *, brief_hash=None):
     return bool(state.get("proposal") or state.get("blueprint")) and bool(
         receipt.get("guide_id") == state.get("id")
         and receipt.get("blueprint_hash") == scope["blueprint_hash"]
+        and ("organization_hash" not in receipt or receipt["organization_hash"] == scope.get("organization_hash"))
         and (brief_hash if brief_hash is not None else receipt.get("brief_hash")) == scope["brief_hash"])
 
 
@@ -41,6 +44,12 @@ def frozen_matches(receipt, frozen, state):
     scope = {"guide_id": frozen["guide_id"],
              "blueprint_hash": proposal_hash(frozen.get("blueprint")),
              "brief_hash": fingerprint(frozen.get("brief") or {})}
+    if frozen.get("organization") is not None:
+        scope["organization_hash"] = fingerprint(frozen["organization"])
+        if receipt.get("organization_hash") != scope["organization_hash"]:
+            return False
+    elif "organization_hash" in receipt:
+        return False
     if not isinstance(frozen.get("brief"), dict) and frozen["guide_version"] != state.get("version"):
         # Missing legacy inputs cannot prove unchanged application scope.
         return False
@@ -66,6 +75,8 @@ def report_brief_hash(report):
 
 def package_matches(report, state):
     brief_hash = report_brief_hash(report)
+    if "organization_hash" in report and report["organization_hash"] != inputs(state).get("organization_hash"):
+        return False
     if type(report.get("guide_version")) is not int or report.get("blueprint_hash") != inputs(state)["blueprint_hash"]:
         return False
     # Legacy packages without a full brief binding cannot cross transcript

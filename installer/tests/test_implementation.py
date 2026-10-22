@@ -1556,3 +1556,85 @@ async def test_framework_refresh_does_not_bypass_prior_owned_cleanup(service, cl
     assert len(list(service.root.glob("*/*/receipt.json"))) == 1
     assert (directory / "receipt.json").read_bytes() == before
     await service.shutdown()
+
+
+async def test_organization_reaches_builder_and_reviewer_from_saved_guide_only(service, monkeypatch):
+    from launchkit.acceptance import SemanticAcceptance
+    from launchkit.implementation_workspace import WorkspaceError
+    organization = {"schema_version": 1, "id": "workplace", "version": "1.0",
+        "label": "Example workplace", "description": "", "starting_examples": [],
+        "guide_context": "Use the selected private identity package; keep its missing contract explicit."}
+    service.guide.state["organization"] = deepcopy(organization)
+    monkeypatch.setattr("launchkit.organization.load_organization_plugin",
+        lambda *a, **kw: pytest.fail("Build must not reload the installed plugin"))
+    try:
+        admitted = await service.submit(service.guide.identity, 3, "Build this workplace tool")
+        directory = service._directory(service.guide.identity)
+        frozen = json.loads((directory / "input.json").read_text())
+        assert admitted["current"] and admitted["organization_hash"] == fingerprint(organization)
+        assert frozen["organization"] == organization
+        tools = BuildTools(directory)
+        assert (await tools.context({"view": "full"}))["organization"] == organization
+        projected = await tools.context({})
+        projected["organization"]["guide_context"] = "Changed projection"
+        assert tools.input["organization"] == organization
+        reviewer = SemanticAcceptance(directory / "acceptance", tools.workspace, frozen)
+        reviewer.begin_round()
+        assert reviewer.context()["organization"] == organization
+        reviewer.context()["organization"]["guide_context"] = "Changed reviewer projection"
+        assert reviewer.context()["organization"] == organization
+        changed = deepcopy(frozen)
+        changed["organization"]["guide_context"] = "Different identity constraints"
+        with pytest.raises(WorkspaceError):
+            SemanticAcceptance(directory / "acceptance", tools.workspace, changed)
+        service.guide.state["organization"]["version"] = "2.0"
+        assert not (await service.status(service.guide.identity))["current"]
+        assert tools.input["organization"] == organization
+        assert json.loads((directory / "input.json").read_text())["organization"] == organization
+    finally:
+        await service.shutdown()
+
+
+async def test_organization_change_during_preparation_refuses_new_admission(service, monkeypatch):
+    service.guide.state["organization"] = {"schema_version": 1, "id": "workplace", "version": "1.0",
+        "label": "Example workplace", "description": "", "starting_examples": [], "guide_context": "Original context"}
+    reached, release = pause_build_preparation(monkeypatch, "seed")
+    admission = asyncio.create_task(service.submit(service.guide.identity, 3, "Prepare the application"))
+    try:
+        await asyncio.wait_for(reached.wait(), 5)
+        service.guide.state["organization"]["guide_context"] = "Different identity constraints"
+        release.set()
+        with pytest.raises(DraftConflict, match="changed while preparing"):
+            await admission
+        assert not service.tasks and not service.processes
+        assert not (service.root / service.guide.identity / "latest.json").exists()
+    finally:
+        release.set()
+        await asyncio.gather(admission, return_exceptions=True)
+        await service.shutdown()
+
+
+async def test_organization_bound_application_keeps_framework_export_and_recovery(service):
+    service.guide.state["organization"] = {"schema_version": 1, "id": "workplace", "version": "1.0",
+        "label": "Example workplace", "description": "", "starting_examples": [], "guide_context": "Workplace identity context"}
+    try:
+        first = await service.submit(service.guide.identity, 3, "Keep workplace identity")
+        project = await complete(service, first)
+        status = await service.status(service.guide.identity)
+        assert status["current"] and status["ready_to_package"]
+        baseline = service._accepted_framework(service.guide.identity, first["build_id"], project.digest(),
+            service.guide.state, service.guide.state["proposal"])
+        assert baseline.previous_build_id == first["build_id"]
+        selection_path = service._directory(service.guide.identity).parent / "latest.json"
+        selection_bytes = selection_path.read_bytes()
+        selection_path.unlink()
+        candidates = await service.saved_selection(service.guide.identity)
+        assert [row["build_id"] for row in candidates["candidates"]] == [first["build_id"]]
+        selection_path.write_bytes(selection_bytes)
+        data, _ = await service.package(service.guide.identity, first["build_id"])
+        with zipfile.ZipFile(io.BytesIO(data)) as package:
+            report = json.loads(package.read("implementation-report.json"))
+        assert report["organization_hash"] == fingerprint(service.guide.state["organization"])
+        assert (await service.submit(service.guide.identity, 3, "Keep workplace identity"))["build_id"] == first["build_id"]
+    finally:
+        await service.shutdown()

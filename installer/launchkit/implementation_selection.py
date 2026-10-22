@@ -204,7 +204,7 @@ def candidate(parent_path, guide_id, build_id, *, restoring=False, budget=None):
                             or not isinstance(receipt.get("created_at"), str) or len(receipt["created_at"]) > 100
                             or not frozen_matches(receipt, frozen, {"id": guide_id,
                                 "version": frozen["guide_version"], "blueprint": frozen["blueprint"],
-                                "brief": frozen["brief"]})
+                                "brief": frozen["brief"], "organization": frozen.get("organization")})
                             or receipt.get("request") != frozen.get("request")
                             or fingerprint(receipt.get("framework")) != fingerprint(frozen.get("framework"))):
                         raise CustodyError(ERROR)
