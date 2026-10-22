@@ -610,11 +610,14 @@ def _native_prefix_progress(report_progress, action):
 
 
 def verify_meta_toolkit_prefix(artifacts, *, deployment_root, prefix_path=None,
-        report_progress=None):
+        report_progress=None, known=None, record=None):
     """Compare generic installed bytes/modes/links to the selected full archive.
 
     Native resource loading and application admission stay with their existing
     owners. This creates no installed-resource manifest or release receipt.
+    ``known`` maps a regular file to the fingerprint a verified, hashed walk
+    observed; an unchanged fingerprint skips that file's read. ``record``
+    collects each file's fingerprint, taken after an fsync, for such a walk.
     """
     if __package__ == "launchkit.templates":
         from ..runtime_candidates import MetaToolkitRuntimeArtifacts, MAX_PRODUCT_FILE_BYTES
@@ -630,6 +633,7 @@ def verify_meta_toolkit_prefix(artifacts, *, deployment_root, prefix_path=None,
         require(selected.name == artifacts.prefix, "The original startup selected another product prefix.")
         owned_directory(selected.parent)
     expected = {entry.name: entry for entry in artifacts.entries}
+    gateway = artifacts.prefix + "/bin/toolkit_gateway"
     progress = _native_prefix_progress(report_progress, "Checking native runtime files")
     observed = set()
     def walk(path, name):
@@ -650,10 +654,26 @@ def verify_meta_toolkit_prefix(artifacts, *, deployment_root, prefix_path=None,
             require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
                 and stat.S_IMODE(info.st_mode) == entry.mode and info.st_size == entry.size,
                 "An installed native prefix file or mode changed.")
-            data = read_owned(path, MAX_PRODUCT_FILE_BYTES, empty=True)
-            require(digest(data) == entry.sha256, "An installed native prefix file changed.")
+            if record is not None:
+                # Writeback write-protects every shared mapping of the file, so
+                # any later write through one faults and moves its ctime.
+                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                info = path.lstat()
+                require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                    and stat.S_IMODE(info.st_mode) == entry.mode and info.st_size == entry.size,
+                    "An installed native prefix file or mode changed.")
+            # The executed gateway is always hashed, whatever its fingerprint.
+            if (known is None or name == gateway or tuple(known.get(name, ())) != fingerprint(info)):
+                data = read_owned(path, MAX_PRODUCT_FILE_BYTES, empty=True)
+                require(digest(data) == entry.sha256, "An installed native prefix file changed.")
         require(fingerprint(path.lstat()) == fingerprint(info), "The native prefix changed during readback.")
         if entry.kind == "file":
+            if record is not None:
+                record[name] = (fingerprint(info), time.time_ns())
             progress(entry.size)
     walk(selected, artifacts.prefix)
     require(observed == set(expected), "The complete installed native prefix inventory changed.")

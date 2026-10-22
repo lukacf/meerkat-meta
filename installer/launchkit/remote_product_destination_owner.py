@@ -180,7 +180,7 @@ def _package_source(payload, context, origin, *, check_platform=True):
     return files, selection
 
 
-def _artifact_custody(context):
+def _artifact_custody(context, retained=None):
     """Read completed original artifact custody without replaying receiver finish."""
     home = Path(context["host"]["home"])
     store = home / ".local/state/meta-forge/product-artifacts" / context["artifact_transaction_id"]
@@ -214,7 +214,7 @@ def _artifact_custody(context):
         "artifact_root": str(store / "inputs"), "selection_sha256": context["artifact_selection_sha256"]}
     _require(read("custody.json", receiver.MAX_RESPONSE_BYTES) == _json(expected),
         "The original complete artifact observation is absent or changed.")
-    artifacts = selected_runtime_artifacts(relocated)
+    artifacts = selected_runtime_artifacts(relocated, retained=retained)
     observed = {str(pin.path.relative_to(relocated.artifact_root)):
         {"name": str(pin.path.relative_to(relocated.artifact_root)), "size": pin.size, "sha256": pin.sha256}
         for pin in artifacts.evidence}
@@ -275,8 +275,8 @@ def _result(context):
         "artifact_selection_sha256": context["artifact_selection_sha256"], "status": "product-source-staged"}
 
 
-def _staged_inputs(context, store, *, owner_source, installed_view=None):
-    original, relocated, artifacts, evidence = _artifact_custody(context)
+def _staged_inputs(context, store, *, owner_source, installed_view=None, retained=None):
+    original, relocated, artifacts, evidence = _artifact_custody(context, retained)
     inputs = _Inputs(store)
     _, payload = inputs.read(store / "package.zip", context["package_sha256"], MAX_APPLICATION_BYTES,
         size=context["package_size"])
@@ -472,7 +472,7 @@ class StoppedProductSource:
     """
 
     def __init__(self, context, store, owner_source, lease, require_current, *,
-            installed_view=None, file_lane=False):
+            installed_view=None, file_lane=False, retained=None):
         self._context, self._store = deepcopy(context), store
         self._owner_source, self._lease, self._owner_current = owner_source, lease, require_current
         self._closed = self._invalidated = False
@@ -483,7 +483,7 @@ class StoppedProductSource:
         else:
             self.require_owner_current()
         files, self._origin, self._relocated, self._artifacts, self._observed = _staged_inputs(
-            context, store, owner_source=owner_source, installed_view=installed_view)
+            context, store, owner_source=owner_source, installed_view=installed_view, retained=retained)
         self._files = {name: ArtifactFile(self._root / name, len(content), hashlib.sha256(content).hexdigest())
             for name, (content, _) in files.items()}
         self._receipt = {"scope": "staged-product-application-source", "status": "product-source-staged",

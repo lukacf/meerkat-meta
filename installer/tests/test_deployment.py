@@ -1730,3 +1730,30 @@ async def test_harmless_turn_retains_owned_install_and_private_options_without_r
     revised = {**service.guide.state, "brief": {"requirements": [{"id": "custom-ui", "outcome": "Add a custom UI"}]}}
     assert not (await service.status(service.guide.identity, state=revised))["current"]
     await service.shutdown()
+
+
+async def test_retry_admission_checks_leave_the_event_loop_free(service, tmp_path, monkeypatch):
+    from launchkit import deployment
+    receipt = await submit(service, tmp_path / "team")
+    stopped = await service.action(service.guide.identity, receipt["deployment_id"], "stop")
+    assert stopped["interactive_cleanup"]["boundary"] == "worker-not-admitted"
+    original = deployment.package_files
+    def slowed(payload):
+        time.sleep(1.0)  # A large package on a small host.
+        return original(payload)
+    monkeypatch.setattr(deployment, "package_files", slowed)
+    stalls, done = [], asyncio.Event()
+    async def other_request():
+        while not done.is_set():
+            started = time.monotonic()
+            await asyncio.sleep(0.01)
+            stalls.append(time.monotonic() - started)
+    probe = asyncio.create_task(other_request())
+    await asyncio.sleep(0)  # The other request is waiting on the loop.
+    try:
+        retried = await service.action(service.guide.identity, receipt["deployment_id"], "retry")
+    finally:
+        done.set()
+        await probe
+    assert retried["status"] == "queued" and stalls and max(stalls) < 0.5
+    await service.shutdown()

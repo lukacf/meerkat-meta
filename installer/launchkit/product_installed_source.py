@@ -451,7 +451,7 @@ def _selected_owner_source(directory, owner_source, owner_source_sha256):
 
 
 @contextmanager
-def _open_files(directory, lease, callback, owner_source, application_startup):
+def _open_files(directory, lease, callback, owner_source, application_startup, retained=None):
     from .deployment import OWNER_FILE, ownership, read_receipt, verify_destination
     from .deployment_application_bootstrap import bootstrap_installation_binding
     from .deployment_sources import read_package_source
@@ -503,7 +503,7 @@ def _open_files(directory, lease, callback, owner_source, application_startup):
     with _intake(context, owner_source) as (store, current):
         receiver._read(store / "staged.json", receiver._json(_result(context)), keep=False)[1].finish()
         source = StoppedProductSource(context, store, owner_source, lease, callback,
-            installed_view=view, file_lane=True)
+            installed_view=view, file_lane=True, retained=retained)
         try:
             require_product_installation(source, receipt)
             current()
@@ -519,8 +519,12 @@ def _open_files(directory, lease, callback, owner_source, application_startup):
 
 @asynccontextmanager
 async def open_installed_product_source(directory, *, project_lease, require_current,
-        owner_source=None, owner_source_sha256=None, application_startup=None):
-    """Join file work while the original owner callback stays on its caller task."""
+        owner_source=None, owner_source_sha256=None, application_startup=None, retained=None):
+    """Join file work while the original owner callback stays on its caller task.
+
+    Only a product Start passes ``retained``: the inventory receipt.json names
+    for its installed prefix, used in place of re-inflating the archive.
+    """
     from .remote_product_artifacts import _current
     def current():
         project_lease.require_current()
@@ -540,7 +544,7 @@ async def open_installed_product_source(directory, *, project_lease, require_cur
         owner_source_sha256, _owner_current=current)
         if has_intake else None)
     current()
-    scope = _open_files(directory, project_lease, current, expected, application_startup)
+    scope = _open_files(directory, project_lease, current, expected, application_startup, retained)
     entered = {}
     def enter():
         entered["source"] = scope.__enter__()

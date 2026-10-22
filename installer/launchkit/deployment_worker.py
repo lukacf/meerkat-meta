@@ -154,6 +154,25 @@ def console_health_headers(destination):
         raise ValueError("The private Console health authorization could not be verified.") from None
 
 
+
+STARTUP_REFUSAL_GRACE = 2
+
+
+def startup_refusal(line):
+    """A child's custody refusal, reported on its readiness channel before exiting.
+
+    The child writes {"refused": message} only for a source custody refusal
+    before readiness, so the Start failure names the file and the remedy.
+    """
+    try:
+        payload = json.loads(line)
+    except (ValueError, UnicodeError, TypeError):
+        return None
+    message = payload.get("refused") if type(payload) is dict and set(payload) == {"refused"} else None
+    if type(message) is not str or not message.strip():
+        return None
+    return "The application refused to start: " + message.strip()[:2000]
+
 class Supervisor:
     def __init__(self, directory, *, source_custody=None):
         self.directory = Path(directory)
@@ -678,7 +697,7 @@ class Supervisor:
             raise RuntimeError("The selected candidate cannot use native gateway overrides.")
         return target
 
-    def _verify_candidate_runtime(self, files, *, source_custody=None):
+    def _verify_candidate_runtime(self, files, *, source_custody=None, retained=None, observation=None):
         target = self._candidate_runtime_target(files)
         if target is None:
             return None
@@ -691,12 +710,87 @@ class Supervisor:
             from .product_runtime_custody import require_product_source, require_product_installation
             require_product_installation(source_custody, read_receipt(self.directory))
             require_product_source(source_custody, target, destination=self.destination, files=files)
+        # A carrier already made its reads with any retained inventory it was given.
         proof = verify_runtime(self.destination, selected_runtime_version(target), runtime_target=target,
-            **({"source_custody": source_custody} if source_custody is not None else {}))
+            **({"source_custody": source_custody} if source_custody is not None else
+                {"retained": retained} if retained is not None else {}),
+            **({"observation": observation} if observation is not None else {}))
         verify_destination(read_receipt(self.directory), files)
         if self._candidate_runtime_target(files) != target:
             raise RuntimeError("The admitted candidate selection changed during runtime verification.")
         return proof
+
+    @staticmethod
+    async def _startup_refusal(started):
+        """The refusal an exited child wrote to its readiness channel, if any."""
+        try:
+            line = await asyncio.wait_for(asyncio.shield(started), STARTUP_REFUSAL_GRACE)
+        except (asyncio.TimeoutError, ValueError, OSError, asyncio.LimitOverrunError, asyncio.IncompleteReadError):
+            return None
+        return startup_refusal(line)
+
+    def _keep_native_inventory(self, observation, proof):
+        """Keep an install's fully verified prefix inventory for its later Starts."""
+        from .native_prefix_receipt import RECEIPT_FIELD, mint
+        artifacts = observation.get("artifacts")
+        try:
+            # The selection this install verified, not a later receipt read.
+            named = None if artifacts is None else mint(self.directory, artifacts, proof=proof,
+                runtime_candidate=self.receipt.get("runtime_candidate"),
+                fingerprints=observation.get("fingerprints"))
+        except (OSError, ValueError, TypeError):
+            # Keeping the inventory is only a cache; the next Start verifies fully.
+            named = None
+        return {RECEIPT_FIELD: named} if named is not None else {}
+
+    def _prune_native_inventories(self):
+        from .native_prefix_receipt import prune
+        try:
+            prune(self.directory)
+        except OSError:
+            pass
+
+    def _retained_native_inventory(self, definition):
+        """The inventory receipt.json names for this Start, or None for the full check."""
+        if "runtimeCandidate" not in definition:
+            return None
+        from .native_prefix_receipt import load
+        return load(self.directory, read_receipt(self.directory))
+
+    def _settle_native_inventory(self, retained, observation, proof, verified_receipt):
+        """After a verified Start, hold a used inventory to the receipt or keep a new one.
+
+        ``verified_receipt`` is the receipt the verification ran on. A new
+        inventory records its selection, and is named only while the live
+        receipt still selects it.
+        """
+        from .native_prefix_receipt import (RECEIPT_FIELD, installed_inventory_sha256, mint, record,
+            same_selection)
+        artifacts = observation.get("artifacts")
+        if artifacts is None or proof is None:
+            return
+        receipt = read_receipt(self.directory)
+        if observation.get("inventory_source") == "retained":
+            if (retained is None or receipt.get(RECEIPT_FIELD) != retained.receipt_sha256
+                    or installed_inventory_sha256(receipt) != retained.inventory_sha256
+                    or not same_selection(receipt, retained.runtime_candidate_sha256)
+                    or proof.get("prefix_inventory_sha256") != retained.inventory_sha256):
+                raise RuntimeError("Forge's saved native runtime inventory changed during verification. Start again.")
+            return
+        # The full verification ran. Keep its inventory only for the digest the
+        # installed proof already records; a failed verification never gets here.
+        selected = verified_receipt.get("runtime_candidate")
+        if installed_inventory_sha256(verified_receipt) != proof.get("prefix_inventory_sha256"):
+            return
+        try:
+            named = mint(self.directory, artifacts, proof=proof, runtime_candidate=selected,
+                fingerprints=observation.get("fingerprints"))
+            if named is not None:
+                record(self.directory, named, inventory_sha256=proof["prefix_inventory_sha256"],
+                    runtime_candidate=selected)
+        except (OSError, ValueError, TypeError):
+            # Keeping the inventory is only a cache; the next Start verifies fully.
+            pass
 
     def native_binary_provenance(self, files):
         """Retain the existing installer's owned artifact receipt, not a version guess."""
@@ -768,16 +862,22 @@ class Supervisor:
                 report_progress=lambda message: journal(self.directory, message))
             require_current()
             journal(self.directory, "Checking the installed runtime and application.")
+            observation = {}
             proof = await await_product_validation(source_custody, verify_runtime, self.destination,
                 selected_runtime_version(target), runtime_target=target, **paths,
-                report_progress=lambda message: journal(self.directory, message),
+                report_progress=lambda message: journal(self.directory, message), observation=observation,
                 **({"source_custody": source_custody} if source_custody is not None else {}))
             require_current()
             await command([str(paths["sdk_python"]), "app.py", "--application-check"],
                 "Installed application contract", CHECK_TIMEOUT)
             require_current()
+            # Only this success continuation keeps the verified inventory; a
+            # failed check above never reaches it.
+            kept = await asyncio.to_thread(self._keep_native_inventory, observation, proof)
             journal(self.directory, "Selected runtime bytes and application contract are checked. Configure the original native startup before use.",
-                installed_candidate_runtime_proof=proof)
+                installed_candidate_runtime_proof=proof, **kept)
+            if kept:
+                await asyncio.to_thread(self._prune_native_inventories)
             return
         if "runtimeCandidate" in definition:
             raise RuntimeError("A private runtime candidate requires its checked stopped-installation update; a fresh installation is not admitted.")
@@ -1183,9 +1283,11 @@ class Supervisor:
                         raise DraftConflict("The original child source admission changed.")
                     from .deployment_application_bootstrap import require_bootstrap_admission_current
                     require_bootstrap_admission_current(self.directory, pin, selected, observed)
+            retained = await asyncio.to_thread(self._retained_native_inventory, definition)
             async with installed_bootstrap_source(self.directory, original_bootstrap,
                     require_current=current_source_owner,
-                    owner_source=getattr(self, "_bootstrap_owner_source", None)) as source_custody:
+                    owner_source=getattr(self, "_bootstrap_owner_source", None),
+                    retained=retained) as source_custody:
                 bootstrap_selected, bootstrap_observation = await await_product_validation(
                     source_custody, observe_bootstrap_admission, self.directory, original_bootstrap,
                     **({"source_custody": source_custody} if source_custody is not None else {}))
@@ -1204,13 +1306,17 @@ class Supervisor:
                 current = read_receipt(self.directory)
                 if "runtimeCandidate" in definition or "runtime_candidate" in current:
                     from .deployment_updates import checked_package
+                    observation = {}
                     def runtime_proof():
                         _, files = checked_package(self.directory, "package.zip", current["package_sha256"])
                         if json.loads(files["deployment.json"][0]) != definition:
                             raise RuntimeError("The candidate startup definition differs from its checked package.")
-                        return self._verify_candidate_runtime(files, source_custody=source_custody)
+                        return self._verify_candidate_runtime(files, source_custody=source_custody,
+                            retained=retained, observation=observation)
                     candidate_proof = await await_product_validation(source_custody, runtime_proof)
                     require_bootstrap_original()
+                    await asyncio.to_thread(self._settle_native_inventory, retained, observation, candidate_proof,
+                        current)
                 if (source_custody is not None and current.get("knowledge_managed") is True
                         and definition["knowledge"]["mode"] == "local"):
                     await self.prepare_knowledge(definition, require_current=current_source_owner,
@@ -1309,12 +1415,17 @@ class Supervisor:
             if stopped in done:
                 raise asyncio.CancelledError
             if exited in done:
-                raise RuntimeError(f"The application stopped before startup verification (exit {process.returncode}).")
+                # A child that refused its source custody said why before exiting.
+                refusal = await self._startup_refusal(started)
+                raise RuntimeError(refusal or f"The application stopped before startup verification (exit {process.returncode}).")
             if started not in done:
                 raise TimeoutError("The application did not finish native startup verification in time. Rebuild a package with the current host if it lacks Forge readiness reporting.")
             startup = started.result()
             if not startup:
                 raise RuntimeError("The application closed its startup verification channel before reporting readiness. Inspect the runtime logs for the native startup failure.")
+            refusal = startup_refusal(startup)
+            if refusal is not None:
+                raise RuntimeError(refusal)
             try:
                 payload = json.loads(startup)
             except (ValueError, UnicodeError):
@@ -1539,9 +1650,8 @@ async def _install_selected_product(supervisor, artifacts, require_current, comm
 async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=None, update_selection=None):
     """One source transaction, one verified startup, and at most one safe fallback."""
     from . import deployment_updates as updates
-    from .deployment_application_bootstrap import require_bootstrap_history_settled
+    from .deployment_application_bootstrap import require_update_bootstrap_history
     directory = supervisor.directory
-    require_bootstrap_history_settled(directory)
     if update_selection is not None:
         selected = updates.read_update_admission(directory, mode, update_selection)
         if update_id is not None and update_id != selected["binding"]["update_id"]:
@@ -1555,9 +1665,15 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
     # Existing trusted direct callers retain their first checked selection.
     # User-launched workers supply the earlier original admission explicitly.
     expected_binding = updates.update_binding(update) if expected_binding is None else updates.update_binding(expected_binding)
+    # After setup, the completed Restore recorded at Stage is the only history
+    # admission, and only its owner starts the application. This worker's own
+    # transaction may count as lineage while it changes source.
+    bootstrap_restore = updates.setup_restore_pin(directory, update)
+    require_update_bootstrap_history(directory, bootstrap_restore, in_flight=expected_binding)
+    owner_start = bootstrap_restore is not None
 
     def current_transaction(*, check_replacement=True):
-        require_bootstrap_history_settled(directory)
+        require_update_bootstrap_history(directory, bootstrap_restore, in_flight=expected_binding)
         if update_selection is not None:
             retained = updates.read_update_admission(directory, mode, update_selection)
             updates.require_update_binding(retained["binding"], expected_binding)
@@ -1580,6 +1696,8 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
     updates.require_application_policy_continuity(directory, update)
     updates.require_replacement_history_settled(directory)
     identity = update["update_id"]
+    if owner_start and replacement is not None:
+        raise DraftConflict("After setup, a replacement startup cannot follow its completed Restore. No source was changed.")
     if replacement is not None:
         from .deployment_application_startup import selected_inputs, ATTEMPT_NAME
         from .connect_application_startup import _joined
@@ -1611,7 +1729,7 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
     restore_data = rollback and update.get("runtime_admission_possible") is False and (
         update.get("rollback_kind") == "failed-update" or update["status"] in {"applying", "verifying", "recovery-needed"})
 
-    def publish(restored):
+    def publish(restored, *, started=True):
         nonlocal ready
         current = read_receipt(directory)
         _, _, bound = current_transaction()
@@ -1621,7 +1739,8 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
             raise DraftConflict("The started source no longer matches the admitted update transaction.")
         _, source = updates.checked_package(directory, "package.zip", current["package_sha256"])
         verify_destination(current, source)
-        updates.committed(directory, identity, restored=restored, expected_binding=expected_binding, expected_installation=expected_installation)
+        updates.committed(directory, identity, restored=restored, started=started,
+            expected_binding=expected_binding, expected_installation=expected_installation)
         ready = True
 
     async def observe_native_revision():
@@ -1804,7 +1923,8 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
                 # A ready new marker can survive an interruption before the
                 # checkpoint above. Ordinary startup re-inspects native truth;
                 # it does not repeat an already completed native apply.
-            checks = [("Updated application contract", "--application-check")] if product_update else [
+            # A set-up product's doctor needs its owner's startup, as at install.
+            checks = [("Updated application contract", "--application-check")] if product_update or owner_start else [
                 ("Update prerequisites", "--doctor"), ("Updated application contract", "--application-check")]
             for name, flag in checks:
                 verify_destination(read_receipt(directory), files)
@@ -1861,7 +1981,11 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
                 raise RuntimeError("Previous source and canonical configuration were restored as a new observed native revision, but its legacy host cannot restore continuing role instructions. Existing sessions and all current private records are preserved; recover the current accepted application rather than claiming role rollback.")
         updates._require_runtime_framework_configuration(read_receipt(directory), current)
         current_transaction()
-        if replacement is None:
+        if owner_start:
+            # The owner's next Start restores the completed setup with this
+            # checked source. No worker child selects bootstrap inputs.
+            publish(restored, started=False)
+        elif replacement is None:
             await supervisor.start(definition, on_ready=lambda: publish(restored))
         else:
             from .deployment_application_startup import selected_inputs, retain_attempt
@@ -2128,14 +2252,20 @@ async def run(directory, mode, *, update_selection=None, bootstrap_selection=Non
         if bootstrap_lifecycle_binding(read_receipt(directory)) != original_lifecycle:
             raise DraftConflict("The original bootstrap worker lifecycle changed before supervisor admission.")
         require_bootstrap_history_settled(directory, bootstrap_selection=original_bootstrap)
-    from .deployment_application_bootstrap import require_bootstrap_history_settled
-    require_bootstrap_history_settled(directory, bootstrap_selection=original_bootstrap)
+    from .deployment_application_bootstrap import (require_bootstrap_history_settled,
+        require_update_bootstrap_history)
+    if update_selection is None:
+        require_bootstrap_history_settled(directory, bootstrap_selection=original_bootstrap)
     expected = None
     if update_selection is not None:
         from .deployment_updates import read_update_admission, transaction, require_recovery_source
         expected = read_update_admission(directory, mode, update_selection)
-        receipt, _, _ = transaction(directory, expected["binding"]["update_id"],
+        receipt, _, staged = transaction(directory, expected["binding"]["update_id"],
                                     expected_binding=expected["binding"], expected_installation=expected["installation"])
+        # After setup, only the completed Restore recorded at Stage admits it.
+        from .deployment_updates import setup_restore_pin
+        require_update_bootstrap_history(directory, setup_restore_pin(directory, staged),
+            in_flight=expected["binding"])
         require_recovery_source(directory, expected)
     if mode in {"update", "rollback", "recover-current"}:
         if expected is None:
