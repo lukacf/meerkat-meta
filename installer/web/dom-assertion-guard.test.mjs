@@ -83,3 +83,20 @@ test("the guard finds DOM nodes compared with undefined or with another node and
   assert.deepEqual(equalityAssertions(source).map((finding) => finding.method).filter((method) => method !== "equal"),
     ["notEqual", "deepEqual"]);
 });
+
+test("the guard reads functions, a node's own values, request bodies and text calls as values", () => {
+  const source = [
+    "const pick = () => document.querySelector('.x');",
+    "const value = document.querySelector('.save');",
+    "Object.defineProperty(globalThis, 'saveButton', { configurable: true, value });",
+    "const children = document.querySelector('ul').children;",
+    "assert.equal(handler, pick);",
+    "assert.equal(document.querySelector('input').value, draft);",
+    "assert.equal(init.body, payload);",
+    "assert.equal(children[0], label.trim());",
+    "assert.equal(document.body, current);",
+    "assert.equal(children[0], label);",
+    "assert.equal(!document.activeElement, expected);",
+  ].join("\n");
+  assert.deepEqual(domAssertions(source).map((finding) => finding.line), [9, 10]);
+});
