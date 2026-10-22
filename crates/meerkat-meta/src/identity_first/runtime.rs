@@ -2165,15 +2165,24 @@ impl IdentityFirstRuntimeContext {
         &self,
         roster: &[DurableAgentSpec],
     ) -> Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError> {
-        let _controller = self.runtime.bootstrap_controller.lock().await;
-        let generation = self
-            .runtime
-            .begin_identity_bootstrap_pending(self.bootstrap_mode.clone());
-        if let Err(error) = self.prepare_controlled_bootstrap().await {
-            self.runtime.fail_identity_bootstrap(generation, &error);
-            return Err(error);
+        let mut retired = Vec::new();
+        let result = async {
+            let _controller = self.runtime.bootstrap_controller.lock().await;
+            let generation = self
+                .runtime
+                .begin_identity_bootstrap_pending(self.bootstrap_mode.clone());
+            if let Err(error) = self.prepare_controlled_bootstrap().await {
+                self.runtime.fail_identity_bootstrap(generation, &error);
+                return Err(error);
+            }
+            self.apply_roster_controlled(generation, roster, &mut retired)
+                .await
         }
-        self.apply_roster_controlled(generation, roster).await
+        .await;
+        // The pass's retirements reach the host's retirement hook after the
+        // bootstrap controller is released, whatever the pass returned.
+        self.runtime.release_retired_members(retired).await;
+        result
     }
 
     /// [`Self::bootstrap_roster`] with every freshly created roster member
@@ -2427,6 +2436,31 @@ impl IdentityFirstRuntimeContext {
         ) -> Fut,
         Fut: std::future::Future<Output = Result<(), String>>,
     {
+        let mut retired = Vec::new();
+        let result = self
+            .bootstrap_roster_held_controlled(roster, terminal, complete, abandonment, &mut retired)
+            .await;
+        // The pass's retirements reach the host's retirement hook after the
+        // bootstrap controller is released, whatever the pass returned.
+        self.runtime.release_retired_members(retired).await;
+        result
+    }
+
+    async fn bootstrap_roster_held_controlled<F, Fut>(
+        &self,
+        roster: &[DurableAgentSpec],
+        terminal: Arc<super::held_bootstrap::HeldTerminal>,
+        complete: F,
+        abandonment: super::held_bootstrap::HeldAbandonment,
+        retired: &mut Vec<super::types::RetiredIdentityMember>,
+    ) -> Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError>
+    where
+        F: FnOnce(
+            Vec<super::held_bootstrap::HeldIdentityMember>,
+            super::held_bootstrap::HeldCompletion,
+        ) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
         use super::held_bootstrap::HeldBootstrapRefusal as Refusal;
         use super::held_bootstrap::{HeldCreatePass, HeldDecision};
         let refused = |refusal: Refusal| IdentityRuntimeError::HeldBootstrapRefused(refusal);
@@ -2524,7 +2558,7 @@ impl IdentityFirstRuntimeContext {
             &pass,
             abandonment,
             complete,
-            self.apply_roster_controlled(generation, roster),
+            self.apply_roster_controlled(generation, roster, retired),
         )
         .await
     }
@@ -2789,14 +2823,16 @@ impl IdentityFirstRuntimeContext {
         &self,
         generation: u64,
         roster: &[DurableAgentSpec],
+        retired: &mut Vec<super::types::RetiredIdentityMember>,
     ) -> Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError> {
-        self.apply_roster_pass(generation, roster).await
+        self.apply_roster_pass(generation, roster, retired).await
     }
 
     async fn apply_roster_pass(
         &self,
         generation: u64,
         roster: &[DurableAgentSpec],
+        retired: &mut Vec<super::types::RetiredIdentityMember>,
     ) -> Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError> {
         if let Err(message) = self.bootstrap_mode.validate() {
             let error = IdentityRuntimeError::Internal(message);
@@ -2820,7 +2856,7 @@ impl IdentityFirstRuntimeContext {
         // desired spec changes.
         if let Err(error) = self
             .runtime
-            .reconcile_roster_members(roster, generation)
+            .reconcile_roster_members(roster, generation, retired)
             .await
         {
             self.runtime.fail_identity_bootstrap(generation, &error);
@@ -2876,6 +2912,19 @@ impl IdentityFirstRuntimeContext {
     async fn refresh_desired_topology_from(
         &self,
     ) -> Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError> {
+        let mut retired = Vec::new();
+        let result = self.refresh_desired_topology_controlled(&mut retired).await;
+        // The pass's retirements reach the host's retirement hook after the
+        // bootstrap controller is released, whatever the pass returned, so
+        // a hook may itself refresh the roster.
+        self.runtime.release_retired_members(retired).await;
+        result
+    }
+
+    async fn refresh_desired_topology_controlled(
+        &self,
+        retired: &mut Vec<super::types::RetiredIdentityMember>,
+    ) -> Result<super::orchestrator::RestoreFlowResult, IdentityRuntimeError> {
         // One runtime owns one controller from roster discovery through task
         // installation. Provider calls are user code and can be slow; publish
         // the in-flight pass before awaiting them so concurrent readiness RPCs
@@ -2904,7 +2953,8 @@ impl IdentityFirstRuntimeContext {
             }
         };
 
-        self.apply_roster_controlled(generation, &roster).await
+        self.apply_roster_controlled(generation, &roster, retired)
+            .await
     }
 
     /// Cancellation-safe reconcile for RPC/host request boundaries.
@@ -3167,6 +3217,18 @@ enum FirstBootRows {
     Settled,
 }
 
+/// How a host-composed gateway hears that an incarnation of a durable
+/// identity's member was retired
+/// (`GatewayHostComposition::identity_member_retired`). An `Err` is the
+/// host's release failing; the retirement stands.
+pub(crate) type RetiredMemberObserver = Arc<
+    dyn Fn(
+            super::types::RetiredIdentityMember,
+        ) -> futures::future::BoxFuture<'static, Result<(), String>>
+        + Send
+        + Sync,
+>;
+
 /// Why this gateway's runtime does not serve a member it has registered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotServedHere {
@@ -3234,6 +3296,9 @@ pub struct IdentityRuntime {
     /// commands; absent fields render as explicit placeholders.
     session_repair_scope: StdRwLock<Option<SessionRepairScope>>,
     error_hook: StdRwLock<Option<crate::unified_runtime::ErrorHook>>,
+    /// The host's retirement hook, installed by a host-composed gateway.
+    /// Without one, a retire reads nothing extra and tells no one.
+    retired_member_observer: StdRwLock<Option<RetiredMemberObserver>>,
     /// The unified runtime's actor-loop probe verdict, installed late (the
     /// probe starts with the base runtime, identity-first attaches after).
     /// Forwarded to the session bridge so admission fails fast while a stall
@@ -3954,6 +4019,7 @@ impl IdentityRuntime {
             materialization_failure_backoff: RwLock::new(BTreeMap::new()),
             session_repair_scope: StdRwLock::new(None),
             error_hook: StdRwLock::new(None),
+            retired_member_observer: StdRwLock::new(None),
             actor_loop_health: StdRwLock::new(None),
             session_rotation_observer: StdRwLock::new(None),
             bootstrap_status,
@@ -5213,6 +5279,93 @@ impl IdentityRuntime {
                 tracing::warn!(
                     error = %err,
                     "identity runtime error hook lock poisoned; dropping hook update"
+                );
+            }
+        }
+    }
+
+    /// Install (or clear) the host's retirement hook. A host-composed
+    /// gateway installs it right after the host binds the identity runtime,
+    /// before the identity bootstrap, so a boot pass's retirements reach it.
+    pub(crate) fn set_retired_member_observer(&self, observer: Option<RetiredMemberObserver>) {
+        *self
+            .retired_member_observer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = observer;
+    }
+
+    /// Test seam: whether no roster pass holds the bootstrap controller now.
+    #[cfg(test)]
+    pub(crate) fn bootstrap_controller_is_free(&self) -> bool {
+        self.bootstrap_controller.try_lock().is_ok()
+    }
+
+    fn retired_member_observer(&self) -> Option<RetiredMemberObserver> {
+        self.retired_member_observer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The incarnation a retire of `identity` is about to retire, for the
+    /// host's retirement hook: the live binding in Core's member history,
+    /// read under the identity's lifecycle lock before Core retires it.
+    /// `None` when no hook is installed (nothing extra is read) or Core
+    /// holds no live member.
+    async fn retiring_incarnation(
+        &self,
+        identity: &AgentIdentity,
+        cause: super::types::RetiredIdentityCause,
+    ) -> Result<Option<super::types::RetiredIdentityMember>, IdentityRuntimeError> {
+        if self.retired_member_observer().is_none() {
+            return Ok(None);
+        }
+        let Some(binding) = self.core_last_binding(identity).await? else {
+            return Ok(None);
+        };
+        let Some(agent_runtime_id) = live_binding_runtime_id(&binding) else {
+            return Ok(None);
+        };
+        Ok(Some(super::types::RetiredIdentityMember {
+            identity: identity.clone(),
+            member: binding.identity().as_str().to_string(),
+            role: binding.role().clone(),
+            agent_runtime_id,
+            generation: binding.generation().get(),
+            session_id: binding.session_id().cloned(),
+            cause,
+        }))
+    }
+
+    /// Hand each retired incarnation to the host's retirement hook, in
+    /// order. Callers hold no Meta lock here (no identity lifecycle lock, no
+    /// bootstrap controller), so the hook may call back into this runtime.
+    /// A hook error leaves the retirement standing: it is reported once to
+    /// the error hook and not retried.
+    pub(crate) async fn release_retired_members(
+        &self,
+        retired: Vec<super::types::RetiredIdentityMember>,
+    ) {
+        if retired.is_empty() {
+            return;
+        }
+        let Some(observer) = self.retired_member_observer() else {
+            return;
+        };
+        for member in retired {
+            let identity = member.identity.to_string();
+            let agent_runtime_id = member.agent_runtime_id.to_string();
+            let session_id = member.session_id.as_ref().map(ToString::to_string);
+            let cause = member.cause.as_str().to_string();
+            if let Err(error) = observer(member).await {
+                self.emit_error(
+                    crate::unified_runtime::types::ErrorEvent::RetiredMemberReleaseFailed {
+                        identity,
+                        agent_runtime_id,
+                        session_id,
+                        cause,
+                        error,
+                    },
                 );
             }
         }
@@ -7202,19 +7355,29 @@ impl IdentityRuntime {
         let identity = identity.clone();
         let expected_alias = expected_alias.map(str::to_owned);
         self.run_tracked_foreground(async move {
-            let lifecycle_lock = runtime.lifecycle_lock_for(&identity).await;
-            let _lifecycle_guard = lifecycle_lock.lock().await;
-            if let Some(expected_alias) = expected_alias.as_deref() {
-                runtime
-                    .ensure_expected_member_alias_current(&identity, expected_alias)
+            let (retired, cleaned) = {
+                let lifecycle_lock = runtime.lifecycle_lock_for(&identity).await;
+                let _lifecycle_guard = lifecycle_lock.lock().await;
+                if let Some(expected_alias) = expected_alias.as_deref() {
+                    runtime
+                        .ensure_expected_member_alias_current(&identity, expected_alias)
+                        .await?;
+                }
+                let retired_alias = runtime
+                    .core_live_member(&identity)
+                    .await?
+                    .map(|live| live.agent_runtime_id);
+                let retiring = runtime
+                    .retiring_incarnation(&identity, super::types::RetiredIdentityCause::Retire)
                     .await?;
-            }
-            let retired_alias = runtime
-                .core_live_member(&identity)
-                .await?
-                .map(|live| live.agent_runtime_id);
-            runtime.retire_locked(&identity).await?;
-            Ok(cleanup(retired_alias).await)
+                runtime.retire_locked(&identity).await?;
+                (retiring, cleanup(retired_alias).await)
+            };
+            // After the cleanup, with the lifecycle lock released.
+            runtime
+                .release_retired_members(retired.into_iter().collect())
+                .await;
+            Ok(cleaned)
         })
         .await
     }
@@ -9150,12 +9313,18 @@ impl IdentityRuntime {
     /// the exact live session and grant. Profile changes retire to Dormant
     /// before the new spec is installed; the selected eager/background/lazy
     /// policy then decides when to rebuild the physical member.
+    ///
+    /// Each member it retires because the roster no longer lists it is
+    /// pushed to `retired` as soon as Core retired it, so the caller hands
+    /// it to the host's retirement hook even when a later step of the pass
+    /// fails.
     async fn reconcile_roster_members(
         &self,
         roster: &[DurableAgentSpec],
         generation: u64,
+        retired: &mut Vec<super::types::RetiredIdentityMember>,
     ) -> Result<(), IdentityRuntimeError> {
-        self.reconcile_roster_members_after_lifecycle_lock(roster, generation, |_| {
+        self.reconcile_roster_members_after_lifecycle_lock(roster, generation, retired, |_| {
             std::future::ready(())
         })
         .await
@@ -9176,6 +9345,7 @@ impl IdentityRuntime {
         &self,
         roster: &[DurableAgentSpec],
         generation: u64,
+        retired: &mut Vec<super::types::RetiredIdentityMember>,
         mut after_lifecycle_lock: H,
     ) -> Result<(), IdentityRuntimeError>
     where
@@ -9199,7 +9369,7 @@ impl IdentityRuntime {
             if !self.entries.read().await.contains_key(identity) {
                 continue;
             }
-            self.retire_unlisted_locked(identity).await?;
+            retired.extend(self.retire_unlisted_locked(identity).await?);
             self.event_channels.write().await.remove(identity);
             self.entries.write().await.remove(identity);
         }
@@ -9215,7 +9385,7 @@ impl IdentityRuntime {
             if self.entries.read().await.contains_key(&identity) {
                 continue;
             }
-            self.retire_unlisted_locked(&identity).await?;
+            retired.extend(self.retire_unlisted_locked(&identity).await?);
         }
 
         // A live member Meta 0.9.3 spawned carries no marker, only the
@@ -9228,13 +9398,16 @@ impl IdentityRuntime {
             if self.entries.read().await.contains_key(&identity) {
                 continue;
             }
-            if let Err(error) = self.retire_unlisted_locked(&identity).await {
-                tracing::warn!(
-                    %identity,
-                    %error,
-                    "retiring a labelled member the roster no longer lists failed; the next \
-                     roster pass tries it again"
-                );
+            match self.retire_unlisted_locked(&identity).await {
+                Ok(retiring) => retired.extend(retiring),
+                Err(error) => {
+                    tracing::warn!(
+                        %identity,
+                        %error,
+                        "retiring a labelled member the roster no longer lists failed; the \
+                         next roster pass tries it again"
+                    );
+                }
             }
         }
 
@@ -9297,18 +9470,23 @@ impl IdentityRuntime {
     /// Retire an identity the roster no longer lists, under its lifecycle
     /// lock: Core's live member retires and Core keeps its history. Nothing
     /// to do when Core holds no live member or the identity is read-only to
-    /// the compile.
+    /// the compile. Returns the incarnation it retired when the host's
+    /// retirement hook is installed.
     async fn retire_unlisted_locked(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<(), IdentityRuntimeError> {
+    ) -> Result<Option<super::types::RetiredIdentityMember>, IdentityRuntimeError> {
         if !self.compile_may_act_on(identity).await? {
-            return Ok(());
+            return Ok(None);
         }
         if self.core_live_member(identity).await?.is_none() {
-            return Ok(());
+            return Ok(None);
         }
-        self.retire_locked(identity).await
+        let retiring = self
+            .retiring_incarnation(identity, super::types::RetiredIdentityCause::Unlisted)
+            .await?;
+        self.retire_locked(identity).await?;
+        Ok(retiring)
     }
 
     /// Identities of Core's live Meta-marked members that the
@@ -11555,49 +11733,67 @@ impl IdentityRuntime {
             meta_runtime_id(member.runtime_id()).map_err(|error| ScopedRetireError::Rejected {
                 detail: error.to_string(),
             })?;
-        let lifecycle_lock = self.lifecycle_lock_for(identity).await;
-        let _lifecycle_guard = lifecycle_lock.lock().await;
-        // Core decides, step by step, which incarnation the scope names. Meta
-        // runs an ordinary retire's memory hooks only while the scope names
-        // the live member, before Core retires it.
-        let live = match self.core_live_scope(identity).await {
-            Ok(scope) => scope,
-            // Core refuses the scope read of a member it holds no session
-            // binding for, such as a retired one. With no live member there
-            // is no live scope: the call goes on to Core, whose answer for a
-            // scope no incarnation is current at is `Ok`. Any other failure
-            // to read refuses here, before Core is asked.
-            Err(error) => match self.core_live_member(identity).await {
-                Ok(None) => None,
-                Ok(Some(_)) | Err(_) => {
-                    return Err(ScopedRetireError::Rejected {
-                        detail: error.to_string(),
-                    });
-                }
-            },
-        };
-        let retires_live = live.as_ref() == Some(member);
-        if retires_live {
-            self.clear_wake_notes_of_live_member(identity).await;
-            self.distill_before_retire(identity, Some(member.session_id()))
-                .await;
-        }
-        bridge
-            .retire_at_scope(&runtime_id, member)
-            .await
-            .map_err(|error| name_stale_retire_mismatch(error, live.as_ref(), member))?;
-        if retires_live {
-            self.entries.notify_binding_changed();
-            self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Dormant, None);
-            self.emit_event(
-                identity,
-                IdentityEvent::StateChanged {
-                    identity: identity.clone(),
-                    new_state: IdentityLifecycleState::Dormant,
+        let retired = {
+            let lifecycle_lock = self.lifecycle_lock_for(identity).await;
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            // Core decides, step by step, which incarnation the scope names.
+            // Meta runs an ordinary retire's memory hooks only while the scope
+            // names the live member, before Core retires it.
+            let live = match self.core_live_scope(identity).await {
+                Ok(scope) => scope,
+                // Core refuses the scope read of a member it holds no session
+                // binding for, such as a retired one. With no live member
+                // there is no live scope: the call goes on to Core, whose
+                // answer for a scope no incarnation is current at is `Ok`.
+                // Any other failure to read refuses here, before Core is asked.
+                Err(error) => match self.core_live_member(identity).await {
+                    Ok(None) => None,
+                    Ok(Some(_)) | Err(_) => {
+                        return Err(ScopedRetireError::Rejected {
+                            detail: error.to_string(),
+                        });
+                    }
                 },
-            )
+            };
+            let retires_live = live.as_ref() == Some(member);
+            // Only a retire of the live member tells the host's retirement
+            // hook: Core answers `Ok` for a scope no incarnation is current
+            // at without retiring anything.
+            let retiring = if retires_live {
+                self.retiring_incarnation(identity, super::types::RetiredIdentityCause::Scoped)
+                    .await
+                    .map_err(|error| ScopedRetireError::Rejected {
+                        detail: error.to_string(),
+                    })?
+            } else {
+                None
+            };
+            if retires_live {
+                self.clear_wake_notes_of_live_member(identity).await;
+                self.distill_before_retire(identity, Some(member.session_id()))
+                    .await;
+            }
+            bridge
+                .retire_at_scope(&runtime_id, member)
+                .await
+                .map_err(|error| name_stale_retire_mismatch(error, live.as_ref(), member))?;
+            if retires_live {
+                self.entries.notify_binding_changed();
+                self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Dormant, None);
+                self.emit_event(
+                    identity,
+                    IdentityEvent::StateChanged {
+                        identity: identity.clone(),
+                        new_state: IdentityLifecycleState::Dormant,
+                    },
+                )
+                .await;
+            }
+            retiring
+        };
+        // The host hears of the retirement with the lifecycle lock released.
+        self.release_retired_members(retired.into_iter().collect())
             .await;
-        }
         Ok(FencingToken::new(member.fence_token().get()))
     }
 
@@ -12506,13 +12702,23 @@ impl IdentityRuntime {
         identity: &AgentIdentity,
         expected_alias: Option<&str>,
     ) -> Result<(), IdentityRuntimeError> {
-        let lifecycle_lock = self.lifecycle_lock_for(identity).await;
-        let _lifecycle_guard = lifecycle_lock.lock().await;
-        if let Some(expected_alias) = expected_alias {
-            self.ensure_expected_member_alias_current(identity, expected_alias)
+        let retired = {
+            let lifecycle_lock = self.lifecycle_lock_for(identity).await;
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            if let Some(expected_alias) = expected_alias {
+                self.ensure_expected_member_alias_current(identity, expected_alias)
+                    .await?;
+            }
+            let retiring = self
+                .retiring_incarnation(identity, super::types::RetiredIdentityCause::Retire)
                 .await?;
-        }
-        self.retire_locked(identity).await
+            self.retire_locked(identity).await?;
+            retiring
+        };
+        // The host hears of the retirement with the lifecycle lock released.
+        self.release_retired_members(retired.into_iter().collect())
+            .await;
+        Ok(())
     }
 
     async fn retire_locked(&self, identity: &AgentIdentity) -> Result<(), IdentityRuntimeError> {
@@ -16456,6 +16662,7 @@ mod reset_reprofile_tests {
                     .reconcile_roster_members_after_lifecycle_lock(
                         std::slice::from_ref(&spec),
                         next_generation,
+                        &mut Vec::new(),
                         move |_| {
                             let should_pause = !paused.swap(true, Ordering::SeqCst);
                             let reconcile_holds_lock = reconcile_holds_lock.clone();

@@ -68,6 +68,8 @@ pub mod mob_events;
 pub mod mob_ops;
 pub(crate) mod mob_stop;
 pub mod module_ops;
+#[cfg(test)]
+mod retired_member_hook_tests;
 pub mod types;
 
 pub use crate::identity_first::IdentityBootstrapMode;

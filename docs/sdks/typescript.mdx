@@ -444,7 +444,7 @@ from a hang.
 `compaction_persistence_rejected`, `actor_loop_stalled`,
 `actor_loop_recovered`, `actor_loop_terminated`, `host_loop_crash`, `rediscover_failure`,
 `event_log_flush_failure`, `identity_materialization_failure`,
-`mob_stop_proceeded_without_interrupt`). The SDK source constants are kept
+`mob_stop_proceeded_without_interrupt`, `retired_member_release_failed`). The SDK source constants are kept
 in lockstep with the Rust enum by `tests/sdk_error_category_parity.rs`;
 `context` carries the variant's fields (`member_id`, `error`, and so on).
 `actor_loop_terminated` is a terminal actor failure requiring a process restart,

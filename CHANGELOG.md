@@ -66,6 +66,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   identity bootstrap, as does an answer that adds a customizer where the
   gateway composed none or drops the composed one. A gateway without an
   identity roster never asks.
+- `GatewayHostComposition::identity_member_retired` (defaulted to doing
+  nothing): a host-composed gateway tells its host once per retired
+  incarnation of a durable identity's member, after Core's retire returned and
+  with no Meta lock held, so the host can release what it keeps for that
+  incarnation. The new `RetiredIdentityMember` names the incarnation (member
+  id, role, runtime id, generation, session, read from Core before the retire)
+  and its `RetiredIdentityCause`: `unlisted` (a roster pass retired it because
+  the roster no longer lists the identity, the one cause that ends the
+  identity's place in the roster), `retire` (an explicit retire) or `scoped`
+  (a retire at a captured delivery scope that named the live member). After
+  `retire` or `scoped` the identity stays registered and dormant, and a still
+  listed identity resumes at the next generation on the same session. A roster
+  pass collects its retirements and the host hears of them after the bootstrap
+  controller is released, also when a later step of the pass failed; the
+  identity bootstrap's retirements reach the host too. Reloads, reprofiles,
+  compaction rebuilds, respawns, reset and delete successors, held or refused
+  spawns, shutdowns and restarts never call it. A host error leaves the
+  retirement standing and is reported once as the new `ErrorEvent` category
+  `retired_member_release_failed` (`identity`, `agent_runtime_id`,
+  `session_id?`, `cause`, `error`), which both SDKs' `ErrorCategory` lists
+  carry. Without a host, retires read nothing extra.
 
 - An identity that owes its host a held completion (a held roster pass or a
   held member add did not publish its member) is refused with structured
