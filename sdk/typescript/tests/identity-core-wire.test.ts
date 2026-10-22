@@ -263,6 +263,26 @@ describe("#306: held wakes are typed", () => {
       assert.equal(Object.getPrototypeOf(err), RpcError.prototype);
     });
   }
+
+  it("keeps an owed held completion a plain RpcError carrying its data", async () => {
+    // An identity a held pass did not publish owes its host a held
+    // completion: an admission still owed, not a held wake.
+    const data = { kind: "held_completion_owed", identity: "w" };
+    const err = await refusal({ code: -32603, message: "owed", data });
+    assert.ok(err instanceof RpcError);
+    assert.equal(Object.getPrototypeOf(err), RpcError.prototype);
+    assert.equal(err.code, -32603);
+    assert.deepEqual(err.data, data);
+    assert.ok(!IDENTITY_WAKE_HELD_KINDS.has(data.kind));
+    assert.deepEqual(
+      parseIdentityRestoreProgress({
+        stage: "refused",
+        code: -32603,
+        kind: "held_completion_owed",
+      }),
+      { stage: "refused", code: -32603, kind: "held_completion_owed" },
+    );
+  });
 });
 
 describe("#306: identity status reads Core's view", () => {
