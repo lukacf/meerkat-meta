@@ -793,3 +793,16 @@ def test_generated_readme_names_the_cpython_of_a_compiled_closure():
     assert "`PYTHON_BIN` set to a CPython 3.11 interpreter" in compiled
     portable = readme("cryptography-44.0.0-cp39-abi3-manylinux_2_28_x86_64.whl", "httpx-0.28.1-py3-none-any.whl")
     assert "You need a complete Python 3.11+ installation" in portable and "PYTHON_BIN" not in portable
+
+
+@pytest.mark.parametrize("floor, host", [((2, 41), "Linux x86_64 with glibc 2.41 or newer"), (None, "Linux x86_64")],
+    ids=["declared", "undeclared"])
+def test_generated_readme_names_the_product_declared_glibc_floor(floor, host):
+    from launchkit import product_distribution
+    guide = SimpleNamespace(core_version="0.9.4", version="0.9.4", core_source="core", meta_source="meta")
+    selected = SimpleNamespace(target="linux-x86_64", meta=SimpleNamespace(version="0.9.4"),
+        toolkit=SimpleNamespace(version="0.9.4"), meta_wheel=SimpleNamespace(sha256="1" * 64),
+        toolkit_wheel=SimpleNamespace(sha256="2" * 64), assembly=SimpleNamespace(sha256="3" * 64),
+        dependency_wheels=closure("httpx-0.28.1-py3-none-any.whl").dependency_wheels)
+    readme = product_distribution.candidate_readme(guide, selected, "origin", glibc_floor=floor)
+    assert f"Supported package destination: **{host}**." in readme and "2.39" not in readme

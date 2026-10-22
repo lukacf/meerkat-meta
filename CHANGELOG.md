@@ -111,7 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   oldest glibc its native programs run on (glibc 2.39 for the 0.9.4
   product). Forge offered Fresh install on an older glibc, such as 2.35,
   and installed an application that then failed when it started. The
-  refusal names both glibc versions.
+  refusal names both glibc versions. The generated package README states
+  the same declared floor instead of a fixed glibc 2.39.
 
 ### Known limitations
 
