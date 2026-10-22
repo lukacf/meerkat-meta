@@ -74,12 +74,11 @@ def admit(f, update, mode="update"):
     return selection
 
 
-def commit_candidate(f):
-    """A completed update as the worker settles it after setup: no worker start."""
+async def commit_candidate(f, monkeypatch):
+    """A completed update as the real worker settles it after setup: no worker start."""
     update, _ = stage_candidate(f)
-    admit(f, update)
-    updates.activate(f.directory, update["update_id"])
-    updates.committed(f.directory, update["update_id"], started=False)
+    worker_type = await run_worker(f, monkeypatch, "update", admit(f, update))
+    assert worker_type.starts == []
     assert deployment.read_receipt(f.directory)["update"]["status"] == "completed"
     return update["update_id"]
 
@@ -97,10 +96,20 @@ def accept_candidate(f, monkeypatch, report):
     monkeypatch.setattr(implementation, "selected_build_id", lambda guide_id: report["build_id"])
 
 
-async def run_worker(f, monkeypatch, mode, selection, *, failing_builds=()):
-    """The real worker run with inert application checks; it must never start the app.
+def new_lifecycle(f):
+    """As DeploymentService._launch does, every worker owns a new lifecycle."""
+    lifecycle = str(uuid4())
+    deployment.update_receipt(f.directory, interactive_lifecycle_id=lifecycle,
+        interactive_cleanup_attempt_id=None, interactive_cleanup=None)
+    return lifecycle
+
+
+async def run_worker(f, monkeypatch, mode, selection, *, failing_builds=(), lifecycle=None):
+    """The real interactive worker entry with inert application checks; it must never start the app.
 
     Only this run sees the inert Supervisor seams; owners keep the real class.
+    No worker process runs here, so the fixed wrapper's confirmation of its
+    exit is an inert specimen, as DeploymentService._run records it.
     """
     class SetupWorker(worker.Supervisor):
         checks, starts = [], []
@@ -119,10 +128,17 @@ async def run_worker(f, monkeypatch, mode, selection, *, failing_builds=()):
         await supervisor.stop.wait()
         return "stopped"
 
+    lifecycle = new_lifecycle(f) if lifecycle is None else lifecycle
     with monkeypatch.context() as patch:
         patch.setattr(worker, "Supervisor", SetupWorker)
         patch.setattr(worker, "owner_input", owned_input)
-        SetupWorker.result = await worker.run(f.directory, mode, update_selection=selection)
+        SetupWorker.result = await deployment.interactive_worker(f.directory, mode, lifecycle,
+            selection["path"], selection["sha256"])
+    # The entry ran in this test process; the fixture's inert worker process
+    # stands for the one whose exit the wrapper confirms.
+    cleanup = deployment.read_receipt(f.directory)["interactive_cleanup"]
+    deployment.update_receipt(f.directory, interactive_cleanup={**cleanup,
+        "supervisor_pid": f.process.pid, "worker_exit_confirmed": True})
     return SetupWorker
 
 
@@ -269,7 +285,7 @@ async def test_failed_contract_check_restores_previous_source_without_a_start(lo
 async def test_manual_rollback_after_setup_restores_without_a_start(local_restore, monkeypatch):
     f = local_restore
     await completed_setup(f, monkeypatch)
-    identity = commit_candidate(f)
+    identity = await commit_candidate(f, monkeypatch)
     previous = deployment.read_receipt(f.directory)["update"]["from_build_id"]
     f.service.launched.clear()
     await f.service.action(f.guide_id, f.directory.name, "rollback", identity)
@@ -355,10 +371,11 @@ async def test_worker_rereads_the_recorded_restore_before_changing_source(local_
         f.owner._restore_pin.path.unlink()
     else:
         (updates.update_directory(f.directory, update["update_id"]) / updates.SETUP_RESTORE_NAME).unlink()
+    lifecycle = new_lifecycle(f)
     before = source_bytes(f.destination), deployment.read_receipt(f.directory)
     # The refusal comes before the worker admits its Supervisor or any change.
     with pytest.raises(CustodyError) as refused:
-        await run_worker(f, monkeypatch, "update", selection)
+        await run_worker(f, monkeypatch, "update", selection, lifecycle=lifecycle)
     assert str(refused.value) == bootstrap.SETUP_RESTORE_CHANGED
     assert (source_bytes(f.destination), deployment.read_receipt(f.directory)) == before
 
@@ -387,7 +404,7 @@ async def test_apply_requires_the_owner_restore_recorded_at_stage(local_restore,
 async def test_next_start_after_a_committed_update_authenticates_the_original_restore(local_restore, monkeypatch):
     f = local_restore
     entry = await completed_setup(f, monkeypatch)
-    commit_candidate(f)
+    await commit_candidate(f, monkeypatch)
     await owner_start(f)
     assert (f.directory / bootstrap.FRESH_ENTRY_NAME).read_bytes() == entry
 
@@ -395,8 +412,8 @@ async def test_next_start_after_a_committed_update_authenticates_the_original_re
 async def test_two_completed_updates_chain_from_the_original_setup(local_restore, monkeypatch):
     f = local_restore
     await completed_setup(f, monkeypatch)
-    commit_candidate(f)
-    commit_candidate(f)
+    await commit_candidate(f, monkeypatch)
+    await commit_candidate(f, monkeypatch)
     await owner_start(f)
     # The walk is bounded; a longer history than its bound refuses.
     monkeypatch.setattr(bootstrap, "MAX_LINEAGE_UPDATES", 1)
@@ -446,7 +463,7 @@ def forge(f, identity, forgery):
 async def test_next_start_refuses_a_forged_update_lineage(local_restore, monkeypatch, forgery):
     f = local_restore
     await completed_setup(f, monkeypatch)
-    identity = commit_candidate(f)
+    identity = await commit_candidate(f, monkeypatch)
     forge(f, identity, forgery)
     f.service.launched.clear()
     with pytest.raises((CustodyError, DraftConflict)):
@@ -457,8 +474,8 @@ async def test_next_start_refuses_a_forged_update_lineage(local_restore, monkeyp
 async def test_gap_in_a_two_update_chain_refuses(local_restore, monkeypatch):
     f = local_restore
     await completed_setup(f, monkeypatch)
-    first = commit_candidate(f)
-    commit_candidate(f)
+    first = await commit_candidate(f, monkeypatch)
+    await commit_candidate(f, monkeypatch)
     forge(f, first, "missing-journal")
     f.service.launched.clear()
     with pytest.raises(CustodyError) as refused:

@@ -440,10 +440,8 @@ async def recover_local_application(registry, guide_id, deployment_id):
             model_configuration=registry._selected_model_configuration(),
             replacement_selection=registry.replacement_selection)
         host = factory()
-        if (_json(admission.package["blueprint.json"][0]) != host._blueprint
-                or admission.package["config/mob.toml"][0] != host._definition.encode()
-                or any(admission.package.get(name, (None, None))[0] != pin.read()
-                    for name, pin in host._protected)):
+        from .forge_application_host import owner_choices_match
+        if not owner_choices_match(host, admission.package):
             raise CustodyError("Recovered protected choices differ from the original accepted installation.")
         values, private = private_configuration_snapshot(destination)
         host.validate_installed_settings(guide_id, receipt, destination, admission.package, values)

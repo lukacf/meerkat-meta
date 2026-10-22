@@ -95,16 +95,18 @@ class LocalApplicationPreparationOwner:
                 or self._inputs is None):
             raise CustodyError("The original successful Install has not retained local setup inputs.")
         from .deployment_worker import read_receipt
+        from .deployment_application_bootstrap import require_owner_installation
         self.host.require_current()
         receipt = read_receipt(self._inputs.supervisor.directory)
-        if (not _same_json_value(self._binding(receipt), self._installation)
-                or parse_candidate_selection(receipt.get("runtime_candidate")) != self.factory.runtime_target
+        changed = "The original installation or its selected local preparation policy changed."
+        if (parse_candidate_selection(receipt.get("runtime_candidate")) != self.factory.runtime_target
                 or self._inputs.supervisor.directory != self._directory
                 or self._inputs.supervisor.destination != Path(receipt["destination"])
                 or self._inputs.fresh_paths != self._fresh_paths
                 or any(_private_directory(path) != observed for path, observed in self._directories)
                 or self._choices_pin.read() != self._choices_bytes):
-            raise CustodyError("The original installation or its selected local preparation policy changed.")
+            raise CustodyError(changed)
+        require_owner_installation(self._directory, receipt, self._installation, changed)
         if not _same_json_value(self._inputs._require_model_configuration(),
                 self.factory._selected_model_configuration()):
             raise CustodyError("The retained preparation changed its original model configuration.")
