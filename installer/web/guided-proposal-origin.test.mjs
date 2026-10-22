@@ -856,7 +856,7 @@ test('opening the desktop proposal selects its retained mobile pane while closin
       Object.getOwnPropertyDescriptor(document.defaultView.HTMLTextAreaElement.prototype,'value').set.call(draft,'  Keep this thought unsent\nfor later  ');
       draft.dispatchEvent(new document.defaultView.Event('input',{bubbles:true}));
     });
-    const callCount=calls.length,publicationCount=publications.length,source=JSON.stringify(current());
+    const writes=calls.filter(call=>call.method!=='GET'),publicationCount=publications.length,source=JSON.stringify(current());
     const expand=preview.querySelector('button');await act(async()=>{expand.click();await settle();});
     assert.ok(shell.classList.contains('setup-mobile-plan'),'The existing responsive CSS must keep the expanded descendant visible on a later narrow viewport');
     assert.equal(document.querySelector('.setup-mobile-tabs button[aria-pressed="true"]').textContent.trim(),'Your team 1');
@@ -866,7 +866,7 @@ test('opening the desktop proposal selects its retained mobile pane while closin
     assert.equal(expand.getAttribute('aria-expanded'),'false');assert.ok(shell.classList.contains('setup-mobile-plan'));
     assert.equal(document.querySelector('[data-proposal-snapshot]'),preview);
     assert.equal(document.querySelector('#setup-message'),draft);assert.equal(draft.value,'  Keep this thought unsent\nfor later  ');
-    assert.equal(calls.length,callCount,'Opening and closing admit no request');assert.equal(publications.length,publicationCount);
+    assert.deepEqual(calls.filter(call=>call.method!=='GET'),writes,'Opening and closing admit no work; pending read-only observations may settle');assert.equal(publications.length,publicationCount);
     assert.equal(JSON.stringify(current()),source,'Presentation selection does not change saved guide state');
   });
 });

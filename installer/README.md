@@ -1492,7 +1492,15 @@ timeline retains native frame versions and replay semantics across reloads;
 the optional detailed editor uses the console workbench components. The backend
 is a durable four-agent MobKit team: deployment architect, integration specialist,
 systems reviewer, and visualization programmer. Open its native console to inspect real identities,
-conversations, tools, and memory. The four-role setup runtime keeps its native
+conversations, tools, and memory. Setup, builder and trial Console links use the
+Forge origin, so they also work when Forge runs on a remote computer behind an
+SSH tunnel or an authenticated host wrapper. Forge serves the existing native
+Console assets and forwards its requests only while it owns that live runtime.
+An ended or replaced runtime closes the link and its live streams; the saved
+conversation and build history remain available in Forge. The host wrapper must
+protect the whole Forge origin, including `/api/owned-console/`. These links do
+not change the installed application's separate Console access configuration.
+The four-role setup runtime keeps its native
 state in the Forge state directory: `architect-runtime-meta-v1` for a guide on a
 Meta release before 0.9.4, and `architect-runtime-meta-v2` from Meta 0.9.4 on.
 Meta 0.9.4 refuses native state that an earlier release wrote until a one-time,

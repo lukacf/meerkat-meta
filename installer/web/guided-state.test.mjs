@@ -111,14 +111,16 @@ async function mountedGuideRuntime({ busy = false, architect, status }, verify) 
   }
 }
 
-const oldRuntimeOwner = { available: true, status: "ready", console_url: "http://127.0.0.1:58124/console" };
-const currentRuntimeOwner = { available: true, status: "ready", console_url: "http://127.0.0.1:51558/console" };
+const oldRuntimeOwner = { available: true, status: "ready", console_url: "http://127.0.0.1:58124/console",
+  browser_console_url: "/api/owned-console/guide/11111111-1111-4111-8111-111111111111/console" };
+const currentRuntimeOwner = { available: true, status: "ready", console_url: "http://127.0.0.1:51558/console",
+  browser_console_url: "/api/owned-console/guide/22222222-2222-4222-8222-222222222222/console" };
 
 test("Guide console follows the confirmed current owner while a restored guide is idle", async () => {
   await mountedGuideRuntime({ busy: true, architect: oldRuntimeOwner, status: () => oldRuntimeOwner },
     async ({ render, link, calls, intervals, finish }) => {
     await act(async () => intervals.find(interval => interval.delay === 4000).callback());
-    assert.equal(link()?.href, oldRuntimeOwner.console_url);
+    assert.equal(link()?.href, new URL(oldRuntimeOwner.browser_console_url, "http://localhost/").href);
     assert.equal(link().textContent.trim(), "Guide console");
     assert.equal(link().getAttribute("aria-label"), "Open the Forge setup guide console in a new tab");
     assert.equal(link().target, "_blank");
@@ -127,7 +129,7 @@ test("Guide console follows the confirmed current owner while a restored guide i
       "The guide is idle and its own runtime polling has stopped");
     const reads = calls.filter(call => call.url === "/api/architect/status").length;
     await render(currentRuntimeOwner);
-    assert.equal(link()?.href, currentRuntimeOwner.console_url);
+    assert.equal(link()?.href, new URL(currentRuntimeOwner.browser_console_url, "http://localhost/").href);
     assert.equal(calls.filter(call => call.url === "/api/architect/status").length, reads,
       "An idle guide must receive the owner update without starting its own runtime polling");
   });
@@ -137,16 +139,16 @@ test("Guide console is removed when the confirmed owner explicitly has no Consol
   await mountedGuideRuntime({ busy: true, architect: oldRuntimeOwner, status: () => oldRuntimeOwner },
     async ({ render, link, intervals }) => {
       await act(async () => intervals.find(interval => interval.delay === 4000).callback());
-      assert.equal(link()?.href, oldRuntimeOwner.console_url);
-      await render({ ...currentRuntimeOwner, console_url: null });
+      assert.equal(link()?.href, new URL(oldRuntimeOwner.browser_console_url, "http://localhost/").href);
+      await render({ ...currentRuntimeOwner, browser_console_url: null });
       assert.equal(link(), null, "The old local and historical URLs cannot survive an owner-null update");
     });
 });
 
 test("Guide console respects an explicit null URL from the current runtime status read", async () => {
   await mountedGuideRuntime({ busy: true, architect: oldRuntimeOwner,
-    status: () => ({ available: true, status: "stopped", console_url: null }) }, async ({ link, intervals }) => {
-      assert.equal(link()?.href, oldRuntimeOwner.console_url);
+    status: () => ({ available: true, status: "stopped", console_url: null, browser_console_url: null }) }, async ({ link, intervals }) => {
+      assert.equal(link()?.href, new URL(oldRuntimeOwner.browser_console_url, "http://localhost/").href);
       await act(async () => intervals.find(interval => interval.delay === 4000).callback());
       assert.equal(link(), null, "A confirmed null status must not fall back to an older config URL");
     });
@@ -161,9 +163,9 @@ test("Guide console rejects a delayed busy status response after a newer owner i
       assert.ok(completeOldRead, "The old status request is already in flight");
       await render(currentRuntimeOwner);
       assert.equal(oldPoll.cancelled, true);
-      assert.equal(link()?.href, currentRuntimeOwner.console_url);
+      assert.equal(link()?.href, new URL(currentRuntimeOwner.browser_console_url, "http://localhost/").href);
       await act(async () => { completeOldRead(oldRuntimeOwner); });
-      assert.equal(link()?.href, currentRuntimeOwner.console_url,
+      assert.equal(link()?.href, new URL(currentRuntimeOwner.browser_console_url, "http://localhost/").href,
         "The old delayed response must not replace the fresh owner");
       assert.equal(calls.filter(call => call.url === "/api/architect/status").length, 1);
     });

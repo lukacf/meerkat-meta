@@ -21,8 +21,9 @@ const { GuidedSetup, NativeGuideChat, useGuideTimeline } = await import(`data:te
 const deferred = () => { let resolve; const promise = new Promise(yes => { resolve = yes; }); return { promise, resolve }; };
 const settle = () => new Promise(resolve => setTimeout(resolve, 5));
 const page = { available: true, frames: [], bindings: [], exhausted: true };
-const failed = { available: true, status: 'failed', startup_retry_required: true, console_url: null };
-const ready = { available: true, status: 'ready', startup_retry_required: false, console_url: 'http://127.0.0.1:51842/console' };
+const failed = { available: true, status: 'failed', startup_retry_required: true, console_url: null, browser_console_url: null };
+const ready = { available: true, status: 'ready', startup_retry_required: false, console_url: 'http://127.0.0.1:51842/console',
+  browser_console_url: '/api/owned-console/guide/11111111-1111-4111-8111-111111111111/console' };
 const guide = { id: 'offline-console-recovery', version: 5, status: 'question', stage: 'purpose', completed_stages: [], answers: [],
   brief: { facts: {}, requirements: [] }, capabilities: { available: true },
   messages: [{ id: 'saved-context', role: 'assistant', text: 'Your saved conversation is kept.' }],
@@ -126,7 +127,7 @@ test('saved conversation Reload replaces old unavailable runtime before its exac
     window.localStorage.setItem(GUIDE_KEY, guide.id);
     window.localStorage.setItem(inputKey(guide), JSON.stringify({ key: inputKey(guide), draft, selected: ['household'], mode: 'answer' }));
     return React.createElement(GuidedSetup, { active: true, bp: null, Icon: () => null, onBlueprint() {},
-      appError: 'Forge restarted. Check the saved conversation.', config: { architect: { available: false, status: 'idle', console_url: null } } });
+      appError: 'Forge restarted. Check the saved conversation.', config: { architect: { available: false, status: 'idle', console_url: null, browser_console_url: null } } });
   }, async ({ document, window, calls, button, click }) => {
     const editor = document.querySelector('#setup-message');
     const before = window.localStorage.getItem(inputKey(guide));
@@ -150,7 +151,8 @@ test('saved conversation Reload replaces old unavailable runtime before its exac
 test('a delayed Reload runtime body cannot replace the newer current owner or the retained unsent draft', async () => {
   const body = deferred(); let entered = false;
   const draft = '  Keep the next question private.  ';
-  const current = { ...ready, console_url: 'http://127.0.0.1:52614/console' };
+  const current = { ...ready, console_url: 'http://127.0.0.1:52614/console',
+    browser_console_url: '/api/owned-console/guide/22222222-2222-4222-8222-222222222222/console' };
   const view = architect => React.createElement(GuidedSetup, { active: true, bp: null, Icon: () => null, onBlueprint() {},
     appError: 'Check the saved conversation after reconnecting.', config: { architect } });
   try {
@@ -171,9 +173,9 @@ test('a delayed Reload runtime body cannot replace the newer current owner or th
       assert.equal(entered, true);
       await rerender(view(current));
       const link = () => document.querySelector('a[title="Inspect the live Forge setup team"]');
-      assert.equal(link()?.href, current.console_url);
-      await act(async () => { body.resolve({ available: false, status: 'idle', console_url: null }); await settle(); });
-      assert.equal(link()?.href, current.console_url, 'The old Reload read cannot retire the newer confirmed owner.');
+      assert.equal(link()?.href, new URL(current.browser_console_url, 'http://offline.test/').href);
+      await act(async () => { body.resolve({ available: false, status: 'idle', console_url: null, browser_console_url: null }); await settle(); });
+      assert.equal(link()?.href, new URL(current.browser_console_url, 'http://offline.test/').href, 'The old Reload read cannot retire the newer confirmed owner.');
       assert.equal(document.querySelector('.setup-provider-model').textContent.includes('Provider setup needed'), false);
       assert.equal(document.querySelector('#setup-message'), editor);
       assert.equal(editor.value, draft);
@@ -188,7 +190,8 @@ test('a newer busy status observation fences a held Reload runtime body without 
   const draft = '  Keep this follow-up while the admitted work finishes.  ';
   const active = { ...structuredClone(guide), operation: { status: 'running', request_id: 'c'.repeat(64), version: 4,
     request: { version: 4, action: 'chat', text: 'The already admitted original request.', selected: [] } } };
-  const current = { ...ready, console_url: 'http://127.0.0.1:53914/console' };
+  const current = { ...ready, console_url: 'http://127.0.0.1:53914/console',
+    browser_console_url: '/api/owned-console/guide/33333333-3333-4333-8333-333333333333/console' };
   try {
     await mount(async call => {
       assert.equal(call.method, 'GET', 'The fixture observes saved work without admitting any operation.');
@@ -211,9 +214,9 @@ test('a newer busy status observation fences a held Reload runtime body without 
       assert.ok(poll, 'The real current busy status owner remains mounted.');
       await act(async () => { await poll.callback(); await settle(); });
       const link = () => document.querySelector('a[title="Inspect the live Forge setup team"]');
-      assert.equal(link()?.href, current.console_url);
-      await act(async () => { body.resolve({ available: false, status: 'idle', console_url: null }); await settle(); });
-      assert.equal(link()?.href, current.console_url, 'The earlier read cannot overwrite a newer accepted current-status observation.');
+      assert.equal(link()?.href, new URL(current.browser_console_url, 'http://offline.test/').href);
+      await act(async () => { body.resolve({ available: false, status: 'idle', console_url: null, browser_console_url: null }); await settle(); });
+      assert.equal(link()?.href, new URL(current.browser_console_url, 'http://offline.test/').href, 'The earlier read cannot overwrite a newer accepted current-status observation.');
       assert.equal(document.querySelector('#setup-message').value, draft);
       assert.equal(window.localStorage.getItem(inputKey(active)), before);
       assert.deepEqual(calls.filter(call => call.method === 'POST'), []);

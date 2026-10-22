@@ -901,6 +901,7 @@ class ArchitectService:
         from .visualizer import VisualizerService
         self.visualizer = VisualizerService(self)
         self.runtime = None
+        self.console_generation = None
         self.provider_stop_failed = False
         self.provider_paused = False
         self.provider_settings = None
@@ -1061,9 +1062,11 @@ class ArchitectService:
         return data
 
     def status(self):
+        from .owned_console import guide_browser_console_url
         capability = planner_capability()
         return {"available": capability["available"], "status": self.state,
                 "console_url": (self.runtime.rust_http_base_url + "/console") if self.runtime else None,
+                "browser_console_url": guide_browser_console_url(self),
                 "identities": ["architect:main", "connectors:main", "reviewer:main", "visualizer:main"] if self.runtime else [],
                 "detail": self.last_error or capability["reason"], "proposal": self.proposal,
                 "busy": self.message_lock.locked() or bool(self.pending_interaction),
@@ -1641,6 +1644,7 @@ class ArchitectService:
                 if expected_revision is not None:
                     builder.declare_spec_update(expected_revision)
                 self.runtime = await build_with_cleanup(configure_builder(builder, selected), self.startup_cleanup)
+                self.console_generation = str(uuid.uuid4())
                 self.setup_runtime_selection = selected
                 self.startup_phase = "identity_warmup"
                 status = await _wait_setup_startup_ready(self.runtime, target=bootstrap_target)
@@ -1781,7 +1785,8 @@ class ArchitectService:
                         "proposal": proposal["blueprint"] if proposal else None, "source": "agent",
                         "changes": proposal["changes"] if proposal else [], "warnings": [],
                         "guide": publication,
-                        "base_hash": fingerprint(before), "console_url": base + "/console"}
+                        "base_hash": fingerprint(before), "console_url": base + "/console",
+                        "browser_console_url": self.status()["browser_console_url"]}
             finally:
                 self.message_publications = None
                 self.guide_edit_turn = None
