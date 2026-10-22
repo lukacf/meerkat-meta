@@ -316,6 +316,29 @@ def _declared_glibc_floor(record, platform):
     return int(found[1]), int(found[2])
 
 
+def declared_glibc_floor(target):
+    """Read only a selected product's declared glibc floor.
+
+    It opens the pinned assembly and its resource build record, not the whole
+    product, so a refusal can come before the full read. The full read still
+    verifies both again.
+    """
+    try:
+        _require(type(target) is MetaToolkitRuntimeTarget,
+            "The native product requires its original application selection.")
+        inputs = _Inputs(target.artifact_root)
+        _, raw = inputs.read(target.assembly.path, target.assembly.sha256, MAX_PRODUCT_METADATA,
+            size=target.assembly.size)
+        _, raw = inputs.read(target.assembly.path.parent / "resource-build-record.json",
+            _json(raw)["resource_build_record_sha256"], MAX_PRODUCT_METADATA)
+        inputs.finish()
+        return _declared_glibc_floor(_json(raw), target.target)
+    except CandidateArtifactError:
+        raise
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        raise CandidateArtifactError("The selected native product has an absent, changed or malformed input.") from error
+
+
 def _read_meta_toolkit_artifacts(target, retained=None):
     """Read existing producer relationships against an already selected input.
 
