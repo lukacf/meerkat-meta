@@ -83,7 +83,7 @@ class RequestedFeature(StrictModel):
 class IncomingDataRoute(StrictModel):
     """Desired recipient, not a runtime subscription or an access grant."""
 
-    recipient: str = Field(min_length=3, max_length=60)
+    recipient: str = Field(min_length=1, max_length=60)
     delivery: Literal["direct", "triage", "conversation"]
     recipient_kind: Literal["identity", "class"] = Field(default="identity",
         description="A proposed identity, or a whole proposed class including future members. A class is desired scope, not a native role selector or access grant.")
@@ -97,6 +97,12 @@ class IncomingDataRoute(StrictModel):
 
     @model_validator(mode="after")
     def single_conversation_or_triage_owner(self):
+        if self.recipient_kind == "class":
+            from .blueprint import ID
+            if not re.fullmatch(ID, self.recipient):
+                raise ValueError("Choose a valid Blueprint class ID for a class recipient.")
+        elif len(self.recipient) < 3:
+            raise ValueError("An identity recipient must have at least 3 characters.")
         if self.recipient_kind == "class" and self.delivery != "direct":
             raise ValueError("Choose one identity for triage or conversation ownership; class routes describe direct awareness.")
         return self

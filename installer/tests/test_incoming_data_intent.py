@@ -46,23 +46,41 @@ def test_guided_publication_retains_mixed_routes_as_intent_and_open_implementati
     assert value == before
 
 
-def test_class_route_can_start_empty_and_survives_reopen_without_placeholder_members(tmp_path):
+@pytest.mark.parametrize("class_id", ["review", "q", "qa"])
+def test_class_route_can_start_empty_and_survives_reopen_without_placeholder_members(tmp_path, class_id):
     from launchkit.guide_store import GuideStore
 
     plan = starter_blueprint().model_dump(mode="json")
-    plan["agent_classes"][1]["instances"] = 0
+    recipient_class = next(item for item in plan["agent_classes"] if item["id"] == "review")
+    recipient_class.update(id=class_id, instances=0)
     plan["flows"] = []
     value = brief()
     source = value["incoming_data"][0]
-    source["routes"] = [{"recipient": "review", "recipient_kind": "class", "delivery": "direct"}]
+    source["routes"] = [{"recipient": class_id, "recipient_kind": "class", "delivery": "direct"}]
     before = copy.deepcopy(plan)
     result = publish(value, plan)
     saved = GuideStore(tmp_path).create({"brief": result["brief"], "proposal": plan})
     reopened = GuideStore(tmp_path).get(saved["id"])
     assert reopened["brief"]["incoming_data"][0]["routes"] == source["routes"]
-    assert reopened["proposal"]["agent_classes"][1]["instances"] == 0
+    assert next(item for item in reopened["proposal"]["agent_classes"] if item["id"] == class_id)["instances"] == 0
     assert reopened["brief"]["requirements"][0]["disposition"] == "open"
     assert plan == before
+
+
+@pytest.mark.parametrize("recipient", ["Q", "qa team", "a" * 41, "lead:main"])
+def test_class_recipients_follow_blueprint_id_rules(recipient):
+    from launchkit.guide_models import IncomingDataRoute
+
+    with pytest.raises(ValueError, match="class ID"):
+        IncomingDataRoute(recipient=recipient, recipient_kind="class", delivery="direct")
+
+
+@pytest.mark.parametrize("recipient", ["q", "qa"])
+def test_short_class_ids_do_not_relax_identity_recipient_validation(recipient):
+    from launchkit.guide_models import IncomingDataRoute
+
+    with pytest.raises(ValueError):
+        IncomingDataRoute(recipient=recipient, delivery="direct")
 
 
 @pytest.mark.parametrize("delivery", ["triage", "conversation"])
