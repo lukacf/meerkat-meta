@@ -136,6 +136,20 @@ def selected_update_refusal(target, interpreter=None):
         or selected_interpreter_refusal(target, interpreter))
 
 
+def staged_runtime_refusal(update):
+    """Why this computer cannot install a staged update's selected product, or None.
+
+    The product's declared glibc floor and this Forge's interpreter are both
+    checked, as Stage checks them, before the worker moves the runtime aside.
+    """
+    selection = (update.get("runtime_dependency_update") or {}).get("runtime_candidate")
+    if selection is None:
+        return None
+    from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
+    target = parse_candidate_selection(selection)
+    return selected_update_refusal(target) if type(target) is MetaToolkitRuntimeTarget else None
+
+
 def product_runtime_source(files, selected, *, verified_artifacts=None, source_custody=None):
     """Join an owner's retained product selection to its exact accepted source.
 
@@ -3656,6 +3670,13 @@ class DeploymentService:
                 eligible = {"staged", "snapshotting"} if action == "apply-update" else CURRENT_RECOVERY_STATES
                 if update["status"] not in eligible or update["blockers"]:
                     raise DraftConflict("This staged package has update requirements that must be resolved first.")
+                if action == "apply-update":
+                    # The worker moves the current runtime aside before it
+                    # installs the selected product with this interpreter, so
+                    # refuse here a computer that product cannot run on.
+                    refusal = staged_runtime_refusal(update)
+                    if refusal is not None:
+                        raise DraftConflict(refusal)
                 checked = await self.implementation.status(guide_id)
                 require_accepted(checked)
                 latest = await self._guide(guide_id)
