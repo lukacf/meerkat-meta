@@ -540,9 +540,9 @@ def _lineage_journals(directory, in_flight):
     return edges
 
 
-# Edges already verified in this process, keyed by their journal directory.
-# The file identities include ctime, so a changed journal, package or admission
-# is verified again in full.
+# Edges already verified in this process, keyed by their journal directory. A
+# hit needs the same file identities, which include ctime, and the same walked
+# journal content; anything else is verified again in full.
 _verified_edges = {}
 MAX_VERIFIED_EDGES = 4096
 
@@ -559,14 +559,17 @@ def _require_lineage_edge(directory, child, journal):
         observed = _edge_identities(child)
     except OSError:
         observed = None
+    # The walk trusts the journal it read, which can differ from the bytes
+    # behind the identities observed here.
+    verified = (observed, hashlib.sha256(_selected_json(journal).encode()).hexdigest())
     key = (str(directory), str(child))
-    if observed is not None and _verified_edges.get(key) == observed:
+    if observed is not None and _verified_edges.get(key) == verified:
         return
     _verify_lineage_edge(directory, child, journal)
     if observed is not None and _edge_identities(child) == observed:
         if len(_verified_edges) >= MAX_VERIFIED_EDGES:
             _verified_edges.clear()
-        _verified_edges[key] = observed
+        _verified_edges[key] = verified
 
 
 def _verify_lineage_edge(directory, child, journal):

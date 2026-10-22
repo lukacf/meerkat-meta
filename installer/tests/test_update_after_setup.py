@@ -486,6 +486,33 @@ async def test_a_verified_lineage_edge_is_verified_again_after_it_changes(local_
     assert not f.service.launched
 
 
+async def test_a_memoized_lineage_edge_still_verifies_the_journal_the_walk_read(local_restore, monkeypatch):
+    f = local_restore
+    await completed_setup(f, monkeypatch)
+    identity = await commit_candidate(f, monkeypatch)
+    await owner_start(f)
+    edge = updates.update_directory(f.directory, identity)
+    assert any(key[1] == str(edge) for key in bootstrap._verified_edges)
+    # The journal a walk reads can differ from the bytes the memo observed
+    # (a racing write). Only the edge verification compares source_digest.
+    original = bootstrap._lineage_journals
+
+    def raced(directory, in_flight):
+        edges = original(directory, in_flight)
+        for rows in edges.values():
+            for index, (child, journal) in enumerate(rows):
+                if child == edge:
+                    rows[index] = (child, {**journal, "source_digest": "0" * 64})
+        return edges
+
+    monkeypatch.setattr(bootstrap, "_lineage_journals", raced)
+    f.service.launched.clear()
+    with pytest.raises(CustodyError) as refused:
+        await action(f, "finish-setup")
+    assert str(refused.value) == bootstrap.LINEAGE_CHANGED
+    assert not f.service.launched
+
+
 async def test_gap_in_a_two_update_chain_refuses(local_restore, monkeypatch):
     f = local_restore
     await completed_setup(f, monkeypatch)
