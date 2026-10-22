@@ -1434,7 +1434,7 @@ def test_remote_unit_budgets_are_exactly_the_recognised_ones():
     # unreported horizon's unit. A reported horizon widens a drop-in instead.
     for budget in (45, 397, remote_budget('service', gateway_horizon_ms())):
         assert module.service_stop_timeout({'stop_timeout_seconds': budget}) == budget
-    for budget in (396, 398, remote_budget('service', 432_000), 3600):
+    for budget in (396, 398, remote_budget('service', gateway_horizon_ms() + 40_000), 3600):
         with pytest.raises(ValueError, match='unsupported shutdown budget'):
             module.service_stop_timeout({'stop_timeout_seconds': budget})
 
