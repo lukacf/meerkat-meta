@@ -9,7 +9,7 @@ import pytest
 from launchkit.projects import DraftConflict
 from launchkit.remote_browser_access import browser_responds, console_port
 from launchkit.remote_deployment import update_receipt
-from test_remote_deployment import service, connect, install
+from test_remote_deployment import service, connect, install, longest_loop_gap, slow_package_reads
 
 
 class Handle:
@@ -458,3 +458,28 @@ async def test_pending_harmless_guide_turn_keeps_readonly_access_but_blocks_new_
     changed = await browser.status(receipt["guide_id"], receipt["deployment_id"])
     assert changed["status"] == "unavailable" and changed["local_url"] is None
     assert browser.transport.handles[0].closes == 1
+
+
+async def test_remote_browser_access_open_leaves_the_event_loop_free(access, monkeypatch):
+    browser, receipt = access
+    slow_package_reads(monkeypatch)
+    value, gap = await longest_loop_gap(opened(browser, receipt))
+    assert value["status"] == "ready" and value["local_url"] == receipt["service"]["console_url"]
+    assert gap < 0.5
+
+
+async def test_remote_browser_access_status_leaves_the_event_loop_free(access, monkeypatch):
+    browser, receipt = access
+    ready = await opened(browser, receipt)
+    slow_package_reads(monkeypatch)
+    value, gap = await longest_loop_gap(browser.status(receipt["guide_id"], receipt["deployment_id"]))
+    assert value["status"] == "ready" and value["access_id"] == ready["access_id"]
+    assert gap < 0.5
+
+
+async def test_remote_browser_access_closed_scope_leaves_the_event_loop_free(access, monkeypatch):
+    browser, receipt = access
+    slow_package_reads(monkeypatch)
+    value, gap = await longest_loop_gap(browser.status(receipt["guide_id"], receipt["deployment_id"]))
+    assert value["status"] == "closed" and value["scope"]["authentication"] == "loopback-only"
+    assert gap < 0.5

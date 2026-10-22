@@ -9,7 +9,7 @@ import time
 import uuid
 from urllib.parse import quote
 
-from .deployment import now, package_console_scope, package_configuration_fields
+from .deployment import await_validation, now, package_console_scope, package_configuration_fields
 from .projects import DraftConflict
 from .application_access import ENTRY, selected_application_entry, application_available
 
@@ -282,7 +282,10 @@ class RemoteBrowserAccessService:
     async def _scope(self, receipt, entry_id):
         if entry_id != "native-console":
             return {"health_scope": "declared-application-transport", "custom_interfaces_verified": False}
-        files, _, _ = self.remote.frozen(self.remote.directory(receipt["guide_id"], receipt["deployment_id"]), receipt)
+        # Reading, hashing and unpacking the saved package must not hold the
+        # event loop.
+        files, _, _ = await await_validation(self.remote.frozen,
+            self.remote.directory(receipt["guide_id"], receipt["deployment_id"]), receipt)
         fields = package_configuration_fields(json.loads(files["deployment.json"][0]), files)
         return package_console_scope(files, fields, await self.remote.guide.get(receipt["guide_id"]))
 
@@ -406,7 +409,7 @@ class RemoteBrowserAccessService:
         key = self.key(guide_id, deployment_id, entry_id)
         async with self.remote.lock:
             try:
-                directory, receipt = self.remote.stored(guide_id, deployment_id)
+                directory, receipt = await await_validation(self.remote.stored, guide_id, deployment_id)
             except (ValueError, LookupError, OSError, RuntimeError, TypeError, KeyError):
                 async with self.lock(key):
                     await self._revoke_locked(key)
@@ -581,7 +584,7 @@ class RemoteBrowserAccessService:
         key = self.key(guide_id, deployment_id, entry_id)
         if key not in self.records or not self.records[key].get("handle"):
             try:
-                _, receipt = self.remote.stored(guide_id, deployment_id)
+                _, receipt = await await_validation(self.remote.stored, guide_id, deployment_id)
                 state = await self.remote.current_state(receipt)
                 receipt["current_guide_version"] = state["version"] if state is not None else None
             except (ValueError, LookupError, OSError, RuntimeError, TypeError, KeyError):
@@ -594,7 +597,7 @@ class RemoteBrowserAccessService:
             record["public"]["current_guide_version"] = receipt["current_guide_version"]
             return self.public(key)
         try:
-            directory, _ = self.remote.stored(guide_id, deployment_id)
+            directory, _ = await await_validation(self.remote.stored, guide_id, deployment_id)
         except (ValueError, LookupError, OSError, TypeError, KeyError):
             async with self.lock(key):
                 return await self._revoke_locked(key, status="unavailable",

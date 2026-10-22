@@ -15,6 +15,7 @@ import time
 import uuid
 
 from .application_first_use import first_use_suggestions
+from .deployment import await_validation
 from .installed_feedback import (_continuation, _mutating, _feedback_pre_admission,
                                  InstalledFeedbackNotAdmitted, installed_feedback_request, success_readback)
 from .implementation import ImplementationPrerequisiteNotAdmitted
@@ -189,9 +190,11 @@ def _observation(service, receipt):
         "scope": "saved-destination-observation"}
 
 
-def _record(service, guide_id, deployment_id=None):
+async def _record(service, guide_id, deployment_id=None):
     try:
-        directory, receipt = service.stored(guide_id, deployment_id)
+        # Reading, hashing and unpacking the frozen package must not hold the
+        # event loop.
+        directory, receipt = await await_validation(service.stored, guide_id, deployment_id)
         if service.directory(guide_id) != directory:
             raise DraftConflict("A different remote installation is selected. Reload its first job before continuing.")
         if not isinstance(receipt.get("status"), str) or receipt["status"] not in _STATES:
@@ -201,27 +204,38 @@ def _record(service, guide_id, deployment_id=None):
         raise DraftConflict("The selected remote package or ownership could not be verified. Preserve this installation before guided use.") from None
 
 
-def _stored(service, guide_id, deployment_id=None):
-    directory, receipt, selected = _record(service, guide_id, deployment_id)
+async def _stored(service, guide_id, deployment_id=None):
+    directory, receipt, selected = await _record(service, guide_id, deployment_id)
     try:
-        files, _, _ = service.frozen(directory, receipt)
+        files, _, _ = await await_validation(service.frozen, directory, receipt)
         return directory, receipt, selected, _metadata(files, receipt)
+    except (OSError, KeyError, TypeError, ValueError):
+        raise DraftConflict("The selected remote package or ownership could not be verified. Preserve this installation before guided use.") from None
+
+
+def _unchanged(directory, receipt):
+    """Compare the saved record with one that was verified before a lock."""
+    from .remote_deployment import read_receipt
+    try:
+        return read_receipt(directory) == receipt
     except (OSError, KeyError, TypeError, ValueError):
         raise DraftConflict("The selected remote package or ownership could not be verified. Preserve this installation before guided use.") from None
 
 
 async def _snapshot(service, guide_id, directory):
     state = await service.local._guide(guide_id)
-    _, receipt, selected, metadata = _stored(service, guide_id, directory.name)
+    _, receipt, selected, metadata = await _stored(service, guide_id, directory.name)
     try:
         checked = await service.implementation.status(guide_id, state=state)
     except (LookupError, OSError, ValueError):
         checked = None
     current = await service.current(receipt)
+    # Rejoin before the last guide read, so no await separates that read
+    # from the callers' use of this guide state.
+    _, rejoined, exact = await _record(service, guide_id, directory.name)
     fresh = await service.local._guide(guide_id)
     if fingerprint(fresh) != fingerprint(state):
         raise DraftConflict("The setup changed while preparing remote use. Reload before continuing.")
-    _, rejoined, exact = _record(service, guide_id, directory.name)
     if exact != selected or rejoined != receipt:
         raise DraftConflict("The remote installation changed while preparing its first job. Reload before continuing.")
     return state, receipt, selected, metadata, checked, current
