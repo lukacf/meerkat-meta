@@ -2047,7 +2047,8 @@ class DeploymentService:
             if receipt["build_id"] == build_id:
                 raise DraftConflict("This accepted application is already installed.")
             payload, _ = await self.implementation.package(guide_id, build_id)
-            files = package_files(payload)
+            # Unpacking the whole package must not hold the event loop.
+            files = await asyncio.to_thread(package_files, payload)
             report = json.loads(files["implementation-report.json"][0])
             runtime_target = None
             if "runtimeCandidate" in json.loads(files["deployment.json"][0]):
@@ -2059,6 +2060,10 @@ class DeploymentService:
                 if runtime_target is None:
                     raise DraftConflict("The candidate package has no exact accepted host runtime selection.")
             setup_blockers = await self._setup_owner_blockers(guide_id, deployment_id, files, report)
+            # Reading the installed source and every selected runtime, which
+            # can be a full native product, must not hold the event loop.
+            prepared = await await_validation(self._prepare_update_stage, guide_id, deployment_id,
+                payload, report, runtime_target, setup_blockers)
             current = await self.implementation.status(guide_id)
             require_accepted(current)
             latest = await self._guide(guide_id)
@@ -2068,16 +2073,21 @@ class DeploymentService:
                     or not package_matches(report, latest) or report.get("build_id") != build_id
                     or report.get("blueprint_hash") != proposal_hash(latest.get("proposal") or latest.get("blueprint"))):
                 raise DraftConflict("The accepted application changed while preparing its update.")
-            # No await separates the final source/design fences and publication.
-            from .deployment_updates import stage
-            restore_selection = self._setup_update_restore(guide_id, deployment_id)
-            setup = ({"restore_selection": restore_selection, "setup_blockers": setup_blockers}
-                if restore_selection is not None else {})
-            if runtime_target is None:
-                stage(self._directory(guide_id), payload, report, **setup)
-            else:
-                stage(self._directory(guide_id), payload, report, runtime_target=runtime_target, **setup)
+            # No await separates the final source/design fences and publication,
+            # which rechecks what the preparation read.
+            from .deployment_updates import publish_stage
+            publish_stage(self._directory(guide_id), prepared)
             return await self.status(guide_id)
+
+    def _prepare_update_stage(self, guide_id, deployment_id, payload, report, runtime_target, setup_blockers):
+        """Read and check a Stage in a worker thread; nothing is written here."""
+        from .deployment_updates import prepare_stage
+        restore_selection = self._setup_update_restore(guide_id, deployment_id)
+        setup = ({"restore_selection": restore_selection, "setup_blockers": setup_blockers}
+            if restore_selection is not None else {})
+        if runtime_target is not None:
+            setup["runtime_target"] = runtime_target
+        return prepare_stage(self._directory(guide_id), payload, report, **setup)
 
     def _setup_owner(self, guide_id, deployment_id):
         """The selected host that owns a set-up installation's completed setup, or None.

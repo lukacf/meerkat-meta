@@ -13,6 +13,7 @@ from pathlib import Path
 import stat
 import time
 import tomllib
+from types import SimpleNamespace
 import uuid
 import zipfile
 from copy import deepcopy
@@ -453,7 +454,7 @@ def _candidate_source_selection(files, *, source_custody=None):
     return selection
 
 
-def current_host_framework(files, *, runtime_target=None, verified_artifacts=None):
+def current_host_framework(files, *, runtime_target=None, verified_artifacts=None, reads=None):
     """Require the exact current compiler export and its protected provenance."""
     if not _framework_provenance(files):
         return False
@@ -469,8 +470,11 @@ def current_host_framework(files, *, runtime_target=None, verified_artifacts=Non
         selection = _candidate_source_selection(files)
         if selection is not None:
             from .runtime_selection import candidate_selection
-            if runtime_target is None or not _same_toml(selection, candidate_selection(runtime_target,
-                    verified_artifacts=verified_artifacts)):
+            if runtime_target is None:
+                return False
+            if reads is not None and verified_artifacts is None:
+                verified_artifacts = reads(runtime_target)
+            if not _same_toml(selection, candidate_selection(runtime_target, verified_artifacts=verified_artifacts)):
                 return False
         elif runtime_target is not None:
             return False
@@ -554,7 +558,7 @@ def _maintained_supervisor_paths(*, sources=None):
     return sorted(names)
 
 
-def maintained_host_transition(previous, candidate, receipt, *, runtime_target=None, archived=None):
+def maintained_host_transition(previous, candidate, receipt, *, runtime_target=None, archived=None, reads=None):
     """Bind seven current host files to the identical already admitted candidate.
 
     The historical compiler inventory is deliberately bounded. A newer host
@@ -625,7 +629,8 @@ def maintained_host_transition(previous, candidate, receipt, *, runtime_target=N
             archived.get("required_supervisor_sources") if archived is not None else None))
         if archived is None:
             from .runtime_selection import candidate_selection
-            if runtime_target is None or not _same_toml(selection, candidate_selection(runtime_target)):
+            if runtime_target is None or not _same_toml(selection, candidate_selection(runtime_target,
+                    verified_artifacts=None if reads is None else reads(runtime_target))):
                 return None
             expected = {item.path: (item.as_bytes(), item.mode) for item in maintained_host_export()}
             sources = {name: digest(Path(__file__).parent.joinpath(*Path(name).parts[1:]).read_bytes())
@@ -942,17 +947,18 @@ def _product_refresh_descriptor(previous, candidate, authority, *, sources, expe
         "previous_baseline_digest": old["baseline_digest"], "previous_compiler_baseline_digest": old["current_compiler_baseline_digest"]}
 
 
-def _product_runtime_transition(previous, candidate, receipt, authority, runtime_target):
+def _product_runtime_transition(previous, candidate, receipt, authority, runtime_target, *, reads=None):
     from .compiler import generate_package, generate_runtime_refresh
     from .generator import PackageFile
     from .runtime_selection import candidate_selection, parse_candidate_selection, selected_runtime_artifacts
     if runtime_target is None:
         return None
-    verified = selected_runtime_artifacts(runtime_target)
+    verified = selected_runtime_artifacts(runtime_target) if reads is None else reads(runtime_target)
     if not _same_toml(candidate_selection(runtime_target, verified_artifacts=verified), authority["runtime_candidate"]):
         return None
     prior_target = parse_candidate_selection(authority["previous_runtime_candidate"])
-    prior_expected = _candidate_artifact_expectation(prior_target)
+    prior_verified = None if reads is None else reads(prior_target)
+    prior_expected = _candidate_artifact_expectation(prior_target, verified_artifacts=prior_verified)
     expected = _candidate_artifact_expectation(runtime_target, verified_artifacts=verified)
     protected = _product_protected_paths(previous)
     old_report = _parsed_config(previous, "implementation-report.json")
@@ -960,7 +966,8 @@ def _product_runtime_transition(previous, candidate, receipt, authority, runtime
     source = [PackageFile(name, previous[name][0].decode(), 0o600 if name == ".env.example" else previous[name][1])
         for name in _product_framework_paths(previous, protected)]
     generated = generate_runtime_refresh(_parsed_config(candidate, "blueprint.json"), source,
-        runtime_target=runtime_target, verified_artifacts=verified, protected_application_paths=tuple(protected))
+        runtime_target=runtime_target, verified_artifacts=verified, protected_application_paths=tuple(protected),
+        predecessor_artifacts=prior_verified)
     ordinary = generate_package(_parsed_config(candidate, "blueprint.json"), runtime_target=runtime_target,
         verified_artifacts=verified)
     baseline = {item.path: {"sha256": digest(item.as_bytes()), "mode": item.mode} for item in generated}
@@ -982,9 +989,30 @@ def _product_runtime_transition(previous, candidate, receipt, authority, runtime
     if _archived_supervisor_sources(candidate, {"required_supervisor_sources": sources}, 4) is None:
         return None
     selected_runtime_artifacts(runtime_target, verified_artifacts=verified)
-    _candidate_artifact_expectation(prior_target)
+    _candidate_artifact_expectation(prior_target, verified_artifacts=prior_verified)
     return _product_refresh_descriptor(previous, candidate, authority, sources=sources,
         expected=expected, prior_expected=prior_expected)
+
+
+class SelectedRuntimeReads:
+    """One Stage's selected runtime reads: each runtime is read in full once.
+
+    A later use passes the verified artifacts back to the selected runtime
+    reader. That rechecks the same inputs' file fingerprints, as an explicit
+    verified_artifacts argument always does, so a changed input still refuses.
+    """
+
+    def __init__(self):
+        self._verified = []
+
+    def __call__(self, target):
+        from .runtime_selection import selected_runtime_artifacts
+        for selected, verified in self._verified:
+            if selected == target:
+                return selected_runtime_artifacts(target, verified_artifacts=verified)
+        verified = selected_runtime_artifacts(target)
+        self._verified.append((target, verified))
+        return verified
 
 
 def _candidate_artifact_expectation(runtime_target, *, verified_artifacts=None):
@@ -1032,14 +1060,18 @@ def _candidate_artifact_expectation(runtime_target, *, verified_artifacts=None):
     return {"sdk": {"payload_sha256": dict(artifacts.sdk.payload), "metadata_sha256": metadata}, "native": native}
 
 
-def runtime_dependency_transition(previous, candidate, receipt, *, runtime_target=None):
-    """Recompute every current protected byte, retaining only accepted design."""
+def runtime_dependency_transition(previous, candidate, receipt, *, runtime_target=None, reads=None):
+    """Recompute every current protected byte, retaining only accepted design.
+
+    reads, when given, holds one Stage's verified selected runtimes, so each is
+    read in full once and only rechecked by later calls.
+    """
     authority = _runtime_dependency_authority(previous, candidate, receipt)
     if authority is None:
         return None
     try:
         if authority.get("version") == 5:
-            return _product_runtime_transition(previous, candidate, receipt, authority, runtime_target)
+            return _product_runtime_transition(previous, candidate, receipt, authority, runtime_target, reads=reads)
         from .compiler import generate_package, generate_runtime_refresh
         from .generator import MOBKIT_VERSION, PackageFile
         from .implementation_workspace import _wheel_path
@@ -1049,13 +1081,15 @@ def runtime_dependency_transition(previous, candidate, receipt, *, runtime_targe
         previous_artifacts = None
         if authority.get("previous_runtime_candidate") is not None:
             from .runtime_selection import parse_candidate_selection
-            previous_artifacts = _candidate_artifact_expectation(
-                parse_candidate_selection(authority["previous_runtime_candidate"]))
+            prior_target = parse_candidate_selection(authority["previous_runtime_candidate"])
+            previous_artifacts = _candidate_artifact_expectation(prior_target,
+                verified_artifacts=None if reads is None else reads(prior_target))
         if selection is not None:
             from .runtime_selection import candidate_selection, selected_runtime_artifacts
             if runtime_target is None:
                 return None
-            verified_artifacts = selected_runtime_artifacts(runtime_target)
+            verified_artifacts = (selected_runtime_artifacts(runtime_target) if reads is None
+                else reads(runtime_target))
             if not _same_toml(selection, candidate_selection(runtime_target,
                     verified_artifacts=verified_artifacts)):
                 return None
@@ -1878,16 +1912,18 @@ def _completed_runtime_dependency_transition(previous, candidate, receipt, updat
         return None
 
 
-def compatibility(previous, candidate, receipt, *, runtime_target=None):
+def compatibility(previous, candidate, receipt, *, runtime_target=None, reads=None):
     changes, blockers = [], []
     crossing = native_storage_crossing(previous, candidate)
     if crossing is not None:
         blockers.append(NATIVE_STORAGE_UPDATE_BLOCKER.format(*crossing))
     instruction_update = instruction_configuration_update(previous, candidate)
-    current_host = (current_host_framework(candidate, runtime_target=runtime_target)
+    current_host = (current_host_framework(candidate, runtime_target=runtime_target, reads=reads)
                     if runtime_target is not None else current_host_framework(candidate))
-    dependency_update = runtime_dependency_transition(previous, candidate, receipt, runtime_target=runtime_target)
-    maintained_update = maintained_host_transition(previous, candidate, receipt, runtime_target=runtime_target)
+    dependency_update = runtime_dependency_transition(previous, candidate, receipt, runtime_target=runtime_target,
+        reads=reads)
+    maintained_update = maintained_host_transition(previous, candidate, receipt, runtime_target=runtime_target,
+        reads=reads)
     for name in sorted(previous.keys() | candidate.keys()):
         if previous.get(name) == candidate.get(name):
             continue
@@ -1974,6 +2010,27 @@ def stage(directory, payload, report, *, runtime_target=None, restore_selection=
     pin; any other change after setup is blocked here. setup_blockers are the
     owner's own refusals of this candidate, which the deployment service read.
     """
+    return publish_stage(directory, prepare_stage(directory, payload, report, runtime_target=runtime_target,
+        restore_selection=restore_selection, setup_blockers=setup_blockers))
+
+
+STAGE_CHANGED = "The installation changed while its update was being prepared. No update was staged; stage it again."
+
+
+def _stage_binding(receipt):
+    """The receipt facts a prepared Stage read; status observations stay out."""
+    return {**inspection_binding(receipt), **{key: receipt.get(key) for key in (*BOUND_KEYS, "target")},
+        "update": receipt.get("update")}
+
+
+def prepare_stage(directory, payload, report, *, runtime_target=None, restore_selection=None, setup_blockers=()):
+    """Read and check one accepted package for staging, without writing anything.
+
+    This is the long part of a Stage: it reads both packages, the installed
+    source and every selected runtime, which can be a full native product. The
+    deployment service runs it in a worker thread. Each selected runtime is
+    read in full once. publish_stage rechecks the result and writes it.
+    """
     require_replacement_history_settled(directory)
     from .deployment_application_bootstrap import require_update_bootstrap_history, setup_keeps_candidate
     restore = require_update_bootstrap_history(directory, restore_selection)
@@ -1997,8 +2054,9 @@ def stage(directory, payload, report, *, runtime_target=None, restore_selection=
     if any(previous_report.get(key) != receipt.get(key) for key in ("build_id", "guide_version", "blueprint_hash", "unresolved")):
         raise DraftConflict("The installed metadata no longer matches its exact previous package.")
     verify_destination(receipt, previous)
-    dependency = runtime_dependency_transition(previous, candidate, receipt, runtime_target=runtime_target)
-    maintained = maintained_host_transition(previous, candidate, receipt, runtime_target=runtime_target)
+    reads = SelectedRuntimeReads()
+    dependency = runtime_dependency_transition(previous, candidate, receipt, runtime_target=runtime_target, reads=reads)
+    maintained = maintained_host_transition(previous, candidate, receipt, runtime_target=runtime_target, reads=reads)
     if maintained:
         if not _same_toml(report, _parsed_config(candidate, "implementation-report.json")):
             raise DraftConflict("The maintained host report differs from its exact accepted source package.")
@@ -2012,14 +2070,9 @@ def stage(directory, payload, report, *, runtime_target=None, restore_selection=
         require_candidate_update_protocol(service, {"runtime_dependency_update": dependency})
         if receipt.get("status") != "stopped" or receipt.get("service_cleanup_confirmed") is not True:
             raise DraftConflict("Stop this exact owned background service and confirm its native cleanup before staging a runtime refresh.")
-    identity = str(uuid.uuid4())
-    root = update_directory(directory, identity)
-    root.mkdir(mode=0o700, parents=True)
-    write_archive(root / "previous.zip", previous_payload)
-    write_archive(root / "candidate.zip", payload)
-    write_private(root / "previous-receipt.json", {key: report_brief_hash(previous_report) if key == "brief_hash" else receipt[key] for key in BOUND_KEYS})
-    changes, blockers = compatibility(previous, candidate, receipt, runtime_target=runtime_target)
-    dependency_update = runtime_dependency_transition(previous, candidate, receipt, runtime_target=runtime_target)
+    changes, blockers = compatibility(previous, candidate, receipt, runtime_target=runtime_target, reads=reads)
+    dependency_update = runtime_dependency_transition(previous, candidate, receipt, runtime_target=runtime_target,
+        reads=reads)
     native_definition_update = bool(instruction_configuration_update(previous, candidate)
         or dependency_update and dependency_update["native_registry_update"])
     host_instruction_update = bool(not maintained and has_host_instruction_carrier(candidate)
@@ -2029,7 +2082,7 @@ def stage(directory, payload, report, *, runtime_target=None, restore_selection=
         if (native_definition_update or host_instruction_update or dependency_update
                 or maintained or not setup_keeps_candidate(directory, restore, candidate)):
             blockers.append(SETUP_REPLACEMENT_BLOCKER)
-    transaction = {"update_id": identity, "status": "blocked" if blockers else "staged",
+    transaction = {"update_id": str(uuid.uuid4()), "status": "blocked" if blockers else "staged",
         "from_build_id": receipt["build_id"], "to_build_id": report["build_id"],
         "guide_version": report["guide_version"], "blueprint_hash": report["blueprint_hash"],
         "brief_hash": report_brief_hash(report),
@@ -2044,9 +2097,35 @@ def stage(directory, payload, report, *, runtime_target=None, restore_selection=
         "host_instruction_scope": "Canonical profile skills on ordinary trusted-host send and keyed dispatch turns only; Console, native flows, schedules and internal peer turns are outside this carrier.",
         "detail": ("Update prepared for review, but cannot be applied yet. Installed source and private data have not changed."
                    if blockers else "The exact accepted update is staged. Installed source and private data have not changed.")}
+    return SimpleNamespace(receipt=deepcopy(receipt), restore_selection=deepcopy(restore_selection),
+        restore=deepcopy(restore), previous_payload=previous_payload, payload=payload,
+        previous_receipt={key: report_brief_hash(previous_report) if key == "brief_hash" else receipt[key]
+            for key in BOUND_KEYS},
+        transaction=transaction)
+
+
+def publish_stage(directory, prepared):
+    """Publish one prepared Stage after rechecking what it read.
+
+    Only cheap reads and the update's own files happen here, so the deployment
+    service runs it on the event loop with no await after its final source
+    and design fences. A change since the preparation writes nothing.
+    """
+    require_replacement_history_settled(directory)
+    from .deployment_application_bootstrap import require_update_bootstrap_history
+    restore = require_update_bootstrap_history(directory, prepared.restore_selection)
+    if not _same_toml(restore, prepared.restore) or not _same_toml(
+            _stage_binding(read_receipt(directory)), _stage_binding(prepared.receipt)):
+        raise DraftConflict(STAGE_CHANGED)
+    transaction = deepcopy(prepared.transaction)
+    root = update_directory(directory, transaction["update_id"])
+    root.mkdir(mode=0o700, parents=True)
+    write_archive(root / "previous.zip", prepared.previous_payload)
+    write_archive(root / "candidate.zip", prepared.payload)
+    write_private(root / "previous-receipt.json", prepared.previous_receipt)
     if restore is not None:
         # Apply and the worker re-verify this exact pin; the owner starts it.
-        transaction["setup_restore_sha256"] = retain_setup_restore(root, restore_selection)
+        transaction["setup_restore_sha256"] = retain_setup_restore(root, prepared.restore_selection)
     write_private(root / "update.json", transaction)
     return update_receipt(directory, update=transaction)
 

@@ -801,7 +801,7 @@ def maintained_host_export():
 
 
 def generate_runtime_refresh(value, accepted_files, *, runtime_target=None, verified_artifacts=None,
-                             protected_application_paths=None):
+                             protected_application_paths=None, predecessor_artifacts=None):
     """Derive a current host from an exact host-accepted framework snapshot.
 
     Application source is copied separately under its existing workspace lock.
@@ -809,6 +809,8 @@ def generate_runtime_refresh(value, accepted_files, *, runtime_target=None, veri
     product successor retains its host-protected application inputs while
     replacing the selected SDK/native dependency tuple and framework source.
     Keeping accepted design and MCP source preserves their declared closure.
+    predecessor_artifacts are the caller's verified artifacts of the accepted
+    predecessor product, rechecked here instead of read again.
     """
     import re
     from .native_models import _exact
@@ -837,7 +839,9 @@ def generate_runtime_refresh(value, accepted_files, *, runtime_target=None, veri
                            or "\0" in accepted[name].content for name in protected_application_paths)
                     or old.get("mobkitVersion") != prior.meta.version
                     or old.get("runtimeCandidate") != selected_runtime_marker(prior)
-                    or json.loads(accepted["runtime-candidate.json"].content) != candidate_selection(prior)):
+                    or json.loads(accepted["runtime-candidate.json"].content) != candidate_selection(prior,
+                        verified_artifacts=predecessor_artifacts
+                            if getattr(predecessor_artifacts, "selection", None) == prior else None)):
                 raise ValueError("The product successor requires its exact protected predecessor snapshot and selected artifacts.")
             protected = protected_application_paths
         elif protected_application_paths:
