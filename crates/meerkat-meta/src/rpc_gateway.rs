@@ -7103,6 +7103,7 @@ comms = true
             accepted: AtomicBool::new(false),
             durable_phase_begun: AtomicBool::new(false),
             settled: AtomicBool::new(false),
+            shutdown_horizon_ms: GATEWAY_SHUTDOWN_HORIZON_MS,
         }
     }
 
@@ -10857,6 +10858,44 @@ const GATEWAY_STDOUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 // an SDK never races the gateway's own deadline and preempts a valid callback.
 const GATEWAY_SHUTDOWN_HORIZON_MS: u64 = 432_000;
 
+/// The largest `shutdown_in_flight_drain_ms` a `meta/init` may set: 5 minutes.
+const MAX_SHUTDOWN_IN_FLIGHT_DRAIN_MS: u64 = 300_000;
+
+/// The `shutdown_in_flight_drain_ms` init parameter: the window a graceful
+/// shutdown gives in-flight member turns to finish. Absent or 0 is no drain.
+/// Above [`MAX_SHUTDOWN_IN_FLIGHT_DRAIN_MS`] the init is refused, never
+/// clamped.
+fn parse_shutdown_in_flight_drain(params: &Value) -> Result<Option<Duration>, String> {
+    let Some(value) = params.get("shutdown_in_flight_drain_ms") else {
+        return Ok(None);
+    };
+    let millis = value.as_u64().ok_or_else(|| {
+        "shutdown_in_flight_drain_ms must be a non-negative integer of milliseconds".to_string()
+    })?;
+    if millis > MAX_SHUTDOWN_IN_FLIGHT_DRAIN_MS {
+        return Err(format!(
+            "shutdown_in_flight_drain_ms {millis} exceeds the maximum of \
+             {MAX_SHUTDOWN_IN_FLIGHT_DRAIN_MS}"
+        ));
+    }
+    Ok((millis > 0).then(|| Duration::from_millis(millis)))
+}
+
+/// The shutdown horizon `meta/init` advertises: [`GATEWAY_SHUTDOWN_HORIZON_MS`]
+/// without an in-flight drain. With one, that plus the drain phase: its
+/// window and its own Stop, which settles flow runs for up to
+/// [`crate::MOB_STOP_FLOW_SETTLE_BUDGET`].
+fn advertised_shutdown_horizon_ms(in_flight_drain: Option<Duration>) -> u64 {
+    match in_flight_drain {
+        None => GATEWAY_SHUTDOWN_HORIZON_MS,
+        Some(window) => GATEWAY_SHUTDOWN_HORIZON_MS
+            .saturating_add(
+                u64::try_from(crate::MOB_STOP_FLOW_SETTLE_BUDGET.as_millis()).unwrap_or(u64::MAX),
+            )
+            .saturating_add(u64::try_from(window.as_millis()).unwrap_or(u64::MAX)),
+    }
+}
+
 // -- meta/init: accepted, then settled (#550) ------------------------------
 //
 // An SDK that sends `init_protocol: "accepted_then_settled"` and an `init_id`
@@ -10952,6 +10991,9 @@ struct InitSession {
     /// (`InitPhase::Storage`). `durable_effects` is "none" only while false.
     durable_phase_begun: AtomicBool,
     settled: AtomicBool,
+    /// The horizon `accepted` advertises
+    /// ([`advertised_shutdown_horizon_ms`]).
+    shutdown_horizon_ms: u64,
 }
 
 static INIT_SESSION: std::sync::OnceLock<InitSession> = std::sync::OnceLock::new();
@@ -11002,7 +11044,7 @@ impl InitSession {
                 "init_id": init_id,
                 "provider_callback_timeout_ms": PROVIDER_CALLBACK_TIMEOUT.as_millis() as u64,
                 "stdio_shutdown_handshake": true,
-                "stdio_shutdown_horizon_ms": GATEWAY_SHUTDOWN_HORIZON_MS,
+                "stdio_shutdown_horizon_ms": self.shutdown_horizon_ms,
             }
         })
     }
@@ -14477,6 +14519,17 @@ enum DispatchLoopEnd {
 }
 
 impl DispatchLoopEnd {
+    /// Whether this end runs a configured in-flight drain: a SIGTERM (the
+    /// stop signal a supervisor sends) or the SDK shutdown handshake. A
+    /// SIGINT, a closed stdin, a closed host and a cancelled caller shut
+    /// down at once.
+    fn drains_in_flight_turns(self) -> bool {
+        matches!(
+            self,
+            Self::Signal(ShutdownSignal::Terminate) | Self::SdkShutdownHandshake
+        )
+    }
+
     fn host_reason(self) -> GatewayHostCloseReason {
         match self {
             Self::HostClosed | Self::StdinClosed => GatewayHostCloseReason::HostDisconnected,
@@ -14773,6 +14826,28 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         &self,
         publication: GatewayBootstrapReady<'_>,
     ) -> Result<(), GatewayHostError>;
+    /// Stop admitting new work before a shutdown's in-flight drain: fence
+    /// fresh source submissions, member adds and recovery steps. Called at
+    /// most once, synchronously, and only when the drain runs (a configured
+    /// `shutdown_in_flight_drain_ms`, and a SIGTERM or the SDK shutdown
+    /// handshake), before [`Self::begin_close`].
+    ///
+    /// - Do not cancel work already entered: its finalizers, ACKs,
+    ///   settlement and retirement controls keep running, and the host keeps
+    ///   serving what Meta still calls into for it (the held completion
+    ///   callbacks, such as [`Self::complete_held_identity_members`]). Keep
+    ///   the credentials and custody that in-flight turns use:
+    ///   [`Self::begin_close`] still follows the drain.
+    /// - An `Err` skips the drain, and the shutdown continues as it does
+    ///   without one. It is not a rollback: a fence applied in part is closed
+    ///   by [`Self::begin_close`] as usual.
+    /// - The default admits on: work the host submits during the drain is
+    ///   held by the mob's Stop and ends `Abandoned(Stopped)` at the
+    ///   shutdown.
+    fn stop_admitting(&self, reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+        let _ = reason;
+        Ok(())
+    }
     /// Close admission synchronously. This is not a settlement observation.
     fn begin_close(&self, reason: GatewayHostCloseReason) -> Result<(), GatewayHostError>;
     /// Join the actual retained owner. A pending or uncertain owner is not Ok.
@@ -15540,6 +15615,9 @@ struct GatewayRunResources {
         crate::gateway_composition::GatewayComposition<crate::gateway_composition::ActiveGateway>,
     >,
     http_server: Option<crate::gateway_composition::GatewayHttpServer>,
+    /// The in-flight drain phase's report, for the `meta/shutdown` answer.
+    /// `None` when no drain window is configured.
+    in_flight_drain: Option<Value>,
     schedule_host: Option<meerkat::surface::ScheduleHostHandle>,
     schedule_watchdog: Option<tokio::task::JoinHandle<()>>,
     console_voice: Option<crate::console_voice::ConsoleVoiceController>,
@@ -15733,6 +15811,9 @@ impl GatewayRunResources {
                     member_mcp_at_exit.as_ref(),
                 )
             };
+            if let Some(in_flight_drain) = self.in_flight_drain.take() {
+                response["result"]["in_flight_drain"] = in_flight_drain;
+            }
             if host.is_some() {
                 let host_complete = host_begin.is_ok()
                     && host_join.is_ok()
@@ -16113,13 +16194,18 @@ async fn run_persistent_inner(
     let request_id = init_raw.get("id").cloned().unwrap_or(Value::Null);
 
     let params = init_raw.get("params").cloned().unwrap_or_else(|| json!({}));
+    let in_flight_drain = parse_shutdown_in_flight_drain(&params);
     let _ = INIT_SESSION.set(InitSession {
         request_id: request_id.clone(),
         protocol: init_protocol_request(&params),
         accepted: AtomicBool::new(false),
         durable_phase_begun: AtomicBool::new(false),
         settled: AtomicBool::new(false),
+        shutdown_horizon_ms: advertised_shutdown_horizon_ms(
+            in_flight_drain.as_ref().ok().copied().flatten(),
+        ),
     });
+    let in_flight_drain = in_flight_drain.map_err(|error| fail_init(&request_id, -32602, error))?;
 
     // 2. Parse init params
     let mob_config_param = params.get("mob_config").and_then(|v| v.as_str());
@@ -18990,7 +19076,7 @@ external_addressable = true
         "stdio_shutdown_handshake": true,
         // Complete, bounded host wait for the private shutdown request.
         // SDKs keep callback admission and stdin alive for this horizon.
-        "stdio_shutdown_horizon_ms": GATEWAY_SHUTDOWN_HORIZON_MS,
+        "stdio_shutdown_horizon_ms": advertised_shutdown_horizon_ms(in_flight_drain),
         // Dialable address of the cross-mob control listener when the
         // gateway was launched with --control-listen (`tcp://ip:port`
         // with the real kernel-assigned port for host:0 binds, or
@@ -19133,6 +19219,12 @@ external_addressable = true
         if let Some(announcements) = runtime.mob_announcements() {
             announcements.stop();
         }
+        // The in-flight drain runs before begin_close and the bridge close:
+        // a drained turn keeps the host authority and callbacks it uses.
+        let in_flight_drain_report =
+            run_in_flight_drain_phase(in_flight_drain, dispatch_end, host, &runtime, resources)
+                .await;
+        resources.in_flight_drain = in_flight_drain_report;
         if let Some(closed) = observed_stdio_close(&resources.stdio) {
             gateway_shutdown = gateway_shutdown.or(closed.shutdown_request);
         }
@@ -19163,6 +19255,170 @@ external_addressable = true
     resources.dispatch_end = Some(dispatch_end);
     resources.shutdown_request = gateway_shutdown;
     Ok(())
+}
+
+/// The in-flight drain phase of a graceful shutdown, between the dispatch
+/// loop's end and the host's `begin_close`. `None` when no drain window is
+/// configured: that shutdown is the one without a drain.
+///
+/// It drains only for a dispatch end that [drains in-flight
+/// turns](DispatchLoopEnd::drains_in_flight_turns), and reports any other as
+/// skipped. In order: the host stops admitting new work (a refusal skips
+/// the drain), the schedule host stops claiming occurrences and releases its
+/// executor lease, the HTTP listener stops accepting connections (requests
+/// and streams already open continue), and the runtime drains its mob's
+/// in-flight turns until the window ends
+/// ([`UnifiedRuntime::drain_in_flight_turns`]).
+async fn run_in_flight_drain_phase(
+    window: Option<Duration>,
+    dispatch_end: DispatchLoopEnd,
+    host: Option<&Arc<dyn GatewayHostComposition>>,
+    runtime: &UnifiedRuntime,
+    resources: &mut GatewayRunResources,
+) -> Option<Value> {
+    let window = match in_flight_drain_plan(window, dispatch_end) {
+        InFlightDrainPlan::NotConfigured => return None,
+        InFlightDrainPlan::Skip { report } => {
+            tracing::info!(report = %report, "in-flight drain skipped");
+            return Some(report);
+        }
+        InFlightDrainPlan::Drain { window } => window,
+    };
+    if let Some(host) = host
+        && let Err(error) = host.stop_admitting(dispatch_end.host_reason())
+    {
+        tracing::warn!(%error, "the host did not stop admitting new work");
+        let report = skipped_in_flight_drain("host_admission_open", window, dispatch_end);
+        tracing::info!(report = %report, "in-flight drain skipped");
+        return Some(report);
+    }
+    if let Some(schedule_host) = resources.schedule_host.take() {
+        schedule_host.shutdown().await;
+    }
+    if let Some(watchdog) = resources.schedule_watchdog.take() {
+        watchdog.abort();
+        let _ = watchdog.await;
+    }
+    if let Some(server) = resources.http_server.as_ref() {
+        server.stop_accepting();
+    }
+    let report = runtime
+        .drain_in_flight_turns(std::time::Instant::now() + window)
+        .await;
+    let report = in_flight_drain_json(&report);
+    tracing::info!(report = %report, "in-flight drain finished");
+    Some(report)
+}
+
+/// What a shutdown's in-flight drain phase does.
+#[derive(Debug, Clone, PartialEq)]
+enum InFlightDrainPlan {
+    /// No window is configured: no phase, and no report.
+    NotConfigured,
+    /// A window is configured but this dispatch end does not drain.
+    Skip { report: Value },
+    /// Drain for `window`.
+    Drain { window: Duration },
+}
+
+fn in_flight_drain_plan(
+    window: Option<Duration>,
+    dispatch_end: DispatchLoopEnd,
+) -> InFlightDrainPlan {
+    match window {
+        None => InFlightDrainPlan::NotConfigured,
+        Some(window) if dispatch_end.drains_in_flight_turns() => {
+            InFlightDrainPlan::Drain { window }
+        }
+        Some(window) => InFlightDrainPlan::Skip {
+            report: skipped_in_flight_drain(&dispatch_end.to_string(), window, dispatch_end),
+        },
+    }
+}
+
+/// The `in_flight_drain` report of a skipped drain. A signal end also names
+/// its signal.
+fn skipped_in_flight_drain(reason: &str, window: Duration, dispatch_end: DispatchLoopEnd) -> Value {
+    let mut report = json!({
+        "outcome": "skipped",
+        "reason": reason,
+        "window_ms": u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+    });
+    if let Some(signal) = dispatch_end.signal() {
+        report["signal"] = json!(signal.name());
+    }
+    report
+}
+
+/// The `in_flight_drain` report of a shutdown whose drain phase ran.
+fn in_flight_drain_json(report: &crate::InFlightDrainReport) -> Value {
+    let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    let mut json = json!({
+        "window_ms": millis(report.window),
+        "waited_ms": millis(report.waited),
+    });
+    match &report.outcome {
+        crate::InFlightDrainOutcome::Drained(drained) => {
+            let mut ended = Vec::new();
+            let mut still_running_at_bound = Vec::new();
+            let mut live_channel_open = Vec::new();
+            let mut not_local = Vec::new();
+            let mut reload_required = Vec::new();
+            let mut starts_not_held = Vec::new();
+            let mut unclassified = Vec::new();
+            for (identity, member) in &drained.members {
+                let identity = identity.to_string();
+                match &member.run {
+                    meerkat_mob::MemberRunDrain::Ended { terminal, .. } => {
+                        ended.push(json!({ "member": identity, "terminal": terminal }));
+                    }
+                    meerkat_mob::MemberRunDrain::StillRunning { .. } => {
+                        still_running_at_bound.push(json!(identity));
+                    }
+                    meerkat_mob::MemberRunDrain::LiveChannelOpen { .. } => {
+                        live_channel_open.push(json!(identity));
+                    }
+                    meerkat_mob::MemberRunDrain::NotLocal => not_local.push(json!(identity)),
+                    meerkat_mob::MemberRunDrain::ReloadRequired => {
+                        reload_required.push(json!(identity));
+                    }
+                    meerkat_mob::MemberRunDrain::NoRun => {}
+                    // A run outcome this gateway does not classify yet stays
+                    // in the report with its serialized form.
+                    run => unclassified.push(json!({ "member": identity, "run": run })),
+                }
+                if matches!(
+                    member.starts,
+                    Some(meerkat_mob::MemberRunStarts::NotHoldable { .. })
+                ) {
+                    starts_not_held.push(json!(identity));
+                }
+            }
+            json["outcome"] = json!("drained");
+            json["ended"] = json!(ended);
+            json["still_running_at_bound"] = json!(still_running_at_bound);
+            json["live_channel_open"] = json!(live_channel_open);
+            json["not_local"] = json!(not_local);
+            json["reload_required"] = json!(reload_required);
+            json["starts_not_held"] = json!(starts_not_held);
+            if !unclassified.is_empty() {
+                json["unclassified"] = json!(unclassified);
+            }
+        }
+        crate::InFlightDrainOutcome::IdentityForegroundBusy => {
+            json["outcome"] = json!("cut");
+            json["reason"] = json!("identity_foreground_busy");
+        }
+        crate::InFlightDrainOutcome::StopFailed { error } => {
+            json["outcome"] = json!("stop_failed");
+            json["error"] = json!(error);
+        }
+        crate::InFlightDrainOutcome::DrainFailed { error } => {
+            json["outcome"] = json!("drain_failed");
+            json["error"] = json!(error);
+        }
+    }
+    json
 }
 
 /// Run the stock gateway command surface without application host extensions.
@@ -22651,6 +22907,296 @@ mob = true
             "one SDK host, one callback source: {:?} vs {:?}",
             source(&first),
             source(&second)
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+mod in_flight_drain_tests {
+    //! The in-flight drain phase of a graceful shutdown: its init parameter,
+    //! the horizon `meta/init` advertises for it, the dispatch ends that run
+    //! it, and its place against the host's admission.
+
+    use super::*;
+    use std::sync::Mutex;
+
+    use crate::unified_runtime::lifecycle::stop_degrade_tests::empty_runtime;
+
+    /// A host that records the calls the drain phase makes on it and answers
+    /// `stop_admitting` with `stop_admitting`.
+    struct AdmissionProbe {
+        calls: Mutex<Vec<&'static str>>,
+        stop_admitting: Result<(), GatewayHostError>,
+    }
+
+    impl AdmissionProbe {
+        fn new(stop_admitting: Result<(), GatewayHostError>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                stop_admitting,
+            })
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl GatewayHostComposition for AdmissionProbe {
+        async fn prepare_bootstrap(
+            &self,
+            _spec: MobBootstrapSpec,
+        ) -> Result<MobBootstrapSpec, GatewayHostError> {
+            Err(GatewayHostError::Denied)
+        }
+        fn native_grant_work_configuration(
+            &self,
+        ) -> Result<
+            Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
+            GatewayHostError,
+        > {
+            Ok(None)
+        }
+        async fn bind_runtime(
+            &self,
+            _runtime: &mut UnifiedRuntime,
+        ) -> Result<(), GatewayHostError> {
+            Err(GatewayHostError::Denied)
+        }
+        fn publish_bootstrap_ready(
+            &self,
+            _publication: GatewayBootstrapReady<'_>,
+        ) -> Result<(), GatewayHostError> {
+            Err(GatewayHostError::Denied)
+        }
+        fn stop_admitting(&self, reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+            assert_eq!(reason, GatewayHostCloseReason::Shutdown);
+            self.calls.lock().unwrap().push("stop_admitting");
+            self.stop_admitting
+        }
+        fn begin_close(&self, _reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+            self.calls.lock().unwrap().push("begin_close");
+            Ok(())
+        }
+        async fn join_close(&self) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        async fn wait_closed(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// The window is an integer of milliseconds up to five minutes. Absent
+    /// or 0 is no drain; anything else is refused, never clamped.
+    #[test]
+    fn the_in_flight_drain_window_is_parsed_and_bounded() {
+        let parse = |value: Value| {
+            parse_shutdown_in_flight_drain(&json!({ "shutdown_in_flight_drain_ms": value }))
+        };
+        assert_eq!(parse_shutdown_in_flight_drain(&json!({})), Ok(None));
+        assert_eq!(parse(json!(0)), Ok(None));
+        assert_eq!(parse(json!(60_000)), Ok(Some(Duration::from_mins(1))));
+        assert_eq!(parse(json!(300_000)), Ok(Some(Duration::from_mins(5))));
+        for refused in [
+            json!(300_001),
+            json!(-1),
+            json!(1.5),
+            json!("60000"),
+            Value::Null,
+        ] {
+            assert!(parse(refused.clone()).is_err(), "{refused} must be refused");
+        }
+    }
+
+    /// Without a window the advertised horizon is the literal gateway
+    /// horizon. With one it also counts the phase: the window and its Stop's
+    /// flow-run settle budget. The accepted response carries the session's
+    /// horizon.
+    #[test]
+    fn the_advertised_shutdown_horizon_counts_the_drain_phase() {
+        assert_eq!(GATEWAY_SHUTDOWN_HORIZON_MS, 432_000);
+        assert_eq!(advertised_shutdown_horizon_ms(None), 432_000);
+        assert_eq!(
+            advertised_shutdown_horizon_ms(Some(Duration::from_mins(1))),
+            502_000
+        );
+        assert_eq!(
+            advertised_shutdown_horizon_ms(Some(Duration::from_mins(5))),
+            742_000
+        );
+        let session = InitSession {
+            request_id: json!("init-req"),
+            protocol: InitProtocolRequest::AcceptedThenSettled {
+                init_id: "init-1".to_string(),
+            },
+            accepted: AtomicBool::new(false),
+            durable_phase_begun: AtomicBool::new(false),
+            settled: AtomicBool::new(false),
+            shutdown_horizon_ms: advertised_shutdown_horizon_ms(Some(Duration::from_mins(1))),
+        };
+        assert_eq!(
+            session.accepted_response("init-1")["result"]["stdio_shutdown_horizon_ms"],
+            json!(502_000)
+        );
+    }
+
+    /// A configured window drains only on a SIGTERM or the SDK shutdown
+    /// handshake. Every other end is reported skipped, with its reason, and
+    /// no window means no phase and no report.
+    #[test]
+    fn only_sigterm_and_the_handshake_drain_in_flight_turns() {
+        let window = Duration::from_mins(1);
+        let ends = [
+            DispatchLoopEnd::StdinClosed,
+            DispatchLoopEnd::Signal(ShutdownSignal::Interrupt),
+            DispatchLoopEnd::Signal(ShutdownSignal::Terminate),
+            DispatchLoopEnd::SdkShutdownHandshake,
+            DispatchLoopEnd::HostClosed,
+            DispatchLoopEnd::CallerCancelled,
+        ];
+        for end in ends {
+            assert_eq!(
+                in_flight_drain_plan(None, end),
+                InFlightDrainPlan::NotConfigured,
+                "{end}"
+            );
+        }
+        for end in [
+            DispatchLoopEnd::Signal(ShutdownSignal::Terminate),
+            DispatchLoopEnd::SdkShutdownHandshake,
+        ] {
+            assert_eq!(
+                in_flight_drain_plan(Some(window), end),
+                InFlightDrainPlan::Drain { window },
+                "{end}"
+            );
+        }
+        assert_eq!(
+            in_flight_drain_plan(
+                Some(window),
+                DispatchLoopEnd::Signal(ShutdownSignal::Interrupt)
+            ),
+            InFlightDrainPlan::Skip {
+                report: json!({
+                    "outcome": "skipped",
+                    "reason": "signal",
+                    "signal": "SIGINT",
+                    "window_ms": 60_000,
+                }),
+            }
+        );
+        for (end, reason) in [
+            (DispatchLoopEnd::StdinClosed, "stdin_closed"),
+            (DispatchLoopEnd::HostClosed, "host_closed"),
+            (DispatchLoopEnd::CallerCancelled, "caller_cancelled"),
+        ] {
+            assert_eq!(
+                in_flight_drain_plan(Some(window), end),
+                InFlightDrainPlan::Skip {
+                    report: json!({
+                        "outcome": "skipped",
+                        "reason": reason,
+                        "window_ms": 60_000,
+                    }),
+                },
+                "{end}"
+            );
+        }
+    }
+
+    /// A host that cannot stop admitting skips the drain: the mob is never
+    /// stopped by the phase, and the shutdown goes on as without a drain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_that_keeps_admitting_skips_the_in_flight_drain() {
+        let runtime = empty_runtime("drain-host-refuses").await;
+        let probe = AdmissionProbe::new(Err(GatewayHostError::Denied));
+        let host: Arc<dyn GatewayHostComposition> = probe.clone();
+        let mut resources = GatewayRunResources::default();
+        let report = run_in_flight_drain_phase(
+            Some(Duration::from_mins(1)),
+            DispatchLoopEnd::SdkShutdownHandshake,
+            Some(&host),
+            &runtime,
+            &mut resources,
+        )
+        .await;
+        assert_eq!(
+            report,
+            Some(json!({
+                "outcome": "skipped",
+                "reason": "host_admission_open",
+                "window_ms": 60_000,
+            }))
+        );
+        assert_eq!(probe.calls(), ["stop_admitting"]);
+        assert_eq!(
+            runtime.mob_handle().status().await.expect("mob status"),
+            meerkat_mob::MobState::Running,
+            "a skipped drain never stops the mob"
+        );
+        runtime.shutdown().await;
+    }
+
+    /// A host that stops admitting gets the phase: its mob is stopped and
+    /// drained, and the phase never closes the host itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_in_flight_drain_stops_host_admission_then_stops_and_drains_the_mob() {
+        let runtime = empty_runtime("drain-host-admits").await;
+        let probe = AdmissionProbe::new(Ok(()));
+        let host: Arc<dyn GatewayHostComposition> = probe.clone();
+        let mut resources = GatewayRunResources::default();
+        let report = run_in_flight_drain_phase(
+            Some(Duration::from_mins(1)),
+            DispatchLoopEnd::Signal(ShutdownSignal::Terminate),
+            Some(&host),
+            &runtime,
+            &mut resources,
+        )
+        .await
+        .expect("a configured window reports");
+        assert_eq!(report["outcome"], json!("drained"), "{report}");
+        for list in [
+            "ended",
+            "still_running_at_bound",
+            "live_channel_open",
+            "not_local",
+            "reload_required",
+            "starts_not_held",
+        ] {
+            assert_eq!(report[list], json!([]), "{list}: {report}");
+        }
+        assert!(report.get("unclassified").is_none(), "{report}");
+        assert_eq!(probe.calls(), ["stop_admitting"]);
+        assert_eq!(
+            runtime.mob_handle().status().await.expect("mob status"),
+            meerkat_mob::MobState::Stopped
+        );
+        runtime.shutdown().await;
+    }
+
+    /// The gateway runs the phase after the announcement dispatcher stops
+    /// and before the host's `begin_close`, so a drained turn keeps the host
+    /// authority and callbacks it uses.
+    #[test]
+    fn the_in_flight_drain_phase_runs_before_the_hosts_begin_close() {
+        let source = include_str!("rpc_gateway.rs");
+        let start = source
+            .find("\nasync fn run_persistent_inner(")
+            .expect("run_persistent_inner");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("the end of run_persistent_inner")];
+        let at = |needle: &str| {
+            assert_eq!(body.matches(needle).count(), 1, "one {needle}");
+            body.find(needle).expect("found")
+        };
+        let announcements_stopped = at("announcements.stop();");
+        let phase = at("run_in_flight_drain_phase(");
+        let begin_close = at("host.begin_close(dispatch_end.host_reason())");
+        assert!(
+            announcements_stopped < phase && phase < begin_close,
+            "the drain phase runs between the announcements' stop and begin_close"
         );
     }
 }
