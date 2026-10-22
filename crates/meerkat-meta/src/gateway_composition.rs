@@ -833,10 +833,17 @@ pub enum GatewayHttpDrainOutcome {
 }
 
 impl GatewayHttpServer {
+    /// Stop accepting connections. Requests and streams already open
+    /// continue until [`Self::shutdown`] joins them within its drain bound.
+    /// Idempotent.
+    pub fn stop_accepting(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
     /// Stop admission and join the actual HTTP task. This is shared by normal
     /// active shutdown and failures during later gateway composition.
     pub async fn shutdown(mut self) -> GatewayHttpDrainOutcome {
-        let _ = self.shutdown_tx.send(true);
+        self.stop_accepting();
         if let Some(mut task) = self.task.take() {
             match tokio::time::timeout(GATEWAY_HTTP_DRAIN_TIMEOUT, &mut task).await {
                 Ok(Ok(result)) => GatewayHttpDrainOutcome::Completed(result),
