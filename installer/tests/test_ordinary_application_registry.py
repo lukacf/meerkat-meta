@@ -19,8 +19,11 @@ from launchkit.ordinary_application_source import OrdinaryApplicationHost
 from launchkit.projects import DraftConflict
 from test_local_application_registry import (
     registry, product, no_product_execution, no_processes, new_guide, build,
-    accept_source_fixture, install_fixture, workspace,
+    accept_source_fixture, install_fixture, workspace, bind_registry,
 )
+
+
+HELPERLESS_UPDATE = "An application without a setup helper cannot take a staged update in place yet"
 
 
 def ordinary_guide(f):
@@ -47,12 +50,7 @@ async def ordinary_registry(registry):
     f.registry = LocalApplicationRegistry(guide_store=f.store, implementation=f.implementation,
         deployment=f.service, runtime_target=f.target, ordinary_meta_gateway=f.gateway)
     f.implementation.prepare_workspace = f.registry.prepare_workspace
-    for name, method in (("application_host_selection", "selected_host"),
-            ("application_setup_retention", "retain_installation_inputs"),
-            ("application_setup_selection", "_selected_startup"),
-            ("application_setup_preparation", "prepare_application"),
-            ("application_setup_continuation", "continue_application_startup")):
-        setattr(f.service, name, getattr(f.registry, method))
+    bind_registry(f.service, f.registry)
     return f
 
 
@@ -142,12 +140,7 @@ def reloaded_registry(f, *, gateway=None):
     owner = LocalApplicationRegistry(guide_store=store, implementation=implementation,
         deployment=service, runtime_target=f.target, ordinary_meta_gateway=f.gateway if gateway is None else gateway)
     implementation.prepare_workspace = owner.prepare_workspace
-    for name, method in (("application_host_selection", "selected_host"),
-            ("application_setup_retention", "retain_installation_inputs"),
-            ("application_setup_selection", "_selected_startup"),
-            ("application_setup_preparation", "prepare_application"),
-            ("application_setup_continuation", "continue_application_startup")):
-        setattr(service, name, getattr(owner, method))
+    bind_registry(service, owner)
     return store, implementation, service, owner
 
 
@@ -423,8 +416,8 @@ async def test_staged_update_keeps_the_stopped_original_startable(ordinary_regis
     current = deployment.read_receipt(directory)["update"]
     assert (current["update_id"], current["status"]) == (staged["update"]["update_id"], staged["update"]["status"])
     assert record.read_bytes() == recorded
-    # The unapplied update still cannot redirect this original installation.
-    with pytest.raises(CustodyError, match="cannot be redirected to another build or source owner"):
+    # The staged update still cannot replace this original installation's source.
+    with pytest.raises(CustodyError, match=HELPERLESS_UPDATE):
         f.registry._selected_replacement(saved["id"], directory.name, staged["update"]["update_id"])
 
 
@@ -470,6 +463,35 @@ async def test_apply_after_reload_refuses_a_helperless_staged_update_cleanly(ord
     monkeypatch.setattr(service, "_launch", lambda *args, **kwargs: None)
     # After a Forge restart, Start retains the staged binding as the original.
     await service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
-    with pytest.raises(CustodyError, match="cannot be redirected to another build or source owner"):
+    with pytest.raises(CustodyError, match=HELPERLESS_UPDATE):
         owner._selected_replacement(saved["id"], directory.name, staged["update"]["update_id"])
     assert deployment.read_receipt(directory)["update"]["update_id"] == staged["update"]["update_id"]
+
+
+async def test_apply_of_a_helperless_staged_update_refuses_before_any_worker(ordinary_registry, monkeypatch):
+    """Apply as the browser sends it, through the launcher's callbacks.
+
+    An application without a setup helper has no in-place update path yet.
+    Apply refuses with guidance before any worker is queued: the installed
+    source, the staged update and the stopped application stay as they were.
+    """
+    f = ordinary_registry
+    assert f.service.application_replacement_selection == f.registry._selected_replacement
+    saved = ordinary_guide(f)
+    result = await build(f, saved)
+    await accept_source_fixture(f, result)
+    directory, _ = await install_fixture(f, saved, result, monkeypatch)
+    staged = await staged_improvement(f, saved, result, directory)
+    before = deployment.read_receipt(directory)
+    f.service.launched.clear()
+    with pytest.raises(CustodyError, match=HELPERLESS_UPDATE):
+        await f.service.action(saved["id"], directory.name, "apply-update",
+            staged["update"]["update_id"], action_request_id=str(uuid4()))
+    assert f.service.launched == [] and not f.service.tasks
+    after = deployment.read_receipt(directory)
+    assert {key: after.get(key) for key in ("status", "build_id", "package_sha256", "update", "update_action")} == {
+        key: before.get(key) for key in ("status", "build_id", "package_sha256", "update", "update_action")}
+    assert after["update"]["update_id"] == staged["update"]["update_id"]
+    # The stopped original stays startable after the refusal.
+    await f.service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
+    assert f.service.launched[-1][1] == "start"

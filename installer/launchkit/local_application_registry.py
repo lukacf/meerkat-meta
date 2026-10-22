@@ -65,6 +65,10 @@ def _set_up(directory):
 
 
 REDIRECTED = "The original installation cannot be redirected to another build or source owner."
+HELPERLESS_UPDATE = ("An application without a setup helper cannot take a staged update in place yet. "
+    "Its installed application is unchanged. Install the new build into a new empty folder.")
+FIRST_SETUP_UPDATE = ("This application has not finished its setup, so it cannot take a staged update in "
+    "place yet. Its installed application is unchanged. Finish its setup, then stage the accepted update again.")
 
 
 class LocalApplicationRegistry:
@@ -616,6 +620,8 @@ class LocalApplicationRegistry:
             return True
 
     def _selected_replacement(self, guide_id, deployment_id, update_id):
+        if self.replacement_selection is None:
+            return self._no_replacement(guide_id, deployment_id)
         host = self.selected_host(guide_id, deployment_id, staged_update_allowed=False)
         if host is None:
             raise CustodyError("This installation has no trusted replacement source owner.")
@@ -626,6 +632,24 @@ class LocalApplicationRegistry:
         if self.selected_host(guide_id, deployment_id, staged_update_allowed=False) is not host:
             raise CustodyError("The original installed replacement owner changed.")
         return result
+
+    def _no_replacement(self, guide_id, deployment_id):
+        """Without a launcher-selected supplier, no installation has a replacement owner.
+
+        Apply then takes the ordinary update path, which checks the set-up
+        owner's completed Restore itself. The owner lookup still refuses a
+        redirect to another build or source owner. An application without a
+        setup helper, or one that has not entered its setup, has no update
+        worker that could start it, so Apply refuses before any worker.
+        """
+        host = self.selected_host(guide_id, deployment_id)
+        if type(host) is OrdinaryApplicationHost:
+            raise CustodyError(HELPERLESS_UPDATE)
+        if host is not None and not _set_up(self.deployment._directory(guide_id, deployment_id)):
+            raise CustodyError(FIRST_SETUP_UPDATE)
+        if self.selected_host(guide_id, deployment_id) is not host:
+            raise CustodyError("The original installed replacement owner changed.")
+        return None
 
     async def setup_status(self, deployment, guide_id, deployment_id):
         reconnect = self._reconnect_status(deployment, guide_id, deployment_id)

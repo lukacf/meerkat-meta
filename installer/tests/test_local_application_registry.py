@@ -34,6 +34,28 @@ from test_meta_toolkit_runtime_selection import product, no_product_execution
 from test_meta_toolkit_runtime_update import catalog_target
 
 
+def shipping_callbacks():
+    """The deployment callbacks that server.select_local_application_runtime binds.
+
+    Read from that function's own source: every product launcher and the
+    packaged entry select a registry through it, so registry rows use the
+    same callbacks, including the installed replacement selection.
+    """
+    import ast
+    source = Path(__file__).resolve().parents[1] / "launchkit/server.py"
+    function = next(node for node in ast.parse(source.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "select_local_application_runtime")
+    assignment = next(node for node in ast.walk(function) if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "callbacks" for target in node.targets))
+    return ast.literal_eval(assignment.value)
+
+
+def bind_registry(service, owner):
+    """Bind a registry's callbacks to its deployment service, as the launcher does."""
+    for name, method in shipping_callbacks():
+        setattr(service, name, getattr(owner, method))
+
+
 @pytest.fixture
 async def registry(tmp_path, product, monkeypatch):
     target = catalog_target(product)
@@ -54,15 +76,10 @@ async def registry(tmp_path, product, monkeypatch):
     service.launched = []
     owner = LocalApplicationRegistry(guide_store=store, implementation=implementation,
         deployment=service, runtime_target=target)
-    # Bind the actual trusted callbacks. Server/launcher selection is tested
-    # separately; no proxy service or file-selected host enters this fixture.
+    # Bind the actual trusted callbacks, as the launcher's runtime selection
+    # does. No proxy service or file-selected host enters this fixture.
     implementation.prepare_workspace = owner.prepare_workspace
-    for name, method in (("application_host_selection", "selected_host"),
-            ("application_setup_retention", "retain_installation_inputs"),
-            ("application_setup_selection", "_selected_startup"),
-            ("application_setup_preparation", "prepare_application"),
-            ("application_setup_continuation", "continue_application_startup")):
-        setattr(service, name, getattr(owner, method))
+    bind_registry(service, owner)
 
     async def inert_builder(directory):
         await asyncio.Event().wait()
@@ -456,12 +473,7 @@ async def test_managed_host_product_install_retains_inputs_only_with_launcher_mo
         deployment=f.service, runtime_target=f.target,
         model_configuration=None if owner is None else owner.selection())
     f.implementation.prepare_workspace = f.registry.prepare_workspace
-    for name, method in (("application_host_selection", "selected_host"),
-            ("application_setup_retention", "retain_installation_inputs"),
-            ("application_setup_selection", "_selected_startup"),
-            ("application_setup_preparation", "prepare_application"),
-            ("application_setup_continuation", "continue_application_startup")):
-        setattr(f.service, name, getattr(f.registry, method))
+    bind_registry(f.service, f.registry)
     saved = new_guide(f)
     saved["proposal"]["agent_classes"][0]["model_auth"] = "managed_host"
     saved = f.store.save(saved, saved["version"])
