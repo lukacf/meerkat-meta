@@ -12,11 +12,11 @@ use serde_json::{Value, json};
 
 use super::owner::{AnnouncementError, AnnouncementService};
 use super::sources::{
-    AdvanceSource, AnnouncementSource, AudienceGrant, AuditQuery, Coverage, ObservationCapability,
-    Observed, Principal, PutSource, Rebaseline, RecordSourceFailure, SourceChange, SourceConfig,
-    SourceConnection, SourceDelivery, SourceFailure, SourceHealthPolicy, SourceIdentity,
-    SourceItem, SourcePage, SourceQuery, SourceRoute, SourceRunner, SourceStart, SourceState,
-    StreamOnboarding,
+    AdvanceSource, AnnouncementSource, AudienceGrant, AuditAction, AuditQuery, Coverage,
+    ObservationCapability, Observed, Principal, PutSource, Rebaseline, RecordSourceFailure,
+    SourceChange, SourceConfig, SourceConnection, SourceDelivery, SourceFailure,
+    SourceHealthPolicy, SourceIdentity, SourceItem, SourcePage, SourceQuery, SourceRoute,
+    SourceRunner, SourceStart, SourceState, StreamOnboarding,
 };
 use super::types::{
     AnnounceRequest, AnnouncementRef, AnnouncementStoreError, Announcer, BatchId, BatchQuery,
@@ -596,8 +596,9 @@ struct AdvanceSourceParams {
     collected_at_ms: Option<u64>,
 }
 
-/// `meta/mob_announcements/audit/list`: refused subscriptions and withheld
-/// captures of one mob's sources, by source, by member, or both.
+/// `meta/mob_announcements/audit/list`: the counted refusals and
+/// withholdings of one mob's sources, by source, by member, by action, or
+/// any of them.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuditListParams {
@@ -608,7 +609,9 @@ struct AuditListParams {
     source_id: Option<SourceId>,
     #[serde(default)]
     member: Option<Member>,
-    /// Start after this audit row id.
+    #[serde(default)]
+    action: Option<AuditAction>,
+    /// Start after this entry id.
     #[serde(default)]
     after: Option<u64>,
     #[serde(default)]
@@ -937,12 +940,13 @@ pub async fn handle_announcement_method(
                     mob_id: Some(request.mob_id.unwrap_or_else(|| own_mob.clone())),
                     source_id: request.source_id,
                     member: request.member,
+                    action: request.action,
                     after: request.after,
                     limit: request.limit.unwrap_or(DEFAULT_LIMIT),
                 })
                 .await
                 .map_err(rpc_error)?;
-            Ok(json!({ "audit": to_value(rows)? }))
+            Ok(json!({ "entries": to_value(rows)? }))
         }
         "meta/mob_announcements/sources/record_failure" => {
             let request: RecordFailureParams = params(raw)?;

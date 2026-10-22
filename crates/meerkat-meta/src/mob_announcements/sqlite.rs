@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::sources::{
-    AdvanceSource, AnnouncementSource, AuditKind, AuditQuery, AuditReason, AuditRow,
+    AdvanceSource, AnnouncementSource, AuditAction, AuditQuery, AuditReason, AuditRow,
     CollectionPhase, Coverage, CoverageGap, DeletionCapability, ItemChange, ItemOutcome,
     ItemOutcomeKind, MAX_SOURCES_PER_GATEWAY, MAX_SOURCES_PER_MOB, MAX_STREAMS_PER_SOURCE,
     MemberFacts, OnboardingMode, Principal, PutSource, RecordSourceFailure, RosterFacts,
@@ -110,8 +110,9 @@ CREATE INDEX IF NOT EXISTS member_routes_by_route ON member_routes (route, membe
 
 /// The tables version 2 adds: announcement sources, one row per
 /// `(mob_id, source_id)` holding its current generation, the topics the
-/// sources own, the streams each generation onboarded, and the audit of
-/// refused subscriptions and withheld captures. A provider applies this
+/// sources own, the streams each generation onboarded, and the counted
+/// audit of refused subscriptions and withheld captures, one entry per
+/// source, generation, member, action and reason. A provider applies this
 /// after [`SCHEMA`].
 pub const SCHEMA_V2: &str = "
 CREATE TABLE IF NOT EXISTS announcement_sources (
@@ -132,7 +133,11 @@ CREATE TABLE IF NOT EXISTS announcement_source_streams (
  PRIMARY KEY (mob_id, source_id, stream));
 CREATE TABLE IF NOT EXISTS announcement_audit (
  id INTEGER PRIMARY KEY AUTOINCREMENT, mob_id TEXT NOT NULL, source_id TEXT NOT NULL,
- member TEXT NOT NULL, at_ms INTEGER NOT NULL, record TEXT NOT NULL);
+ generation INTEGER NOT NULL, member TEXT NOT NULL, action TEXT NOT NULL,
+ reason TEXT NOT NULL, count INTEGER NOT NULL, first_at_ms INTEGER NOT NULL,
+ last_at_ms INTEGER NOT NULL, record TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS announcement_audit_counted
+ ON announcement_audit (mob_id, source_id, generation, member, action, reason);
 CREATE INDEX IF NOT EXISTS announcement_audit_by_source
  ON announcement_audit (mob_id, source_id, id);
 CREATE INDEX IF NOT EXISTS announcement_audit_by_member
@@ -851,22 +856,21 @@ fn announce_in(
         if sequence <= after {
             continue;
         }
-        // A topic a source owns admits only the members its audience covers,
-        // and none that owns a live conversation on its scope.
-        if let Some((reason, source_id, topic)) =
+        // A topic a source owns admits only the members its audience covers
+        // and its routes reach, and none that owns a live conversation on
+        // its scope.
+        if let Some((reason, owned)) =
             withholding(&owners, &subscription, &announcement.topics, facts)
         {
-            write_audit(
+            count_audit(
                 db,
-                &AuditEntry {
-                    kind: AuditKind::Withheld,
+                &AuditKey {
+                    mob_id: announcement.mob_id.clone(),
+                    source_id: owned.source_id.clone(),
+                    generation: owned.generation,
+                    member: subscription.member.clone(),
+                    action: AuditAction::CaptureWithheld,
                     reason,
-                    mob_id: &announcement.mob_id,
-                    source_id: &source_id,
-                    member: &subscription.member,
-                    topic: Some(&topic),
-                    subscription_id: Some(&subscription.id),
-                    sequence: Some(sequence),
                 },
                 now_ms,
             )?;
@@ -2213,11 +2217,11 @@ fn prune_in(db: &Connection, now_ms: u64, retention_ms: u64, limit: usize) -> Re
         .map_err(storage)? as u64;
     report.more |= report.lineage >= budget;
 
-    // Audit rows are kept for the retention window.
+    // Audit entries are kept for the retention window from their last count.
     let audited = db
         .execute(
             "DELETE FROM announcement_audit WHERE id IN (
-               SELECT id FROM announcement_audit WHERE at_ms <= ?1 ORDER BY id LIMIT ?2)",
+               SELECT id FROM announcement_audit WHERE last_at_ms <= ?1 ORDER BY id LIMIT ?2)",
             params![cutoff, int(budget)?],
         )
         .map_err(storage)? as u64;
@@ -3205,15 +3209,22 @@ fn record_failure_in(
 // Who may receive a source's items
 // ---------------------------------------------------------------------------
 
-/// The sources owning any of `topics` in `mob_id`: each topic's owner and
-/// its declaration.
+/// The source owning a topic: its id, its current generation and its
+/// declaration.
+struct OwnedTopic {
+    source_id: SourceId,
+    generation: u64,
+    config: SourceConfig,
+}
+
+/// The sources owning any of `topics` in `mob_id`, by topic.
 fn topic_sources(
     db: &Connection,
     mob_id: &MobId,
     topics: &BTreeSet<Topic>,
-) -> Result<BTreeMap<Topic, (SourceId, SourceConfig)>> {
+) -> Result<BTreeMap<Topic, OwnedTopic>> {
     let mut owners = BTreeMap::new();
-    let mut loaded: BTreeMap<SourceId, SourceConfig> = BTreeMap::new();
+    let mut loaded: BTreeMap<SourceId, (u64, SourceConfig)> = BTreeMap::new();
     for topic in topics {
         let Some((source_id, _)) = topic_owner(db, mob_id, topic)? else {
             continue;
@@ -3224,81 +3235,93 @@ fn topic_sources(
                     "topic {topic} is owned by a source the store does not hold"
                 )));
             };
-            loaded.insert(source_id.clone(), source.config());
+            loaded.insert(source_id.clone(), (source.generation, source.config()));
         }
-        if let Some(config) = loaded.get(&source_id) {
-            owners.insert(topic.clone(), (source_id, config.clone()));
+        if let Some((generation, config)) = loaded.get(&source_id) {
+            owners.insert(
+                topic.clone(),
+                OwnedTopic {
+                    source_id,
+                    generation: *generation,
+                    config: config.clone(),
+                },
+            );
         }
     }
     Ok(owners)
 }
 
 /// Why `subscription` may not capture an announcement on `topics`, if it
-/// may not. A topic no source owns lets it capture; a topic a source owns
-/// lets it capture only when the member owns no live conversation on the
-/// source's scope and the topic's audience covers it, as the roster facts
-/// the owner read say. A member those facts do not name is covered by a
-/// member grant alone.
-fn withholding(
-    owners: &BTreeMap<Topic, (SourceId, SourceConfig)>,
+/// may not: the reason, and the source that withholds it. A topic no source
+/// owns lets it capture. A topic a source owns lets it capture only when the
+/// member owns no live conversation on the source's scope, the topic's
+/// audience covers it as the roster facts the owner read say (a member those
+/// facts do not name is covered by a member grant alone), and, for one of
+/// the source's own topics, a direct route names the topic or the member
+/// triages it. Routes bind every subscriber, one from before a route change
+/// too.
+fn withholding<'a>(
+    owners: &'a BTreeMap<Topic, OwnedTopic>,
     subscription: &Subscription,
     topics: &BTreeSet<Topic>,
     facts: &RosterFacts,
-) -> Option<(AuditReason, SourceId, Topic)> {
+) -> Option<(AuditReason, &'a OwnedTopic)> {
     let member = &subscription.member;
     let mut refusal = None;
     for topic in subscription.selector.topics.intersection(topics) {
         // A topic no source owns lets the subscription capture.
-        let (source_id, config) = owners.get(topic)?;
+        let owned = owners.get(topic)?;
+        let config = &owned.config;
         let reason = if config.conversation_members.contains(member) {
             AuditReason::RouteConflict
-        } else if config
+        } else if !config
             .audience_of(topic)
             .is_some_and(|audience| covers(audience, member, facts.get(member)))
         {
-            return None;
-        } else {
             AuditReason::AudienceNotCovered
+        } else if config.topics.contains(topic)
+            && !config.directly_routes(topic)
+            && !config.triages(member, topic)
+        {
+            AuditReason::NoDirectRoute
+        } else {
+            return None;
         };
-        refusal.get_or_insert((reason, source_id.clone(), topic.clone()));
+        refusal.get_or_insert((reason, owned));
     }
     refusal
 }
 
-/// One audited refusal or withholding, before it is stored.
-struct AuditEntry<'a> {
-    kind: AuditKind,
+/// What one counted audit entry is about. Every refusal or withholding with
+/// the same key counts on the same entry.
+#[derive(Serialize, serde::Deserialize)]
+struct AuditKey {
+    mob_id: MobId,
+    source_id: SourceId,
+    generation: u64,
+    member: Member,
+    action: AuditAction,
     reason: AuditReason,
-    mob_id: &'a MobId,
-    source_id: &'a SourceId,
-    member: &'a Member,
-    topic: Option<&'a Topic>,
-    subscription_id: Option<&'a SubscriptionId>,
-    sequence: Option<u64>,
 }
 
-fn write_audit(db: &Connection, entry: &AuditEntry<'_>, now_ms: u64) -> Result<()> {
-    let row = AuditRow {
-        id: 0,
-        at_ms: now_ms,
-        kind: entry.kind,
-        reason: entry.reason,
-        mob_id: entry.mob_id.clone(),
-        source_id: entry.source_id.clone(),
-        member: entry.member.clone(),
-        topic: entry.topic.cloned(),
-        subscription_id: entry.subscription_id.cloned(),
-        sequence: entry.sequence,
-    };
+/// Count one refusal or withholding on its entry: the first makes the entry,
+/// and each later one adds to its count and moves its last time.
+fn count_audit(db: &Connection, key: &AuditKey, now_ms: u64) -> Result<()> {
     db.execute(
-        "INSERT INTO announcement_audit (mob_id, source_id, member, at_ms, record)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO announcement_audit (mob_id, source_id, generation, member, action,
+           reason, count, first_at_ms, last_at_ms, record)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?8)
+         ON CONFLICT (mob_id, source_id, generation, member, action, reason) DO UPDATE SET
+           count = count + 1, last_at_ms = MAX(last_at_ms, excluded.last_at_ms)",
         params![
-            entry.mob_id.as_str(),
-            entry.source_id.as_str(),
-            entry.member.key(),
+            key.mob_id.as_str(),
+            key.source_id.as_str(),
+            int(key.generation)?,
+            key.member.key(),
+            key.action.as_str(),
+            key.reason.as_str(),
             int(now_ms)?,
-            encode(&row)?,
+            encode(key)?,
         ],
     )
     .map_err(storage)?;
@@ -3309,10 +3332,10 @@ fn audit_in(db: &Connection, query: &AuditQuery) -> Result<Vec<AuditRow>> {
     let member = query.member.as_ref().map(Member::key);
     let mut statement = db
         .prepare(
-            "SELECT id, record FROM announcement_audit
+            "SELECT id, count, first_at_ms, last_at_ms, record FROM announcement_audit
              WHERE (?1 IS NULL OR mob_id = ?1) AND (?2 IS NULL OR source_id = ?2)
-               AND (?3 IS NULL OR member = ?3) AND id > ?4
-             ORDER BY id LIMIT ?5",
+               AND (?3 IS NULL OR member = ?3) AND (?4 IS NULL OR action = ?4) AND id > ?5
+             ORDER BY id LIMIT ?6",
         )
         .map_err(storage)?;
     let rows = statement
@@ -3321,82 +3344,50 @@ fn audit_in(db: &Connection, query: &AuditQuery) -> Result<Vec<AuditRow>> {
                 query.mob_id.as_ref().map(MobId::as_str),
                 query.source_id.as_ref().map(SourceId::as_str),
                 member,
+                query.action.map(AuditAction::as_str),
                 int(query.after.unwrap_or(0))?,
                 page(query.limit)?,
             ],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
         )
         .map_err(storage)?;
     rows.map(|row| {
-        let (id, record) = row.map_err(storage)?;
-        let mut audited: AuditRow = decode(&record)?;
-        audited.id = uint(id)?;
-        Ok(audited)
+        let (id, count, first_at_ms, last_at_ms, record) = row.map_err(storage)?;
+        let key: AuditKey = decode(&record)?;
+        let last_at_ms = uint(last_at_ms)?;
+        Ok(AuditRow {
+            id: uint(id)?,
+            at_ms: last_at_ms,
+            action: key.action,
+            mob_id: key.mob_id,
+            source_id: key.source_id,
+            generation: key.generation,
+            member: key.member,
+            reason: key.reason,
+            count: uint(count)?,
+            first_at_ms: uint(first_at_ms)?,
+            last_at_ms,
+        })
     })
     .collect()
 }
 
-/// A subscription refused by a source's audience or routes, as its audit
-/// row names it.
+/// A subscription a source's audience or routes refused: the refusal, and
+/// the source, generation and reason its audit entry counts under.
 struct SubscriptionRefusal {
-    reason: AuditReason,
+    error: AnnouncementStoreError,
+    mob_id: MobId,
     source_id: SourceId,
-    topic: Option<Topic>,
-}
-
-impl SubscriptionRefusal {
-    fn of(error: &AnnouncementStoreError) -> Option<Self> {
-        let (reason, source_id, topic) = match error {
-            AnnouncementStoreError::AudienceNotCovered { source_id, topic } => (
-                AuditReason::AudienceNotCovered,
-                source_id,
-                Some(topic.clone()),
-            ),
-            AnnouncementStoreError::NoDirectRoute { source_id, topic } => {
-                (AuditReason::NoDirectRoute, source_id, Some(topic.clone()))
-            }
-            AnnouncementStoreError::RouteOverlap { source_id, .. } => {
-                (AuditReason::RouteOverlap, source_id, None)
-            }
-            AnnouncementStoreError::ConversationMember { source_id } => {
-                (AuditReason::RouteConflict, source_id, None)
-            }
-            _ => return None,
-        };
-        Some(Self {
-            reason,
-            source_id: source_id.clone(),
-            topic,
-        })
-    }
-}
-
-fn audit_refusal_in(
-    db: &Connection,
-    request: &PutSubscription,
-    refusal: &SubscriptionRefusal,
-    now_ms: u64,
-) -> Result<()> {
-    // The refused mob: the one whose source owns the topic.
-    for mob_id in &request.selector.mobs {
-        if load_source(db, mob_id, &refusal.source_id)?.is_some() {
-            return write_audit(
-                db,
-                &AuditEntry {
-                    kind: AuditKind::Refused,
-                    reason: refusal.reason,
-                    mob_id,
-                    source_id: &refusal.source_id,
-                    member: &request.member,
-                    topic: refusal.topic.as_ref(),
-                    subscription_id: Some(&request.id),
-                    sequence: None,
-                },
-                now_ms,
-            );
-        }
-    }
-    Ok(())
+    generation: u64,
+    reason: AuditReason,
 }
 
 /// The member's live subscriptions.
@@ -3436,74 +3427,112 @@ fn reaches<'a>(
     (direct, forward)
 }
 
-/// Refuse a subscription a source's audience or routes do not admit: for
-/// every topic it selects that a source owns, the member must own no live
-/// conversation on the source's scope, the topic's audience must cover it,
-/// a source topic must have a direct route unless the member triages it,
-/// and with its other live subscriptions the member must not reach the
-/// source both directly and through a forward.
+/// The refusal of a subscription a source's audience or routes do not
+/// admit, if they do not: for every topic it selects that a source owns, the
+/// member must own no live conversation on the source's scope, the topic's
+/// audience must cover it, a source topic must have a direct route unless
+/// the member triages it, and with its other live subscriptions the member
+/// must not reach the source both directly and through a forward.
 fn ensure_subscription_admitted(
     db: &Connection,
     request: &PutSubscription,
     facts: Option<&MemberFacts>,
-) -> Result<()> {
+) -> Result<Option<SubscriptionRefusal>> {
     let member = &request.member;
-    let mut sources: BTreeMap<(MobId, SourceId), SourceConfig> = BTreeMap::new();
+    let mut sources: BTreeMap<(MobId, SourceId), OwnedTopic> = BTreeMap::new();
     for mob_id in &request.selector.mobs {
-        for (topic, (source_id, config)) in topic_sources(db, mob_id, &request.selector.topics)? {
-            if config.conversation_members.contains(member) {
-                return Err(AnnouncementStoreError::ConversationMember { source_id });
-            }
-            if !config
+        for (topic, owned) in topic_sources(db, mob_id, &request.selector.topics)? {
+            let config = &owned.config;
+            let refused = if config.conversation_members.contains(member) {
+                Some((
+                    AuditReason::RouteConflict,
+                    AnnouncementStoreError::ConversationMember {
+                        source_id: owned.source_id.clone(),
+                    },
+                ))
+            } else if !config
                 .audience_of(&topic)
                 .is_some_and(|audience| covers(audience, member, facts))
             {
-                return Err(AnnouncementStoreError::AudienceNotCovered { source_id, topic });
-            }
-            if config.topics.contains(&topic)
+                Some((
+                    AuditReason::AudienceNotCovered,
+                    AnnouncementStoreError::AudienceNotCovered {
+                        source_id: owned.source_id.clone(),
+                        topic: topic.clone(),
+                    },
+                ))
+            } else if config.topics.contains(&topic)
                 && !config.directly_routes(&topic)
                 && !config.triages(member, &topic)
             {
-                return Err(AnnouncementStoreError::NoDirectRoute { source_id, topic });
+                Some((
+                    AuditReason::NoDirectRoute,
+                    AnnouncementStoreError::NoDirectRoute {
+                        source_id: owned.source_id.clone(),
+                        topic: topic.clone(),
+                    },
+                ))
+            } else {
+                None
+            };
+            if let Some((reason, error)) = refused {
+                return Ok(Some(SubscriptionRefusal {
+                    error,
+                    mob_id: mob_id.clone(),
+                    source_id: owned.source_id,
+                    generation: owned.generation,
+                    reason,
+                }));
             }
-            sources.insert((mob_id.clone(), source_id), config);
+            sources.insert((mob_id.clone(), owned.source_id.clone()), owned);
         }
     }
     if sources.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let others = member_live_subscriptions(db, member)?;
-    for ((mob_id, source_id), config) in sources {
+    for ((mob_id, source_id), owned) in sources {
         let selectors = std::iter::once(&request.selector).chain(
             others
                 .iter()
                 .filter(|other| other.id != request.id)
                 .map(|other| &other.selector),
         );
-        if reaches(&config, &mob_id, selectors) == (true, true) {
-            return Err(AnnouncementStoreError::RouteOverlap {
+        if reaches(&owned.config, &mob_id, selectors) == (true, true) {
+            return Ok(Some(SubscriptionRefusal {
+                error: AnnouncementStoreError::RouteOverlap {
+                    source_id: source_id.clone(),
+                    member: member.clone(),
+                },
+                mob_id,
                 source_id,
-                member: member.clone(),
-            });
+                generation: owned.generation,
+                reason: AuditReason::RouteOverlap,
+            }));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
+/// Put a subscription the sources' audiences and routes admit. A refusal
+/// comes back inside, with what its audit entry counts under, and leaves
+/// the store unchanged.
 fn put_subscription_admitted_in(
     db: &Connection,
     operation: &OperationId,
     request: &PutSubscription,
     facts: Option<&MemberFacts>,
     now_ms: u64,
-) -> Result<Subscription> {
+) -> Result<std::result::Result<Subscription, SubscriptionRefusal>> {
     // A replay of a committed put answers its original.
     let fingerprint = request_fingerprint("put_subscription", request)?;
     if let Some(result) = operation_result(db, operation, &fingerprint)? {
-        return decode(&result);
+        return Ok(Ok(decode(&result)?));
     }
-    ensure_subscription_admitted(db, request, facts)?;
-    put_subscription_in(db, operation, request, now_ms)
+    if let Some(refusal) = ensure_subscription_admitted(db, request, facts)? {
+        return Ok(Err(refusal));
+    }
+    Ok(Ok(put_subscription_in(db, operation, request, now_ms)?))
 }
 
 /// Refuse a declaration under which an existing live subscriber would reach
@@ -3629,20 +3658,26 @@ impl AnnouncementStore for SqliteAnnouncementStore {
                 put_subscription_admitted_in(db, &operation, &request, facts.as_ref(), now_ms)
             }
         };
-        let result = self.run(put).await;
-        // A refusal leaves the store unchanged, then is audited on its own.
-        if let Err(error) = &result
-            && let Some(refusal) = SubscriptionRefusal::of(error)
-            && let Err(audit_error) = self
-                .run(move |db| audit_refusal_in(db, &request, &refusal, now_ms))
-                .await
-        {
+        let refusal = match self.run(put).await? {
+            Ok(subscription) => return Ok(subscription),
+            Err(refusal) => refusal,
+        };
+        // A refusal leaves the store unchanged, then is counted on its own.
+        let key = AuditKey {
+            mob_id: refusal.mob_id,
+            source_id: refusal.source_id,
+            generation: refusal.generation,
+            member: request.member.clone(),
+            action: AuditAction::SubscriptionRefused,
+            reason: refusal.reason,
+        };
+        if let Err(audit_error) = self.run(move |db| count_audit(db, &key, now_ms)).await {
             tracing::warn!(
                 error = %audit_error,
                 "a refused subscription could not be audited"
             );
         }
-        result
+        Err(refusal.error)
     }
 
     async fn change_subscription(

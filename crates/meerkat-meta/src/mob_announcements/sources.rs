@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::types::{
     AnnouncementStoreError, MAX_ANNOUNCEMENT_TOPICS, MAX_BODY_BYTES, MAX_ID_BYTES, Member, MobId,
-    Result, SOURCE_KEY_PREFIX, SourceId, SourceKey, SubscriptionId, Topic, sha256_hex,
+    Result, SOURCE_KEY_PREFIX, SourceId, SourceKey, Topic, sha256_hex,
 };
 use crate::access::{
     AccessControlConfig, AccessEffect, AccessPrincipal, AccessResource, AccessRule, evaluate_access,
@@ -1694,22 +1694,22 @@ impl RecordSourceFailure {
     }
 }
 
-/// What an audit row records.
+/// What an audit entry counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
-pub enum AuditKind {
+pub enum AuditAction {
     /// A subscription was refused.
-    Refused,
+    SubscriptionRefused,
     /// A capture was withheld from a subscription.
-    Withheld,
+    CaptureWithheld,
 }
 
-impl AuditKind {
+impl AuditAction {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Refused => "refused",
-            Self::Withheld => "withheld",
+            Self::SubscriptionRefused => "subscription_refused",
+            Self::CaptureWithheld => "capture_withheld",
         }
     }
 }
@@ -1729,34 +1729,49 @@ pub enum AuditReason {
     RouteConflict,
 }
 
-/// One audited refusal or withholding, kept for the retention window. It
-/// names members, topics and counts, never content.
+impl AuditReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AudienceNotCovered => "audience_not_covered",
+            Self::NoDirectRoute => "no_direct_route",
+            Self::RouteOverlap => "route_overlap",
+            Self::RouteConflict => "route_conflict",
+        }
+    }
+}
+
+/// One counted audit entry: every refusal or withholding of one member by
+/// one generation of one source, for one reason. It is kept for the
+/// retention window from its last count, and names members and counts,
+/// never content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct AuditRow {
-    /// Rises with every row: `audit/list` pages after it.
+    /// The entry's id: entries list in the order they were first counted,
+    /// and `audit/list` pages after one.
     pub id: u64,
+    /// When the entry last counted: its `last_at_ms`.
     pub at_ms: u64,
-    pub kind: AuditKind,
-    pub reason: AuditReason,
+    pub action: AuditAction,
     pub mob_id: MobId,
     pub source_id: SourceId,
+    pub generation: u64,
     pub member: Member,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub topic: Option<Topic>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subscription_id: Option<SubscriptionId>,
-    /// The withheld announcement's sequence.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sequence: Option<u64>,
+    pub reason: AuditReason,
+    pub count: u64,
+    pub first_at_ms: u64,
+    pub last_at_ms: u64,
 }
 
-/// A page of audit rows, by source, by member, or both, in id order.
+/// A page of audit entries, by source, by member, by action, or any of
+/// them, in id order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AuditQuery {
     pub mob_id: Option<MobId>,
     pub source_id: Option<SourceId>,
     pub member: Option<Member>,
+    pub action: Option<AuditAction>,
+    /// Start after this entry id.
     pub after: Option<u64>,
     pub limit: usize,
 }
