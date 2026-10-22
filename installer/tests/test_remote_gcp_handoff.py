@@ -16,7 +16,7 @@ from launchkit.gcp_transport import validate_gcp_endpoint
 from launchkit.projects import DraftConflict
 from launchkit.remote_deployment import RemoteDeploymentService, read_receipt, binding, update_receipt
 from launchkit.remote_destination import _archive
-from test_remote_deployment import Guide, Implementation, Transport
+from test_remote_deployment import Guide, Implementation, Transport, longest_loop_gap, slow_package_hashing
 from test_remote_browser_access import Handle
 
 
@@ -484,3 +484,14 @@ async def test_removal_intent_blocks_new_tunnel_without_destination_probe(cloud_
     with pytest.raises(DraftConflict):
         await service.browser_access.open(receipt["guide_id"], 4, receipt["build_id"], receipt["deployment_id"])
     assert not service.cloud_transport.forwards and len(service.cloud_transport.calls) == calls
+
+
+async def test_cloud_connect_hashes_the_package_off_the_event_loop(cloud_service, monkeypatch):
+    service = cloud_service
+    cloud = await ready_cloud(service)
+    slow_package_hashing(monkeypatch)
+    receipt, gap = await longest_loop_gap(service.connect_cloud(service.guide.identity, 4,
+        service.implementation.identity, cloud))
+    await asyncio.gather(*list(service.tasks.values()))
+    assert receipt["target"] == "gcp" and receipt["package_sha256"] == cloud["binding"]["package_sha256"]
+    assert gap < 0.5
