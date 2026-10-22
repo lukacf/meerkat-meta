@@ -557,8 +557,8 @@ refuses the fork instead.
 | `refuse` | Refused before anything is committed. | Refused before anything is committed. |
 
 A source with no activation rows in the copied prefix forks the same way
-under every policy. The default is the least-privilege choice: no child runs
-an instruction that nobody activated for that child.
+under every policy. The default is the least-privilege choice: no durable
+fork's child runs an instruction that nobody activated for that child.
 
 Under `require_explicit_activation`, a Rust host activates an inherited key on
 the child with `MobHandle::activate_member_instruction(child, request)`
