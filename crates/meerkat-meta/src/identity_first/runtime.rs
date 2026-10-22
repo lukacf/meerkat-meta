@@ -3342,6 +3342,11 @@ pub struct IdentityRuntime {
     foreground_operations: Mutex<JoinSet<()>>,
     foreground_cancel: watch::Sender<bool>,
     foreground_shutdown: AtomicBool,
+    /// Wakes the read-only waits (a turn's outcome, a completion, an output
+    /// preview) at shutdown. A shutdown's in-flight drain closes foreground
+    /// operations but leaves these waiting, so a drained turn's waiter
+    /// reports the turn's outcome.
+    foreground_waits_closed: watch::Sender<bool>,
     /// Reset memory captures of outgoing sessions not yet run, keyed by the
     /// session. A capture is recorded before its task spawns and leaves the
     /// ledger only after it ran, so shutdown joins or reruns it.
@@ -4005,6 +4010,7 @@ impl IdentityRuntime {
             IdentityBootstrapMode::EagerMaterialize,
         ));
         let (foreground_cancel, _) = watch::channel(false);
+        let (foreground_waits_closed, _) = watch::channel(false);
         Self {
             entries: IdentityEntries::new(),
             event_channels: RwLock::new(BTreeMap::new()),
@@ -4056,6 +4062,7 @@ impl IdentityRuntime {
             foreground_operations: Mutex::new(JoinSet::new()),
             foreground_cancel,
             foreground_shutdown: AtomicBool::new(false),
+            foreground_waits_closed,
             pending_reset_memory_captures: Arc::new(RwLock::new(BTreeMap::new())),
             reset_memory_capture_tasks: Mutex::new(JoinSet::new()),
             after_create_tasks: Mutex::new(JoinSet::new()),
@@ -7012,6 +7019,16 @@ impl IdentityRuntime {
     }
 
     pub(crate) fn close_foreground_operations(&self) {
+        self.close_foreground_operations_for_drain();
+        self.foreground_waits_closed.send_replace(true);
+    }
+
+    /// Close foreground operations as [`Self::close_foreground_operations`]
+    /// does, but leave the read-only waits (a turn's outcome, a completion,
+    /// an output preview) waiting: a shutdown's in-flight drain lets admitted
+    /// turns finish, and their waiters report how they ended. The shutdown
+    /// that follows wakes them.
+    pub(crate) fn close_foreground_operations_for_drain(&self) {
         self.foreground_shutdown.store(true, Ordering::Release);
         // `watch::Sender::send` discards the value when no receiver exists.
         // A just-admitted JoinSet task may not have subscribed yet, so retain
@@ -10587,7 +10604,7 @@ impl IdentityRuntime {
         // Subscribe before the first read so a settlement landing between the
         // read and the wait still wakes it.
         let mut changes = self.turn_outcome_changes.subscribe();
-        let mut shutdown = self.foreground_cancel.subscribe();
+        let mut shutdown = self.foreground_waits_closed.subscribe();
         loop {
             let outcome = self.turn_outcome(identity, ticket);
             if outcome != TurnOutcome::Pending {
@@ -15013,7 +15030,7 @@ impl IdentityRuntime {
         // Subscribe before the first read so a completion landing between the
         // read and the wait still wakes it.
         let mut changes = self.entries.subscribe();
-        let mut shutdown = self.foreground_cancel.subscribe();
+        let mut shutdown = self.foreground_waits_closed.subscribe();
         // Credit what already happened before taking the failure baseline: a
         // failure that preceded this wait but is credited by its first read
         // must not end the wait as its own failure.
@@ -15230,7 +15247,7 @@ impl IdentityRuntime {
     ) -> Result<String, OutputWaitEnded> {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut changes = self.entries.subscribe();
-        let mut shutdown = self.foreground_cancel.subscribe();
+        let mut shutdown = self.foreground_waits_closed.subscribe();
         let mut last_error = None;
         loop {
             changes.borrow_and_update();
@@ -17341,6 +17358,58 @@ mod foreground_shutdown_tests {
         assert!(
             *receiver.borrow(),
             "a task subscribed after close must still observe shutdown"
+        );
+        Ok(())
+    }
+
+    /// A shutdown's in-flight drain closes foreground operations but leaves
+    /// a turn's waiter waiting, so the drained turn's caller hears how it
+    /// ended. The shutdown's own close then wakes the waiter.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn the_drain_close_leaves_a_turn_waiter_to_the_shutdown_close()
+    -> Result<(), ContinuityStoreError> {
+        let runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "drain-turn-waiter-test".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        let identity = AgentIdentity::parse("agent:waiting").expect("identity");
+        let ticket = runtime
+            .turn_outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admit(&identity, None);
+        let waiting = {
+            let runtime = Arc::clone(&runtime);
+            let identity = identity.clone();
+            tokio::spawn(async move {
+                runtime
+                    .wait_for_turn_outcome(&identity, ticket, Duration::from_mins(1))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        runtime.close_foreground_operations_for_drain();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the drain's close leaves the turn's waiter waiting"
+        );
+
+        runtime.close_foreground_operations();
+        let wait = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the shutdown's close wakes the waiter")
+            .expect("waiter task");
+        assert!(
+            matches!(wait, TurnWait::ShuttingDown(TurnOutcome::Pending)),
+            "{wait:?}"
         );
         Ok(())
     }
