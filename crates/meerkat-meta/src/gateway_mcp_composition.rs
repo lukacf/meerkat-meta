@@ -55,6 +55,7 @@ pub struct GatewayFactoryConstruction<'a> {
     factory: &'a AgentFactory,
     runtime: &'a MeerkatMachine,
     storage: &'a ResolvedStorage,
+    custody: &'a Arc<crate::member_mcp_custody::MemberMcpCustody>,
 }
 
 impl<'a> GatewayFactoryConstruction<'a> {
@@ -63,12 +64,14 @@ impl<'a> GatewayFactoryConstruction<'a> {
         factory: &'a AgentFactory,
         runtime: &'a MeerkatMachine,
         storage: &'a ResolvedStorage,
+        custody: &'a Arc<crate::member_mcp_custody::MemberMcpCustody>,
     ) -> Self {
         Self {
             kind,
             factory,
             runtime,
             storage,
+            custody,
         }
     }
 
@@ -113,6 +116,17 @@ impl<'a> GatewayFactoryConstruction<'a> {
             storage: self.storage.clone(),
             persistence,
         })
+    }
+
+    /// The gateway's member MCP custody: the one owner every member
+    /// construction of this gateway adopts its MCP adapter into, before any
+    /// server is staged. The host keeps it to tell the gateway's own members
+    /// that a credential landed ([`crate::MemberMcpCustody::credential_landed`]),
+    /// after a login through [`Self::host_auth_service`] completed, so the
+    /// operation awaiting that login continues in the same runtime. It
+    /// grants nothing else.
+    pub fn member_mcp_custody(&self) -> Arc<crate::member_mcp_custody::MemberMcpCustody> {
+        Arc::clone(self.custody)
     }
 }
 
@@ -285,6 +299,48 @@ impl GatewayRealmMcpInstallation {
         .await
     }
 
+    /// The native MCP target `target` names in this realm's effective
+    /// configuration: its own document folded with the chain it inherits,
+    /// the same configuration the realm's credential source reads. Meerkat's
+    /// own resolver decides
+    /// ([`meerkat::resolve_configured_mcp_target_in_realm_trusting`]): the
+    /// server must be configured under that name, `server_url` must equal
+    /// its configured URL, it must use OAuth login, and a named account or
+    /// selection must equal the configured one. Gateway members read no
+    /// project or user `mcp.toml`, so none is consulted. The identity is
+    /// built from the configuration, never from the request; pass it to
+    /// [`GatewayFactoryConstruction::host_auth_service`]'s MCP login, status
+    /// and logout, which serve this realm's credential slot.
+    pub async fn resolve_mcp_auth_target(
+        &self,
+        target: &meerkat_contracts::WireMcpAuthTarget,
+    ) -> Result<meerkat::McpServerIdentity, HostAuthError> {
+        let realm = &self.storage.locator.realm;
+        let source = meerkat_store::FilesystemRealmConfigSource::new(
+            self.storage.locator.state_root.clone(),
+            self.storage.layout.global_config_path().unwrap_or_default(),
+            meerkat_models::canonical(),
+        );
+        let config = meerkat_core::EffectiveConfigReader::new(Arc::new(source))
+            .effective_config(realm)
+            .await
+            .map_err(|error| {
+                HostAuthError::McpTarget(meerkat::HostMcpTargetRefusal::ConfigUnavailable(
+                    meerkat_core::McpConfigError::Io(format!(
+                        "the realm's configuration could not be composed: {error}"
+                    )),
+                ))
+            })?;
+        meerkat::resolve_configured_mcp_target_in_realm_trusting(
+            target,
+            &config.tools.mcp_servers,
+            None,
+            None,
+            &|_| true,
+        )
+        .await
+    }
+
     /// The config runtime of the realm's own document.
     fn config(&self) -> Result<meerkat_core::ConfigRuntime, GatewayRealmMcpError> {
         let document = realm_document(&self.storage).ok_or(GatewayRealmMcpError::NoDocument)?;
@@ -453,7 +509,7 @@ pub(crate) fn compose_gateway_member_factory(
     let Some(host) = host else {
         return Ok(factory);
     };
-    let construction = GatewayFactoryConstruction::new(kind, &factory, runtime, storage);
+    let construction = GatewayFactoryConstruction::new(kind, &factory, runtime, storage, custody);
     let composition = host.compose_member_factory(&construction)?;
     let observer = host.operation_refusal_observer(&construction)?;
     let factory = match composition {
@@ -510,6 +566,8 @@ mod tests {
         answer: Answer,
         seen: Mutex<Vec<(GatewayFactoryKind, String, bool)>>,
         installations: Mutex<Vec<GatewayRealmMcpInstallation>>,
+        /// The member MCP custody each construction handed the host.
+        custodies: Mutex<Vec<Arc<crate::member_mcp_custody::MemberMcpCustody>>>,
         /// What the host answers when asked for its refusal observer.
         observer: ObserverAnswer,
         /// The construction kind of each observer offer, in order.
@@ -531,6 +589,7 @@ mod tests {
             answer,
             seen: Mutex::new(Vec::new()),
             installations: Mutex::new(Vec::new()),
+            custodies: Mutex::new(Vec::new()),
             observer,
             observer_offers: Mutex::new(Vec::new()),
         })
@@ -585,6 +644,10 @@ mod tests {
             if let Ok(installation) = construction.realm_mcp_installation() {
                 self.installations.lock().unwrap().push(installation);
             }
+            self.custodies
+                .lock()
+                .unwrap()
+                .push(construction.member_mcp_custody());
             match &self.answer {
                 Answer::Compose(recording) => Ok(Some(GatewayMcpComposition::new(Arc::clone(
                     recording,
@@ -1841,5 +1904,131 @@ mod tests {
             .as_deref(),
             Some(SECRET)
         );
+    }
+
+    /// The host's handle to the gateway's member MCP custody is the custody
+    /// every construction of this gateway adopts its adapters into, so a
+    /// credential landed through it reaches the members' own routers.
+    #[tokio::test]
+    async fn the_construction_hands_the_host_the_gateways_own_member_custody() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = Arc::new(runtime_machine());
+        let storage = storage(dir.path());
+        let custody = crate::member_mcp_custody::MemberMcpCustody::new();
+        let host = composing_host(Answer::Ordinary);
+        let offered: Arc<dyn GatewayHostComposition> = host.clone();
+        for kind in [
+            GatewayFactoryKind::Persistent,
+            GatewayFactoryKind::ProcessLocal,
+        ] {
+            compose_gateway_member_factory(
+                Some(&offered),
+                kind,
+                AgentFactory::new(dir.path()).builtins(false).comms(true),
+                &machine,
+                &storage,
+                &custody,
+            )
+            .expect("composed");
+        }
+        let handed = host.custodies.lock().unwrap().clone();
+        assert_eq!(handed.len(), 2, "one handle per construction");
+        assert!(
+            handed.iter().all(|each| Arc::ptr_eq(each, &custody)),
+            "every construction hands out the gateway's own custody"
+        );
+    }
+
+    /// An OAuth MCP server the realm's configuration defines resolves, from
+    /// the host's wire target, to the native identity Meerkat builds from
+    /// that configuration: the identity the realm's credential slot and the
+    /// members' connections use. Anything the configuration does not define
+    /// exactly is refused typed, and nothing is resolved from the request.
+    #[tokio::test]
+    async fn a_configured_oauth_server_resolves_to_its_native_target() {
+        if !runs_isolated("a_configured_oauth_server_resolves_to_its_native_target") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let machine = Arc::new(runtime_machine());
+        let storage = storage(dir.path());
+        let persistence = credentials(dir.path());
+        let (_factory, installation) =
+            composed_with_installation(dir.path(), &machine, &storage, &persistence);
+        let mut hosted = McpServerConfig::streamable_http(
+            "hosted",
+            "https://mcp.example.invalid/mcp",
+            std::collections::HashMap::new(),
+        );
+        if let meerkat_core::mcp_config::McpTransportConfig::Http(http) = &mut hosted.transport {
+            http.oauth_account = Some("subject-7".to_string());
+        }
+        let wire =
+            |name: &str, url: &str, account: Option<&str>| meerkat_contracts::WireMcpAuthTarget {
+                server_name: name.to_string(),
+                server_url: url.to_string(),
+                oauth_account: account.map(str::to_string),
+                oauth_account_selection: None,
+            };
+        // Not configured yet: refused, never invented from the request.
+        assert!(matches!(
+            installation
+                .resolve_mcp_auth_target(&wire(
+                    "hosted",
+                    "https://mcp.example.invalid/mcp",
+                    Some("subject-7")
+                ))
+                .await,
+            Err(HostAuthError::McpTarget(
+                meerkat::HostMcpTargetRefusal::UnknownServer { .. }
+            ))
+        ));
+        let (_, generation) = installation.servers().await.expect("review");
+        installation
+            .install(hosted.clone(), generation, admin())
+            .await
+            .expect("installed");
+
+        let resolved = installation
+            .resolve_mcp_auth_target(&wire(
+                "hosted",
+                "https://mcp.example.invalid/mcp",
+                Some("subject-7"),
+            ))
+            .await
+            .expect("a configured server resolves");
+        assert_eq!(
+            resolved,
+            meerkat::McpServerIdentity::from_config(&hosted).expect("identity"),
+            "the identity comes from the configuration"
+        );
+        assert!(matches!(
+            installation
+                .resolve_mcp_auth_target(&wire("hosted", "https://other.example.invalid/mcp", None))
+                .await,
+            Err(HostAuthError::McpTarget(
+                meerkat::HostMcpTargetRefusal::UrlMismatch { .. }
+            ))
+        ));
+        assert!(matches!(
+            installation
+                .resolve_mcp_auth_target(&wire(
+                    "hosted",
+                    "https://mcp.example.invalid/mcp",
+                    Some("subject-8")
+                ))
+                .await,
+            Err(HostAuthError::McpTarget(
+                meerkat::HostMcpTargetRefusal::AccountMismatch { .. }
+            ))
+        ));
+        assert!(matches!(
+            installation
+                .resolve_mcp_auth_target(&wire("absent", "https://mcp.example.invalid/mcp", None))
+                .await,
+            Err(HostAuthError::McpTarget(
+                meerkat::HostMcpTargetRefusal::UnknownServer { .. }
+            ))
+        ));
     }
 }
