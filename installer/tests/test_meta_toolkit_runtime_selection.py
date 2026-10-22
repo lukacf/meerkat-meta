@@ -28,6 +28,9 @@ FIXTURE = "INERT_SOURCE_ONLY_FIXTURE_NOT_QUALIFIED"
 TARGET = "macos-arm64"
 PREFIX = "meerkat-connect-" + TARGET
 RESOURCE = PREFIX + "/libexec/meerkat-connect"
+# Further fields of the resource component's build record, such as the
+# supported host that the Connect resource packager declares.
+RESOURCE_RECORD = {}
 GATEWAY_BYTES = b"INERT gateway bytes, must never execute\n"
 SDK_BYTES = b"raise RuntimeError('inert fixture must never import or execute')\n"
 
@@ -133,7 +136,7 @@ def product(tmp_path):
     resources = {"fixture": FIXTURE, "schema_version": 1, "target": TARGET,
         "resources_sha256": resource_sha, "archive_sha256": resource_component_sha,
         "archive_bytes": 1, "prepare_source_sha256": digest(SDK_BYTES),
-        "input_selection": {"kind": "explicit_pinned_connect_resource_inputs"}}
+        "input_selection": {"kind": "explicit_pinned_connect_resource_inputs"}, **RESOURCE_RECORD}
     resource_record = put(final / "resource-build-record.json", json_bytes(resources))
     candidate = {"target": TARGET, "source_manifest_sha256": source.sha256,
         "resources_sha256": resource_sha, "binary_kind": "toolkit_gateway",
@@ -194,6 +197,25 @@ def product(tmp_path):
 
 def changed_assembly(product):
     return replace(product.target, assembly=put(product.target.assembly.path, json_bytes(product.assembly)))
+
+
+LINUX_HOST = {"platform": "linux", "machine": "x86_64", "pointer_bits": 64, "glibc": "glibc 2.39"}
+
+
+def linux_product(monkeypatch, supported_host=LINUX_HOST):
+    """Build the next product fixture for Linux x86_64.
+
+    Its resource build record declares supported_host as the Connect resource
+    packager does; None leaves that declaration out.
+    """
+    module = sys.modules[__name__]
+    prefix = "meerkat-connect-linux-x86_64"
+    monkeypatch.setattr(module, "TARGET", "linux-x86_64")
+    monkeypatch.setattr(module, "PREFIX", prefix)
+    monkeypatch.setattr(module, "RESOURCE", prefix + "/libexec/meerkat-connect")
+    monkeypatch.setattr(module, "RESOURCE_RECORD", {} if supported_host is None else {"runtime_compatibility": {
+        "supported_host": supported_host,
+        "scope": "hash_bound_archive_metadata_and_declared_host_only_not_runtime_qualification"}})
 
 
 def test_final_product_reader_preserves_complete_inert_prefix_without_admission(product):
@@ -438,6 +460,49 @@ def test_archive_manifest_must_match_native_compiled_resource_pin(product):
     product.assembly.update(archive_sha256=archive.sha256, archive_bytes=archive.size)
     with pytest.raises(candidates.CandidateArtifactError, match="resource manifest"):
         candidates.read_meta_toolkit_artifacts(changed_assembly(product))
+
+
+@pytest.mark.parametrize("supported_host, floor", [
+    (None, None),
+    (LINUX_HOST, (2, 39)),
+    ({**LINUX_HOST, "glibc": "glibc 2.41"}, (2, 41)),
+    ({key: value for key, value in LINUX_HOST.items() if key != "glibc"}, "refused"),
+    ({**LINUX_HOST, "glibc": "musl 1.2"}, "refused"),
+    ({**LINUX_HOST, "glibc": "glibc 2"}, "refused"),
+    ({**LINUX_HOST, "glibc": 2.39}, "refused"),
+    ("glibc 2.39", "refused")],
+    ids=["undeclared", "glibc-2.39", "glibc-2.41", "no-glibc", "musl", "no-minor", "number", "not-a-host"])
+def test_linux_product_reader_carries_its_declared_glibc_floor(monkeypatch, request, supported_host, floor):
+    # The resource build record is pinned through the assembly. The floor is
+    # the supported host that record declares, not a Forge constant.
+    linux_product(monkeypatch, supported_host)
+    product = request.getfixturevalue("product")
+    if floor == "refused":
+        with pytest.raises(candidates.CandidateArtifactError, match="supported host"):
+            candidates.read_meta_toolkit_artifacts(product.target)
+        return
+    observed = candidates.read_meta_toolkit_artifacts(product.target)
+    assert observed.glibc_floor == floor
+    assert candidates.recheck_meta_toolkit_artifacts(observed, product.target) is observed
+    object.__setattr__(observed, "glibc_floor", (2, 17))
+    with pytest.raises(candidates.CandidateArtifactError, match="metadata changed"):
+        candidates.recheck_meta_toolkit_artifacts(observed, product.target)
+
+
+@pytest.mark.parametrize("supported_host, refused", [
+    ({"platform": "darwin", "machine": "arm64", "pointer_bits": 64}, False),
+    ({"platform": "darwin", "machine": "arm64", "pointer_bits": 64, "glibc": "glibc 2.39"}, True)],
+    ids=["declared-host", "glibc-on-macos"])
+def test_macos_product_reader_declares_no_glibc_floor(monkeypatch, request, supported_host, refused):
+    monkeypatch.setattr(sys.modules[__name__], "RESOURCE_RECORD", {"runtime_compatibility": {
+        "supported_host": supported_host,
+        "scope": "hash_bound_archive_metadata_and_declared_host_only_not_runtime_qualification"}})
+    product = request.getfixturevalue("product")
+    if refused:
+        with pytest.raises(candidates.CandidateArtifactError, match="supported host"):
+            candidates.read_meta_toolkit_artifacts(product.target)
+    else:
+        assert candidates.read_meta_toolkit_artifacts(product.target).glibc_floor is None
 
 
 @pytest.mark.parametrize("link", ["prepare.py/../real-file", "missing", "../../../../escape", "/absolute", "python-current"])
