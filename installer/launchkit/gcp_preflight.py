@@ -313,6 +313,8 @@ class GcpPreflightService:
         proposal = Blueprint.model_validate(state.get("proposal") or state.get("blueprint"))
         if proposal.target != "gcp":
             raise ValueError("Choose Google Cloud with the setup guide and accept its application package first.")
+        if proposal.gcp.provisioning == "existing_host":
+            raise ValueError("This proposal uses an existing host. New-VM cloud preparation is unavailable; use the existing destination's installation controls or package handoff.")
         payload, slug = await self.local.implementation.package(guide_id, build_id)
         files = package_files(payload)
         try:

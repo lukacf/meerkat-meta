@@ -113,6 +113,9 @@ def package_availability(value, *, runtime_target=None, verified_artifacts=None)
         return {"available": False, "status": "pending-integration", "reason": NATIVE_BUNDLE_PENDING, **authoring}
     if spec.target == "gcp" and spec.gcp.project == "":
         return {"available": False, "status": "pending-configuration", "reason": GCP_PROJECT_PENDING, **authoring}
+    if spec.target == "gcp" and spec.gcp.provisioning == "existing_host" and not spec.gcp.existing_instance:
+        return {"available": False, "status": "pending-configuration", "reason":
+            "Tell the guide the existing VM instance name before preparing its package. Forge will not create a replacement VM.", **authoring}
     return {"available": True, "status": "ready", "reason": None, **authoring}
 
 
@@ -502,6 +505,29 @@ native memory."""
         schedule_hook_guidance = 'When accepted application source defines `schedule_runnables()`, the generated host collects its named handlers. Product Fresh and Restore startup bind those handlers through `runtime.on_schedule_fire` before native `connect()`. This wiring uses the selected Meta builder and actual Toolkit application or restore runtime. A callable hook and successful binding do not create a native schedule or add scheduling authority. The original native owner controls schedule creation, timing, claims and occurrence outcomes; do not invent another scheduler or schedule-creation API.'
         console_guidance = 'Keep the original protected `application/console.json`, `application/configuration.json` and `config/access.toml` with this saved installation. They retain the selected viewer and declared private fields. Preserve the selected Console user and enter credentials only in the existing protected private-settings or login forms. These source selections do not authenticate a human or grant native access.\n\nThe generated host conditionally attaches `on_console_input` and `frontend_management` hooks to its Meta Console front. These hooks require the retained local-password authentication metadata, declared private fields and exact loaded application configuration. The host checks successful matching native admission before delivering an authenticated Console input event. That source wiring does not by itself prove installed authentication, a principal-attesting native timeline, a permitted reply or arbitrary frontend capability; the original trusted host and selected native runtime retain identity, route and access authority.\n\nA chat message, reply, login health check or completed native input does not itself authorize a separate action. Application approval must be checked against the exact action, human, scope, expiry and current state at the side-effect boundary. Keep duplicate or uncertain delivery attached to its original native interaction and application state; do not infer permission from text, automatically resend, or create a parallel native event log.\n\nIf the installed Console offers **Set up your app**, ask which setup options this application supports. Enter passwords and tokens only in its protected forms. Closing the panel leaves the application running; reopen it to check the original work after an uncertain result. Complete setup and send a permitted message through the configured channel to verify its actual reply. This panel does not add arbitrary integrations to an existing build.'
         schedule_runtime_guidance = "Do not infer a schedule target schema or restored-delivery behavior from an older MobKit release or from callback wiring. Use only the capabilities actually supported by this application's selected host/native runtime and its original grants. A live schedule, persisted occurrence outcome, permitted delivery and restart recovery require their actual installed observations; source checks and assistant prose are insufficient. Inspect the original owned schedule after an uncertain result before creating another recurrence, and keep timezone, missed-run policy, overlap, provider cost and action authorization explicit."
+    if spec.target == "gcp" and spec.gcp.provisioning == "existing_host":
+        destination = f"{spec.gcp.project} / {spec.gcp.zone} / {spec.gcp.existing_instance}"
+        existing_guidance = (
+            f"This package targets the existing VM {destination}. The application folder name is {spec.project.slug}; it is not the VM name. "
+            "No VM, firewall rule, IAM grant, service account or host prerequisite is created or changed by deploy/deploy-gcp.sh. "
+            "That script only shows the plan with --dry-run and refuses provisioning, resume and remote operations. "
+            "Use the existing host's authorized SSH access; the package does not establish IAP access or host ownership. "
+            "Check Linux/Python and selected connector or knowledge prerequisites on that host before installation. "
+            "Keep an existing installation's folder, private settings and state; use its offered update/recovery controls instead of extracting over it.")
+        install_guidance = existing_guidance + "\n\n" + install_guidance
+        if not candidate and not product:
+            install = [
+                "Transfer this accepted ZIP using your existing authorized access to the selected VM. Extract it into a new empty folder you own there and open the folder containing install.sh and start.sh. Do not replace an existing installation.",
+                "On that VM, run `bash install.sh` with Python 3.11+ and the selected connector prerequisites available. Enter private settings only in its setup interview.",
+                "Run `bash start.sh --doctor` and `bash start.sh --application-check`, then `bash start.sh --connections-check` for selected connections.",
+                "Use `bash deploy/install-service.sh` on the VM to set up its owned application service, or `bash start.sh` for terminal operation. Use one at a time.",
+                "On the computer with your browser, use `bash deploy/tunnel-gcp.sh` if IAP SSH is already authorized. Otherwise use the host's existing private access route. Open the Console URL printed after startup.",
+            ]
+        # No new-VM cleanup, claims about configured VM resources or bootstrap.
+        service_guidance = existing_guidance + "\n\n" + (
+            "Operate the same application on the VM with `bash deploy/install-service.sh status`, `stop`, `restart` or `remove-service`. "
+            "Removal preserves application files and state. The service setup asks before enabling operation after logout; this may require sudo. "
+            "For a selected Meta/Toolkit product or private candidate, use the saved Forge installation controls instead; shell entrypoints cannot recreate its native authority.")
     install_steps = "\n".join(f"{index}. {step}" for index, step in enumerate(install, 1))
     return f"""# {spec.project.name}
 
@@ -734,9 +760,21 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None):
         deploy = deploy.replace(key, value)
     from .gcp_bootstrap import render_manual_prerequisites
     deploy = render_manual_prerequisites(deploy, runtime)
+    instance = spec.project.slug
+    if spec.target == "gcp" and spec.gcp.provisioning == "existing_host":
+        instance = spec.gcp.existing_instance
+        # Keep the public filename stable but ship no provisioning implementation.
+        # An old --resume or --setup command cannot select the new-VM path.
+        plan = (f"Existing host: {spec.gcp.project} / {spec.gcp.zone} / {instance}\n"
+                "No cloud resources, host files or private settings were changed.\n"
+                "Use this host's saved Forge installation controls, or follow README.md for an ordinary exported package.\n")
+        deploy = ("#!/usr/bin/env bash\nset -euo pipefail\n"
+            f"printf '%s' {shlex.quote(plan)}\n"
+            'if [[ "$#" == 1 && "$1" == --dry-run ]]; then exit 0; fi\n'
+            'echo "Existing-host package: provisioning and remote lifecycle operations are unavailable here. Use the existing installation owner." >&2\nexit 1\n')
     files += [PackageFile("deploy/deploy-gcp.sh", deploy, 0o755),
               PackageFile("deploy/install-service.sh", (TEMPLATES / "install-service.sh").read_text(), 0o755),
-              PackageFile("deploy/tunnel-gcp.sh", f"#!/usr/bin/env bash\nset -euo pipefail\nexec gcloud compute ssh {shlex.quote(spec.project.slug)} --project {shlex.quote(spec.gcp.project)} --zone {shlex.quote(spec.gcp.zone)} --tunnel-through-iap -- -N -L {spec.advanced.port}:127.0.0.1:{spec.advanced.port}\n", 0o755)]
+              PackageFile("deploy/tunnel-gcp.sh", f"#!/usr/bin/env bash\nset -euo pipefail\nexec gcloud compute ssh {shlex.quote(instance)} --project {shlex.quote(spec.gcp.project)} --zone {shlex.quote(spec.gcp.zone)} --tunnel-through-iap -- -N -L {spec.advanced.port}:127.0.0.1:{spec.advanced.port}\n", 0o755)]
     hashes = "".join(f"{hashlib.sha256(item.as_bytes()).hexdigest()}  {item.path}\n" for item in sorted(files, key=lambda item: item.path))
     files.append(PackageFile("SHA256SUMS", hashes))
     return files

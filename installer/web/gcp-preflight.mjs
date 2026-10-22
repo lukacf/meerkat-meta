@@ -12,6 +12,7 @@ export function gcpCheckFresh(response, now = Date.now()) {
 
 export function gcpPreflightAvailable(state, build, blocked = false) {
   return !blocked && (state?.proposal || state?.blueprint)?.target === "gcp" &&
+    (state?.proposal || state?.blueprint)?.gcp?.provisioning !== "existing_host" &&
     deploymentCanPrepare(build, state) && HASH.test(build?.blueprint_hash || "") && HASH.test(build?.source_digest || "");
 }
 
