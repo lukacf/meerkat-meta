@@ -1110,6 +1110,8 @@ class DeploymentService:
         self.application_replacement_selection = None
         self.application_host_selection = None
         self._application_preparations = {}
+        # Verified reads of selected products, and first reads in flight.
+        self._product_reads, self._product_reading = [], []
         from .deployment_service import UserServiceManager
         self.service_manager = service_manager or UserServiceManager()
 
@@ -1596,8 +1598,8 @@ class DeploymentService:
             if expected is not None:
                 raise DraftConflict("The original implementation-selected product changed before installation.")
             return None
-        artifacts = await await_validation(selected_runtime_artifacts, target,
-            verified_artifacts=expected.artifacts if expected is not None else None)
+        artifacts = (await self._selected_product_artifacts(target) if expected is None else
+            await await_validation(selected_runtime_artifacts, target, verified_artifacts=expected.artifacts))
         selected = candidate_selection(target, verified_artifacts=artifacts)
         if expected is not None and selected != expected.selection:
             raise DraftConflict("The original implementation-selected product changed before installation.")
@@ -1612,6 +1614,37 @@ class DeploymentService:
         return SimpleNamespace(selection=selected, artifacts=artifacts,
             interpreter_refusal=selected_host_refusal(artifacts.glibc_floor)
                 or selected_interpreter_refusal(artifacts.selection))
+
+    async def _selected_product_artifacts(self, target):
+        """A selected product's verified artifacts, read in full once while it is unchanged.
+
+        A later call passes the kept read back to the selected runtime reader,
+        which rechecks every verified input's file fingerprint, as an explicit
+        verified_artifacts argument always does. A changed input refuses that
+        recheck and the product is read again in full. Concurrent first reads
+        of one product share a single read.
+        """
+        from .runtime_selection import selected_runtime_artifacts
+        reads = self.__dict__.setdefault("_product_reads", [])
+        reading = self.__dict__.setdefault("_product_reading", [])
+        for index, (selected, verified) in enumerate(reads):
+            if selected == target:
+                try:
+                    return await await_validation(selected_runtime_artifacts, target, verified_artifacts=verified)
+                except (OSError, ValueError):
+                    if index < len(reads) and reads[index][0] == target:
+                        del reads[index]
+                break
+        task = next((pending for selected, pending in reading if selected == target), None)
+        if task is None:
+            task = asyncio.create_task(await_validation(selected_runtime_artifacts, target))
+            reading.append((target, task))
+            def finished(done, target=target):
+                reading[:] = [row for row in reading if row[1] is not done]
+                if not done.cancelled() and done.exception() is None:
+                    reads[:] = [row for row in reads if row[0] != target][-3:] + [(target, done.result())]
+            task.add_done_callback(finished)
+        return await asyncio.shield(task)
 
     async def options(self, guide_id, build_id=None, *, console_port=None, source_kind="application", version=None):
         if source_kind not in {"application", "native-team"}:
