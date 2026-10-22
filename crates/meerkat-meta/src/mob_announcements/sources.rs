@@ -13,13 +13,16 @@
 //! and keeps them reserved to its source id after it ends: no other source
 //! and no plain announcement ever reaches them.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use super::types::{
     AnnouncementStoreError, MAX_ANNOUNCEMENT_TOPICS, MAX_BODY_BYTES, MAX_ID_BYTES, Member, MobId,
-    Result, SOURCE_KEY_PREFIX, SourceId, SourceKey, Topic, sha256_hex,
+    Result, SOURCE_KEY_PREFIX, SourceId, SourceKey, SubscriptionId, Topic, sha256_hex,
+};
+use crate::access::{
+    AccessControlConfig, AccessEffect, AccessPrincipal, AccessResource, AccessRule, evaluate_access,
 };
 
 /// Most topics a source owns for its items.
@@ -256,7 +259,14 @@ pub enum AudienceGrant {
 impl AudienceGrant {
     pub fn validate(&self) -> Result<()> {
         match self {
+            // Grants name exact values: "*" is no member and no role.
+            Self::Member { member } if member.identity.as_str() == "*" => Err(
+                AnnouncementStoreError::Invalid("a member grant names one member".to_string()),
+            ),
             Self::Member { .. } => Ok(()),
+            Self::Role { role, .. } if role == "*" => Err(AnnouncementStoreError::Invalid(
+                "a role grant names one role".to_string(),
+            )),
             Self::Role { role, .. } => text(role, MAX_ID_BYTES, "a role"),
             Self::Label { key, value, .. } => {
                 text(key, MAX_ID_BYTES, "a label key")?;
@@ -264,6 +274,125 @@ impl AudienceGrant {
             }
         }
     }
+
+    /// The allow rule this grant compiles to for members of `mob_id`, or
+    /// none when it names another mob.
+    fn rule(&self, index: usize, mob_id: &MobId) -> Option<AccessRule> {
+        let mut rule = AccessRule {
+            id: format!("grant-{index}"),
+            effect: AccessEffect::Allow,
+            actions: vec![RECEIVE_ACTION.to_string()],
+            ..AccessRule::default()
+        };
+        match self {
+            Self::Member { member } if member.mob_id == *mob_id => {
+                rule.agents = vec![member.identity.as_str().to_string()];
+            }
+            Self::Role {
+                mob_id: granted,
+                role,
+            } if granted == mob_id => rule.roles = vec![role.clone()],
+            Self::Label {
+                mob_id: granted,
+                key,
+                value,
+            } if granted == mob_id => {
+                rule.match_labels = BTreeMap::from([(key.clone(), value.clone())]);
+            }
+            _ => return None,
+        }
+        Some(rule)
+    }
+
+    /// Whether a role or label grant names a mob other than `mob_id`.
+    fn names_another_mob(&self, mob_id: &MobId) -> bool {
+        match self {
+            Self::Role {
+                mob_id: granted, ..
+            }
+            | Self::Label {
+                mob_id: granted, ..
+            } => granted != mob_id,
+            Self::Member { .. } => false,
+        }
+    }
+}
+
+/// The action a source's audience grants a member: receiving the source's
+/// items.
+pub const RECEIVE_ACTION: &str = "mob_announcements.receive";
+
+/// What a mob's roster records about a member, the facts role and label
+/// grants are decided over: the profile it was spawned from and its labels.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct MemberFacts {
+    pub role: String,
+    pub labels: BTreeMap<String, String>,
+}
+
+impl MemberFacts {
+    pub fn new(role: impl Into<String>, labels: BTreeMap<String, String>) -> Self {
+        Self {
+            role: role.into(),
+            labels,
+        }
+    }
+}
+
+/// The roster facts the owner read for one store call. A member missing
+/// here has none, so only a member grant can cover it: the store fails
+/// closed on anything it was not told.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RosterFacts {
+    members: BTreeMap<Member, MemberFacts>,
+}
+
+impl RosterFacts {
+    pub fn insert(&mut self, member: Member, facts: MemberFacts) {
+        self.members.insert(member, facts);
+    }
+
+    pub fn get(&self, member: &Member) -> Option<&MemberFacts> {
+        self.members.get(member)
+    }
+}
+
+/// Whether `audience` lets `member` receive. Each grant naming the member's
+/// mob compiles to an allow rule of the access engine over the member's
+/// identity, role and labels; the engine denies by default and fails closed
+/// on a role or labels it was not given. A grant never matches another
+/// mob's member.
+pub(crate) fn covers(
+    audience: &[AudienceGrant],
+    member: &Member,
+    facts: Option<&MemberFacts>,
+) -> bool {
+    let rules: Vec<AccessRule> = (0..)
+        .zip(audience)
+        .filter_map(|(index, grant)| grant.rule(index, &member.mob_id))
+        .collect();
+    if rules.is_empty() {
+        return false;
+    }
+    let config = AccessControlConfig {
+        enabled: true,
+        rules,
+        ..AccessControlConfig::default()
+    };
+    let resource = AccessResource {
+        identity: Some(member.identity.as_str()),
+        agent_id: None,
+        role: facts.map(|facts| facts.role.as_str()),
+        labels: facts.map(|facts| &facts.labels),
+    };
+    evaluate_access(
+        &config,
+        &AccessPrincipal::anonymous(),
+        RECEIVE_ACTION,
+        &resource,
+    )
+    .is_allow()
 }
 
 fn validate_audience(audience: &[AudienceGrant], what: &str) -> Result<()> {
@@ -643,6 +772,82 @@ impl SourceConfig {
             SourceRoute::Direct { .. } => Vec::new(),
         });
         own.chain(forwards).collect()
+    }
+
+    /// Refuse what could never act in the source's mob `mob_id`: a triage
+    /// member of another mob, and a role or label grant naming another mob
+    /// (a member grant may name a member of another gateway's mob).
+    pub(crate) fn validate_for(&self, mob_id: &MobId) -> Result<()> {
+        if self
+            .audience
+            .iter()
+            .any(|grant| grant.names_another_mob(mob_id))
+        {
+            return Err(AnnouncementStoreError::Invalid(
+                "a role or label grant names a mob other than the source's".to_string(),
+            ));
+        }
+        for route in &self.routes {
+            if let SourceRoute::Triage {
+                member,
+                forward_audience,
+                ..
+            } = route
+            {
+                if member.mob_id != *mob_id {
+                    return Err(AnnouncementStoreError::Invalid(
+                        "a triage member is a member of another mob than the source's".to_string(),
+                    ));
+                }
+                if forward_audience
+                    .iter()
+                    .flatten()
+                    .any(|grant| grant.names_another_mob(mob_id))
+                {
+                    return Err(AnnouncementStoreError::Invalid(
+                        "a role or label grant names a mob other than the source's".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Who may receive announcements on `topic`, a topic this source owns:
+    /// its audience for its own topics, a triage route's forward audience
+    /// (the audience when the route names none) for that route's forward
+    /// topics.
+    pub(crate) fn audience_of(&self, topic: &Topic) -> Option<&[AudienceGrant]> {
+        if self.topics.contains(topic) {
+            return Some(&self.audience);
+        }
+        self.routes.iter().find_map(|route| match route {
+            SourceRoute::Triage {
+                forward_topics,
+                forward_audience,
+                ..
+            } if forward_topics.contains(topic) => {
+                Some(forward_audience.as_deref().unwrap_or(&self.audience))
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether a direct route lets members subscribe to `topic` directly.
+    pub(crate) fn directly_routes(&self, topic: &Topic) -> bool {
+        self.routes.iter().any(|route| {
+            matches!(route, SourceRoute::Direct { topics, .. }
+                if topics.as_ref().is_none_or(|topics| topics.contains(topic)))
+        })
+    }
+
+    /// Whether `member` is the triage member of a route that takes `topic`.
+    pub(crate) fn triages(&self, member: &Member, topic: &Topic) -> bool {
+        self.routes.iter().any(|route| {
+            matches!(route, SourceRoute::Triage { member: triage, topics, .. }
+                if triage == member
+                    && topics.as_ref().is_none_or(|topics| topics.contains(topic)))
+        })
     }
 
     /// The triage member whose route forwards on `topic`, if one does.
@@ -1487,4 +1692,71 @@ impl RecordSourceFailure {
         }
         Ok(())
     }
+}
+
+/// What an audit row records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AuditKind {
+    /// A subscription was refused.
+    Refused,
+    /// A capture was withheld from a subscription.
+    Withheld,
+}
+
+impl AuditKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::Withheld => "withheld",
+        }
+    }
+}
+
+/// Why it was refused or withheld.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AuditReason {
+    /// The audience (or forward audience) does not cover the member.
+    AudienceNotCovered,
+    /// No direct route names the topic.
+    NoDirectRoute,
+    /// The member would be reachable directly and through a forward.
+    RouteOverlap,
+    /// The member owns a live conversation on the source's scope.
+    RouteConflict,
+}
+
+/// One audited refusal or withholding, kept for the retention window. It
+/// names members, topics and counts, never content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AuditRow {
+    /// Rises with every row: `audit/list` pages after it.
+    pub id: u64,
+    pub at_ms: u64,
+    pub kind: AuditKind,
+    pub reason: AuditReason,
+    pub mob_id: MobId,
+    pub source_id: SourceId,
+    pub member: Member,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<Topic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_id: Option<SubscriptionId>,
+    /// The withheld announcement's sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+}
+
+/// A page of audit rows, by source, by member, or both, in id order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AuditQuery {
+    pub mob_id: Option<MobId>,
+    pub source_id: Option<SourceId>,
+    pub member: Option<Member>,
+    pub after: Option<u64>,
+    pub limit: usize,
 }

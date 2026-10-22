@@ -291,6 +291,18 @@ pub(crate) const ANNOUNCEMENT_SCHEMA_DOMAIN: meerkat_sqlite::SchemaDomain =
                 kind: meerkat_sqlite::SchemaObjectKind::Table,
                 name: "announcement_source_streams",
             },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "announcement_audit",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Index,
+                name: "announcement_audit_by_source",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Index,
+                name: "announcement_audit_by_member",
+            },
         ],
         retired_objects: &[],
     };

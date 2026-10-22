@@ -69,6 +69,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Bounds: 100 items and 1 MiB of item bodies per step, an 8 KiB cursor
     token (refused, never cut), 1024 streams per source, a 512 byte
     failure detail.
+- Mob announcement sources decide who receives their items. A source's
+  audience is a list of grants (a member, a role, or a label of its mob)
+  that Meta's access engine evaluates over the member's roster facts,
+  denying by default; a member whose role or labels the roster does not
+  record is covered by a member grant alone. A triage route's forward
+  topics take its forward audience (the source's audience by default).
+  - A subscription to a topic a source owns is refused when the topic's
+    audience does not cover the member (`audience_not_covered`, through
+    the host RPC and the member tool alike), when no direct route names a
+    source topic and the member is not the triage member that takes it
+    (`no_direct_route`), when the member owns a live conversation on the
+    source's scope (`route_conflict`), or when the member would reach the
+    source both directly and through a forward (`route_overlap`, also
+    refused at `sources/put` for a route change that would do this to an
+    existing subscriber).
+  - Capture follows the same audience: an uncovered subscription, or a
+    conversation member's, does not capture the item, and the withholding
+    is an audit row.
+  - New method `meta/mob_announcements/audit/list` reads the refusals and
+    withholdings of a mob's sources, per source, per member, or both,
+    kept for the retention window.
+  - A triage member of another mob, and a role or label grant naming
+    another mob, are refused at `sources/put`; a member grant may name a
+    member of another gateway's mob. A grant names exact values: "*" is
+    no member and no role.
 
 ### Changed
 
