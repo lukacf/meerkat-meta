@@ -165,15 +165,21 @@ def _sync_directory(path):
 
 
 def _staging_lock(path):
-    """Claim one staging entry for this connect's whole life; None if it is held."""
+    """Claim one staging entry for this connect's whole life; None if it is held or gone."""
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
             raise DraftConflict("The remote installation store is not an owned directory.")
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # A sweep may have claimed and unlinked this name between the open and
+        # the flock; a claim on a nameless inode protects nothing.
+        current = os.stat(path, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            os.close(descriptor)
+            return None
         return descriptor
-    except BlockingIOError:
+    except (BlockingIOError, FileNotFoundError):
         os.close(descriptor)
         return None
     except BaseException:

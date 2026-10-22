@@ -1498,3 +1498,30 @@ async def test_connect_never_replaces_an_existing_installation_directory(service
             "owned.example", "test", 22, "~/src/team")
     assert existing.is_dir() and not any(existing.iterdir())
     assert installation_entries(service)[1] == []
+
+
+def test_a_staging_claim_whose_name_was_swept_before_its_lock_is_refused(tmp_path, monkeypatch):
+    import fcntl
+    from launchkit import remote_deployment
+    root = tmp_path / ".connecting"
+    root.mkdir(mode=0o700)
+    identity = str(uuid.uuid4())
+    lock_path, staging = root / (identity + ".lock"), root / identity
+    real_flock, interleaved = fcntl.flock, []
+    def sweep_first(descriptor, operation):
+        if not interleaved:
+            interleaved.append(True)
+            # Another process's sweep claims the new name between this open and
+            # this lock, finds no staging copy and unlinks the lock file.
+            claim = remote_deployment._staging_lock(lock_path)
+            assert claim is not None
+            remote_deployment._end_staging(staging, claim)
+        return real_flock(descriptor, operation)
+    monkeypatch.setattr(remote_deployment.fcntl, "flock", sweep_first)
+    claim = remote_deployment._staging_lock(lock_path)
+    monkeypatch.setattr(remote_deployment.fcntl, "flock", real_flock)
+    try:
+        assert interleaved and claim is None
+    finally:
+        if claim is not None:
+            os.close(claim)
