@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 from .projects import fingerprint
 from .artifact_binding import current_version, proposal_hash
-from .admission_health import retained_pending_admission
+from .admission_health import health_is_fresh, retained_pending_admission
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _ATTEMPT = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -33,12 +33,7 @@ def _text(value, limit=100):
 
 
 def _fresh_health(value, now):
-    try:
-        checked = datetime.fromisoformat(value)
-        age = (now - checked).total_seconds()
-        return checked.tzinfo is not None and 0 <= age <= 30
-    except (TypeError, ValueError):
-        return False
+    return health_is_fresh(value, now)
 
 
 def _console(value):

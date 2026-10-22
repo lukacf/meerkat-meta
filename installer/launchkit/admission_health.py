@@ -2,6 +2,27 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
+
+
+# K1/K2 producers must emit pending frames more often than this window.
+PENDING_HEALTH_WINDOW = 30.0
+
+
+def health_is_fresh(value, observed_at=None):
+    """A manager poll cannot renew a native observation's timestamp."""
+    try:
+        checked = datetime.fromisoformat(value)
+        age = ((observed_at or datetime.now(timezone.utc)) - checked).total_seconds()
+        return checked.tzinfo is not None and 0 <= age <= PENDING_HEALTH_WINDOW
+    except (TypeError, ValueError):
+        return False
+
+
+def fresh_pending_admission(receipt, observed_at=None):
+    if not health_is_fresh(receipt.get("health_checked_at"), observed_at):
+        return None
+    return retained_pending_admission(receipt)
 
 
 def retained_pending_admission(receipt):
@@ -52,11 +73,13 @@ def pending_admission(bootstrap, admission, *, seeds=()):
     if (not isinstance(counts, dict) or type(counts.get("broken")) is not int
             or counts["broken"] < 0 or not isinstance(identities, dict)):
         refuse()
-    broken = set()
+    broken, dormant = set(), set()
     for identity, entry in identities.items():
         if (not isinstance(entry, dict) or not isinstance(entry.get("state"), str)
                 or entry["state"] not in {"active", "dormant", "warming", "broken"}):
             refuse()
+        if entry["state"] == "dormant":
+            dormant.add(identity)
         if entry["state"] != "broken":
             continue
         restore = entry.get("restore")
@@ -65,7 +88,10 @@ def pending_admission(bootstrap, admission, *, seeds=()):
                 or restore.get("kind") != "held_completion_owed"):
             refuse()
         broken.add(identity)
-    if (broken != set(rows["owed"]) or len(broken) != counts["broken"]
+    owed = set(rows["owed"])
+    # Lazy bootstrap can leave a listed owed identity dormant. Keep it owed
+    # and pending even when that unchanged native snapshot reports ready.
+    if (not broken <= owed or not owed - broken <= dormant or len(broken) != counts["broken"]
             or broken and bootstrap["ready"]):
         refuse()
     return rows if rows["admitting"] or rows["owed"] else None

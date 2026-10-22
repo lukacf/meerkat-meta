@@ -190,14 +190,14 @@ async def test_apply_and_explicit_rollback_use_fresh_service_health_without_repl
 
 async def test_pending_update_waits_past_both_budgets_then_commits_only_fresh_ready(background, monkeypatch):
     service, directory, target, old, private, identity, manager, _ = background
-    monkeypatch.setattr(services, "SERVICE_START_TIMEOUT", .4)
-    monkeypatch.setattr(services, "SERVICE_UPDATE_TIMEOUT", .6)
+    monkeypatch.setattr(services, "SERVICE_START_TIMEOUT", 1)
+    monkeypatch.setattr(services, "SERVICE_UPDATE_TIMEOUT", 1.5)
     manager.behaviors = ["pending"]
     task = asyncio.create_task(services.update_background(directory, manager, "update", update_id=identity))
     try:
         await asyncio.wait_for(manager.started.wait(), 5)
         pending = read_receipt(directory)
-        await asyncio.sleep(.8)
+        await asyncio.sleep(1.65)
         assert not task.done(), "A recoverable native admission is not an update timeout"
         waiting = read_receipt(directory)
         assert waiting["status"] == "starting" and waiting["health"] == "pending"
@@ -256,6 +256,47 @@ async def test_invalid_pending_update_cannot_suspend_timeout(background, monkeyp
     assert result["update"]["status"] == "rolled-back" and result["build_id"] == old["build_id"]
     assert manager.starts == [service.implementation.identity, old["build_id"]]
     assert manager.stops == [service.implementation.identity]
+
+
+@pytest.mark.parametrize("condition", ["stale", "silent", "never-ready"])
+async def test_pending_update_is_bounded_and_rolls_back(background, monkeypatch, condition):
+    service, directory, target, old, private, identity, manager, _ = background
+    monkeypatch.setattr(services, "SERVICE_START_TIMEOUT", .2)
+    monkeypatch.setattr(services, "SERVICE_UPDATE_TIMEOUT", 3)
+    monkeypatch.setattr(services, "SERVICE_PENDING_MAX_WAIT", 2 if condition == "silent" else .3)
+    manager.behaviors = ["pending", "ready"]
+    original_observe = manager.observe
+    entered_at = None
+    records = (target / "data/ledger.db").read_bytes()
+
+    async def observe(definition):
+        nonlocal entered_at
+        if len(manager.starts) == 1:
+            elapsed = asyncio.get_running_loop().time()
+            if entered_at is None:
+                entered_at = elapsed
+            fresh = condition == "never-ready" or condition == "silent" and elapsed - entered_at < .3
+            update_receipt(directory, health_checked_at=(now() if fresh
+                else "2000-01-01T00:00:00+00:00"))
+        return await original_observe(definition)
+
+    monkeypatch.setattr(manager, "observe", observe)
+    task = asyncio.create_task(services.update_background(directory, manager, "update", update_id=identity))
+    try:
+        try:
+            await asyncio.wait_for(asyncio.shield(task), 2)
+        except TimeoutError:
+            pytest.fail("Pending evidence must not hold the transaction open until external cancellation")
+        result = read_receipt(directory)
+        assert result["update"]["status"] == "rolled-back" and result["build_id"] == old["build_id"]
+        assert manager.starts == [service.implementation.identity, old["build_id"]]
+        assert manager.stops == [service.implementation.identity]
+        assert (target / ".env").read_bytes() == private
+        assert (target / "data/ledger.db").read_bytes() == records
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 3)
 
 
 @pytest.mark.parametrize("after_pending", ["unknown", "cancel", "failed-then-stalled-fallback", "stalled-observation"])

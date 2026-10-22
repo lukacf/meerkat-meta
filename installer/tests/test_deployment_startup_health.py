@@ -144,9 +144,11 @@ async def test_pending_admission_waits_for_later_native_ready_before_console_pro
         "fd=int(os.environ['MOBKIT_LAUNCH_READY_FD'])\n"
         "pending['pid']=ready['pid']=os.getpid()\n"
         "os.write(fd,(json.dumps(pending)+'\\n').encode())\n"
-        f"while not os.path.exists({str(release)!r}): time.sleep(.01)\n"
+        f"while not os.path.exists({str(release)!r}):\n"
+        " time.sleep(.05)\n os.write(fd,(json.dumps(pending)+'\\n').encode())\n"
         "os.write(fd,(json.dumps(ready)+'\\n').encode())\nos.close(fd)\ntime.sleep(60)\n")
     monkeypatch.setattr(worker, "START_TIMEOUT", .2)
+    monkeypatch.setattr(worker, "PENDING_HEALTH_WINDOW", .15)
     published = []
     def on_ready():
         published.append(True)
@@ -176,6 +178,29 @@ async def test_pending_admission_waits_for_later_native_ready_before_console_pro
     finally:
         supervisor.stop.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_pending_child_must_keep_reporting_within_frame_deadline(fixture, monkeypatch):
+    from test_admission_health import pending_payload
+    import launchkit.deployment_worker as worker
+    supervisor, definition, console = await fixture([])
+    pending = pending_payload()
+    pending["console_url"] = f"http://127.0.0.1:{definition['port']}/console"
+    (supervisor.destination / "app.py").write_text(
+        "import json,os,time\n"
+        f"payload={pending!r}\npayload['pid']=os.getpid()\n"
+        "fd=int(os.environ['MOBKIT_LAUNCH_READY_FD'])\n"
+        "os.write(fd,(json.dumps(payload)+'\\n').encode())\ntime.sleep(60)\n")
+    monkeypatch.setattr(worker, "PENDING_HEALTH_WINDOW", .15, raising=False)
+    task = asyncio.create_task(supervisor.start(definition))
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), 1)
+        assert task.done(), "The worker frame deadline must expire without test cancellation"
+        assert supervisor.child is None and console.requests == []
+    finally:
+        supervisor.stop.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 3)
 
 
 async def test_pending_admission_can_be_stopped_without_publishing_ready(fixture):

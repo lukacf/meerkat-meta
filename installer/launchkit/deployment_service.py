@@ -25,6 +25,7 @@ from .deployment_deadlines import (USER_SERVICE_STOP_TIMEOUT, SERVICE_STOP_COMMA
 
 SERVICE_TIMEOUT = 60
 SERVICE_UPDATE_TIMEOUT = 1200
+SERVICE_PENDING_MAX_WAIT = 1200
 SERVICE_START_TIMEOUT = 270
 UPDATE_STARTUP_PROTOCOL = 1
 CANDIDATE_STARTUP_PROTOCOL = 1
@@ -586,7 +587,7 @@ def _record_service_observation(directory, service, public, observation, *, expe
 async def background_status(directory, manager):
     """Read actual manager ownership; never revive a saved PID or readiness flag."""
     from .deployment import now, package_files, read_receipt, verify_destination
-    from .admission_health import retained_pending_admission
+    from .admission_health import fresh_pending_admission
     directory = Path(directory)
     receipt = read_receipt(directory)
     inspected_receipt = receipt
@@ -606,7 +607,7 @@ async def background_status(directory, manager):
         matching = bool(observed_pid and observed_pid == receipt.get("service_supervisor_pid"))
         pending = bool(matching and receipt["status"] == "starting" and receipt.get("runtime_pid")
             and receipt.get("process_live") is True and receipt.get("health") == "pending"
-            and retained_pending_admission(receipt) is not None)
+            and fresh_pending_admission(receipt) is not None)
         confirmed = (matching and receipt["status"] == "running" and receipt.get("runtime_pid")
             and receipt.get("bootstrap") and receipt.get("admission_health") is None)
         healthy = False
@@ -858,12 +859,23 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
             self.previous_attempt = self.receipt.get("startup_attempt_id")
             self.failed_start = None
             self.pending_update_remaining = None
+            self.pending_started_at = None
+            self.pending_suspended = 0.0
+            self.pending_limit = min(SERVICE_PENDING_MAX_WAIT, SERVICE_UPDATE_TIMEOUT)
 
         def resume_update_budget(self):
             if self.pending_update_remaining is not None:
+                observed_at = asyncio.get_running_loop().time()
+                elapsed = observed_at - self.pending_started_at
+                paused = min(elapsed, max(0.0, self.pending_limit - self.pending_suspended))
+                self.pending_suspended += paused
+                remaining = self.pending_update_remaining - (elapsed - paused)
                 if not update_deadline.expired():
-                    update_deadline.reschedule(asyncio.get_running_loop().time() + self.pending_update_remaining)
+                    update_deadline.reschedule(observed_at + max(0.0, remaining))
                 self.pending_update_remaining = None
+                self.pending_started_at = None
+                return paused
+            return 0.0
 
         async def before_source_change(self):
             from .deployment import await_validation
@@ -941,7 +953,7 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
         async def start_service(self, definition, *, on_ready=None):
             from .deployment_updates import checked_package
             from .deployment import verify_destination
-            from .admission_health import retained_pending_admission
+            from .admission_health import fresh_pending_admission
             receipt = read_receipt(self.directory)
             service = await require_stopped_service(self.directory, manager)
             require_original()
@@ -982,21 +994,23 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
                     and instance and instance != previous_instance and attempt and attempt != previous_attempt
                     and current.get("service_cleanup_confirmed") is False
                     and _service_health_current(current, observed)
-                    and retained_pending_admission(current) is not None)
+                    and fresh_pending_admission(current) is not None)
                 checked_at = asyncio.get_running_loop().time()
-                if pending and pending_since is None:
+                suspended = self.pending_suspended + (checked_at - pending_since if pending_since is not None else 0.0)
+                pause = pending and suspended < self.pending_limit
+                if pause and pending_since is None:
                     remaining = update_deadline.when() - checked_at
                     if remaining <= 0 or checked_at >= deadline:
                         raise TimeoutError("The update startup deadline expired before admission recovery was observed.")
-                    # This is still an unfinished startup, not success. Keep
-                    # observing owned service/source and honour Stop, but do
-                    # not turn a known admission wait into source rollback.
+                    # Fresh pending frames may suspend the normal budgets,
+                    # within one cumulative cap across this transaction.
+                    # Even a parked manager query remains bounded overall.
                     self.pending_update_remaining = remaining
-                    update_deadline.reschedule(None)
+                    self.pending_started_at = checked_at
+                    update_deadline.reschedule(checked_at + remaining + self.pending_limit - self.pending_suspended)
                     pending_since = checked_at
-                elif not pending and pending_since is not None:
-                    deadline += checked_at - pending_since
-                    self.resume_update_budget()
+                elif not pause and pending_since is not None:
+                    deadline += self.resume_update_budget()
                     pending_since = None
                 if (observed.get("status") == "running" and observed.get("health") == "ready"
                         and observed.get("process_live") is True
@@ -1023,7 +1037,7 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
                     return
                 if current.get("status") == "failed":
                     raise RuntimeError("The background application failed its native startup. Inspect the retained redacted diagnostics.")
-                if not pending and asyncio.get_running_loop().time() >= deadline:
+                if not pause and asyncio.get_running_loop().time() >= deadline:
                     raise TimeoutError("The owned background service did not supply fresh native startup and authenticated Console health in time.")
                 await asyncio.sleep(0.2)
 

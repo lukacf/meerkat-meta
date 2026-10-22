@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 from .deployment import (MAX_PACKAGE_BYTES, await_validation, journal, materialize, now, package_files, read_receipt,
                          parse_setting, update_receipt, verify_destination)
 from .projects import DraftConflict
-from .admission_health import NativeAdmissionPending, pending_admission
+from .admission_health import NativeAdmissionPending, PENDING_HEALTH_WINDOW, pending_admission
 from .templates.storage_setup import project_lock
 from .deployment_deadlines import APPLICATION_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOUT
 from .deployment_ports import require_available_console_port, LocalConsolePortUnavailable
@@ -1343,12 +1343,11 @@ class Supervisor:
                         admission_health={"attempt_id": attempt_id, **pending.admission},
                         console_url=None, runtime_pid=process.pid, process_live=True,
                         health="pending", health_checked_at=now())
-                    # The child has reported a recoverable native condition.
-                    # Keep its normal Stop/exit controls and await an explicit
-                    # later observation; a ready timeout must not turn it into
-                    # a failed installation. This performs no admission/retry.
+                    # Each actual child frame renews this bounded wait. A
+                    # silent child must fail instead of holding startup open.
+                    # This performs no admission or retry.
                     started = asyncio.create_task(reader.readline())
-                    startup_timeout = None
+                    startup_timeout = PENDING_HEALTH_WINDOW
                     continue
                 break
             journal(self.directory, "Native agents finished bootstrap. Checking the actual Console before publishing readiness.",

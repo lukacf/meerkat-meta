@@ -37,6 +37,27 @@ def test_an_admitting_row_prevents_ready_even_when_native_roster_is_ready():
     assert type(caught.value).__name__ == "NativeAdmissionPending"
 
 
+def test_lazy_owed_identity_stays_owed_and_pending_without_rewriting_native_health():
+    payload = pending_payload()
+    payload["bootstrap"]["identities"]["project:one"] = {"state": "dormant"}
+    payload["bootstrap"].update(ready=True, counts={"broken": 0})
+    before = deepcopy(payload)
+    with pytest.raises(Exception) as caught:
+        readiness(payload, {"agents": [{"identity": "lead:main"}]}, 42, 18088)
+    assert type(caught.value).__name__ == "NativeAdmissionPending"
+    assert caught.value.admission == {"admitting": [], "owed": ["project:one"]}
+    assert caught.value.bootstrap == before["bootstrap"] and payload == before
+
+
+@pytest.mark.parametrize("state", ["active", "warming"])
+def test_extra_owed_identity_must_be_dormant(state):
+    payload = pending_payload()
+    payload["bootstrap"]["identities"]["project:two"] = {"state": state}
+    payload["admission"]["owed"].append("project:two")
+    with pytest.raises(ValueError):
+        readiness(payload, {"agents": [{"identity": "lead:main"}]}, 42, 18088)
+
+
 @pytest.mark.parametrize("fault", ["ordinary_broken", "error_text_only", "wrong_code",
     "wrong_stage", "missing_owed", "unrelated_owed", "overlap", "seed", "duplicate",
     "counts_bool", "counts_mismatch", "wrong_pid", "wrong_console", "malformed_console",

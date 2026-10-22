@@ -9,7 +9,7 @@ import uuid
 
 import pytest
 
-from launchkit.deployment import DeploymentService, materialize, read_receipt, update_receipt
+from launchkit.deployment import DeploymentService, materialize, now, read_receipt, update_receipt
 from launchkit.deployment_service import (UserServiceManager, background_status, digest,
     prepare_service, service_plan, stop_background, unit_bytes, verify_service)
 from launchkit.deployment_worker import console_health_headers, run
@@ -63,7 +63,8 @@ async def owned(tmp_path, monkeypatch):
     await service.shutdown()
 
 
-async def test_background_observation_preserves_owned_pending_admission(owned):
+@pytest.mark.parametrize("stale", [False, True])
+async def test_background_observation_preserves_owned_pending_admission(owned, stale):
     from test_admission_health import pending_payload
     _, manager, directory, _ = owned
     payload = pending_payload()
@@ -71,10 +72,15 @@ async def test_background_observation_preserves_owned_pending_admission(owned):
     manager.observation = {"loaded": True, "pid": 4567, "state": "running"}
     update_receipt(directory, status="starting", service_supervisor_pid=4567,
         runtime_pid=6789, process_live=True, startup_attempt_id=attempt,
-        bootstrap=payload["bootstrap"], health="pending", health_checked_at="2026-10-22T17:00:00+00:00",
+        bootstrap=payload["bootstrap"], health="pending", health_checked_at="2000-01-01T00:00:00+00:00" if stale else now(),
         console_url=None, admission_health={"attempt_id": attempt, **payload["admission"]})
     before = read_receipt(directory)
     observed = await background_status(directory, manager)
+    if stale:
+        assert observed["health"] != "pending" and observed["process_live"] is False
+        assert observed["console_url"] is None
+        assert observed["bootstrap"] == before["bootstrap"]
+        return
     assert observed["status"] == "starting" and observed["health"] == "pending"
     assert observed["process_live"] is True and observed["console_url"] is None
     assert observed["health_checked_at"] == before["health_checked_at"], "Manager liveness cannot freshen native evidence"
