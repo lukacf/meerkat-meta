@@ -25,10 +25,10 @@ environment variable with your existing Forge launcher. Distribution installers
 may need to install the plugin into their packaged Python environment.
 
 The host selects one entry-point name from `meerkat_forge.organizations.v1`.
-Forge calls that installed function once at startup and validates its returned
-data. Missing, ambiguous or invalid explicit selections, including an empty
-value, stop startup. They do not fall back to unrelated stock examples. No plugin
-is loaded by default.
+Forge calls that installed function once at startup and validates its
+returned data. Missing, ambiguous or invalid explicit selections, including
+an empty value, stop startup. They do not fall back to unrelated stock
+examples. No plugin is loaded by default.
 
 The fields are documented by `launchkit.organization.OrganizationPlugin`:
 
