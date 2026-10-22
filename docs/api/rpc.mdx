@@ -123,6 +123,16 @@ that cleanup has settled does it emit the `failed` settlement (`code:
 -32098`, `data.reason: "shutdown_requested"`). It then answers the shutdown
 request.
 
+**Drain window.** `params.shutdown_in_flight_drain_ms`, an integer of
+milliseconds from 0 to 300000 (absent or 0 is no drain), lets in-flight
+member turns finish when the gateway stops through the shutdown handshake or
+SIGTERM. The gateway reads it before it answers, refuses any other value with
+`-32602`, and advertises the longer horizon in `stdio_shutdown_horizon_ms`
+(in `accepted` and in the init result): 442000 plus the window. The
+`meta/shutdown` answer then carries the drain's report as
+`result.in_flight_drain`. See
+[Letting in-flight turns finish on shutdown](/reference/configuration#letting-in-flight-turns-finish-on-shutdown).
+
 **Startup callbacks must not issue ordinary RPCs.** Ordinary request dispatch
 starts only after init settles, so the gateway answers an ordinary request
 that arrives earlier at once with `-32018` (`data: {kind: "init_in_progress",
