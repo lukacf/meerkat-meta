@@ -1,6 +1,7 @@
 import React, { useEffect, useId, useRef, useState } from "react";
 import { startingAudiences, startingKinds, startingContextDetails } from "./forge-starting-context.mjs";
 import "./forge-starting-conversation.css";
+import { ForgeOrganizationStart } from "./forge-organization-start.jsx";
 
 const audiences = [
   { id: "personal", label: "Just me", description: "Personal projects or everyday work", context: "For myself, " },
@@ -27,6 +28,7 @@ function appliedHandoff(hint, draft) {
 
 // Optional context only. The main composer is the editor, and sending stays explicit.
 export function ForgeStartingHelp(props) {
+  if (props.organization) return <ForgeOrganizationStart {...props} />;
   // Existing saved prose remains editable under its original ownership contract.
   return props.separateContext && (!props.appliedContext || props.appliedContext.version === 2)
     ? <ForgeStartingConversation {...props} /> : <LegacyStartingHelp {...props} />;

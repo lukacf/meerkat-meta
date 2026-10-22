@@ -29,6 +29,7 @@ from .architect import ArchitectService, ArchitectUnavailable
 from .projects import ProjectStore, DraftConflict, fingerprint
 from .guide import GuideService
 from .guide_store import GuideStore
+from .organization import load_organization_plugin
 from .guide_attachments import AttachmentReference, MAX_FILES, MAX_FILE_BYTES, MAX_TURN_BYTES
 from .guide_operations import GuideOperations
 from .guide_preview import staged_guide_preview
@@ -72,7 +73,7 @@ provider_settings = ProviderSettings(STUDIO_ROOT)
 architect = ArchitectService(STUDIO_ROOT)
 architect.provider_settings = provider_settings
 projects = ProjectStore(STUDIO_ROOT)
-guide = GuideService(GuideStore(STUDIO_ROOT), architect)
+guide = GuideService(GuideStore(STUDIO_ROOT), architect, organization=load_organization_plugin())
 toolkit_saved_requests = ToolkitSavedRequests(STUDIO_ROOT / 'toolkit-saved-requests')
 
 

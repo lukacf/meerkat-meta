@@ -36,6 +36,7 @@ import { nativeTeamPackagePlan, setupNeedsApplicationBuild, setupProgress, setup
 import { RehearsalPanel } from "./rehearsal-panel.jsx";
 import { ProviderSetup } from "./provider-setup.jsx";
 import { hasForgeOpeningContext, isForgeOpening, ForgeWelcomeIntro, ForgeWelcomeNext, ForgeWelcomeOrientation, ForgeIllustrationMotionProvider, useForgeProposalNotice } from "./first-experience.jsx";
+import { ForgeOrganizationStart } from "./forge-organization-start.jsx";
 import { ForgeStartingHelp, ForgeStartingContext, ForgeStartingExample } from "./forge-starting-help.jsx";
 import { startingContextDetails } from "./forge-starting-context.mjs";
 import { ToolkitSavedSetup } from "./toolkit-saved-setup.jsx";
@@ -86,8 +87,10 @@ export function GuideRecoveryNotice({ persistent }) {
   return persistent ? null : <p role="status">Browser recovery is unavailable. Your draft and choices remain in this open page. Saved guide responses are kept on the setup server.</p>;
 }
 
-export function SetupStartingPoints({ draft, disabled, onChoose, onReturnToTyping, showHelp = true }) {
+export function SetupStartingPoints({ draft, disabled, onChoose, onReturnToTyping, showHelp = true, organization }) {
   const [preview, setPreview] = useState(null);
+  if (organization) return <ForgeOrganizationStart organization={organization} draft={draft} disabled={disabled}
+    onChoose={onChoose} onReturnToTyping={onReturnToTyping} />;
   const examples = [
     ["Stay on top of my projects", "I want help keeping track of my personal projects. Turn scattered notes into a short weekly check-in showing what changed, what needs my attention, and the next useful step. Help me work out which information it needs.", "A weekly check-in with clear next steps."],
     ["Keep our household in sync", "I want help preparing a simple daily household brief with upcoming school dates, family plans, and tasks that need attention. Ask who it should help and where we already keep this information.", "Today's plans, dates and things to remember."],
@@ -2581,7 +2584,7 @@ export function GuidedSetup({
                   <div className="setup-bubble setup-question-bubble">
                     {welcome ? <ForgeWelcomeIntro /> : <SetupGuideQuestionHeading question={question} lifecycle={!!primaryProgress} waiting={busy} />}
                     <div className="setup-interactive-answer">
-                      {opening && !welcome && <SetupStartingPoints draft={draft} disabled={blocked}
+                      {opening && !welcome && <SetupStartingPoints organization={state.organization} draft={draft} disabled={blocked}
                         onReturnToTyping={() => inputRef.current?.focus()} onChoose={(text) => {
                         setDraft(text); setComposeMode("answer"); inputRef.current?.focus();
                       }} />}
@@ -2801,7 +2804,7 @@ export function GuidedSetup({
                 ? "Your answer to the setup guide"
                 : "Message your setup guide"}
             </label>}
-            {welcome && <ForgeStartingHelp key={lifecycleToken} inlineStart separateContext draft={draft} disabled={blocked} composerId="setup-message"
+            {welcome && <ForgeStartingHelp organization={state.organization} key={lifecycleToken} inlineStart separateContext draft={draft} disabled={blocked} composerId="setup-message"
               appliedContext={inputStartingHelp(input)}
               editRequest={startingHelpEdit?.key === input.key ? startingHelpEdit : null}
               onChooseContext={starting_help => {
@@ -2836,6 +2839,8 @@ export function GuidedSetup({
               }}
               onReturnToTyping={() => {
                 const guideId = state.id, key = input.key, editor = inputRef.current;
+                // Organization examples never hide or replace the composer.
+                if (state.organization) { editor?.focus(); return; }
                 const focusOwner = editor?.ownerDocument.activeElement;
                 setStartingHelpEdit(null);
                 requestAnimationFrame(() => {
@@ -2956,13 +2961,13 @@ export function GuidedSetup({
                   aria-label={`Continue ${resumeSetup.name || "Untitled setup"}`}
                   onClick={() => { if (!blocked && !loadGate.current.pending()) switchSetup(resumeSetup.id); }}>Open conversation <Icon name="arrow" size={14} /></button>
               </section>}
-              <details className="forge-example-disclosure">
+              {!state.organization && <details className="forge-example-disclosure">
                 <summary>See example ideas</summary>
-                <SetupStartingPoints draft={draft} disabled={blocked} showHelp={false}
+                <SetupStartingPoints organization={state.organization} draft={draft} disabled={blocked} showHelp={false}
                   onReturnToTyping={() => inputRef.current?.focus()} onChoose={text => {
                   setDraft(text); setComposeMode("answer"); inputRef.current?.focus();
                 }} />
-              </details>
+              </details>}
               <button type="button" className="forge-welcome-mobile-editor" disabled={blocked || !onAdvanced}
                 onClick={openDetails}>Advanced editor <Icon name="arrow" size={14} /></button>
             </>}

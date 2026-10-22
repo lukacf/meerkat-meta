@@ -64,10 +64,11 @@ const starter = { schema_version: 2, project: { name: 'Internal scaffold', slug:
   topology: { mode: 'manual', entrypoint: 'lead:main', edges: [] }, connections: [], flows: [],
   knowledge: { mode: 'none' }, advanced: { port: 4110 } };
 
-async function mounted(scenario, verify, timers = {}, { narrow = false, available = false, allowSend = false, startingInput = null } = {}) {
+async function mounted(scenario, verify, timers = {}, { narrow = false, available = false, allowSend = false, startingInput = null, organization = null } = {}) {
   const a = guide('resume-opening-a'), b = { ...guide('resume-existing-b'),
     messages: [{ role: 'user', text: 'Keep the real saved observing setup.' }] };
   a.capabilities.available = available;
+  if (organization) a.organization = structuredClone(organization);
   const list = deferred(), selection = deferred(), calls = [];
   const values = new Map([[GUIDE_KEY, a.id]]);
   if (startingInput) values.set(inputKey(a), JSON.stringify({ ...startingInput, key: inputKey(a) }));
@@ -324,4 +325,59 @@ test('welcome resumes only an explicitly selected checked saved setup and preser
       assert.ok(calls.every(call => call.method === 'GET'));
     });
   }
+});
+
+
+const workplace = { schema_version: 1, id: 'workplace', version: '1.0.0', label: 'Example workplace',
+  starting_examples: [{ id: 'triage', title: 'Find work that needs attention', outcome: 'A clear weekly view.',
+    initial_brief: 'Help our team find the commitments that need attention. Ask who it is for.' }] };
+
+for (const narrow of [false, true]) test(`organization opening replaces stock examples and sends only after explicit Send (${narrow ? 'phone' : 'desktop'})`, async () => {
+  await mounted('empty', async ({ document, calls, list, finish }) => {
+    await finish(list, response({ setups: [] }));
+    assert.ok(document.querySelector('.setup-welcome'));
+    assert.equal(document.querySelectorAll('.forge-organization-start').length, 1);
+    assert.doesNotMatch(document.body.textContent, /household|school dates|Run a club/);
+    assert.equal(document.querySelector('.forge-example-disclosure'), null);
+    const pick = document.querySelector('[aria-label="Use Find work that needs attention"]');
+    await click(pick);
+    const editor = document.querySelector('#setup-message');
+    assert.equal(editor.value, workplace.starting_examples[0].initial_brief);
+    assert.ok(document.activeElement === editor, `Expected composer focus; got ${document.activeElement?.tagName} ${document.activeElement?.id}`);
+    assert.equal(calls.filter(call => call.method !== 'GET').length, 0);
+    await click(document.querySelector('#setup-send'));
+    const writes = calls.filter(call => call.method !== 'GET');
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].body.text, workplace.starting_examples[0].initial_brief);
+    assert.equal(editor.value, '', 'Accepted Send clears the normal composer.');
+  }, {}, { narrow, available: true, allowSend: true, organization: workplace });
+});
+
+test('organization examples preserve existing writing and custom idea focus', async () => {
+  const own = 'Keep my own unusual idea exactly.  ';
+  await mounted('empty', async ({ document, calls, list, finish }) => {
+    await finish(list, response({ setups: [] }));
+    const editor = document.querySelector('#setup-message');
+    await click(document.querySelector('[aria-label="Preview Find work that needs attention"]'));
+    assert.equal(editor.value, own);
+    await click(button(document, 'Keep my idea'));
+    assert.ok(document.activeElement === editor, `Expected composer focus; got ${document.activeElement?.tagName} ${document.activeElement?.id}`);
+    assert.equal(editor.value, own);
+    await click(document.querySelector('[aria-label="Preview Find work that needs attention"]'));
+    await click(button(document, 'Add inspiration to my idea'));
+    assert.equal(editor.value, own + '\n\n' + workplace.starting_examples[0].initial_brief);
+    await click(document.querySelector('.forge-organization-start__header > button'));
+    assert.ok(document.activeElement === editor, `Expected composer focus; got ${document.activeElement?.tagName} ${document.activeElement?.id}`);
+    assert.equal(calls.filter(call => call.method !== 'GET').length, 0);
+  }, {}, { organization: workplace, startingInput: { draft: own, mode: 'answer' } });
+});
+
+test('organization with no examples keeps custom input and does not restore stock examples', async () => {
+  await mounted('empty', async ({ document, list, finish }) => {
+    await finish(list, response({ setups: [] }));
+    assert.equal(document.querySelectorAll('.forge-organization-start .setup-starting-points > button').length, 0);
+    assert.doesNotMatch(document.body.textContent, /household|school dates|Run a club/);
+    await click(document.querySelector('.forge-organization-start__header > button'));
+    assert.ok(document.activeElement === document.querySelector('#setup-message'));
+  }, {}, { organization: { ...workplace, starting_examples: [] } });
 });

@@ -340,6 +340,17 @@ retains its explicit metadata support.
 
 ## Follow the guide
 
+An organization can supply its own starting examples and guide context through
+an installed Python plugin selected by the Forge host. Its examples replace the
+stock opening suggestions; people can always describe their own idea. Choosing
+an example fills an editable draft and never installs a connector or grants
+access. Saved setups retain the plugin context they started with.
+
+For operators, see the [installable workplace example](examples/workplace-starters/README.md)
+and its version 1 contribution contract. Plugin installation and selection are
+host configuration, not a tenant authorization boundary. This context-only
+extension does not implement hosted account sign-in or cloud deployment.
+
 The wizard first explores the job, audience and scale, how people will interact,
 operational reliability, and deployment. Compatible channels and interfaces can
 be selected together. It narrows down tools and connectors once that context is
