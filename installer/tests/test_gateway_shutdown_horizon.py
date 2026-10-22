@@ -212,8 +212,8 @@ async def test_an_earlier_unit_gets_a_stop_budget_drop_in_for_the_reported_horiz
     assert unit.read_bytes() == content and receipt["service"] == earlier
     assert f.service.verify_service(directory, receipt) == earlier
     if f.platform == "darwin":
-        # launchd reads ExitTimeOut only when it loads the job: an earlier plist
-        # keeps its own until it is reinstalled.
+        # launchd reads ExitTimeOut only when it loads the job and has no
+        # drop-in: an earlier plist keeps the stop timeout it was installed with.
         assert reload is None and not drop_in.parent.exists() and "service_stop_budget" not in receipt
         return
     budget = service_budget(reported)

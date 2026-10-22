@@ -1198,15 +1198,21 @@ native history.
 A stop waits for the application's native gateway shutdown. That is the horizon
 its runtime reports at readiness (this repository's gateway horizon when it reports
 none), plus the SDK's TERM and KILL graces and Forge's own margins. A new owned
-service gets that stop timeout from the start. A Linux user service installed
-before Forge 0.9.5 keeps its frozen unit: when its application reports a longer
-horizon, the service's own run adds an owned systemd drop-in,
-`forge-stop-budget.conf`, with the larger stop timeout and reloads the user manager.
-A macOS LaunchAgent installed before Forge 0.9.5 keeps its recorded stop timeout
-until it is reinstalled, because launchd reads it only when it loads the job. On
-Linux, logout and shutdown are bounded by the systemd user manager's own stop
-timeout (120 seconds by default), whatever the unit sets; the unit's stop timeout
-governs an explicit Stop or Restart.
+service gets that stop timeout from the start, and an interactive run and Forge's
+own waits and service commands use it at once. A background service runs the
+supervisor that was saved when it was installed, so one installed before Forge
+0.9.5 keeps its earlier stop budgets until **Apply support update** under
+**Installation support** replaces that supervisor. After that, a Linux user
+service keeps its frozen unit: when its application reports a longer horizon, the
+service's own run adds an owned systemd drop-in, `forge-stop-budget.conf`, with
+the larger stop timeout and reloads the user manager. A destination's supervisor
+comes with its package and does the same for its own unit from the next package
+the destination runs. A macOS LaunchAgent keeps the stop timeout it was installed
+with (397 seconds from Forge before 0.9.5): launchd has no drop-in, so a longer
+horizon that its application reports later is not applied, and native cleanup can
+be cut at that timeout. On Linux, logout and shutdown are bounded by the systemd
+user manager's own stop timeout (120 seconds by default), whatever the unit sets;
+the unit's stop timeout governs an explicit Stop or Restart.
 
 For a supported stopped local installation, **Stage accepted update** compares
 the exact independently accepted package with the installed source before changing
