@@ -4,10 +4,9 @@ import test from "node:test";
 import { domNullAssertions, nullAssertions } from "./test-support/dom-null-asserts.mjs";
 
 const here = new URL(".", import.meta.url);
-// Three open branches edit the rows of this file: codex/forge-ordinary-runtime-store,
-// codex/forge-setup-read-deadline and codex/forge-venv-site-scheme. It keeps its
-// node-vs-null rows until the last of them merges. One commit then rewrites them,
-// with the row those branches add, and removes this entry.
+// Open branches edit these rows; remove this exemption when they land. The
+// commit that rewrites the rows removes the entry too: the check below fails
+// once an exempted file has no rows left.
 const PENDING = new Set(["deployment-port-recovery.test.mjs"]);
 
 test("web tests compare a DOM node with null as a boolean, never the node itself", () => {
