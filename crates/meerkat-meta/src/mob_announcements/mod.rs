@@ -73,12 +73,15 @@ pub use owner::{
 };
 pub use remote::{KeyedInjectServer, RemoteMemberDelivery};
 pub use sources::{
-    AnnouncementSource, AudienceGrant, BaselineCapability, CollectionPhase, ConnectionKind,
-    DeletionCapability, ObservationCapability, Observed, Principal, PutSource, SourceChange,
-    SourceConfig, SourceConnection, SourceCursor, SourceDelivery, SourceHealth, SourceHealthPolicy,
-    SourceHealthStatus, SourceIdentity, SourcePriority, SourceQuery, SourceRoute, SourceRunner,
-    SourceScope, SourceStart, SourceState, SourceStreamCounts, SourceTotals, TopicOwnership,
-    UnhandledPolicy,
+    AdvanceSource, AnnouncementSource, AudienceGrant, BaselineCapability, CollectionPhase,
+    ConnectionKind, Coverage, CoverageGap, DeletionCapability, FailureClass, ItemChange,
+    ItemOutcome, ItemOutcomeKind, ObservationCapability, Observed, OnboardingMode, Principal,
+    PutSource, Rebaseline, RebaselineReason, RecordSourceFailure, SourceAdvance, SourceChange,
+    SourceConfig, SourceConflictRecord, SourceConnection, SourceCursor, SourceDelivery,
+    SourceFailure, SourceFailureRecord, SourceHealth, SourceHealthPolicy, SourceHealthStatus,
+    SourceIdentity, SourceItem, SourcePage, SourcePriority, SourceQuery, SourceRoute, SourceRunner,
+    SourceScope, SourceStart, SourceState, SourceStream, SourceStreamCounts, SourceTotals,
+    StreamOnboarding, StreamPhase, TopicOwnership, UnhandledPolicy,
 };
 pub use sqlite::{ConnectionGuard, SCHEMA, SCHEMA_V2, SqliteAnnouncementStore};
 pub use store::AnnouncementStore;

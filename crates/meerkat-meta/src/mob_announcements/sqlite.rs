@@ -16,8 +16,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::sources::{
-    AnnouncementSource, MAX_SOURCES_PER_GATEWAY, MAX_SOURCES_PER_MOB, PutSource, SourceChange,
-    SourceQuery, SourceState, TopicOwnership,
+    AdvanceSource, AnnouncementSource, CollectionPhase, Coverage, CoverageGap, DeletionCapability,
+    ItemChange, ItemOutcome, ItemOutcomeKind, MAX_SOURCES_PER_GATEWAY, MAX_SOURCES_PER_MOB,
+    MAX_STREAMS_PER_SOURCE, OnboardingMode, Principal, PutSource, RecordSourceFailure,
+    SourceAdvance, SourceChange, SourceConflictRecord, SourceFailureRecord, SourceQuery,
+    SourceState, SourceStream, StreamPhase, TopicOwnership,
 };
 use super::store::AnnouncementStore;
 use super::types::{
@@ -25,9 +28,9 @@ use super::types::{
     BatchEvent, BatchGap, BatchId, BatchItem, BatchPosition, BatchQuery, BatchState, BatchStateTag,
     ExpiryReport, GapReason, LateOutcome, MAX_BACKFILL, MAX_ITEM_WIRE_BYTES, MAX_PAGE, Member,
     MemberBacklog, MemberRoute, MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport,
-    PutSubscription, Result, SealingPolicy, SourceId, SourceKey, StartFrontier, Subscription,
-    SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
-    SubscriptionState, Topic, content_digest, header_wire_bound, merge_gaps, render_batch,
+    PutSubscription, Result, SOURCE_KEY_PREFIX, SealingPolicy, SourceId, SourceKey, StartFrontier,
+    Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
+    SubscriptionState, Topic, content_digest, header_wire_bound, merge_gaps, quoted, render_batch,
     render_gap, render_item, request_fingerprint, wire_budget, wire_len,
 };
 
@@ -105,8 +108,9 @@ CREATE TABLE IF NOT EXISTS member_routes (
 CREATE INDEX IF NOT EXISTS member_routes_by_route ON member_routes (route, member);";
 
 /// The tables version 2 adds: announcement sources, one row per
-/// `(mob_id, source_id)` holding its current generation, and the topics the
-/// sources own. A provider applies this after [`SCHEMA`].
+/// `(mob_id, source_id)` holding its current generation, the topics the
+/// sources own, and the streams each generation onboarded. A provider
+/// applies this after [`SCHEMA`].
 pub const SCHEMA_V2: &str = "
 CREATE TABLE IF NOT EXISTS announcement_sources (
  mob_id TEXT NOT NULL, source_id TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -118,7 +122,12 @@ CREATE TABLE IF NOT EXISTS announcement_source_topics (
  mob_id TEXT NOT NULL, topic TEXT NOT NULL, source_id TEXT NOT NULL, kind TEXT NOT NULL,
  PRIMARY KEY (mob_id, topic));
 CREATE INDEX IF NOT EXISTS announcement_source_topics_by_source
- ON announcement_source_topics (mob_id, source_id);";
+ ON announcement_source_topics (mob_id, source_id);
+CREATE TABLE IF NOT EXISTS announcement_source_streams (
+ mob_id TEXT NOT NULL, source_id TEXT NOT NULL, stream TEXT NOT NULL,
+ generation INTEGER NOT NULL, phase TEXT NOT NULL, mode TEXT NOT NULL,
+ max_items INTEGER, backfilled INTEGER NOT NULL, since_ms INTEGER NOT NULL,
+ PRIMARY KEY (mob_id, source_id, stream));";
 
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
@@ -739,9 +748,11 @@ fn announce_in(db: &Connection, request: &AnnounceRequest, now_ms: u64) -> Resul
             captured_for: captured,
         });
     }
-    // A topic a source owns is reached only by that source's items and, on a
-    // forward topic, by its triage route's own member. A replay above meets
-    // its original; this guards only what would be announced now.
+    // The key prefix of source items and a topic a source owns are reached
+    // only by that source's items and, on a forward topic, by its triage
+    // route's own member. A replay above meets its original; this guards
+    // only what would be announced now.
+    request.ensure_key_open()?;
     ensure_topics_open(db, request)?;
     let head: Option<i64> = db
         .query_row(
@@ -2409,6 +2420,17 @@ fn put_source_in(
     };
     ensure_source_admitted(db, &source)?;
     claim_topics(db, &source)?;
+    // A new generation onboards its streams again.
+    db.execute(
+        "DELETE FROM announcement_source_streams
+         WHERE mob_id = ?1 AND source_id = ?2 AND generation != ?3",
+        params![
+            source.mob_id.as_str(),
+            source.source_id.as_str(),
+            int(source.generation)?,
+        ],
+    )
+    .map_err(storage)?;
     write_source(db, &source)?;
     record_operation(db, operation, &fingerprint, now_ms, &encode(&source)?)?;
     Ok(source)
@@ -2510,6 +2532,602 @@ fn sources_in(db: &Connection, query: &SourceQuery) -> Result<Vec<AnnouncementSo
         .map_err(storage)?;
     rows.map(|record| decode(&record.map_err(storage)?))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Advancing a source
+// ---------------------------------------------------------------------------
+
+/// One stream of a source's current generation.
+struct StreamRow {
+    phase: CollectionPhase,
+    mode: OnboardingMode,
+    max_items: Option<u32>,
+    backfilled: u32,
+    since_ms: u64,
+}
+
+fn small(value: i64) -> Result<u32> {
+    u32::try_from(value).map_err(|_| storage(format!("{value} is out of range")))
+}
+
+fn load_stream(
+    db: &Connection,
+    source: &AnnouncementSource,
+    stream: &str,
+) -> Result<Option<StreamRow>> {
+    let row: Option<(String, String, Option<i64>, i64, i64)> = db
+        .query_row(
+            "SELECT phase, mode, max_items, backfilled, since_ms FROM announcement_source_streams
+             WHERE mob_id = ?1 AND source_id = ?2 AND stream = ?3 AND generation = ?4",
+            params![
+                source.mob_id.as_str(),
+                source.source_id.as_str(),
+                stream,
+                int(source.generation)?,
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage)?;
+    row.map(|(phase, mode, max_items, backfilled, since_ms)| {
+        Ok(StreamRow {
+            phase: CollectionPhase::parse(&phase)?,
+            mode: OnboardingMode::parse(&mode)?,
+            max_items: max_items.map(small).transpose()?,
+            backfilled: small(backfilled)?,
+            since_ms: uint(since_ms)?,
+        })
+    })
+    .transpose()
+}
+
+fn write_stream(
+    db: &Connection,
+    source: &AnnouncementSource,
+    stream: &str,
+    row: &StreamRow,
+) -> Result<()> {
+    db.execute(
+        "INSERT INTO announcement_source_streams
+         (mob_id, source_id, stream, generation, phase, mode, max_items, backfilled, since_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(mob_id, source_id, stream) DO UPDATE SET generation = excluded.generation,
+           phase = excluded.phase, mode = excluded.mode, max_items = excluded.max_items,
+           backfilled = excluded.backfilled, since_ms = excluded.since_ms",
+        params![
+            source.mob_id.as_str(),
+            source.source_id.as_str(),
+            stream,
+            int(source.generation)?,
+            row.phase.as_str(),
+            row.mode.as_str(),
+            row.max_items.map(i64::from),
+            i64::from(row.backfilled),
+            int(row.since_ms)?,
+        ],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// How many of the generation's streams are live, and how many onboard.
+fn count_streams(db: &Connection, source: &AnnouncementSource) -> Result<(u32, u32)> {
+    let (live, onboarding): (i64, i64) = db
+        .query_row(
+            "SELECT COUNT(*) FILTER (WHERE phase = 'live'), COUNT(*) FILTER (WHERE phase != 'live')
+             FROM announcement_source_streams
+             WHERE mob_id = ?1 AND source_id = ?2 AND generation = ?3",
+            params![
+                source.mob_id.as_str(),
+                source.source_id.as_str(),
+                int(source.generation)?,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(storage)?;
+    Ok((small(live)?, small(onboarding)?))
+}
+
+fn source_streams_in(
+    db: &Connection,
+    mob_id: &MobId,
+    source_id: &SourceId,
+) -> Result<Vec<SourceStream>> {
+    let Some(source) = load_source(db, mob_id, source_id)? else {
+        return Ok(Vec::new());
+    };
+    let mut statement = db
+        .prepare(
+            "SELECT stream, phase, mode, max_items, backfilled, since_ms
+             FROM announcement_source_streams
+             WHERE mob_id = ?1 AND source_id = ?2 AND generation = ?3
+             ORDER BY stream",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(
+            params![
+                source.mob_id.as_str(),
+                source.source_id.as_str(),
+                int(source.generation)?,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .map_err(storage)?;
+    rows.map(|row| {
+        let (stream, phase, mode, max_items, backfilled, since_ms) = row.map_err(storage)?;
+        Ok(SourceStream {
+            stream,
+            phase: CollectionPhase::parse(&phase)?,
+            mode: OnboardingMode::parse(&mode)?,
+            max_items: max_items.map(small).transpose()?,
+            backfilled: small(backfilled)?,
+            since_ms: uint(since_ms)?,
+        })
+    })
+    .collect()
+}
+
+/// Refuse a collector's step that is not the source's current one: a
+/// paused or ended source, another revision, another principal, or another
+/// cursor version, in that order.
+fn ensure_current_step(
+    source: &AnnouncementSource,
+    expected_revision: u64,
+    principal: &Principal,
+    expected_version: u64,
+) -> Result<()> {
+    match source.state {
+        SourceState::Paused => return Err(AnnouncementStoreError::SourcePaused),
+        SourceState::Ended => return Err(AnnouncementStoreError::SourceEnded),
+        _ => {}
+    }
+    if source.revision != expected_revision {
+        return Err(source_stale(source));
+    }
+    if source.identity.principal.canonical()? != principal.canonical()? {
+        return Err(AnnouncementStoreError::PrincipalChanged {
+            pinned_digest: source.identity.principal.digest()?,
+            offered_digest: principal.digest()?,
+        });
+    }
+    if source.cursor.version != expected_version {
+        return Err(AnnouncementStoreError::SourceVersionConflict {
+            revision: source.revision,
+            state: source.state,
+            cursor: source.cursor.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// A time a gap notice names, in UTC to the second.
+fn utc(ms: u64) -> String {
+    i64::try_from(ms)
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map_or_else(
+            || format!("{ms} ms"),
+            |time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+}
+
+/// Announce the one notice a coverage gap or a rebaseline owes the
+/// source's subscribers: on its topics, under its own key, in typed words
+/// that name no adapter text but the reason's class. Returns whether it
+/// captured anything.
+fn announce_gap_notice(
+    db: &Connection,
+    source: &AnnouncementSource,
+    version: u64,
+    what: &str,
+    reason: &str,
+    until_ms: u64,
+    now_ms: u64,
+) -> Result<bool> {
+    let since_ms = source
+        .health
+        .last_success_at_ms
+        .unwrap_or(source.created_at_ms);
+    let notice = AnnounceRequest {
+        mob_id: source.mob_id.clone(),
+        announced_by: Announcer::Source {
+            source_id: source.source_id.clone(),
+        },
+        source_key: SourceKey::new(format!(
+            "{SOURCE_KEY_PREFIX}{}:gap:{}:{version}",
+            source.source_id, source.generation
+        ))?,
+        topics: source.topics.clone(),
+        body: format!(
+            "Source {} {what} ({reason}): changes between {} and {} may be missing.",
+            quoted(source.source_id.as_str()),
+            utc(since_ms),
+            utc(until_ms)
+        ),
+        correlation_id: None,
+        causes: Vec::new(),
+    };
+    Ok(!announce_in(db, &notice, now_ms)?.captured_for.is_empty())
+}
+
+fn advance_source_in(
+    db: &Connection,
+    operation: &OperationId,
+    request: &AdvanceSource,
+    now_ms: u64,
+) -> Result<SourceAdvance> {
+    request.validate()?;
+    let fingerprint = request_fingerprint("advance_source", request)?;
+    if let Some(result) = operation_result(db, operation, &fingerprint)? {
+        let mut answer: SourceAdvance = decode(&result)?;
+        answer.replayed = true;
+        return Ok(answer);
+    }
+    let mut source = load_source(db, &request.mob_id, &request.source_id)?
+        .ok_or(AnnouncementStoreError::UnknownSource)?;
+    ensure_current_step(
+        &source,
+        request.expected_revision,
+        &request.principal,
+        request.expected_version,
+    )?;
+
+    // What the declaration allows.
+    for item in &request.items {
+        if let Some(topic) = item
+            .topics
+            .iter()
+            .find(|topic| !source.topics.contains(*topic))
+        {
+            return Err(AnnouncementStoreError::Invalid(format!(
+                "topic {topic} is not one of the source's own topics"
+            )));
+        }
+    }
+    if source.observation.deletions == DeletionCapability::Unobservable
+        && request
+            .items
+            .iter()
+            .any(|item| item.change == ItemChange::Delete)
+    {
+        return Err(AnnouncementStoreError::DeletionsUnobservable);
+    }
+
+    // Onboarding: the source's own phase for this step, then its streams.
+    let phase = if request.rebaseline.is_some() {
+        CollectionPhase::Baselining
+    } else {
+        source.collection
+    };
+    if phase == CollectionPhase::Baselining && !request.items.is_empty() {
+        return Err(AnnouncementStoreError::BaselineRequired);
+    }
+    let mut streams: BTreeMap<String, StreamRow> = BTreeMap::new();
+    let mut new_streams = 0usize;
+    for entry in &request.streams {
+        let row = match load_stream(db, &source, &entry.stream)? {
+            Some(row) if row.phase == CollectionPhase::Live => {
+                return Err(AnnouncementStoreError::Invalid(
+                    "an onboarded stream is live already".to_string(),
+                ));
+            }
+            Some(row) if row.mode != entry.mode || row.max_items != entry.max_items => {
+                return Err(AnnouncementStoreError::Invalid(
+                    "a stream onboards in one mode, with one bound".to_string(),
+                ));
+            }
+            Some(row) => row,
+            None => {
+                new_streams += 1;
+                StreamRow {
+                    phase: match entry.mode {
+                        OnboardingMode::Backfill => CollectionPhase::Backfilling,
+                        _ => CollectionPhase::Baselining,
+                    },
+                    mode: entry.mode,
+                    max_items: entry.max_items,
+                    backfilled: 0,
+                    since_ms: now_ms,
+                }
+            }
+        };
+        streams.insert(entry.stream.clone(), row);
+    }
+    if new_streams > 0 {
+        let (live, onboarding) = count_streams(db, &source)?;
+        if live as usize + onboarding as usize + new_streams > MAX_STREAMS_PER_SOURCE {
+            return Err(AnnouncementStoreError::TooLarge(format!(
+                "a source onboards at most {MAX_STREAMS_PER_SOURCE} streams"
+            )));
+        }
+    }
+    let mut per_stream: BTreeMap<String, u32> = BTreeMap::new();
+    for item in &request.items {
+        *per_stream.entry(item.stream.clone()).or_default() += 1;
+    }
+    let mut unbaselined = Vec::new();
+    for stream in per_stream.keys().filter(|stream| !stream.is_empty()) {
+        if !streams.contains_key(stream)
+            && let Some(row) = load_stream(db, &source, stream)?
+        {
+            streams.insert(stream.clone(), row);
+        }
+        if streams
+            .get(stream)
+            .is_none_or(|row| row.phase == CollectionPhase::Baselining)
+        {
+            unbaselined.push(stream.clone());
+        }
+    }
+    if !unbaselined.is_empty() {
+        return Err(AnnouncementStoreError::StreamNotBaselined {
+            streams: unbaselined,
+        });
+    }
+    let default_items = per_stream.get("").copied().unwrap_or(0);
+    if phase == CollectionPhase::Backfilling && default_items > 0 {
+        let remaining = source
+            .backfill_bound()
+            .unwrap_or(0)
+            .saturating_sub(source.backfilled);
+        if default_items > remaining {
+            return Err(AnnouncementStoreError::BackfillBoundExceeded {
+                remaining,
+                stream: None,
+            });
+        }
+    }
+    for (stream, count) in per_stream.iter().filter(|(stream, _)| !stream.is_empty()) {
+        if let Some(row) = streams.get(stream)
+            && row.phase == CollectionPhase::Backfilling
+        {
+            let remaining = row.max_items.unwrap_or(0).saturating_sub(row.backfilled);
+            if *count > remaining {
+                return Err(AnnouncementStoreError::BackfillBoundExceeded {
+                    remaining,
+                    stream: Some(stream.clone()),
+                });
+            }
+        }
+    }
+    let settles = request.settles();
+    let source_onboarded = settles && phase != CollectionPhase::Live;
+    if (source_onboarded || request.streams.iter().any(|entry| entry.is_final))
+        && request.coverage.is_none()
+    {
+        return Err(AnnouncementStoreError::Invalid(
+            "the final page of a baseline, a backfill or a stream onboarding says what it \
+             covered"
+                .to_string(),
+        ));
+    }
+
+    // The items, in order: announced, replayed or a recorded conflict.
+    let announcer = Announcer::Source {
+        source_id: source.source_id.clone(),
+    };
+    let mut outcomes = Vec::with_capacity(request.items.len());
+    let mut captured = false;
+    let (mut announced, mut replayed, mut conflicts) = (0u64, 0u64, 0u64);
+    for item in &request.items {
+        let key = item.key(&source.source_id, &source.identity)?;
+        let announcement = AnnounceRequest {
+            mob_id: source.mob_id.clone(),
+            announced_by: announcer.clone(),
+            source_key: key.clone(),
+            topics: item.topics.clone(),
+            body: item.body.clone(),
+            correlation_id: item.correlation_id.clone(),
+            causes: Vec::new(),
+        };
+        let mut outcome = ItemOutcome {
+            item_id: item.item_id.clone(),
+            version: item.version.clone(),
+            source_key: key.clone(),
+            outcome: ItemOutcomeKind::Announced,
+            sequence: None,
+            captured: None,
+            existing_digest: None,
+            offered_digest: None,
+        };
+        match announce_in(db, &announcement, now_ms) {
+            Ok(committed) if committed.replayed => {
+                replayed += 1;
+                outcome.outcome = ItemOutcomeKind::Replayed;
+                outcome.sequence = Some(committed.announcement.sequence);
+            }
+            Ok(committed) => {
+                announced += 1;
+                captured |= !committed.captured_for.is_empty();
+                outcome.sequence = Some(committed.announcement.sequence);
+                outcome.captured =
+                    Some(u32::try_from(committed.captured_for.len()).unwrap_or(u32::MAX));
+            }
+            Err(AnnouncementStoreError::AnnouncementConflict { existing }) => {
+                conflicts += 1;
+                let offered = announcement.digest();
+                source.health.last_conflict = Some(SourceConflictRecord {
+                    source_key: key,
+                    existing_sequence: existing.sequence,
+                    existing_digest: existing.digest.clone(),
+                    offered_digest: offered.clone(),
+                    at_ms: now_ms,
+                });
+                outcome.outcome = ItemOutcomeKind::Conflict;
+                outcome.sequence = Some(existing.sequence);
+                outcome.existing_digest = Some(existing.digest);
+                outcome.offered_digest = Some(offered);
+            }
+            Err(error) => return Err(error),
+        }
+        outcomes.push(outcome);
+    }
+
+    // One gap notice for a rebaseline or a final page that cannot prove
+    // complete coverage.
+    let version = request.expected_version + 1;
+    let gap = match (&request.rebaseline, &request.coverage) {
+        (Some(rebaseline), _) => Some((
+            "is taking a fresh baseline",
+            rebaseline.reason.as_str().to_string(),
+        )),
+        (None, Some(Coverage::Gap(CoverageGap { reason }))) => {
+            Some(("could not prove complete coverage", reason.clone()))
+        }
+        _ => None,
+    };
+    if let Some((what, reason)) = gap {
+        let until_ms = request.collected_at_ms.unwrap_or(now_ms);
+        captured |= announce_gap_notice(db, &source, version, what, &reason, until_ms, now_ms)?;
+        source.health.totals.gaps += 1;
+    }
+
+    // The cursor, the phases and the health.
+    source.cursor.version = version;
+    source.cursor.token.clone_from(&request.next_cursor);
+    source.cursor.advanced_at_ms = Some(now_ms);
+    if request.rebaseline.is_some() {
+        source.collection = CollectionPhase::Baselining;
+    }
+    if phase == CollectionPhase::Backfilling {
+        source.backfilled = source.backfilled.saturating_add(default_items);
+    }
+    if source_onboarded {
+        source.collection = CollectionPhase::Live;
+    }
+    for (stream, count) in &per_stream {
+        if let Some(row) = streams.get_mut(stream)
+            && row.phase == CollectionPhase::Backfilling
+        {
+            row.backfilled = row.backfilled.saturating_add(*count);
+        }
+    }
+    let mut phases = Vec::with_capacity(request.streams.len());
+    for entry in &request.streams {
+        if let Some(row) = streams.get_mut(&entry.stream) {
+            if entry.is_final && row.phase != CollectionPhase::Live {
+                row.phase = CollectionPhase::Live;
+                row.since_ms = now_ms;
+            }
+            phases.push(StreamPhase {
+                stream: entry.stream.clone(),
+                phase: row.phase,
+            });
+        }
+    }
+    for (stream, row) in &streams {
+        write_stream(db, &source, stream, row)?;
+    }
+    let (live, onboarding) = count_streams(db, &source)?;
+    source.streams.live = live;
+    source.streams.onboarding = onboarding;
+    let health = &mut source.health;
+    health.consecutive_failures = 0;
+    if settles {
+        health.last_success_at_ms = Some(now_ms);
+    }
+    health.totals.announced += announced;
+    health.totals.replayed += replayed;
+    health.totals.conflicts += conflicts;
+    if announced > 0 {
+        health.last_new_item_at_ms = Some(now_ms);
+    }
+    health.observe(request.observed, now_ms);
+    source.updated_at_ms = now_ms;
+    source.refresh_status();
+    write_source(db, &source)?;
+    let answer = SourceAdvance {
+        source,
+        replayed: false,
+        items: outcomes,
+        streams: phases,
+        captured,
+    };
+    record_operation(db, operation, &fingerprint, now_ms, &encode(&answer)?)?;
+    super::faults::inside_source_advance();
+    Ok(answer)
+}
+
+/// Count an onboarding refusal of an advance toward its source's failure
+/// streak, in a transaction of its own, unless the source moved since.
+fn count_refusal_in(
+    db: &Connection,
+    request: &AdvanceSource,
+    kind: &str,
+    now_ms: u64,
+) -> Result<()> {
+    let Some(mut source) = load_source(db, &request.mob_id, &request.source_id)? else {
+        return Ok(());
+    };
+    if source.state != SourceState::Active
+        || source.revision != request.expected_revision
+        || source.cursor.version != request.expected_version
+    {
+        return Ok(());
+    }
+    let health = &mut source.health;
+    health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+    health.totals.refusals += 1;
+    health.last_failure = Some(SourceFailureRecord {
+        class: format!("refused:{kind}"),
+        at_ms: now_ms,
+        retry_after_ms: None,
+        detail: None,
+    });
+    source.refresh_status();
+    write_source(db, &source)
+}
+
+fn record_failure_in(
+    db: &Connection,
+    operation: &OperationId,
+    request: &RecordSourceFailure,
+    now_ms: u64,
+) -> Result<AnnouncementSource> {
+    request.validate()?;
+    let fingerprint = request_fingerprint("record_source_failure", request)?;
+    if let Some(result) = operation_result(db, operation, &fingerprint)? {
+        return decode(&result);
+    }
+    let mut source = load_source(db, &request.mob_id, &request.source_id)?
+        .ok_or(AnnouncementStoreError::UnknownSource)?;
+    ensure_current_step(
+        &source,
+        request.expected_revision,
+        &request.principal,
+        request.expected_version,
+    )?;
+    let health = &mut source.health;
+    health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+    health.last_failure = Some(SourceFailureRecord {
+        class: request.failure.class.as_str().to_string(),
+        at_ms: now_ms,
+        retry_after_ms: request.failure.retry_after_ms,
+        detail: request.failure.detail.clone(),
+    });
+    source.refresh_status();
+    write_source(db, &source)?;
+    record_operation(db, operation, &fingerprint, now_ms, &encode(&source)?)?;
+    Ok(source)
 }
 
 #[async_trait]
@@ -2889,6 +3507,50 @@ impl AnnouncementStore for SqliteAnnouncementStore {
             )
         })
         .await
+    }
+
+    async fn advance_source(
+        &self,
+        operation: &OperationId,
+        request: AdvanceSource,
+        now_ms: u64,
+    ) -> Result<SourceAdvance> {
+        let request = Arc::new(request);
+        let step = {
+            let (operation, request) = (operation.clone(), Arc::clone(&request));
+            move |db: &Connection| advance_source_in(db, &operation, &request, now_ms)
+        };
+        let result = self.run(step).await;
+        // An onboarding refusal leaves the source unchanged, then counts
+        // toward its failure streak on its own.
+        if let Err(error) = &result
+            && let Some(kind) = error.onboarding_refusal()
+        {
+            self.run(move |db| count_refusal_in(db, &request, kind, now_ms))
+                .await?;
+        }
+        result
+    }
+
+    async fn record_source_failure(
+        &self,
+        operation: &OperationId,
+        request: RecordSourceFailure,
+        now_ms: u64,
+    ) -> Result<AnnouncementSource> {
+        let operation = operation.clone();
+        self.run(move |db| record_failure_in(db, &operation, &request, now_ms))
+            .await
+    }
+
+    async fn source_streams(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<Vec<SourceStream>> {
+        let (mob_id, source_id) = (mob_id.clone(), source_id.clone());
+        self.run(move |db| source_streams_in(db, &mob_id, &source_id))
+            .await
     }
 
     async fn source(
