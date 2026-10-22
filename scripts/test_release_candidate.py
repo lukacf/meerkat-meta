@@ -925,6 +925,45 @@ class CandidateProtocolTests(unittest.TestCase):
         self.assertEqual((helper.RUN_REREAD_ATTEMPTS, helper.RUN_REREAD_DELAY), (40, 15), "10 minutes")
         self.assertFalse((self.root / "never").exists())
 
+    def collect_with_listing_reads(self, script, *, success=True, name="listing"):
+        """collect() with a scripted sequence of reads of its run's artifact listing."""
+        listing = helper.repo_endpoint(f"actions/runs/{RUN}/artifacts?per_page=100")
+        self.state["api_script"] = {listing: script}
+        self.state["calls"] = []
+        self.save()
+        with mock.patch.object(helper.time, "sleep") as sleep:
+            _, error = self.command("collect", "--output-dir", str(self.root / name),
+                                    "--ci-run-id", str(CI), "--ci-run-attempt", "1", success=success)
+        reads = [c["args"][1] for c in self.state["calls"] if c["args"][0] == "api" and c["args"][1] == listing]
+        return reads, sleep, error
+
+    def test_collect_re_reads_the_artifact_listing_after_a_transient_api_failure(self):
+        """GitHub answered the listing with 503, then reset the connection, then answered."""
+        reads, sleep, error = self.collect_with_listing_reads(
+            [{"fail": "gh: HTTP 503: Service Unavailable"}, {"fail": "read: connection reset by peer"}])
+        self.assertEqual(len(reads), 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(helper.RUN_REREAD_DELAY)] * 2)
+        self.assertEqual(error.count("transient API failure"), 2)
+        self.assertTrue((self.root / "listing" / helper.MANIFEST).exists())
+
+    def test_collect_refuses_at_once_when_the_artifact_listing_fails_for_good_or_is_incomplete(self):
+        """Only a transient failure of the listing is read again: an incomplete listing is no lag here."""
+        listing = helper.repo_endpoint(f"actions/runs/{RUN}/artifacts?per_page=100")
+        complete = copy.deepcopy(self.state["api"][listing])
+        partial = [{"artifacts": complete[0]["artifacts"][:-1], "total_count": len(complete[0]["artifacts"]) - 1}]
+        cases = {
+            "not found": ([{"fail": "gh: HTTP 404: Not Found"}], complete, "HTTP 404"),
+            "incomplete": ([], partial, "missing/duplicate/unexpected target artifacts"),
+        }
+        for label, (script, value, message) in cases.items():
+            with self.subTest(label):
+                self.state["api"][listing] = copy.deepcopy(value)
+                reads, sleep, error = self.collect_with_listing_reads(script, success=False, name=f"listing-{label}")
+                self.assertIn(message, error)
+                self.assertEqual(len(reads), 1, "a refusal that is no transient failure was read again")
+                sleep.assert_not_called()
+                self.assertFalse((self.root / f"listing-{label}").exists())
+
     def test_download_media_negotiation_uses_explicit_endpoint_intent(self):
         aid = self.artifact_ids[0]
         metadata = self.state["api"][helper.repo_endpoint(f"actions/artifacts/{aid}")]
