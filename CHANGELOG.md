@@ -130,15 +130,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   server's event loop, so a large package on a small host no longer stalls
   the rest of Forge.
 - Meta Forge also keeps answering other requests while the guide checks an
-  installed application's source, which it does on every guide turn, and
-  while it connects, installs, configures, starts, stops or checks the status
-  of a remote installation, opens or checks browser access to it, or shows
-  its first jobs and takes a success report or feedback about it. The
-  package work these need runs outside the server's event loop: reading,
-  hashing and unpacking the saved packages to check them, checking the
-  remote controller, hashing and unpacking the accepted package, archiving
-  its source, saving a remote installation's copy of it and a product's
-  control bundle, and comparing a local installation's files.
+  installed application's source, which it does on every guide turn; while
+  it lists Google Cloud accounts and projects for an application, checks a
+  cloud project for it or creates its cloud computer; and while it
+  connects, installs, configures, starts, stops or checks the status of a
+  remote installation, opens or checks browser access to it, or shows its
+  first jobs and takes a success report or feedback about it. The package
+  work these need runs outside the server's event loop: reading, hashing
+  and unpacking the saved packages to check them, checking the remote
+  controller, hashing and unpacking the accepted package, archiving its
+  source, saving a remote installation's copy of it and a product's control
+  bundle, and comparing a local installation's files.
 - Meta Forge refuses a Meta/Toolkit product application installation on a
   Linux computer whose glibc is older than the product declares, before
   anything is installed. The product's resource build record states the
