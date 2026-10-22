@@ -630,6 +630,9 @@ class Application:
         admission_roster() reads listed and admitting rows together from the
         application's store. Only listed rows feed native roster/topology reads;
         both partitions can supply the exact spec for a held native build.
+        When present, it supersedes desired_roster() reads. First publication
+        pins each identity's class, including identities still admitting; a
+        removed admission cannot return under another class in this process.
         """
         models = identity_models(native=self._native_identity_models or self._application_callbacks is not None)
         DurableAgentSpec, ManagedPeerEdge = models.DurableAgentSpec, models.ManagedPeerEdge
@@ -793,7 +796,12 @@ class Application:
                                 input_schema=self._json_copy(tool["schema"], "Application callback schema"))
 
     async def _identity_callbacks(self, identity, snapshot):
-        """Build current callbacks for one identity in a validated snapshot."""
+        """Build current callbacks for one identity in a validated snapshot.
+
+        Any republish during an await refuses this build, even if this identity
+        is unchanged. TP4 finalization must account for that before publishing
+        while a held build is still in progress.
+        """
         agent = snapshot.buildable_agents.get(identity)
         if agent is None:
             raise ValueError("Application callbacks need an exact validated desired identity.")

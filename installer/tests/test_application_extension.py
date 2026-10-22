@@ -1191,14 +1191,14 @@ async def test_projection_refresh_completes_while_native_reconcile_is_parked(tmp
     try:
         await asyncio.wait_for(entered.wait(), 1)
         assert application._reconcile_lock.locked()
-        assert "lead:pending" not in {row.identity for row in await application.roster(None)}
+        assert "lead:pending" not in {row.identity for row in await asyncio.wait_for(application.roster(None), 1)}
         application.integration.rows.append(pending.pop())
         await asyncio.wait_for(application._prepare_snapshot(runtime=runtime), 1)
         assert application._reconcile_lock.locked()
-        assert "lead:pending" in {row.identity for row in await application.roster(None)}
+        assert "lead:pending" in {row.identity for row in await asyncio.wait_for(application.roster(None), 1)}
     finally:
         release.set()
-        await task
+        await asyncio.wait_for(task, 1)
 
 
 @pytest.mark.parametrize("case", ["seed", "duplicate", "profile", "unknown-class", "edge", "not-list", "schema"])
