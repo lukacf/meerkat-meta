@@ -89,8 +89,9 @@ MAX_MEMBER = 2 * 1024**3
 # GitHub answers a read with 5xx or drops the connection. Collection reads its
 # own run again RUN_REREAD_DELAY seconds apart, for up to RUN_REREAD_ATTEMPTS
 # reads (10 minutes), while the run does not report in progress yet or the read
-# failed that way. Any other refusal, such as a run identity mismatch, stays
-# immediate.
+# failed that way, and reads the run's artifact listing again only after such a
+# failed read. Any other refusal, such as a run identity mismatch or a listing
+# that misses an artifact, stays immediate.
 RUN_REREAD_ATTEMPTS = 40
 RUN_REREAD_DELAY = 15
 # api() runs `gh api` once, and run() reports a failure as "gh api failed: ...".
@@ -518,16 +519,15 @@ def verify_run(run_id, attempt, sha, *, ci=False, collecting=False, legacy_tag=N
     return value
 
 
-def collecting_run(run_id, attempt, sha):
-    """This candidate run's own record, once GitHub reports it in progress.
-
-    A read that finds the run not in progress yet, or that fails transiently,
-    is read again (see RUN_REREAD_ATTEMPTS); each such read logs one line to
-    stderr. Any other refusal propagates at once."""
+def reread(label, read):
+    """The first answer of read(). A read that finds the run not in progress
+    yet, or that fails transiently, is read again (see RUN_REREAD_ATTEMPTS);
+    each such read logs one line to stderr. Any other refusal propagates at
+    once."""
     started = time.monotonic()
-    for read in range(1, RUN_REREAD_ATTEMPTS + 1):
+    for attempt in range(1, RUN_REREAD_ATTEMPTS + 1):
         try:
-            return verify_run(run_id, attempt, sha, collecting=True)
+            return read()
         except RunNotInProgress as pending:
             reason, refusal = f"status={pending.status}", str(pending)
         except ProtocolError as error:
@@ -535,11 +535,16 @@ def collecting_run(run_id, attempt, sha):
                 raise
             reason, refusal = f"transient API failure: {error}", str(error)
         elapsed = f"{time.monotonic() - started:.0f}"
-        print(f"candidate run {run_id}: read {read}/{RUN_REREAD_ATTEMPTS} missed at {elapsed} s: "
+        print(f"{label}: read {attempt}/{RUN_REREAD_ATTEMPTS} missed at {elapsed} s: "
               + " ".join(reason.split()), file=sys.stderr)
-        if read < RUN_REREAD_ATTEMPTS:
+        if attempt < RUN_REREAD_ATTEMPTS:
             time.sleep(RUN_REREAD_DELAY)
     raise ProtocolError(f"{refusal} (after {RUN_REREAD_ATTEMPTS} reads over {elapsed} s)")
+
+
+def collecting_run(run_id, attempt, sha):
+    """This candidate run's own record, once GitHub reports it in progress."""
+    return reread(f"candidate run {run_id}", lambda: verify_run(run_id, attempt, sha, collecting=True))
 
 
 def download_artifact(identity, run_info, directory):
@@ -685,7 +690,10 @@ def collect(args):
     run_id, attempt = env_int("GITHUB_RUN_ID"), env_int("GITHUB_RUN_ATTEMPT")
     info = collecting_run(run_id, attempt, sha)
     verify_run(args.ci_run_id, args.ci_run_attempt, sha, ci=True)
-    pages = api(repo_endpoint(f"actions/runs/{run_id}/artifacts?per_page=100"), pages=True)
+    # Only a transient failure of this read is read again: a listing that
+    # misses an artifact is refused below, at once.
+    endpoint = repo_endpoint(f"actions/runs/{run_id}/artifacts?per_page=100")
+    pages = reread(f"candidate run {run_id} artifacts", lambda: api(endpoint, pages=True))
     listing = [item for page in pages for item in page["artifacts"]]
     expected = {f"meta-gateway-binaries-{target}-{attempt}": target for target in tier_targets(tier)}
     selected = [a for a in listing if a["name"].startswith("meta-gateway-binaries-")]
