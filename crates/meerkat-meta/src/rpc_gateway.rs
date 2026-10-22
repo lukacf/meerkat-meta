@@ -14949,6 +14949,33 @@ async fn select_prepared_application(
     }
 }
 
+/// The agent customizer the gateway installs: the one it composed, as its host
+/// composes it ([`GatewayHostComposition::compose_agent_customizer`]). Without
+/// a host it is the composed one unchanged. A host answer that adds or drops a
+/// customizer is refused, as a host error is.
+fn host_composed_agent_customizer(
+    host: Option<&Arc<dyn GatewayHostComposition>>,
+    composed: Option<Arc<dyn crate::identity_first::AgentCustomizer>>,
+) -> Result<Option<Arc<dyn crate::identity_first::AgentCustomizer>>, String> {
+    let Some(host) = host else {
+        return Ok(composed);
+    };
+    let had_customizer = composed.is_some();
+    match host.compose_agent_customizer(composed) {
+        Err(error) => Err(error.to_string()),
+        Ok(customizer) if customizer.is_some() == had_customizer => Ok(customizer),
+        Ok(Some(_)) => Err(
+            "the native host composition added an agent customizer where the gateway composed \
+             none; refusing it"
+                .to_string(),
+        ),
+        Ok(None) => Err(
+            "the native host composition dropped the gateway's agent customizer; refusing it"
+                .to_string(),
+        ),
+    }
+}
+
 /// The gateway's roster provider: the SDK callback, with the prepared
 /// application's projection applied when there is one. Every gateway site
 /// that reads the roster builds it here, so the projection is never
@@ -17986,6 +18013,11 @@ external_addressable = true
             } else {
                 base_customizer
             };
+        // The host composes the final customizer here, once. The same `Arc`
+        // is the identity runtime's, the identity context's and the RPC
+        // context's below.
+        let customizer = host_composed_agent_customizer(host, customizer)
+            .map_err(|error| fail_init(&request_id, -32603, error))?;
         let agent_memory_injector = if let (Some(agent_memory), Some(provider)) = (
             gateway_options.agent_memory.as_ref(),
             agent_memory_provider.clone(),
