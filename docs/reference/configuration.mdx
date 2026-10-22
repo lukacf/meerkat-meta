@@ -1147,6 +1147,98 @@ shutdown protocol.
 If the gateway exhausts its runtime deadline, it reports incomplete cleanup;
 the SDK still reaps the bounded child process and then surfaces the failure.
 
+#### Letting in-flight turns finish on shutdown
+
+By default a graceful shutdown cancels the turns members are running: the
+mob's stop interrupts each member's current run. An application that would
+rather let them finish sets a drain window at init: the top-level `meta/init`
+parameter `shutdown_in_flight_drain_ms` (Python
+`MetaBuilder.shutdown_in_flight_drain_ms(ms)`, TypeScript
+`MetaBuilder.shutdownInFlightDrainMs(ms)`). It is an integer of milliseconds.
+Absent or 0 drains nothing, and the most is 300000 (5 minutes); init refuses
+any other value.
+
+The drain runs only for the SDK's shutdown handshake and for SIGTERM, the
+stop signal supervisors send. SIGINT, a closed stdin and a closed host shut
+down at once, as before. With a window, once the dispatch loop has ended and
+before the rest of the shutdown, the gateway:
+
+1. asks a host composition to stop admitting new work (see below);
+2. stops the schedule host from claiming occurrences: an occurrence that
+   falls due during the window stays due, and the restarted gateway handles
+   it under its misfire policy. A `skip` occurrence overdue past its grace is
+   skipped, and a long window plus a slow restart can push a
+   `catch_up_within` occurrence past its bound;
+3. stops the HTTP listener from accepting connections (requests and streams
+   already open continue);
+4. closes cross-mob control, identity foreground operations and runtime
+   delivery;
+5. stops the mob with every member's current run left running, and waits
+   until each of those runs ends or the window passes.
+
+The shutdown then continues as it does without a drain, and a run still going
+when the window ends is cancelled by it.
+
+The advertised `stdio_shutdown_horizon_ms` grows by the window plus 10
+seconds for the drain's own stop: 432000 + 10000 + the window. The SDKs wait
+that much longer when they close. A supervisor that stops the gateway with
+SIGTERM must allow at least that horizon, plus the time to reap the process,
+before it kills it.
+
+What a drained turn can still do:
+
+- Mob-mutating tool calls (spawn, delegate, fork, wiring) are refused, typed,
+  and the model sees the error.
+- A message to a peer is held, and ends `Abandoned(Stopped)` at the shutdown.
+  A turn that waits on another member's new run cannot finish, so it is still
+  running when the window ends.
+- `mob_announce` commits, and subscribers receive the announcement after the
+  restart.
+- WorkGraph writes commit, and their wakes stay pending.
+- Identity foreground operations are refused, typed. A caller already
+  waiting on a turn (`meta/wait_for_turn`) keeps waiting and gets the turn's
+  outcome.
+- A schedule the turn creates is stored, and fires after the restart.
+- Detached jobs and monitors keep running, with their notifications pending
+  in the inbox.
+- Host callbacks are answered, under the handshake and under SIGTERM. An SDK
+  host hit by the same signal may be stopping itself, so SDK-hosted gateways
+  should stop through the handshake.
+
+Durable child mobs are not drained: they are stood down later, as without a
+drain, and their in-flight turns are cancelled there. A connected voice or
+live session does not lengthen the drain: its member is reported
+`live_channel_open` and the shutdown handles it as before. An autonomous
+member whose current run is its long-lived kickoff loop holds the drain for
+the whole window, and the shutdown then cancels it. A held member add or a
+roster pass still settling when the window ends cuts the drain before its
+stop (`identity_foreground_busy`), and the shutdown settles it inside its own
+budget.
+
+The `meta/shutdown` answer carries the drain's report as
+`result.in_flight_drain`, and the gateway also logs it at INFO
+(`in-flight drain finished`), which is where a SIGTERM stop reports it.
+Without a window the answer has no such field.
+
+| `outcome` | Meaning |
+|-----------|---------|
+| `drained` | The mob stopped and the drain waited. `ended` lists each member whose run ended in the window, with its terminal (`completed`, `failed`, `cancelled` and the other turn terminals, or `null` when the member's runtime registration ended with the run). `still_running_at_bound`, `live_channel_open`, `not_local` (placed or remote members) and `reload_required` list the members the drain did not see end. `starts_not_held` lists members whose run starts could not be held. A run outcome this gateway does not know is listed in `unclassified`, with its serialized form. |
+| `skipped` | No drain ran. `reason` is the dispatch end (`signal`, with `signal: "SIGINT"`; `stdin_closed`; `host_closed`; `caller_cancelled`), or `host_admission_open` when the host could not stop admitting. |
+| `cut` | `reason: "identity_foreground_busy"`: the window ended while identity operations were settling, before the drain's stop. |
+| `stop_failed`, `drain_failed` | The drain's stop, or its wait, failed (`error`). The shutdown proceeds as without a drain. |
+
+Every report carries `window_ms`; every report but `skipped` also carries
+`waited_ms`.
+
+A host composition (`run_persistent_with_host`) that admits work of its own
+(source submissions, member adds, recovery steps) implements
+`GatewayHostComposition::stop_admitting`, which the gateway calls once, before
+the drain. The host keeps serving work already entered, and keeps the
+credentials and custody in-flight turns use: `begin_close` still follows the
+drain. An error skips the drain (`host_admission_open`). A host on the default,
+which keeps admitting, can still submit work during the window: the mob's stop
+holds it, and it ends `Abandoned(Stopped)` at the shutdown.
+
 Rust hosts that dispatch JSON-RPC from an `Arc<UnifiedRuntime>` should call
 `handle_unified_rpc_json_arc` (or the corresponding `with_live_arc` entrypoint).
 That transfers runtime ownership to supervised identity mutations, so a
