@@ -424,7 +424,7 @@ def verify_known(f, artifacts, known=None):
         known=dict(artifacts._known_fingerprints) if known is None else known)
 
 
-def test_r11_an_unchanged_prefix_is_checked_without_reading_one_file(installed, monkeypatch):
+def test_r11_an_unchanged_prefix_is_checked_reading_only_the_gateway(installed, monkeypatch):
     f = installed
     named, record = keep_with_fingerprints(f, monkeypatch)
     assert sorted(record) == file_names(f)
@@ -432,7 +432,8 @@ def test_r11_an_unchanged_prefix_is_checked_without_reading_one_file(installed, 
     artifacts = retained_artifacts(f)
     reads = counted_reads(monkeypatch, f)
     verify_known(f, artifacts)
-    assert reads == []
+    # The executed gateway is always hashed; no other unchanged file is read.
+    assert reads == [f.artifacts.prefix + "/bin/toolkit_gateway"]
 
 
 def test_r12_a_content_change_with_its_mtime_restored_moves_ctime_and_refuses(installed, monkeypatch):
@@ -494,7 +495,7 @@ def test_r15_the_same_bytes_in_a_new_inode_are_hashed_again_and_pass(installed, 
     artifacts = retained_artifacts(f)
     reads = counted_reads(monkeypatch, f)
     verify_known(f, artifacts)
-    assert reads == [f.artifacts.prefix + "/README.md"]
+    assert sorted(reads) == sorted([f.artifacts.prefix + "/README.md", f.artifacts.prefix + "/bin/toolkit_gateway"])
     assert receipt(f)[kept.RECEIPT_FIELD] == named and kept_files(f) == [kept_path(f, named).name]
 
 
