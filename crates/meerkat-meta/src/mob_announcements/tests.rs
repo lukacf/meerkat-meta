@@ -10005,6 +10005,11 @@ fn the_version_two_schema_is_pinned() {
     assert_eq!(
         objects_added_by(&tx, &before),
         vec![
+            "table announcement_source_streams: mob_id TEXT notnull pk1, source_id TEXT \
+             notnull pk2, stream TEXT notnull pk3, generation INTEGER notnull, phase TEXT \
+             notnull, mode TEXT notnull, max_items INTEGER, backfilled INTEGER notnull, \
+             since_ms INTEGER notnull"
+                .to_string(),
             "table announcement_source_topics: mob_id TEXT notnull pk1, topic TEXT notnull \
              pk2, source_id TEXT notnull, kind TEXT notnull"
                 .to_string(),
@@ -10109,12 +10114,13 @@ async fn a_version_one_store_migrates_to_version_two_in_place() {
     let tables: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
-             AND name IN ('announcement_sources', 'announcement_source_topics')",
+             AND name IN ('announcement_sources', 'announcement_source_topics',
+                          'announcement_source_streams')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 2);
+    assert_eq!(tables, 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -10492,4 +10498,1961 @@ async fn a_mob_holds_a_bounded_number_of_live_sources() {
         .await
         .unwrap();
     store.put_source(&op("over-2"), over(), 4).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Announcement sources: advancing the cursor and recording failures, through
+// the one handler every gateway dispatches to.
+// ---------------------------------------------------------------------------
+
+const SOURCES_ADVANCE: &str = "meta/mob_announcements/sources/advance";
+const SOURCES_RECORD_FAILURE: &str = "meta/mob_announcements/sources/record_failure";
+const SOURCES_PAUSE: &str = "meta/mob_announcements/sources/pause";
+const SOURCES_RESUME: &str = "meta/mob_announcements/sources/resume";
+const SUBSCRIPTIONS_PUT: &str = "meta/mob_announcements/subscriptions/put";
+
+/// The verified account `source_params` pins for `subject`.
+fn principal_of(subject: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "connector_verified_account",
+        "issuer": "https://accounts.example",
+        "strategy_id": "oauth-code",
+        "subject": subject,
+    })
+}
+
+/// A `sources/advance` of source "inbox" as its collector reading for
+/// "subject-1", from `version` at `revision`, moving the cursor to `cursor`.
+fn advance_params(operation: &str, revision: u64, version: u64, cursor: &str) -> serde_json::Value {
+    serde_json::json!({
+        "operation_id": operation,
+        "source_id": "inbox",
+        "expected_revision": revision,
+        "expected_version": version,
+        "principal": principal_of("subject-1"),
+        "next_cursor": cursor,
+    })
+}
+
+/// `params` carrying `items`.
+fn with_items(params: serde_json::Value, items: &[serde_json::Value]) -> serde_json::Value {
+    with(params, "items", serde_json::Value::Array(items.to_vec()))
+}
+
+/// One item on the source topic: `change` of `item_id` at `version`.
+fn change_of(item_id: &str, version: &str, change: &str, body: &str) -> serde_json::Value {
+    serde_json::json!({
+        "item_id": item_id,
+        "version": version,
+        "change": change,
+        "topics": ["mail.received"],
+        "body": body,
+    })
+}
+
+/// An upsert of `item_id` at `version`.
+fn upsert(item_id: &str, version: &str, body: &str) -> serde_json::Value {
+    change_of(item_id, version, "upsert", body)
+}
+
+/// An upsert of `item_id` filed in `stream`.
+fn upsert_in(stream: &str, item_id: &str, body: &str) -> serde_json::Value {
+    let mut item = upsert(item_id, "v1", body);
+    item["stream"] = serde_json::json!(stream);
+    item
+}
+
+/// Declare "inbox" (read for "subject-1", topic "mail.received") and take
+/// its baseline in one final page: live at revision 1, version 1, cursor
+/// "c1".
+async fn live_inbox(service: &AnnouncementService) {
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("put-inbox", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    let baseline = with(
+        advance_params("baseline", 1, 0, "c1"),
+        "coverage",
+        serde_json::json!("complete"),
+    );
+    let advanced = try_host_call(service, SOURCES_ADVANCE, baseline)
+        .await
+        .unwrap();
+    assert_eq!(advanced["source"]["collection"], serde_json::json!("live"));
+}
+
+/// Subscribe this mob's member `identity` to the source topic from now.
+async fn subscribe_to_inbox(service: &AnnouncementService, id: &str, identity: &str) {
+    try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": format!("subscribe-{id}"),
+            "subscription_id": id,
+            "member": { "mob_id": OWN_MOB, "identity": identity },
+            "topics": ["mail.received"],
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+/// A native owner that serves members "agent:a" and "agent:b".
+fn native_serving_a_and_b() -> ScriptedNative {
+    let mut native = ScriptedNative::new();
+    native.known.insert("agent:b".into());
+    native
+}
+
+/// "inbox" as `sources/get` returns it.
+async fn inbox(service: &AnnouncementService) -> serde_json::Value {
+    try_host_call(
+        service,
+        SOURCES_GET,
+        serde_json::json!({ "source_id": "inbox" }),
+    )
+    .await
+    .unwrap()["source"]
+        .clone()
+}
+
+/// What each item of an advance came to, in order.
+fn outcomes(advanced: &serde_json::Value) -> Vec<String> {
+    advanced["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|item| item["outcome"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Owed announcements per member, as the backlog counts them.
+async fn owed(harness: &Harness) -> BTreeMap<String, u64> {
+    harness
+        .store
+        .backlogs(16)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|backlog| (backlog.member.identity.to_string(), backlog.eligible_count))
+        .collect()
+}
+
+/// An advance commits its items, their captures and the cursor in one
+/// transaction: a page that fails at its second item leaves neither the
+/// first item, its capture nor the cursor behind.
+#[tokio::test]
+async fn an_advance_commits_its_items_captures_and_cursor_together_or_not_at_all() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+
+    // The second item renders past a delivery's bound only when it is
+    // rendered, after the first item was written in the same transaction.
+    let unrenderable = "\u{1}".repeat(16 * 1024);
+    let refused = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run-1:v1", 1, 1, "c2"),
+            &[
+                upsert("m-1", "v1", "first"),
+                upsert("m-2", "v1", &unrenderable),
+            ],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, -32602, "{refused:?}");
+    let source = inbox(service).await;
+    assert_eq!(source["cursor"]["version"], serde_json::json!(1));
+    assert_eq!(source["cursor"]["token"], serde_json::json!("c1"));
+    assert!(owed(&harness).await.is_empty(), "nothing was captured");
+
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run-2:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcomes(&advanced),
+        vec!["announced"],
+        "nothing of the refused page was committed"
+    );
+    assert_eq!(advanced["items"][0]["captured"], serde_json::json!(1));
+    assert_eq!(
+        advanced["source"]["cursor"]["version"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        advanced["source"]["cursor"]["token"],
+        serde_json::json!("c2")
+    );
+    assert_eq!(owed(&harness).await.get("agent:a"), Some(&1));
+    let key = SourceKey::new(advanced["items"][0]["source_key"].as_str().unwrap()).unwrap();
+    let committed = harness
+        .store
+        .announcement(&mob(OWN_MOB), &key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        committed.announced_by,
+        Announcer::Source {
+            source_id: SourceId::new("inbox").unwrap()
+        }
+    );
+    assert!(key.as_str().starts_with("source:inbox:"), "{key}");
+}
+
+/// A step retried with its operation id answers its original result, byte
+/// for byte but marked replayed, and the cursor moves once.
+#[tokio::test]
+async fn an_advance_retried_with_its_operation_id_returns_the_original_result() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    let step = with_items(
+        advance_params("schedule:s:occurrence:o:v1", 1, 1, "c2"),
+        &[upsert("m-1", "v1", "hello")],
+    );
+    let first = try_host_call(service, SOURCES_ADVANCE, step.clone())
+        .await
+        .unwrap();
+    assert_eq!(first["replayed"], serde_json::json!(false));
+    harness.clock.fetch_add(5_000, Ordering::SeqCst);
+    let again = try_host_call(service, SOURCES_ADVANCE, step).await.unwrap();
+    let mut original = first.clone();
+    original["replayed"] = serde_json::json!(true);
+    assert_eq!(again, original);
+    assert_eq!(
+        inbox(service).await["cursor"]["version"],
+        serde_json::json!(2)
+    );
+}
+
+/// A collector that read the provider and never advanced left nothing
+/// durable: the next run reads the same cursor, and what it advances is
+/// announced once.
+#[tokio::test]
+async fn a_collector_that_never_advanced_rereads_the_same_cursor_and_loses_nothing() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    // A first run read from "c1" and died before its advance.
+    let source = inbox(service).await;
+    assert_eq!(source["cursor"]["token"], serde_json::json!("c1"));
+    assert_eq!(source["cursor"]["version"], serde_json::json!(1));
+    // The next run reads the same cursor and the same changes.
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run-2:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "lost and found")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcomes(&advanced), vec!["announced"]);
+    assert_eq!(owed(&harness).await.get("agent:a"), Some(&1));
+}
+
+/// Two collectors that read one version race: the first advance wins, the
+/// second is refused with where the cursor stands and commits none of its
+/// items.
+#[tokio::test]
+async fn overlapping_collectors_are_fenced_by_the_cursor_version() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    let first = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run-a:v1", 1, 1, "c-a"),
+            &[upsert("m-1", "v1", "from a")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first["source"]["cursor"]["version"], serde_json::json!(2));
+    let second = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run-b:v1", 1, 1, "c-b"),
+            &[upsert("m-2", "v1", "from b")],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(second.code, super::rpc::ANNOUNCEMENTS_CONFLICT_CODE);
+    assert_eq!(
+        second.data,
+        Some(serde_json::json!({
+            "kind": "source_version_conflict",
+            "current_version": 2,
+            "cursor": { "version": 2, "token": "c-a", "advanced_at_ms": 1000 },
+            "state": "active",
+            "revision": 1,
+        }))
+    );
+    assert!(
+        !second.message.contains("c-a"),
+        "the token travels in data only: {}",
+        second.message
+    );
+    let retried = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run-b:v2", 1, 2, "c-b"),
+            &[upsert("m-2", "v1", "from b")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcomes(&retried),
+        vec!["announced"],
+        "the refused advance committed none of its items"
+    );
+}
+
+/// A configuration change between a collector's read and its advance moves
+/// the revision: the advance loses typed, with the revision, version,
+/// generation and cursor it should read again.
+#[tokio::test]
+async fn an_advance_in_flight_across_a_configuration_change_loses_typed() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    try_host_call(
+        service,
+        SOURCES_PAUSE,
+        serde_json::json!({ "operation_id": "pause", "source_id": "inbox", "expected_revision": 1 }),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SOURCES_RESUME,
+        serde_json::json!({ "operation_id": "resume", "source_id": "inbox", "expected_revision": 2 }),
+    )
+    .await
+    .unwrap();
+    let stale = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "late")],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale.code, super::rpc::ANNOUNCEMENTS_CONFLICT_CODE);
+    assert_eq!(
+        stale.data,
+        Some(serde_json::json!({
+            "kind": "stale_revision",
+            "current_revision": 3,
+            "current_version": 1,
+            "generation": 1,
+            "cursor": { "version": 1, "token": "c1", "advanced_at_ms": 1000 },
+        }))
+    );
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run-2:v1", 3, 1, "c2"),
+            &[upsert("m-1", "v1", "late")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcomes(&advanced), vec!["announced"]);
+}
+
+/// `record_failure` is fenced like an advance: a collector that read an
+/// older version cannot mark a healthy source failing; a current one can.
+#[tokio::test]
+async fn a_failure_from_a_stale_collector_does_not_mark_the_source_failing() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        advance_params("run-a:v1", 1, 1, "c2"),
+    )
+    .await
+    .unwrap();
+    let failure = |operation: &str, version: u64| {
+        serde_json::json!({
+            "operation_id": operation,
+            "source_id": "inbox",
+            "expected_revision": 1,
+            "expected_version": version,
+            "principal": principal_of("subject-1"),
+            "failure": { "class": "provider_unavailable", "retry_after_ms": 60000 },
+        })
+    };
+    let stale = try_host_call(service, SOURCES_RECORD_FAILURE, failure("fail-1", 1))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refusal_kind(&stale).as_deref(),
+        Some("source_version_conflict")
+    );
+    let health = &inbox(service).await["health"];
+    assert_eq!(health["consecutive_failures"], serde_json::json!(0));
+    assert_eq!(health["status"], serde_json::json!("ok"));
+    assert_eq!(health["last_failure"], serde_json::Value::Null);
+
+    let failed = try_host_call(service, SOURCES_RECORD_FAILURE, failure("fail-2", 2))
+        .await
+        .unwrap();
+    let health = &failed["source"]["health"];
+    assert_eq!(health["consecutive_failures"], serde_json::json!(1));
+    assert_eq!(health["status"], serde_json::json!("failing"));
+    assert_eq!(
+        health["last_failure"]["class"],
+        serde_json::json!("provider_unavailable")
+    );
+    assert_eq!(
+        failed["source"]["cursor"]["version"],
+        serde_json::json!(2),
+        "a failure moves no cursor"
+    );
+}
+
+/// Every bound of an advance is enforced and refused as invalid params, and
+/// a refusal leaves the cursor where it was.
+#[tokio::test]
+async fn source_items_are_bounded_and_refused_typed() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    let page_of = |items: Vec<serde_json::Value>| {
+        with_items(advance_params("bounded:v1", 1, 1, "c2"), &items)
+    };
+    let mut cases: Vec<(&str, serde_json::Value)> = Vec::new();
+    cases.push((
+        "more than 100 items",
+        page_of(
+            (0..101)
+                .map(|index| upsert(&format!("m-{index}"), "v1", "b"))
+                .collect(),
+        ),
+    ));
+    cases.push(("an empty item id", page_of(vec![upsert("", "v1", "b")])));
+    cases.push((
+        "an item id over 256 bytes",
+        page_of(vec![upsert(&"i".repeat(257), "v1", "b")]),
+    ));
+    cases.push((
+        "a version over 256 bytes",
+        page_of(vec![upsert("m-1", &"v".repeat(257), "b")]),
+    ));
+    cases.push((
+        "a stream over 256 bytes",
+        page_of(vec![upsert_in(&"s".repeat(257), "m-1", "b")]),
+    ));
+    cases.push((
+        "a body over 16 KiB",
+        page_of(vec![upsert("m-1", "v1", &"b".repeat(16 * 1024 + 1))]),
+    ));
+    cases.push((
+        "bodies over 1 MiB in one page",
+        page_of(
+            (0..65)
+                .map(|index| upsert(&format!("m-{index}"), "v1", &"b".repeat(16 * 1024)))
+                .collect(),
+        ),
+    ));
+    let mut foreign = upsert("m-1", "v1", "b");
+    foreign["topics"] = serde_json::json!(["mail.sent"]);
+    cases.push(("a topic the source does not own", page_of(vec![foreign])));
+    let mut untopical = upsert("m-1", "v1", "b");
+    untopical["topics"] = serde_json::json!([]);
+    cases.push(("an item without a topic", page_of(vec![untopical])));
+    cases.push((
+        "an unknown change",
+        page_of(vec![change_of("m-1", "v1", "modify", "b")]),
+    ));
+    for (case, params) in cases {
+        let refused = try_host_call(service, SOURCES_ADVANCE, params)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, -32602, "{case}: {refused:?}");
+    }
+    let source = inbox(service).await;
+    assert_eq!(source["cursor"]["version"], serde_json::json!(1));
+    assert_eq!(
+        source["health"]["totals"]["announced"],
+        serde_json::json!(0)
+    );
+}
+
+/// A writer that keeps whatever is logged on the test thread.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A collector's cursor token, its principal and a failure's detail never
+/// reach a log line, a list, an error message or a delivered body: lists show
+/// the principal's kind and digest only, and the token and the detail are
+/// read back from `sources/get` alone.
+#[tokio::test]
+async fn cursor_tokens_principals_and_failure_details_never_reach_logs_lists_status_or_bodies() {
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _logging = tracing::subscriber::set_default(subscriber);
+
+    const SUBJECT: &str = "subject-secret-7f3a";
+    const TOKEN: &str = "cursor-secret-91c2";
+    const DETAIL: &str = "detail-secret-55e1";
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("put", "inbox", SUBJECT, &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    let mut step = with(
+        advance_params("baseline", 1, 0, TOKEN),
+        "coverage",
+        serde_json::json!("complete"),
+    );
+    step["principal"] = principal_of(SUBJECT);
+    try_host_call(service, SOURCES_ADVANCE, step).await.unwrap();
+    let mut step = with_items(
+        advance_params("run:v1", 1, 1, TOKEN),
+        &[upsert("m-1", "v1", "an invoice arrived")],
+    );
+    step["principal"] = principal_of(SUBJECT);
+    try_host_call(service, SOURCES_ADVANCE, step).await.unwrap();
+    let mut stale = advance_params("stale:v1", 1, 1, "other");
+    stale["principal"] = principal_of(SUBJECT);
+    let refused = try_host_call(service, SOURCES_ADVANCE, stale)
+        .await
+        .unwrap_err();
+    let failed = try_host_call(
+        service,
+        SOURCES_RECORD_FAILURE,
+        serde_json::json!({
+            "operation_id": "fail",
+            "source_id": "inbox",
+            "expected_revision": 1,
+            "expected_version": 2,
+            "principal": principal_of(SUBJECT),
+            "failure": { "class": "adapter_error", "detail": DETAIL },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        failed["source"]["health"]["last_failure"]["class"],
+        serde_json::json!("adapter_error")
+    );
+    harness.clock.fetch_add(60_001, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+
+    let got = inbox(service).await;
+    assert_eq!(got["cursor"]["token"], serde_json::json!(TOKEN));
+    assert_eq!(
+        got["health"]["last_failure"]["detail"],
+        serde_json::json!(DETAIL),
+        "sources/get keeps the detail for the operator"
+    );
+    let listed = try_host_call(service, SOURCES_LIST, serde_json::json!({}))
+        .await
+        .unwrap();
+    let principal = &listed["sources"][0]["identity"]["principal"];
+    assert_eq!(
+        principal["kind"],
+        serde_json::json!("connector_verified_account")
+    );
+    assert!(
+        principal["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:")),
+        "{principal}"
+    );
+    let delivered: Vec<String> = harness
+        .native
+        .ledger
+        .lock()
+        .unwrap()
+        .bindings
+        .values()
+        .map(|(delivery, _, _)| delivery.clone())
+        .collect();
+    assert_eq!(delivered.len(), 1, "the item was delivered");
+    let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let seen = [
+        ("the list", listed.to_string()),
+        ("a refusal message", refused.message.clone()),
+        ("a delivered body", delivered.join("\n")),
+        ("the log", logged),
+    ];
+    for (place, text) in seen {
+        for secret in [SUBJECT, TOKEN, DETAIL] {
+            assert!(!text.contains(secret), "{secret} reached {place}: {text}");
+        }
+    }
+}
+
+/// One provider version is announced once however often a collector reads
+/// it: every later collection replays it, captures nothing new, and the
+/// cursor still moves.
+#[tokio::test]
+async fn one_provider_version_is_announced_once_however_often_it_is_collected() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    let mut sequences = Vec::new();
+    for version in 1..=3u64 {
+        let advanced = try_host_call(
+            service,
+            SOURCES_ADVANCE,
+            with_items(
+                advance_params(&format!("run-{version}:v{version}"), 1, version, "c"),
+                &[upsert("m-1", "v1", "the same message")],
+            ),
+        )
+        .await
+        .unwrap();
+        sequences.push(advanced["items"][0]["sequence"].clone());
+        assert_eq!(
+            advanced["source"]["cursor"]["version"],
+            serde_json::json!(version + 1)
+        );
+        let expected = if version == 1 {
+            "announced"
+        } else {
+            "replayed"
+        };
+        assert_eq!(outcomes(&advanced), vec![expected]);
+    }
+    assert_eq!(sequences[0], sequences[1]);
+    assert_eq!(sequences[1], sequences[2]);
+    assert_eq!(owed(&harness).await.get("agent:a"), Some(&1));
+    let totals = &inbox(service).await["health"]["totals"];
+    assert_eq!(totals["announced"], serde_json::json!(1));
+    assert_eq!(totals["replayed"], serde_json::json!(2));
+}
+
+/// A baseline that spans pages and is interrupted resumes from its interim
+/// cursor and stays baselining until its final page; an item offered while
+/// it baselines is refused.
+#[tokio::test]
+async fn a_baseline_interrupted_after_some_pages_resumes_and_stays_baselining() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("put", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    for (index, cursor) in [(0u64, "p1"), (1, "p2")] {
+        let page = with(
+            advance_params(&format!("baseline:v{index}"), 1, index, cursor),
+            "page",
+            serde_json::json!({ "index": index, "final": false }),
+        );
+        let advanced = try_host_call(service, SOURCES_ADVANCE, page).await.unwrap();
+        assert_eq!(
+            advanced["source"]["collection"],
+            serde_json::json!("baselining")
+        );
+    }
+    // The collector stops here; the next run reads where the baseline is.
+    let source = inbox(service).await;
+    assert_eq!(source["cursor"]["token"], serde_json::json!("p2"));
+    assert_eq!(source["cursor"]["version"], serde_json::json!(2));
+    assert_eq!(source["collection"], serde_json::json!("baselining"));
+    let early = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("early:v2", 1, 2, "p3"),
+            &[upsert("m-1", "v1", "too early")],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal_kind(&early).as_deref(), Some("baseline_required"));
+    let resumed = with(
+        advance_params("resumed:v2", 1, 2, "p3"),
+        "page",
+        serde_json::json!({ "index": 2, "final": false }),
+    );
+    let advanced = try_host_call(service, SOURCES_ADVANCE, resumed)
+        .await
+        .unwrap();
+    assert_eq!(
+        advanced["source"]["collection"],
+        serde_json::json!("baselining")
+    );
+    let last = with(
+        with(
+            advance_params("last:v3", 1, 3, "c1"),
+            "page",
+            serde_json::json!({ "index": 3, "final": true }),
+        ),
+        "coverage",
+        serde_json::json!("complete"),
+    );
+    let advanced = try_host_call(service, SOURCES_ADVANCE, last).await.unwrap();
+    assert_eq!(advanced["source"]["collection"], serde_json::json!("live"));
+}
+
+/// A baseline the collector starts over from its first page announces none
+/// of what its pages read: the mob's log stays empty until the first real
+/// announcement.
+#[tokio::test]
+async fn a_restarted_baseline_announces_nothing_of_the_pages_it_read() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("put", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    let pages = [
+        (0u64, 0u64, false, "p1"),
+        (1, 1, false, "p2"),
+        // The collector restarted its baseline from the first page.
+        (0, 2, false, "q1"),
+        (1, 3, true, "q2"),
+    ];
+    for (index, version, last, cursor) in pages {
+        let mut page = with(
+            advance_params(&format!("page:v{version}"), 1, version, cursor),
+            "page",
+            serde_json::json!({ "index": index, "final": last }),
+        );
+        if last {
+            page["coverage"] = serde_json::json!("complete");
+        }
+        try_host_call(service, SOURCES_ADVANCE, page).await.unwrap();
+    }
+    assert_eq!(
+        inbox(service).await["collection"],
+        serde_json::json!("live")
+    );
+    assert!(
+        owed(&harness).await.is_empty(),
+        "a baseline captures nothing"
+    );
+    let first = try_host_call(
+        service,
+        ANNOUNCE,
+        serde_json::json!({ "source_key": "first", "topics": ["other"], "body": "b" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first["announcement"]["sequence"],
+        serde_json::json!(1),
+        "the baseline announced nothing into the mob's log"
+    );
+}
+
+/// A source's first collection takes a baseline and announces nothing; a
+/// first collection that brings items is refused until the baseline is
+/// taken.
+#[tokio::test]
+async fn a_first_collection_baselines_and_announces_nothing() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("put", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    let history = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("history:v0", 1, 0, "c1"),
+            &[upsert("m-0", "v1", "old mail")],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal_kind(&history).as_deref(), Some("baseline_required"));
+    let baseline = with(
+        advance_params("baseline:v0", 1, 0, "c1"),
+        "coverage",
+        serde_json::json!("complete"),
+    );
+    let advanced = try_host_call(service, SOURCES_ADVANCE, baseline)
+        .await
+        .unwrap();
+    assert_eq!(advanced["source"]["collection"], serde_json::json!("live"));
+    assert_eq!(advanced["items"], serde_json::json!([]));
+    assert!(owed(&harness).await.is_empty());
+}
+
+/// A multi-page baseline turns the source live only when its final page
+/// commits; each page before it moves the cursor and keeps it baselining.
+#[tokio::test]
+async fn a_multi_page_baseline_turns_live_only_on_its_final_page() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("put", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    for index in 0..3u64 {
+        let page = with(
+            advance_params(&format!("page:v{index}"), 1, index, &format!("p{index}")),
+            "page",
+            serde_json::json!({ "index": index, "final": false }),
+        );
+        let advanced = try_host_call(service, SOURCES_ADVANCE, page).await.unwrap();
+        assert_eq!(
+            advanced["source"]["collection"],
+            serde_json::json!("baselining")
+        );
+        assert_eq!(
+            advanced["source"]["health"]["status"],
+            serde_json::json!("baselining")
+        );
+        assert_eq!(
+            advanced["source"]["cursor"]["version"],
+            serde_json::json!(index + 1)
+        );
+    }
+    let last = with(
+        with(
+            advance_params("page:v3", 1, 3, "c1"),
+            "page",
+            serde_json::json!({ "index": 3, "final": true }),
+        ),
+        "coverage",
+        serde_json::json!("complete"),
+    );
+    let advanced = try_host_call(service, SOURCES_ADVANCE, last).await.unwrap();
+    assert_eq!(advanced["source"]["collection"], serde_json::json!("live"));
+    assert_eq!(
+        advanced["source"]["health"]["status"],
+        serde_json::json!("ok")
+    );
+}
+
+/// The first item after a baseline is announced once, captured once, and
+/// every later collection of it replays.
+#[tokio::test]
+async fn the_first_item_after_a_baseline_is_announced_exactly_once() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    let step = with_items(
+        advance_params("run:v1", 1, 1, "c2"),
+        &[upsert("m-1", "v1", "first after baseline")],
+    );
+    let first = try_host_call(service, SOURCES_ADVANCE, step.clone())
+        .await
+        .unwrap();
+    assert_eq!(outcomes(&first), vec!["announced"]);
+    assert_eq!(first["items"][0]["captured"], serde_json::json!(1));
+    try_host_call(service, SOURCES_ADVANCE, step).await.unwrap();
+    let later = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run-2:v2", 1, 2, "c3"),
+            &[upsert("m-1", "v1", "first after baseline")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcomes(&later), vec!["replayed"]);
+    assert_eq!(owed(&harness).await.get("agent:a"), Some(&1));
+}
+
+/// A backfill announces its history across pages and stops at its total
+/// bound: the page that would pass it is refused with what remains, and the
+/// final page turns the source live.
+#[tokio::test]
+async fn a_backfill_spans_pages_and_stops_at_its_total_bound() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            source_params("put", "inbox", "subject-1", &["mail.received"]),
+            "start",
+            serde_json::json!({ "kind": "backfill", "max_items": 3 }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        inbox(service).await["collection"],
+        serde_json::json!("backfilling")
+    );
+    let first = with(
+        with_items(
+            advance_params("backfill:v0", 1, 0, "b1"),
+            &[upsert("h-1", "v1", "old 1"), upsert("h-2", "v1", "old 2")],
+        ),
+        "page",
+        serde_json::json!({ "index": 0, "final": false }),
+    );
+    let advanced = try_host_call(service, SOURCES_ADVANCE, first)
+        .await
+        .unwrap();
+    assert_eq!(outcomes(&advanced), vec!["announced", "announced"]);
+    assert_eq!(
+        advanced["source"]["collection"],
+        serde_json::json!("backfilling")
+    );
+    let past = with(
+        with_items(
+            advance_params("backfill:v1", 1, 1, "b2"),
+            &[upsert("h-3", "v1", "old 3"), upsert("h-4", "v1", "old 4")],
+        ),
+        "page",
+        serde_json::json!({ "index": 1, "final": false }),
+    );
+    let refused = try_host_call(service, SOURCES_ADVANCE, past)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.data,
+        Some(serde_json::json!({ "kind": "backfill_bound_exceeded", "remaining": 1 }))
+    );
+    let last = with(
+        with(
+            with_items(
+                advance_params("backfill-last:v1", 1, 1, "c1"),
+                &[upsert("h-3", "v1", "old 3")],
+            ),
+            "page",
+            serde_json::json!({ "index": 1, "final": true }),
+        ),
+        "coverage",
+        serde_json::json!("complete"),
+    );
+    let advanced = try_host_call(service, SOURCES_ADVANCE, last).await.unwrap();
+    assert_eq!(outcomes(&advanced), vec!["announced"]);
+    assert_eq!(advanced["source"]["collection"], serde_json::json!("live"));
+}
+
+/// A subscription made while a source is busy gets none of its history; one
+/// that names an explicit frontier gets the retained window after it.
+#[tokio::test]
+async fn a_new_subscription_on_a_busy_source_gets_no_history_and_an_explicit_frontier_gets_its_window()
+ {
+    let harness = harness_with(native_serving_a_and_b());
+    let service = &harness.service;
+    live_inbox(service).await;
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "one"), upsert("m-2", "v1", "two")],
+        ),
+    )
+    .await
+    .unwrap();
+    let first_sequence = advanced["items"][0]["sequence"].as_u64().unwrap();
+    subscribe_to_inbox(service, "now", "agent:a").await;
+    let mut frontier = serde_json::Map::new();
+    frontier.insert(OWN_MOB.to_string(), serde_json::json!(first_sequence));
+    try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "subscribe-window",
+            "subscription_id": "window",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:b" },
+            "topics": ["mail.received"],
+            "start": { "kind": "after", "frontier": frontier },
+        }),
+    )
+    .await
+    .unwrap();
+    let owed_now = owed(&harness).await;
+    assert_eq!(
+        owed_now.get("agent:a"),
+        None,
+        "no history for a new subscriber"
+    );
+    assert_eq!(
+        owed_now.get("agent:b"),
+        Some(&1),
+        "the window after the frontier"
+    );
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v2", 1, 2, "c3"),
+            &[upsert("m-3", "v1", "three")],
+        ),
+    )
+    .await
+    .unwrap();
+    let owed_later = owed(&harness).await;
+    assert_eq!(owed_later.get("agent:a"), Some(&1));
+    assert_eq!(owed_later.get("agent:b"), Some(&2));
+}
+
+/// An item of a stream that has not been baselined refuses the whole
+/// advance, naming the stream, and nothing of the advance is announced.
+#[tokio::test]
+async fn an_item_of_an_unbaselined_stream_refuses_the_advance_and_announces_nothing() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    let refused = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v1", 1, 1, "c2"),
+            &[
+                upsert("m-1", "v1", "default stream"),
+                upsert_in("work", "w-1", "work"),
+            ],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        refused.data,
+        Some(serde_json::json!({ "kind": "stream_not_baselined", "streams": ["work"] }))
+    );
+    assert_eq!(
+        inbox(service).await["cursor"]["version"],
+        serde_json::json!(1)
+    );
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run-2:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "default stream")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcomes(&advanced), vec!["announced"]);
+}
+
+/// A stream onboarded with a baseline announces only the items collected
+/// after it.
+#[tokio::test]
+async fn a_baselined_stream_announces_only_its_later_items() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    let onboard = with(
+        with(
+            advance_params("onboard:v1", 1, 1, "c2"),
+            "streams",
+            serde_json::json!([{ "stream": "work", "mode": "baseline", "final": true }]),
+        ),
+        "coverage",
+        serde_json::json!("complete"),
+    );
+    let onboarded = try_host_call(service, SOURCES_ADVANCE, onboard)
+        .await
+        .unwrap();
+    assert_eq!(
+        onboarded["streams"],
+        serde_json::json!([{ "stream": "work", "phase": "live" }])
+    );
+    assert_eq!(
+        onboarded["source"]["streams"],
+        serde_json::json!({ "live": 1, "onboarding": 0 })
+    );
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v2", 1, 2, "c3"),
+            &[upsert_in("work", "w-1", "a work mail")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcomes(&advanced), vec!["announced"]);
+    let streams = try_host_call(
+        service,
+        SOURCES_GET,
+        serde_json::json!({ "source_id": "inbox", "include_streams": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(streams["streams"][0]["stream"], serde_json::json!("work"));
+    assert_eq!(streams["streams"][0]["phase"], serde_json::json!("live"));
+}
+
+/// A stream's backfill starts with its onboarding entry, in the advance that
+/// carries its first items, and stops at the stream's own bound.
+#[tokio::test]
+async fn a_stream_backfill_starts_with_its_onboarding_entry() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    let start = with(
+        with_items(
+            advance_params("backfill:v1", 1, 1, "c2"),
+            &[upsert_in("work", "w-1", "old work")],
+        ),
+        "streams",
+        serde_json::json!([
+            { "stream": "work", "mode": "backfill", "max_items": 2, "final": false }
+        ]),
+    );
+    let started = try_host_call(service, SOURCES_ADVANCE, start)
+        .await
+        .unwrap();
+    assert_eq!(outcomes(&started), vec!["announced"]);
+    assert_eq!(
+        started["streams"],
+        serde_json::json!([{ "stream": "work", "phase": "backfilling" }])
+    );
+    let past = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("backfill:v2", 1, 2, "c3"),
+            &[
+                upsert_in("work", "w-2", "old"),
+                upsert_in("work", "w-3", "older"),
+            ],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        past.data,
+        Some(serde_json::json!({
+            "kind": "backfill_bound_exceeded", "remaining": 1, "stream": "work"
+        }))
+    );
+    let last = with(
+        with(
+            with_items(
+                advance_params("backfill-last:v2", 1, 2, "c3"),
+                &[upsert_in("work", "w-2", "old")],
+            ),
+            "streams",
+            serde_json::json!([
+                { "stream": "work", "mode": "backfill", "max_items": 2, "final": true }
+            ]),
+        ),
+        "coverage",
+        serde_json::json!("complete"),
+    );
+    let finished = try_host_call(service, SOURCES_ADVANCE, last).await.unwrap();
+    assert_eq!(outcomes(&finished), vec!["announced"]);
+    assert_eq!(
+        finished["streams"],
+        serde_json::json!([{ "stream": "work", "phase": "live" }])
+    );
+}
+
+/// Each `stream_not_baselined` refusal counts toward the source's failure
+/// streak even when its collector reports nothing; a success ends the
+/// streak.
+#[tokio::test]
+async fn stream_not_baselined_refusals_count_toward_the_failure_streak() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    for attempt in 1..=3u64 {
+        let refused = try_host_call(
+            service,
+            SOURCES_ADVANCE,
+            with_items(
+                advance_params(&format!("run-{attempt}:v1"), 1, 1, "c2"),
+                &[upsert_in("work", "w-1", "work")],
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refusal_kind(&refused).as_deref(),
+            Some("stream_not_baselined")
+        );
+        let health = &inbox(service).await["health"];
+        assert_eq!(health["consecutive_failures"], serde_json::json!(attempt));
+        assert_eq!(
+            health["last_failure"]["class"],
+            serde_json::json!("refused:stream_not_baselined")
+        );
+        assert_eq!(health["totals"]["refusals"], serde_json::json!(attempt));
+        assert_eq!(health["status"], serde_json::json!("failing"));
+    }
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        advance_params("run-4:v1", 1, 1, "c2"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        advanced["source"]["health"]["consecutive_failures"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        advanced["source"]["health"]["status"],
+        serde_json::json!("ok")
+    );
+}
+
+/// Two versions and a deletion of one item are three announcements under
+/// three keys: an edit never collapses into the version before it.
+#[tokio::test]
+async fn two_versions_and_a_deletion_of_one_item_are_three_announcements() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    let changes = [
+        upsert("m-1", "v1", "draft"),
+        upsert("m-1", "v2", "edited"),
+        change_of("m-1", "v3", "delete", "deleted by its sender"),
+    ];
+    let mut keys = BTreeSet::new();
+    for (version, item) in (1u64..).zip(changes) {
+        let advanced = try_host_call(
+            service,
+            SOURCES_ADVANCE,
+            with_items(
+                advance_params(&format!("run:v{version}"), 1, version, "c"),
+                &[item],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcomes(&advanced), vec!["announced"]);
+        keys.insert(
+            advanced["items"][0]["source_key"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    assert_eq!(keys.len(), 3);
+    assert_eq!(owed(&harness).await.get("agent:a"), Some(&3));
+}
+
+/// Each advance records what its adapter observed and when; a spell of
+/// empty snapshots is dated from its first one, and a delta ends it.
+#[tokio::test]
+async fn an_advance_records_its_observation_evidence() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    let observed = |operation: &str, version: u64, evidence: serde_json::Value| {
+        with(
+            advance_params(operation, 1, version, "c"),
+            "observed",
+            evidence,
+        )
+    };
+    harness.clock.store(2_000, Ordering::SeqCst);
+    let empty = serde_json::json!({ "kind": "snapshot", "records": 0 });
+    let advanced = try_host_call(service, SOURCES_ADVANCE, observed("o1", 1, empty.clone()))
+        .await
+        .unwrap();
+    let health = &advanced["source"]["health"];
+    assert_eq!(health["last_observed"], empty);
+    assert_eq!(health["last_observed_at_ms"], serde_json::json!(2_000));
+    assert_eq!(health["empty_snapshot_since_ms"], serde_json::json!(2_000));
+    harness.clock.store(3_000, Ordering::SeqCst);
+    let advanced = try_host_call(service, SOURCES_ADVANCE, observed("o2", 2, empty))
+        .await
+        .unwrap();
+    assert_eq!(
+        advanced["source"]["health"]["empty_snapshot_since_ms"],
+        serde_json::json!(2_000),
+        "the spell keeps its start"
+    );
+    harness.clock.store(4_000, Ordering::SeqCst);
+    let delta = serde_json::json!({ "kind": "delta" });
+    let advanced = try_host_call(service, SOURCES_ADVANCE, observed("o3", 3, delta.clone()))
+        .await
+        .unwrap();
+    let health = &advanced["source"]["health"];
+    assert_eq!(health["last_observed"], delta);
+    assert_eq!(health["last_observed_at_ms"], serde_json::json!(4_000));
+    assert_eq!(health["empty_snapshot_since_ms"], serde_json::Value::Null);
+    harness.clock.store(5_000, Ordering::SeqCst);
+    let advanced = try_host_call(service, SOURCES_ADVANCE, advance_params("o4", 1, 4, "c"))
+        .await
+        .unwrap();
+    assert_eq!(
+        advanced["source"]["health"]["last_observed_at_ms"],
+        serde_json::json!(4_000),
+        "an advance that says nothing keeps the last evidence"
+    );
+}
+
+/// A rebaseline takes a fresh baseline and announces one gap notice on the
+/// source's topics, and none of the history the provider lost.
+#[tokio::test]
+async fn a_rebaseline_announces_one_gap_notice_and_no_history() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    let rebaseline = with(
+        with(
+            advance_params("rebaseline:v1", 1, 1, "r1"),
+            "rebaseline",
+            serde_json::json!({ "reason": "cursor_expired" }),
+        ),
+        "page",
+        serde_json::json!({ "index": 0, "final": false }),
+    );
+    let advanced = try_host_call(service, SOURCES_ADVANCE, rebaseline)
+        .await
+        .unwrap();
+    assert_eq!(
+        advanced["source"]["collection"],
+        serde_json::json!("baselining")
+    );
+    assert_eq!(
+        advanced["source"]["health"]["totals"]["gaps"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        owed(&harness).await.get("agent:a"),
+        Some(&1),
+        "one gap notice"
+    );
+    let notice = harness
+        .store
+        .announcement(
+            &mob(OWN_MOB),
+            &SourceKey::new("source:inbox:gap:1:2").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        notice.announced_by,
+        Announcer::Source {
+            source_id: SourceId::new("inbox").unwrap()
+        }
+    );
+    assert_eq!(notice.topics, topics(&["mail.received"]));
+    assert!(notice.body.contains("cursor_expired"), "{}", notice.body);
+    assert!(notice.body.contains("may be missing"), "{}", notice.body);
+    let history = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("history:v2", 1, 2, "r2"),
+            &[upsert("m-old", "v1", "lost history")],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal_kind(&history).as_deref(), Some("baseline_required"));
+    let last = with(
+        with(
+            advance_params("rebaseline-last:v2", 1, 2, "c9"),
+            "page",
+            serde_json::json!({ "index": 1, "final": true }),
+        ),
+        "coverage",
+        serde_json::json!("complete"),
+    );
+    let advanced = try_host_call(service, SOURCES_ADVANCE, last).await.unwrap();
+    assert_eq!(advanced["source"]["collection"], serde_json::json!("live"));
+    assert_eq!(
+        owed(&harness).await.get("agent:a"),
+        Some(&1),
+        "still one notice"
+    );
+}
+
+/// The same key with other content is a conflict: recorded with both
+/// content digests, the original untouched, and the cursor still advances.
+#[tokio::test]
+async fn a_conflicting_item_is_recorded_with_both_digests_and_the_cursor_still_advances() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    let first = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "the original")],
+        ),
+    )
+    .await
+    .unwrap();
+    let sequence = first["items"][0]["sequence"].clone();
+    let key = first["items"][0]["source_key"].clone();
+    let conflicted = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v2", 1, 2, "c3"),
+            &[upsert("m-1", "v1", "a read time leaked into the body")],
+        ),
+    )
+    .await
+    .unwrap();
+    let item = &conflicted["items"][0];
+    assert_eq!(item["outcome"], serde_json::json!("conflict"));
+    assert_eq!(item["sequence"], sequence);
+    let existing = item["existing_digest"].as_str().unwrap();
+    let offered = item["offered_digest"].as_str().unwrap();
+    assert!(existing.starts_with("sha256:") && offered.starts_with("sha256:"));
+    assert_ne!(existing, offered);
+    assert_eq!(
+        conflicted["source"]["cursor"]["version"],
+        serde_json::json!(3)
+    );
+    let health = &conflicted["source"]["health"];
+    assert_eq!(health["totals"]["conflicts"], serde_json::json!(1));
+    assert_eq!(health["last_conflict"]["source_key"], key);
+    assert_eq!(health["last_conflict"]["existing_sequence"], sequence);
+    assert_eq!(
+        health["last_conflict"]["existing_digest"],
+        serde_json::json!(existing)
+    );
+    assert_eq!(
+        health["last_conflict"]["offered_digest"],
+        serde_json::json!(offered)
+    );
+    let original = harness
+        .store
+        .announcement(
+            &mob(OWN_MOB),
+            &SourceKey::new(key.as_str().unwrap()).unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.body, "the original");
+}
+
+/// A source declared again with the same principal and scope replays the
+/// item versions still retained instead of announcing them again, and
+/// captures them for no subscriber made since.
+#[tokio::test]
+async fn a_redeclared_source_replays_retained_versions_and_redelivers_no_held_item() {
+    let harness = harness_with(native_serving_a_and_b());
+    let service = &harness.service;
+    live_inbox(service).await;
+    let first = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "kept")],
+        ),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SOURCES_END,
+        serde_json::json!({ "operation_id": "end", "source_id": "inbox", "expected_revision": 1 }),
+    )
+    .await
+    .unwrap();
+    subscribe_to_inbox(service, "later", "agent:b").await;
+    let declared = try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("again", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(declared["source"]["generation"], serde_json::json!(2));
+    let revision = declared["source"]["revision"].as_u64().unwrap();
+    let baseline = with(
+        advance_params("baseline-2:v0", revision, 0, "d1"),
+        "coverage",
+        serde_json::json!("complete"),
+    );
+    try_host_call(service, SOURCES_ADVANCE, baseline)
+        .await
+        .unwrap();
+    let again = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run-2:v1", revision, 1, "d2"),
+            &[upsert("m-1", "v1", "kept")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcomes(&again), vec!["replayed"]);
+    assert_eq!(again["items"][0]["sequence"], first["items"][0]["sequence"]);
+    assert_eq!(owed(&harness).await.get("agent:b"), None);
+}
+
+/// An advance or a failure under another principal than the generation
+/// pins is refused typed, with both principals' digests and neither
+/// principal.
+#[tokio::test]
+async fn an_advance_under_another_principal_is_refused_typed() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    let mut step = with_items(
+        advance_params("run:v1", 1, 1, "c2"),
+        &[upsert("m-1", "v1", "b")],
+    );
+    step["principal"] = principal_of("subject-2");
+    let refused = try_host_call(service, SOURCES_ADVANCE, step)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, super::rpc::ANNOUNCEMENTS_REFUSED_CODE);
+    let data = refused.data.clone().unwrap();
+    assert_eq!(data["kind"], serde_json::json!("principal_changed"));
+    let pinned = data["pinned_digest"].as_str().unwrap();
+    let offered = data["offered_digest"].as_str().unwrap();
+    assert!(pinned.starts_with("sha256:") && offered.starts_with("sha256:"));
+    assert_ne!(pinned, offered);
+    assert!(!data.to_string().contains("subject-"), "{data}");
+    let failure = try_host_call(
+        service,
+        SOURCES_RECORD_FAILURE,
+        serde_json::json!({
+            "operation_id": "fail",
+            "source_id": "inbox",
+            "expected_revision": 1,
+            "expected_version": 1,
+            "principal": principal_of("subject-2"),
+            "failure": { "class": "auth_required" },
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal_kind(&failure).as_deref(), Some("principal_changed"));
+    assert_eq!(
+        inbox(service).await["cursor"]["version"],
+        serde_json::json!(1)
+    );
+}
+
+/// A refresh or reconnect under the same verified principal keeps the
+/// source's generation, collection and cursor: a new connection reference
+/// is a configuration change, not a new baseline.
+#[tokio::test]
+async fn a_same_principal_refresh_keeps_the_generation_and_cursor() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        advance_params("run:v1", 1, 1, "c2"),
+    )
+    .await
+    .unwrap();
+    let reconnected = try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            with(
+                source_params("reconnect", "inbox", "subject-1", &["mail.received"]),
+                "connection",
+                serde_json::json!({ "kind": "connect_setup", "id": "setup-2" }),
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    let source = &reconnected["source"];
+    assert_eq!(source["generation"], serde_json::json!(1));
+    assert_eq!(source["revision"], serde_json::json!(2));
+    assert_eq!(source["collection"], serde_json::json!("live"));
+    assert_eq!(source["cursor"]["version"], serde_json::json!(2));
+    assert_eq!(source["cursor"]["token"], serde_json::json!("c2"));
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v2", 2, 2, "c3"),
+            &[upsert("m-1", "v1", "after the refresh")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcomes(&advanced), vec!["announced"]);
+}
+
+/// A deletion on a source whose provider has no observable deletions is
+/// refused typed, and the advance commits nothing.
+#[tokio::test]
+async fn a_delete_on_a_source_without_observable_deletions_is_refused() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            source_params("put", "inbox", "subject-1", &["mail.received"]),
+            "observation",
+            serde_json::json!({ "baseline": "snapshot", "deletions": "unobservable" }),
+        ),
+    )
+    .await
+    .unwrap();
+    let baseline = with(
+        advance_params("baseline", 1, 0, "c1"),
+        "coverage",
+        serde_json::json!("complete"),
+    );
+    try_host_call(service, SOURCES_ADVANCE, baseline)
+        .await
+        .unwrap();
+    let refused = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v1", 1, 1, "c2"),
+            &[
+                upsert("m-1", "v1", "b"),
+                change_of("m-2", "v9", "delete", "gone"),
+            ],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, super::rpc::ANNOUNCEMENTS_REFUSED_CODE);
+    assert_eq!(
+        refusal_kind(&refused).as_deref(),
+        Some("deletions_unobservable")
+    );
+    assert_eq!(
+        inbox(service).await["cursor"]["version"],
+        serde_json::json!(1)
+    );
+}
+
+/// A step id names one request: the same id with other content is refused
+/// typed and commits nothing.
+#[tokio::test]
+async fn a_changed_request_under_a_used_step_id_is_refused() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "b")],
+        ),
+    )
+    .await
+    .unwrap();
+    let reused = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("run:v1", 1, 1, "c2"),
+            &[upsert("m-2", "v1", "rebuilt under a used id")],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reused.code, super::rpc::ANNOUNCEMENTS_CONFLICT_CODE);
+    assert_eq!(refusal_kind(&reused).as_deref(), Some("operation_reused"));
+    assert_eq!(
+        inbox(service).await["cursor"]["version"],
+        serde_json::json!(2)
+    );
+}
+
+/// A run that lost its step's answer and its request reads the cursor
+/// again: past the step's version, the step committed, and the run goes on
+/// from the current cursor under a new step id.
+#[tokio::test]
+async fn a_resumed_run_after_an_advanced_cursor_steps_with_a_new_id() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    let run = "schedule:s:occurrence:o";
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params(&format!("{run}:v1"), 1, 1, "c2"),
+            &[upsert("m-1", "v1", "b")],
+        ),
+    )
+    .await
+    .unwrap();
+    // The answer and the request were lost; the run reads the source again.
+    let version = inbox(service).await["cursor"]["version"].as_u64().unwrap();
+    assert_eq!(version, 2, "the step committed");
+    let next = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params(&format!("{run}:v{version}"), 1, version, "c3"),
+            &[upsert("m-2", "v1", "the next page")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcomes(&next), vec!["announced"]);
+    assert_eq!(next["source"]["cursor"]["version"], serde_json::json!(3));
+}
+
+/// A page continuation moves the cursor but settles no checkpoint: the
+/// source's last success waits for the read's final page.
+#[tokio::test]
+async fn a_page_continuation_does_not_settle_a_checkpoint() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    assert_eq!(
+        inbox(service).await["health"]["last_success_at_ms"],
+        serde_json::json!(1_000)
+    );
+    harness.clock.store(2_000, Ordering::SeqCst);
+    let continuation = with(
+        with_items(
+            advance_params("read:v1", 1, 1, "page-2"),
+            &[upsert("m-1", "v1", "b")],
+        ),
+        "page",
+        serde_json::json!({ "index": 0, "final": false }),
+    );
+    let advanced = try_host_call(service, SOURCES_ADVANCE, continuation)
+        .await
+        .unwrap();
+    assert_eq!(
+        advanced["source"]["cursor"]["version"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        advanced["source"]["cursor"]["advanced_at_ms"],
+        serde_json::json!(2_000)
+    );
+    assert_eq!(
+        advanced["source"]["health"]["last_success_at_ms"],
+        serde_json::json!(1_000),
+        "a continuation settles nothing"
+    );
+    harness.clock.store(3_000, Ordering::SeqCst);
+    let last = with(
+        advance_params("read:v2", 1, 2, "c2"),
+        "page",
+        serde_json::json!({ "index": 1, "final": true }),
+    );
+    let advanced = try_host_call(service, SOURCES_ADVANCE, last).await.unwrap();
+    assert_eq!(
+        advanced["source"]["health"]["last_success_at_ms"],
+        serde_json::json!(3_000)
+    );
+}
+
+/// A baseline whose final page cannot prove complete coverage records a gap
+/// and announces one gap notice; a final onboarding page that says nothing
+/// about coverage is refused.
+#[tokio::test]
+async fn a_final_page_with_a_coverage_gap_announces_one_gap_notice() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("put", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    let silent = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        advance_params("baseline:v0", 1, 0, "c1"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(silent.code, -32602, "{silent:?}");
+    let gap = with(
+        advance_params("baseline-gap:v0", 1, 0, "c1"),
+        "coverage",
+        serde_json::json!({ "gap": { "reason": "shared_cursor" } }),
+    );
+    let advanced = try_host_call(service, SOURCES_ADVANCE, gap).await.unwrap();
+    assert_eq!(advanced["source"]["collection"], serde_json::json!("live"));
+    assert_eq!(
+        advanced["source"]["health"]["totals"]["gaps"],
+        serde_json::json!(1)
+    );
+    assert_eq!(owed(&harness).await.get("agent:a"), Some(&1));
+    let notice = harness
+        .store
+        .announcement(
+            &mob(OWN_MOB),
+            &SourceKey::new("source:inbox:gap:1:1").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(notice.body.contains("shared_cursor"), "{}", notice.body);
+}
+
+/// A cursor token over 8 KiB is refused, never cut; one at the bound is
+/// kept byte for byte.
+#[tokio::test]
+async fn a_cursor_token_over_its_bound_is_refused_never_truncated() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    live_inbox(service).await;
+    let over = "t".repeat(8 * 1024 + 1);
+    let refused = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        advance_params("run:v1", 1, 1, &over),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, -32602, "{refused:?}");
+    assert_eq!(
+        inbox(service).await["cursor"]["token"],
+        serde_json::json!("c1")
+    );
+    let at_bound = "t".repeat(8 * 1024);
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        advance_params("run-2:v1", 1, 1, &at_bound),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        inbox(service).await["cursor"]["token"],
+        serde_json::json!(at_bound)
+    );
+}
+
+/// 0.9.4 let a host announce under any key, "source:" included: retrying
+/// such an announcement after the upgrade answers its original instead of
+/// refusing it. Only a new announcement under the prefix is refused.
+#[tokio::test]
+async fn a_pre_upgrade_host_announcement_under_the_source_prefix_still_replays() {
+    let harness = harness_with(ScriptedNative::new());
+    let request = announce_request(OWN_MOB, "source:legacy-1", &["t"], "from 0.9.4");
+    let announcement = Announcement {
+        mob_id: request.mob_id.clone(),
+        sequence: 1,
+        announced_by: Announcer::Host,
+        source_key: request.source_key.clone(),
+        topics: request.topics.clone(),
+        body: request.body.clone(),
+        correlation_id: None,
+        causes: Vec::new(),
+        digest: request.digest(),
+        announced_at_ms: 1,
+    };
+    {
+        let connection =
+            rusqlite::Connection::open(harness._dir.path().join("mob_announcements.sqlite3"))
+                .unwrap();
+        connection
+            .execute(
+                "INSERT INTO announcement_logs (mob_id, head_sequence, earliest_retained)
+                 VALUES (?1, 1, 1)",
+                rusqlite::params![OWN_MOB],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO announcements
+                 (mob_id, sequence, source_key, announced_at_ms, rendered_bytes, record)
+                 VALUES (?1, 1, 'source:legacy-1', 1, ?2, ?3)",
+                rusqlite::params![
+                    OWN_MOB,
+                    i64::try_from(render_item(&announcement).len()).unwrap(),
+                    serde_json::to_string(&announcement).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO announcement_topics (topic, mob_id, sequence) VALUES ('t', ?1, 1)",
+                rusqlite::params![OWN_MOB],
+            )
+            .unwrap();
+    }
+    let replayed = try_host_call(
+        &harness.service,
+        ANNOUNCE,
+        serde_json::json!({ "source_key": "source:legacy-1", "topics": ["t"], "body": "from 0.9.4" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replayed["replayed"], serde_json::json!(true));
+    assert_eq!(replayed["announcement"]["sequence"], serde_json::json!(1));
+    let fresh = try_host_call(
+        &harness.service,
+        ANNOUNCE,
+        serde_json::json!({ "source_key": "source:legacy-2", "topics": ["t"], "body": "new" }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(fresh.code, -32602, "{fresh:?}");
 }
