@@ -81,15 +81,42 @@ def _render(reference):
     lines.extend(name + "=" + _json(schema) for name, schema in schemas.items()
                  if name not in {"meerkat_schedule_create", "meerkat_schedule_update"})
     lines.extend(["", "Pinned native result fields=" + _json(reference["result_fields"]),
-                  "Native result serialization=" + _json(reference["result_serialization"]),
-                  "Pinned identity observation error=" + _json(reference["observation_error_contract"]),
-                  "", "Primary source provenance:"])
+                  "Native result serialization=" + _json(reference["result_serialization"])])
+    if "observation_error_contract" in reference:
+        lines.append("Pinned identity observation error=" + _json(reference["observation_error_contract"]))
+    lines.extend(["", "Primary source provenance:"])
     lines.extend(source["url"] + "\n  SHA256=" + source["sha256"]
                  + "; anchors=" + source["anchors"] for source in reference["sources"])
     content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_REFERENCE_BYTES:
         raise ValueError("The rendered schedule reference exceeds its size bound.")
     return content
+
+
+def meta_schedule_reference(sdk_version):
+    """Select current product documentation without borrowing another release."""
+    if sdk_version != "0.9.4":
+        return {"content": selected_recurrence_guidance(),
+                "native_authoring_schema": "No bundled contract matches this Meta SDK version; inspect the actual granted native tools."}
+    filename = "meta_schedule_reference_0_9_4.json"
+    try:
+        raw = resources.files(__package__).joinpath(filename).read_bytes()
+        if len(raw) > MAX_REFERENCE_BYTES:
+            raise ValueError("The bundled Meta schedule reference exceeds its size bound.")
+        reference = json.loads(raw)
+        if (reference.get("version") != sdk_version or reference.get("reference_revision") != 1
+                or reference.get("kind") != REFERENCE_KIND
+                or reference.get("observed_destination") is not False):
+            raise ValueError("The bundled Meta schedule reference has invalid provenance.")
+        return {"content": _render(reference), "schedule_reference_kind": REFERENCE_KIND,
+                "schedule_reference_version": sdk_version, "schedule_reference_revision": 1,
+                "schedule_reference_sha256": hashlib.sha256(raw).hexdigest(),
+                "schedule_reference_file": filename, "schedule_reference_sources": reference["sources"],
+                "native_authoring_schema": "Pinned Meta/Core 0.9.4 source documentation with the agent-facing current_session rewrite; not a destination catalog or grant.",
+                "observed_destination": False}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        return {"ok": False, "observed_destination": False,
+                "error": "The bundled Meta scheduling reference could not be read: " + str(error)}
 
 
 def schedule_reference(installed_sdk_version):
