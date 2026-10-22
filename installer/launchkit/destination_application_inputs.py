@@ -27,7 +27,7 @@ from .forge_application_host import ForgeApplicationHost
 from .local_application_factory import LocalApplicationFactory
 from .local_application_preparation_inputs import LocalApplicationPreparationOwner
 from .local_application_source import (_application_acquisition_selection,
-    _application_viewer_selection, _compiler_sources, _json_bytes)
+    _application_viewer_selection, _compiler_sources, _json_bytes, _missing_source_input)
 from .product_runtime_custody import (await_product_validation, product_source_custody,
     require_product_installation)
 
@@ -42,7 +42,7 @@ def _source_contents(files, runtime_target):
     from .templates_v2.console_configuration import console_authentication
     spec = Blueprint.model_validate(_json(files["blueprint.json"][0]))
     if not compiler._product_acquisition_supported(spec, runtime_target=runtime_target):
-        raise CustodyError(compiler.CONNECTION_SETUP_PENDING)
+        raise CustodyError(_missing_source_input(spec))
     definition = files["config/mob.toml"][0]
     _source_definition({"format": "toml", "text": definition.decode("utf-8")})
     inventory_bytes = compiler.application_inventory_input(spec)

@@ -179,6 +179,17 @@ ORDINARY_TARGET_UNSUPPORTED = (
     "helper. Your plan is preserved.")
 
 
+def _missing_source_input(spec):
+    """Name the actual missing input; only a helper plan is pending setup support."""
+    if spec.acquisition is None:
+        if any(row.tools.rust_bundles for row in spec.agent_classes):
+            return compiler.NATIVE_BUNDLE_PENDING
+        if spec.target not in {"mac", "linux"}:
+            return ORDINARY_TARGET_UNSUPPORTED
+        return ORDINARY_SOURCE_UNAVAILABLE
+    return compiler.CONNECTION_SETUP_PENDING
+
+
 def create_local_application_source(*, guide_store, guide_id, guide_version,
         runtime_target, output_directory, model_configuration=None, replacement_selection=None):
     """Return one real source factory after publishing and checking its source.
@@ -199,14 +210,7 @@ def create_local_application_source(*, guide_store, guide_id, guide_version,
     spec = _guide(guide_store, guide_id, guide_version, storage)
     selected_plan = spec.model_dump(mode="json")
     if not compiler._product_acquisition_supported(spec, runtime_target=runtime_target):
-        # Name the actual missing input; only a helper plan is pending setup support.
-        if spec.acquisition is None:
-            if any(row.tools.rust_bundles for row in spec.agent_classes):
-                raise CustodyError(compiler.NATIVE_BUNDLE_PENDING)
-            if spec.target not in {"mac", "linux"}:
-                raise CustodyError(ORDINARY_TARGET_UNSUPPORTED)
-            raise CustodyError(ORDINARY_SOURCE_UNAVAILABLE)
-        raise CustodyError(compiler.CONNECTION_SETUP_PENDING)
+        raise CustodyError(_missing_source_input(spec))
     sources = _compiler_sources()
     artifacts = selected_runtime_artifacts(runtime_target)
     availability = compiler.package_availability(spec, runtime_target=runtime_target,
