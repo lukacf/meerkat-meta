@@ -471,7 +471,9 @@ Avoid manual runtime ID extraction for ordinary identity-scoped work. Do not ass
   The child runs no turn until each inherited key is activated in the child
   itself; until then its first model request fails with
   `forked session must explicitly activate inherited instruction keys`. Mob
-  operator authority is never copied.
+  operator authority is never copied. `meta/fork_helper` is not a durable
+  fork: its default full-history context renders the source's transcript as
+  text, activation bodies included, under every policy.
 - `runtime_options.fork_instruction_policy` decides for every fork of the
   gateway's mob, never per fork, and is applied again on every boot (the mob
   does not store it). Python `.fork_instruction_policy(...)`, TypeScript
@@ -481,9 +483,11 @@ Avoid manual runtime ID extraction for ordinary identity-scoped work. Do not ass
   - `require_explicit_activation` (default): a host-driven `fork_member` is
     committed and the host activates each key on the child
     (`MobHandle::activate_member_instruction`). A fork that starts its own
-    turn is refused before commit with `fork_instruction_refused` (Meerkat
-    `FORK_INSTRUCTION_REFUSED`, `-32037`; data `fork_instruction_refusal` with
-    `cause.kind` `policy_refuses` and the `keys`).
+    turn is refused before commit with `fork_instruction_refused` (data
+    `fork_instruction_refusal` with `cause.kind` `policy_refuses` and the
+    `keys`). No gateway method forks a member, so it never arrives as an RPC
+    error: agents get it as a `fork_off` tool error, Rust hosts as
+    `MobError::ForkInstructionRefused`.
   - `reactivate_inherited`: the fork writes the child's own activation of
     every inherited key, in every namespace, with the revision and body the
     source had in effect at the fork boundary. The child runs them without

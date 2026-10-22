@@ -757,17 +757,17 @@ are unchanged.
 ## Forks of members with activated instructions
 
 A member's activated instructions (everything a host appended with
-`meta/member_activate_instruction`, skills included) reach a fork only as
-history. The gateway's `runtime_options.fork_instruction_policy` decides what
+`meta/member_activate_instruction`, skill bodies activated that way included)
+reach a fork only as history. The gateway's `runtime_options.fork_instruction_policy` decides what
 happens to them, and its default changes what a fork of such a member does:
 
 - In 0.9.3, the fork was committed and the child's first turn failed with
   `forked session must explicitly activate inherited instruction keys`.
 - In 0.9.4, under the default `require_explicit_activation`, a fork that starts
   its own first turn (`fork_off`, a delegation fork, a council participant) is
-  refused before anything is committed, with `fork_instruction_refused`
-  (Meerkat's `FORK_INSTRUCTION_REFUSED`, `-32037`); a temporary council ends
-  with the exit reason `participant_fork_instruction_refused`. A fork you
+  refused before anything is committed, with `fork_instruction_refused`; a
+  temporary council ends with the exit reason
+  `participant_fork_instruction_refused`. A fork you
   drive with `UnifiedRuntime::fork_member` is still committed, and you activate
   each inherited key on the child before its first turn.
 

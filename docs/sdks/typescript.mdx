@@ -53,7 +53,7 @@ const results = await handle.memoryQuery({
 
 A member forked with `fork_off`, a delegation fork or a council does not run
 the instructions its source activated (`meta/member_activate_instruction`,
-skills included) unless the gateway's fork instruction policy says so. Under
+skill bodies activated that way included) unless the gateway's fork instruction policy says so. Under
 the default, `"require_explicit_activation"`, such a fork is refused with
 `fork_instruction_refused` before anything is committed. Set the policy on the
 builder; it is sent as `runtime_options.fork_instruction_policy`:
