@@ -12,7 +12,7 @@ earlier pinned 347-second horizon, 397-second OS budget.
 
 # rpc_gateway.rs GATEWAY_SHUTDOWN_HORIZON_MS, pinned by a parity test: a change
 # to the gateway's horizon moves this fallback in the same change.
-UNREPORTED_GATEWAY_SHUTDOWN_HORIZON_MS = 392_000
+UNREPORTED_GATEWAY_SHUTDOWN_HORIZON_MS = 432_000
 # The Python SDK's parse bound; it waits its own default for a larger value.
 MAX_REPORTED_GATEWAY_SHUTDOWN_HORIZON_MS = 2_147_483_647
 EARLIER_PINNED_GATEWAY_SHUTDOWN_HORIZON_MS = 347_000

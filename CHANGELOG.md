@@ -168,8 +168,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   successor got `AlreadyClaimed`) and `meta/shutdown` could report
   `runtime_cleanup_completed: false`, even for a runtime with no child mobs.
 - Forge stops a local or destination application within the shutdown horizon
-  its gateway advertised. It used a pinned 347-second budget, which cut the
-  current gateway's 392-second horizon during native cleanup. The generated
+  its gateway advertised. It used a pinned 347-second budget, shorter than the
+  stock gateway's horizon (392 seconds in 0.9.4, 432 seconds now), so a stop
+  could cut the gateway during native cleanup. The generated
   application reports its runtime's `gateway_shutdown_horizon_ms` at
   readiness. The application stop, the worker's and the host's waits, the
   service unit's stop timeout and the service manager's stop and restart
