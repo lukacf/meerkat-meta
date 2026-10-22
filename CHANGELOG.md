@@ -216,11 +216,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   kept. Finish such an application's setup before you apply an update.
 - A macOS LaunchAgent keeps the stop timeout it was installed with (397
   seconds from Forge before 0.9.5). launchd has no drop-in, so a longer
-  horizon that its application reports later is not applied, and native
-  cleanup can be cut at that timeout. The application's stop is shortened to
-  fit it (367 seconds, or 15 under the 45-second timeout of the earliest
-  releases), so native cleanup can be cut short, and Forge still records its
-  own cleanup.
+  horizon that its application reports later is not applied. The
+  application's stop is shortened to fit it (367 seconds, or 15 under the
+  45-second timeout of the earliest releases), so native cleanup can be cut
+  short, and Forge still records its own cleanup.
 - A destination deployed from a package that Forge 0.9.4 accepted keeps that
   release's destination helper and its stop budgets until the package is
   rebuilt.
