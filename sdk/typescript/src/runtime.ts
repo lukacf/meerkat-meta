@@ -919,6 +919,19 @@ export class MetaRuntime {
   }
 
   /**
+   * The shutdown horizon, in milliseconds, that this runtime's gateway
+   * advertised and its transport accepted (see
+   * {@link PersistentTransport.advertisedShutdownHorizonMs}). A process that
+   * supervises this application waits at least this long, plus the
+   * transport's own TERM and KILL graces, before it kills the gateway.
+   * `null` without a running gateway or when the gateway advertised no valid
+   * horizon.
+   */
+  get gatewayShutdownHorizonMs(): number | null {
+    return this._transport?.advertisedShutdownHorizonMs() ?? null;
+  }
+
+  /**
    * Compose the gateway transport for one connect, before any init request:
    * the configured `gatewayTransport()` factory, else the transport given to
    * the constructor, else a default `PersistentTransport`. Subclasses may

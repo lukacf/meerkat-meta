@@ -512,6 +512,7 @@ export class PersistentTransport {
   private _nativeShutdownError: Error | null = null;
   private _supportsShutdownHandshake = false;
   private _shutdownHorizonMs = PERSISTENT_TRANSPORT_SHUTDOWN_GRACE_MS;
+  private _advertisedShutdownHorizonMs: number | null = null;
   private readonly _pending = new Map<
     string,
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
@@ -604,6 +605,7 @@ export class PersistentTransport {
     // a child restart.
     this._supportsShutdownHandshake = false;
     this._shutdownHorizonMs = PERSISTENT_TRANSPORT_SHUTDOWN_GRACE_MS;
+    this._advertisedShutdownHorizonMs = null;
     // A new process gets a new reader.
     this._readerFailure = null;
     // A new process has no termination yet; a previous child's never stands
@@ -860,6 +862,7 @@ export class PersistentTransport {
         result !== null &&
         (result as Record<string, unknown>).stdio_shutdown_handshake === true;
       this._shutdownHorizonMs = PERSISTENT_TRANSPORT_SHUTDOWN_GRACE_MS;
+      this._advertisedShutdownHorizonMs = null;
       if (this._supportsShutdownHandshake) {
         const horizonMs = (result as Record<string, unknown>).stdio_shutdown_horizon_ms;
         if (
@@ -869,6 +872,7 @@ export class PersistentTransport {
           horizonMs <= MAX_GATEWAY_SHUTDOWN_HORIZON_MS
         ) {
           this._shutdownHorizonMs = horizonMs;
+          this._advertisedShutdownHorizonMs = horizonMs;
         }
       }
     }
@@ -1013,6 +1017,18 @@ export class PersistentTransport {
    */
   lastTermination(): TransportTermination | null {
     return this._lastTermination;
+  }
+
+  /**
+   * The shutdown horizon, in milliseconds, that the current gateway process
+   * advertised as `stdio_shutdown_horizon_ms` in a `meta/init` that also
+   * advertised the shutdown handshake, as accepted. `null` before that
+   * `meta/init`, or when the gateway advertised no valid horizon and this
+   * transport waits its own default; a new process never inherits an earlier
+   * one's value.
+   */
+  advertisedShutdownHorizonMs(): number | null {
+    return this._advertisedShutdownHorizonMs;
   }
 
   isRunning(): boolean {

@@ -1709,6 +1709,18 @@ class MetaRuntime:
             transport = getattr(self, "_last_gateway_transport", None)
         return getattr(transport, "last_termination", None)
 
+    @property
+    def gateway_shutdown_horizon_ms(self) -> int | None:
+        """The shutdown horizon this runtime's gateway advertised, as accepted.
+
+        Milliseconds (see ``PersistentTransport.advertised_shutdown_horizon_ms``).
+        A process that supervises this application waits at least this long,
+        plus the transport's own TERM and KILL graces, before it kills the
+        gateway. ``None`` without a running gateway or when the gateway
+        advertised no valid horizon.
+        """
+        return getattr(self._transport, "advertised_shutdown_horizon_ms", None)
+
     async def wait_gateway_ended(
         self, timeout: float | None = None
     ) -> GatewayChildEndedError | None:

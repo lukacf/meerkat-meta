@@ -376,6 +376,7 @@ class PersistentTransport:
         self._stderr_file = None
         self._supports_shutdown_handshake = False
         self._shutdown_horizon_seconds = _GATEWAY_SHUTDOWN_GRACE_SECONDS
+        self._advertised_shutdown_horizon_ms: int | None = None
         # What stops observed for the current child (``last_termination``).
         # The escalation and the shutdown answer belong to that child: a later
         # stop of the same child keeps them and never asks it twice.
@@ -599,6 +600,7 @@ class PersistentTransport:
             # Capabilities and streams belong to this exact child.
             self._supports_shutdown_handshake = False
             self._shutdown_horizon_seconds = _GATEWAY_SHUTDOWN_GRACE_SECONDS
+            self._advertised_shutdown_horizon_ms = None
             # So do the stop record and progress: a new child starts without.
             self._last_termination = None
             self._attempted_escalation = "none"
@@ -1021,6 +1023,7 @@ class PersistentTransport:
                 and result.get("stdio_shutdown_handshake") is True
             )
             shutdown_horizon = _GATEWAY_SHUTDOWN_GRACE_SECONDS
+            advertised_horizon_ms = None
             if supports_shutdown_handshake and isinstance(result, dict):
                 horizon_ms = result.get("stdio_shutdown_horizon_ms")
                 if (
@@ -1029,10 +1032,12 @@ class PersistentTransport:
                     and 0 < horizon_ms <= _MAX_GATEWAY_SHUTDOWN_HORIZON_MS
                 ):
                     shutdown_horizon = horizon_ms / 1000.0
+                    advertised_horizon_ms = horizon_ms
             with self._pending_lock:
                 if process is self._process:
                     self._supports_shutdown_handshake = supports_shutdown_handshake
                     self._shutdown_horizon_seconds = shutdown_horizon
+                    self._advertised_shutdown_horizon_ms = advertised_horizon_ms
         return response
 
     def _send_sync_running(
@@ -1397,6 +1402,18 @@ class PersistentTransport:
         one's record, and a stop with nothing to stop never overwrites one.
         """
         return getattr(self, "_last_termination", None)
+
+    @property
+    def advertised_shutdown_horizon_ms(self) -> int | None:
+        """The shutdown horizon the current gateway advertised and was accepted.
+
+        Milliseconds, from the ``stdio_shutdown_horizon_ms`` of a ``meta/init``
+        that also advertised the shutdown handshake. ``None`` before that
+        ``meta/init``, or when the gateway advertised no valid horizon and
+        this transport waits its own default. A new process never inherits
+        an earlier one's value.
+        """
+        return getattr(self, "_advertised_shutdown_horizon_ms", None)
 
     @property
     def child_ended(self) -> GatewayChildEndedError | None:

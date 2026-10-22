@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   context with `META_FORGE_ORGANIZATION` and the
   `meerkat_forge.organizations.v1` Python entry-point group. New setups retain
   their selected contribution; examples remain editable drafts.
+- The Python and TypeScript runtimes report the shutdown horizon their
+  gateway advertised in `meta/init`, as the transport accepted it:
+  `runtime.gateway_shutdown_horizon_ms` and
+  `runtime.gatewayShutdownHorizonMs`, in milliseconds. The value is `None` or
+  `null` before `meta/init`, or when the gateway advertised no valid horizon
+  and the transport waits its own default. A replacement gateway process
+  never inherits an earlier value. The transports expose it as
+  `advertised_shutdown_horizon_ms` and `advertisedShutdownHorizonMs()`. A
+  process that supervises an application can use it to size its stop window.
 
 ### Changed
 
