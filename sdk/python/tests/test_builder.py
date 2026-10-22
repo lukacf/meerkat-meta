@@ -373,6 +373,32 @@ class TestBuilderChain:
 
         assert params["runtime_options"]["allow_remote"] is False
 
+    def test_shutdown_in_flight_drain_defaults_to_omitted(self):
+        params = MetaRuntime(Meta.builder()._config)._build_init_params()
+
+        assert "shutdown_in_flight_drain_ms" not in params
+
+    def test_shutdown_in_flight_drain_ms_sets_top_level_init_param(self):
+        b = Meta.builder().shutdown_in_flight_drain_ms(60_000)
+        params = MetaRuntime(b._config)._build_init_params()
+
+        assert params["shutdown_in_flight_drain_ms"] == 60_000
+        assert "shutdown_in_flight_drain_ms" not in params["runtime_options"]
+
+    @pytest.mark.parametrize("window_ms", [0, 300_000])
+    def test_shutdown_in_flight_drain_ms_sends_its_bounds(self, window_ms):
+        b = Meta.builder().shutdown_in_flight_drain_ms(window_ms)
+        params = MetaRuntime(b._config)._build_init_params()
+
+        assert params["shutdown_in_flight_drain_ms"] == window_ms
+
+    @pytest.mark.parametrize("window_ms", [-1, 300_001, 1.5, True, "60000"])
+    def test_shutdown_in_flight_drain_ms_rejects_values_the_gateway_refuses(
+        self, window_ms
+    ):
+        with pytest.raises(ValueError, match="in 0..=300000"):
+            Meta.builder().shutdown_in_flight_drain_ms(window_ms)
+
     def test_meerkat_config_defaults_to_omitted(self):
         params = MetaRuntime(Meta.builder()._config)._build_init_params()
 

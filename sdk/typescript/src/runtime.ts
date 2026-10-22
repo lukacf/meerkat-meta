@@ -1270,6 +1270,10 @@ export class MetaRuntime {
     if (this._config.persistentState) {
       params.persistent_state = this._config.persistentState;
     }
+    const inFlightDrainMs = this._config.shutdownInFlightDrainMs;
+    if (inFlightDrainMs !== undefined && inFlightDrainMs !== null) {
+      params.shutdown_in_flight_drain_ms = inFlightDrainMs;
+    }
     if (this._config.rosterProvider !== null) {
       params.has_roster_provider = true;
     }
