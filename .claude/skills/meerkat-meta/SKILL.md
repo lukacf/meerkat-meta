@@ -469,8 +469,9 @@ Avoid manual runtime ID extraction for ordinary identity-scoped work. Do not ass
 - A durable fork (`fork_off`, `UnifiedRuntime::fork_member`, a live delegation
   fork, temporary council participants) copies those rows only as history.
   The child runs no turn until each inherited key is activated in the child
-  itself (`forked session must explicitly activate inherited instruction
-  keys`). Mob operator authority is never copied.
+  itself; until then its first model request fails with
+  `forked session must explicitly activate inherited instruction keys`. Mob
+  operator authority is never copied.
 - `runtime_options.fork_instruction_policy` decides for every fork of the
   gateway's mob, never per fork, and is applied again on every boot (the mob
   does not store it). Python `.fork_instruction_policy(...)`, TypeScript

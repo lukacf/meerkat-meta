@@ -540,9 +540,9 @@ rendered for the child as `[meerkat-inherited-instruction-v1]` with
 `status=historical_only_not_active_in_child`. The child can read what its
 source was told, but none of it is in effect. A child runs no model turn while
 an inherited key has no activation of its own: its first model request fails
-with `forked session must explicitly activate inherited instruction keys:
-[...]`. The policy decides who writes that activation, or refuses the fork
-instead.
+with `forked session must explicitly activate inherited instruction keys`,
+followed by the keys. The policy decides who writes that activation, or
+refuses the fork instead.
 
 ### The three policies
 
@@ -644,12 +644,14 @@ structured data:
 | `activation` (with `code`) | The activation rules refused a re-activation row. |
 | `member_host_unsupported` | `reactivate_inherited`, but the member host that holds a placed source is older than 0.9.4 and cannot apply the policy. Upgrade member hosts before their controller. |
 
-The message names the keys, for example `fork of member 'assistant' refused:
-fork refused: the child would inherit activated instruction keys
-[app.skills/calendar] and the fork instruction policy refuses them;
-reactivate_inherited carries them into the child`. An agent that called
-`fork_off` gets a tool error with that message after `tool 'fork_off' failed:`
-and the structured data above. A temporary council ends with the exit reason
+The message names the keys, for example:
+
+```text
+fork of member 'assistant' refused: fork refused: the child would inherit activated instruction keys [app.skills/calendar] and the fork instruction policy refuses them; reactivate_inherited carries them into the child
+```
+
+An agent that called `fork_off` gets a tool error with that message after
+`tool 'fork_off' failed:` and the structured data above. A temporary council ends with the exit reason
 `participant_fork_instruction_refused`, naming the participant's order and the
 refusal; nothing was created for that participant, so its cleanup has nothing
 to revoke.
