@@ -8142,10 +8142,12 @@ mod tests {
 
         let attached = bound(weak.clone(), member.clone(), session_id.clone());
         assert_eq!(attached.observe("echo").await, usable);
-        assert_eq!(
-            attached.wait("echo", Duration::from_millis(10)).await,
-            usable
-        );
+        // The wait's two identity checks read the identity table, which can
+        // take more than a few milliseconds on a busy host. This row is about
+        // currency, so its budget is one those reads cannot exhaust; the wait
+        // still answers as soon as they finish. The held-table row below pins
+        // the deadline itself.
+        assert_eq!(attached.wait("echo", Duration::from_secs(30)).await, usable);
         assert_eq!(
             bound(
                 weak.clone(),
