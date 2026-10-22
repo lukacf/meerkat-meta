@@ -26688,6 +26688,8 @@ mod mob_announcement_console_access_tests {
         ("meta/mob_announcements/sources/end", true),
         ("meta/mob_announcements/sources/get", false),
         ("meta/mob_announcements/sources/list", false),
+        ("meta/mob_announcements/sources/advance", true),
+        ("meta/mob_announcements/sources/record_failure", true),
     ];
 
     /// The console takes the family's methods and its read/mutate split from
