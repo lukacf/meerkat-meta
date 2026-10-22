@@ -1666,3 +1666,40 @@ async def test_package_hashing_and_compression_leave_the_event_loop_free(service
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         assert "SHA256SUMS" in archive.namelist()
     assert stalls and max(stalls) < 0.5
+
+
+def held_workspace_lock(service, status, seconds):
+    """Hold this build's workspace lock as a long writer would, then release it."""
+    import fcntl
+    import os
+    path = workspace(service, status).root / "workspace.lock"
+    descriptor = os.open(path, os.O_RDWR)
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    release = threading.Timer(seconds, os.close, (descriptor,))
+    release.start()
+    return release
+
+
+@pytest.mark.parametrize("reader", ["status", "selected-runtime"])
+async def test_server_reads_refuse_a_busy_workspace_within_their_bound(service, monkeypatch, reader):
+    # A browser poll or an install check must not wait without bound for a
+    # workspace lock: abandoned polls would queue up in the thread pool.
+    from launchkit import implementation as implementation_module
+    status = await service.submit(service.guide.identity, 3)
+    await complete(service, status)
+    status = await service.status(service.guide.identity)
+    monkeypatch.setattr(implementation_module, "WORKSPACE_READ_LOCK_TIMEOUT", 0.3, raising=False)
+    release = held_workspace_lock(service, status, 3.0)
+    started = time.monotonic()
+    try:
+        with pytest.raises(DraftConflict, match="busy"):
+            if reader == "status":
+                await service.status(service.guide.identity)
+            else:
+                await asyncio.to_thread(service.selected_runtime_target, service.guide.identity,
+                    build_id=status["build_id"], source_digest=status["source_digest"])
+        assert time.monotonic() - started < 2.0
+    finally:
+        release.join()
+    # The same read succeeds once the lock is free again.
+    assert (await service.status(service.guide.identity))["build_id"] == status["build_id"]

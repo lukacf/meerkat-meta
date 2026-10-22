@@ -27,6 +27,12 @@ from .deployment_deadlines import WORKER_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOU
 
 ACCEPTANCE_POLICY_VERSION = 1
 IMPLEMENTATION_SECONDS = 2400
+# How long selection recovery waits for the event loop to read the guide while
+# its worker thread holds the build's selection locks.
+SELECTION_FENCE_TIMEOUT = 30
+# How long a server read (status, packaging, runtime selection) waits for the
+# workspace lock before it refuses as busy, instead of holding a pool thread.
+WORKSPACE_READ_LOCK_TIMEOUT = 15
 _UNSET_SELECTED_BUILD = object()
 _UNSET_TRIAL_REPLAY = object()
 
@@ -1040,7 +1046,15 @@ class ImplementationService:
             def require_current():
                 if build_id in self.tasks or build_id in self.processes:
                     raise DraftConflict("This build still has an original owner. Its selection cannot be recovered while that work is held.")
-                current = asyncio.run_coroutine_threadsafe(self._guide(guide_id), loop).result()
+                # This worker thread holds the build's selection locks. A loop
+                # that waits for one of them could never answer, so wait a
+                # bounded time and give the locks back by refusing instead.
+                pending = asyncio.run_coroutine_threadsafe(self._guide(guide_id), loop)
+                try:
+                    current = pending.result(timeout=SELECTION_FENCE_TIMEOUT)
+                except TimeoutError:
+                    pending.cancel()
+                    raise DraftConflict("Forge is busy. Recover this selection again in a moment.") from None
                 if current["version"] != version:
                     raise DraftConflict("This setup changed. Reload its saved builds before recovering a selection.")
 
@@ -1048,11 +1062,11 @@ class ImplementationService:
             return {"guide_id": guide_id, "version": version, "build_id": build_id,
                     "selection_restored": True}
 
-    def _retained_runtime_candidate(self, directory, frozen):
+    def _retained_runtime_candidate(self, directory, frozen, *, lock_timeout=None):
         """Read a saved host selection, never admit one from input JSON alone."""
         from .implementation_workspace import ImplementationWorkspace
         workspace = ImplementationWorkspace(directory / "workspace", frozen["blueprint"])
-        with workspace._locked():
+        with workspace._locked(timeout=lock_timeout):
             stored = workspace._state()
             files = workspace._files(stored)
             selection = workspace._runtime_candidate(stored, files)
@@ -1070,7 +1084,7 @@ class ImplementationService:
         Recovery is pure source identity; current deployment admission separately
         rechecks the external artifacts through candidate_selection.
         """
-        from .implementation_workspace import ImplementationWorkspace
+        from .implementation_workspace import ImplementationWorkspace, WorkspaceBusy
         from .runtime_selection import parse_candidate_selection
         error = "The selected accepted runtime source changed. Reload before deploying it."
         if not isinstance(source_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", source_digest):
@@ -1084,12 +1098,14 @@ class ImplementationService:
             scope = {"id": guide_id, "version": frozen.get("guide_version"),
                      "blueprint": frozen.get("blueprint"), "brief": frozen.get("brief"),
                      "organization": frozen.get("organization")}
-            snapshot = self._accepted_framework(guide_id, build_id, source_digest, scope, frozen["blueprint"])
-            selection = self._retained_runtime_candidate(directory, frozen)
+            snapshot = self._accepted_framework(guide_id, build_id, source_digest, scope, frozen["blueprint"],
+                lock_timeout=WORKSPACE_READ_LOCK_TIMEOUT)
+            selection = self._retained_runtime_candidate(directory, frozen,
+                lock_timeout=WORKSPACE_READ_LOCK_TIMEOUT)
             if snapshot.runtime_candidate != selection:
                 raise DraftConflict(error)
             workspace = ImplementationWorkspace(directory / "workspace", frozen["blueprint"])
-            with workspace._locked():
+            with workspace._locked(timeout=WORKSPACE_READ_LOCK_TIMEOUT):
                 stored = workspace._state()
                 files = workspace._files(stored)
                 if (workspace._digest(files) != source_digest
@@ -1099,6 +1115,8 @@ class ImplementationService:
                     raise DraftConflict(error)
                 self._fence_selected(guide_id, build_id)
             return parse_candidate_selection(selection) if selection is not None else None
+        except WorkspaceBusy:
+            raise
         except (LookupError, OSError, ValueError, TypeError, KeyError):
             raise DraftConflict(error) from None
 
@@ -1113,11 +1131,11 @@ class ImplementationService:
         if selected != expected:
             raise DraftConflict("The selected application build changed. Reload before continuing it.")
 
-    def _accepted_framework(self, guide_id, build_id, source_digest, state, proposal):
+    def _accepted_framework(self, guide_id, build_id, source_digest, state, proposal, *, lock_timeout=None):
         """Read an exact host-accepted baseline without selecting its application source."""
         from .acceptance import SemanticAcceptance
         from .artifact_binding import frozen_matches
-        from .implementation_workspace import ImplementationWorkspace
+        from .implementation_workspace import ImplementationWorkspace, WorkspaceBusy
         error = "The installed framework baseline is unavailable or no longer independently accepted. No builder was started."
         try:
             directory = self._directory(guide_id, build_id)
@@ -1139,14 +1157,14 @@ class ImplementationService:
                     or not all((directory / "acceptance" / name).is_file()
                         for name in ("acceptance-state.json", "acceptance-key", "acceptance.lock"))):
                 raise DraftConflict(error)
-            old = ImplementationWorkspace(directory / "workspace", proposal)
+            old = ImplementationWorkspace(directory / "workspace", proposal, read_lock_timeout=lock_timeout)
             accepted = SemanticAcceptance(directory / "acceptance", old, frozen).verification()
             if (not accepted or accepted.get("status") != "pass" or accepted.get("ready_to_package") is not True
                     or accepted.get("tests_run", 0) <= 0 or accepted.get("source_digest") != source_digest
                     or accepted.get("blueprint_digest") != fingerprint(proposal)
                     or accepted.get("brief_digest") != fingerprint(frozen["brief"])):
                 raise DraftConflict(error)
-            with old._locked():
+            with old._locked(timeout=lock_timeout):
                 stored = old._state()
                 files = old._files(stored)
                 checked = old._verification(stored, files)
@@ -1155,6 +1173,8 @@ class ImplementationService:
                     raise DraftConflict(error)
                 return old._framework_snapshot(stored, files, build_id=build_id,
                     accepted_source_digest=source_digest)
+        except WorkspaceBusy:
+            raise
         except (LookupError, OSError, ValueError, TypeError, KeyError):
             raise DraftConflict(error) from None
 
@@ -1908,11 +1928,12 @@ class ImplementationService:
             receipt["trial_replay"] = await asyncio.to_thread(trial_replay_projection, directory, frozen, receipt, state)
             return receipt
         from .implementation_workspace import ImplementationWorkspace
-        workspace = ImplementationWorkspace(directory / "workspace", frozen["blueprint"])
+        workspace = ImplementationWorkspace(directory / "workspace", frozen["blueprint"],
+            read_lock_timeout=WORKSPACE_READ_LOCK_TIMEOUT)
         def inspect():
             # Bind the file inventory, check and authored samples to the same
             # host snapshot. Sample metadata never imports application code.
-            with workspace._locked():
+            with workspace._locked(timeout=WORKSPACE_READ_LOCK_TIMEOUT):
                 stored = workspace._state()
                 exported = workspace._files(stored)
                 files = workspace._list(exported, stored)
@@ -1970,7 +1991,8 @@ class ImplementationService:
         directory = self._directory(guide_id, status["build_id"])
         from .implementation_workspace import ImplementationWorkspace
         frozen = json.loads((directory / "input.json").read_text())
-        workspace = ImplementationWorkspace(directory / "workspace", frozen["blueprint"])
+        workspace = ImplementationWorkspace(directory / "workspace", frozen["blueprint"],
+            read_lock_timeout=WORKSPACE_READ_LOCK_TIMEOUT)
         return {"path": path, "content": await asyncio.to_thread(workspace.read_file, path)}
 
     async def timeline(self, guide_id, after=None, limit=200, build_id=None):
@@ -2010,7 +2032,8 @@ class ImplementationService:
         directory = self._directory(guide_id, status["build_id"])
         frozen = json.loads((directory / "input.json").read_text())
         from .implementation_workspace import ImplementationWorkspace
-        workspace = ImplementationWorkspace(directory / "workspace", frozen["blueprint"])
+        workspace = ImplementationWorkspace(directory / "workspace", frozen["blueprint"],
+            read_lock_timeout=WORKSPACE_READ_LOCK_TIMEOUT)
         files = await asyncio.to_thread(workspace.export_files, require_verified=True)
         if status.get("acceptance_current"):
             from .acceptance import SemanticAcceptance
