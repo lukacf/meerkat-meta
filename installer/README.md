@@ -1457,11 +1457,26 @@ as unconfirmed; closing the tab is not confirmation.
 
 ### Set up an installed application's channels
 
-When the installed Console offers **Set up your app**, its conversation can
-inspect the setup capabilities supplied by that application. Ask what is
-supported before providing service details. The application decides which
-channels, participants and actions it permits; this panel does not add arbitrary
-integrations to an existing build. Enter credentials only in its protected forms.
+For an application built with the matching native Toolkit runtime, use
+**Connect setup** in its installed Console. This panel belongs to the selected
+`ToolkitApplicationSelection` and supports the capabilities supplied by that
+application. Ask what is supported before providing service details, and enter
+credentials only in the protected forms.
+
+Return to the same application's Console to continue setup, including when it
+runs in the background. This requires an installation that already supports the
+panel and a current authorized login. Being installed or running does not itself
+add setup support. For an older application without that capability, return to
+its saved setup in Forge and review a compatible update; there is no automatic
+setup retrofit or separate panel for arbitrary installed applications.
+
+**Set up your app** is a separate, optional generic setup conversation. It uses
+a protocol 1 subprocess selected by `MOBKIT_CONNECT_BIN`. This variable is an
+operator-only advanced legacy override: the installation owner must supply and
+qualify the executable for that application and its current login. Normal
+**Connect setup** uses the matching selected Toolkit product and runtime.
+Changing the variable does not install native setup support, authenticate the
+user or add new application capabilities.
 
 Closing the panel detaches the view and leaves the application running. Reopen
 it to check the original work before sending another request after an uncertain

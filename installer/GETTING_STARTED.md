@@ -714,17 +714,29 @@ through Telegram as well as the Console, using the same saved collection." A
 connection that lets agents read a service's data does not automatically provide
 a place for people to chat.
 
-If your Console offers **Set up your app**, open it to ask about the setup options
-this application supports. Keep passwords and tokens in the protected forms it
-opens, not in your messages. Closing the panel leaves the application running.
-A proposed or saved setting is not proof that a channel works; complete its
-setup, then send and receive a real message through that channel.
+If your installed Console offers **Connect setup**, use it to configure the
+connections supported by that application. Return to the same Console to
+continue setup, including when the app runs in the background. This requires an
+app that already supports setup and a current authorized login; an older app
+does not gain setup support just by being installed or running.
 
-If this panel reports missing native authentication, missing application context
-or an unsupported setup runtime, return to the saved setup in Forge and review
-that part of the application with the guide. Console sign-in does not supply
-native authentication. **Check current status** only reads the original setup
-result; it does not restart the setup agent or repair the application.
+Some installations instead offer the optional **Set up your app** conversation.
+Its setup component is selected by the installation operator. The two panels
+have different runtime requirements; see
+[Installed application setup](README.md#set-up-an-installed-applications-channels)
+for the distinction.
+
+Keep passwords and tokens in the protected forms, not in your messages. Closing
+either panel leaves the application running. A proposed or saved setting is not
+proof that a channel works; complete its setup, then send and receive a real
+message through that channel.
+
+If **Set up your app** reports missing native authentication, missing application
+context or an unsupported setup runtime, return to the saved setup in Forge and
+review that part of the application with the guide. Console sign-in alone does
+not make that optional component compatible. Its **Check current status** action
+only reads the original setup result; it does not restart the setup agent or
+repair the application.
 
 If the installed app cannot support the requested channel yet, refine its plan
 with the guide and review the resulting build. Apply it to the same installation
