@@ -1351,6 +1351,56 @@ class ModelsCatalogResult:
 
 
 @dataclass(frozen=True)
+class ScheduleToolDefinition:
+    """One of Meerkat's durable schedule tools, as ``meta/schedule/tools`` lists it.
+
+    ``input_schema`` is the tool's JSON input schema exactly as Meerkat
+    defines it; this SDK carries it without re-declaring its shape.
+    """
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ScheduleToolsResult:
+    """Result of ``meta/schedule/tools``: Meerkat's ``ScheduleToolsResult``.
+
+    The base definitions of the ``meerkat_schedule_*`` tools a member whose
+    profile sets ``tools.schedule = true`` is given. Inside that member's
+    session, ``meerkat_schedule_create`` and ``meerkat_schedule_update`` also
+    accept a session target of ``type: "current_session"``.
+    """
+
+    tools: list[ScheduleToolDefinition]
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ScheduleToolsResult:
+        """Parse the result; raise ``ValueError`` on any other shape."""
+        tools = data.get("tools") if isinstance(data, dict) else None
+        if not isinstance(tools, list):
+            raise ValueError(f"invalid meta/schedule/tools result: {data!r}")
+        parsed: list[ScheduleToolDefinition] = []
+        for tool in tools:
+            if (
+                not isinstance(tool, dict)
+                or not isinstance(tool.get("name"), str)
+                or not isinstance(tool.get("description"), str)
+                or not isinstance(tool.get("inputSchema"), dict)
+            ):
+                raise ValueError(f"invalid meta/schedule/tools result: {data!r}")
+            parsed.append(
+                ScheduleToolDefinition(
+                    name=tool["name"],
+                    description=tool["description"],
+                    input_schema=dict(tool["inputSchema"]),
+                )
+            )
+        return cls(tools=parsed)
+
+
+@dataclass(frozen=True)
 class MobpackToolsCatalogResult:
     """Result of a meta/tools/catalog RPC call."""
     schema_version: str

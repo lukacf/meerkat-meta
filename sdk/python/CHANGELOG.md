@@ -4,6 +4,11 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+- `MobHandle.schedule_tools()` returns `ScheduleToolsResult`, the definitions
+  of Meerkat's durable schedule tools from `meta/schedule/tools`: one
+  `ScheduleToolDefinition` (`name`, `description`, `input_schema`) per tool.
+  It raises `ValueError` on a malformed result.
+
 ## 0.9.4
 
 - `MemberReloadRequiredError` (an `RpcError`), with

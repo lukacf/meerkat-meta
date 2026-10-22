@@ -235,3 +235,71 @@ async def test_real_gateway_reset_reprofile_materializes_shell_tools(tmp_path):
         assert "shell" not in await handle.identity_resolved_tools("domain:plain")
     finally:
         await runtime.shutdown()
+
+
+_SCHEDULE_MOB_TOML = """\
+[mob]
+id = "schedule-tools-python-smoke"
+
+[profiles.scheduler]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.scheduler.tools]
+comms = true
+schedule = true
+
+[profiles.plain]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.plain.tools]
+comms = true
+"""
+
+
+class _ScheduleRoster:
+    async def roster(self, context: dict) -> list[DurableAgentSpec]:
+        return [
+            DurableAgentSpec(
+                identity="ops:scheduler",
+                profile="scheduler",
+                addressability="addressable",
+            ),
+            DurableAgentSpec(
+                identity="ops:plain",
+                profile="plain",
+                addressability="addressable",
+            ),
+        ]
+
+
+def _schedule_tool_names(tools) -> set[str]:
+    return {name for name in tools if name.startswith("meerkat_schedule_")}
+
+
+@_skip_no_binary
+@pytest.mark.asyncio
+@pytest.mark.timeout(90)
+async def test_real_gateway_schedule_tools_name_a_schedule_granted_member_surface(tmp_path):
+    """The listing names exactly the schedule tools a granted member resolves."""
+    mob_toml = tmp_path / "mob.toml"
+    mob_toml.write_text(_SCHEDULE_MOB_TOML)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    runtime = await _build_runtime(mob_toml, state_dir, _ScheduleRoster())
+    try:
+        handle = runtime.mob_handle()
+        listed = {tool.name for tool in (await handle.schedule_tools()).tools}
+        assert listed
+        assert _schedule_tool_names(listed) == listed
+
+        await runtime.reset("ops:scheduler")
+        await runtime.reset("ops:plain")
+        granted = set(await handle.identity_resolved_tools("ops:scheduler"))
+        plain = set(await handle.identity_resolved_tools("ops:plain"))
+        assert _schedule_tool_names(granted) == listed
+        assert _schedule_tool_names(plain) == set()
+    finally:
+        await runtime.shutdown()

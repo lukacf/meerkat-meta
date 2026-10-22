@@ -559,6 +559,43 @@ fn gateway_static_scheduling_methods_are_not_found() {
     }
 }
 
+/// `meta/schedule/tools` answers Meerkat's own schedule tool definitions,
+/// unchanged, through the real gateway, and `meta/capabilities` lists it.
+#[test]
+fn gateway_schedule_tools_lists_the_durable_schedule_tool_definitions() {
+    let state_dir = tempfile::tempdir().expect("state dir");
+    let mut gateway = GatewayProcess::start();
+    let init = gateway.init_with_runtime_options(&state_dir, json!({}));
+    assert_eq!(init["result"]["contract_version"], json!("0.5.0"), "{init}");
+
+    let listed = gateway.rpc(json!({
+        "jsonrpc": "2.0",
+        "id": "schedule-tools",
+        "method": "meta/schedule/tools",
+        "params": {}
+    }));
+    assert!(listed["error"].is_null(), "{listed}");
+    assert_eq!(
+        listed["result"],
+        json!({ "tools": meerkat::schedule_tools_list() }),
+        "{listed}"
+    );
+
+    let capabilities = gateway.rpc(json!({
+        "jsonrpc": "2.0",
+        "id": "capabilities",
+        "method": "meta/capabilities",
+        "params": {}
+    }));
+    let advertised = capabilities["result"]["methods"]
+        .as_array()
+        .expect("methods array")
+        .iter()
+        .filter(|method| method.as_str() == Some("meta/schedule/tools"))
+        .count();
+    assert_eq!(advertised, 1, "{capabilities}");
+}
+
 #[test]
 fn gateway_runtime_options_gating_config_path_supplies_risk_tiers() {
     let state_dir = tempfile::tempdir().expect("state dir");

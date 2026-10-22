@@ -145,6 +145,7 @@ from .types import (
     RediscoverReport,
     RoutingResolution,
     RuntimeRouteResult,
+    ScheduleToolsResult,
     SendMessageResult,
     SpawnResult,
     StatusResult,
@@ -2911,6 +2912,17 @@ class MobHandle:
         """Return the curated model catalog with provider defaults."""
         raw = await self._runtime._rpc("meta/models/catalog")
         return ModelsCatalogResult.from_dict(raw)
+
+    async def schedule_tools(self) -> ScheduleToolsResult:
+        """Return the definitions of Meerkat's durable schedule tools.
+
+        Static: the gateway answers ``meta/schedule/tools`` from Meerkat's own
+        definitions, without a schedule store or host. Whether this gateway
+        attached the tools is the ``schedule`` slot of the ``storage``
+        summary. Raises ``ValueError`` on a malformed result.
+        """
+        raw = await self._runtime._rpc("meta/schedule/tools")
+        return ScheduleToolsResult.from_dict(raw)
 
     async def storage_doctor(
         self,

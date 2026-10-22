@@ -22,6 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   never inherits an earlier value. The transports expose it as
   `advertised_shutdown_horizon_ms` and `advertisedShutdownHorizonMs()`. A
   process that supervises an application can use it to size its stop window.
+- `meta/schedule/tools` lists the definitions of Meerkat's durable schedule
+  tools (`meerkat_schedule_*`), unchanged from Meerkat's own `schedule/tools`
+  result, on the unified stdio and console (`POST /console/rpc`) surfaces,
+  and `meta/capabilities` advertises it there. The answer is static: no
+  schedule store is opened, no schedule host is started, and params are
+  ignored. These are the base definitions; inside a member's session,
+  `meerkat_schedule_create` and `meerkat_schedule_update` also accept a
+  `current_session` session target. The module-only surface, the
+  aggregator-only console and the Flow Editor do not serve it. The Python and
+  TypeScript SDKs read it with `MobHandle.schedule_tools()` and
+  `MobHandle.scheduleTools()`.
 
 ### Changed
 

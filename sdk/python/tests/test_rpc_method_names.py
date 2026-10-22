@@ -2336,3 +2336,46 @@ async def test_live_send_input_image_wire_shape():
             "data": "aGVsbG8=",
         },
     }
+
+
+_SCHEDULE_LIST_TOOL = {
+    "name": "meerkat_schedule_list",
+    "description": "List all schedules in the active realm.",
+    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+}
+
+
+@pytest.mark.asyncio
+async def test_schedule_tools_rpc_name_and_typed_result():
+    handle, calls = make_mock_mob_handle({
+        "meta/schedule/tools": {"tools": [_SCHEDULE_LIST_TOOL]},
+    })
+
+    result = await handle.schedule_tools()
+
+    assert calls == [("meta/schedule/tools", None)]
+    assert [tool.name for tool in result.tools] == ["meerkat_schedule_list"]
+    assert result.tools[0].description == _SCHEDULE_LIST_TOOL["description"]
+    assert result.tools[0].input_schema == _SCHEDULE_LIST_TOOL["inputSchema"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {},
+        {"tools": {}},
+        {"tools": ["meerkat_schedule_list"]},
+        {"tools": [{**_SCHEDULE_LIST_TOOL, "name": 7}]},
+        {"tools": [{**_SCHEDULE_LIST_TOOL, "description": None}]},
+        {"tools": [{
+            key: value for key, value in _SCHEDULE_LIST_TOOL.items() if key != "inputSchema"
+        }]},
+        {"tools": [{**_SCHEDULE_LIST_TOOL, "inputSchema": "object"}]},
+    ],
+)
+async def test_schedule_tools_fails_closed_on_malformed_results(raw):
+    handle, _calls = make_mock_mob_handle({"meta/schedule/tools": raw})
+
+    with pytest.raises(ValueError, match="meta/schedule/tools"):
+        await handle.schedule_tools()
