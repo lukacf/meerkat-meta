@@ -480,8 +480,10 @@ class WorkflowGraphTests(unittest.TestCase):
 class InputsTests(unittest.TestCase):
     def test_the_committed_inputs_file_is_valid(self):
         value = forge.validate_inputs(json.loads((ROOT / forge.INPUTS).read_text()))
-        self.assertEqual(value["guide"]["meta_source"], "b275e0ed4fe61cf4ff43d16691c54efb17812919")
-        self.assertEqual(value["guide"]["core_source"], "a00bafaf1d862fb41112ff1f30312b350ad05246")
+        skeleton = json.loads((ROOT / forge.INPUTS_DIR / "forge-release-inputs.skeleton.json").read_text())
+        # The Guide is the skeleton's published release, and every target is pinned.
+        self.assertEqual(value["guide"], skeleton["guide"])
+        self.assertEqual(sorted(value["targets"]), sorted(forge.TARGETS))
 
     def test_the_guide_skeleton_is_refused_until_every_pending_value_is_filled(self):
         selected = guide_sdk.SELECTED_VERSION
