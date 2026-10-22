@@ -678,6 +678,11 @@ export function deploymentUpdatePreparation(receipt, build, guide, options) {
       : null };
 }
 
+/** After setup, Apply installs and checks the update; only the setup owner's Start runs it. */
+export function deploymentUpdateOwnerStart(update) {
+  return typeof update?.setup_restore_sha256 === "string" && /^[0-9a-f]{64}$/.test(update.setup_restore_sha256);
+}
+
 export function deploymentUpdateAction(receipt, build, guide, action) {
   if (deploymentSourceKind(receipt) === "native-team") return null;
   const update = receipt?.update;

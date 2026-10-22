@@ -619,6 +619,16 @@ only when offered to recover the exact accepted runtime.
 update. These application updates are separate from the installation-support
 updates described below.
 
+After a Meta Toolkit application finishes its setup, Forge applies only updates
+built from the same application source that keep its plan, definition, tool
+policy, protected settings and runtime. **Stage accepted update** shows why any
+other update is blocked; install such a build into a new empty folder instead.
+**Apply and verify update** installs and checks the new source and leaves the
+application stopped. **Start installed application** then restores its completed
+setup with the new source. If that Start fails, choose **Restore previous
+application** when offered. After Forge restarts, use **Continue setup** once
+before you stage or apply an update.
+
 For an agent team, tell the setup guide what should change and review the revised
 plan. This does not modify the installed team.
 

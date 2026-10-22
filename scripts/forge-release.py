@@ -47,6 +47,7 @@ import argparse
 import base64
 import importlib
 import importlib.util
+import itertools
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -113,6 +114,19 @@ EVIDENCE_FILES = (FORGE_CI, "console/package-lock.json", "installer/web/package-
 EVIDENCE_JOBS = ("backend", "frontend")
 TOOLCHAIN_FILE = "forge-toolchain.json"
 MAX_EVIDENCE_RUNS = 30
+# GitHub's workflow run and artifact listings are eventually consistent: for
+# minutes at a time a listing can omit a run or an artifact that exists, and a
+# run can report a stale status. A candidate read that misses is read again,
+# REREAD_DELAY seconds apart, for up to REREAD_ATTEMPTS reads (10 minutes)
+# before it refuses. A refusal that is not a lagging read, such as a red
+# exact-main CI run or a mismatched run identity, stays immediate.
+REREAD_ATTEMPTS = 40
+REREAD_DELAY = 15
+# rc.api runs `gh api` once and raises on any failure: inside a re-read, a 5xx
+# response or a broken connection is a miss as well.
+TRANSIENT_API = re.compile(r"gh api failed: .*(?:\bHTTP 5[0-9][0-9]\b|error connecting to|connection reset|"
+                           r"connection refused|timeout|timed out|deadline exceeded|\bEOF\b|GOAWAY|broken pipe)",
+                           re.I | re.S)
 
 
 def package_name(version, target):
@@ -378,16 +392,59 @@ def resolve():
     })
 
 
+class Miss(Exception):
+    """A read GitHub may not have settled yet. reread() reads again, and after
+    its last read refuses with `refusal`, the text a single read refused with."""
+
+    def __init__(self, reason, refusal):
+        super().__init__(reason)
+        self.reason, self.refusal = reason, refusal
+
+
+def reread(label, endpoint, read):
+    """The first read() that does not miss: a miss, or a transient gh api
+    failure, is read again REREAD_DELAY seconds later, for up to
+    REREAD_ATTEMPTS reads. Each miss logs one line to stderr. Any other
+    refusal propagates at once."""
+    started = time.monotonic()
+    for attempt in range(1, REREAD_ATTEMPTS + 1):
+        try:
+            return read()
+        except Miss as miss:
+            reason, refusal = miss.reason, miss.refusal
+        except ProtocolError as error:
+            if not TRANSIENT_API.match(str(error)):
+                raise
+            reason, refusal = f"transient API failure: {error}", str(error)
+        elapsed = f"{time.monotonic() - started:.0f}"
+        print(f"{label}: {endpoint}: read {attempt}/{REREAD_ATTEMPTS} missed at {elapsed} s: "
+              + " ".join(reason.split()), file=sys.stderr)
+        if attempt < REREAD_ATTEMPTS:
+            time.sleep(REREAD_DELAY)
+    raise ProtocolError(f"{refusal} (after {REREAD_ATTEMPTS} reads over {elapsed} s)")
+
+
 def ci_green():
     sha = rc.digest(os.environ.get("RELEASE_SHA"), "RELEASE_SHA", 40)
-    runs = rc.api(rc.repo_endpoint(
-        f"actions/workflows/ci.yml/runs?branch=main&event=push&head_sha={sha}&per_page=100"))["workflow_runs"]
-    runs = [run for run in runs if run.get("head_sha") == sha and run.get("head_branch") == "main"
-            and run.get("event") == "push"]
-    require(runs, f"no exact-main CI run exists for {sha}; push it to main and let ci.yml finish")
-    green = [run for run in runs if run.get("status") == "completed" and run.get("conclusion") == "success"]
-    require(green, f"exact-main CI for {sha} is not green: "
-            + ", ".join(f"{run.get('id')}/{run.get('status')}/{run.get('conclusion')}" for run in runs))
+    endpoint = rc.repo_endpoint(f"actions/workflows/ci.yml/runs?branch=main&event=push&head_sha={sha}&per_page=100")
+
+    def read():
+        runs = [run for run in rc.api(endpoint)["workflow_runs"] if run.get("head_sha") == sha
+                and run.get("head_branch") == "main" and run.get("event") == "push"]
+        if not runs:
+            raise Miss("no exact-main ci.yml run listed",
+                       f"no exact-main CI run exists for {sha}; push it to main and let ci.yml finish")
+        green = [run for run in runs if run.get("status") == "completed" and run.get("conclusion") == "success"]
+        if green:
+            return green
+        states = ", ".join(f"{run.get('id')}/{run.get('status')}/{run.get('conclusion')}" for run in runs)
+        refusal = f"exact-main CI for {sha} is not green: {states}"
+        # Every listed run finished and none succeeded: a red CI, not a
+        # lagging listing, so it refuses at once.
+        require(any(run.get("status") != "completed" for run in runs), refusal)
+        raise Miss(f"no listed exact-main run is green yet: {states}", refusal)
+
+    green = reread("exact-main CI", endpoint, read)
     chosen = max(green, key=lambda run: (run["id"], run["run_attempt"]))
     rc.verify_run(chosen["id"], chosen["run_attempt"], sha, ci=True)
     write_outputs({"run_id": chosen["id"], "run_attempt": chosen["run_attempt"]})
@@ -509,34 +566,44 @@ def forge_ci_evidence(sha, work, objects=None):
     """The newest green dispatched Forge run that tested exactly this
     commit's Forge inputs, preferring a run of this commit itself. A pull
     request run tested a merge commit, not its head_sha, so it never counts.
-    Refuses when no dispatched run did."""
+    Refuses when no dispatched run did, after re-listing the runs: the
+    listing can omit a run for minutes."""
     objects = objects or GitObjects()
     wanted = evidence_tuple(objects, sha)
     declared = declared_toolchain(objects, wanted["files"])
-    runs = rc.api(rc.repo_endpoint(
-        f"actions/workflows/forge.yml/runs?event=workflow_dispatch&status=success&per_page={MAX_EVIDENCE_RUNS}"
-    ))["workflow_runs"]
-    runs = [run for run in runs if run.get("event") == "workflow_dispatch"
-            and run.get("path") == FORGE_CI and run.get("status") == "completed"
-            and run.get("conclusion") == "success" and run["repository"]["full_name"] == rc.repository()]
-    nearest = None
-    for run in sorted(runs, key=lambda run: (run["head_sha"] != sha, -run["id"])):
-        observed = evidence_tuple(objects, rc.digest(run["head_sha"], "Forge run SHA", 40))
-        differences = tuple_differences(wanted, observed)
-        if differences:
-            nearest = nearest or (run["id"], differences)
-            continue
-        if not run_jobs_green(run["id"], run["run_attempt"]):
-            continue
-        toolchain = run_toolchain(run, work)
-        if toolchain is None or not toolchain_fits(declared, toolchain):
-            continue
-        return {"run_id": run["id"], "run_attempt": run["run_attempt"], "head_sha": run["head_sha"],
-                "event": run["event"], "tuple": wanted, "toolchain": {"declared": declared, **toolchain}}
-    detail = (f"; the newest green run {nearest[0]} differs in {', '.join(nearest[1])}" if nearest else "")
-    raise ProtocolError(f"no green dispatched Forge run (backend and frontend) tested the Forge inputs at "
-                        f"{sha}{detail}. "
-                        "Dispatch forge.yml for this commit, then rerun the candidate")
+    endpoint = rc.repo_endpoint(
+        f"actions/workflows/forge.yml/runs?event=workflow_dispatch&status=success&per_page={MAX_EVIDENCE_RUNS}")
+    listing = itertools.count(1)
+
+    def read():
+        # Every listing reads the same object cache, and downloads toolchain
+        # records into a folder of its own.
+        folder = work / f"forge-evidence-{next(listing)}"
+        folder.mkdir()
+        runs = [run for run in rc.api(endpoint)["workflow_runs"] if run.get("event") == "workflow_dispatch"
+                and run.get("path") == FORGE_CI and run.get("status") == "completed"
+                and run.get("conclusion") == "success" and run["repository"]["full_name"] == rc.repository()]
+        nearest = None
+        for run in sorted(runs, key=lambda run: (run["head_sha"] != sha, -run["id"])):
+            observed = evidence_tuple(objects, rc.digest(run["head_sha"], "Forge run SHA", 40))
+            differences = tuple_differences(wanted, observed)
+            if differences:
+                nearest = nearest or (run["id"], differences)
+                continue
+            if not run_jobs_green(run["id"], run["run_attempt"]):
+                continue
+            toolchain = run_toolchain(run, folder)
+            if toolchain is None or not toolchain_fits(declared, toolchain):
+                continue
+            return {"run_id": run["id"], "run_attempt": run["run_attempt"], "head_sha": run["head_sha"],
+                    "event": run["event"], "tuple": wanted, "toolchain": {"declared": declared, **toolchain}}
+        detail = (f"; the newest green run {nearest[0]} differs in {', '.join(nearest[1])}" if nearest else "")
+        raise Miss(f"none of {len(runs)} listed green dispatched run(s) tested these Forge inputs",
+                   f"no green dispatched Forge run (backend and frontend) tested the Forge inputs at "
+                   f"{sha}{detail}. "
+                   "Dispatch forge.yml for this commit, then rerun the candidate")
+
+    return reread("Forge evidence", endpoint, read)
 
 
 def recheck_forge_ci(manifest):
@@ -724,23 +791,48 @@ def candidate_context():
 
 
 def current_run(run_id, attempt, sha, ref):
-    value = rc.api(rc.repo_endpoint(f"actions/runs/{run_id}"))
-    require(value["id"] == run_id and value["run_attempt"] == attempt, "run identity/attempt changed")
-    require(value["repository"]["full_name"] == rc.repository()
-            and value["head_repository"]["full_name"] == rc.repository(), "run repository mismatch")
-    require(value["head_sha"] == sha and value["head_branch"] == ref.removeprefix("refs/heads/")
-            and value["event"] == "workflow_dispatch" and value["path"] == WORKFLOW,
-            "run source/workflow/event/ref mismatch")
-    require(value["status"] == "in_progress", "collection requires its in-progress candidate run")
-    return value
+    endpoint = rc.repo_endpoint(f"actions/runs/{run_id}")
+
+    def read():
+        value = rc.api(endpoint)
+        require(value["id"] == run_id and value["run_attempt"] == attempt, "run identity/attempt changed")
+        require(value["repository"]["full_name"] == rc.repository()
+                and value["head_repository"]["full_name"] == rc.repository(), "run repository mismatch")
+        require(value["head_sha"] == sha and value["head_branch"] == ref.removeprefix("refs/heads/")
+                and value["event"] == "workflow_dispatch" and value["path"] == WORKFLOW,
+                "run source/workflow/event/ref mismatch")
+        # The reported status can lag behind the running job.
+        if value["status"] != "in_progress":
+            raise Miss(f"status={value['status']}", "collection requires its in-progress candidate run")
+        return value
+
+    return reread("candidate run", endpoint, read)
+
+
+def artifacts_endpoint(run_id):
+    return rc.repo_endpoint(f"actions/runs/{run_id}/artifacts?per_page=100")
 
 
 def run_artifacts(run_id):
-    pages = rc.api(rc.repo_endpoint(f"actions/runs/{run_id}/artifacts?per_page=100"), pages=True)
+    pages = rc.api(artifacts_endpoint(run_id), pages=True)
     items = [item for page in pages for item in page["artifacts"]]
     names = [item["name"] for item in items]
     require(len(names) == len(set(names)), "duplicate artifact names in the candidate run")
     return {item["name"]: item for item in items}
+
+
+def candidate_artifacts(run_id, names):
+    """The candidate run's artifacts, once the listing names every package.
+    Every build_package leg has finished before collect starts, so a name
+    still missing is a listing that has not caught up."""
+    def read():
+        artifacts = run_artifacts(run_id)
+        missing = [name for name in names if name not in artifacts]
+        if missing:
+            raise Miss(f"{', '.join(missing)} not listed", f"missing package artifact {missing[0]}")
+        return artifacts
+
+    return reread("candidate artifacts", artifacts_endpoint(run_id), read)
 
 
 def ci_run_from_env():
@@ -762,13 +854,12 @@ def collect(args):
         require(ci is None, "a branch dry run binds no CI run")
     targets = sorted(load_inputs()["targets"])
     require(targets, "no Forge target has pinned inputs")
-    artifacts = run_artifacts(run_id)
+    artifacts = candidate_artifacts(run_id, [package_artifact_name(target, attempt) for target in targets])
     packages = []
     with rc.workspace() as work:
         forge_ci = forge_ci_evidence(sha, work)
         for target in targets:
             name = package_artifact_name(target, attempt)
-            require(name in artifacts, f"missing package artifact {name}")
             item = artifacts[name]
             require(isinstance(item.get("digest"), str) and item["digest"].startswith("sha256:"),
                     f"package artifact {name} has no digest")

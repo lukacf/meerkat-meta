@@ -467,6 +467,18 @@ for the recovery controls.
 
 ## Build the application
 
+When a guide has saved organization context, each new build retains that exact
+snapshot for both the builder and independent reviewer. Updating the installed
+organization plugin does not rewrite an existing guide or build. Acceptance and
+package matching include the saved context, so changing it requires fresh review.
+Older builds without organization context retain their original scope.
+
+This handoff carries visible context and references only. A reference to a private
+authentication or installation package does not install it or grant access. The
+host must adopt the actual package through its supported source-preparation path,
+with compatible dependencies in the selected runtime. Missing source or conflicting
+dependency versions remain explicit implementation dependencies.
+
 When the guide has sufficient context and no necessary decisions remain open,
 **Get your agent team** opens a visible package card. Package availability is
 checked separately from design acceptance. After acceptance, a plan with a

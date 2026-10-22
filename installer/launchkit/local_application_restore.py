@@ -22,7 +22,7 @@ from .connect_installer_caller import (CustodyError, ExactFile, MAX_INPUT_BYTES,
     _same_json_value, _selection, supervisor_executor)
 from .deployment import DeploymentService, read_receipt
 from .deployment_application_bootstrap import (BootstrapObservation, FRESH_ENTRY_NAME,
-    _observe_inputs, _shape, read_bootstrap_admission, require_restore_history_current)
+    _observe_inputs, _shape, read_original_fresh_admission, require_restore_history_current)
 from .deployment_supervisor import pending_custody
 from .deployment_updates import require_replacement_history_settled
 from .local_application_preparation_inputs import LocalApplicationPreparationOwner
@@ -109,7 +109,7 @@ def _completed_restore(owner, directory, receipt, fresh, lease, source_custody):
         raise CustodyError("Restore lost its original entered Fresh selection.")
     admission = _artifact_pin(entry["admission"])
     observe(admission)
-    original = read_bootstrap_admission(directory, entry["admission"])
+    original = read_original_fresh_admission(directory, entry["admission"])
     if not _same_json_value(original["application_startup"], fresh):
         raise CustodyError("Restore cannot replace the original local Fresh input selection.")
     fresh_observation = _observe_inputs(directory, receipt, fresh, entered=True,

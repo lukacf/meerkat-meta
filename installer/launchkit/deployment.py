@@ -1528,7 +1528,8 @@ class DeploymentService:
             state = await self._guide(guide_id)
             payload, slug = await self.implementation.package(guide_id, status["build_id"])
         proposal = state.get("proposal") or state.get("blueprint") or {}
-        files = package_files(payload)
+        # Unpacking the whole package must not hold the event loop.
+        files = await asyncio.to_thread(package_files, payload)
         deployment = json.loads(files["deployment.json"][0])
         source = read_package_source(files)
         if source["build_id"] != status["build_id"] or not package_matches(source, state):
@@ -1967,6 +1968,7 @@ class DeploymentService:
                     guide_id, build_id=build_id, source_digest=report.get("verification", {}).get("digest"))
                 if runtime_target is None:
                     raise DraftConflict("The candidate package has no exact accepted host runtime selection.")
+            setup_blockers = await self._setup_owner_blockers(guide_id, deployment_id, files, report)
             current = await self.implementation.status(guide_id)
             require_accepted(current)
             latest = await self._guide(guide_id)
@@ -1978,11 +1980,81 @@ class DeploymentService:
                 raise DraftConflict("The accepted application changed while preparing its update.")
             # No await separates the final source/design fences and publication.
             from .deployment_updates import stage
+            restore_selection = self._setup_update_restore(guide_id, deployment_id)
+            setup = ({"restore_selection": restore_selection, "setup_blockers": setup_blockers}
+                if restore_selection is not None else {})
             if runtime_target is None:
-                stage(self._directory(guide_id), payload, report)
+                stage(self._directory(guide_id), payload, report, **setup)
             else:
-                stage(self._directory(guide_id), payload, report, runtime_target=runtime_target)
+                stage(self._directory(guide_id), payload, report, runtime_target=runtime_target, **setup)
             return await self.status(guide_id)
+
+    def _setup_owner(self, guide_id, deployment_id):
+        """The selected host that owns a set-up installation's completed setup, or None.
+
+        Only an installation that entered Fresh has one, and only through the
+        trusted host selection, never a request. A background Restore service
+        keeps the existing Fresh refusal.
+        """
+        from .deployment_application_bootstrap import FRESH_ENTRY_NAME, restored_service
+        from .forge_application_host import ForgeApplicationHost
+        directory = self._directory(guide_id, deployment_id)
+        entry = directory / FRESH_ENTRY_NAME
+        if not entry.exists() and not entry.is_symlink() or restored_service(read_receipt(directory)):
+            return None
+        select = getattr(self, "application_host_selection", None)
+        registry = getattr(select, "__self__", None)
+        from .local_application_registry import LocalApplicationRegistry
+        if (type(registry) is LocalApplicationRegistry and select == registry.selected_host
+                and registry._reconnect_status(self, guide_id, deployment_id) is not None):
+            # Only the claimed setup action recovers the owner after a restart.
+            from .deployment_updates import SETUP_OWNER_RECONNECT
+            raise DraftConflict(SETUP_OWNER_RECONNECT)
+        host = (select(guide_id, deployment_id) if callable(select)
+            else getattr(getattr(self, "application_setup_selection", None), "__self__", None))
+        if type(host) is not ForgeApplicationHost or host._startup_selection is None:
+            return None
+        return host
+
+    def _setup_update_restore(self, guide_id, deployment_id):
+        """The trusted owner's published completed Restore pin, after setup.
+
+        Without a completed Restore, the update path keeps its existing Fresh
+        refusal.
+        """
+        from .deployment_application_bootstrap import _shape
+        host = self._setup_owner(guide_id, deployment_id)
+        if host is None:
+            return None
+        try:
+            pin, value = host._selected_startup_observation(guide_id, deployment_id)
+        except FileNotFoundError:
+            return None
+        return pin.pin() if _shape(value) == "restore" else None
+
+    async def _setup_owner_blockers(self, guide_id, deployment_id, files, report):
+        """Stage refuses, after setup, what the installation's owner would refuse later.
+
+        The candidate must keep the setup owner's protected choices. Under the
+        per-installation registry, its signed source chain must also continue
+        the installed Build. A single selected host owns every Build's source.
+        """
+        from .deployment_updates import SETUP_OWNER_BLOCKER
+        from .forge_application_host import owner_choices_match
+        from .local_application_registry import LocalApplicationRegistry
+        host = self._setup_owner(guide_id, deployment_id)
+        if host is None:
+            return ()
+        if not owner_choices_match(host, files):
+            return (SETUP_OWNER_BLOCKER,)
+        select = getattr(self, "application_host_selection", None)
+        registry = getattr(select, "__self__", None)
+        if type(registry) is LocalApplicationRegistry and select == registry.selected_host:
+            continues = await asyncio.to_thread(registry.continues_installed_source, guide_id, deployment_id,
+                report.get("build_id"), report.get("verification", {}).get("digest"))
+            if not continues:
+                return (SETUP_OWNER_BLOCKER,)
+        return ()
 
     async def _run(self, directory, mode, *, update_selection=None, bootstrap_selection=None,
             install_retention=None, install_binding=None, bootstrap_owner_source=None):
@@ -3116,9 +3188,11 @@ class DeploymentService:
             else:
                 file_service_current()
 
+        from .deployment_application_bootstrap import kept_native_inventory
+        retained = await await_validation(kept_native_inventory, directory)
         with project_lock(destination) as lease:
             async with open_installed_product_source(directory, project_lease=lease,
-                    require_current=source_current, owner_source=owner_source,
+                    require_current=source_current, owner_source=owner_source, retained=retained,
                     application_startup=selected) as source_custody:
                 if destination_owner is not None:
                     self._destination_control_owner(destination_owner, guide_id, deployment_id)
@@ -3310,14 +3384,17 @@ class DeploymentService:
             self._destination_control_owner(destination_owner, guide_id, deployment_id)
             destination = owned_destination(receipt["destination"])
         require_stopped_owner()
+        from .deployment_application_bootstrap import kept_native_inventory
         from .product_installed_source import open_installed_product_source
         from .product_runtime_custody import await_product_validation
+        retained = await await_validation(kept_native_inventory, directory)
+        require_stopped_owner()
         with project_lock(destination) as lease:
             # Close this parent source scope before the child takes its own
             # project lease. Only the original private caller selects inputs.
             async with open_installed_product_source(directory, project_lease=lease,
                     require_current=require_stopped_owner, application_startup=selected,
-                    owner_source=owner_source) as source_custody:
+                    owner_source=owner_source, retained=retained) as source_custody:
                 if destination_owner is not None:
                     self._destination_control_owner(destination_owner, guide_id, deployment_id)
                     if source_custody is None:
@@ -3420,12 +3497,29 @@ class DeploymentService:
                 raise DraftConflict("The original destination Restore selection changed before restart.")
             return await destination_owner.start_application(self, guide_id, deployment_id)
         if action != "stop":
-            from .deployment_application_bootstrap import require_bootstrap_history_settled, restored_service
+            from .deployment_application_bootstrap import (require_bootstrap_history_settled,
+                require_update_bootstrap_history, restored_service)
             bootstrap_selection = None
             if action == "restart" and restored_service(receipt):
                 from .deployment_service import verify_service
                 bootstrap_selection = verify_service(directory, receipt)["bootstrap_selection"]
-            require_bootstrap_history_settled(directory, bootstrap_selection)
+            if action in {"apply-update", "rollback", "recover-current"}:
+                # After setup, these admit only the completed Restore recorded at
+                # Stage, read from the private journal projection. Apply also
+                # requires the owner's current publication. Rollback and recovery
+                # may read their own unfinished transaction as lineage.
+                from .deployment_application_bootstrap import SETUP_RESTORE_CHANGED
+                from .deployment_updates import setup_restore_pin, update_binding
+                selected = read_receipt(directory).get("update") or {}
+                recorded = setup_restore_pin(directory, selected)
+                if (action == "apply-update" and recorded is not None
+                        and self._setup_update_restore(receipt["guide_id"], deployment_id) != recorded):
+                    raise DraftConflict(SETUP_RESTORE_CHANGED)
+                require_update_bootstrap_history(directory, recorded,
+                    in_flight=update_binding(selected) if action != "apply-update"
+                        and selected.get("update_id") == update_id else None)
+            else:
+                require_bootstrap_history_settled(directory, bootstrap_selection)
         if receipt.get("source_kind") == "native-team" and action in {"apply-update", "rollback", "recover-current"}:
             raise DraftConflict("Agent-team source updates are not supported here. Its installed source and state are preserved.")
         if (action == "stop" and receipt.get("execution_mode", "interactive") == "interactive"
@@ -3611,8 +3705,12 @@ class DeploymentService:
                     # The frozen manifest independently selected this digest.
                     # Observe under one real pre-manager lease, then retain
                     # only the authenticated file facts for a live child's hold.
+                    from .deployment_application_bootstrap import kept_native_inventory
+                    retained = await await_validation(kept_native_inventory, directory)
+                    destination_current()
                     async with installed_bootstrap_source(directory, service["bootstrap_selection"],
-                            require_current=source_current, owner_source_sha256=owner_sha256) as source_custody:
+                            require_current=source_current, owner_source_sha256=owner_sha256,
+                            retained=retained) as source_custody:
                         def observe_restart():
                             _, observed = observe_bootstrap_admission(directory, service["bootstrap_selection"],
                                 **({"source_custody": source_custody} if source_custody is not None else {}))
@@ -3707,15 +3805,21 @@ class DeploymentService:
         interactive = receipt.get("execution_mode", "interactive") == "interactive" and not receipt.get("service")
         if interactive and receipt.get("interactive_lifecycle_id") is not None and not interactive_cleanup_matches(receipt):
             raise DraftConflict("The owned runtime's cleanup is unconfirmed. Stop and verify cleanup before a fresh start.")
-        payload = (directory / "package.zip").read_bytes()
-        if hashlib.sha256(payload).hexdigest() != receipt["package_sha256"]:
-            raise DraftConflict("The saved checked package changed. No process was started.")
-        files = package_files(payload)
-        destination = verify_destination(receipt, files, allow_missing=action == "retry")
+        def checked_package():
+            payload = (directory / "package.zip").read_bytes()
+            if hashlib.sha256(payload).hexdigest() != receipt["package_sha256"]:
+                raise DraftConflict("The saved checked package changed. No process was started.")
+            files = package_files(payload)
+            return files, verify_destination(receipt, files, allow_missing=action == "retry")
+        # Reading and hashing the saved package, its installed copy and the
+        # selected product must not hold the event loop.
+        files, destination = await asyncio.to_thread(checked_package)
+        # Every in-process taker of this project lock runs under self.lock, and
+        # the lock refuses instead of waiting, so its holder may await threads.
         with project_lock(destination) if interactive else nullcontext():
             validate_installed_console_settings(files, destination)
             if interactive and receipt.get("interactive_lifecycle_id") is not None:
-                checked_cleanup = interactive_source_binding(directory, receipt,
+                checked_cleanup = await asyncio.to_thread(interactive_source_binding, directory, receipt,
                     allow_missing=(receipt.get("interactive_cleanup") or {}).get("boundary") == "worker-not-admitted")
                 if any(receipt["interactive_cleanup"].get(key) != value for key, value in checked_cleanup.items()):
                     raise DraftConflict("The cleanup confirmation belongs to different installed source or ownership.")
@@ -3727,7 +3831,7 @@ class DeploymentService:
                 from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
                 selected_target = parse_candidate_selection(receipt["runtime_candidate"])
                 if type(selected_target) is MetaToolkitRuntimeTarget:
-                    product_runtime_source(files, receipt["runtime_candidate"])
+                    await asyncio.to_thread(product_runtime_source, files, receipt["runtime_candidate"])
                     if mode != "install" or not interactive:
                         raise DraftConflict(PRODUCT_CONFIGURE_REQUIRED)
                     if receipt.get("update") is not None:

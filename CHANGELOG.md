@@ -32,6 +32,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   starts are released), `not_held` (it was not held, and its tools are
   republished) and, in the WARN, `still_pending_count` beside the
   `still_pending` names. It logged `owed` and `released` before.
+- A Meta/Toolkit product Start no longer reads and unpacks the whole native
+  runtime archive, in Meta Forge or in the application's own startup, and no
+  longer reads unchanged native runtime files again. After an installation's
+  full verification succeeds, Forge keeps the verified list of the native
+  runtime's files (names, kinds, modes, sizes, links and SHA-256 digests) and
+  each file's identity (device, inode, mode, owner, link count, size,
+  modification and change times) in a private file in the installation's
+  folder, and the installation record names that file by its SHA-256. Each
+  Start still checks every installed native runtime file against the list,
+  and refuses a changed, added or removed file or a changed mode as before.
+  It reads a file's bytes again only when the file's identity changed, and
+  always reads the gateway it runs. Writing to a file always moves its change
+  time, which only an administrator can set back. Forge uses the recorded
+  identities on ext4, xfs and btrfs only, and reads every file on other
+  filesystems.
+- A kept list that differs from the copy the installation record names is
+  refused, and the refusal names the file: remove it, and the next Start runs
+  the full verification and keeps a new list. When the application's own
+  startup refuses its installed source, that refusal is now the reported
+  Start failure instead of only a runtime log line. An installation from
+  0.9.4 or earlier gets its list at its first Start. Forge 0.9.4 ignores the
+  new installation record field.
 
 ### Fixed
 
@@ -53,6 +75,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   not acknowledge the stored one are refused before the provider sees the
   stored definition. A definition written into the mob storage after the
   roster was resolved is refused rather than resumed.
+- Meta Forge updates a Meta Toolkit product application after its setup when
+  the update is built from the same application source and keeps its plan,
+  definition, tool policy, protected settings and runtime. "Apply and verify
+  update" installs and checks the new source and leaves the application
+  stopped. "Start installed application" then restores its completed setup
+  with that source, and "Restore previous application" returns to the
+  previous source if that Start fails. The installation keeps its setup
+  across later updates, Stops and Forge restarts.
+- Meta Forge keeps answering other requests while it prepares an
+  application's installation options, or admits a Start or Retry of an
+  installed application. Hashing, compressing and unpacking the package, and
+  checking the installed files and the selected product, run outside the
+  server's event loop, so a large package on a small host no longer stalls
+  the rest of Forge.
+
+### Known limitations
+
+- After its setup, a Meta Toolkit product application still cannot take an
+  update that changes its native definition, instructions, tool policy,
+  protected settings or runtime, including a "Rebuild with updated runtime"
+  package. "Stage accepted update" blocks such an update and says why;
+  install that build into a new empty folder. A set-up application that runs
+  as a background service still refuses "Stage accepted update". On the
+  Meta Toolkit Connect route, an update staged before the application's
+  first setup can still make that setup refuse. After Forge restarts, use
+  "Continue setup" once before you stage or apply an update.
 
 ## [0.9.4] - 2026-10-22
 

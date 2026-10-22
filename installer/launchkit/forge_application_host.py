@@ -92,6 +92,26 @@ def application_setup_binding(settings, guide_id, deployment_id):
             "source_digest", "package_sha256")}}
 
 
+def owner_choices_match(host, files):
+    """Whether a package keeps the protected choices of this source owner.
+
+    Its Blueprint, native definition, protected application files and runtime
+    selection must equal the owner's. Stage, the installation lookup and
+    recovery use this one reader, so Stage refuses what the owner would.
+    """
+    from .deployment_updates import _candidate_source_selection
+    try:
+        blueprint = json.loads(files["blueprint.json"][0])
+        definition = files["config/mob.toml"][0]
+        selection = _candidate_source_selection(files)
+        target = parse_candidate_selection(selection) if selection is not None else None
+    except (KeyError, TypeError, ValueError, UnicodeError):
+        return False
+    return (blueprint == host._blueprint and definition == host._definition.encode("utf-8")
+        and target == host._target
+        and all(files.get(name, (None, None))[0] == pin.read() for name, pin in host._protected))
+
+
 class ForgeApplicationHost:
     """Host-injected selection, never initialized from an HTTP request.
 
@@ -695,19 +715,21 @@ class ForgeApplicationHost:
             chosen["model_configuration"] = model_configuration
         directory, receipt, stopped = deployment._stopped_application_owner(guide_id, deployment_id)
         supervisor = chosen["supervisor"]
-        binding = deployment._configuration_binding
+        changed = "Preparation inputs differ from the original stopped product owner."
+        if (not isinstance(supervisor, Supervisor) or supervisor.directory != directory
+                or supervisor.destination != Path(receipt["destination"])
+                or restore_inputs is None
+                    and deployment._configuration_binding(supervisor.receipt) != deployment._configuration_binding(receipt)
+                or parse_candidate_selection(receipt.get("runtime_candidate")) != self._target
+                or deployment_id in deployment._application_preparations):
+            raise CustodyError(changed)
         if restore_inputs is not None:
             # Start creates a new worker lifecycle. The stopped owner above
             # verifies its current cleanup; Restore retains the same installed
-            # source, rather than the original Install worker's lifecycle.
-            from .deployment_application_bootstrap import bootstrap_installation_binding
-            binding = bootstrap_installation_binding
-        if (not isinstance(supervisor, Supervisor) or supervisor.directory != directory
-                or supervisor.destination != Path(receipt["destination"])
-                or binding(supervisor.receipt) != binding(receipt)
-                or parse_candidate_selection(receipt.get("runtime_candidate")) != self._target
-                or deployment_id in deployment._application_preparations):
-            raise CustodyError("Preparation inputs differ from the original stopped product owner.")
+            # source, or its own completed updates, rather than the original
+            # Install worker's lifecycle.
+            from .deployment_application_bootstrap import bootstrap_installation_binding, require_owner_installation
+            require_owner_installation(directory, receipt, bootstrap_installation_binding(supervisor.receipt), changed)
         if (supervisor.child is not None or getattr(supervisor, "_child_admission", None) is not None
                 or getattr(supervisor, "_selected_sdk_install_task", None) is not None or supervisor.stop.is_set()):
             raise CustodyError("The original preparation Supervisor has unresolved child custody.")

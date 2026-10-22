@@ -435,7 +435,8 @@ async def test_update_checked_start_reaches_same_owned_preparation(installed, mo
     scope = {**worker.__dict__, "supervisor": installed.supervisor, "directory": installed.directory,
         "recover_current": False, "product_update": False, "current_transaction": lambda: (read_receipt(installed.directory), installed.directory, {}),
         "updates": updates, "expected_binding": None, "expected_installation": None, "dependency_update": None,
-        "native_update": False, "replacement": None, "command": command, "publish": lambda *args: pytest.fail("No native readiness is fabricated.")}
+        "native_update": False, "replacement": None, "owner_start": False, "command": command,
+        "publish": lambda *args: pytest.fail("No native readiness is fabricated.")}
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), scope)
     with pytest.raises(AppBoundary):
         await scope["checked_start"](files, False)

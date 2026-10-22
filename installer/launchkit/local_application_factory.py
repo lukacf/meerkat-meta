@@ -250,15 +250,20 @@ class LocalApplicationFactory:
                 or inputs.supervisor.directory != owner._directory):
             raise CustodyError("Preserve the installed application's original retained owner.")
         receipt = read_receipt(inputs.supervisor.directory)
-        binding = owner._binding(receipt)
-        if (binding != owner._installation or receipt.get("guide_id") != self.guide_id
+        if (receipt.get("guide_id") != self.guide_id
                 or receipt.get("deployment_id") != owner._deployment_id
                 or not receipt.get("installed_candidate_runtime_proof")
                 or parse_candidate_selection(receipt.get("runtime_candidate")) != self.runtime_target
                 or inputs.supervisor.destination != Path(receipt["destination"])):
             raise CustodyError("The original installed application source association changed.")
-        if admission is not None and binding != admission.installation:
-            raise CustodyError("The recovered private inputs changed their original admitted installation.")
+        # The retained installation is this owner's anchor. Its own completed
+        # source updates may move it; nothing else may.
+        from .deployment_application_bootstrap import require_owner_installation
+        binding = require_owner_installation(inputs.supervisor.directory, receipt, owner._installation,
+            "The original installed application source association changed.")
+        if admission is not None:
+            require_owner_installation(inputs.supervisor.directory, receipt, admission.installation,
+                "The recovered private inputs changed their original admitted installation.")
         return binding
 
     def __call__(self):

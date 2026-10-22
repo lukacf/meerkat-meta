@@ -118,6 +118,30 @@ class MetaToolkitRuntimeArtifacts:
     origin: str = "installed-gateway-assembly"
     _verified_inputs: tuple = field(default=(), init=False, repr=False, compare=False)
     _verified_metadata: tuple = field(default=(), init=False, repr=False, compare=False)
+    _inventory_source: str = field(default="archive", init=False, repr=False, compare=False)
+    _known_fingerprints: tuple = field(default=(), init=False, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class RetainedPrefixInventory:
+    """An inventory kept after a successful full verification of these pins.
+
+    Only the Start reader accepts it, and only for the same selected assembly,
+    archive pin and prefix. Its owner binds it to receipt.json by sha256.
+    """
+    entries: tuple[ProductPrefixEntry, ...]
+    prefix: str
+    assembly_sha256: str
+    archive_sha256: str
+    archive_bytes: int
+    inventory_sha256: str
+    receipt_sha256: str
+    runtime_candidate_sha256: str
+    fingerprints: tuple = ()
+
+    def matches(self, assembly_sha256, archive, prefix):
+        return (self.assembly_sha256 == assembly_sha256 and self.prefix == prefix
+            and (self.archive_sha256, self.archive_bytes) == (archive.sha256, archive.size))
 
 
 @dataclass(frozen=True)
@@ -269,7 +293,7 @@ def product_prefix_entries(content, prefix):
     return tuple(entries[name] for name in sorted(entries))
 
 
-def _read_meta_toolkit_artifacts(target):
+def _read_meta_toolkit_artifacts(target, retained=None):
     """Read existing producer relationships against an already selected input.
 
     No qualification is inferred or replayed. The selected final assembly's
@@ -278,6 +302,8 @@ def _read_meta_toolkit_artifacts(target):
     """
     _require(type(target) is MetaToolkitRuntimeTarget,
         "The native product requires its original application selection.")
+    _require(retained is None or type(retained) is RetainedPrefixInventory,
+        "A retained native prefix inventory needs its bound owner.")
     inputs = _Inputs(target.artifact_root)
     def read(item, limit=MAX_PRODUCT_METADATA, *, keep=True):
         _require(type(item) is ArtifactFile and _positive(item.size),
@@ -434,7 +460,14 @@ def _read_meta_toolkit_artifacts(target):
     _require(isinstance(archive_name, str) and Path(archive_name).name == archive_name,
         "The native product archive locator is invalid.")
     archive = ArtifactFile(directory / archive_name, assembly["archive_bytes"], assembly["archive_sha256"])
-    entries = product_prefix_entries(read(archive, MAX_PRODUCT_ARCHIVE_BYTES), prefix)
+    if retained is not None and retained.matches(target.assembly.sha256, archive, prefix):
+        # The inventory receipt.json names was rebuilt from these exact pins
+        # by a successful full verification. The Start compares the installed
+        # prefix with it; the unread archive keeps its size and fingerprint pin.
+        inputs.pin(archive, MAX_PRODUCT_ARCHIVE_BYTES)
+        entries, source = retained.entries, "retained"
+    else:
+        entries, source = product_prefix_entries(read(archive, MAX_PRODUCT_ARCHIVE_BYTES), prefix), "archive"
     inventory = {item.name: item for item in entries}
     gateway = inventory.get(prefix + "/bin/toolkit_gateway")
     manifest = inventory.get(prefix + "/libexec/meerkat-connect/resources.json")
@@ -448,15 +481,18 @@ def _read_meta_toolkit_artifacts(target):
         tuple(item[0] for item in inputs.files.values()),
         origin="source-built-development" if development else "installed-gateway-assembly")
     object.__setattr__(result, "_verified_inputs", tuple(inputs.files.values()))
+    object.__setattr__(result, "_inventory_source", source)
+    if source == "retained":
+        object.__setattr__(result, "_known_fingerprints", retained.fingerprints)
     object.__setattr__(result, "_verified_metadata", tuple(json.dumps(value, sort_keys=True,
         ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode()
         for value in (candidate, catalog, result.origin)))
     return result
 
 
-def read_meta_toolkit_artifacts(target):
+def read_meta_toolkit_artifacts(target, retained=None):
     try:
-        return _read_meta_toolkit_artifacts(target)
+        return _read_meta_toolkit_artifacts(target, retained)
     except CandidateArtifactError:
         raise
     except (OSError, ValueError, TypeError, KeyError, IndexError, tarfile.TarError, EOFError) as error:
@@ -505,6 +541,15 @@ def _json(content):
 def _fingerprint(info):
     return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink,
         info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def prefix_inventory_bytes(entries):
+    """The exact canonical bytes behind a proof's prefix_inventory_sha256."""
+    return json.dumps([asdict(entry) for entry in entries], sort_keys=True, separators=(",", ":")).encode()
+
+
+def prefix_inventory_sha256(entries):
+    return hashlib.sha256(prefix_inventory_bytes(entries)).hexdigest()
 
 
 class _Inputs:
@@ -567,6 +612,14 @@ class _Inputs:
             artifact = ArtifactFile(path, total, expected)
             self.files[path] = artifact, _fingerprint(info)
         return artifact, b"".join(chunks) if keep else None
+
+    def pin(self, artifact, limit):
+        """Bind an unread input by size and fingerprint for the later rechecks."""
+        path = self.path(artifact.path)
+        with self.open(path, limit) as (_, info):
+            _require(info.st_size == artifact.size, "Candidate artifact bytes do not match their binding.")
+            self.files[path] = artifact, _fingerprint(info)
+        return artifact
 
     def finish(self):
         for path, (_, fingerprint) in self.files.items():

@@ -658,3 +658,21 @@ async def test_cancelled_late_spawn_failure_preserves_errors_then_releases_local
             if not current.done():
                 current.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("linger", [0, 60])
+async def test_a_child_custody_refusal_is_the_reported_start_failure(fixture, linger):
+    supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})])
+    refusal = ("Forge's saved native runtime inventory /private/native-prefix-receipt-x.json differs from "
+        "the copy receipt.json names. Remove that file and start again: the Start then runs the full "
+        "native runtime verification and saves a new one.")
+    (supervisor.destination / "app.py").write_text(
+        "import json,os,sys,time\n"
+        "fd=int(os.environ['MOBKIT_LAUNCH_READY_FD'])\n"
+        f"os.write(fd,(json.dumps({{'refused':{refusal!r}}})+'\\n').encode())\n"
+        f"time.sleep({linger!r})\nsys.exit(1)\n")
+    with pytest.raises(RuntimeError) as raised:
+        await asyncio.wait_for(supervisor.start(definition), 5)
+    assert str(raised.value) == "The application refused to start: " + refusal
+    assert_unready(supervisor)
+    assert not console.requests

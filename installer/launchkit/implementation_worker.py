@@ -469,7 +469,7 @@ class BuildTools:
         from .implementation_attachments import register_build_attachment
         register_build_attachment(draft, self.attachment)
         draft.register_tool("inspect_implementation", self.context,
-            description="Read the full frozen user brief, messages, cumulative requests, native design and generated project files. Default overview replaces only exact duplicate previous blueprint/review values with previous_implementation.identical_context_fields: field names mapped to root JSON pointers containing their unchanged values. Every distinct previous field remains. Set view='full' to read the original context with every repeated field restored; omitted or null view means overview.",
+            description="Read the full frozen user brief, saved organization context when present, messages, cumulative requests, native design and generated project files. Default overview replaces only exact duplicate previous blueprint/review values with previous_implementation.identical_context_fields: field names mapped to root JSON pointers containing their unchanged values. Every distinct previous field remains. Set view='full' to read the original context with every repeated field restored; omitted or null view means overview.",
             input_schema=_schema({"view": {"type": ["string", "null"],
                 "enum": ["overview", "full", None]}}))
         draft.register_tool("read_project_file", self.read, description="Read a text file and its current SHA256 inside this isolated generated project only. Existing source-text reads normalize line endings.", input_schema=_schema({"path": {"type": "string"}}, ["path"]))
