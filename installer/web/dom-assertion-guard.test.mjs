@@ -4,27 +4,14 @@ import test from "node:test";
 import { domAssertions, equalityAssertions } from "./test-support/dom-assertions.mjs";
 
 const here = new URL(".", import.meta.url);
-// Open branches edit these rows; remove this exemption when they land. The
-// commit that rewrites the rows removes the entry too: the check below fails
-// once an exempted file has no rows left.
-const PENDING = new Set(["deployment-port-recovery.test.mjs"]);
 
 test("web tests compare a DOM node as a boolean, never pass the node itself to an equality assertion", () => {
   const findings = [];
   for (const name of readdirSync(here).filter((entry) => entry.endsWith(".test.mjs")).sort()) {
     const source = readFileSync(new URL(name, here), "utf8");
-    const rows = domAssertions(source);
-    if (PENDING.has(name)) {
-      // An entry whose rows are gone must go too.
-      if (rows.length === 0) findings.push(`${name}: has no rows that compare a node; remove it from PENDING`);
-      continue;
-    }
-    for (const finding of rows) {
+    for (const finding of domAssertions(source)) {
       findings.push(`${name}:${finding.line}: ${finding.text.split("\n")[0]}`);
     }
-  }
-  for (const name of PENDING) {
-    if (!readdirSync(here).includes(name)) findings.push(`${name}: not found; remove it from PENDING`);
   }
   // The message holds strings only: a node in it is what this rule prevents.
   assert.equal(findings.length, 0, "A failing assertion formats its operands. Compare a boolean instead, as in "
