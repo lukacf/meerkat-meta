@@ -20,8 +20,9 @@ import sys
 import uuid
 
 from .projects import DraftConflict
-from .deployment_deadlines import (USER_SERVICE_STOP_TIMEOUT, SERVICE_STOP_COMMAND_TIMEOUT,
-                                   LEGACY_USER_SERVICE_STOP_TIMEOUT)
+from .deployment_deadlines import (USER_SERVICE_STOP_TIMEOUT, SERVICE_STOP_COMMAND_MARGIN,
+                                   LEGACY_USER_SERVICE_STOP_TIMEOUT, reported_gateway_horizon,
+                                   service_stop_budgets, shutdown_budget)
 
 SERVICE_TIMEOUT = 60
 SERVICE_UPDATE_TIMEOUT = 1200
@@ -168,6 +169,20 @@ def unit_bytes(plan, *, legacy=False):
             "Environment=PYTHONNOUSERSITE=1\n\n[Install]\nWantedBy=default.target\n").encode()
 
 
+def unit_gateway_horizon(record):
+    """The gateway horizon a unit or plan was sized for; None for the unreported one."""
+    try:
+        return reported_gateway_horizon(record)
+    except ValueError:
+        raise DraftConflict("The recorded service shutdown budget is unsupported. Its definition is preserved.") from None
+
+
+def stop_command_timeout(service):
+    """Outlast the manager's own stop of this unit, never below the current budget's."""
+    return (max(service.get("stop_timeout_seconds", LEGACY_USER_SERVICE_STOP_TIMEOUT), USER_SERVICE_STOP_TIMEOUT)
+            + SERVICE_STOP_COMMAND_MARGIN)
+
+
 def verify_service(directory, receipt):
     if "supervisor_refresh" in receipt:
         from .deployment_supervisor import require_complete
@@ -183,9 +198,10 @@ def verify_service(directory, receipt):
     plan["interpreter"] = interpreter
     # Missing metadata identifies the exact older renderer, not permission to
     # rewrite its frozen unit or claim it has the current graceful-stop budget.
+    # A budget is the legacy one, the earlier pin's, or derived from the
+    # unreported horizon or the one this unit was sized for.
     stop_timeout = service.get("stop_timeout_seconds", LEGACY_USER_SERVICE_STOP_TIMEOUT)
-    if type(stop_timeout) is not int or stop_timeout not in {
-            LEGACY_USER_SERVICE_STOP_TIMEOUT, USER_SERVICE_STOP_TIMEOUT}:
+    if type(stop_timeout) is not int or stop_timeout not in service_stop_budgets(unit_gateway_horizon(service)):
         raise DraftConflict("The recorded service shutdown budget is unsupported. Its definition is preserved.")
     plan["stop_timeout_seconds"] = stop_timeout
     if "bootstrap_selection" in service:
@@ -381,6 +397,11 @@ def prepare_service(directory, receipt, *, bootstrap_selection=None, source_cust
             raise DraftConflict("The frozen service cannot replace its original Restore selection.")
         return service
     plan = service_plan(receipt["deployment_id"], directory)
+    # Size the unit for the horizon the application last reported, if any.
+    horizon_ms = unit_gateway_horizon(receipt)
+    if horizon_ms is not None:
+        plan["stop_timeout_seconds"] = shutdown_budget(horizon_ms)["service"]
+        plan["gateway_shutdown_horizon_ms"] = horizon_ms
     if bootstrap_selection is not None:
         from .deployment_application_bootstrap import observe_bootstrap_admission
         selected, observed = observe_bootstrap_admission(directory, bootstrap_selection,
@@ -551,10 +572,10 @@ class UserServiceManager:
             await self.command([executable, "disable", service["domain"] + "/" + label])
             if observation["loaded"]:
                 await self.command([executable, "bootout", service["domain"] + "/" + label],
-                                   timeout=SERVICE_STOP_COMMAND_TIMEOUT)
+                                   timeout=stop_command_timeout(service))
         else:
             await self.command([executable, "--user", "disable", "--now", label + ".service"],
-                               timeout=SERVICE_STOP_COMMAND_TIMEOUT)
+                               timeout=stop_command_timeout(service))
         return await self.observe(service)
 
 

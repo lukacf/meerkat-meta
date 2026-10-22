@@ -265,6 +265,11 @@ async def report_host_readiness(runtime, console_url=None, *, stop=None):
         return
     payload = {"pid": os.getpid(), "bootstrap": status.to_dict(),
                "console_url": console_url or f"{runtime.rust_http_base_url}/console"}
+    # The host's stop waits this long for the gateway's own cleanup. An SDK
+    # without the accessor, or a gateway that advertised none, reports nothing.
+    horizon_ms = getattr(runtime, "gateway_shutdown_horizon_ms", None)
+    if horizon_ms is not None:
+        payload["gateway_shutdown_horizon_ms"] = horizon_ms
     with os.fdopen(descriptor, "w") as channel:
         channel.write(json.dumps(payload) + "\n")
         channel.flush()

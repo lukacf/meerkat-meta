@@ -234,7 +234,9 @@ def test_forged_receipt_shutdown_budget_cannot_control_even_rehashed_unit(packag
     operations = fake_operations(module, package, tmp_path / 'home')
     receipt = operations.prepare()
     unit = Path(receipt['unit_path'])
-    content = unit.read_bytes().replace(b'TimeoutStopSec=397\n', f'TimeoutStopSec={budget}\n'.encode())
+    current = f'TimeoutStopSec={module.SERVICE_STOP_TIMEOUT}\n'.encode()
+    assert current in unit.read_bytes()
+    content = unit.read_bytes().replace(current, f'TimeoutStopSec={budget}\n'.encode())
     unit.write_bytes(content)
     receipt.update(stop_timeout_seconds=budget, unit_sha256=hashlib.sha256(content).hexdigest())
     module.write_private(operations.path, receipt)
@@ -1210,7 +1212,7 @@ async def test_cancelled_supervisor_admission_keeps_exact_child_and_cleanup_join
             raise
         return child
 
-    async def close(selected):
+    async def close(selected, **options):
         assert selected is child
         closures.append(selected)
         cleaning.set()
@@ -1293,7 +1295,7 @@ async def test_cancelled_supervisor_admission_failure_preserves_error_without_cl
 
     monkeypatch.setattr(module.asyncio, 'create_subprocess_exec', create)
     monkeypatch.setattr(module, 'stop_supervised_application',
-        lambda *args: pytest.fail('No process handle was supplied.'))
+        lambda *args, **options: pytest.fail('No process handle was supplied.'))
     task = asyncio.create_task(module.supervise(operations))
     try:
         await asyncio.wait_for(entered.wait(), 30)
@@ -1342,7 +1344,7 @@ async def test_supervisor_cleanup_preserves_startup_failure_through_repeated_can
     async def wait():
         return child.returncode
 
-    async def close(selected):
+    async def close(selected, **options):
         assert selected is child
         calls.append(selected)
         entered.set()

@@ -12,22 +12,33 @@ from types import SimpleNamespace
 import pytest
 
 from launchkit import deployment, deployment_worker, deployment_service
-from launchkit.deployment_deadlines import (NATIVE_GATEWAY_SHUTDOWN_TIMEOUT, APPLICATION_STOP_TIMEOUT,
-    NATIVE_TRANSPORT_FORCE_REAP_TIMEOUT, APPLICATION_ADAPTER_STOP_MARGIN,
+from launchkit.deployment_deadlines import (UNREPORTED_GATEWAY_SHUTDOWN_HORIZON_MS,
+    MAX_REPORTED_GATEWAY_SHUTDOWN_HORIZON_MS, EARLIER_PINNED_GATEWAY_SHUTDOWN_HORIZON_MS,
+    APPLICATION_STOP_TIMEOUT, NATIVE_TRANSPORT_FORCE_REAP_TIMEOUT, APPLICATION_ADAPTER_STOP_MARGIN,
     PROCESS_FORCE_REAP_TIMEOUT, WORKER_STOP_TIMEOUT, USER_SERVICE_STOP_TIMEOUT,
-    SERVICE_STOP_COMMAND_TIMEOUT, LEGACY_USER_SERVICE_STOP_TIMEOUT)
+    SERVICE_STOP_COMMAND_TIMEOUT, LEGACY_USER_SERVICE_STOP_TIMEOUT, shutdown_budget)
 from launchkit.projects import DraftConflict
 from test_deployment import Guide, Implementation, Service, submit
 from test_gateway_shutdown_horizon import gateway_horizon_ms
 
 
-def test_pinned_native_horizon_has_ordered_enclosing_deadlines():
-    assert NATIVE_GATEWAY_SHUTDOWN_TIMEOUT == 347
-    assert NATIVE_GATEWAY_SHUTDOWN_TIMEOUT + NATIVE_TRANSPORT_FORCE_REAP_TIMEOUT < APPLICATION_STOP_TIMEOUT
+def test_every_horizon_has_ordered_enclosing_deadlines():
+    unreported = -(-UNREPORTED_GATEWAY_SHUTDOWN_HORIZON_MS // 1000)
+    assert unreported + NATIVE_TRANSPORT_FORCE_REAP_TIMEOUT < APPLICATION_STOP_TIMEOUT
     assert APPLICATION_ADAPTER_STOP_MARGIN == 10
     assert APPLICATION_STOP_TIMEOUT + PROCESS_FORCE_REAP_TIMEOUT < WORKER_STOP_TIMEOUT
     assert WORKER_STOP_TIMEOUT < USER_SERVICE_STOP_TIMEOUT < SERVICE_STOP_COMMAND_TIMEOUT
     assert deployment_worker.STOP_TIMEOUT == APPLICATION_STOP_TIMEOUT
+    assert shutdown_budget() == shutdown_budget(UNREPORTED_GATEWAY_SHUTDOWN_HORIZON_MS)
+    for horizon_ms in (1, 999, EARLIER_PINNED_GATEWAY_SHUTDOWN_HORIZON_MS, 432_000,
+                       MAX_REPORTED_GATEWAY_SHUTDOWN_HORIZON_MS):
+        budget = shutdown_budget(horizon_ms)
+        # A partial second rounds up: no window ends inside the horizon.
+        assert budget["application"] * 1000 >= horizon_ms + (
+            NATIVE_TRANSPORT_FORCE_REAP_TIMEOUT + APPLICATION_ADAPTER_STOP_MARGIN) * 1000
+        assert budget["application"] + budget["force_reap"] < budget["worker"] < budget["service"] < budget["command"]
+    # The unit an earlier Forge wrote from its pinned 347-second horizon.
+    assert shutdown_budget(EARLIER_PINNED_GATEWAY_SHUTDOWN_HORIZON_MS)["service"] == 397
 
 
 async def test_application_adapter_time_is_outside_full_installed_transport_shutdown(monkeypatch):
@@ -35,10 +46,10 @@ async def test_application_adapter_time_is_outside_full_installed_transport_shut
     # and KILL waits. Console close happens before runtime shutdown; this real
     # application boundary therefore needs time beyond the transport's maximum.
     from meerkat_mobkit import _transport
-    transport_maximum = (NATIVE_GATEWAY_SHUTDOWN_TIMEOUT
+    transport_maximum = (UNREPORTED_GATEWAY_SHUTDOWN_HORIZON_MS // 1000
         + _transport._PROCESS_TERMINATE_GRACE_SECONDS
         + _transport._PROCESS_KILL_GRACE_SECONDS)
-    assert transport_maximum == 357
+    assert transport_maximum == UNREPORTED_GATEWAY_SHUTDOWN_HORIZON_MS // 1000 + NATIVE_TRANSPORT_FORCE_REAP_TIMEOUT
     process = SimpleNamespace(pid=778, returncode=None, terminate=lambda: None)
     async def wait(): return process.returncode
     process.wait = wait

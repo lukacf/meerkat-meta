@@ -27,14 +27,29 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parent
 START_TIMEOUT = 240
-# The compiler fills these from the host's pinned gateway shutdown budget.
-# They are bounded grace/reap allowances, never native cleanup acknowledgments.
+# The compiler fills this from the host's shutdown budget: margins around the
+# gateway shutdown horizon the application reports at readiness, and the
+# horizon assumed when it reports none. They are bounded grace/reap
+# allowances, never native cleanup acknowledgments.
 SHUTDOWN_BUDGET = '__LAUNCH_SHUTDOWN_BUDGET__'
-STOP_TIMEOUT = SHUTDOWN_BUDGET['application']
+
+
+def shutdown_budget(horizon_ms=None):
+    """Stop budgets, in seconds, that enclose one gateway shutdown horizon."""
+    horizon = SHUTDOWN_BUDGET['unreported_horizon_ms'] if horizon_ms is None else horizon_ms
+    application = -(-horizon // 1000) + SHUTDOWN_BUDGET['application_margin']
+    worker = application + SHUTDOWN_BUDGET['force_reap'] + SHUTDOWN_BUDGET['worker_margin']
+    service = worker + SHUTDOWN_BUDGET['service_margin']
+    return {'application': application, 'force_reap': SHUTDOWN_BUDGET['force_reap'], 'worker': worker,
+            'service': service, 'command': service + SHUTDOWN_BUDGET['command_margin'],
+            'legacy_service': SHUTDOWN_BUDGET['legacy_service']}
+
+
+STOP_TIMEOUT = shutdown_budget()['application']
 FORCE_REAP_TIMEOUT = SHUTDOWN_BUDGET['force_reap']
-WORKER_STOP_TIMEOUT = SHUTDOWN_BUDGET['worker']
-SERVICE_STOP_TIMEOUT = SHUTDOWN_BUDGET['service']
-SERVICE_STOP_COMMAND_TIMEOUT = SHUTDOWN_BUDGET['command']
+WORKER_STOP_TIMEOUT = shutdown_budget()['worker']
+SERVICE_STOP_TIMEOUT = shutdown_budget()['service']
+SERVICE_STOP_COMMAND_TIMEOUT = shutdown_budget()['command']
 LEGACY_SERVICE_STOP_TIMEOUT = SHUTDOWN_BUDGET['legacy_service']
 SERVICE_RESTART_COMMAND_TIMEOUT = SERVICE_STOP_COMMAND_TIMEOUT + START_TIMEOUT + 10
 EXIT_OBSERVATION_TIMEOUT = 1
@@ -356,7 +371,18 @@ async def supervised_parent_exit(process):
         await asyncio.sleep(0.01)
 
 
-async def stop_supervised_application(process):
+def reported_gateway_horizon(payload):
+    """The horizon an application reported at readiness; None when it reported none."""
+    value = payload.get('gateway_shutdown_horizon_ms')
+    if value is None:
+        return None
+    if type(value) is not int or not 0 < value <= SHUTDOWN_BUDGET['maximum_horizon_ms']:
+        raise DestinationError('The application reported an invalid gateway shutdown horizon.')
+    return value
+
+
+async def stop_supervised_application(process, *, horizon_ms=None):
+    window = STOP_TIMEOUT if horizon_ms is None else shutdown_budget(horizon_ms)['application']
     if process.returncode is None:
         try:
             # The SDK's gateway inherits this group. Let the application keep
@@ -374,7 +400,7 @@ async def stop_supervised_application(process):
             if process.returncode is None:
                 raise
         try:
-            await asyncio.wait_for(supervised_parent_exit(process), STOP_TIMEOUT)
+            await asyncio.wait_for(supervised_parent_exit(process), window)
         except TimeoutError:
             pass
     # Parent exit is separate from owned group cleanup. Escalate only after
@@ -434,8 +460,11 @@ def private_settings(root=ROOT):
 
 
 def service_stop_timeout(receipt):
+    # The legacy budget, the one the earlier pinned horizon gave, or the
+    # unreported horizon's budget.
     value = receipt.get('stop_timeout_seconds', LEGACY_SERVICE_STOP_TIMEOUT)
-    if type(value) is not int or value not in {LEGACY_SERVICE_STOP_TIMEOUT, SERVICE_STOP_TIMEOUT}:
+    if type(value) is not int or value not in {LEGACY_SERVICE_STOP_TIMEOUT, SERVICE_STOP_TIMEOUT,
+            shutdown_budget(SHUTDOWN_BUDGET['earlier_pinned_horizon_ms'])['service']}:
         raise DestinationError('The service receipt has an unsupported shutdown budget. No service was controlled.')
     return value
 
@@ -670,6 +699,8 @@ async def supervise(operations):
     pipe = os.fdopen(read_fd, 'rb', buffering=0)
     transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), pipe)
     process = None
+    # The horizon the application's gateway advertised, reported at readiness.
+    horizon_ms = None
     admission_entered = False
     cleanup_confirmed = False
     primary_error = None
@@ -722,6 +753,7 @@ async def supervise(operations):
             raise DestinationError('Native startup did not report readiness before exit or the time limit.')
         payload = json.loads(ready.result())
         bootstrap = startup(payload, operations.spec, process.pid, port)
+        horizon_ms = reported_gateway_horizon(payload)
         while not stop.is_set() and process.returncode is None:
             try:
                 healthy = await asyncio.to_thread(console_healthy, operations.root, operations.spec, payload['console_url'])
@@ -744,7 +776,7 @@ async def supervise(operations):
                     os.close(write_fd)
                 transport.close()
                 if process is not None:
-                    await stop_supervised_application(process)
+                    await stop_supervised_application(process, horizon_ms=horizon_ms)
                     cleanup_confirmed = True
             finally:
                 for task in tasks:

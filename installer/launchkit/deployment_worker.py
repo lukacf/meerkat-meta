@@ -22,7 +22,8 @@ from .deployment import (MAX_PACKAGE_BYTES, await_validation, journal, materiali
                          parse_setting, update_receipt, verify_destination)
 from .projects import DraftConflict
 from .templates.storage_setup import project_lock
-from .deployment_deadlines import APPLICATION_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOUT
+from .deployment_deadlines import (APPLICATION_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOUT,
+                                   reported_gateway_horizon, shutdown_budget)
 from .deployment_ports import require_available_console_port, LocalConsolePortUnavailable
 from .native_definition_continuity import valid_continuity_projection
 from .owned_worker import spawn_owned_worker
@@ -174,6 +175,9 @@ def startup_refusal(line):
     return "The application refused to start: " + message.strip()[:2000]
 
 class Supervisor:
+    # The horizon the current child's gateway advertised, reported at readiness.
+    gateway_shutdown_horizon_ms = None
+
     def __init__(self, directory, *, source_custody=None):
         self.directory = Path(directory)
         self.receipt = read_receipt(directory)
@@ -236,7 +240,9 @@ class Supervisor:
                 captured.append(text)
 
     async def terminate(self, timeout=None):
-        timeout = STOP_TIMEOUT if timeout is None else timeout
+        if timeout is None:
+            horizon_ms = self.gateway_shutdown_horizon_ms
+            timeout = STOP_TIMEOUT if horizon_ms is None else shutdown_budget(horizon_ms)["application"]
         process = self.child
         if not process:
             return
@@ -1358,8 +1364,11 @@ class Supervisor:
         require_bootstrap_history_settled(self.directory, bootstrap_selection=original_bootstrap)
         require_bootstrap_original()
         attempt_id = str(uuid.uuid4())
+        # A new child reports its own horizon; until then the stop assumes none.
+        self.gateway_shutdown_horizon_ms = None
         journal(self.directory, "Starting your application and bootstrapping its native agents.",
                 status="starting", phase="start", startup_attempt_id=attempt_id, startup_console_health=None,
+                gateway_shutdown_horizon_ms=None,
                 startup_port_observation={**observation, "attempt_id": attempt_id,
                     "deployment_id": current["deployment_id"], "package_sha256": current["package_sha256"]},
                 **({"startup_candidate_runtime_proof": candidate_proof} if candidate_proof is not None else {}),
@@ -1431,9 +1440,13 @@ class Supervisor:
             except (ValueError, UnicodeError):
                 raise ValueError("The application returned invalid startup evidence. Inspect the runtime logs and rebuild the checked package.") from None
             bootstrap, url = readiness(payload, definition, process.pid, self.port)
+            horizon_ms = reported_gateway_horizon(payload)
+            # Record before use: the host's wait for this worker reads it.
             journal(self.directory, "Native agents finished bootstrap. Checking the actual Console before publishing readiness.",
                     status="starting", phase="start", bootstrap=bootstrap, console_url=None, runtime_pid=process.pid,
-                    process_live=True, health="unknown", health_checked_at=now())
+                    process_live=True, health="unknown", health_checked_at=now(),
+                    gateway_shutdown_horizon_ms=horizon_ms)
+            self.gateway_shutdown_horizon_ms = horizon_ms
             import httpx
             async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
                 await self.startup_console(client, url, definition, process, exited, stopped)

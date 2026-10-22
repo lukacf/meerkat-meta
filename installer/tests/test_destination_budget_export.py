@@ -42,12 +42,17 @@ def test_both_exporters_load_destination_budget_without_launch_installed(tmp_pat
     result = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(helper)],
                             cwd=tmp_path, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {
-        "application": deployment_deadlines.APPLICATION_STOP_TIMEOUT,
+    budgets = json.loads(result.stdout)
+    assert budgets == {
+        "unreported_horizon_ms": deployment_deadlines.UNREPORTED_GATEWAY_SHUTDOWN_HORIZON_MS,
+        "maximum_horizon_ms": deployment_deadlines.MAX_REPORTED_GATEWAY_SHUTDOWN_HORIZON_MS,
+        "earlier_pinned_horizon_ms": deployment_deadlines.EARLIER_PINNED_GATEWAY_SHUTDOWN_HORIZON_MS,
+        "application_margin": (deployment_deadlines.NATIVE_TRANSPORT_FORCE_REAP_TIMEOUT
+                               + deployment_deadlines.APPLICATION_ADAPTER_STOP_MARGIN),
         "force_reap": deployment_deadlines.PROCESS_FORCE_REAP_TIMEOUT,
-        "worker": deployment_deadlines.WORKER_STOP_TIMEOUT,
-        "service": deployment_deadlines.USER_SERVICE_STOP_TIMEOUT,
-        "command": deployment_deadlines.SERVICE_STOP_COMMAND_TIMEOUT,
+        "worker_margin": deployment_deadlines.WORKER_STOP_MARGIN,
+        "service_margin": deployment_deadlines.USER_SERVICE_STOP_MARGIN,
+        "command_margin": deployment_deadlines.SERVICE_STOP_COMMAND_MARGIN,
         "legacy_service": deployment_deadlines.LEGACY_USER_SERVICE_STOP_TIMEOUT}
     assert "__LAUNCH_SHUTDOWN_BUDGET__" not in files["remote_operations.py"]
     sums = dict(row.split("  ", 1)[::-1] for row in files["SHA256SUMS"].splitlines())

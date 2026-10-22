@@ -27,7 +27,8 @@ from .templates_v2.application_configuration import validate_application_fields,
 from .templates_v2.console_configuration import (console_configuration,
     console_authentication as declared_console_authentication, validate_console_configuration_values)
 from .artifact_binding import package_matches, report_brief_hash, matches as artifact_matches, current_version, proposal_hash
-from .deployment_deadlines import WORKER_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOUT
+from .deployment_deadlines import (WORKER_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOUT,
+                                   reported_gateway_horizon, shutdown_budget)
 from .deployment_ports import observe_local_console_port, require_available_console_port, installed_console_port
 from .deployment_sources import compile_native_source, read_package_source, native_fields, NATIVE_SOURCE, NATIVE_KEYS
 
@@ -229,6 +230,20 @@ def new_installation_receipt(identity, guide_id, source, version, build_id, dige
 
 def read_receipt(root):
     return json.loads((Path(root) / "receipt.json").read_text())
+
+
+def worker_stop_timeout(root):
+    """Wait for an owned worker's stop around the horizon its application reported.
+
+    The worker records that horizon at readiness and clears it for each new
+    child. An unreadable or invalid record is waited as unreported: the stop
+    itself must not fail on it.
+    """
+    try:
+        horizon_ms = reported_gateway_horizon(read_receipt(root))
+    except (OSError, ValueError, AttributeError):
+        horizon_ms = None
+    return WORKER_STOP_TIMEOUT if horizon_ms is None else shutdown_budget(horizon_ms)["worker"]
 
 
 @contextmanager
@@ -2233,7 +2248,7 @@ class DeploymentService:
                     if process.stdin:
                         process.stdin.close()
                     try:
-                        await asyncio.wait_for(process.wait(), WORKER_STOP_TIMEOUT)
+                        await asyncio.wait_for(process.wait(), worker_stop_timeout(directory))
                     except asyncio.TimeoutError:
                         try:
                             os.killpg(process.pid, 9)
@@ -2616,9 +2631,9 @@ class DeploymentService:
                 pass  # Its actual return and the fixed cleanup record still gate recovery.
         try:
             if task is not None:
-                await asyncio.wait_for(asyncio.shield(task), WORKER_STOP_TIMEOUT)
+                await asyncio.wait_for(asyncio.shield(task), worker_stop_timeout(directory))
             elif process is not None:
-                await asyncio.wait_for(process.wait(), WORKER_STOP_TIMEOUT)
+                await asyncio.wait_for(process.wait(), worker_stop_timeout(directory))
         except asyncio.TimeoutError:
             raise DraftConflict("The owned worker has not finished cleanup. No private settings were changed.") from None
         latest = read_receipt(directory)
@@ -3824,7 +3839,7 @@ class DeploymentService:
                 await process.stdin.drain()
                 if task is not None:
                     try:
-                        await asyncio.wait_for(asyncio.shield(task), WORKER_STOP_TIMEOUT)
+                        await asyncio.wait_for(asyncio.shield(task), worker_stop_timeout(directory))
                     except asyncio.TimeoutError:
                         raise DraftConflict("The owned worker has not finished cleanup. No stopped state was confirmed.") from None
             elif task is not None:
