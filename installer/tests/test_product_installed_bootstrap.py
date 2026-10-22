@@ -516,6 +516,82 @@ async def test_changed_kept_inventory_refuses_the_product_start(installed_bootst
     assert outcome is None and inflated == [f.source.artifacts.prefix] and sources == ["archive"]
 
 
+def _keep_with_fingerprints(f, monkeypatch):
+    """Keep the inventory with fingerprints, as a later full Start does."""
+    from launchkit import native_prefix_receipt as kept
+    from launchkit.templates import install_candidate as adapter
+    monkeypatch.setattr(kept, "RACY_NS", 0)
+    monkeypatch.setattr(kept, "local_disk_filesystem", lambda path: True)
+    receipt = deployment.read_receipt(f.directory)
+    proof = receipt["installed_candidate_runtime_proof"]
+    record = {}
+    adapter.verify_meta_toolkit_prefix(f.source.artifacts, deployment_root=f.selected.destination, record=record)
+    named = kept.mint(f.directory, f.source.artifacts, proof=proof,
+        runtime_candidate=receipt["runtime_candidate"], fingerprints=record)
+    assert named and kept.record(f.directory, named, inventory_sha256=proof["prefix_inventory_sha256"],
+        runtime_candidate=receipt["runtime_candidate"])
+    return named
+
+
+def _child_counts(monkeypatch, f):
+    from launchkit import runtime_candidates as candidates
+    from launchkit.templates import install_candidate as adapter
+    counts = {"inflated": 0, "reads": 0}
+    prefix = f.selected.destination / ".bin" / f.source.artifacts.prefix
+    original_entries, original_read = candidates.product_prefix_entries, adapter.read_owned
+    def entries(content, name):
+        counts["inflated"] += 1
+        return original_entries(content, name)
+    def read_owned(path, *args, **kwargs):
+        if prefix in Path(path).parents:
+            counts["reads"] += 1
+        return original_read(path, *args, **kwargs)
+    monkeypatch.setattr(candidates, "product_prefix_entries", entries)
+    monkeypatch.setattr(adapter, "read_owned", read_owned)
+    return counts
+
+
+def test_product_child_start_uses_the_kept_inventory_and_reads_no_unchanged_native_file(
+        installed_bootstrap, tmp_path, monkeypatch):
+    f = installed_bootstrap
+    _keep_with_fingerprints(f, monkeypatch)
+    counts = _child_counts(monkeypatch, f)
+    entered = []
+    async def run(spec, args, *, application_startup):
+        entered.append(application_startup)
+    _child_host(f, tmp_path, monkeypatch, run)
+    _invoke_child(f)
+    assert len(entered) == 1 and counts == {"inflated": 0, "reads": 0}
+
+
+def test_product_child_start_refuses_a_changed_native_file_despite_kept_fingerprints(
+        installed_bootstrap, tmp_path, monkeypatch):
+    f = installed_bootstrap
+    _keep_with_fingerprints(f, monkeypatch)
+    readme = f.selected.destination / ".bin" / f.source.artifacts.prefix / "README.md"
+    original = readme.read_bytes()
+    readme.chmod(0o644)
+    readme.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+    readme.chmod(0o444)
+    async def run(spec, args, *, application_startup):
+        pytest.fail("The child started over a changed native prefix.")
+    _child_host(f, tmp_path, monkeypatch, run)
+    with pytest.raises(Exception, match="native prefix file changed"):
+        _invoke_child(f)
+
+
+def test_product_child_start_refuses_a_changed_kept_inventory(installed_bootstrap, tmp_path, monkeypatch):
+    f = installed_bootstrap
+    named = deployment.read_receipt(f.directory)[KEPT_FIELD]
+    path = f.directory / f"native-prefix-receipt-{named}.json"
+    path.write_bytes(path.read_bytes().rstrip(b"\n") + b" \n")
+    async def run(spec, args, *, application_startup):
+        pytest.fail("The child started with a changed kept inventory.")
+    _child_host(f, tmp_path, monkeypatch, run)
+    with pytest.raises(Exception, match="differs from the copy receipt.json names"):
+        _invoke_child(f)
+
+
 @pytest.mark.parametrize("change", ["receipt", "selection", "lifecycle", "source"])
 def test_exact_child_refuses_drift_between_preimport_and_application_scope(
         installed_bootstrap, tmp_path, monkeypatch, change):

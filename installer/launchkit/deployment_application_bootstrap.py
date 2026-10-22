@@ -916,7 +916,7 @@ class InstalledBootstrapFactory:
         self.source_scope = open_installed_product_source(self.directory,
             project_lease=project_lease, require_current=self.require_selection_current,
             owner_source=self._owner_source, owner_source_sha256=self._owner_source_sha256,
-            application_startup=self.inputs)
+            application_startup=self.inputs, retained=kept_native_inventory(self.directory))
         self.source = await self.source_scope.__aenter__()
         try:
             self.require_selection_current()
@@ -936,6 +936,17 @@ class InstalledBootstrapFactory:
             # original app/native lifetime owner may settle that boundary.
 
 
+def kept_native_inventory(directory):
+    """The verified native inventory receipt.json names for a product Start.
+
+    The child joins the same receipt-bound inventory as its parent's Start:
+    forged bytes refuse, and a stale, missing or legacy one keeps the full
+    archive read.
+    """
+    from .native_prefix_receipt import load
+    return load(directory, read_receipt(directory))
+
+
 def run_child(directory, selection_path, selection_sha256, lifecycle_id=None, *,
         owner_source=None, owner_source_sha256=None):
     wrapper = InstalledBootstrapFactory(Path(directory),
@@ -953,7 +964,8 @@ def run_child(directory, selection_path, selection_sha256, lifecycle_id=None, *,
             async with open_installed_product_source(factory.directory,
                     project_lease=lease, require_current=wrapper.require_selection_current,
                     owner_source=owner_source, owner_source_sha256=owner_source_sha256,
-                    application_startup=factory.inputs) as source:
+                    application_startup=factory.inputs,
+                    retained=kept_native_inventory(factory.directory)) as source:
                 receipt = read_receipt(factory.directory)
                 observation = await await_product_validation(source, _observe_inputs,
                     factory.directory, receipt, factory.inputs,
