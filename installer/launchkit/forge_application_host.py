@@ -716,10 +716,14 @@ class ForgeApplicationHost:
         directory, receipt, stopped = deployment._stopped_application_owner(guide_id, deployment_id)
         supervisor = chosen["supervisor"]
         changed = "Preparation inputs differ from the original stopped product owner."
+        from .deployment_application_bootstrap import same_installation_apart_from_staged_update
+        # An update staged or blocked after Install changed nothing installed;
+        # its pointer alone does not change the original stopped owner.
         if (not isinstance(supervisor, Supervisor) or supervisor.directory != directory
                 or supervisor.destination != Path(receipt["destination"])
-                or restore_inputs is None
-                    and deployment._configuration_binding(supervisor.receipt) != deployment._configuration_binding(receipt)
+                or restore_inputs is None and not same_installation_apart_from_staged_update(
+                    deployment._configuration_binding(supervisor.receipt),
+                    deployment._configuration_binding(receipt), receipt)
                 or parse_candidate_selection(receipt.get("runtime_candidate")) != self._target
                 or deployment_id in deployment._application_preparations):
             raise CustodyError(changed)

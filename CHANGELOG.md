@@ -408,6 +408,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the session. It read a nested `context` object, which the gateway does not
   send, and passed an empty context; a nested object is still read when one
   is present.
+- A Meta Toolkit product application's first setup now works when an
+  accepted update was staged after its Install. Preparing or finishing
+  that setup refused with "Preparation inputs differ from the original
+  stopped product owner." (or "Preparation cannot substitute a Supervisor
+  from another installation."): the staged update counted as a change to the
+  installed application, though it changes nothing until it is applied. The
+  update stays staged; to apply it after the setup, stage it again.
 
 ### Known limitations
 
@@ -416,10 +423,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   protected settings or runtime, including a "Rebuild with updated runtime"
   package. "Stage accepted update" blocks such an update and says why;
   install that build into a new empty folder. A set-up application that runs
-  as a background service still refuses "Stage accepted update". On the
-  Meta Toolkit Connect route, an update staged before the application's
-  first setup can still make that setup refuse. After Forge restarts, use
-  "Continue setup" once before you stage or apply an update.
+  as a background service still refuses "Stage accepted update". After
+  Forge restarts, use "Continue setup" once before you stage or apply an
+  update.
 - A Meta Toolkit product application that has not finished its setup cannot
   take a staged update in place yet. "Apply and verify update" refuses such
   an update before anything changes. Finish its setup, then stage the

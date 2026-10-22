@@ -608,6 +608,41 @@ async def test_apply_in_a_forge_without_a_selected_host_takes_the_ordinary_updat
         await service.shutdown()
 
 
+async def test_update_staged_before_the_first_setup_keeps_that_setup_available(local, monkeypatch):
+    """Stage right after Install, then run the first setup.
+
+    The install-time Supervisor and the Toolkit preparation owner are the real
+    ones. A staged update changes nothing installed, so the first setup stays
+    available: status offers it, Prepare retains its Fresh draft and Finish
+    starts it with the installed source. The update stays staged.
+    """
+    f = local
+    f.select()
+    f.service.application_setup_continuation = f.host.continue_application_startup
+    inputs = await retain(f)
+    installed = deployment.read_receipt(f.directory)
+    candidate, report = candidate_update(f)
+    update = updates.stage(f.directory, packed(candidate), report)["update"]
+    assert update["status"] == "staged" and "setup_restore_sha256" not in update
+    # Each read and Prepare see the same original stopped owner, every time.
+    for _ in range(2):
+        status = await f.host.setup_status(f.service, f.guide_id, f.directory.name)
+        assert status["available"] and status["action"] == "prepare-setup", status.get("detail")
+    fresh = await prepare(f, monkeypatch)
+    assert json.loads(fresh.read())["kind"] == "fresh"
+    assert f.host._installation_supervisor is inputs.supervisor
+    f.service.launched.clear()
+    started = await action(f, "finish-setup")
+    assert started["action_request"]["outcome"] == "returned", started["action_request"]
+    directory, mode, options = f.service.launched[-1]
+    assert (directory, mode) == (f.directory, "start")
+    admitted = bootstrap.read_bootstrap_admission(directory, options["bootstrap_selection"])
+    assert admitted["application_startup"] == json.loads(fresh.read())
+    receipt = deployment.read_receipt(f.directory)
+    assert (receipt["build_id"], receipt["package_sha256"]) == (installed["build_id"], installed["package_sha256"])
+    assert (receipt["update"]["update_id"], receipt["update"]["status"]) == (update["update_id"], "staged")
+
+
 async def test_ordinary_update_keeps_its_doctor_check_and_worker_start(tmp_path):
     _, directory, _, previous, _, identity = await staged(tmp_path)
     calls = []
