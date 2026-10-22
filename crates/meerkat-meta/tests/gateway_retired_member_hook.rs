@@ -7,6 +7,8 @@
 //! host error leaves the retire standing and reaches the SDK as the
 //! `retired_member_release_failed` error event. Each case runs separate
 //! gateway processes over real stdio, answering the SDK callbacks itself.
+//! The gateway composes its session bridge with the runtime machine, so a
+//! retired live member names the registration of its own session.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::BTreeMap;
@@ -95,7 +97,7 @@ impl GatewayHostComposition for RetiringHost {
         append(
             &self.record,
             &format!(
-                "retired identity={} cause={} generation={} runtime={} session={}",
+                "retired identity={} cause={} generation={} runtime={} session={} registration={}",
                 retired.identity,
                 retired.cause.as_str(),
                 retired.generation,
@@ -104,6 +106,16 @@ impl GatewayHostComposition for RetiringHost {
                     "some"
                 } else {
                     "none"
+                },
+                // The registration of the incarnation's own session.
+                match &retired.registration {
+                    Some(registration)
+                        if retired.session_id.as_ref() == Some(registration.session_id()) =>
+                    {
+                        "own"
+                    }
+                    Some(_) => "other",
+                    None => "none",
                 },
             ),
         );
@@ -372,7 +384,6 @@ fn drive(
             }
         }
     }
-    drop(send);
     drop(stdin);
     let deadline = Instant::now() + BACKSTOP;
     while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
@@ -395,7 +406,8 @@ fn drive(
 
 /// An explicit retire reaches the host once, with cause `retire`, before the
 /// retire answers; a later roster pass that no longer lists an identity
-/// reaches it once, with cause `unlisted`, before the pass answers. The pass
+/// reaches it once, with cause `unlisted`, before the pass answers; each names
+/// the registration of the retired incarnation's own session. The pass
 /// that brings the explicitly retired identity back (it is still listed)
 /// tells the host nothing, and the host hears of nothing else.
 #[test]
@@ -448,7 +460,10 @@ fn a_host_hears_an_explicit_and_an_unlisted_retirement_once_each() {
         run.lines
     );
     for line in &retired {
-        assert!(line.ends_with(" session=some"), "{line}");
+        assert!(
+            line.ends_with(" session=some registration=own"),
+            "the gateway names the registration of the retired incarnation's session: {line}"
+        );
     }
     let settled = run.position(SETTLED);
     let answered = run.position(RETIRED);

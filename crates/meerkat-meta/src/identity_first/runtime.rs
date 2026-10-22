@@ -5316,10 +5316,11 @@ impl IdentityRuntime {
     }
 
     /// The incarnation a retire of `identity` is about to retire, for the
-    /// host's retirement hook: the live binding in Core's member history,
-    /// read under the identity's lifecycle lock before Core retires it.
-    /// `None` when no hook is installed (nothing extra is read) or Core
-    /// holds no live member.
+    /// host's retirement hook: the live binding in Core's member history
+    /// and the exact registration its session holds, read under the
+    /// identity's lifecycle lock before Core retires it (Core hands out
+    /// only a current registration). `None` when no hook is installed
+    /// (nothing extra is read) or Core holds no live member.
     async fn retiring_incarnation(
         &self,
         identity: &AgentIdentity,
@@ -5334,6 +5335,10 @@ impl IdentityRuntime {
         let Some(agent_runtime_id) = live_binding_runtime_id(&binding) else {
             return Ok(None);
         };
+        let registration = match (binding.session_id(), self.bridge.as_ref()) {
+            (Some(session_id), Some(bridge)) => bridge.member_registration(session_id).await,
+            _ => None,
+        };
         Ok(Some(super::types::RetiredIdentityMember {
             identity: identity.clone(),
             member: binding.identity().as_str().to_string(),
@@ -5341,8 +5346,42 @@ impl IdentityRuntime {
             agent_runtime_id,
             generation: binding.generation().get(),
             session_id: binding.session_id().cloned(),
+            registration,
             cause,
         }))
+    }
+
+    /// Right after Core's retire answered, still under the identity's
+    /// lifecycle lock: Core's retire answers only once the retired
+    /// registration's teardown removed it, so a registration still current
+    /// here was not ended by this retire. The host is then told of no
+    /// registration and keeps what it bound to it.
+    async fn settle_retired_registration(
+        &self,
+        retiring: &mut Option<super::types::RetiredIdentityMember>,
+    ) {
+        let Some(member) = retiring.as_mut() else {
+            return;
+        };
+        let still_current = match (member.registration.as_ref(), self.bridge.as_ref()) {
+            (Some(registration), Some(bridge)) => {
+                bridge
+                    .member_registration(registration.session_id())
+                    .await
+                    .as_ref()
+                    == Some(registration)
+            }
+            _ => false,
+        };
+        if still_current {
+            tracing::warn!(
+                identity = %member.identity,
+                agent_runtime_id = %member.agent_runtime_id,
+                "Core's retire answered while the retired incarnation's registration is \
+                 still current; the host's retirement hook is told of no registration"
+            );
+            member.registration = None;
+        }
     }
 
     /// Hand each retired incarnation to the host's retirement hook, in
@@ -7375,10 +7414,11 @@ impl IdentityRuntime {
                     .core_live_member(&identity)
                     .await?
                     .map(|live| live.agent_runtime_id);
-                let retiring = runtime
+                let mut retiring = runtime
                     .retiring_incarnation(&identity, super::types::RetiredIdentityCause::Retire)
                     .await?;
                 runtime.retire_locked(&identity).await?;
+                runtime.settle_retired_registration(&mut retiring).await;
                 (retiring, cleanup(retired_alias).await)
             };
             // After the cleanup, with the lifecycle lock released.
@@ -9490,10 +9530,11 @@ impl IdentityRuntime {
         if self.core_live_member(identity).await?.is_none() {
             return Ok(None);
         }
-        let retiring = self
+        let mut retiring = self
             .retiring_incarnation(identity, super::types::RetiredIdentityCause::Unlisted)
             .await?;
         self.retire_locked(identity).await?;
+        self.settle_retired_registration(&mut retiring).await;
         Ok(retiring)
     }
 
@@ -11767,7 +11808,7 @@ impl IdentityRuntime {
             // Only a retire of the live member tells the host's retirement
             // hook: Core answers `Ok` for a scope no incarnation is current
             // at without retiring anything.
-            let retiring = if retires_live {
+            let mut retiring = if retires_live {
                 self.retiring_incarnation(identity, super::types::RetiredIdentityCause::Scoped)
                     .await
                     .map_err(|error| ScopedRetireError::Rejected {
@@ -11785,6 +11826,7 @@ impl IdentityRuntime {
                 .retire_at_scope(&runtime_id, member)
                 .await
                 .map_err(|error| name_stale_retire_mismatch(error, live.as_ref(), member))?;
+            self.settle_retired_registration(&mut retiring).await;
             if retires_live {
                 self.entries.notify_binding_changed();
                 self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Dormant, None);
@@ -12717,10 +12759,11 @@ impl IdentityRuntime {
                 self.ensure_expected_member_alias_current(identity, expected_alias)
                     .await?;
             }
-            let retiring = self
+            let mut retiring = self
                 .retiring_incarnation(identity, super::types::RetiredIdentityCause::Retire)
                 .await?;
             self.retire_locked(identity).await?;
+            self.settle_retired_registration(&mut retiring).await;
             retiring
         };
         // The host hears of the retirement with the lifecycle lock released.
