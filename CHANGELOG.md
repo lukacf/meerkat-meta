@@ -65,6 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with that source, and "Restore previous application" returns to the
   previous source if that Start fails. The installation keeps its setup
   across later updates, Stops and Forge restarts.
+- Meta Forge keeps answering other requests while it prepares an
+  application's installation options, or admits a Start or Retry of an
+  installed application. Hashing, compressing and unpacking the package, and
+  checking the installed files and the selected product, run outside the
+  server's event loop, so a large package on a small host no longer stalls
+  the rest of Forge.
 
 ### Known limitations
 
