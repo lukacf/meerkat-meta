@@ -492,9 +492,10 @@ def prepare_service(directory, receipt, *, bootstrap_selection=None, source_cust
             raise DraftConflict("The frozen service cannot replace its original Restore selection.")
         return service
     plan = service_plan(receipt["deployment_id"], directory)
-    # Size the unit for the horizon the application last reported, if any.
+    # A longer horizon the application last reported widens the new unit;
+    # it never gets less than the unreported horizon's budget.
     horizon_ms = unit_gateway_horizon(receipt)
-    if horizon_ms is not None:
+    if horizon_ms is not None and shutdown_budget(horizon_ms)["service"] > plan["stop_timeout_seconds"]:
         plan["stop_timeout_seconds"] = shutdown_budget(horizon_ms)["service"]
         plan["gateway_shutdown_horizon_ms"] = horizon_ms
     if bootstrap_selection is not None:
