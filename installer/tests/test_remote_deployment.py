@@ -1482,3 +1482,19 @@ async def test_connect_names_an_installation_only_after_its_record_is_in_place(s
     receipt = await connect(service)
     assert seen == [(True, False)]
     assert installation_entries(service) == (sorted([receipt["deployment_id"], "latest.json"]), [])
+
+
+async def test_connect_never_replaces_an_existing_installation_directory(service, monkeypatch):
+    from types import SimpleNamespace
+    from launchkit import remote_deployment
+    taken = uuid.uuid4()
+    existing = service.root / service.guide.identity / str(taken)
+    existing.mkdir(parents=True, mode=0o700)
+    issued = iter([taken])
+    monkeypatch.setattr(remote_deployment, "uuid", SimpleNamespace(UUID=uuid.UUID,
+        uuid4=lambda: next(issued, None) or uuid.uuid4()))
+    with pytest.raises(FileExistsError):
+        await service.connect(service.guide.identity, 4, service.implementation.identity,
+            "owned.example", "test", 22, "~/src/team")
+    assert existing.is_dir() and not any(existing.iterdir())
+    assert installation_entries(service)[1] == []
