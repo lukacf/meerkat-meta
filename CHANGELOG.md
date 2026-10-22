@@ -57,6 +57,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   not acknowledge the stored one are refused before the provider sees the
   stored definition. A definition written into the mob storage after the
   roster was resolved is refused rather than resumed.
+- Meta Forge updates a Meta Toolkit product application after its setup when
+  the update is built from the same application source and keeps its plan,
+  definition, tool policy, protected settings and runtime. "Apply and verify
+  update" installs and checks the new source and leaves the application
+  stopped. "Start installed application" then restores its completed setup
+  with that source, and "Restore previous application" returns to the
+  previous source if that Start fails. The installation keeps its setup
+  across later updates, Stops and Forge restarts.
+
+### Known limitations
+
+- After its setup, a Meta Toolkit product application still cannot take an
+  update that changes its native definition, instructions, tool policy,
+  protected settings or runtime, including a "Rebuild with updated runtime"
+  package. "Stage accepted update" blocks such an update and says why;
+  install that build into a new empty folder. A set-up application that runs
+  as a background service still refuses "Stage accepted update". On the
+  Meta Toolkit Connect route, an update staged before the application's
+  first setup can still make that setup refuse. After Forge restarts, use
+  "Continue setup" once before you stage or apply an update.
 
 ## [0.9.4] - 2026-10-22
 
