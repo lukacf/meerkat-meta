@@ -550,24 +550,24 @@ async def test_failed_observation_keeps_evidence_but_must_match_the_submitted_op
     evidence = {"status": "failed", "operation_id": str(uuid.uuid4()), "worker_live": False, "cleanup_confirmed": True,
                 "error": {"code": "operation-failed", "message": "The operation needs attention."}}
     with pytest.raises(DraftConflict):
-        service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
+        await service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
     evidence["operation_id"] = expected
-    service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
+    await service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
     result = read_receipt(directory)
     assert result["status"] == "failed" and result["remote_error_code"] == "operation-failed"
     assert result["worker_live"] is False and result["observation"]["available"] is True
     evidence["cleanup_confirmed"] = False
-    service.adopt(directory, result, evidence, expected_operation=expected)
+    await service.adopt(directory, result, evidence, expected_operation=expected)
     assert read_receipt(directory)["status"] == "recovery-needed"
     evidence.update(cleanup_confirmed=True, worker_live=True, ready=True, source_current=True)
-    service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
+    await service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
     observed = read_receipt(directory)
     assert observed["status"] == "recovery-needed" and observed["ready"] is False
     evidence.pop("worker_live")
-    service.adopt(directory, observed, evidence, expected_operation=expected)
+    await service.adopt(directory, observed, evidence, expected_operation=expected)
     assert read_receipt(directory)["status"] == "recovery-needed"
     evidence["worker_live"] = False
-    service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
+    await service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
     observed = read_receipt(directory)
     assert observed["status"] == "failed" and observed["ready"] is False
 
@@ -1243,3 +1243,58 @@ async def test_remote_interview_evidence_leaves_the_event_loop_free(service, mon
         await probe
     assert result["status"] == "configuration-required" and result["owned_package_verified"]
     assert stalls and max(stalls) < 0.5
+
+
+def slow_package_reads(monkeypatch):
+    from launchkit import remote_deployment
+    for name in ("package_files", "source_archive"):
+        def slowed(*args, original=getattr(remote_deployment, name), **kwargs):
+            time.sleep(1.0)  # A large package on a small host.
+            return original(*args, **kwargs)
+        monkeypatch.setattr(remote_deployment, name, slowed)
+
+
+async def longest_loop_gap(operation):
+    stalls, done = [], asyncio.Event()
+    async def other_request():
+        while not done.is_set():
+            started = time.monotonic()
+            await asyncio.sleep(0.01)
+            stalls.append(time.monotonic() - started)
+    probe = asyncio.create_task(other_request())
+    await asyncio.sleep(0)  # The other request is waiting on the loop.
+    try:
+        result = await operation
+    finally:
+        done.set()
+        await probe
+    return result, max(stalls)
+
+
+async def test_remote_connect_leaves_the_event_loop_free(service, monkeypatch):
+    slow_package_reads(monkeypatch)
+    connected, gap = await longest_loop_gap(connect(service))
+    assert connected["status"] == "configuration-required"
+    assert gap < 0.5
+
+
+async def test_remote_install_leaves_the_event_loop_free(service, monkeypatch):
+    receipt = await connect(service)
+    slow_package_reads(monkeypatch)
+    async def installed():
+        value = await install(service, receipt)
+        await asyncio.gather(*list(service.tasks.values()))
+        return value
+    accepted, gap = await longest_loop_gap(installed())
+    assert accepted["status"] == "installing" and not accepted["can_install"]
+    assert gap < 0.5
+
+
+async def test_remote_status_observation_leaves_the_event_loop_free(service, monkeypatch):
+    receipt = await connect(service)
+    await install(service, receipt)
+    await asyncio.gather(*list(service.tasks.values()))
+    slow_package_reads(monkeypatch)
+    observed, gap = await longest_loop_gap(running(service, receipt))
+    assert observed["status"] == "running" and observed["ready"]
+    assert gap < 0.5
