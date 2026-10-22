@@ -332,4 +332,5 @@ async def test_hook_control_below_the_product_glibc_floor_refuses_before_any_rem
             match=r"need glibc 2\.39 or newer, but the selected Linux control admits computers with glibc 2\.31"):
         await f.service._connect(GUIDE, 3, BUILD, ENDPOINT, str(f.destination), product_owner=f.selection)
     assert not f.transport.calls and not f.transport.frames
-    assert not f.service.directory(GUIDE).exists()
+    with pytest.raises(LookupError, match="No remote installation"):
+        f.service.directory(GUIDE)
