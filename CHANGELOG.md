@@ -488,6 +488,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   advertise `meta/send_status`, since an older gateway would ignore the key.
   Rust hosts call `PublicIdentityRuntime::send_keyed` and `send_status`.
   The rpc reference has a table of the three keyed delivery modes.
+- Hosted MCP OAuth for a gateway host, on the native owners it already
+  composes with. `GatewayRealmMcpInstallation::resolve_mcp_auth_target`
+  resolves a host's wire MCP target to the native `McpServerIdentity` its
+  realm's effective configuration defines (its own document folded with the
+  chain it inherits), through Meerkat's own resolver
+  (`resolve_configured_mcp_target_in_realm_trusting`): an unconfigured name,
+  another URL or another account is refused typed, and nothing is resolved
+  from the request. `GatewayFactoryConstruction::member_mcp_custody` hands
+  the host the gateway's member MCP custody, and
+  `MemberMcpCustody::credential_landed` tells every member adapter in it that
+  a login completed: each re-stages the operation awaiting exactly that
+  target (`McpRouterAdapter::retry_authorized`, as Meerkat's RPC and REST
+  completions do), so the waiting member continues in the same runtime at
+  its next boundary. The host passes the identity to `host_auth_service()`'s
+  MCP login (including the registered https callback) and calls
+  `credential_landed` with the completion's target.
 
 ### Changed
 
