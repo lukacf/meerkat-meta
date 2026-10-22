@@ -29,7 +29,7 @@ const SLOW_UNREGISTER: Duration = Duration::from_secs(6);
 
 /// Bound for a held saga's release task; it only turns a hang into a
 /// failure.
-const RELEASE_BOUND: Duration = Duration::from_secs(60);
+const RELEASE_BOUND: Duration = Duration::from_mins(1);
 
 static NEXT_MOB: AtomicU64 = AtomicU64::new(0);
 
