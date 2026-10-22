@@ -16,11 +16,11 @@
 //! `spawn_member` for the kept profile, and reads each result as the model
 //! receives it.
 //!
-//! The narrowing applies to one session build. A persisted scope narrowing
-//! is not restored as authority (a persisted disable of the mob tools still
-//! is): a restore build reaches the host's hook with Meerkat's default
-//! authority again, so a host narrows every build, restores included. The
-//! restart rows pin both sides of that contract.
+//! The narrowing applies to one session build, and so does a disable of the
+//! member's mob tools made in the hook: neither is restored as authority, and
+//! a restore build reaches the host's hook with the profile's setting and
+//! Meerkat's default authority again. A host edits every build, restores
+//! included. The restart rows pin both sides of that contract.
 //!
 //! Storage: the host-spawned rows run on the builder's ephemeral composition
 //! (in-memory mob storage, a temporary runtime store); the identity rows run
@@ -155,7 +155,8 @@ comms = true
 /// The host's session hook. For each session build that carries mob operator
 /// authority it records the spawn profiles of its mob the build arrived with,
 /// and with `keep` it keeps only those profiles spawnable (without `keep` the
-/// hook only observes). With `install_host_tools` the hook also installs the
+/// hook only observes). With `disable_mob_tools` it turns the member's mob
+/// tools off instead. With `install_host_tools` the hook also installs the
 /// host's own tools on that session, composed over the slot as hosts must
 /// (`tool_compose::ComposedExternalTools`, as the RPC gateway does for
 /// callback tools), so the member's own tools sit behind Meta's composition.
@@ -163,6 +164,7 @@ struct HostHook {
     mob_id: String,
     keep: Option<Vec<&'static str>>,
     install_host_tools: bool,
+    disable_mob_tools: bool,
     /// Per build, in order: the spawn profiles of the hook's mob in the
     /// authority the build arrived with, before any narrowing.
     arrived_with: Mutex<Vec<BTreeSet<String>>>,
@@ -174,6 +176,7 @@ impl HostHook {
             mob_id: mob_id.to_string(),
             keep: keep.map(<[&'static str]>::to_vec),
             install_host_tools,
+            disable_mob_tools: false,
             arrived_with: Mutex::new(Vec::new()),
         })
     }
@@ -190,8 +193,20 @@ impl HostHook {
         Self::new(mob_id, None, false)
     }
 
+    /// Turns the member's mob tools off: no mob operator tools, no
+    /// authority.
+    fn disabling(mob_id: &str) -> Arc<Self> {
+        Arc::new(Self {
+            mob_id: mob_id.to_string(),
+            keep: None,
+            install_host_tools: false,
+            disable_mob_tools: true,
+            arrived_with: Mutex::new(Vec::new()),
+        })
+    }
+
     /// How many session builds carrying mob operator authority this hook saw
-    /// (and, with `keep`, narrowed).
+    /// (and, with `keep` or `disable_mob_tools`, edited).
     fn sessions_with_authority(&self) -> usize {
         self.arrived_with.lock().unwrap().len()
     }
@@ -219,6 +234,13 @@ impl SessionHook for HostHook {
                 .cloned()
                 .unwrap_or_default(),
         );
+        if self.disable_mob_tools {
+            if let Some(build) = req.build.as_mut() {
+                build.override_mob = meerkat_core::ToolCategoryOverride::Disable;
+                build.mob_tool_authority_context = None;
+            }
+            return Ok(());
+        }
         let Some(keep) = &self.keep else {
             return Ok(());
         };
@@ -734,24 +756,24 @@ async fn an_identity_member_with_customizer_tools_spawns_only_the_profiles_its_h
     assert!(shutdown.cleanup_completed(), "{shutdown:?}");
 }
 
-/// Boots the identity-first lead narrowed, stops it, and boots it again on
-/// the same state with `second_hook`; returns the restored runtime once its
-/// lead holds the same session. Both boots' builds of the lead reach their
-/// hook with Meerkat's default authority: the restore build is built through
-/// the hook again rather than restoring the narrowed scope the first boot
-/// built.
-async fn restart_narrowed_lead(
+/// Boots the identity-first lead with `first_hook`, which edits its build,
+/// stops it, and boots it again on the same state with `second_hook`; returns
+/// the restored runtime once its lead holds the same session. Both boots'
+/// builds of the lead reach their hook with Meerkat's default authority: the
+/// restore build is built through the hook again rather than restoring what
+/// the first boot's hook made of it.
+async fn restart_lead(
     state: &std::path::Path,
     mob_id: &str,
     client: &ProbeClient,
+    first_hook: Arc<HostHook>,
     second_hook: Arc<HostHook>,
 ) -> UnifiedRuntime {
-    let first_hook = HostHook::narrowing(mob_id, &[KEPT_PROFILE]);
     let first = identity_runtime(state, mob_id, client, Arc::clone(&first_hook)).await;
     assert_eq!(
         first_hook.arrived_with(),
         vec![every_profile()],
-        "the first boot's hook narrowed the lead's build, which arrived with the default authority"
+        "the first boot's hook edited the lead's build, which arrived with the default authority"
     );
     let session = lead_session(&first).await;
     let shutdown = first.shutdown().await;
@@ -772,7 +794,7 @@ async fn restart_narrowed_lead(
     assert_eq!(
         second_hook.arrived_with(),
         vec![every_profile()],
-        "the restore build arrives with the default authority, not the scope the first boot narrowed"
+        "the restore build arrives with the default authority, not what the first boot's hook made of it"
     );
     second
 }
@@ -786,10 +808,11 @@ async fn a_restored_identity_member_stays_narrowed_after_a_restart() {
     let state = tempfile::tempdir().expect("state dir");
     let mob_id = unique_mob_id("restored-narrowed-spawn");
     let client = ProbeClient::default();
-    let second = restart_narrowed_lead(
+    let second = restart_lead(
         state.path(),
         &mob_id,
         &client,
+        HostHook::narrowing(&mob_id, &[KEPT_PROFILE]),
         HostHook::narrowing(&mob_id, &[KEPT_PROFILE]),
     )
     .await;
@@ -803,7 +826,7 @@ async fn a_restored_identity_member_stays_narrowed_after_a_restart() {
 /// The contract witness: a host's narrowing applies per session build, so a
 /// restored member's authority follows the hook of the boot that restores it.
 /// The restore build reaches that hook with the default authority
-/// (`restart_narrowed_lead`); a hook that does not narrow it leaves the
+/// (`restart_lead`); a hook that does not narrow it leaves the
 /// restored lead (the same session) with the default, which spawns every
 /// profile of its mob. A host narrows every build, restores included, as in
 /// the row above.
@@ -812,10 +835,49 @@ async fn a_restored_member_follows_the_current_host_hook_after_a_restart() {
     let state = tempfile::tempdir().expect("state dir");
     let mob_id = unique_mob_id("restored-unnarrowed-spawn");
     let client = ProbeClient::default();
-    let second =
-        restart_narrowed_lead(state.path(), &mob_id, &client, HostHook::observing(&mob_id)).await;
+    let second = restart_lead(
+        state.path(),
+        &mob_id,
+        &client,
+        HostHook::narrowing(&mob_id, &[KEPT_PROFILE]),
+        HostHook::observing(&mob_id),
+    )
+    .await;
 
     let results = probe_lead_identity(&second, &client).await;
+    assert_default_spawns(&second, &results).await;
+    let shutdown = second.shutdown().await;
+    assert!(shutdown.cleanup_completed(), "{shutdown:?}");
+}
+
+/// A disable of the member's mob tools that the hook made on an earlier build
+/// is per build too. The first boot's hook turns the lead's mob tools off;
+/// the restore build reaches the second boot's hook with the profile's
+/// setting and the default authority again (`restart_lead`), and a hook that
+/// leaves it alone gives the restored lead (the same session) its mob tools
+/// back, with every profile of its mob spawnable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mob_tools_disable_made_by_the_hook_is_per_build_too() {
+    let state = tempfile::tempdir().expect("state dir");
+    let mob_id = unique_mob_id("restored-undisabled-spawn");
+    let client = ProbeClient::default();
+    let second = restart_lead(
+        state.path(),
+        &mob_id,
+        &client,
+        HostHook::disabling(&mob_id),
+        HostHook::observing(&mob_id),
+    )
+    .await;
+
+    let results = probe_lead_identity(&second, &client).await;
+    let mounted = client.mounted();
+    for tool in ["spawn_member", "spawn_many_members"] {
+        assert!(
+            mounted.iter().any(|name| name == tool),
+            "the restored lead lists {tool} again: {mounted:?}"
+        );
+    }
     assert_default_spawns(&second, &results).await;
     let shutdown = second.shutdown().await;
     assert!(shutdown.cleanup_completed(), "{shutdown:?}");
