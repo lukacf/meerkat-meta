@@ -33,10 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `MemberMcpCustody::credential_landed` tells every member adapter in it that
   a login completed: each re-stages the operation awaiting exactly that
   target (`McpRouterAdapter::retry_authorized`, as Meerkat's RPC and REST
-  completions do), so the waiting member continues in the same runtime at
-  its next boundary. The host passes the identity to `host_auth_service()`'s
-  MCP login (including the registered https callback) and calls
-  `credential_landed` with the completion's target.
+  completions do), and the custody applies it in that member at once, since
+  nothing applies staged MCP changes in a gateway member after its
+  construction. The waiting member reconnects in the same runtime; each
+  member's answer is a `MemberMcpCredentialOutcome` (what its router
+  recorded, and the boundaries the custody applied). The host passes the
+  identity to `host_auth_service()`'s MCP login (including the registered
+  https callback) and calls `credential_landed` with the completion's target,
+  after answering the callback.
 
 ## [0.9.4] - 2026-10-22
 

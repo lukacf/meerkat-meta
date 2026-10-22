@@ -220,7 +220,9 @@ pub use meerkat_mob::{MemberTurnEventSender, MemberTurnHandle, MemberTurnOptions
 pub use meerkat_mob_mcp::ChildToolBundleAvailability;
 pub use member_comms_id::RuntimePlaneIdentityGuard;
 #[cfg(not(target_arch = "wasm32"))]
-pub use member_mcp_custody::{MEMBER_MCP_SETTLEMENT_BUDGET, MemberMcpCustody};
+pub use member_mcp_custody::{
+    MEMBER_MCP_SETTLEMENT_BUDGET, MemberMcpCredentialOutcome, MemberMcpCustody,
+};
 pub use memory::{
     CompactionResetSink, ConsolePrincipalOperatorResolver, ContentTrustConfig, DispatchTaintSlot,
     DistillCause, DistillerConfig, DistillerEngine, DreamOutcome, DreamRun, HygieneCause,
