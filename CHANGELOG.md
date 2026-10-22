@@ -22,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   each member before the member exists, or logs that summary for members that
   were never restored. The failure stays pending until the member's
   materialization publishes its tools.
+- An identity-first resume resolves its roster from the mob definition
+  stored in the mob's event log, which is the definition the resumed mob
+  runs. The roster provider was handed the supplied definition as the
+  roster context's `mob_definition`, so a candidate launch that boots the
+  stored definition knowingly (`candidate_definition = "stored"`), or an
+  in-process resume whose supplied definition changed, could resolve
+  identities for profiles the running mob does not have. The resume's
+  composition checks now run before the roster provider is called: an
+  undeclared mob storage that already holds events, an authoritative
+  definition that diverges from the stored one and a candidate that does
+  not acknowledge the stored one are refused before the provider sees the
+  stored definition. A definition written into the mob storage after the
+  roster was resolved is refused rather than resumed.
 
 ## [0.9.4] - 2026-10-22
 
