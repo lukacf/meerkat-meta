@@ -116,6 +116,8 @@ class MetaToolkitRuntimeArtifacts:
     catalog: dict
     evidence: tuple[ArtifactFile, ...]
     origin: str = "installed-gateway-assembly"
+    # The oldest glibc the product's Linux programs run on, as declared.
+    glibc_floor: tuple[int, int] | None = None
     _verified_inputs: tuple = field(default=(), init=False, repr=False, compare=False)
     _verified_metadata: tuple = field(default=(), init=False, repr=False, compare=False)
     _inventory_source: str = field(default="archive", init=False, repr=False, compare=False)
@@ -293,6 +295,27 @@ def product_prefix_entries(content, prefix):
     return tuple(entries[name] for name in sorted(entries))
 
 
+def _declared_glibc_floor(record, platform):
+    """The oldest glibc a Linux product runs on, as its resource build declares.
+
+    The Connect resource packager records the host the product supports. A
+    record without that declaration states no floor; a present one must be
+    complete.
+    """
+    if "runtime_compatibility" not in record:
+        return None
+    compatibility = record["runtime_compatibility"]
+    host = compatibility.get("supported_host") if type(compatibility) is dict else None
+    if not platform.startswith("linux-"):
+        _require(type(host) is dict and "glibc" not in host,
+            "The selected native product declares an invalid supported host.")
+        return None
+    declared = host.get("glibc") if type(host) is dict else None
+    found = re.fullmatch(r"glibc ([0-9]+)\.([0-9]+)", declared) if type(declared) is str else None
+    _require(found is not None, "The selected native product declares an invalid supported host.")
+    return int(found[1]), int(found[2])
+
+
 def _read_meta_toolkit_artifacts(target, retained=None):
     """Read existing producer relationships against an already selected input.
 
@@ -383,6 +406,7 @@ def _read_meta_toolkit_artifacts(target, retained=None):
         and resources["target"] == platform and resources["resources_sha256"] == candidate["resources_sha256"]
         and resources["archive_sha256"] == assembly["resource_component_sha256"],
         "The selected native build, resource component or source binding changed.")
+    glibc_floor = _declared_glibc_floor(resources, platform)
     source = build["source_manifest"]
     if target.source_manifest is None:
         related(Path(source["path"]), source["sha256"])
@@ -479,14 +503,15 @@ def _read_meta_toolkit_artifacts(target, retained=None):
     inputs.finish()
     result = MetaToolkitRuntimeArtifacts(target, archive, prefix, entries, candidate, catalog,
         tuple(item[0] for item in inputs.files.values()),
-        origin="source-built-development" if development else "installed-gateway-assembly")
+        origin="source-built-development" if development else "installed-gateway-assembly",
+        glibc_floor=glibc_floor)
     object.__setattr__(result, "_verified_inputs", tuple(inputs.files.values()))
     object.__setattr__(result, "_inventory_source", source)
     if source == "retained":
         object.__setattr__(result, "_known_fingerprints", retained.fingerprints)
     object.__setattr__(result, "_verified_metadata", tuple(json.dumps(value, sort_keys=True,
         ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode()
-        for value in (candidate, catalog, result.origin)))
+        for value in (candidate, catalog, result.origin, result.glibc_floor)))
     return result
 
 
@@ -505,7 +530,7 @@ def recheck_meta_toolkit_artifacts(verified, target):
     try:
         metadata = tuple(json.dumps(value, sort_keys=True, ensure_ascii=True,
             allow_nan=False, separators=(",", ":")).encode()
-            for value in (verified.candidate, verified.catalog, verified.origin))
+            for value in (verified.candidate, verified.catalog, verified.origin, verified.glibc_floor))
     except (ValueError, TypeError, RecursionError) as error:
         raise CandidateArtifactError("The checked native product metadata changed.") from error
     _require(verified._verified_metadata and metadata == verified._verified_metadata,

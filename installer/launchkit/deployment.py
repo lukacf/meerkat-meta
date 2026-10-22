@@ -101,6 +101,26 @@ def selected_interpreter_refusal(target, interpreter=None):
     return f"This product's application packages do not support this computer: {', '.join(refused[:3])}."
 
 
+def selected_host_refusal(artifacts, interpreter=None):
+    """Why this computer cannot run the selected product's native programs, or None.
+
+    A Linux product declares the oldest glibc they run on. Below it every
+    package still installs, and the application fails only when it starts.
+    """
+    floor = artifacts.glibc_floor
+    if floor is None:
+        return None
+    host = forge_interpreter() if interpreter is None else interpreter
+    found = tuple(host["glibc_minimum"])
+    if host["system"] == "Linux" and found >= floor:
+        return None
+    needed = f"glibc {floor[0]}.{floor[1]}"
+    present = f"glibc {found[0]}.{found[1]}" if host["system"] == "Linux" and found != (0, 0) else "no glibc"
+    return (f"This product's native programs need {needed} or newer, but this computer has {present}, so the "
+        f"application would install and then fail when it starts. Install it on a Linux computer with {needed} "
+        "or newer, or upgrade this computer's operating system.")
+
+
 def product_runtime_source(files, selected, *, verified_artifacts=None, source_custody=None):
     """Join an owner's retained product selection to its exact accepted source.
 
@@ -1507,8 +1527,10 @@ class DeploymentService:
         await await_validation(verify_selected_application_dependencies,
             files.get("requirements.application.txt", (b"", 0o644))[0], artifacts)
         from types import SimpleNamespace
+        # The product's glibc floor goes first: the CPython remedy (PYTHON_BIN)
+        # cannot lift it.
         return SimpleNamespace(selection=selected, artifacts=artifacts,
-            interpreter_refusal=selected_interpreter_refusal(artifacts.selection))
+            interpreter_refusal=selected_host_refusal(artifacts) or selected_interpreter_refusal(artifacts.selection))
 
     async def options(self, guide_id, build_id=None, *, console_port=None, source_kind="application", version=None):
         if source_kind not in {"application", "native-team"}:
