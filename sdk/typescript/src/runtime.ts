@@ -156,6 +156,7 @@ import {
   parseMobRunSnapshot,
   parseCrossMobContactEntry,
   parseModelsCatalogResult,
+  parseScheduleToolsResult,
   parseMobpackToolsCatalogResult,
   parseMobpackSkillsCatalogResult,
   parseMobpackAgentDefinitionsResult,
@@ -252,6 +253,7 @@ import {
   type MobRunSnapshot,
   type CrossMobContactEntry,
   type ModelsCatalogResult,
+  type ScheduleToolsResult,
   type MobpackToolsCatalogResult,
   type MobpackSkillsCatalogResult,
   type MobpackAgentDefinitionsResult,
@@ -2283,6 +2285,18 @@ export class MobHandle {
   async modelsCatalog(): Promise<ModelsCatalogResult> {
     return parseModelsCatalogResult(
       await this._runtime._rpc("meta/models/catalog"),
+    );
+  }
+
+  /**
+   * Meerkat's durable schedule tool definitions (`meta/schedule/tools`), the
+   * base definitions a member whose profile sets `tools.schedule` is given.
+   * Static: the gateway answers without a schedule store or host. Rejects on
+   * a malformed result.
+   */
+  async scheduleTools(): Promise<ScheduleToolsResult> {
+    return parseScheduleToolsResult(
+      await this._runtime._rpc("meta/schedule/tools"),
     );
   }
 

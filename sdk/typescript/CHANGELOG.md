@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `MobHandle.scheduleTools()` returns `ScheduleToolsResult`, the definitions
+  of Meerkat's durable schedule tools from `meta/schedule/tools`: one
+  `ScheduleToolDefinition` (`name`, `description`, `inputSchema`) per tool,
+  parsed by the exported `parseScheduleToolsResult`, which rejects a
+  malformed result.
+
 ## 0.9.4
 
 - `GatewayChildEndedError` (extends `TransportReaderFailedError`, with

@@ -1023,6 +1023,7 @@ Most apps should use `send`, `subscribe_agent`/`subscribe_mob`, and `status`/`re
 | `spawn(spec: DiscoverySpec)` | `SpawnResult` | Spawn a member from a discovery spec |
 | `spawn_member(module_id)` | `SpawnResult` | Spawn a member by module ID |
 | `capabilities()` | `CapabilitiesResult` | List available RPC methods |
+| `schedule_tools()` | `ScheduleToolsResult` | Meerkat's durable schedule tool definitions ([`meta/schedule/tools`](/api/rpc#meta%2Fschedule%2Ftools)) |
 | `subscribe_events(scope, ...)` | `SubscribeResult` | Low-level event subscription |
 | `resolve_routing(recipient)` | `RoutingResolution` | Resolve delivery routing |
 | `send_delivery(...)` | `DeliveryResult` | Send via delivery module |

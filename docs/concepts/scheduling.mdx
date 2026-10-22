@@ -29,6 +29,14 @@ The gateway binds the member's
 `meerkat_schedule_{create,get,list,update,pause,resume,delete,occurrences}`
 tools and the firing host to the same `ScheduleService` and store.
 
+To read those tools' definitions (names, descriptions and JSON input schemas)
+from a running gateway, call
+[`meta/schedule/tools`](/api/rpc#meta%2Fschedule%2Ftools), or
+`MobHandle.schedule_tools()` in Python and `MobHandle.scheduleTools()` in
+TypeScript. It returns Meerkat's base definitions without touching the
+schedule store. Inside a member's session, `meerkat_schedule_create` and
+`meerkat_schedule_update` also accept a `current_session` session target.
+
 ## Durable ownership
 
 A persistent gateway stores schedules under its state directory. The firing

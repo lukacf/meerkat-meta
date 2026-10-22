@@ -30,6 +30,7 @@ pub(crate) mod mob_methods;
 pub(crate) mod operator_methods;
 pub(crate) mod params;
 mod routing_delivery_methods;
+pub(crate) mod schedule_methods;
 mod session_store_methods;
 pub(crate) mod storage_methods;
 mod subscribe_methods;
@@ -2180,6 +2181,7 @@ async fn handle_unified_rpc_json_inner(
                 "meta/gating/audit",
                 "meta/call_tool",
                 "meta/models/catalog",
+                schedule_methods::SCHEDULE_TOOLS_METHOD,
                 "meta/blob/get",
                 "meta/send_message",
                 "meta/find_members",
@@ -3404,6 +3406,14 @@ async fn handle_unified_rpc_json_inner(
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: response_id,
             result: Some(build_models_catalog_result()),
+            error: None,
+        },
+        // Static Meerkat schedule tool definitions, served without a schedule
+        // store or host (see `schedule_methods`).
+        schedule_methods::SCHEDULE_TOOLS_METHOD => JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: response_id,
+            result: Some(schedule_methods::schedule_tools_result()),
             error: None,
         },
         // Read-only state-directory diagnosis with the live H1/H2 durability
@@ -8520,6 +8530,155 @@ shell = true
             json!("rkat mob run")
         );
 
+        Ok(())
+    }
+
+    /// A library-mode runtime built without `schedule_store(...)`: no schedule
+    /// store and no schedule host exist behind it.
+    async fn schedule_tools_test_runtime(
+        temp_dir: &tempfile::TempDir,
+        namespace: &str,
+    ) -> Result<UnifiedRuntime, Box<dyn std::error::Error + Send + Sync>> {
+        let runtime = Box::pin(
+            UnifiedRuntime::builder()
+                .mob_spec(rpc_test_mob_spec(temp_dir)?)
+                .module_config(MetaConfig {
+                    modules: Vec::new(),
+                    discovery: DiscoverySpec {
+                        namespace: namespace.to_string(),
+                        modules: Vec::new(),
+                    },
+                    pre_spawn: Vec::new(),
+                })
+                .timeout(Duration::from_secs(1))
+                .build(),
+        )
+        .await?;
+        Ok(runtime)
+    }
+
+    #[tokio::test]
+    async fn unified_rpc_serves_the_schedule_tool_definitions_without_a_schedule_store()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime =
+            schedule_tools_test_runtime(&temp_dir, "rpc-schedule-tools-serve-test").await?;
+
+        let response: Value = serde_json::from_str(
+            &handle_unified_rpc_json(
+                &runtime,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "meta/schedule/tools",
+                })
+                .to_string(),
+                Duration::from_secs(1),
+                None,
+                None,
+            )
+            .await,
+        )?;
+        let _ = runtime.mob_handle().stop().await;
+
+        assert!(response["error"].is_null(), "{response:#?}");
+        // Meerkat's own `schedule/tools` result, unchanged.
+        assert_eq!(
+            response["result"],
+            json!({ "tools": meerkat::schedule_tools_list() })
+        );
+        let tools = response["result"]["tools"].as_array().expect("tools array");
+        let names = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(names, meerkat_schedule::schedule_tool_names());
+        assert!(
+            tools.iter().all(|tool| tool["inputSchema"].is_object()),
+            "{response:#?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unified_capabilities_advertise_schedule_tools()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime =
+            schedule_tools_test_runtime(&temp_dir, "rpc-schedule-tools-capabilities-test").await?;
+
+        let capabilities: Value = serde_json::from_str(
+            &handle_unified_rpc_json(
+                &runtime,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "meta/capabilities",
+                })
+                .to_string(),
+                Duration::from_secs(1),
+                None,
+                None,
+            )
+            .await,
+        )?;
+        let _ = runtime.mob_handle().stop().await;
+
+        let advertised = capabilities["result"]["methods"]
+            .as_array()
+            .expect("methods array")
+            .iter()
+            .filter(|method| method.as_str() == Some("meta/schedule/tools"))
+            .count();
+        assert_eq!(advertised, 1, "{capabilities:#?}");
+        Ok(())
+    }
+
+    /// The module-only surface has no mob and no members to give schedule
+    /// tools to, so it neither serves nor advertises their definitions.
+    #[test]
+    fn module_only_rpc_neither_serves_nor_advertises_schedule_tools()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let config = MetaConfig {
+            modules: Vec::new(),
+            discovery: DiscoverySpec {
+                namespace: "module-rpc-schedule-tools-test".to_string(),
+                modules: Vec::new(),
+            },
+            pre_spawn: Vec::new(),
+        };
+        let mut runtime = crate::start_meta_runtime(config, Vec::new(), Duration::from_secs(1))?;
+        let served: Value = serde_json::from_str(&super::handle_meta_rpc_json(
+            &mut runtime,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "meta/schedule/tools",
+            })
+            .to_string(),
+            Duration::from_secs(1),
+        ))?;
+        let capabilities: Value = serde_json::from_str(&super::handle_meta_rpc_json(
+            &mut runtime,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "meta/capabilities",
+            })
+            .to_string(),
+            Duration::from_secs(1),
+        ))?;
+        let _ = runtime.shutdown();
+
+        assert_eq!(served["error"]["code"], json!(-32601), "{served:#?}");
+        assert!(
+            !capabilities["result"]["methods"]
+                .as_array()
+                .expect("methods array")
+                .iter()
+                .any(|method| method.as_str() == Some("meta/schedule/tools")),
+            "{capabilities:#?}"
+        );
         Ok(())
     }
 

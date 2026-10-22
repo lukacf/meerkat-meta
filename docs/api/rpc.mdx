@@ -1998,7 +1998,42 @@ Meerkat's `InstructionActivationReadPage`; naming one exact `namespace` and
 `key` also returns its `key_state`, including the `next_expectation` for the
 next activation.
 
-## Scheduling migration
+## Scheduling
+
+### `meta/schedule/tools`
+
+Lists the definitions of Meerkat's durable schedule tools, the
+`meerkat_schedule_{create,get,list,update,pause,resume,delete,occurrences}`
+tools that a member whose profile sets `tools.schedule = true` is given. The
+result is Meerkat's own `schedule/tools` result, unchanged, so a client can
+read the authoring and readback schemas from the gateway it talks to.
+
+The answer is static. The gateway serves it from Meerkat's definitions without
+opening a schedule store or starting a schedule host, and it ignores params,
+as Meerkat's `schedule/tools` does. These are the base definitions: inside a
+member's session, `meerkat_schedule_create` and `meerkat_schedule_update` also
+accept a session target of `type: "current_session"`, which the tool host
+resolves to a durable target before it persists the schedule. Whether this
+gateway attached the schedule tools is a separate fact, reported by the
+`schedule` slot of the `storage` summary in `meta/status` and
+`meta/capabilities`.
+
+Available on the unified stdio and console (`POST /console/rpc`, read method,
+no grant) surfaces. The module-only surface, the aggregator-only console and
+the Flow Editor do not serve it. Additive method, no `contract_version` bump.
+The SDKs read it with `MobHandle.schedule_tools()` (Python) and
+`MobHandle.scheduleTools()` (TypeScript).
+
+<Accordion title="Result">
+| Field | Type | Description |
+|-------|------|-------------|
+| `tools` | `array` | One entry per schedule tool, in Meerkat's order |
+| `tools[].name` | `string` | The tool name, for example `meerkat_schedule_create` |
+| `tools[].description` | `string` | Meerkat's model-facing description |
+| `tools[].inputSchema` | `object` | The tool's JSON input schema |
+</Accordion>
+
+### Scheduling migration
 
 Contract 0.5.0 removed `meta/scheduling/evaluate` and
 `meta/scheduling/dispatch`. Both names now return the standard `-32601`

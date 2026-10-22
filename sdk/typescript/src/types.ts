@@ -1725,6 +1725,56 @@ export function parseModelsCatalogResult(raw: unknown): ModelsCatalogResult {
   };
 }
 
+// -- Schedule tool definitions ---------------------------------------------
+
+/** One of Meerkat's durable schedule tools, as `meta/schedule/tools` lists it. */
+export interface ScheduleToolDefinition {
+  readonly name: string;
+  readonly description: string;
+  /** The tool's JSON input schema, exactly as Meerkat defines it. */
+  readonly inputSchema: Record<string, unknown>;
+}
+
+/**
+ * Result of `meta/schedule/tools`: Meerkat's `ScheduleToolsResult`, the base
+ * definitions of the `meerkat_schedule_*` tools a member whose profile sets
+ * `tools.schedule = true` is given. Inside that member's session,
+ * `meerkat_schedule_create` and `meerkat_schedule_update` also accept a
+ * session target of `type: "current_session"`.
+ */
+export interface ScheduleToolsResult {
+  readonly tools: readonly ScheduleToolDefinition[];
+}
+
+function isScheduleToolObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Parse a `meta/schedule/tools` result, rejecting any other shape. */
+export function parseScheduleToolsResult(raw: unknown): ScheduleToolsResult {
+  const invalid = () =>
+    new Error(`invalid meta/schedule/tools result: ${JSON.stringify(raw)}`);
+  if (!isScheduleToolObject(raw) || !Array.isArray(raw.tools)) {
+    throw invalid();
+  }
+  const tools = raw.tools.map((tool: unknown): ScheduleToolDefinition => {
+    if (
+      !isScheduleToolObject(tool) ||
+      typeof tool.name !== "string" ||
+      typeof tool.description !== "string" ||
+      !isScheduleToolObject(tool.inputSchema)
+    ) {
+      throw invalid();
+    }
+    return {
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+    };
+  });
+  return { tools };
+}
+
 // -- Mobpack editor catalogs ----------------------------------------------
 
 export interface MobpackToolsCatalogResult {
