@@ -11,6 +11,7 @@ import re
 import shutil
 from pathlib import Path
 import stat
+import threading
 import time
 import tomllib
 from types import SimpleNamespace
@@ -994,23 +995,59 @@ def _product_runtime_transition(previous, candidate, receipt, authority, runtime
         expected=expected, prior_expected=prior_expected)
 
 
-class SelectedRuntimeReads:
-    """One Stage's selected runtime reads: each runtime is read in full once.
+class KeptRuntimeReads:
+    """Verified reads of selected native products, kept for this process.
 
-    A later use passes the verified artifacts back to the selected runtime
-    reader. That rechecks the same inputs' file fingerprints, as an explicit
-    verified_artifacts argument always does, so a changed input still refuses.
+    A kept read is returned only after the selected runtime reader rechecks
+    every verified input's file fingerprint, as an explicit verified_artifacts
+    argument always does. A missing or changed read is replaced by a new full
+    read. Only a few products are kept; other runtimes are always read.
     """
 
-    def __init__(self):
+    def __init__(self, limit=4):
+        self._lock = threading.Lock()
+        self._kept = []
+        self._limit = limit
+
+    def __call__(self, target):
+        from .runtime_selection import MetaToolkitRuntimeTarget, selected_runtime_artifacts
+        if type(target) is not MetaToolkitRuntimeTarget:
+            return selected_runtime_artifacts(target)
+        with self._lock:
+            kept = next((verified for selected, verified in self._kept if selected == target), None)
+        if kept is not None:
+            try:
+                return selected_runtime_artifacts(target, verified_artifacts=kept)
+            except (OSError, ValueError):
+                pass
+        verified = selected_runtime_artifacts(target)
+        with self._lock:
+            self._kept = [row for row in self._kept if row[0] != target][-(self._limit - 1):] + [(target, verified)]
+        return verified
+
+
+KEPT_RUNTIME_READS = KeptRuntimeReads()
+
+
+class SelectedRuntimeReads:
+    """One check's selected runtime reads: each runtime is read at most once.
+
+    The first use of a runtime reads it, or takes a kept read when one is
+    given. A later use in the same check passes the verified artifacts back
+    to the selected runtime reader, which rechecks the inputs' fingerprints,
+    so an input that changes during the check refuses it.
+    """
+
+    def __init__(self, kept=None):
         self._verified = []
+        self._kept = kept
 
     def __call__(self, target):
         from .runtime_selection import selected_runtime_artifacts
         for selected, verified in self._verified:
             if selected == target:
                 return selected_runtime_artifacts(target, verified_artifacts=verified)
-        verified = selected_runtime_artifacts(target)
+        verified = selected_runtime_artifacts(target) if self._kept is None else self._kept(target)
         self._verified.append((target, verified))
         return verified
 
@@ -2054,7 +2091,7 @@ def prepare_stage(directory, payload, report, *, runtime_target=None, restore_se
     if any(previous_report.get(key) != receipt.get(key) for key in ("build_id", "guide_version", "blueprint_hash", "unresolved")):
         raise DraftConflict("The installed metadata no longer matches its exact previous package.")
     verify_destination(receipt, previous)
-    reads = SelectedRuntimeReads()
+    reads = SelectedRuntimeReads(kept=KEPT_RUNTIME_READS)
     dependency = runtime_dependency_transition(previous, candidate, receipt, runtime_target=runtime_target, reads=reads)
     maintained = maintained_host_transition(previous, candidate, receipt, runtime_target=runtime_target, reads=reads)
     if maintained:
@@ -2235,8 +2272,11 @@ def _transaction(directory, expected_id, *, cleanup_update=None, expected_bindin
                 runtime_target = parse_candidate_selection(descriptor["runtime_candidate"])
             except (ValueError, TypeError, KeyError):
                 raise DraftConflict("The checked update's candidate target is invalid.") from None
+        # Every inspection, including each status poll of a staged update,
+        # re-derives the transition from the products' kept verified reads.
         transition = (_completed_runtime_dependency_transition(previous, candidate, receipt, update, root)
-            if update.get("status") == "completed" else runtime_dependency_transition(previous, candidate, receipt, runtime_target=runtime_target))
+            if update.get("status") == "completed" else runtime_dependency_transition(previous, candidate, receipt,
+                runtime_target=runtime_target, reads=SelectedRuntimeReads(kept=KEPT_RUNTIME_READS)))
         if not _same_toml(update["runtime_dependency_update"], transition):
             raise DraftConflict("The runtime dependency transition no longer matches its exact accepted packages and qualified host.")
     if update.get("maintained_host_update") is not None:

@@ -160,5 +160,7 @@ async def test_product_runtime_refresh_stage_leaves_the_event_loop_free(registry
         f.store.get(saved["id"])["version"], refreshed["build_id"]))
     update = receipt["update"]
     assert update["runtime_dependency_update"] is not None, update
-    assert reads[new_target] >= 1 and reads[f.target] >= 1
+    # The new product is read in full once. The installed product's read may
+    # be kept from its Install checks, then only its fingerprints are rechecked.
+    assert reads[new_target] == 1 and reads[f.target] <= 1, dict(reads)
     assert gap < LOOP_GAP_BOUND, (gap, dict(reads))
