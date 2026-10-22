@@ -1655,7 +1655,10 @@ pub struct RetiredIdentityMember {
     /// no registration: this gateway observed none for the incarnation (no
     /// local registration, as for a peer-only or placed member, or a bridge
     /// without a runtime machine), or the registration was still current
-    /// after Core's retire answered, so the retire did not end it.
+    /// after Core's retire answered, so the retire did not end it. Compare
+    /// registrations with `==` only: a successor that resumes the same
+    /// session can carry the same session id and epoch (all its `Debug`
+    /// output shows), and only `==` tells the two apart.
     pub registration: Option<meerkat_runtime::RuntimeSessionRegistrationWitness>,
     /// Why it was retired.
     pub cause: RetiredIdentityCause,

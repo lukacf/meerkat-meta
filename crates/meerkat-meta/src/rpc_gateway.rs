@@ -14709,7 +14709,10 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// (`MemberRuntimeBuildIdentity::registration`): a host that bound what
     /// it decided there to that registration releases exactly that. It is
     /// never a successor's, even when a still listed identity returns on the
-    /// same session before this call; `None` names no registration.
+    /// same session before this call; `None` names no registration. Compare
+    /// registrations with `==` only, never by their session id or epoch: a
+    /// successor on the same session can carry the same session id and
+    /// epoch, and only `==` tells the two apart.
     ///
     /// What ended depends on [`crate::identity_first::RetiredIdentityCause`]:
     /// every cause ends that one incarnation, so state the host keeps for it

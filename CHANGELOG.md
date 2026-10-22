@@ -72,18 +72,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   generation on the same session, under another registration: `registration` is
   the one a host's registration hook was given for the retired incarnation and
   never a successor's, and `None` (none observed, or still current after Core's
-  retire answered) names no registration. A roster pass collects its
-  retirements and the host hears of them after the bootstrap controller is
-  released, also when a later step of the pass failed; the identity bootstrap's
-  retirements reach the host too. Reloads, reprofiles, compaction rebuilds,
-  respawns, reset and delete successors, held or refused spawns, shutdowns and
-  restarts never call it. A host error leaves the retirement standing and is
-  reported once as the new `ErrorEvent` category
-  `retired_member_release_failed` (`identity`, `agent_runtime_id`,
-  `session_id?`, `cause`, `error`), which both SDKs' `ErrorCategory` lists
-  carry. With a host, a retire whose incarnation read from Core fails is
-  refused before Core is asked (fail closed). Without a host, retires read
-  nothing extra.
+  retire answered) names no registration. Hosts compare registrations with `==`
+  only, never by session id or epoch: a successor on the same session can carry
+  the same session id and epoch. A roster pass collects its retirements and the
+  host hears of them after the bootstrap controller is released, also when a
+  later step of the pass failed; the identity bootstrap's retirements reach the
+  host too. Reloads, reprofiles, compaction rebuilds, respawns, reset and
+  delete successors, held or refused spawns, shutdowns and restarts never call
+  it. A host error leaves the retirement standing and is reported once as the
+  new `ErrorEvent` category `retired_member_release_failed` (`identity`,
+  `agent_runtime_id`, `session_id?`, `cause`, `error`), which both SDKs'
+  `ErrorCategory` lists carry. With a host, a retire whose incarnation read
+  from Core fails is refused before Core is asked (fail closed). Without a
+  host, retires read nothing extra.
 
 ### Changed
 
