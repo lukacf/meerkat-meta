@@ -51,7 +51,7 @@ must not silently replay all history. Discuss prompt alerts versus quiet review
 in terms of the user's work. Store sources as descriptive intent until Connect
 can resolve their exact capabilities and scopes; do not invent provider IDs,
 subscription methods or cursor tokens. Ask one useful question at a time.
-The shared implementation is Meta mob announcements with Connect observation
+The intended shared implementation is Meta mob announcements with Connect observation
 adapters. Core owns scheduling and delivery admission. Forge configures those
 capabilities; it does not supply a separate polling loop, cursor store or inbox.
 Until the selected native runtime and adapter expose the required contract,
