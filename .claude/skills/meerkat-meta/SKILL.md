@@ -459,6 +459,38 @@ Key files:
 
 Avoid manual runtime ID extraction for ordinary identity-scoped work. Do not assume a registered identity is an active member: read its status, because `dormant` and `broken` identities exist.
 
+## Standing Instructions And Forks
+
+- `meta/member_activate_instruction` appends one keyed, immutable instruction
+  activation (a skill body, a persona, any namespace) to a member's current
+  session; `meta/member_instruction_activations` reads them, and a query that
+  names `namespace` and `key` also returns its `key_state`. Both are host
+  verbs, never agent tools (`docs/api/rpc.mdx`).
+- A durable fork (`fork_off`, `UnifiedRuntime::fork_member`, a live delegation
+  fork, temporary council participants) copies those rows only as history.
+  The child runs no turn until each inherited key is activated in the child
+  itself (`forked session must explicitly activate inherited instruction
+  keys`). Mob operator authority is never copied.
+- `runtime_options.fork_instruction_policy` decides for every fork of the
+  gateway's mob, never per fork, and is applied again on every boot (the mob
+  does not store it). Python `.fork_instruction_policy(...)`, TypeScript
+  `.forkInstructionPolicy(...)`, Rust `UnifiedRuntimeBuilder::
+  fork_instruction_policy` or `MobBootstrapSpec::with_fork_instruction_policy`:
+  - `require_explicit_activation` (default): a host-driven `fork_member` is
+    committed and the host activates each key on the child
+    (`MobHandle::activate_member_instruction`). A fork that starts its own
+    turn is refused before commit with `fork_instruction_refused` (Meerkat
+    `FORK_INSTRUCTION_REFUSED`, `-32037`; data `fork_instruction_refusal` with
+    `cause.kind` `policy_refuses` and the `keys`).
+  - `reactivate_inherited`: the fork writes the child's own activation of
+    every inherited key, in every namespace, with the revision and body the
+    source had in effect at the fork boundary. The child runs them without
+    the host checking them again, and forks of the child carry them on.
+  - `refuse`: every fork of an activated member is refused before commit.
+- What a fork copies, the refusal causes, the exact rows
+  `reactivate_inherited` writes and what it trusts: `docs/reference/
+  configuration.mdx`, "Fork instruction policy".
+
 ## Embedding Hooks
 
 Hooks an embedding host uses around the runtime:
