@@ -2337,8 +2337,11 @@ struct ScriptedNative {
     log_reads: Mutex<Vec<u64>>,
     /// What each member's roster records: its role and its labels. A member
     /// missing here has no roster facts.
-    roster_facts: Mutex<BTreeMap<String, (String, BTreeMap<String, String>)>>,
+    roster_facts: Mutex<BTreeMap<String, RosterRow>>,
 }
+
+/// A member's role and labels, as a scripted roster records them.
+type RosterRow = (String, BTreeMap<String, String>);
 
 impl ScriptedNative {
     fn new() -> Self {

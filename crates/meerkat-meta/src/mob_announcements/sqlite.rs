@@ -3248,9 +3248,8 @@ fn withholding(
     let member = &subscription.member;
     let mut refusal = None;
     for topic in subscription.selector.topics.intersection(topics) {
-        let Some((source_id, config)) = owners.get(topic) else {
-            return None;
-        };
+        // A topic no source owns lets the subscription capture.
+        let (source_id, config) = owners.get(topic)?;
         let reason = if config.conversation_members.contains(member) {
             AuditReason::RouteConflict
         } else if config
