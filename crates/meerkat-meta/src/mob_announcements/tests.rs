@@ -10042,10 +10042,15 @@ fn the_version_two_schema_is_pinned() {
         objects_added_by(&tx, &before),
         vec![
             "table announcement_audit: id INTEGER pk1, mob_id TEXT notnull, source_id TEXT \
-             notnull, member TEXT notnull, at_ms INTEGER notnull, record TEXT notnull"
+             notnull, generation INTEGER notnull, member TEXT notnull, action TEXT notnull, \
+             reason TEXT notnull, count INTEGER notnull, first_at_ms INTEGER notnull, \
+             last_at_ms INTEGER notnull, record TEXT notnull"
                 .to_string(),
             "index announcement_audit_by_member on announcement_audit: member, id".to_string(),
             "index announcement_audit_by_source on announcement_audit: mob_id, source_id, id"
+                .to_string(),
+            "index announcement_audit_counted on announcement_audit: mob_id, source_id, \
+             generation, member, action, reason"
                 .to_string(),
             "table announcement_source_streams: mob_id TEXT notnull pk1, source_id TEXT \
              notnull pk2, stream TEXT notnull pk3, generation INTEGER notnull, phase TEXT \
@@ -12674,12 +12679,12 @@ async fn triage_announces(
         .unwrap()
 }
 
-/// The rows `audit/list` answers for `params`.
+/// The entries `audit/list` answers for `params`.
 async fn audit_rows(
     service: &AnnouncementService,
     params: serde_json::Value,
 ) -> Vec<serde_json::Value> {
-    try_host_call(service, AUDIT_LIST, params).await.unwrap()["audit"]
+    try_host_call(service, AUDIT_LIST, params).await.unwrap()["entries"]
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -12871,18 +12876,15 @@ async fn a_forward_is_withheld_from_a_subscriber_outside_the_forward_audience() 
     assert_eq!(owed_now.get("agent:b"), None, "withheld");
     let rows = audit_rows(service, serde_json::json!({ "source_id": "inbox" })).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0]["kind"], serde_json::json!("withheld"));
+    assert_eq!(rows[0]["action"], serde_json::json!("capture_withheld"));
     assert_eq!(rows[0]["reason"], serde_json::json!("audience_not_covered"));
     assert_eq!(
         rows[0]["member"],
         serde_json::json!({ "mob_id": OWN_MOB, "identity": "agent:b" })
     );
-    assert_eq!(rows[0]["topic"], serde_json::json!("mail.triaged"));
-    assert_eq!(rows[0]["subscription_id"], serde_json::json!("b-triaged"));
-    assert_eq!(
-        rows[0]["sequence"],
-        serde_json::json!(forwarded.announcement.sequence)
-    );
+    assert_eq!(rows[0]["source_id"], serde_json::json!("inbox"));
+    assert_eq!(rows[0]["generation"], serde_json::json!(1));
+    assert_eq!(rows[0]["count"], serde_json::json!(1));
 }
 
 /// One member is never reachable both directly and through a forward of the
@@ -13202,7 +13204,10 @@ async fn withheld_captures_are_listed_per_source_and_per_member() {
     let per_source = audit_rows(service, serde_json::json!({ "source_id": "inbox" })).await;
     assert_eq!(per_source.len(), 1, "{per_source:?}");
     assert_eq!(per_source[0]["member"], b);
-    assert_eq!(per_source[0]["kind"], serde_json::json!("withheld"));
+    assert_eq!(
+        per_source[0]["action"],
+        serde_json::json!("capture_withheld")
+    );
     let per_member = audit_rows(service, serde_json::json!({ "member": b })).await;
     let sources: Vec<_> = per_member
         .iter()
@@ -13215,13 +13220,35 @@ async fn withheld_captures_are_listed_per_source_and_per_member() {
     )
     .await;
     assert_eq!(both_ways.len(), 1, "{both_ways:?}");
-    assert_eq!(both_ways[0]["topic"], serde_json::json!("cal.events"));
+    assert_eq!(both_ways[0]["source_id"], serde_json::json!("calendar"));
+    assert_eq!(
+        both_ways[0]["reason"],
+        serde_json::json!("audience_not_covered")
+    );
     let after = audit_rows(
         service,
         serde_json::json!({ "member": b, "after": per_member[0]["id"] }),
     )
     .await;
     assert_eq!(after, per_member[1..].to_vec(), "a list pages after an id");
+    let withheld = audit_rows(
+        service,
+        serde_json::json!({ "member": b, "action": "capture_withheld" }),
+    )
+    .await;
+    assert_eq!(
+        withheld, per_member,
+        "every entry here is a withheld capture"
+    );
+    let refused = audit_rows(
+        service,
+        serde_json::json!({ "member": b, "action": "subscription_refused" }),
+    )
+    .await;
+    assert!(
+        refused.is_empty(),
+        "no subscription was refused: {refused:?}"
+    );
 }
 
 /// A forward that cites its source item is an announcement of its own: its
@@ -13493,4 +13520,286 @@ async fn an_onboarding_refusal_survives_a_failure_to_count_it() {
         source.health.consecutive_failures, 0,
         "the refusal went uncounted"
     );
+}
+
+/// Withheld captures are one counted entry per source, generation, member
+/// and reason: a second withheld item counts on the first one's entry,
+/// keeping its first time and moving its last, and the source's next
+/// generation starts an entry of its own.
+#[tokio::test]
+async fn withheld_captures_are_one_counted_entry_per_source_generation_and_member() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let direct = serde_json::json!([{ "kind": "direct" }]);
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]),
+            direct.clone(),
+        ),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "b-direct", "agent:b", &["mail.received"])
+        .await
+        .unwrap();
+    // The audience narrows past "agent:b", which stays subscribed.
+    let only_a = serde_json::json!([member_grant("agent:a")]);
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox_with("narrow", only_a.clone(), direct.clone()),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    baseline_inbox(service, 2).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 2, 1, "c2"),
+            &[upsert("m-1", "v1", "first")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(5_000, Ordering::SeqCst);
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v2", 2, 2, "c3"),
+            &[upsert("m-2", "v1", "second")],
+        ),
+    )
+    .await
+    .unwrap();
+    let b = serde_json::json!({ "mob_id": OWN_MOB, "identity": "agent:b" });
+    let entries = audit_rows(service, serde_json::json!({ "member": b })).await;
+    assert_eq!(entries.len(), 1, "one counted entry: {entries:?}");
+    let entry = &entries[0];
+    assert_eq!(entry["action"], serde_json::json!("capture_withheld"));
+    assert_eq!(entry["reason"], serde_json::json!("audience_not_covered"));
+    assert_eq!(entry["source_id"], serde_json::json!("inbox"));
+    assert_eq!(entry["generation"], serde_json::json!(1));
+    assert_eq!(entry["member"], b);
+    assert_eq!(entry["count"], serde_json::json!(2));
+    assert_eq!(entry["first_at_ms"], serde_json::json!(1_000));
+    assert_eq!(entry["last_at_ms"], serde_json::json!(5_000));
+    assert_eq!(entry["at_ms"], serde_json::json!(5_000));
+
+    // The next generation counts apart.
+    let renewed = try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            with(
+                inbox_with("renew", only_a, direct),
+                "expected_revision",
+                serde_json::json!(2),
+            ),
+            "new_generation",
+            serde_json::json!(true),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(renewed["source"]["generation"], serde_json::json!(2));
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with(
+            advance_params("baseline-g2", 3, 0, "c1"),
+            "coverage",
+            serde_json::json!("complete"),
+        ),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:g2:v1", 3, 1, "c2"),
+            &[upsert("m-3", "v1", "third")],
+        ),
+    )
+    .await
+    .unwrap();
+    let entries = audit_rows(service, serde_json::json!({ "member": b })).await;
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert_eq!(entries[0]["generation"], serde_json::json!(1));
+    assert_eq!(entries[0]["count"], serde_json::json!(2));
+    assert_eq!(entries[1]["generation"], serde_json::json!(2));
+    assert_eq!(entries[1]["count"], serde_json::json!(1));
+    assert_eq!(entries[1]["first_at_ms"], serde_json::json!(5_000));
+}
+
+/// A refused subscription is a counted entry too: a member that asks again
+/// counts on the entry of its first refusal.
+#[tokio::test]
+async fn refused_subscriptions_are_counted_entries() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("put", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    for (attempt, at_ms) in [(1, 1_000), (2, 4_000)] {
+        harness.clock.store(at_ms, Ordering::SeqCst);
+        let refused = try_subscribe(
+            service,
+            &format!("b-{attempt}"),
+            "agent:b",
+            &["mail.received"],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refusal_kind(&refused).as_deref(),
+            Some("audience_not_covered")
+        );
+    }
+    let b = serde_json::json!({ "mob_id": OWN_MOB, "identity": "agent:b" });
+    let entries = audit_rows(
+        service,
+        serde_json::json!({ "member": b, "action": "subscription_refused" }),
+    )
+    .await;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let entry = &entries[0];
+    assert_eq!(entry["action"], serde_json::json!("subscription_refused"));
+    assert_eq!(entry["reason"], serde_json::json!("audience_not_covered"));
+    assert_eq!(entry["source_id"], serde_json::json!("inbox"));
+    assert_eq!(entry["generation"], serde_json::json!(1));
+    assert_eq!(entry["count"], serde_json::json!(2));
+    assert_eq!(entry["first_at_ms"], serde_json::json!(1_000));
+    assert_eq!(entry["last_at_ms"], serde_json::json!(4_000));
+    let withheld = audit_rows(
+        service,
+        serde_json::json!({ "member": b, "action": "capture_withheld" }),
+    )
+    .await;
+    assert!(withheld.is_empty(), "{withheld:?}");
+}
+
+/// A route change binds the subscribers already there. Once a declaration
+/// drops the direct route, an earlier direct subscriber captures none of the
+/// source's items (each withheld, counted as `no_direct_route`) while the
+/// triage member still captures them. Re-adding the route lets the
+/// subscriber, still current, capture what comes next, and nothing withheld
+/// meanwhile reaches it.
+#[tokio::test]
+async fn a_removed_direct_route_stops_an_earlier_direct_subscriber() {
+    let harness = harness_with(native_serving(&["agent:t"]));
+    let service = &harness.service;
+    let audience = serde_json::json!([member_grant("agent:a"), member_grant("agent:t")]);
+    let triage = triage_by("agent:t", serde_json::json!([member_grant("agent:a")]));
+    let both_routes = serde_json::json!([{ "kind": "direct" }, triage.clone()]);
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with("put", audience.clone(), both_routes.clone()),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "a-direct", "agent:a", &["mail.received"])
+        .await
+        .unwrap();
+    try_subscribe(service, "t-takes", "agent:t", &["mail.received"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first")],
+        ),
+    )
+    .await
+    .unwrap();
+    let owed_now = owed(&harness).await;
+    assert_eq!(owed_now.get("agent:a"), Some(&1));
+    assert_eq!(owed_now.get("agent:t"), Some(&1));
+
+    // The direct route goes: the source is triage-only.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox_with("triage-only", audience.clone(), serde_json::json!([triage])),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v2", 2, 2, "c3"),
+            &[upsert("m-2", "v1", "second")],
+        ),
+    )
+    .await
+    .unwrap();
+    let owed_now = owed(&harness).await;
+    assert_eq!(
+        owed_now.get("agent:a"),
+        Some(&1),
+        "the earlier direct subscriber captures nothing more"
+    );
+    assert_eq!(
+        owed_now.get("agent:t"),
+        Some(&2),
+        "the triage member still captures"
+    );
+    let a = serde_json::json!({ "mob_id": OWN_MOB, "identity": "agent:a" });
+    let entries = audit_rows(service, serde_json::json!({ "member": a })).await;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["action"], serde_json::json!("capture_withheld"));
+    assert_eq!(entries[0]["reason"], serde_json::json!("no_direct_route"));
+    assert_eq!(entries[0]["count"], serde_json::json!(1));
+
+    // The direct route comes back: what comes next reaches the subscriber.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox_with("direct-again", audience, both_routes),
+            "expected_revision",
+            serde_json::json!(2),
+        ),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v3", 3, 3, "c4"),
+            &[upsert("m-3", "v1", "third")],
+        ),
+    )
+    .await
+    .unwrap();
+    let owed_now = owed(&harness).await;
+    assert_eq!(
+        owed_now.get("agent:a"),
+        Some(&2),
+        "the first item and the third: the withheld second never comes"
+    );
+    assert_eq!(owed_now.get("agent:t"), Some(&3));
 }
