@@ -31,6 +31,8 @@ const HUMAN: &str = "CURRENT_VALUE is cobalt; remember my exact choice.";
 struct RecordingClient {
     requests: Arc<Mutex<Vec<LlmRequest>>>,
     gate: tokio::sync::watch::Sender<bool>,
+    /// How many model requests this client has seen, to wait on one.
+    seen: tokio::sync::watch::Sender<usize>,
 }
 
 impl RecordingClient {
@@ -38,6 +40,7 @@ impl RecordingClient {
         Self {
             requests: Arc::default(),
             gate: tokio::sync::watch::channel(true).0,
+            seen: tokio::sync::watch::channel(0).0,
         }
     }
 }
@@ -50,6 +53,7 @@ impl LlmClient for RecordingClient {
 
     fn stream<'a>(&'a self, request: &'a LlmRequest) -> meerkat_client::types::LlmStream<'a> {
         self.requests.lock().unwrap().push(request.clone());
+        self.seen.send_modify(|count| *count += 1);
         let mut gate = self.gate.subscribe();
         Box::pin(async_stream::try_stream! {
             while !*gate.borrow_and_update() {
@@ -191,6 +195,24 @@ comms = true
             })
             .await
             .unwrap();
+        } else if unified
+            .mob_handle()
+            .get_member(&crate::member_comms_id::mob_member_id(identity.as_str()))
+            .await
+            .unwrap()
+            .is_some_and(|entry| entry.kickoff.is_some())
+        {
+            // The member is an autonomous host, so Core runs its spawn kickoff
+            // (Core's own spawn prompt) on its own schedule, and that turn can
+            // reach the model at any point of a row. Wait for its model request,
+            // then start the row with an empty request log: a row's checks see
+            // only what the row itself caused.
+            let mut seen = client.seen.subscribe();
+            tokio::time::timeout(WAIT, seen.wait_for(|count| *count > 0))
+                .await
+                .expect("the member's spawn kickoff reached the model")
+                .expect("the recording client is alive");
+            client.requests.lock().unwrap().clear();
         }
         let aggregator = MetaConsoleAggregator::in_memory();
         aggregator.register_runtime_handles_with_policy(
