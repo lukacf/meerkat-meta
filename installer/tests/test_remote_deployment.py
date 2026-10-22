@@ -7,6 +7,7 @@ import io
 import json
 import os
 import tarfile
+import time
 import uuid
 import zipfile
 
@@ -1216,3 +1217,29 @@ async def test_initial_ordinary_observation_failure_does_not_infer_cloud_from_ta
     assert "cloud_operation_id" not in failed and "install_operation_id" not in failed
     assert failed["observation"] == {"available": False} and failed["preflight"] is None
     assert all(call["payload"]["action"] == "preflight" for call in service.transport.calls)
+
+
+async def test_remote_interview_evidence_leaves_the_event_loop_free(service, monkeypatch):
+    from launchkit import remote_deployment
+    await connect(service)
+    state = deepcopy(service.guide.state)
+    original = remote_deployment.package_files
+    def slowed(payload):
+        time.sleep(1.0)  # A large package on a small host.
+        return original(payload)
+    monkeypatch.setattr(remote_deployment, "package_files", slowed)
+    stalls, done = [], asyncio.Event()
+    async def other_request():
+        while not done.is_set():
+            started = time.monotonic()
+            await asyncio.sleep(0.01)
+            stalls.append(time.monotonic() - started)
+    probe = asyncio.create_task(other_request())
+    await asyncio.sleep(0)  # The other request is waiting on the loop.
+    try:
+        result = await service.guide_status(state["id"], state=state)
+    finally:
+        done.set()
+        await probe
+    assert result["status"] == "configuration-required" and result["owned_package_verified"]
+    assert stalls and max(stalls) < 0.5

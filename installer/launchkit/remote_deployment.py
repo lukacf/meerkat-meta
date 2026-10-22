@@ -20,8 +20,8 @@ import uuid
 import zlib
 
 from .artifact_binding import current_version, package_matches, proposal_hash
-from .deployment import (MAX_PACKAGE_BYTES, package_files, package_configuration_fields, package_console_scope,
-                         prepare_private_settings, require_accepted, now)
+from .deployment import (MAX_PACKAGE_BYTES, await_validation, package_files, package_configuration_fields,
+                         package_console_scope, prepare_private_settings, require_accepted, now)
 from .deployment_ports import checked_console_port
 from .projects import DraftConflict
 from .ssh_transport import SshTransport, SshTransportError, validate_endpoint
@@ -525,7 +525,8 @@ class RemoteDeploymentService:
             raise DraftConflict("Build and accept the current application before connecting its destination.")
         payload, slug = (await self.implementation.package(guide_id, build_id, state=state) if supplied_state
                          else await self.implementation.package(guide_id, build_id))
-        files = package_files(payload)
+        # Unpacking the whole package must not hold the event loop.
+        files = await await_validation(package_files, payload)
         spec = json.loads(files["deployment.json"][0])
         report = json.loads(files["implementation-report.json"][0])
         if (report.get("build_id") != build_id or report.get("guide_version") != checked["guide_version"]
@@ -1316,7 +1317,9 @@ class RemoteDeploymentService:
         return value
 
     async def _status(self, guide_id, *, force=False, state=None, interview=False):
-        directory, receipt = self.stored(guide_id)
+        # Reading and hashing the saved package and controller must not hold
+        # the event loop.
+        directory, receipt = await await_validation(self.stored, guide_id)
         # An interview observes admitted work only. It neither starts another
         # destination preflight nor reconciles any browser connection.
         observe = not interview or receipt.get("remote_admission_requested") is True
@@ -1344,11 +1347,11 @@ class RemoteDeploymentService:
         if not isinstance(state, dict) or state.get("id") != guide_id:
             raise ValueError("Remote evidence requires the matching detached guide state.")
         value = await self._status(guide_id, state=state, interview=True)
-        directory, receipt = self.stored(guide_id)
+        directory, receipt = await await_validation(self.stored, guide_id)
         if receipt["deployment_id"] != value["deployment_id"] or binding(receipt) != binding(value):
             raise DraftConflict("The selected remote installation changed during its observation.")
         value = await self._observation_public(receipt, value["source_binding_current"], interview=True)
-        files, _, _ = self.frozen(directory, receipt)
+        files, _, _ = await await_validation(self.frozen, directory, receipt)
         report = json.loads(files["implementation-report.json"][0])
         source = report.get("verification", {}).get("digest")
         if (report.get("build_id") != receipt["build_id"]
