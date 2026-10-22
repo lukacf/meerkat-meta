@@ -4452,6 +4452,7 @@ const allScenarios = [
     ...require("./scenarios/real-tab-isolation.cjs").scenarios,
     ...require("./scenarios/real-legacy-import.cjs").scenarios,
     ...require("./scenarios/real-sidebar-activity.cjs").scenarios,
+    ...require("./scenarios/operator-panel-frame.cjs").scenarios,
   ];
 
 module.exports = { scenarios: allScenarios };
