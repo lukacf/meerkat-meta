@@ -1077,7 +1077,7 @@ class ImplementationService:
             # the new application must earn fresh acceptance for today's brief.
             frozen_scope = {"id": guide_id, "version": frozen.get("guide_version"),
                             "blueprint": frozen.get("blueprint"), "brief": frozen.get("brief"),
-                     "organization": frozen.get("organization")}
+                            "organization": frozen.get("organization")}
             if (receipt.get("build_id") != build_id or receipt.get("status") != "completed"
                     or receipt.get("cleanup_pending") or receipt.get("cleanup_in_progress")
                     or build_id in self.tasks or build_id in self.processes

@@ -112,3 +112,17 @@ def test_organization_bound_build_and_export_cannot_match_changed_context(change
     stripped = deepcopy(frozen)
     del stripped["organization"]
     assert not frozen_matches(receipt, stripped, state)
+
+
+@pytest.mark.parametrize("full_brief", [False, True])
+def test_legacy_receipt_cannot_gain_unbound_organization_context(full_brief):
+    state = scope()
+    receipt = {"guide_id": state["id"], "guide_version": 3, **inputs(state)}
+    package = dict(receipt)
+    if not full_brief:
+        del package["brief_hash"]
+    assert matches(receipt, state)
+    assert package_matches(package, state)
+    state["organization"] = {"id": "example", "version": "1", "guide_context": "Required identity contract"}
+    assert not matches(receipt, state)
+    assert not package_matches(package, state)
