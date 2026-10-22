@@ -18,7 +18,8 @@ def existing():
     value = starter_blueprint().model_dump(mode="json")
     value["target"] = "gcp"
     value["project"]["slug"] = "review-helper"
-    value["gcp"].update(project="example-project", provisioning="existing_host", existing_instance="retained-vm")
+    value["gcp"].update(project="example-project", provisioning="existing_host", existing_instance="retained-vm",
+                        existing_zone_confirmed=True)
     return value
 
 
@@ -32,6 +33,11 @@ def test_existing_destination_keeps_distinct_instance_and_legacy_serialization()
     assert Blueprint.model_validate_json(plan.model_dump_json()) == plan
     with pytest.raises(ValidationError, match="requires existing_host"):
         CloudOptions.model_validate({**legacy, "existing_instance": "retained-vm"})
+    with pytest.raises(ValidationError, match="requires existing_host"):
+        CloudOptions.model_validate({**legacy, "existing_zone_confirmed": True})
+    for value in ("true", 1):
+        with pytest.raises(ValidationError):
+            CloudOptions.model_validate({**existing()["gcp"], "existing_zone_confirmed": value})
     for name in ("--project=other", "vm; touch marker", "vm/path", "UPPER", "trailing-", "a" * 64):
         with pytest.raises(ValidationError):
             Blueprint.model_validate({**existing(), "gcp": {**existing()["gcp"], "existing_instance": name}})
@@ -44,6 +50,38 @@ def test_unknown_existing_instance_stays_editable_but_not_packageable():
     assert package_availability(spec)["status"] == "pending-configuration"
     with pytest.raises(ValueError, match="existing VM"):
         generate_files(spec)
+
+
+def test_existing_vm_does_not_accept_an_unconfirmed_default_zone():
+    value = existing()
+    value["gcp"].pop("existing_zone_confirmed", None)
+    spec = Blueprint.model_validate(value)
+    assert spec.gcp.zone == "europe-west1-b"
+    assert package_availability(spec)["status"] == "pending-configuration"
+    assert "zone" in package_availability(spec)["reason"]
+    with pytest.raises(ValueError, match="zone"):
+        generate_files(spec)
+    reopened = Blueprint.model_validate_json(spec.model_dump_json())
+    assert package_availability(reopened)["status"] == "pending-configuration"
+    files = generate_files(existing())
+    from launchkit.projects import DraftConflict
+    with pytest.raises(DraftConflict, match="confirmed zone"):
+        deployment_handoff(json.loads(files["deployment.json"]), files, value, "guide", "build")
+
+
+def test_confirmed_existing_vm_zone_reaches_tunnel_and_handoff():
+    value = existing()
+    value["gcp"].update(region="us-central1", zone="us-central1-c", existing_zone_confirmed=True)
+    spec = Blueprint.model_validate_json(Blueprint.model_validate(value).model_dump_json())
+    files = generate_files(spec)
+    args = shlex.split(files["deploy/tunnel-gcp.sh"].splitlines()[-1])
+    assert args[args.index("--zone") + 1] == "us-central1-c"
+    _, _, handoff = deployment_handoff(json.loads(files["deployment.json"]), files,
+                                      spec.model_dump(mode="json"), "guide", "build")
+    assert "us-central1-c" in json.dumps(handoff)
+    assert "us-central1-c" in files["README.md"]
+    assert "us-central1-c" in files["deploy/deploy-gcp.sh"]
+    assert "europe-west1-b" not in json.dumps(handoff)
 
 
 @pytest.mark.parametrize("args", [[], ["--dry-run"], ["--resume"], ["--setup"], ["--status"], ["--stop"], ["--restart"], ["--remove-service"], ["--dry-run", "--resume"]])

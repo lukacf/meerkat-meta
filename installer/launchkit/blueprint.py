@@ -287,11 +287,15 @@ class CloudOptions(Cloud):
         description="Whether to create a new VM or install on an existing host. Existing-host intent never authorizes provisioning or changes to cloud resources.")
     existing_instance: str = Field(default="", pattern=r"^(?:[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)?$",
         description="Existing Compute Engine instance name, distinct from the application's project slug. Leave empty while discovering the destination; required before packaging existing-host deployments.")
+    existing_zone_confirmed: bool = Field(default=False, strict=True,
+        description="True only after the actual existing VM zone has been confirmed for this project and instance. Set region and zone to that destination. The new-VM default zone is not confirmation; leave false while unknown or after the destination changes.")
 
     @model_validator(mode="after")
     def destination_consistency(self):
         if self.existing_instance and self.provisioning != "existing_host":
             raise ValueError("An existing instance requires existing_host provisioning.")
+        if self.existing_zone_confirmed and self.provisioning != "existing_host":
+            raise ValueError("Existing zone confirmation requires existing_host provisioning.")
         return self
 
     @model_serializer(mode="wrap")
@@ -302,6 +306,8 @@ class CloudOptions(Cloud):
             data.pop("provisioning", None)
         if not self.existing_instance:
             data.pop("existing_instance", None)
+        if not self.existing_zone_confirmed:
+            data.pop("existing_zone_confirmed", None)
         return data
 
 

@@ -116,6 +116,9 @@ def package_availability(value, *, runtime_target=None, verified_artifacts=None)
     if spec.target == "gcp" and spec.gcp.provisioning == "existing_host" and not spec.gcp.existing_instance:
         return {"available": False, "status": "pending-configuration", "reason":
             "Tell the guide the existing VM instance name before preparing its package. Forge will not create a replacement VM.", **authoring}
+    if spec.target == "gcp" and spec.gcp.provisioning == "existing_host" and not spec.gcp.existing_zone_confirmed:
+        return {"available": False, "status": "pending-configuration", "reason":
+            "Confirm the existing VM's actual zone for this project and instance before preparing its package. The suggested zone may not be where your VM runs.", **authoring}
     return {"available": True, "status": "ready", "reason": None, **authoring}
 
 

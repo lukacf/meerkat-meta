@@ -493,9 +493,9 @@ def deployment_handoff(definition, files, proposal, guide_id, build_id):
     if existing_host:
         from .blueprint import CloudOptions
         selected = CloudOptions.model_validate(cloud)
-        if (not selected.existing_instance
+        if (not selected.existing_instance or not selected.existing_zone_confirmed
                 or not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", selected.project)):
-            raise DraftConflict("The existing-host package needs its actual project and instance name.")
+            raise DraftConflict("The existing-host package needs its actual project, instance name and confirmed zone.")
         steps.append({"title": "Use the existing VM", "where": "existing destination",
             "description": f"Destination: {selected.project}, {selected.zone}, {selected.existing_instance}. Use its authorized SSH access and prepare Python 3.11+ and selected connector prerequisites there. The application folder is {definition.get('slug', '')}; it is not the VM name. No new VM, firewall rule or host bootstrap is offered. Preserve any existing installation and use its saved update controls.",
             "commands": []})
