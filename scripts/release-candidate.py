@@ -85,10 +85,31 @@ BUILD_LEGS = (
 SLSA = "https://slsa.dev/provenance/v1"
 BINARY_NAMES = dict(zip(assets.ARCHIVE_PREFIXES, ("meta_gateway", "rpc_gateway", "meta_repair")))
 MAX_MEMBER = 2 * 1024**3
+# A just-started run can report a stale status for minutes, and under load
+# GitHub answers a read with 5xx or drops the connection. Collection reads its
+# own run again RUN_REREAD_DELAY seconds apart, for up to RUN_REREAD_ATTEMPTS
+# reads (10 minutes), while the run does not report in progress yet or the read
+# failed that way. Any other refusal, such as a run identity mismatch, stays
+# immediate.
+RUN_REREAD_ATTEMPTS = 40
+RUN_REREAD_DELAY = 15
+# api() runs `gh api` once, and run() reports a failure as "gh api failed: ...".
+TRANSIENT_API = re.compile(r"gh api failed: .*(?:\bHTTP 5[0-9][0-9]\b|error connecting to|connection reset|"
+                           r"connection refused|timeout|timed out|deadline exceeded|\bEOF\b|GOAWAY|broken pipe)",
+                           re.I | re.S)
 
 
 class ProtocolError(RuntimeError):
     pass
+
+
+class RunNotInProgress(ProtocolError):
+    """The candidate run's own record is right in every other way, but GitHub
+    does not report the run in progress yet."""
+
+    def __init__(self, message, status):
+        super().__init__(message)
+        self.status = status
 
 
 def require(condition, message):
@@ -489,11 +510,36 @@ def verify_run(run_id, attempt, sha, *, ci=False, collecting=False, legacy_tag=N
             and value["event"] == expected_event and value["path"] == expected_path,
             "run source/workflow/event/ref mismatch")
     if collecting:
-        require(value["status"] == "in_progress", "collection requires its in-progress candidate run")
+        if value["status"] != "in_progress":
+            raise RunNotInProgress("collection requires its in-progress candidate run", value["status"])
     else:
         require(value["status"] == "completed" and value["conclusion"] == "success",
                 "run is not completed-success")
     return value
+
+
+def collecting_run(run_id, attempt, sha):
+    """This candidate run's own record, once GitHub reports it in progress.
+
+    A read that finds the run not in progress yet, or that fails transiently,
+    is read again (see RUN_REREAD_ATTEMPTS); each such read logs one line to
+    stderr. Any other refusal propagates at once."""
+    started = time.monotonic()
+    for read in range(1, RUN_REREAD_ATTEMPTS + 1):
+        try:
+            return verify_run(run_id, attempt, sha, collecting=True)
+        except RunNotInProgress as pending:
+            reason, refusal = f"status={pending.status}", str(pending)
+        except ProtocolError as error:
+            if not TRANSIENT_API.match(str(error)):
+                raise
+            reason, refusal = f"transient API failure: {error}", str(error)
+        elapsed = f"{time.monotonic() - started:.0f}"
+        print(f"candidate run {run_id}: read {read}/{RUN_REREAD_ATTEMPTS} missed at {elapsed} s: "
+              + " ".join(reason.split()), file=sys.stderr)
+        if read < RUN_REREAD_ATTEMPTS:
+            time.sleep(RUN_REREAD_DELAY)
+    raise ProtocolError(f"{refusal} (after {RUN_REREAD_ATTEMPTS} reads over {elapsed} s)")
 
 
 def download_artifact(identity, run_info, directory):
@@ -637,7 +683,7 @@ def collect(args):
             and sha == os.environ.get("GITHUB_SHA") == os.environ.get("GITHUB_WORKFLOW_SHA"),
             "candidate collection source identity mismatch")
     run_id, attempt = env_int("GITHUB_RUN_ID"), env_int("GITHUB_RUN_ATTEMPT")
-    info = verify_run(run_id, attempt, sha, collecting=True)
+    info = collecting_run(run_id, attempt, sha)
     verify_run(args.ci_run_id, args.ci_run_attempt, sha, ci=True)
     pages = api(repo_endpoint(f"actions/runs/{run_id}/artifacts?per_page=100"), pages=True)
     listing = [item for page in pages for item in page["artifacts"]]
