@@ -15,20 +15,25 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::sources::{
+    AnnouncementSource, MAX_SOURCES_PER_GATEWAY, MAX_SOURCES_PER_MOB, PutSource, SourceChange,
+    SourceQuery, SourceState, TopicOwnership,
+};
 use super::store::AnnouncementStore;
 use super::types::{
-    AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
-    BatchGap, BatchId, BatchItem, BatchPosition, BatchQuery, BatchState, BatchStateTag,
+    AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Announcer, Batch,
+    BatchEvent, BatchGap, BatchId, BatchItem, BatchPosition, BatchQuery, BatchState, BatchStateTag,
     ExpiryReport, GapReason, LateOutcome, MAX_BACKFILL, MAX_ITEM_WIRE_BYTES, MAX_PAGE, Member,
     MemberBacklog, MemberRoute, MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport,
-    PutSubscription, Result, SealingPolicy, SourceKey, StartFrontier, Subscription,
+    PutSubscription, Result, SealingPolicy, SourceId, SourceKey, StartFrontier, Subscription,
     SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
     SubscriptionState, Topic, content_digest, header_wire_bound, merge_gaps, render_batch,
     render_gap, render_item, request_fingerprint, wire_budget, wire_len,
 };
 
-/// The mob announcement store's tables. A provider applies this through its own
-/// migration ledger before handing a connection to
+/// The mob announcement store's version 1 tables, frozen with the release
+/// that shipped them (0.9.4). A provider applies this and then [`SCHEMA_V2`]
+/// through its own migration ledger before handing a connection to
 /// [`SqliteAnnouncementStore::from_connection`].
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS announcement_logs (
@@ -99,6 +104,22 @@ CREATE TABLE IF NOT EXISTS member_routes (
  checked_through INTEGER);
 CREATE INDEX IF NOT EXISTS member_routes_by_route ON member_routes (route, member);";
 
+/// The tables version 2 adds: announcement sources, one row per
+/// `(mob_id, source_id)` holding its current generation, and the topics the
+/// sources own. A provider applies this after [`SCHEMA`].
+pub const SCHEMA_V2: &str = "
+CREATE TABLE IF NOT EXISTS announcement_sources (
+ mob_id TEXT NOT NULL, source_id TEXT NOT NULL, generation INTEGER NOT NULL,
+ state TEXT NOT NULL, identity_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL,
+ record TEXT NOT NULL, PRIMARY KEY (mob_id, source_id));
+CREATE INDEX IF NOT EXISTS announcement_sources_by_identity
+ ON announcement_sources (mob_id, identity_key, state);
+CREATE TABLE IF NOT EXISTS announcement_source_topics (
+ mob_id TEXT NOT NULL, topic TEXT NOT NULL, source_id TEXT NOT NULL, kind TEXT NOT NULL,
+ PRIMARY KEY (mob_id, topic));
+CREATE INDEX IF NOT EXISTS announcement_source_topics_by_source
+ ON announcement_source_topics (mob_id, source_id);";
+
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
 }
@@ -150,10 +171,12 @@ impl SqliteAnnouncementStore {
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
             .map_err(storage)?;
         connection.execute_batch(SCHEMA).map_err(storage)?;
+        connection.execute_batch(SCHEMA_V2).map_err(storage)?;
         Ok(Self::from_connection(connection, None))
     }
 
-    /// The caller must have applied [`SCHEMA`] under its migration contract.
+    /// The caller must have applied [`SCHEMA`] and [`SCHEMA_V2`] under its
+    /// migration contract.
     pub fn from_connection(
         connection: Connection,
         guard: Option<Arc<dyn ConnectionGuard>>,
@@ -716,6 +739,10 @@ fn announce_in(db: &Connection, request: &AnnounceRequest, now_ms: u64) -> Resul
             captured_for: captured,
         });
     }
+    // A topic a source owns is reached only by that source's items and, on a
+    // forward topic, by its triage route's own member. A replay above meets
+    // its original; this guards only what would be announced now.
+    ensure_topics_open(db, request)?;
     let head: Option<i64> = db
         .query_row(
             "SELECT head_sequence FROM announcement_logs WHERE mob_id = ?1",
@@ -2141,6 +2168,350 @@ fn prune_in(db: &Connection, now_ms: u64, retention_ms: u64, limit: usize) -> Re
     Ok(report)
 }
 
+// ---------------------------------------------------------------------------
+// Announcement sources
+// ---------------------------------------------------------------------------
+
+fn load_source(
+    db: &Connection,
+    mob_id: &MobId,
+    source_id: &SourceId,
+) -> Result<Option<AnnouncementSource>> {
+    let record: Option<String> = db
+        .query_row(
+            "SELECT record FROM announcement_sources WHERE mob_id = ?1 AND source_id = ?2",
+            params![mob_id.as_str(), source_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    record.as_deref().map(decode).transpose()
+}
+
+fn write_source(db: &Connection, source: &AnnouncementSource) -> Result<()> {
+    db.execute(
+        "INSERT INTO announcement_sources
+         (mob_id, source_id, generation, state, identity_key, updated_at_ms, record)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(mob_id, source_id) DO UPDATE SET generation = excluded.generation,
+           state = excluded.state, identity_key = excluded.identity_key,
+           updated_at_ms = excluded.updated_at_ms, record = excluded.record",
+        params![
+            source.mob_id.as_str(),
+            source.source_id.as_str(),
+            int(source.generation)?,
+            source.state.as_str(),
+            source.identity.key()?,
+            int(source.updated_at_ms)?,
+            encode(source)?,
+        ],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// The source that owns `topic` in `mob_id`, with the kind of ownership.
+fn topic_owner(
+    db: &Connection,
+    mob_id: &MobId,
+    topic: &Topic,
+) -> Result<Option<(SourceId, TopicOwnership)>> {
+    let row: Option<(String, String)> = db
+        .query_row(
+            "SELECT source_id, kind FROM announcement_source_topics
+             WHERE mob_id = ?1 AND topic = ?2",
+            params![mob_id.as_str(), topic.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(storage)?;
+    row.map(|(source_id, kind)| Ok((SourceId::new(source_id)?, TopicOwnership::parse(&kind)?)))
+        .transpose()
+}
+
+/// Refuse an announcement on a topic a source owns, unless it is that
+/// source's own item on one of its topics, or the triage member of the
+/// source's route announcing on that route's forward topic while the source
+/// is not ended.
+fn ensure_topics_open(db: &Connection, request: &AnnounceRequest) -> Result<()> {
+    for topic in &request.topics {
+        let Some((source_id, kind)) = topic_owner(db, &request.mob_id, topic)? else {
+            continue;
+        };
+        let allowed = match (&request.announced_by, kind) {
+            (Announcer::Source { source_id: own }, TopicOwnership::Source) => *own == source_id,
+            (Announcer::Member { identity }, TopicOwnership::Forward) => {
+                load_source(db, &request.mob_id, &source_id)?.is_some_and(|source| {
+                    source.state != SourceState::Ended
+                        && source
+                            .config()
+                            .forwarding_member(topic)
+                            .is_some_and(|member| {
+                                member.mob_id == request.mob_id && member.identity == *identity
+                            })
+                })
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err(AnnouncementStoreError::TopicOwnedBySource {
+                topic: topic.clone(),
+                source_id,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Claim every topic `source` owns, refusing one another source owns. A
+/// topic the source no longer names stays its own: ownership is never
+/// released here.
+fn claim_topics(db: &Connection, source: &AnnouncementSource) -> Result<()> {
+    for (topic, kind) in source.config().owned_topics() {
+        if let Some((owner, _)) = topic_owner(db, &source.mob_id, &topic)?
+            && owner != source.source_id
+        {
+            return Err(AnnouncementStoreError::TopicOwned {
+                topic,
+                source_id: owner,
+            });
+        }
+        db.execute(
+            "INSERT INTO announcement_source_topics (mob_id, topic, source_id, kind)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(mob_id, topic) DO UPDATE SET kind = excluded.kind",
+            params![
+                source.mob_id.as_str(),
+                topic.as_str(),
+                source.source_id.as_str(),
+                kind.as_str(),
+            ],
+        )
+        .map_err(storage)?;
+    }
+    Ok(())
+}
+
+/// The refusal of a change at a revision the source has moved past.
+fn source_stale(source: &AnnouncementSource) -> AnnouncementStoreError {
+    AnnouncementStoreError::SourceStaleRevision {
+        revision: source.revision,
+        generation: source.generation,
+        cursor: source.cursor.clone(),
+    }
+}
+
+/// Refuse a source of a principal's scope another live source of the mob
+/// already reads, and a source past the live-source bounds.
+fn ensure_source_admitted(db: &Connection, source: &AnnouncementSource) -> Result<()> {
+    let taken: Option<String> = db
+        .query_row(
+            "SELECT source_id FROM announcement_sources
+             WHERE mob_id = ?1 AND identity_key = ?2 AND state != 'ended' AND source_id != ?3
+             ORDER BY source_id LIMIT 1",
+            params![
+                source.mob_id.as_str(),
+                source.identity.key()?,
+                source.source_id.as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    if let Some(taken) = taken {
+        return Err(AnnouncementStoreError::SourceIdentityTaken {
+            source_id: SourceId::new(taken)?,
+        });
+    }
+    let (in_mob, in_gateway): (i64, i64) = db
+        .query_row(
+            "SELECT COUNT(*) FILTER (WHERE mob_id = ?1), COUNT(*) FROM announcement_sources
+             WHERE state != 'ended' AND NOT (mob_id = ?1 AND source_id = ?2)",
+            params![source.mob_id.as_str(), source.source_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(storage)?;
+    if uint(in_mob)? >= u64::from(MAX_SOURCES_PER_MOB) {
+        return Err(AnnouncementStoreError::SourceLimit {
+            limit: MAX_SOURCES_PER_MOB,
+            mob_id: Some(source.mob_id.clone()),
+        });
+    }
+    if uint(in_gateway)? >= u64::from(MAX_SOURCES_PER_GATEWAY) {
+        return Err(AnnouncementStoreError::SourceLimit {
+            limit: MAX_SOURCES_PER_GATEWAY,
+            mob_id: None,
+        });
+    }
+    Ok(())
+}
+
+fn put_source_in(
+    db: &Connection,
+    operation: &OperationId,
+    request: &PutSource,
+    now_ms: u64,
+) -> Result<AnnouncementSource> {
+    let fingerprint = request_fingerprint("put_source", request)?;
+    if let Some(result) = operation_result(db, operation, &fingerprint)? {
+        return decode(&result);
+    }
+    request.config.validate()?;
+    let config = request.config.clone();
+    let existing = load_source(db, &request.mob_id, &request.source_id)?;
+    let source = match (existing, request.expected_revision) {
+        (None, None) => AnnouncementSource::begin(
+            request.mob_id.clone(),
+            request.source_id.clone(),
+            1,
+            1,
+            config,
+            now_ms,
+        ),
+        (None, Some(_)) => return Err(AnnouncementStoreError::UnknownSource),
+        // Declaring an ended source again starts its next generation; the
+        // revision keeps rising across generations.
+        (Some(existing), None) if existing.state == SourceState::Ended => {
+            AnnouncementSource::begin(
+                request.mob_id.clone(),
+                request.source_id.clone(),
+                existing.generation + 1,
+                existing.revision + 1,
+                config,
+                now_ms,
+            )
+        }
+        (Some(existing), None) => return Err(source_stale(&existing)),
+        (Some(existing), Some(_)) if existing.state == SourceState::Ended => {
+            return Err(AnnouncementStoreError::SourceEnded);
+        }
+        (Some(existing), Some(expected)) if existing.revision != expected => {
+            return Err(source_stale(&existing));
+        }
+        (Some(existing), Some(_)) if request.new_generation => AnnouncementSource::begin(
+            request.mob_id.clone(),
+            request.source_id.clone(),
+            existing.generation + 1,
+            existing.revision + 1,
+            config,
+            now_ms,
+        ),
+        (Some(mut existing), Some(_)) => {
+            if existing.identity != config.identity {
+                return Err(AnnouncementStoreError::IdentityImmutable);
+            }
+            existing.reconfigure(config);
+            existing.revision += 1;
+            existing.updated_at_ms = now_ms;
+            existing.refresh_status();
+            existing
+        }
+    };
+    ensure_source_admitted(db, &source)?;
+    claim_topics(db, &source)?;
+    write_source(db, &source)?;
+    record_operation(db, operation, &fingerprint, now_ms, &encode(&source)?)?;
+    Ok(source)
+}
+
+#[derive(Serialize)]
+struct SourceChangeRequest<'a> {
+    mob_id: &'a MobId,
+    source_id: &'a SourceId,
+    expected_revision: u64,
+    change: SourceChange,
+}
+
+fn change_source_in(
+    db: &Connection,
+    operation: &OperationId,
+    mob_id: &MobId,
+    source_id: &SourceId,
+    expected_revision: u64,
+    change: SourceChange,
+    now_ms: u64,
+) -> Result<AnnouncementSource> {
+    let fingerprint = request_fingerprint(
+        "change_source",
+        &SourceChangeRequest {
+            mob_id,
+            source_id,
+            expected_revision,
+            change,
+        },
+    )?;
+    if let Some(result) = operation_result(db, operation, &fingerprint)? {
+        return decode(&result);
+    }
+    let mut source =
+        load_source(db, mob_id, source_id)?.ok_or(AnnouncementStoreError::UnknownSource)?;
+    if source.state == SourceState::Ended {
+        return Err(AnnouncementStoreError::SourceEnded);
+    }
+    if source.revision != expected_revision {
+        return Err(source_stale(&source));
+    }
+    let changed = match change {
+        SourceChange::Pause => {
+            let changed = source.state != SourceState::Paused;
+            source.state = SourceState::Paused;
+            changed
+        }
+        SourceChange::Resume { rebaseline } => {
+            let changed = source.state != SourceState::Active || rebaseline;
+            source.state = SourceState::Active;
+            if rebaseline {
+                source.rebaseline();
+            }
+            changed
+        }
+        SourceChange::End => {
+            source.state = SourceState::Ended;
+            true
+        }
+    };
+    if changed {
+        source.revision += 1;
+        source.updated_at_ms = now_ms;
+        source.refresh_status();
+        write_source(db, &source)?;
+    }
+    record_operation(db, operation, &fingerprint, now_ms, &encode(&source)?)?;
+    Ok(source)
+}
+
+fn sources_in(db: &Connection, query: &SourceQuery) -> Result<Vec<AnnouncementSource>> {
+    let (after_mob, after_source) = query
+        .after
+        .as_ref()
+        .map_or((None, None), |(mob_id, source_id)| {
+            (Some(mob_id.as_str()), Some(source_id.as_str()))
+        });
+    let mut statement = db
+        .prepare(
+            "SELECT record FROM announcement_sources
+             WHERE (?1 IS NULL OR mob_id = ?1)
+               AND (?2 IS NULL OR (mob_id, source_id) > (?2, ?3))
+               AND (?4 IS NULL OR state = ?4)
+             ORDER BY mob_id, source_id LIMIT ?5",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(
+            params![
+                query.mob_id.as_ref().map(MobId::as_str),
+                after_mob,
+                after_source,
+                query.state.map(SourceState::as_str),
+                page(query.limit)?,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(storage)?;
+    rows.map(|record| decode(&record.map_err(storage)?))
+        .collect()
+}
+
 #[async_trait]
 impl AnnouncementStore for SqliteAnnouncementStore {
     async fn announce(&self, request: AnnounceRequest, now_ms: u64) -> Result<AnnounceOutcome> {
@@ -2483,5 +2854,55 @@ impl AnnouncementStore for SqliteAnnouncementStore {
     async fn prune(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<PruneReport> {
         self.run(move |db| prune_in(db, now_ms, retention_ms, limit))
             .await
+    }
+
+    async fn put_source(
+        &self,
+        operation: &OperationId,
+        request: PutSource,
+        now_ms: u64,
+    ) -> Result<AnnouncementSource> {
+        let operation = operation.clone();
+        self.run(move |db| put_source_in(db, &operation, &request, now_ms))
+            .await
+    }
+
+    async fn change_source(
+        &self,
+        operation: &OperationId,
+        mob_id: &MobId,
+        source_id: &SourceId,
+        expected_revision: u64,
+        change: SourceChange,
+        now_ms: u64,
+    ) -> Result<AnnouncementSource> {
+        let (operation, mob_id, source_id) = (operation.clone(), mob_id.clone(), source_id.clone());
+        self.run(move |db| {
+            change_source_in(
+                db,
+                &operation,
+                &mob_id,
+                &source_id,
+                expected_revision,
+                change,
+                now_ms,
+            )
+        })
+        .await
+    }
+
+    async fn source(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<Option<AnnouncementSource>> {
+        let (mob_id, source_id) = (mob_id.clone(), source_id.clone());
+        self.run(move |db| load_source(db, &mob_id, &source_id))
+            .await
+    }
+
+    async fn sources(&self, query: &SourceQuery) -> Result<Vec<AnnouncementSource>> {
+        let query = query.clone();
+        self.run(move |db| sources_in(db, &query)).await
     }
 }

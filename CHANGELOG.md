@@ -7,8 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Mob announcement sources, first slice. A source is the durable record of
+  one feed a collector reads into a mob: its identity (the provider, the
+  principal whose account it reads, and the scope), the topics it owns, its
+  audience and routes, how its adapter observes, and its collection state.
+  New methods `meta/mob_announcements/sources/{put, pause, resume, end, get,
+  list}` declare it, change its operator state at its revision, and read
+  it. A list reads one mob's sources (the gateway's own unless `mob_id`
+  names another) and never returns the cursor token. A change at a stale
+  revision is refused `stale_revision` with the source's revision,
+  generation and cursor.
+  - A mob keeps at most 256 live sources and a gateway 1024
+    (`source_limit`); an ended source frees its place.
+  - A mob keeps one live source per principal's scope
+    (`source_identity_taken`). A source's identity is fixed within a
+    generation (`identity_immutable`); `new_generation`, or a declaration
+    after an end, starts the next generation from a fresh baseline, and the
+    revision keeps rising across generations.
+  - A principal is a verified connector account (`issuer`, `strategy_id`,
+    `subject`) or, only with a host connection, a host-attested account
+    (`principal_not_allowed` otherwise). A credential slot or a label is
+    never one, and a source without a principal is refused.
+  - Every source declares its observation capability: how its adapter takes
+    a baseline (`delta` or `snapshot`) and whether deletions are
+    observable.
+  - Routes select by topic: a route that selects by stream is refused
+    (`route_selector_unsupported`).
+
 ### Changed
 
+- A source owns its topics and its triage routes' forward topics in its
+  mob, and keeps them after it ends. Another source cannot claim them
+  (`topic_owned`), and a host or member announcement on one is refused
+  (`topic_owned_by_source`), except a triage route's own member announcing
+  on that route's forward topics. Topics no source owns are unchanged.
+- Announcements gain the announcer kind `{"kind": "source", "source_id"}`,
+  a new value raw readers of announcements may see once sources announce.
+  A batch names such an item's source by its id only.
+- The key prefix `source:` is reserved for source items: a host
+  announcement under it is refused as invalid params.
+- The mob announcement database moves to schema version 2, which only adds
+  the source tables. A version 1 database is migrated in place on first
+  open; an older binary refuses a version 2 database, so going back means
+  disabling mob announcements or keeping this binary.
 - Docs: the configuration reference has a new "Fork instruction policy"
   section. It covers what a durable fork copies (activation rows only as
   history, the session configuration, no mob operator authority), what each

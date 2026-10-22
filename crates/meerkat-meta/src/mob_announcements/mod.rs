@@ -41,6 +41,7 @@ pub mod native;
 pub mod owner;
 pub mod remote;
 pub mod rpc;
+pub mod sources;
 pub mod sqlite;
 pub(crate) mod storage;
 pub mod store;
@@ -71,16 +72,24 @@ pub use owner::{
     DEFAULT_RETENTION_MS, DeliveryObservation, MIN_RETENTION_MS, NativeObservation, RoundReport,
 };
 pub use remote::{KeyedInjectServer, RemoteMemberDelivery};
-pub use sqlite::{ConnectionGuard, SCHEMA, SqliteAnnouncementStore};
+pub use sources::{
+    AnnouncementSource, AudienceGrant, BaselineCapability, CollectionPhase, ConnectionKind,
+    DeletionCapability, ObservationCapability, Observed, Principal, PutSource, SourceChange,
+    SourceConfig, SourceConnection, SourceCursor, SourceDelivery, SourceHealth, SourceHealthPolicy,
+    SourceHealthStatus, SourceIdentity, SourcePriority, SourceQuery, SourceRoute, SourceRunner,
+    SourceScope, SourceStart, SourceState, SourceStreamCounts, SourceTotals, TopicOwnership,
+    UnhandledPolicy,
+};
+pub use sqlite::{ConnectionGuard, SCHEMA, SCHEMA_V2, SqliteAnnouncementStore};
 pub use store::AnnouncementStore;
 pub use types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementRef, AnnouncementStoreError,
     Announcer, Batch, BatchEvent, BatchEventTag, BatchId, BatchItem, BatchQuery, BatchState,
     BatchStateTag, ChildMemberLimits, LateOutcome, MAX_ITEM_WIRE_BYTES, MAX_REMOTE_BODY_WIRE_BYTES,
     Member, MemberBacklog, MemberIdentity, MemberRouteRecord, MobId, NativeReceipt, OperationId,
-    PruneReport, PutSubscription, SealingPolicy, Selector, Settlement, SourceKey, StartFrontier,
-    Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
-    SubscriptionState, SuccessorBatch, Topic,
+    PruneReport, PutSubscription, SOURCE_KEY_PREFIX, SealingPolicy, Selector, Settlement, SourceId,
+    SourceKey, StartFrontier, Subscription, SubscriptionChange, SubscriptionChangeOutcome,
+    SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch, Topic,
 };
 
 /// `runtime_options.mob_announcements`, as a host passes it at startup.
