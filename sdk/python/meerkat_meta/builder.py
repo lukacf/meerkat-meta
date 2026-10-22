@@ -48,6 +48,8 @@ class MetaBuilderConfig:
     # fails. Running out raises InitOutcomeUnknownError.
     init_deadline: float | None = None
     gateway_init_timeout: float = 60.0
+    # The meta/init parameter shutdown_in_flight_drain_ms; None sends nothing.
+    shutdown_in_flight_drain_ms: int | None = None
     modules: list[dict[str, Any]] = field(default_factory=list)
     extra_routes: Any | None = None
     persistent_state: str | None = None
@@ -761,6 +763,31 @@ class MetaBuilder:
         front of the listener. Mirrors the TypeScript builder's ``allowRemote``.
         """
         self._config.allow_remote = bool(allow)
+        return self
+
+    def shutdown_in_flight_drain_ms(self, window_ms: int) -> MetaBuilder:
+        """Let in-flight member turns finish on a graceful stop, for up to ``window_ms``.
+
+        Emitted as the ``meta/init`` parameter ``shutdown_in_flight_drain_ms``.
+        On this SDK's shutdown handshake or a SIGTERM, the gateway stops the
+        mob with its members' current runs left running and waits for them,
+        up to the window, before it shuts down. A turn still running at the
+        bound is cancelled by the shutdown, as without a drain. The gateway's
+        advertised shutdown horizon grows by the window plus 10 seconds for
+        the drain's own Stop, and this transport waits that much longer on
+        close. 0 (the default) drains nothing; the most is 300000 (5 minutes).
+        Mirrors the TypeScript builder's ``shutdownInFlightDrainMs``.
+        """
+        if (
+            not isinstance(window_ms, int)
+            or isinstance(window_ms, bool)
+            or not 0 <= window_ms <= 300_000
+        ):
+            raise ValueError(
+                "shutdown_in_flight_drain_ms must be an integer of milliseconds "
+                "in 0..=300000"
+            )
+        self._config.shutdown_in_flight_drain_ms = window_ms
         return self
 
     def implicit_delegate_idle_retirement(

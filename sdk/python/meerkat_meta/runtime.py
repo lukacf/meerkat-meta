@@ -995,6 +995,10 @@ class MetaRuntime:
         params["runtime_options"] = runtime_options
         if self._config.persistent_state:
             params["persistent_state"] = self._config.persistent_state
+        if self._config.shutdown_in_flight_drain_ms is not None:
+            params["shutdown_in_flight_drain_ms"] = (
+                self._config.shutdown_in_flight_drain_ms
+            )
         # Identity-first provider flags
         if self._config.roster_provider is not None:
             params["has_roster_provider"] = True
