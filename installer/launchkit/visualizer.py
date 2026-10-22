@@ -1227,7 +1227,7 @@ class VisualizerService:
                    if source is not None and job.get("author_draft") is not None else {}),
                 **({"design_context_guidance": DESIGN_CONTEXT_GUIDANCE} if "design_context" in model else {}),
                 "visualization_feedback_guidance": VISUALIZATION_FEEDBACK_GUIDANCE,
-                **({"profile_only_guidance": "model.profile_only_classes is exact presentation of the Blueprint classes with instances=0. These are reusable expertise and grants, with no initial identities, agent nodes, peer edges, workflow targets or observed work. You may annotate their future role freely; do not draw configured-agent marks, invent owners or routes, or add a placeholder identity. Profiles do not establish a worker fleet or prove future materialization."} if model.get("profile_only_classes") else {}),
+                **({"profile_only_guidance": "model.profile_only_classes is exact presentation of the Blueprint classes with instances=0. These are reusable expertise and grants, with no initial identities, agent nodes, peer edges, workflow targets or observed work. You may annotate their future role freely; do not draw configured-agent marks or add a placeholder identity. Do not invent owners or routes unless the source describes them; source-backed future marks remain illustrative and non-selectable. Profiles do not establish a worker fleet or prove future materialization."} if model.get("profile_only_classes") else {}),
                 "contract": job["contract"], "composition_guidance": COMPOSITION_GUIDANCE,
                 "reference_context": reference_context, "reference_guidance": AUTHOR_REFERENCE_GUIDANCE,
                 "view_guidance": composition_view_guidance(job["blueprint"], job["model"]),
