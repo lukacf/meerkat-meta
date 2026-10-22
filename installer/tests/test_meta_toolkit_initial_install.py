@@ -23,6 +23,7 @@ from launchkit.projects import DraftConflict
 from launchkit.templates import install_candidate as adapter
 from test_candidate_implementation import service as implementation_service, accepted_fixture
 from test_implementation import workspace
+import test_meta_toolkit_runtime_selection as product_fixtures
 from test_meta_toolkit_runtime_selection import product, no_product_execution
 from test_meta_toolkit_runtime_update import catalog_target
 from test_meta_toolkit_worker_update import InertExecutor
@@ -46,11 +47,13 @@ def no_processes(monkeypatch):
 @pytest.fixture
 async def initial(implementation_service, product, tmp_path, monkeypatch):
     target = catalog_target(product)
-    # These bytes model an Apple target even when pytest runs on Linux.
+    # These bytes model the product's own target (Apple unless a test selects
+    # Linux) whatever platform pytest runs on.
     selected_platform = selection.selected_runtime_platform(target)
     monkeypatch.setattr(dependencies, "platform_target", lambda: selected_platform)
-    monkeypatch.setattr(deployment, "_local_host_target", lambda: "mac")
-    implementation_service.guide.state["proposal"]["target"] = "mac"
+    host = "mac" if target.target == "macos-arm64" else "linux"
+    monkeypatch.setattr(deployment, "_local_host_target", lambda: host)
+    implementation_service.guide.state["proposal"]["target"] = host
     first = await implementation_service.submit(implementation_service.guide.identity, 3)
     project = workspace(implementation_service, first)
     definition = json.loads(project.read_file("deployment.json"))
@@ -673,9 +676,69 @@ async def test_worker_refuses_a_closure_for_another_cpython_before_creating_the_
     async def command(arguments, *args, **kwargs):
         commands.append(arguments)
         raise RuntimeError("inert venv creation")
-    install = worker._install_selected_product(supervisor, SimpleNamespace(selection=selected), lambda: True, command)
+    install = worker._install_selected_product(supervisor, SimpleNamespace(selection=selected, glibc_floor=None),
+        lambda: True, command)
     if built_for == "cp311":
         with pytest.raises(DraftConflict, match=r"built for CPython 3\.11.*runs CPython 3\.12.*PYTHON_BIN"):
+            await install
+        assert commands == [] and not (destination / ".venv").exists()
+    else:
+        with pytest.raises(RuntimeError, match="inert venv creation"):
+            await install
+        assert commands[0][1:4] == ["-I", "-m", "venv"]
+
+
+CP311_LINUX = {**CP312_LINUX, "python_tag": "cp311", "abi_tag": "cp311"}
+
+
+@pytest.fixture
+def linux_glibc_floor(monkeypatch):
+    # The product fixture builds for Linux, and its resource build declares
+    # glibc 2.39 as the Connect resource packager does.
+    product_fixtures.linux_product(monkeypatch)
+
+
+@pytest.mark.parametrize("host_glibc", [[2, 35], [2, 39], [2, 41]], ids=["glibc-2.35", "glibc-2.39", "glibc-2.41"])
+async def test_linux_host_below_the_declared_glibc_floor_refuses_fresh_install_before_publication(
+        linux_glibc_floor, initial, monkeypatch, host_glibc):
+    # Every selected wheel suits this host and Forge's CPython. Only the
+    # product's declared glibc floor decides; below it the application would
+    # install and then fail when its native programs start.
+    monkeypatch.setattr(deployment, "forge_interpreter", lambda: {**CP311_LINUX, "glibc_minimum": host_glibc},
+        raising=False)
+    f = initial
+    fresh = (await f.service.options(f.guide_id, f.build_id))["fresh_install"]
+    if host_glibc < [2, 39]:
+        assert fresh["available"] is False and "next_step" not in fresh
+        assert "glibc 2.39 or newer" in fresh["reason"] and "this computer has glibc 2.35" in fresh["reason"]
+        with pytest.raises(DraftConflict, match=r"glibc 2\.39 or newer"):
+            await f.submit()
+        assert not f.destination.exists() and not f.service.launched
+    else:
+        assert fresh == {"available": True, "reason": None, "next_step": "configure"}
+        receipt = await f.submit()
+        assert receipt["status"] == "interrupted" and receipt["phase"] == "install"
+
+
+@pytest.mark.parametrize("host_glibc", [[2, 35], [2, 39]], ids=["glibc-2.35", "glibc-2.39"])
+async def test_worker_refuses_a_host_below_the_declared_glibc_floor_before_creating_the_venv(
+        tmp_path, monkeypatch, host_glibc):
+    # Fresh installs and product updates both install through this step.
+    monkeypatch.setattr(deployment, "forge_interpreter", lambda: {**CP311_LINUX, "glibc_minimum": host_glibc},
+        raising=False)
+    selected = closure("cffi-1.17.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "cryptography-44.0.0-cp39-abi3-manylinux_2_34_x86_64.whl", "httpx-0.28.1-py3-none-any.whl")
+    destination = tmp_path / "application"
+    destination.mkdir(mode=0o700)
+    supervisor = SimpleNamespace(stop=asyncio.Event(), destination=destination)
+    commands = []
+    async def command(arguments, *args, **kwargs):
+        commands.append(arguments)
+        raise RuntimeError("inert venv creation")
+    install = worker._install_selected_product(supervisor, SimpleNamespace(selection=selected, glibc_floor=(2, 39)),
+        lambda: True, command)
+    if host_glibc < [2, 39]:
+        with pytest.raises(DraftConflict, match=r"glibc 2\.39 or newer, but this computer has glibc 2\.35"):
             await install
         assert commands == [] and not (destination / ".venv").exists()
     else:
