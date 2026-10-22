@@ -176,6 +176,8 @@ def inert_restore_worker(f, monkeypatch):
     # worker, retained BootstrapFactory, project lease and accepted source.
     calls = []
     class InertSupervisor:
+        # The real service-mode entry reads the budget the manager enforces from the receipt.
+        own_service = worker.Supervisor.own_service
         def __init__(self, directory):
             self.directory = directory
             self.receipt = deployment.read_receipt(directory)
