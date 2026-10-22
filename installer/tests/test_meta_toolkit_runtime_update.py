@@ -4,6 +4,7 @@ from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 import zipfile
 
 import pytest
@@ -260,6 +261,62 @@ def test_closed_product_transition_keeps_original_json_and_source_history(
     corrupted["runtime_artifacts"]["sdk"]["meta"]["source_payload"][0][1] = "f" * 64
     assert updates._completed_runtime_dependency_transition(previous, candidate,
         updates.read_receipt(directory), corrupted, root) is None
+
+
+LINUX_CP311 = {"python_tag": "cp311", "abi_tag": "cp311", "implementation": "cpython", "system": "Linux",
+    "machine": "x86_64", "glibc_minimum": [2, 39], "macos": (0, 0)}
+
+
+def staged_product_update(crossing, tmp_path):
+    _, target, previous, candidate, _, new_report = crossing
+    directory, _ = installation(tmp_path, crossing)
+    receipt = updates.read_receipt(directory)
+    receipt["runtime_candidate"] = json.loads(previous["runtime-candidate.json"][0])
+    updates.write_private(directory / "receipt.json", receipt)
+    return directory, lambda: updates.stage(directory, packed(candidate), new_report, runtime_target=target)
+
+
+@pytest.mark.parametrize("host_glibc", [[2, 35], [2, 39]], ids=["glibc-2.35", "glibc-2.39"])
+def test_stage_refuses_a_product_update_below_the_declared_glibc_floor_before_staging(
+        previous_product_crossing, tmp_path, monkeypatch, host_glibc):
+    # Without this, the update is staged and applied, and only the install
+    # worker refuses it, after the current runtime has been retained. This
+    # fixture's predecessor is an Apple design, so the product's declared
+    # floor is modelled at its cheap reader, which reads a real Linux
+    # declaration in test_meta_toolkit_runtime_selection.
+    from launchkit import deployment, runtime_candidates
+    target = previous_product_crossing[1]
+    def declared(selected):
+        assert selected == target
+        return (2, 39)
+    monkeypatch.setattr(runtime_candidates, "declared_glibc_floor", declared, raising=False)
+    monkeypatch.setattr(deployment, "forge_interpreter", lambda: {**LINUX_CP311, "glibc_minimum": host_glibc},
+        raising=False)
+    directory, stage = staged_product_update(previous_product_crossing, tmp_path)
+    if host_glibc < [2, 39]:
+        with pytest.raises(updates.DraftConflict, match=r"glibc 2\.39 or newer, but this computer has glibc 2\.35"):
+            stage()
+        assert "update" not in updates.read_receipt(directory)
+        assert not (directory / "updates").exists() or not any((directory / "updates").iterdir())
+    else:
+        assert stage()["update"]["status"] == "staged"
+
+
+def test_stage_refuses_a_product_update_this_cpython_cannot_install_before_staging(
+        previous_product_crossing, tmp_path, monkeypatch):
+    # The inert closure is pure Python; model a cp311-only compiled closure
+    # under a cp312 Forge, as the fresh-install row does.
+    from launchkit import deployment
+    original = deployment.selected_interpreter_refusal
+    def cp311_only(target, interpreter=None):
+        compiled = SimpleNamespace(path=Path("/selected/pydantic_core-2.27.2-cp311-cp311-manylinux_2_17_x86_64.whl"))
+        return original(SimpleNamespace(dependency_wheels=(compiled,)),
+            {**LINUX_CP311, "python_tag": "cp312", "abi_tag": "cp312"})
+    monkeypatch.setattr(deployment, "selected_interpreter_refusal", cp311_only, raising=False)
+    directory, stage = staged_product_update(previous_product_crossing, tmp_path)
+    with pytest.raises(updates.DraftConflict, match=r"built for CPython 3\.11, but this Forge runs CPython 3\.12"):
+        stage()
+    assert "update" not in updates.read_receipt(directory)
 
 
 @pytest.fixture
