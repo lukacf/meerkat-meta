@@ -112,9 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   server's event loop, so a large package on a small host no longer stalls
   the rest of Forge.
 - Meta Forge also keeps answering other requests while the guide checks an
-  installed application's source, which it does on every guide turn.
-  Reading, hashing and unpacking the saved package and comparing the
-  installed files run outside the server's event loop.
+  installed application's source, which it does on every guide turn, and
+  while it connects, installs or reads the status of a remote installation.
+  For these operations, reading, hashing and unpacking the saved packages and
+  the remote controller, and comparing a local installation's files, run
+  outside the server's event loop.
 
 ### Known limitations
 
