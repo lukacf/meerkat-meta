@@ -857,6 +857,13 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
             self.previous_instance = self.receipt.get("service_instance_id")
             self.previous_attempt = self.receipt.get("startup_attempt_id")
             self.failed_start = None
+            self.pending_update_remaining = None
+
+        def resume_update_budget(self):
+            if self.pending_update_remaining is not None:
+                if not update_deadline.expired():
+                    update_deadline.reschedule(asyncio.get_running_loop().time() + self.pending_update_remaining)
+                self.pending_update_remaining = None
 
         async def before_source_change(self):
             from .deployment import await_validation
@@ -898,6 +905,10 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
                 self.failed_start["failed_attempt"] = failed.get("startup_attempt_id")
                 self.failed_start["failed_logs"] = failed.get("logs", [])
                 raise
+            finally:
+                # A pending attempt must not disable bounds on cleanup or a
+                # later fallback attempt, even on cancellation or failure.
+                self.resume_update_budget()
 
         def retain_failed_start(self):
             context = self.failed_start
@@ -930,6 +941,7 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
         async def start_service(self, definition, *, on_ready=None):
             from .deployment_updates import checked_package
             from .deployment import verify_destination
+            from .admission_health import retained_pending_admission
             receipt = read_receipt(self.directory)
             service = await require_stopped_service(self.directory, manager)
             require_original()
@@ -938,15 +950,20 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
             expected = (receipt["build_id"], receipt["package_sha256"])
             journal(self.directory, "Starting the exact owned background service; awaiting fresh native startup and authenticated Console health.",
                     status="starting", phase="update", runtime_pid=None, bootstrap=None,
-                    startup_attempt_id=None, startup_console_health=None, console_url=None,
+                    startup_attempt_id=None, startup_console_health=None, admission_health=None, console_url=None,
                     health="unknown", health_checked_at=None, process_live=False)
             await manager.start(service)
             require_original()
             deadline = asyncio.get_running_loop().time() + SERVICE_START_TIMEOUT
+            pending_since = None
             while True:
                 if self.stop.is_set():
                     raise asyncio.CancelledError
-                observed = await background_status(self.directory, manager)
+                # Suspending the admission wait never permits an unbounded
+                # manager/health query. Each active observation is still
+                # limited by the transaction budget left before pending.
+                async with asyncio.timeout(self.pending_update_remaining):
+                    observed = await background_status(self.directory, manager)
                 require_original()
                 current = read_receipt(self.directory)
                 if ((current["build_id"], current["package_sha256"]) != expected
@@ -956,6 +973,31 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
                 verify_destination(current, files)
                 instance, attempt = current.get("service_instance_id"), current.get("startup_attempt_id")
                 health = current.get("startup_console_health") or {}
+                manager_observation = observed.get("service_observation") or {}
+                pending = (observed.get("status") == "starting" and observed.get("health") == "pending"
+                    and observed.get("process_live") is True
+                    and manager_observation.get("owned") is True
+                    and manager_observation.get("state") in {"running", "active"}
+                    and manager_observation.get("pid") == current.get("service_supervisor_pid")
+                    and instance and instance != previous_instance and attempt and attempt != previous_attempt
+                    and current.get("service_cleanup_confirmed") is False
+                    and _service_health_current(current, observed)
+                    and retained_pending_admission(current) is not None)
+                checked_at = asyncio.get_running_loop().time()
+                if pending and pending_since is None:
+                    remaining = update_deadline.when() - checked_at
+                    if remaining <= 0 or checked_at >= deadline:
+                        raise TimeoutError("The update startup deadline expired before admission recovery was observed.")
+                    # This is still an unfinished startup, not success. Keep
+                    # observing owned service/source and honour Stop, but do
+                    # not turn a known admission wait into source rollback.
+                    self.pending_update_remaining = remaining
+                    update_deadline.reschedule(None)
+                    pending_since = checked_at
+                elif not pending and pending_since is not None:
+                    deadline += checked_at - pending_since
+                    self.resume_update_budget()
+                    pending_since = None
                 if (observed.get("status") == "running" and observed.get("health") == "ready"
                         and observed.get("process_live") is True
                         and instance and instance != previous_instance and attempt and attempt != previous_attempt
@@ -981,13 +1023,13 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
                     return
                 if current.get("status") == "failed":
                     raise RuntimeError("The background application failed its native startup. Inspect the retained redacted diagnostics.")
-                if asyncio.get_running_loop().time() >= deadline:
+                if not pending and asyncio.get_running_loop().time() >= deadline:
                     raise TimeoutError("The owned background service did not supply fresh native startup and authenticated Console health in time.")
                 await asyncio.sleep(0.2)
 
     supervisor = BackgroundSupervisor(directory)
     try:
-        async with asyncio.timeout(SERVICE_UPDATE_TIMEOUT):
+        async with asyncio.timeout(SERVICE_UPDATE_TIMEOUT) as update_deadline:
             require_original()
             await update_runtime(supervisor, mode, update_id=update_id,
                 expected_binding=expected_binding, update_selection=update_selection)
