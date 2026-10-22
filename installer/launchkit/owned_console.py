@@ -168,7 +168,7 @@ async def console_response(request, owner, path, *, transport=None):
         raise HTTPException(400, "The Console query exceeds its size limit.")
     cursor = request.headers.get("last-event-id")
     if cursor is not None and (len(cursor) > MAX_EVENT_CURSOR
-            or any(ord(character) < 32 or ord(character) == 127 for character in cursor)):
+            or any(not 32 <= ord(character) <= 126 for character in cursor)):
         raise HTTPException(400, "Invalid Console event cursor.")
     if not await asyncio.to_thread(owner.current):
         raise HTTPException(410, "This agent Console has closed.")

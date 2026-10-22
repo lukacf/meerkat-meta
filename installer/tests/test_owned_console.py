@@ -106,7 +106,8 @@ def test_timeline_reconnect_preserves_native_resume_cursor(guide_console):
     assert not {"cookie", "authorization"} & set(f.requests[-1].headers)
 
 
-@pytest.mark.parametrize("cursor", ["x" * (owned_console.MAX_EVENT_CURSOR + 1), "line\r\nbreak", "bad\x00cursor"])
+@pytest.mark.parametrize("cursor", ["x" * (owned_console.MAX_EVENT_CURSOR + 1),
+    "line\r\nbreak", "bad\x00cursor", "bad\x7fcursor", b"bad\x80cursor", b"caf\xc3\xa9"])
 def test_invalid_event_cursor_is_rejected_before_forwarding(console_api, cursor):
     f = console_api
     assert f.client.get(f.prefix + "/console/timeline/stream", headers={"Last-Event-ID": cursor}).status_code == 400
