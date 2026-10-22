@@ -22,7 +22,7 @@ import uuid
 from .gcp_preflight import (CommandResult, GcloudReadOnly,
     _account, _project, _json)
 from .gcp_bootstrap import bootstrap_script
-from .deployment import package_files
+from .deployment import await_validation, package_files
 from .projects import DraftConflict, fingerprint
 from .remote_deployment import private_file, write_bytes, write_private
 
@@ -336,10 +336,11 @@ class GcpProvisioningService:
     async def _package_bootstrap(self, binding):
         """Derive new guest setup only from the exact admitted package bytes."""
         payload, _ = await self.preflight.local.implementation.package(binding["guide_id"], binding["build_id"])
-        if hashlib.sha256(payload).hexdigest() != binding["package_sha256"]:
+        # Hashing and unpacking the whole package must not hold the event loop.
+        if await await_validation(lambda: hashlib.sha256(payload).hexdigest()) != binding["package_sha256"]:
             raise DraftConflict("The accepted package changed before guest preparation. No cloud resources were requested.")
         try:
-            definition = json.loads(package_files(payload)["deployment.json"][0])
+            definition = json.loads((await await_validation(package_files, payload))["deployment.json"][0])
             if definition.get("target") != "gcp":
                 raise ValueError()
             script = bootstrap_script(definition)

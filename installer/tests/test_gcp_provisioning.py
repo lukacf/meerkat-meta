@@ -20,6 +20,8 @@ from launchkit.gcp_bootstrap import BOOTSTRAP_SCRIPT
 from launchkit.gcp_provisioning import GcpProvisioningService
 from launchkit.gcp_transport import validate_gcp_endpoint
 from launchkit.projects import DraftConflict
+from test_gcp_preflight import slow_cloud_package_work
+from test_remote_deployment import longest_loop_gap
 
 ACCOUNT = "operator@example.com"
 PROJECT = "mobkit-guided-project"
@@ -1083,3 +1085,13 @@ async def test_corrupt_removal_receipt_or_attempt_refuses_observation_without_ne
     assert "PRIVATE" not in str(error.value)
     with pytest.raises(DraftConflict): await service.remove(preflight.guide, identity, request_id, True)
     assert len(cloud.deletions()) == before
+
+
+@pytest.mark.asyncio
+async def test_cloud_computer_creation_leaves_the_event_loop_free(tmp_path, monkeypatch):
+    from launchkit import gcp_provisioning
+    service, preflight, cloud, identity, create = setup(tmp_path)
+    slow_cloud_package_work(monkeypatch, gcp_provisioning)
+    result, gap = await longest_loop_gap(create())
+    assert result["status"] == "vm-ready" and result["vm_verified"]
+    assert gap < 0.5

@@ -25,7 +25,7 @@ import httpx
 
 from .artifact_binding import package_matches, proposal_hash
 from .blueprint import Blueprint
-from .deployment import package_files, require_accepted
+from .deployment import await_validation, package_files, require_accepted
 from .projects import DraftConflict
 
 COMMAND_TIMEOUT = 15
@@ -324,7 +324,8 @@ class GcpPreflightService:
         if proposal.gcp.provisioning == "existing_host":
             raise ValueError("This proposal uses an existing host. New-VM cloud preparation is unavailable; use the existing destination's installation controls or package handoff.")
         payload, slug = await self.local.implementation.package(guide_id, build_id)
-        files = package_files(payload)
+        # Unpacking and hashing the whole package must not hold the event loop.
+        files = await await_validation(package_files, payload)
         try:
             definition = json.loads(files["deployment.json"][0])
             report = json.loads(files["implementation-report.json"][0])
@@ -362,9 +363,10 @@ class GcpPreflightService:
             and files.get("deploy/tunnel-gcp.sh", (None,))[0] == tunnel.encode()
             and files.get("deploy/install-service.sh", (None,))[0] == (TEMPLATES / "install-service.sh").read_bytes()
             and helper_supported)
+        digest = await await_validation(lambda: hashlib.sha256(payload).hexdigest())
         binding = {"guide_id": guide_id, "guide_version": state["version"], "build_id": build_id,
             "blueprint_hash": proposal_hash(state.get("proposal") or state.get("blueprint")),
-            "source_digest": status["source_digest"], "package_sha256": hashlib.sha256(payload).hexdigest()}
+            "source_digest": status["source_digest"], "package_sha256": digest}
         return binding, destination, supported
 
     def _admit(self):
@@ -608,9 +610,9 @@ class GcpPreflightService:
                 return self._result(account, project, destination, checks)
             if _guided:
                 payload, _ = await self.local.implementation.package(guide_id, build_id)
-                if hashlib.sha256(payload).hexdigest() != binding["package_sha256"]:
+                if await await_validation(lambda: hashlib.sha256(payload).hexdigest()) != binding["package_sha256"]:
                     raise DraftConflict("The accepted package changed before guest preparation. No cloud resources were requested.")
-                definition = json.loads(package_files(payload)["deployment.json"][0])
+                definition = json.loads((await await_validation(package_files, payload))["deployment.json"][0])
                 local_knowledge = (definition.get("knowledge") or {}).get("mode", "none") == "local"
             _, account_checks, _ = await self._accounts(account)
             checks.extend(account_checks)

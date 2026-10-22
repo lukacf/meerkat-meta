@@ -23,6 +23,7 @@ from launchkit.gcp_preflight import (CommandResult, GcloudReadOnly, GoogleReadOn
     GcpPreflightService, IAP_PERMISSION, MAX_ERROR, MAX_OUTPUT, PERMISSIONS,
     ProbeUnavailable, RestResult, _environment)
 from launchkit.projects import DraftConflict, fingerprint
+from test_remote_deployment import longest_loop_gap
 
 ACCOUNT = "operator@example.com"
 OTHER = "another@example.com"
@@ -806,3 +807,45 @@ async def test_repeated_cancellation_during_spawn_acquisition_retains_owned_proc
     assert observed["alive"] is False
     assert runner.cleanup_pending is False and runner._pending_processes == {}
     assert service._active is None
+
+
+def slow_cloud_package_work(monkeypatch, module):
+    original_files, original_hashlib = module.package_files, module.hashlib
+    def unpacked(payload):
+        time.sleep(1.0)  # Unpacking a large package on a small host.
+        return original_files(payload)
+    class Hashing:
+        def __getattr__(self, name):
+            return getattr(original_hashlib, name)
+        def sha256(self, data=b""):
+            if bytes(data[:4]) == b"PK\x03\x04":
+                time.sleep(1.0)  # Hashing it.
+            return original_hashlib.sha256(data)
+    monkeypatch.setattr(module, "package_files", unpacked)
+    monkeypatch.setattr(module, "hashlib", Hashing())
+
+
+async def test_cloud_account_options_leave_the_event_loop_free(harness, monkeypatch):
+    from launchkit import gcp_preflight
+    service, local, _, _ = harness
+    slow_cloud_package_work(monkeypatch, gcp_preflight)
+    result, gap = await longest_loop_gap(service.options(local.state["id"], local.build_id))
+    assert result["accounts"] and result["cli"]["status"] == "checked"
+    assert gap < 0.5
+
+
+async def test_cloud_project_list_leaves_the_event_loop_free(harness, monkeypatch):
+    from launchkit import gcp_preflight
+    service, local, _, _ = harness
+    slow_cloud_package_work(monkeypatch, gcp_preflight)
+    result, gap = await longest_loop_gap(service.projects(local.state["id"], 7, local.build_id, ACCOUNT))
+    assert len(result["projects"]) == 1 and result["truncated"] is False
+    assert gap < 0.5
+
+
+async def test_cloud_project_check_leaves_the_event_loop_free(harness, monkeypatch):
+    from launchkit import gcp_preflight
+    slow_cloud_package_work(monkeypatch, gcp_preflight)
+    result, gap = await longest_loop_gap(checked(harness))
+    assert result["ready_for_plan"] is True
+    assert gap < 0.5
