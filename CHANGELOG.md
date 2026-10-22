@@ -116,7 +116,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   finished its setup. "Apply and verify update" refuses such an update
   before anything changes. Install the new build into a new empty folder;
   for a Meta Toolkit product application, you can instead finish its setup
-  and then stage the accepted update again.
+  and then stage the accepted update again. A launcher that selects a Meta
+  Forge application host directly does not refuse that Apply for a Meta
+  Toolkit product application that has not finished its setup: the update
+  stops as "recovery needed", and its previous package and private data are
+  kept. Finish such an application's setup before you apply an update.
 
 ## [0.9.4] - 2026-10-22
 
