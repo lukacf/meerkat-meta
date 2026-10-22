@@ -97,6 +97,38 @@ async def test_launcher_readiness_attests_native_bootstrap_over_private_pipe(tmp
                 pass
 
 
+@pytest.mark.parametrize("advertised", [392_000, None], ids=["advertised", "sdk-without-accessor"])
+async def test_launcher_readiness_reports_the_gateway_shutdown_horizon(tmp_path, monkeypatch, advertised):
+    # The worker's stop waits this long for the gateway's own cleanup. An SDK
+    # without the accessor reports nothing and the worker uses its fallback.
+    module = load_host(monkeypatch, tmp_path)
+    reader, writer = os.pipe()
+    monkeypatch.setenv("MOBKIT_LAUNCH_READY_FD", str(writer))
+    observed = {"complete": True, "ready": True, "counts": {"broken": 0},
+                "identities": {"lead:main": {"state": "ready"}}}
+    class Runtime:
+        rust_http_base_url = "http://127.0.0.1:61337"
+        async def identity_bootstrap_status(self):
+            return SimpleNamespace(complete=True, ready=True, counts=SimpleNamespace(broken=0),
+                                   to_dict=lambda: observed)
+    if advertised is not None:
+        Runtime.gateway_shutdown_horizon_ms = advertised
+    try:
+        await module.report_host_readiness(Runtime())
+        with os.fdopen(reader) as channel:
+            payload = json.loads(channel.readline())
+        expected = {"pid": os.getpid(), "bootstrap": observed, "console_url": "http://127.0.0.1:61337/console"}
+        if advertised is not None:
+            expected["gateway_shutdown_horizon_ms"] = advertised
+        assert payload == expected
+    finally:
+        for descriptor in (reader, writer):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
 async def test_launcher_never_attests_broken_native_identities(tmp_path, monkeypatch):
     module = load_host(monkeypatch, tmp_path)
     reader, writer = os.pipe()

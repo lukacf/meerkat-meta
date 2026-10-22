@@ -18,6 +18,7 @@ from launchkit.deployment_deadlines import (NATIVE_GATEWAY_SHUTDOWN_TIMEOUT, APP
     SERVICE_STOP_COMMAND_TIMEOUT, LEGACY_USER_SERVICE_STOP_TIMEOUT)
 from launchkit.projects import DraftConflict
 from test_deployment import Guide, Implementation, Service, submit
+from test_gateway_shutdown_horizon import gateway_horizon_ms
 
 
 def test_pinned_native_horizon_has_ordered_enclosing_deadlines():
@@ -124,13 +125,21 @@ async def test_force_reap_timeout_never_reports_cleanup(monkeypatch):
     assert signals == [(777, signal.SIGTERM), (777, signal.SIGTERM), (777, signal.SIGKILL)]
 
 
+@pytest.mark.parametrize("recorded", [None, 432_000], ids=["unreported", "reported-432s"])
 @pytest.mark.parametrize("force", [False, True])
-async def test_host_waits_for_owned_worker_then_bounds_exact_force_reap(tmp_path, monkeypatch, force):
+async def test_host_waits_for_owned_worker_then_bounds_exact_force_reap(tmp_path, monkeypatch, force, recorded):
     guide = Guide()
     held = Service(tmp_path / "server", guide, Implementation(guide))
     initial = await submit(held, tmp_path / "application")
     directory = held._directory(guide.identity)
     await held.shutdown()
+    if recorded is not None:
+        # The worker recorded the horizon its application reported at readiness.
+        deployment.update_receipt(directory, gateway_shutdown_horizon_ms=recorded)
+    # The worker's own application stop, its force reap, then five seconds.
+    # Without a report the worker assumes this repository's gateway horizon.
+    worker_window = ((gateway_horizon_ms() if recorded is None else recorded) // 1000
+        + NATIVE_TRANSPORT_FORCE_REAP_TIMEOUT + APPLICATION_ADAPTER_STOP_MARGIN + PROCESS_FORCE_REAP_TIMEOUT + 5)
     closed, exited = asyncio.Event(), asyncio.Event()
     admitted = asyncio.Event()
     signals = []
@@ -173,7 +182,7 @@ async def test_host_waits_for_owned_worker_then_bounds_exact_force_reap(tmp_path
     with pytest.raises(asyncio.CancelledError):
         await task
     assert closed.is_set() and process.returncode is not None
-    assert timeouts == ([WORKER_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOUT] if force else [WORKER_STOP_TIMEOUT])
+    assert timeouts == ([worker_window, PROCESS_FORCE_REAP_TIMEOUT] if force else [worker_window])
     assert signals == ([(999, signal.SIGKILL)] if force else [])
     assert not fresh.processes
     assert deployment.read_receipt(directory).get("interactive_cleanup") is None

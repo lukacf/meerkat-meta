@@ -21,6 +21,7 @@ import pytest
 from launchkit.blueprint import starter_blueprint
 from launchkit.compiler import generate_files
 from launchkit import deployment_deadlines
+from test_gateway_shutdown_horizon import TRANSPORT_AND_ADAPTER_MARGIN, gateway_horizon_ms
 
 
 def load_helper(path=None):
@@ -119,7 +120,7 @@ def fake_operations(module, package, home):
     class Fake(module.Operations):
         def __init__(self):
             super().__init__(package, home)
-            self.calls, self.current, self.check_failed = [], 'inactive', False
+            self.calls, self.timeouts, self.current, self.check_failed = [], [], 'inactive', False
             self.load_state, self.control_pid, self.control_group = 'loaded', '0', ''
 
         def checks(self):
@@ -129,6 +130,7 @@ def fake_operations(module, package, home):
 
         def manager(self, arguments, **kwargs):
             self.calls.append(arguments)
+            self.timeouts.append((arguments[0], kwargs.get('timeout')))
             if arguments[0] == 'show':
                 receipt = json.loads(self.path.read_text())
                 return 0, ('ActiveState=' + self.current + '\nSubState=running\nMainPID=' +
@@ -1376,3 +1378,145 @@ async def test_supervisor_cleanup_preserves_startup_failure_through_repeated_can
             await task
         except BaseException:
             pass
+
+
+
+# The destination supervisor mirrors the local worker: the application reports
+# the horizon its gateway advertised and every enclosing remote budget follows.
+def remote_budget(name, horizon_ms):
+    application = horizon_ms // 1000 + TRANSPORT_AND_ADAPTER_MARGIN
+    service = application + 10 + 5 + 15
+    return {'application': application, 'service': service, 'command': service + 15}[name]
+
+
+@pytest.mark.parametrize('reported', [None, 392_000, 432_000], ids=['unreported', 'meta-0.9.4', 'meta-0.9.5'])
+async def test_supervised_stop_outlasts_the_gateway_horizon_the_application_reported(package, monkeypatch, reported):
+    module = load_helper(package / 'remote_operations.py')
+    process = SimpleNamespace(pid=7782, returncode=None, terminate=lambda: None)
+    async def wait():
+        return process.returncode
+    process.wait = wait
+    windows = []
+    actual_wait = asyncio.wait_for
+    async def model_wait(awaitable, timeout):
+        if getattr(getattr(awaitable, 'cr_code', None), 'co_name', None) == 'supervised_parent_exit':
+            windows.append(timeout)
+            process.returncode = 0
+        return await actual_wait(awaitable, timeout)
+    monkeypatch.setattr(module.asyncio, 'wait_for', model_wait)
+    monkeypatch.setattr(module, 'supervised_group_exists', lambda process: False)
+    stop = module.stop_supervised_application
+    await (stop(process) if reported is None else stop(process, horizon_ms=reported))
+    assert windows == [remote_budget('application', gateway_horizon_ms() if reported is None else reported)]
+
+
+@pytest.mark.parametrize('value, expected', [
+    (None, None), (392_000, 392_000), (432_000, 432_000),
+    ('392000', ValueError), (True, ValueError), (0, ValueError), (-1, ValueError), (1.5, ValueError),
+    (2_147_483_648, ValueError)], ids=str)
+def test_remote_readiness_horizon_is_validated_like_the_local_worker(value, expected):
+    module = load_helper()
+    parse = getattr(module, 'reported_gateway_horizon', None)
+    assert parse is not None, 'the destination supervisor cannot read a reported horizon'
+    payload = {} if value is None else {'gateway_shutdown_horizon_ms': value}
+    if expected is ValueError:
+        with pytest.raises(ValueError, match='gateway shutdown horizon'):
+            parse(payload)
+    else:
+        assert parse(payload) == expected
+
+
+def test_remote_unit_budgets_are_exactly_the_derived_ones():
+    module = load_helper()
+    recorded = {'gateway_shutdown_horizon_ms': 432_000}
+    # The legacy 45-second unit, the unit the 347-second pin wrote, and units
+    # derived from the recorded or the unreported horizon stay controllable.
+    for budget in (45, 397, remote_budget('service', gateway_horizon_ms()), remote_budget('service', 432_000)):
+        assert module.service_stop_timeout({**recorded, 'stop_timeout_seconds': budget}) == budget
+    for budget in (396, 398, remote_budget('service', 432_000) + 1, 3600):
+        with pytest.raises(ValueError, match='unsupported shutdown budget'):
+            module.service_stop_timeout({**recorded, 'stop_timeout_seconds': budget})
+
+
+def test_remote_short_unit_is_widened_to_the_reported_horizon_and_reloaded(package, tmp_path):
+    module = load_helper(package / 'remote_operations.py')
+    operations = fake_operations(module, package, tmp_path / 'home')
+    receipt = operations.prepare()
+    unit = Path(receipt['unit_path'])
+    # The unit an earlier Forge wrote from the 347-second pin.
+    short = {**receipt, 'stop_timeout_seconds': 397}
+    content = module.unit_content(short)
+    unit.write_bytes(content)
+    short['unit_sha256'] = hashlib.sha256(content).hexdigest()
+    module.write_private(operations.path, short)
+    widen = getattr(operations, 'widen_unit', None)
+    assert widen is not None, 'the destination supervisor cannot widen its unit'
+    for reported in (392_000, 432_000):
+        operations.calls.clear()
+        assert widen(reported) is True
+        receipt = operations.load()
+        assert receipt['stop_timeout_seconds'] == remote_budget('service', reported)
+        assert receipt['gateway_shutdown_horizon_ms'] == reported
+        assert f"TimeoutStopSec={remote_budget('service', reported)}\n".encode() in unit.read_bytes()
+        assert operations.calls == [['daemon-reload']]
+    # A shorter report never narrows the recorded unit.
+    operations.calls.clear()
+    before = (unit.read_bytes(), operations.path.read_bytes())
+    assert widen(392_000) is False
+    assert operations.calls == [] and (unit.read_bytes(), operations.path.read_bytes()) == before
+
+
+def test_remote_stop_and_restart_wait_for_the_recorded_horizon(package, tmp_path, monkeypatch):
+    module = load_helper(package / 'remote_operations.py')
+    monkeypatch.setattr(module, 'console_healthy', lambda *args: True)
+    operations = fake_operations(module, package, tmp_path / 'home')
+    receipt = operations.prepare()
+    widened = {**receipt, 'stop_timeout_seconds': remote_budget('service', 432_000),
+               'gateway_shutdown_horizon_ms': 432_000}
+    content = module.unit_content(widened)
+    Path(receipt['unit_path']).write_bytes(content)
+    widened['unit_sha256'] = hashlib.sha256(content).hexdigest()
+    module.write_private(operations.path, widened)
+    operations.current = 'active'
+    operations.stop()
+    operations.start(restart=True)
+    assert [item for item in operations.timeouts if item[0] in {'stop', 'restart'}] == [
+        ('stop', remote_budget('command', 432_000)),
+        ('restart', remote_budget('command', 432_000) + module.START_TIMEOUT + 10)]
+
+
+FIXTURE_APP_REPORTING = FIXTURE_APP.replace("payload = {'pid'", "payload = {'gateway_shutdown_horizon_ms': HORIZON, 'pid'", 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reported', [432_000, '432000'], ids=['reported', 'malformed'])
+async def test_actual_supervisor_widens_at_readiness_and_stops_within_the_reported_horizon(
+        package, tmp_path, monkeypatch, reported):
+    assert FIXTURE_APP_REPORTING != FIXTURE_APP
+    module = load_helper()
+    operations = fixture_supervisor(package, tmp_path, module,
+        FIXTURE_APP_REPORTING.replace('HORIZON', repr(reported)))
+    widened, stops = [], []
+    # No operating-system manager is reached: the unit widening is recorded only.
+    monkeypatch.setattr(operations, 'widen_unit', lambda horizon_ms: widened.append(horizon_ms) or True,
+                        raising=False)
+    owned_stop = module.stop_supervised_application
+    async def recorded_stop(process, **options):
+        stops.append(options.get('horizon_ms'))
+        await owned_stop(process)
+    monkeypatch.setattr(module, 'stop_supervised_application', recorded_stop)
+    task = asyncio.create_task(module.supervise(operations))
+    try:
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and not task.done():
+            await asyncio.sleep(0.1)
+            if operations.health_path.exists() and json.loads(operations.health_path.read_text())['ready']:
+                break
+    finally:
+        task.cancel()
+        outcome = (await asyncio.gather(task, return_exceptions=True))[0]
+    if reported == '432000':
+        assert isinstance(outcome, ValueError) and 'gateway shutdown horizon' in str(outcome)
+        assert (widened, stops) == ([], [None])
+    else:
+        assert (widened, stops) == ([432_000], [432_000])

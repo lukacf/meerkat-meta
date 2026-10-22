@@ -73,7 +73,7 @@ async def fixture(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "console_health_headers", lambda destination: {"Authorization": "Bearer " + TOKEN})
     consoles, servers, supervisors = [], [], []
 
-    async def create(responses, *, blocked=False, child_lifetime=60):
+    async def create(responses, *, blocked=False, child_lifetime=60, readiness_extra=None):
         console = ConsoleFixture(responses, blocked=blocked)
         server = await asyncio.start_server(console.handle, "127.0.0.1", 0)
         consoles.append(console)
@@ -97,7 +97,8 @@ async def fixture(tmp_path, monkeypatch):
         bootstrap = {"complete": True, "ready": True, "counts": {"broken": 0}, "identities": {"lead:main": {}}}
         (destination / "app.py").write_text(
             "import json,os,time\n"
-            f"payload={{'pid':os.getpid(),'bootstrap':{bootstrap!r},'console_url':'http://127.0.0.1:{port}/console'}}\n"
+            f"payload={{'pid':os.getpid(),'bootstrap':{bootstrap!r},'console_url':'http://127.0.0.1:{port}/console',"
+            f"**{dict(readiness_extra or {})!r}}}\n"
             "fd=int(os.environ['MOBKIT_LAUNCH_READY_FD'])\n"
             "os.write(fd,(json.dumps(payload)+'\\n').encode())\nos.close(fd)\n"
             f"time.sleep({child_lifetime!r})\n")
@@ -676,3 +677,37 @@ async def test_a_child_custody_refusal_is_the_reported_start_failure(fixture, li
     assert str(raised.value) == "The application refused to start: " + refusal
     assert_unready(supervisor)
     assert not console.requests
+
+
+@pytest.mark.parametrize("reported", [392_000, None], ids=["reported", "unreported"])
+async def test_readiness_records_the_reported_gateway_horizon_and_the_stop_waits_for_it(fixture, monkeypatch, reported):
+    from test_gateway_shutdown_horizon import gateway_horizon_ms, TRANSPORT_AND_ADAPTER_MARGIN
+    supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})],
+        readiness_extra={} if reported is None else {"gateway_shutdown_horizon_ms": reported})
+    import launchkit.deployment_worker as module
+    actual_wait = asyncio.wait_for
+    windows = []
+    async def observe(awaitable, timeout):
+        if getattr(getattr(awaitable, "cr_code", None), "co_name", None) == "parent_exit":
+            windows.append(timeout)
+        return await actual_wait(awaitable, timeout)
+    monkeypatch.setattr(module.asyncio, "wait_for", observe)
+    recorded = []
+    def ready():
+        recorded.append((getattr(supervisor, "gateway_shutdown_horizon_ms", None),
+            read_receipt(supervisor.directory).get("gateway_shutdown_horizon_ms", "absent")))
+        supervisor.stop.set()
+    await actual_wait(supervisor.start(definition, on_ready=ready), 3)
+    assert recorded == [(reported, reported)]
+    horizon = gateway_horizon_ms() if reported is None else reported
+    assert windows and set(windows) == {horizon // 1000 + TRANSPORT_AND_ADAPTER_MARGIN}
+
+
+@pytest.mark.parametrize("horizon", ["392000", True, 0, -1, 1.5, 2_147_483_648], ids=str)
+async def test_readiness_refuses_a_malformed_gateway_horizon(fixture, horizon):
+    supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})],
+        readiness_extra={"gateway_shutdown_horizon_ms": horizon})
+    published = []
+    with pytest.raises(ValueError, match="gateway shutdown horizon"):
+        await asyncio.wait_for(supervisor.start(definition, on_ready=lambda: published.append(True)), 3)
+    assert not published and read_receipt(supervisor.directory).get("gateway_shutdown_horizon_ms") is None
