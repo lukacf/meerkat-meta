@@ -3116,9 +3116,11 @@ class DeploymentService:
             else:
                 file_service_current()
 
+        from .deployment_application_bootstrap import kept_native_inventory
+        retained = await await_validation(kept_native_inventory, directory)
         with project_lock(destination) as lease:
             async with open_installed_product_source(directory, project_lease=lease,
-                    require_current=source_current, owner_source=owner_source,
+                    require_current=source_current, owner_source=owner_source, retained=retained,
                     application_startup=selected) as source_custody:
                 if destination_owner is not None:
                     self._destination_control_owner(destination_owner, guide_id, deployment_id)
@@ -3310,14 +3312,17 @@ class DeploymentService:
             self._destination_control_owner(destination_owner, guide_id, deployment_id)
             destination = owned_destination(receipt["destination"])
         require_stopped_owner()
+        from .deployment_application_bootstrap import kept_native_inventory
         from .product_installed_source import open_installed_product_source
         from .product_runtime_custody import await_product_validation
+        retained = await await_validation(kept_native_inventory, directory)
+        require_stopped_owner()
         with project_lock(destination) as lease:
             # Close this parent source scope before the child takes its own
             # project lease. Only the original private caller selects inputs.
             async with open_installed_product_source(directory, project_lease=lease,
                     require_current=require_stopped_owner, application_startup=selected,
-                    owner_source=owner_source) as source_custody:
+                    owner_source=owner_source, retained=retained) as source_custody:
                 if destination_owner is not None:
                     self._destination_control_owner(destination_owner, guide_id, deployment_id)
                     if source_custody is None:
@@ -3611,8 +3616,12 @@ class DeploymentService:
                     # The frozen manifest independently selected this digest.
                     # Observe under one real pre-manager lease, then retain
                     # only the authenticated file facts for a live child's hold.
+                    from .deployment_application_bootstrap import kept_native_inventory
+                    retained = await await_validation(kept_native_inventory, directory)
+                    destination_current()
                     async with installed_bootstrap_source(directory, service["bootstrap_selection"],
-                            require_current=source_current, owner_source_sha256=owner_sha256) as source_custody:
+                            require_current=source_current, owner_source_sha256=owner_sha256,
+                            retained=retained) as source_custody:
                         def observe_restart():
                             _, observed = observe_bootstrap_admission(directory, service["bootstrap_selection"],
                                 **({"source_custody": source_custody} if source_custody is not None else {}))

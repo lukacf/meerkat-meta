@@ -892,6 +892,9 @@ class InstalledBootstrapFactory:
         self._lifecycle = bootstrap_lifecycle_binding(read_receipt(self.directory))
         self._owner_source, self._owner_source_sha256 = owner_source, owner_source_sha256
         self.factory = self.source = self.source_scope = None
+        # The inventory before_import loaded, before any authored import; this
+        # scope reuses that object and never reads receipt.json for it again.
+        self.retained = None
         self._entered = False
 
     def require_selection_current(self):
@@ -916,7 +919,7 @@ class InstalledBootstrapFactory:
         self.source_scope = open_installed_product_source(self.directory,
             project_lease=project_lease, require_current=self.require_selection_current,
             owner_source=self._owner_source, owner_source_sha256=self._owner_source_sha256,
-            application_startup=self.inputs, retained=kept_native_inventory(self.directory))
+            application_startup=self.inputs, retained=self.retained)
         self.source = await self.source_scope.__aenter__()
         try:
             self.require_selection_current()
@@ -934,6 +937,29 @@ class InstalledBootstrapFactory:
             # Unsupported terminal cleanup retains the exact source scope. It
             # cannot itself keep an outer app project lease alive; only the
             # original app/native lifetime owner may settle that boundary.
+
+
+def startup_refusals():
+    """Source custody refusals a child reports to its parent's Start failure."""
+    from .native_prefix_receipt import RetainedInventoryError
+    from .runtime_candidates import CandidateArtifactError
+    return (RetainedInventoryError, CandidateArtifactError, CustodyError)
+
+
+def report_startup_refusal(error):
+    """Write a custody refusal to the readiness channel before the child exits.
+
+    The parent turns it into the reported Start failure, so the file and the
+    remedy reach the user instead of only the runtime log. After readiness the
+    channel is gone and nothing is written.
+    """
+    supplied = os.environ.get("MOBKIT_LAUNCH_READY_FD")
+    if supplied is None:
+        return
+    try:
+        os.write(int(supplied), (json.dumps({"refused": str(error)}) + "\n").encode())
+    except (OSError, ValueError):
+        pass
 
 
 def kept_native_inventory(directory):
@@ -960,12 +986,12 @@ def run_child(directory, selection_path, selection_sha256, lifecycle_id=None, *,
         from .templates.storage_setup import project_lock
         from .product_installed_source import open_installed_product_source
         from .product_runtime_custody import await_product_validation
+        wrapper.retained = kept_native_inventory(factory.directory)
         with project_lock(destination) as lease:
             async with open_installed_product_source(factory.directory,
                     project_lease=lease, require_current=wrapper.require_selection_current,
                     owner_source=owner_source, owner_source_sha256=owner_source_sha256,
-                    application_startup=factory.inputs,
-                    retained=kept_native_inventory(factory.directory)) as source:
+                    application_startup=factory.inputs, retained=wrapper.retained) as source:
                 receipt = read_receipt(factory.directory)
                 observation = await await_product_validation(source, _observe_inputs,
                     factory.directory, receipt, factory.inputs,
@@ -973,7 +999,11 @@ def run_child(directory, selection_path, selection_sha256, lifecycle_id=None, *,
                 wrapper.require_selection_current()
                 observation.require_current()
                 return observation, source is not None
-    observation, relocated = asyncio.run(before_import())
+    try:
+        observation, relocated = asyncio.run(before_import())
+    except startup_refusals() as error:
+        report_startup_refusal(error)
+        raise
     wrapper.require_selection_current()
     model_configuration = observation.model_configuration
     if model_configuration is not None:
@@ -1001,4 +1031,9 @@ def run_child(directory, selection_path, selection_sha256, lifecycle_id=None, *,
     if model_configuration is not None:
         model_configuration.require_environment()
     sys.argv = [str(destination / "app.py")]
-    app.main(application_startup_factory=wrapper if relocated else factory)
+    try:
+        app.main(application_startup_factory=wrapper if relocated else factory)
+    except startup_refusals() as error:
+        # Only before readiness: report_host_readiness pops the channel.
+        report_startup_refusal(error)
+        raise

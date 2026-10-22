@@ -219,7 +219,8 @@ def test_local_product_verification_skips_unchanged_files_only_on_a_local_disk(
     assert runtime.verify_runtime(f.selected.destination, f.version, runtime_target=target,
         sdk_python=f.python, site_packages=f.site, retained=retained, observation=second) == proof
     assert second["inventory_source"] == "retained" and second["fingerprints"] == {}
-    assert sorted(reads) == ([] if local_disk else files)
+    # The executed gateway is always hashed; the rest only off a local disk.
+    assert sorted(reads) == ([artifacts.prefix + "/bin/toolkit_gateway"] if local_disk else files)
 
 
 def test_relocated_target_alone_cannot_replace_the_accepted_source_identity(installed_source):

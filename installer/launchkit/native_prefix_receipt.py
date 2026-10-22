@@ -127,6 +127,12 @@ def load(directory, receipt):
         _refuse(path, "is not a private ordinary file")
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        # Removed after the lstat: the full verification runs, as for a missing file.
+        return None
+    except OSError:
+        _refuse(path, "cannot be read")
+    try:
         with os.fdopen(descriptor, "rb") as handle:
             opened = os.fstat(handle.fileno())
             content = handle.read(MAX_BYTES + 1)
@@ -177,12 +183,23 @@ def known_fingerprints(artifacts, prefix):
     """Fingerprints a prefix walk may trust for ``artifacts``, or None to hash all.
 
     Only an artifacts object read with a kept inventory carries them, and only
-    a prefix on an allowed local disk uses them.
+    a prefix on an allowed local disk uses them. A file recorded on another
+    device than the prefix, and the executed gateway itself, are always hashed.
     """
     fingerprints = getattr(artifacts, "_known_fingerprints", ())
-    if getattr(artifacts, "_inventory_source", "archive") != "retained" or not fingerprints:
+    if (getattr(artifacts, "_inventory_source", "archive") != "retained" or not fingerprints
+            or not local_disk_filesystem(prefix)):
         return None
-    return dict(fingerprints) if local_disk_filesystem(prefix) else None
+    device, gateway = os.lstat(prefix).st_dev, artifacts.prefix + "/bin/toolkit_gateway"
+    known = {name: fingerprint for name, fingerprint in fingerprints
+        if fingerprint[0] == device and name != gateway}
+    return known or None
+
+
+def same_device_fingerprints(record, prefix):
+    """Keep only a recording walk's fingerprints on the prefix's own device."""
+    device = os.lstat(prefix).st_dev
+    return {name: value for name, value in record.items() if value[0][0] == device}
 
 
 def local_disk_filesystem(path):

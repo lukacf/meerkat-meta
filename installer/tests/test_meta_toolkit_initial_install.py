@@ -1,6 +1,7 @@
 """Inert product initial-install/public-owner tests, not native qualification."""
 import asyncio
 from copy import deepcopy
+import errno
 import json
 import os
 from pathlib import Path
@@ -296,6 +297,60 @@ async def test_failed_product_install_keeps_no_inventory(worker_fixture, monkeyp
     assert KEPT_FIELD not in receipt and "installed_candidate_runtime_proof" not in receipt
     assert kept_files(f) == []
     assert ("byte-proof" in f.events) is (failure == "application-check")
+
+
+def descriptor_target(descriptor):
+    return os.readlink(f"/proc/self/fd/{descriptor}")
+
+
+@pytest.mark.parametrize("failure", ["no-space", "serialization"])
+async def test_a_failed_inventory_write_keeps_the_install_and_names_nothing(worker_fixture, monkeypatch, failure):
+    from launchkit import native_prefix_receipt as kept
+    f = worker_fixture
+    monkeypatch.setattr(dependencies, "verify_runtime", digest_proof(f))
+    if failure == "no-space":
+        original = os.fsync
+        def fsync(descriptor):
+            if ".native-prefix-receipt-" in descriptor_target(descriptor):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return original(descriptor)
+        monkeypatch.setattr(os, "fsync", fsync)
+    else:
+        def unserializable(runtime_candidate):
+            raise ValueError("Out of range float values are not JSON compliant")
+        monkeypatch.setattr(kept, "selection_sha256", unserializable)
+    assert await worker.run(f.directory, "install") == 0
+    receipt = deployment.read_receipt(f.directory)
+    assert receipt["status"] == "stopped" and receipt["phase"] == "configure"
+    assert "installed_candidate_runtime_proof" in receipt and KEPT_FIELD not in receipt
+    assert kept_files(f) == []
+
+
+async def test_the_kept_inventory_is_durable_before_the_install_receipt_names_it(worker_fixture, monkeypatch):
+    f = worker_fixture
+    monkeypatch.setattr(dependencies, "verify_runtime", digest_proof(f))
+    events = []
+    original_fsync, original_replace, original_write = os.fsync, os.replace, deployment.write_private
+    def fsync(descriptor):
+        target = descriptor_target(descriptor)
+        if "native-prefix-receipt-" in target:
+            events.append("file fsync")
+        elif target == str(f.directory):
+            events.append("folder fsync")
+        return original_fsync(descriptor)
+    def replace(source, destination):
+        if "native-prefix-receipt-" in str(source):
+            events.append("rename")
+        return original_replace(source, destination)
+    def write_private(path, value):
+        if Path(path).name == "receipt.json" and KEPT_FIELD in value:
+            events.append("receipt names it")
+        return original_write(path, value)
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(deployment, "write_private", write_private)
+    assert await worker.run(f.directory, "install") == 0
+    assert events[:4] == ["file fsync", "rename", "folder fsync", "receipt names it"]
 
 
 def observe_initial_prefix(monkeypatch, after_write=lambda path: None):

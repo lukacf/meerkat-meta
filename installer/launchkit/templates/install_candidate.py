@@ -633,6 +633,7 @@ def verify_meta_toolkit_prefix(artifacts, *, deployment_root, prefix_path=None,
         require(selected.name == artifacts.prefix, "The original startup selected another product prefix.")
         owned_directory(selected.parent)
     expected = {entry.name: entry for entry in artifacts.entries}
+    gateway = artifacts.prefix + "/bin/toolkit_gateway"
     progress = _native_prefix_progress(report_progress, "Checking native runtime files")
     observed = set()
     def walk(path, name):
@@ -665,7 +666,8 @@ def verify_meta_toolkit_prefix(artifacts, *, deployment_root, prefix_path=None,
                 require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
                     and stat.S_IMODE(info.st_mode) == entry.mode and info.st_size == entry.size,
                     "An installed native prefix file or mode changed.")
-            if known is None or tuple(known.get(name, ())) != fingerprint(info):
+            # The executed gateway is always hashed, whatever its fingerprint.
+            if (known is None or name == gateway or tuple(known.get(name, ())) != fingerprint(info)):
                 data = read_owned(path, MAX_PRODUCT_FILE_BYTES, empty=True)
                 require(digest(data) == entry.sha256, "An installed native prefix file changed.")
         require(fingerprint(path.lstat()) == fingerprint(info), "The native prefix changed during readback.")

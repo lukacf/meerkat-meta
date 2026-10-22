@@ -154,6 +154,25 @@ def console_health_headers(destination):
         raise ValueError("The private Console health authorization could not be verified.") from None
 
 
+
+STARTUP_REFUSAL_GRACE = 2
+
+
+def startup_refusal(line):
+    """A child's custody refusal, reported on its readiness channel before exiting.
+
+    The child writes {"refused": message} only for a source custody refusal
+    before readiness, so the Start failure names the file and the remedy.
+    """
+    try:
+        payload = json.loads(line)
+    except (ValueError, UnicodeError, TypeError):
+        return None
+    message = payload.get("refused") if type(payload) is dict and set(payload) == {"refused"} else None
+    if type(message) is not str or not message.strip():
+        return None
+    return "The application refused to start: " + message.strip()[:2000]
+
 class Supervisor:
     def __init__(self, directory, *, source_custody=None):
         self.directory = Path(directory)
@@ -701,15 +720,26 @@ class Supervisor:
             raise RuntimeError("The admitted candidate selection changed during runtime verification.")
         return proof
 
+    @staticmethod
+    async def _startup_refusal(started):
+        """The refusal an exited child wrote to its readiness channel, if any."""
+        try:
+            line = await asyncio.wait_for(asyncio.shield(started), STARTUP_REFUSAL_GRACE)
+        except (asyncio.TimeoutError, ValueError, OSError, asyncio.LimitOverrunError, asyncio.IncompleteReadError):
+            return None
+        return startup_refusal(line)
+
     def _keep_native_inventory(self, observation, proof):
         """Keep an install's fully verified prefix inventory for its later Starts."""
         from .native_prefix_receipt import RECEIPT_FIELD, mint
         artifacts = observation.get("artifacts")
         try:
+            # The selection this install verified, not a later receipt read.
             named = None if artifacts is None else mint(self.directory, artifacts, proof=proof,
                 runtime_candidate=self.receipt.get("runtime_candidate"),
                 fingerprints=observation.get("fingerprints"))
-        except OSError:
+        except (OSError, ValueError, TypeError):
+            # Keeping the inventory is only a cache; the next Start verifies fully.
             named = None
         return {RECEIPT_FIELD: named} if named is not None else {}
 
@@ -727,8 +757,13 @@ class Supervisor:
         from .native_prefix_receipt import load
         return load(self.directory, read_receipt(self.directory))
 
-    def _settle_native_inventory(self, retained, observation, proof):
-        """After a verified Start, hold a used inventory to the receipt or keep a new one."""
+    def _settle_native_inventory(self, retained, observation, proof, verified_receipt):
+        """After a verified Start, hold a used inventory to the receipt or keep a new one.
+
+        ``verified_receipt`` is the receipt the verification ran on. A new
+        inventory records its selection, and is named only while the live
+        receipt still selects it.
+        """
         from .native_prefix_receipt import (RECEIPT_FIELD, installed_inventory_sha256, mint, record,
             same_selection)
         artifacts = observation.get("artifacts")
@@ -744,15 +779,17 @@ class Supervisor:
             return
         # The full verification ran. Keep its inventory only for the digest the
         # installed proof already records; a failed verification never gets here.
-        if installed_inventory_sha256(receipt) != proof.get("prefix_inventory_sha256"):
+        selected = verified_receipt.get("runtime_candidate")
+        if installed_inventory_sha256(verified_receipt) != proof.get("prefix_inventory_sha256"):
             return
         try:
-            named = mint(self.directory, artifacts, proof=proof, runtime_candidate=receipt.get("runtime_candidate"),
+            named = mint(self.directory, artifacts, proof=proof, runtime_candidate=selected,
                 fingerprints=observation.get("fingerprints"))
             if named is not None:
                 record(self.directory, named, inventory_sha256=proof["prefix_inventory_sha256"],
-                    runtime_candidate=receipt.get("runtime_candidate"))
-        except OSError:
+                    runtime_candidate=selected)
+        except (OSError, ValueError, TypeError):
+            # Keeping the inventory is only a cache; the next Start verifies fully.
             pass
 
     def native_binary_provenance(self, files):
@@ -1278,7 +1315,8 @@ class Supervisor:
                             retained=retained, observation=observation)
                     candidate_proof = await await_product_validation(source_custody, runtime_proof)
                     require_bootstrap_original()
-                    await asyncio.to_thread(self._settle_native_inventory, retained, observation, candidate_proof)
+                    await asyncio.to_thread(self._settle_native_inventory, retained, observation, candidate_proof,
+                        current)
                 if (source_custody is not None and current.get("knowledge_managed") is True
                         and definition["knowledge"]["mode"] == "local"):
                     await self.prepare_knowledge(definition, require_current=current_source_owner,
@@ -1377,12 +1415,17 @@ class Supervisor:
             if stopped in done:
                 raise asyncio.CancelledError
             if exited in done:
-                raise RuntimeError(f"The application stopped before startup verification (exit {process.returncode}).")
+                # A child that refused its source custody said why before exiting.
+                refusal = await self._startup_refusal(started)
+                raise RuntimeError(refusal or f"The application stopped before startup verification (exit {process.returncode}).")
             if started not in done:
                 raise TimeoutError("The application did not finish native startup verification in time. Rebuild a package with the current host if it lacks Forge readiness reporting.")
             startup = started.result()
             if not startup:
                 raise RuntimeError("The application closed its startup verification channel before reporting readiness. Inspect the runtime logs for the native startup failure.")
+            refusal = startup_refusal(startup)
+            if refusal is not None:
+                raise RuntimeError(refusal)
             try:
                 payload = json.loads(startup)
             except (ValueError, UnicodeError):

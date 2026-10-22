@@ -596,3 +596,57 @@ def test_malformed_kept_fingerprints_refuse(installed, monkeypatch, change):
     write_receipt(f.directory, {**receipt(f), kept.RECEIPT_FIELD: forged})
     with pytest.raises(kept.RetainedInventoryError, match="is not a readable inventory"):
         kept.load(f.directory, receipt(f))
+
+
+def test_a_kept_inventory_removed_after_its_lstat_is_stale_not_refused(installed, monkeypatch):
+    f = installed
+    named = keep(f)
+    path = kept_path(f, named)
+    original = os.open
+    def vanished(name, *args, **kwargs):
+        if Path(name) == path:
+            raise FileNotFoundError(name)
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(os, "open", vanished)
+    assert kept.load(f.directory, receipt(f)) is None
+
+
+def test_kept_fingerprints_never_skip_the_gateway_or_another_device(installed, monkeypatch):
+    f = installed
+    keep_with_fingerprints(f, monkeypatch)
+    artifacts = retained_artifacts(f)
+    monkeypatch.setattr(kept, "local_disk_filesystem", lambda path: True)
+    gateway = f.artifacts.prefix + "/bin/toolkit_gateway"
+    known = kept.known_fingerprints(artifacts, f.prefix)
+    assert gateway not in known and sorted(known) == [name for name in file_names(f) if name != gateway]
+    device = os.lstat(f.prefix).st_dev
+    elsewhere = tuple((name, (device + 1, *fingerprint[1:]) if name.endswith("README.md") else fingerprint)
+        for name, fingerprint in artifacts._known_fingerprints)
+    object.__setattr__(artifacts, "_known_fingerprints", elsewhere)
+    assert f.artifacts.prefix + "/README.md" not in kept.known_fingerprints(artifacts, f.prefix)
+    reads = counted_reads(monkeypatch, f)
+    adapter.verify_meta_toolkit_prefix(artifacts, deployment_root=f.destination,
+        known=kept.known_fingerprints(artifacts, f.prefix))
+    assert sorted(reads) == sorted([gateway, f.artifacts.prefix + "/README.md"])
+    record = {name: ((device + 1, *value[0][1:]), value[1]) if name.endswith("README.md") else value
+        for name, value in {name: ((device, 1, 2, 3, 1, 4, 5, 6), 9) for name in file_names(f)}.items()}
+    assert sorted(kept.same_device_fingerprints(record, f.prefix)) == [
+        name for name in file_names(f) if not name.endswith("README.md")]
+    monkeypatch.setattr(kept, "local_disk_filesystem", lambda path: False)
+    assert kept.known_fingerprints(artifacts, f.prefix) is None
+
+
+def test_a_fingerprint_equal_but_changed_gateway_is_still_caught(installed, monkeypatch):
+    f = installed
+    keep_with_fingerprints(f, monkeypatch)
+    gateway = f.prefix / "bin/toolkit_gateway"
+    content = gateway.read_bytes()
+    gateway.write_bytes(bytes([content[0] ^ 1]) + content[1:])
+    artifacts = retained_artifacts(f)
+    # Even a known fingerprint equal to the changed gateway's never skips it.
+    known = {**dict(artifacts._known_fingerprints),
+        f.artifacts.prefix + "/bin/toolkit_gateway": adapter.fingerprint(gateway.lstat())}
+    reads = counted_reads(monkeypatch, f)
+    with pytest.raises(candidates.CandidateArtifactError, match="An installed native prefix file changed."):
+        adapter.verify_meta_toolkit_prefix(artifacts, deployment_root=f.destination, known=known)
+    assert reads == [f.artifacts.prefix + "/bin/toolkit_gateway"]

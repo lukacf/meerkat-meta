@@ -359,7 +359,7 @@ def _verify_meta_toolkit_runtime(destination, expected_version, target, *, sdk_p
         raise RuntimeDependencyError("The original installed product selection changed during verification.")
     # F2: a kept inventory's fingerprints skip re-reading unchanged files, and a
     # full walk that may be kept records them, only on an allowed local disk.
-    from .native_prefix_receipt import known_fingerprints, local_disk_filesystem
+    from .native_prefix_receipt import known_fingerprints, local_disk_filesystem, same_device_fingerprints
     prefix = native_root / ".bin" / artifacts.prefix
     known = known_fingerprints(artifacts, prefix)
     record = ({} if observation is not None and artifacts._inventory_source == "archive"
@@ -384,7 +384,7 @@ def _verify_meta_toolkit_runtime(destination, expected_version, target, *, sdk_p
     _require_product_installed_observation(observed, artifacts, native_root, site, facts, source_paths)
     if observation is not None:
         observation.update(artifacts=artifacts, inventory_source=artifacts._inventory_source,
-            fingerprints=record or {})
+            fingerprints=same_device_fingerprints(record, prefix) if record else {})
     return result
 
 
