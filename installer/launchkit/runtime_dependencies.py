@@ -357,8 +357,16 @@ def _verify_meta_toolkit_runtime(destination, expected_version, target, *, sdk_p
     observed = _product_installed_observation(artifacts, native_root, site, facts, source_paths)
     if any(observed[1][path] != identity for path, identity in source_observation.items()):
         raise RuntimeDependencyError("The original installed product selection changed during verification.")
+    # F2: a kept inventory's fingerprints skip re-reading unchanged files, and a
+    # full walk that may be kept records them, only on an allowed local disk.
+    from .native_prefix_receipt import known_fingerprints, local_disk_filesystem
+    prefix = native_root / ".bin" / artifacts.prefix
+    known = known_fingerprints(artifacts, prefix)
+    record = ({} if observation is not None and artifacts._inventory_source == "archive"
+        and local_disk_filesystem(prefix) else None)
     adapter.verify_meta_toolkit_prefix(artifacts, deployment_root=native_root,
-        **({"report_progress": report_progress} if report_progress is not None else {}))
+        **({"report_progress": report_progress} if report_progress is not None else {}),
+        **({"known": known} if known is not None else {}), **({"record": record} if record is not None else {}))
     actual = adapter.compare_installed_meta_toolkit_wheels(*facts, deployment_root=sdk_root,
         site_packages=site, sdk_python=python)
     selected_runtime_artifacts(target, verified_artifacts=artifacts, source_custody=source_custody,
@@ -375,7 +383,8 @@ def _verify_meta_toolkit_runtime(destination, expected_version, target, *, sdk_p
         "sdk": sdk}
     _require_product_installed_observation(observed, artifacts, native_root, site, facts, source_paths)
     if observation is not None:
-        observation.update(artifacts=artifacts, inventory_source=artifacts._inventory_source)
+        observation.update(artifacts=artifacts, inventory_source=artifacts._inventory_source,
+            fingerprints=record or {})
     return result
 
 

@@ -119,6 +119,7 @@ class MetaToolkitRuntimeArtifacts:
     _verified_inputs: tuple = field(default=(), init=False, repr=False, compare=False)
     _verified_metadata: tuple = field(default=(), init=False, repr=False, compare=False)
     _inventory_source: str = field(default="archive", init=False, repr=False, compare=False)
+    _known_fingerprints: tuple = field(default=(), init=False, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,7 @@ class RetainedPrefixInventory:
     inventory_sha256: str
     receipt_sha256: str
     runtime_candidate_sha256: str
+    fingerprints: tuple = ()
 
     def matches(self, assembly_sha256, archive, prefix):
         return (self.assembly_sha256 == assembly_sha256 and self.prefix == prefix
@@ -480,6 +482,8 @@ def _read_meta_toolkit_artifacts(target, retained=None):
         origin="source-built-development" if development else "installed-gateway-assembly")
     object.__setattr__(result, "_verified_inputs", tuple(inputs.files.values()))
     object.__setattr__(result, "_inventory_source", source)
+    if source == "retained":
+        object.__setattr__(result, "_known_fingerprints", retained.fingerprints)
     object.__setattr__(result, "_verified_metadata", tuple(json.dumps(value, sort_keys=True,
         ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode()
         for value in (candidate, catalog, result.origin)))

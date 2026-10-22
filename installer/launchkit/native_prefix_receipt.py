@@ -31,14 +31,20 @@ from .runtime_candidates import (ProductPrefixEntry, RetainedPrefixInventory, _f
 from .runtime_dependencies import RuntimeDependencyError
 
 RECEIPT_FIELD = "native_prefix_receipt_sha256"
-SCHEMA = 1
+SCHEMA = 2
 MAX_BYTES = 32 * 1024 * 1024
 STALE_PENDING_SECONDS = 3600
+# A file changed within this window of its observation could keep the same
+# coarse ctime ("racy clean"); such a file is always hashed again.
+RACY_NS = 2_000_000_000
+# Local disk filesystems where any write, including one through a shared
+# mapping after writeback, moves ctime. Elsewhere every file is hashed.
+LOCAL_DISK_FILESYSTEMS = frozenset({"ext4", "xfs", "btrfs"})
 HEX = re.compile(r"[a-f0-9]{64}")
 NAME = re.compile(r"native-prefix-receipt-([a-f0-9]{64})\.json")
 PENDING = re.compile(r"\.native-prefix-receipt-[a-f0-9]{32}\.pending")
 KEYS = frozenset({"schema", "prefix", "inventory_sha256", "entries", "runtime_candidate_sha256",
-    "assembly_sha256", "archive_sha256", "archive_bytes"})
+    "assembly_sha256", "archive_sha256", "archive_bytes", "fingerprints"})
 ENTRY_KEYS = frozenset(ProductPrefixEntry.__dataclass_fields__)
 
 
@@ -142,6 +148,7 @@ def load(directory, receipt):
                 or type(value["archive_bytes"]) is not int or value["archive_bytes"] <= 0):
             raise ValueError("A saved inventory is malformed.")
         entries = tuple(_entry(item) for item in value["entries"])
+        fingerprints = _fingerprints(value["fingerprints"], entries)
     except ValueError:
         _refuse(path, "is not a readable inventory")
     if prefix_inventory_sha256(entries) != value["inventory_sha256"]:
@@ -149,16 +156,65 @@ def load(directory, receipt):
     if value["inventory_sha256"] != current or not same_selection(receipt, value["runtime_candidate_sha256"]):
         return None
     return RetainedPrefixInventory(entries, value["prefix"], value["assembly_sha256"],
-        value["archive_sha256"], value["archive_bytes"], current, named, value["runtime_candidate_sha256"])
+        value["archive_sha256"], value["archive_bytes"], current, named, value["runtime_candidate_sha256"],
+        fingerprints)
 
 
-def mint(directory, artifacts, *, proof, runtime_candidate):
+def _fingerprints(value, entries):
+    files = {entry.name for entry in entries if entry.kind == "file"}
+    if type(value) is not dict or not set(value) <= files:
+        raise ValueError("A saved inventory has fingerprints for no regular file.")
+    result = []
+    for name in sorted(value):
+        row = value[name]
+        if type(row) is not list or len(row) != 8 or any(type(item) is not int for item in row):
+            raise ValueError("A saved inventory fingerprint is malformed.")
+        result.append((name, tuple(row)))
+    return tuple(result)
+
+
+def known_fingerprints(artifacts, prefix):
+    """Fingerprints a prefix walk may trust for ``artifacts``, or None to hash all.
+
+    Only an artifacts object read with a kept inventory carries them, and only
+    a prefix on an allowed local disk uses them.
+    """
+    fingerprints = getattr(artifacts, "_known_fingerprints", ())
+    if getattr(artifacts, "_inventory_source", "archive") != "retained" or not fingerprints:
+        return None
+    return dict(fingerprints) if local_disk_filesystem(prefix) else None
+
+
+def local_disk_filesystem(path):
+    """Whether ``path`` lies on a local disk filesystem from the allow-list.
+
+    The type comes from /proc/self/mountinfo by the device's major:minor.
+    Anything unknown (no /proc, a btrfs subvolume device, overlay, tmpfs,
+    FUSE or network mounts) is not allowed, and its files are always hashed.
+    """
+    try:
+        device = os.stat(path).st_dev
+        wanted = f"{os.major(device)}:{os.minor(device)}"
+        with open("/proc/self/mountinfo", encoding="utf-8") as mounts:
+            for line in mounts:
+                fields = line.split()
+                if len(fields) > 2 and fields[2] == wanted and " - " in line:
+                    return line.split(" - ", 1)[1].split()[0] in LOCAL_DISK_FILESYSTEMS
+    except (OSError, UnicodeError, ValueError, IndexError):
+        return False
+    return False
+
+
+def mint(directory, artifacts, *, proof, runtime_candidate, fingerprints=None):
     """Keep the inventory of a successful full verification; return its sha256.
 
     Callers mint only after that verification (and an install's application
     check) returned, never on a failure path. They name the returned sha256 in
     receipt.json only after this call, when the file is already durable.
     Inventories read from a kept copy are never minted again.
+    ``fingerprints`` are that hashed walk's (fingerprint, observed time) pairs,
+    taken after an fsync; a racy one (ctime within RACY_NS of its
+    observation) is left out, so that file is always hashed again.
     """
     inventory = prefix_inventory_sha256(artifacts.entries)
     if (artifacts._inventory_source != "archive" or type(proof) is not dict
@@ -166,11 +222,15 @@ def mint(directory, artifacts, *, proof, runtime_candidate):
             or proof.get("archive_sha256") != artifacts.archive.sha256
             or proof.get("assembly_sha256") != artifacts.selection.assembly.sha256):
         return None
+    files = {entry.name for entry in artifacts.entries if entry.kind == "file"}
+    kept = {name: list(fingerprint) for name, (fingerprint, observed) in (fingerprints or {}).items()
+        if name in files and fingerprint[7] < observed - RACY_NS}
     content = (json.dumps({"schema": SCHEMA, "prefix": artifacts.prefix, "inventory_sha256": inventory,
         "entries": [asdict(entry) for entry in artifacts.entries],
         "runtime_candidate_sha256": selection_sha256(runtime_candidate),
         "assembly_sha256": artifacts.selection.assembly.sha256,
-        "archive_sha256": artifacts.archive.sha256, "archive_bytes": artifacts.archive.size},
+        "archive_sha256": artifacts.archive.sha256, "archive_bytes": artifacts.archive.size,
+        "fingerprints": kept},
         sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode()
     if len(content) > MAX_BYTES:
         return None

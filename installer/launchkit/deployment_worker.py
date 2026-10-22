@@ -707,7 +707,8 @@ class Supervisor:
         artifacts = observation.get("artifacts")
         try:
             named = None if artifacts is None else mint(self.directory, artifacts, proof=proof,
-                runtime_candidate=self.receipt.get("runtime_candidate"))
+                runtime_candidate=self.receipt.get("runtime_candidate"),
+                fingerprints=observation.get("fingerprints"))
         except OSError:
             named = None
         return {RECEIPT_FIELD: named} if named is not None else {}
@@ -746,7 +747,8 @@ class Supervisor:
         if installed_inventory_sha256(receipt) != proof.get("prefix_inventory_sha256"):
             return
         try:
-            named = mint(self.directory, artifacts, proof=proof, runtime_candidate=receipt.get("runtime_candidate"))
+            named = mint(self.directory, artifacts, proof=proof, runtime_candidate=receipt.get("runtime_candidate"),
+                fingerprints=observation.get("fingerprints"))
             if named is not None:
                 record(self.directory, named, inventory_sha256=proof["prefix_inventory_sha256"],
                     runtime_candidate=receipt.get("runtime_candidate"))

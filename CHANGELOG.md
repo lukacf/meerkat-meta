@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   verification and keeps a new list. An installation from 0.9.4 or earlier
   gets its list at its first Start. Forge 0.9.4 ignores the new installation
   record field.
+- On a Meta/Toolkit product Start, Meta Forge no longer reads a native runtime
+  file again when it is unchanged. The kept list also records each file's
+  identity (device, inode, mode, owner, link count, size, modification and
+  change times) from the verification that read it, and every check of a
+  Start reads a file again only when that identity changed. Writing to a file
+  always moves its change time, which only an administrator can set back.
+  Forge uses the recorded identities on ext4, xfs and btrfs only, and reads
+  every file on other filesystems.
 
 ### Fixed
 

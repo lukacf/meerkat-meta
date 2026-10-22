@@ -6,6 +6,7 @@ R21-R24). The install and Start lanes keep their rows with their fixtures.
 """
 from copy import deepcopy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -255,7 +256,7 @@ def test_r8_a_legacy_receipt_takes_the_full_path_once_and_then_keeps_the_invento
     assert kept.mint(f.directory, again, proof=f.proof, runtime_candidate=SELECTION) is None
 
 
-@pytest.mark.parametrize("change", ["proof", "selection", "schema", "missing"])
+@pytest.mark.parametrize("change", ["proof", "selection", "newer-schema", "older-schema", "missing"])
 def test_r9_r10_r17_r22_stale_or_missing_inventories_fall_back_to_the_full_path(installed, change):
     f = installed
     named = keep(f)
@@ -264,9 +265,11 @@ def test_r9_r10_r17_r22_stale_or_missing_inventories_fall_back_to_the_full_path(
         current["installed_candidate_runtime_proof"] = {**f.proof, "prefix_inventory_sha256": "9" * 64}
     elif change == "selection":
         current["runtime_candidate"] = {**SELECTION, "assembly": "another selected product"}
-    elif change == "schema":
+    elif change.endswith("schema"):
         document = json.loads(kept_path(f, named).read_bytes())
-        content = document_bytes({**document, "schema": 2})
+        if change == "older-schema":
+            document = {key: value for key, value in document.items() if key != "fingerprints"}
+        content = document_bytes({**document, "schema": kept.SCHEMA + (1 if change == "newer-schema" else -1)})
         newer = hashlib.sha256(content).hexdigest()
         rewrite(kept_path(f, newer), content)
         current[kept.RECEIPT_FIELD] = newer
@@ -380,3 +383,216 @@ def test_r24_a_same_size_archive_change_keeps_the_start_but_refuses_the_next_ful
     adapter.verify_meta_toolkit_prefix(artifacts, deployment_root=f.destination)
     with pytest.raises(candidates.CandidateArtifactError):
         candidates.read_meta_toolkit_artifacts(f.product.target)
+
+
+# F2: fingerprints from a verified, hashed walk skip re-reading unchanged files.
+
+def keep_with_fingerprints(f, monkeypatch, racy_ns=0):
+    """Mint after a recording walk, as an install or a legacy Start does."""
+    monkeypatch.setattr(kept, "RACY_NS", racy_ns)
+    record = {}
+    adapter.verify_meta_toolkit_prefix(f.artifacts, deployment_root=f.destination, record=record)
+    named = kept.mint(f.directory, f.artifacts, proof=f.proof, runtime_candidate=SELECTION, fingerprints=record)
+    assert kept.record(f.directory, named, inventory_sha256=f.proof["prefix_inventory_sha256"],
+        runtime_candidate=SELECTION)
+    return named, record
+
+
+def counted_reads(monkeypatch, f):
+    reads = []
+    original = adapter.read_owned
+    def read_owned(path, *args, **kwargs):
+        if f.prefix in Path(path).parents:
+            reads.append(Path(path).relative_to(f.prefix.parent).as_posix())
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(adapter, "read_owned", read_owned)
+    return reads
+
+
+def retained_artifacts(f):
+    artifacts = candidates.read_meta_toolkit_artifacts(f.product.target, retained=kept.load(f.directory, receipt(f)))
+    assert artifacts._inventory_source == "retained"
+    return artifacts
+
+
+def file_names(f):
+    return sorted(entry.name for entry in f.artifacts.entries if entry.kind == "file")
+
+
+def verify_known(f, artifacts, known=None):
+    adapter.verify_meta_toolkit_prefix(artifacts, deployment_root=f.destination,
+        known=dict(artifacts._known_fingerprints) if known is None else known)
+
+
+def test_r11_an_unchanged_prefix_is_checked_without_reading_one_file(installed, monkeypatch):
+    f = installed
+    named, record = keep_with_fingerprints(f, monkeypatch)
+    assert sorted(record) == file_names(f)
+    assert sorted(json.loads(kept_path(f, named).read_bytes())["fingerprints"]) == file_names(f)
+    artifacts = retained_artifacts(f)
+    reads = counted_reads(monkeypatch, f)
+    verify_known(f, artifacts)
+    assert reads == []
+
+
+def test_r12_a_content_change_with_its_mtime_restored_moves_ctime_and_refuses(installed, monkeypatch):
+    f = installed
+    keep_with_fingerprints(f, monkeypatch)
+    readme = f.prefix / "README.md"
+    before = readme.stat()
+    tamper_readme(f)
+    os.utime(readme, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = readme.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    assert after.st_ctime_ns != before.st_ctime_ns
+    artifacts = retained_artifacts(f)
+    reads = counted_reads(monkeypatch, f)
+    with pytest.raises(candidates.CandidateArtifactError, match="An installed native prefix file changed."):
+        verify_known(f, artifacts)
+    assert reads == [f.artifacts.prefix + "/README.md"]
+
+
+def test_r13_a_fingerprint_edited_to_match_a_changed_file_refuses(installed, monkeypatch):
+    f = installed
+    named, _ = keep_with_fingerprints(f, monkeypatch)
+    tamper_readme(f)
+    path = kept_path(f, named)
+    document = json.loads(path.read_bytes())
+    document["fingerprints"][f.artifacts.prefix + "/README.md"] = list(
+        adapter.fingerprint((f.prefix / "README.md").lstat()))
+    rewrite(path, document_bytes(document))
+    with pytest.raises(kept.RetainedInventoryError, match="differs from the copy receipt.json names"):
+        kept.load(f.directory, receipt(f))
+
+
+def test_r14_racy_fingerprints_are_never_kept(installed, monkeypatch):
+    f = installed
+    assert kept.RACY_NS == 2_000_000_000
+    named, record = keep_with_fingerprints(f, monkeypatch, racy_ns=10 ** 18)
+    assert json.loads(kept_path(f, named).read_bytes())["fingerprints"] == {}
+    artifacts = retained_artifacts(f)
+    reads = counted_reads(monkeypatch, f)
+    verify_known(f, artifacts)
+    assert sorted(reads) == file_names(f)
+    name = file_names(f)[0]
+    fingerprint = record[name][0]
+    monkeypatch.setattr(kept, "RACY_NS", 2_000_000_000)
+    for seen, kept_it in ((fingerprint[7] + 1_999_999_999, False), (fingerprint[7] + 2_000_000_001, True)):
+        minted = kept.mint(f.directory, f.artifacts, proof=f.proof, runtime_candidate=SELECTION,
+            fingerprints={name: (fingerprint, seen)})
+        assert (name in json.loads(kept_path(f, minted).read_bytes())["fingerprints"]) is kept_it
+
+
+def test_r15_the_same_bytes_in_a_new_inode_are_hashed_again_and_pass(installed, monkeypatch):
+    f = installed
+    named, _ = keep_with_fingerprints(f, monkeypatch)
+    readme = f.prefix / "README.md"
+    copy = f.destination / "README.copy"
+    copy.write_bytes(readme.read_bytes())
+    copy.chmod(0o444)
+    os.replace(copy, readme)
+    artifacts = retained_artifacts(f)
+    reads = counted_reads(monkeypatch, f)
+    verify_known(f, artifacts)
+    assert reads == [f.artifacts.prefix + "/README.md"]
+    assert receipt(f)[kept.RECEIPT_FIELD] == named and kept_files(f) == [kept_path(f, named).name]
+
+
+@pytest.mark.parametrize("change", ["symlink", "hardlink", "chmod", "added", "removed"])
+def test_r16_structural_checks_refuse_before_any_fingerprint_skip(installed, monkeypatch, change):
+    f = installed
+    keep_with_fingerprints(f, monkeypatch)
+    readme = f.prefix / "README.md"
+    if change == "symlink":
+        readme.unlink()
+        readme.symlink_to("LICENSE-MIT")
+    elif change == "hardlink":
+        os.link(readme, f.destination / "outside-link")
+    elif change == "chmod":
+        readme.chmod(0o644)
+    elif change == "added":
+        (f.prefix / "added.txt").write_bytes(b"added\n")
+    else:
+        readme.unlink()
+    artifacts = retained_artifacts(f)
+    with pytest.raises(candidates.CandidateArtifactError,
+            match="file or mode changed|unexpected or unowned path|inventory changed"):
+        verify_known(f, artifacts)
+
+
+def test_r18_the_recording_walk_syncs_each_file_before_reading_it(installed, monkeypatch):
+    f = installed
+    events = []
+    original_fsync, original_read = os.fsync, adapter.read_owned
+    def fsync(descriptor):
+        events.append(("fsync", os.readlink(f"/proc/self/fd/{descriptor}")))
+        return original_fsync(descriptor)
+    def read_owned(path, *args, **kwargs):
+        events.append(("read", str(path)))
+        return original_read(path, *args, **kwargs)
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(adapter, "read_owned", read_owned)
+    adapter.verify_meta_toolkit_prefix(f.artifacts, deployment_root=f.destination)
+    assert not any(kind == "fsync" for kind, _ in events)
+    events.clear()
+    record = {}
+    adapter.verify_meta_toolkit_prefix(f.artifacts, deployment_root=f.destination, record=record)
+    for name in file_names(f):
+        path = str(f.destination / ".bin" / name)
+        assert events.index(("fsync", path)) < events.index(("read", path))
+    assert sorted(record) == file_names(f)
+
+
+@pytest.mark.parametrize("fstype, allowed", [("ext4", True), ("xfs", True), ("btrfs", True),
+    ("tmpfs", False), ("overlay", False), ("fuse.sshfs", False), ("nfs4", False)])
+def test_r19_only_allow_listed_local_disks_keep_or_use_fingerprints(tmp_path, monkeypatch, fstype, allowed):
+    device = os.stat(tmp_path).st_dev
+    mounts = ("22 1 0:5 / /proc rw,nosuid - proc proc rw\n"
+        f"36 25 {os.major(device)}:{os.minor(device)} / / rw,relatime shared:1 - {fstype} /dev/inert rw\n")
+    real_open = open
+    def fake_open(path, *args, **kwargs):
+        if path == "/proc/self/mountinfo":
+            return io.StringIO(mounts)
+        return real_open(path, *args, **kwargs)
+    monkeypatch.setattr(kept, "open", fake_open, raising=False)
+    assert kept.local_disk_filesystem(tmp_path) is allowed
+
+
+def test_r19_an_unknown_device_or_no_proc_disables_fingerprints(tmp_path, monkeypatch):
+    monkeypatch.setattr(kept, "open", lambda path, *args, **kwargs: io.StringIO(
+        "22 1 0:5 / /proc rw - proc proc rw\n"), raising=False)
+    assert kept.local_disk_filesystem(tmp_path) is False
+    def missing(path, *args, **kwargs):
+        raise FileNotFoundError(path)
+    monkeypatch.setattr(kept, "open", missing, raising=False)
+    assert kept.local_disk_filesystem(tmp_path) is False
+
+
+def test_r20_a_fingerprint_on_another_device_is_hashed_again(installed, monkeypatch):
+    f = installed
+    keep_with_fingerprints(f, monkeypatch)
+    artifacts = retained_artifacts(f)
+    known = {name: (fingerprint[0] + 1, *fingerprint[1:]) for name, fingerprint in artifacts._known_fingerprints}
+    reads = counted_reads(monkeypatch, f)
+    verify_known(f, artifacts, known)
+    assert sorted(reads) == file_names(f)
+
+
+@pytest.mark.parametrize("change", ["not-a-file", "short-row", "text-field"])
+def test_malformed_kept_fingerprints_refuse(installed, monkeypatch, change):
+    f = installed
+    named, _ = keep_with_fingerprints(f, monkeypatch)
+    document = json.loads(kept_path(f, named).read_bytes())
+    name = file_names(f)[0]
+    if change == "not-a-file":
+        document["fingerprints"][f.artifacts.prefix] = document["fingerprints"][name]
+    elif change == "short-row":
+        document["fingerprints"][name] = document["fingerprints"][name][:7]
+    else:
+        document["fingerprints"][name][0] = "device"
+    content = document_bytes(document)
+    forged = hashlib.sha256(content).hexdigest()
+    rewrite(kept_path(f, forged), content)
+    write_receipt(f.directory, {**receipt(f), kept.RECEIPT_FIELD: forged})
+    with pytest.raises(kept.RetainedInventoryError, match="is not a readable inventory"):
+        kept.load(f.directory, receipt(f))

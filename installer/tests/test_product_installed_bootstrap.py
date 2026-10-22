@@ -446,14 +446,44 @@ async def test_product_start_checks_the_prefix_against_the_kept_inventory_withou
 async def test_legacy_product_start_runs_the_full_check_once_and_then_keeps_the_inventory(
         installed_bootstrap, monkeypatch):
     f = installed_bootstrap
-    named = _forget_kept_inventory(f)
+    _forget_kept_inventory(f)
     inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
     assert outcome is None and inflated == [f.source.artifacts.prefix] and sources == ["archive"]
-    # The lazy mint reproduces the install's content-addressed inventory.
-    assert deployment.read_receipt(f.directory)[KEPT_FIELD] == named
-    assert _kept_files(f) == [f"native-prefix-receipt-{named}.json"]
+    # The lazy mint keeps the same verified entries the install kept.
+    kept = deployment.read_receipt(f.directory)[KEPT_FIELD]
+    assert _kept_files(f) == [f"native-prefix-receipt-{kept}.json"]
+    assert (json.loads((f.directory / f"native-prefix-receipt-{kept}.json").read_bytes())["inventory_sha256"]
+        == deployment.read_receipt(f.directory)["installed_candidate_runtime_proof"]["prefix_inventory_sha256"])
     inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
     assert outcome is None and inflated == [] and sources == ["retained"]
+
+
+async def test_product_start_with_kept_fingerprints_reads_no_unchanged_native_file(
+        installed_bootstrap, monkeypatch):
+    from launchkit import native_prefix_receipt as kept
+    from launchkit.templates import install_candidate as adapter
+    f = installed_bootstrap
+    _forget_kept_inventory(f)
+    # The fixture's install has just written every file, so all of them are
+    # racy; a later legacy Start keeps their fingerprints.
+    monkeypatch.setattr(kept, "RACY_NS", 0)
+    monkeypatch.setattr(kept, "local_disk_filesystem", lambda path: True)
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    assert outcome is None and sources == ["archive"]
+    named = deployment.read_receipt(f.directory)[KEPT_FIELD]
+    files = sorted(entry.name for entry in f.source.artifacts.entries if entry.kind == "file")
+    document = json.loads((f.directory / f"native-prefix-receipt-{named}.json").read_bytes())
+    assert sorted(document["fingerprints"]) == files
+    prefix = f.selected.destination / ".bin" / f.source.artifacts.prefix
+    reads = []
+    original = adapter.read_owned
+    def read_owned(path, *args, **kwargs):
+        if prefix in Path(path).parents:
+            reads.append(path)
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(adapter, "read_owned", read_owned)
+    inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
+    assert outcome is None and inflated == [] and sources == ["retained"] and reads == []
 
 
 async def test_failed_legacy_product_start_keeps_no_inventory(installed_bootstrap, monkeypatch):
@@ -476,7 +506,7 @@ async def test_changed_kept_inventory_refuses_the_product_start(installed_bootst
     named = deployment.read_receipt(f.directory)[KEPT_FIELD]
     path = f.directory / f"native-prefix-receipt-{named}.json"
     content = path.read_bytes()
-    path.write_bytes(content.replace(b'"schema":1', b'"schema":1 '))
+    path.write_bytes(content.rstrip(b"\n") + b" \n")
     inflated, sources, outcome = await _start_until_spawn(f, monkeypatch)
     assert outcome is not None and "differs from the copy receipt.json names" in str(outcome)
     assert str(path) in str(outcome) and "Remove that file" in str(outcome)
