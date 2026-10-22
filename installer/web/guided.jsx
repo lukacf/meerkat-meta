@@ -2223,7 +2223,7 @@ export function GuidedSetup({
   const file =
     validation?.files?.find((f) => f.path === selectedFile) ||
     validation?.files?.[0];
-  const startingContext = welcome ? startingContextDetails(inputStartingHelp(input)) : null;
+  const startingContext = welcome && !state?.organization ? startingContextDetails(inputStartingHelp(input)) : null;
   const startingChoicesOnly = !!startingContext && !draft.trim() && !attachments.refs.length;
   const submissionText = inputSubmissionText(input);
   const filesOnly = attachments.refs.length > 0 && !submissionText.trim() && !selected.length;

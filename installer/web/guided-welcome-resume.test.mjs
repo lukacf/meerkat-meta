@@ -376,8 +376,27 @@ test('organization with no examples keeps custom input and does not restore stoc
   await mounted('empty', async ({ document, list, finish }) => {
     await finish(list, response({ setups: [] }));
     assert.equal(document.querySelectorAll('.forge-organization-start .setup-starting-points > button').length, 0);
-    assert.doesNotMatch(document.body.textContent, /household|school dates|Run a club/);
+    assert.doesNotMatch(document.body.textContent, /household|school dates|Run a club|Choose one|An editable starting point/);
     await click(document.querySelector('.forge-organization-start__header > button'));
     assert.ok(document.activeElement === document.querySelector('#setup-message'));
   }, {}, { organization: { ...workplace, starting_examples: [] } });
+});
+
+
+test('organization opening drops saved stock context while preserving and sending the raw draft', async () => {
+  const draft = '  Discover projects I might care about.  ';
+  await mounted('empty', async ({ document, a, calls, values, list, finish }) => {
+    await finish(list, response({ setups: [] }));
+    assert.equal(document.querySelector('.forge-starting-context'), null);
+    assert.doesNotMatch(document.querySelector('#setup-message').placeholder, /For example:/);
+    assert.doesNotMatch(document.body.textContent, /For a team, help with repetitive work/);
+    assert.equal(document.querySelector('#setup-message').value, draft);
+    assert.equal(JSON.parse(values.get(inputKey(a))).starting_help, undefined);
+    await click(document.querySelector('#setup-send'));
+    const writes = calls.filter(call => call.method !== 'GET');
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].body.text, draft);
+  }, {}, { available: true, allowSend: true, organization: workplace,
+    startingInput: { draft, mode: 'answer', selected: [],
+      starting_help: { version: 2, audience_id: 'team', kind_id: 'repetitive' } } });
 });

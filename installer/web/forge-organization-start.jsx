@@ -22,7 +22,7 @@ export function ForgeOrganizationStart({ organization, draft = "", disabled = fa
   return <section className="forge-starting-help forge-organization-start" aria-labelledby={id}>
     <div className="forge-organization-start__header">
       <div><h2 id={id}>Start with your work</h2>
-        <p>{organization.description || `Ideas for ${organization.label}. Choose one and make it your own.`}</p></div>
+        <p>{organization.description || (examples.length ? `Ideas for ${organization.label}. Choose one and make it your own.` : `Describe what you would like help with at ${organization.label}.`)}</p></div>
       <button type="button" disabled={disabled} onClick={keepIdea}>Describe my own idea <span aria-hidden="true">&#8594;</span></button>
     </div>
     <div className="setup-starting-points">
@@ -46,6 +46,6 @@ export function ForgeOrganizationStart({ organization, draft = "", disabled = fa
         </div>
       </details>}
     </div>
-    <p className="forge-organization-start__hint">An editable starting point. Your guide will explore the details with you.</p>
+    {examples.length > 0 && <p className="forge-organization-start__hint">An editable starting point. Your guide will explore the details with you.</p>}
   </section>;
 }

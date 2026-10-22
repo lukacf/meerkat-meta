@@ -4,7 +4,15 @@ This installable, fictional Python plugin changes Forge's opening examples and
 the context available to its guide. It demonstrates the version 1 organization
 contribution without depending on private services.
 
-Install it into the **same Python environment that runs Forge**:
+Install it into the **same Python environment that runs Forge**. For an existing
+Forge installation using the normal launcher, from the folder containing `start.sh`:
+
+```sh
+.venv/bin/python -m pip install /path/to/meerkat-meta/installer/examples/workplace-starters
+META_FORGE_ORGANIZATION=workplace bash start.sh
+```
+
+For a source development environment where Forge is already installed:
 
 ```sh
 python -m pip install ./installer/examples/workplace-starters
@@ -17,7 +25,7 @@ may need to install the plugin into their packaged Python environment.
 
 The host selects one entry-point name from `meerkat_forge.organizations.v1`.
 Forge calls that installed function once at startup and validates its returned
-data. Missing, ambiguous or invalid explicit selections stop startup. They do
+data. Missing, ambiguous or invalid explicit selections, including an empty value, stop startup. They do
 not fall back to unrelated stock examples. No plugin is loaded by default.
 
 The fields are documented by `launchkit.organization.OrganizationPlugin`:
@@ -47,5 +55,5 @@ The selection is host-wide, not a tenant identity or authorization boundary.
 This contribution offers context and ideas, not deployment, account setup,
 installed integrations, permissions or a fixed agent design. Those remain
 separate operations owned by Forge, Connect and the native runtime. Integration
-hints do not claim that a connector is installed or available. This example
-does not qualify hosted OAuth, service writes or a live connected application.
+hints do not claim that a connector is installed or available. Hosted OAuth sign-in and service writes are not supported by this example; it
+connects no live application.

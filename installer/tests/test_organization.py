@@ -1,5 +1,9 @@
 import copy
 import importlib.util
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -135,3 +139,39 @@ def test_selected_examples_reach_actual_guide_turn_and_survive_next_read(guide_c
     assert updated['organization'] == state['organization']
     service.organization = organization_snapshot(example() | {'version': '2.0', 'starting_examples': []})
     assert client.get(f"/api/guide/{state['id']}").json()['organization'] == state['organization']
+
+
+def test_real_server_loads_selected_plugin_and_refuses_a_missing_one(tmp_path):
+    (tmp_path / "server_starters.py").write_text(
+        "def contribution():\n    return " + repr(example()) + "\n"
+    )
+    metadata = tmp_path / "server_starters-1.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text("Name: server-starters\nVersion: 1.0\n")
+    (metadata / "entry_points.txt").write_text(
+        "[meerkat_forge.organizations.v1]\nserver-test = server_starters:contribution\n"
+    )
+    source = str(Path(__file__).resolve().parents[1])
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path),
+           "PYTHONPATH": os.pathsep.join((str(tmp_path), source)),
+           "PYTHONDONTWRITEBYTECODE": "1", "META_FORGE_HOME": str(tmp_path / "state"),
+           "META_FORGE_ORGANIZATION": "server-test"}
+    code = """
+import json
+from fastapi.testclient import TestClient
+from launchkit.server import app
+client = TestClient(app)
+response = client.get('/api/guide/new')
+assert response.status_code == 200
+print(json.dumps(response.json()['organization']))
+"""
+    result = subprocess.run([sys.executable, "-c", code], env=env, cwd=tmp_path,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == organization_snapshot(example())
+    env["META_FORGE_ORGANIZATION"] = "missing-server-plugin"
+    refused = subprocess.run([sys.executable, "-c", code], env=env, cwd=tmp_path,
+                             capture_output=True, text=True, timeout=30)
+    assert refused.returncode != 0
+    assert "must be installed exactly once" in refused.stderr
+    assert "missing-server-plugin" not in refused.stderr
