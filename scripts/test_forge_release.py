@@ -261,6 +261,21 @@ def read_outputs(path):
     return dict(line.split("=", 1) for line in path.read_text().splitlines())
 
 
+@contextlib.contextmanager
+def settling_clock():
+    """Re-reads without waiting: the re-read sleep only advances a fake clock.
+    Yields the sleeps and the captured stderr, where each miss logs a line."""
+    sleeps, now = [], [0.0]
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    with mock.patch.object(forge.time, "sleep", sleep), mock.patch.object(forge.time, "monotonic", lambda: now[0]), \
+            contextlib.redirect_stderr(io.StringIO()) as log:
+        yield sleeps, log
+
+
 class WorkflowShapeTests(unittest.TestCase):
     def test_only_a_dispatch_starts_it_with_exactly_three_inputs(self):
         source = text()
@@ -436,6 +451,24 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertIn("      - run: python3 scripts/test_forge_release.py\n", (ROOT / ".github/workflows/ci.yml").read_text())
         self.assertNotIn("forge", (ROOT / ".github/workflows/release.yml").read_text().lower())
         self.assertNotIn("forge", (ROOT / "scripts/release-candidate.py").read_text().lower())
+
+    def test_the_ci_gate_and_collection_start_after_every_package_leg(self):
+        """GUARD: a job that needs the build_package matrix starts only after
+        every leg finished, and sees success only when every leg succeeded.
+        collect re-reads the artifact listing while a package name is missing,
+        which is a listing that has not caught up only if no leg still runs."""
+        self.assertIn("      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}\n", job_block("build_package"))
+        self.assertIn("build_package", job_needs("require_ci_green"))
+        self.assertIn("needs.build_package.result == 'success'", job_condition("require_ci_green"))
+        self.assertTrue({"build_package", "require_ci_green"} <= set(job_needs("collect")))
+        self.assertIn("needs.build_package.result == 'success'", job_condition("collect"))
+        self.assertIn("needs.require_ci_green.result == 'success'", job_condition("collect"))
+        for publishable in ("true", "false"):
+            for result in ("failure", "cancelled", "skipped"):
+                current = context(publishable=publishable, build_package=result)
+                for job in ("require_ci_green", "collect"):
+                    self.assertFalse(release_tests.evaluate_condition(job_condition(job), **current),
+                                     (job, publishable, result))
 
 
 class WorkflowGraphTests(unittest.TestCase):
@@ -905,6 +938,9 @@ class FakeGitHub:
         self.runs, self.jobs, self.artifacts, self.downloads = [], {}, {}, {}
         self.listings = []
         self.extra = {}
+        # Run ID -> how many more forge.yml listings omit it, as GitHub's can.
+        self.hidden = {}
+        self.calls = []
 
     def tree(self, node):
         entries = []
@@ -951,6 +987,7 @@ class FakeGitHub:
         prefix = f"repos/{REPO}/"
         assert endpoint.startswith(prefix), endpoint
         path = endpoint[len(prefix):]
+        self.calls.append(path)
         if path in self.extra:
             return copy.deepcopy(self.extra[path])
         if match := re.fullmatch(r"git/commits/([0-9a-f]{40})", path):
@@ -961,7 +998,9 @@ class FakeGitHub:
             return {"encoding": "base64", "content": base64.b64encode(self.blobs[match.group(1)].encode()).decode()}
         if path.startswith("actions/workflows/forge.yml/runs?"):
             self.listings.append(path)
-            return {"workflow_runs": copy.deepcopy(self.runs)}
+            listed = [run for run in self.runs if not self.hidden.get(run["id"])]
+            self.hidden = {run_id: count - 1 for run_id, count in self.hidden.items() if count > 1}
+            return {"workflow_runs": copy.deepcopy(listed)}
         if match := re.fullmatch(r"actions/runs/(\d+)/attempts/(\d+)/jobs\?per_page=100", path):
             return {"jobs": copy.deepcopy(self.jobs[(int(match.group(1)), int(match.group(2)))])}
         if match := re.fullmatch(r"actions/runs/(\d+)/artifacts\?per_page=100", path):
@@ -991,7 +1030,7 @@ class EvidenceTests(unittest.TestCase):
         return github
 
     def evidence(self, github):
-        with fixture_directory() as directory, github.installed():
+        with fixture_directory() as directory, github.installed(), settling_clock():
             return forge.forge_ci_evidence(SHA, directory)
 
     def test_a_run_of_identical_forge_inputs_is_reused(self):
@@ -1103,19 +1142,26 @@ def package_members(target="linux-x86_64", data=b"package bytes"):
 
 
 class CollectTests(unittest.TestCase):
-    def collect(self, directory, head, *, ref=forge.MAIN, ci=True, members=None, artifacts=None):
+    def collect(self, directory, head, *, ref=forge.MAIN, ci=True, members=None, artifacts=None, statuses=(),
+                unlisted=0, reads=None):
+        """statuses: what the candidate run reports before in_progress;
+        unlisted: how many artifact listings come back empty first."""
         packages = {11: members or package_members()}
         run = {"id": RUN, "run_attempt": ATTEMPT, "head_sha": head, "head_branch": ref.removeprefix("refs/heads/"),
                "event": "workflow_dispatch", "path": forge.WORKFLOW, "status": "in_progress",
                "repository": {"full_name": REPO, "id": 1}, "head_repository": {"full_name": REPO, "id": 1}}
         listed = artifacts if artifacts is not None else [
             {"id": 11, "name": forge.package_artifact_name("linux-x86_64", ATTEMPT), "digest": "sha256:" + "e" * 64}]
-        provenance, runs = [], []
+        provenance, runs, statuses = [], [], list(statuses)
+        reads = [] if reads is None else reads
 
         def api(endpoint, *, pages=False):
+            reads.append(endpoint.removeprefix(f"repos/{REPO}/"))
             if endpoint.endswith(f"actions/runs/{RUN}"):
-                return dict(run)
+                return {**run, "status": statuses.pop(0) if statuses else "in_progress"}
             if endpoint.endswith(f"actions/runs/{RUN}/artifacts?per_page=100"):
+                if reads.count(reads[-1]) <= unlisted:
+                    return [{"artifacts": []}]
                 return [{"artifacts": listed}]
             raise AssertionError(endpoint)
 
@@ -1131,7 +1177,7 @@ class CollectTests(unittest.TestCase):
                 mock.patch.object(forge.rc, "verify_provenance", lambda *a, **k: provenance.append((a, k))), \
                 mock.patch.object(forge.rc, "verify_run", lambda *a, **k: runs.append((a, k))), \
                 mock.patch.object(forge, "forge_ci_evidence", lambda sha, work: evidence_record(sha)), \
-                contextlib.redirect_stdout(io.StringIO()):
+                contextlib.redirect_stdout(io.StringIO()), settling_clock():
             forge.collect(forge.parse_args(["collect", "--output-dir", str(directory / "candidate")]))
         return json.loads((directory / "candidate" / forge.MANIFEST).read_text()), provenance, runs
 
@@ -1174,6 +1220,295 @@ class CollectTests(unittest.TestCase):
                 head = git_fixture(directory)
                 with self.assertRaisesRegex(forge.ProtocolError, message):
                     self.collect(directory, head, **options)
+
+    def test_collect_re_reads_its_run_until_it_reports_in_progress(self):
+        """GitHub reported the running candidate as queued for a while."""
+        with fixture_directory() as directory:
+            head = git_fixture(directory)
+            reads = []
+            manifest, _, _ = self.collect(directory, head, statuses=("queued", "waiting"), reads=reads)
+            self.assertEqual(manifest["run_id"], RUN)
+            self.assertEqual(reads, [f"actions/runs/{RUN}"] * 3 + [f"actions/runs/{RUN}/artifacts?per_page=100"])
+
+    def test_collect_re_reads_the_artifact_listing_until_it_names_every_package(self):
+        """GitHub listed none of the finished build's artifacts for a while."""
+        with fixture_directory() as directory:
+            head = git_fixture(directory)
+            reads = []
+            manifest, _, _ = self.collect(directory, head, unlisted=2, reads=reads)
+            self.assertEqual(manifest["packages"][0]["artifact"]["id"], 11)
+            self.assertEqual(reads, [f"actions/runs/{RUN}"] + [f"actions/runs/{RUN}/artifacts?per_page=100"] * 3)
+
+
+THIRD = "c" * 40
+CI_LISTING = f"actions/workflows/ci.yml/runs?branch=main&event=push&head_sha={SHA}&per_page=100"
+
+
+def ci_run(run_id=CI_RUN, status="completed", conclusion="success", **changes):
+    return {"id": run_id, "run_attempt": 1, "head_sha": SHA, "head_branch": "main", "event": "push",
+            "status": status, "conclusion": conclusion, **changes}
+
+
+def candidate_run(status="in_progress", **changes):
+    return {"id": RUN, "run_attempt": ATTEMPT, "head_sha": SHA, "head_branch": "main", "event": "workflow_dispatch",
+            "path": forge.WORKFLOW, "status": status, "repository": {"full_name": REPO, "id": 1},
+            "head_repository": {"full_name": REPO, "id": 1}, **changes}
+
+
+def package_artifact(target="linux-x86_64", artifact_id=11):
+    return {"id": artifact_id, "name": forge.package_artifact_name(target, ATTEMPT), "digest": "sha256:" + "e" * 64}
+
+
+class RereadTests(unittest.TestCase):
+    """GitHub's run and artifact listings are eventually consistent. A
+    candidate read that misses is re-read REREAD_DELAY seconds later, for at
+    most REREAD_ATTEMPTS reads, each miss logged; the last refuses with the
+    text a single read refused with. A refusal no read can change is
+    immediate."""
+
+    def outcome(self, call, *responses, **env):
+        """call() against an rc.api that answers each read with the next
+        response, the last one repeating, and raises an exception response."""
+        reads = []
+
+        def api(endpoint, *, pages=False):
+            reads.append(endpoint.removeprefix(f"repos/{REPO}/"))
+            response = responses[min(len(reads), len(responses)) - 1]
+            if isinstance(response, Exception):
+                raise response
+            return copy.deepcopy(response)
+
+        with environment(**env), mock.patch.object(forge.rc, "api", api), settling_clock() as (sleeps, log):
+            try:
+                result = call()
+            except forge.ProtocolError as error:
+                result = error
+        return result, reads, sleeps, log.getvalue().splitlines()
+
+    def test_the_budget_is_forty_reads_fifteen_seconds_apart(self):
+        self.assertEqual((forge.REREAD_ATTEMPTS, forge.REREAD_DELAY), (40, 15))
+
+    def test_a_miss_is_re_read_and_logged_until_a_read_settles(self):
+        read = mock.Mock(side_effect=[*(forge.Miss(f"not listed yet ({n})", "never listed") for n in (1, 2, 3)),
+                                      "settled"])
+        with settling_clock() as (sleeps, log):
+            self.assertEqual(forge.reread("label", "repos/o/r/path?x=1", read), "settled")
+        self.assertEqual((read.call_count, sleeps), (4, [15, 15, 15]))
+        self.assertEqual(log.getvalue().splitlines(), [
+            f"label: repos/o/r/path?x=1: read {n}/40 missed at {15 * (n - 1)} s: not listed yet ({n})"
+            for n in (1, 2, 3)])
+
+    def test_a_read_that_never_settles_refuses_after_forty_reads(self):
+        read = mock.Mock(side_effect=forge.Miss("not listed", "never listed"))
+        with settling_clock() as (sleeps, log), \
+                self.assertRaisesRegex(forge.ProtocolError, r"^never listed \(after 40 reads over 585 s\)$"):
+            forge.reread("label", "path", read)
+        lines = log.getvalue().splitlines()
+        self.assertEqual((read.call_count, sleeps, len(lines)), (40, [15] * 39, 40))
+        self.assertEqual(lines[-1], "label: path: read 40/40 missed at 585 s: not listed")
+
+    def test_any_other_refusal_is_never_re_read(self):
+        for text in ("run identity/attempt changed", "gh api failed: gh: Not Found (HTTP 404)",
+                     "gh api failed: gh: Resource not accessible by integration (HTTP 403)"):
+            read = mock.Mock(side_effect=forge.ProtocolError(text))
+            with self.subTest(text), settling_clock() as (sleeps, log), \
+                    self.assertRaisesRegex(forge.ProtocolError, f"^{re.escape(text)}$"):
+                forge.reread("label", "path", read)
+            self.assertEqual((read.call_count, sleeps, log.getvalue()), (1, [], ""))
+
+    def test_a_transient_api_failure_is_a_miss(self):
+        failures = ("gh api failed: gh: HTTP 502", "gh api failed: gh: Server Error (HTTP 500)",
+                    "gh api failed: error connecting to api.github.com\n"
+                    "check your internet connection or https://githubstatus.com",
+                    'gh api failed: Get "https://api.github.com/x": read tcp 10.0.0.1:443: connection reset by peer',
+                    'gh api failed: Get "https://api.github.com/x": net/http: TLS handshake timeout',
+                    'gh api failed: Get "https://api.github.com/x": unexpected EOF')
+        read = mock.Mock(side_effect=[*map(forge.ProtocolError, failures), "settled"])
+        with settling_clock() as (sleeps, log):
+            self.assertEqual(forge.reread("label", "path", read), "settled")
+        lines = log.getvalue().splitlines()
+        self.assertEqual((read.call_count, sleeps, len(lines)), (7, [15] * 6, 6))
+        self.assertEqual(lines[2], "label: path: read 3/40 missed at 30 s: transient API failure: gh api failed: "
+                                   "error connecting to api.github.com check your internet connection or "
+                                   "https://githubstatus.com")
+        with settling_clock(), self.assertRaisesRegex(
+                forge.ProtocolError, r"^gh api failed: gh: HTTP 503 \(after 40 reads over 585 s\)$"):
+            forge.reread("label", "path", mock.Mock(side_effect=forge.ProtocolError("gh api failed: gh: HTTP 503")))
+
+    def test_the_classification_matches_the_failure_text_of_rc_api(self):
+        results = [subprocess.CompletedProcess(["gh"], 1, b"", b"gh: HTTP 502\n"),
+                   subprocess.CompletedProcess(["gh"], 0, b'{"ok": true}', b"")]
+        with mock.patch.object(forge.rc.subprocess, "run", side_effect=results) as run, \
+                settling_clock() as (sleeps, log):
+            self.assertEqual(forge.reread("label", "path", lambda: forge.rc.api("repos/o/r/x")), {"ok": True})
+        self.assertEqual((run.call_count, sleeps), (2, [15]))
+        self.assertIn("missed at 0 s: transient API failure: gh api failed: gh: HTTP 502", log.getvalue())
+
+    def ci_green(self, *listings):
+        """ci-green against one ci.yml listing per read, the last repeating."""
+        verified = []
+        with fixture_directory() as directory, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(forge.rc, "verify_run", lambda *a, **k: verified.append((a, k))):
+            result, reads, sleeps, log = self.outcome(
+                forge.ci_green, *({"workflow_runs": item} if isinstance(item, list) else item for item in listings),
+                RELEASE_SHA=SHA, GITHUB_OUTPUT=str(directory / "outputs"), GH_TOKEN="ghs_never_logged")
+            if not isinstance(result, Exception):
+                result = read_outputs(directory / "outputs")
+        self.assertEqual(set(reads), {CI_LISTING})
+        self.assertNotIn("ghs_never_logged", "\n".join(log))
+        return result, len(reads), sleeps, log, verified
+
+    def test_ci_green_re_reads_until_the_exact_main_run_is_listed(self):
+        result, reads, sleeps, log, verified = self.ci_green([], [ci_run(head_branch="feature")], [ci_run()])
+        self.assertEqual((result, reads, sleeps), ({"run_id": str(CI_RUN), "run_attempt": "1"}, 3, [15, 15]))
+        self.assertEqual(verified, [((CI_RUN, 1, SHA), {"ci": True})])
+        self.assertEqual(log, [f"exact-main CI: repos/{REPO}/{CI_LISTING}: read {n}/40 missed at {15 * (n - 1)} s: "
+                               "no exact-main ci.yml run listed" for n in (1, 2)])
+
+    def test_ci_green_re_reads_while_no_listed_run_is_green_yet(self):
+        red = ci_run(CI_RUN - 1, conclusion="failure")
+        result, reads, sleeps, log, verified = self.ci_green(
+            [ci_run(status="queued", conclusion=None)], [ci_run(status="in_progress", conclusion=None), red],
+            [ci_run(), red])
+        self.assertEqual((result, reads, sleeps), ({"run_id": str(CI_RUN), "run_attempt": "1"}, 3, [15, 15]))
+        self.assertTrue(log[0].endswith(f"missed at 0 s: no listed exact-main run is green yet: {CI_RUN}/queued/None"))
+        self.assertTrue(log[1].endswith(f": {CI_RUN}/in_progress/None, {CI_RUN - 1}/completed/failure"))
+        self.assertEqual(verified, [((CI_RUN, 1, SHA), {"ci": True})])
+
+    def test_ci_green_refuses_at_once_when_every_listed_run_finished_without_success(self):
+        result, reads, sleeps, log, verified = self.ci_green(
+            [ci_run(conclusion="failure"), ci_run(CI_RUN + 1, conclusion="cancelled")], [ci_run()])
+        self.assertEqual(str(result), f"exact-main CI for {SHA} is not green: "
+                                      f"{CI_RUN}/completed/failure, {CI_RUN + 1}/completed/cancelled")
+        self.assertEqual((reads, sleeps, log, verified), (1, [], [], []))
+
+    def test_ci_green_refuses_after_the_budget_with_the_text_of_one_read(self):
+        for listing, refusal in (
+                ([], f"no exact-main CI run exists for {SHA}; push it to main and let ci.yml finish"),
+                ([ci_run(status="in_progress", conclusion=None)],
+                 f"exact-main CI for {SHA} is not green: {CI_RUN}/in_progress/None")):
+            with self.subTest(refusal):
+                result, reads, sleeps, log, verified = self.ci_green(listing)
+                self.assertEqual(str(result), f"{refusal} (after 40 reads over 585 s)")
+                self.assertEqual((reads, sleeps, len(log), verified), (40, [15] * 39, 40, []))
+
+    def test_ci_green_reads_through_a_transient_failure_but_not_a_refusal(self):
+        result, reads, sleeps, _, _ = self.ci_green(forge.ProtocolError("gh api failed: gh: HTTP 502"), [ci_run()])
+        self.assertEqual((result, reads, sleeps), ({"run_id": str(CI_RUN), "run_attempt": "1"}, 2, [15]))
+        result, reads, sleeps, log, _ = self.ci_green(
+            forge.ProtocolError("gh api failed: gh: Not Found (HTTP 404)"), [ci_run()])
+        self.assertEqual((str(result), reads, sleeps, log), ("gh api failed: gh: Not Found (HTTP 404)", 1, [], []))
+
+    def current_run(self, *values):
+        return self.outcome(lambda: forge.current_run(RUN, ATTEMPT, SHA, forge.MAIN), *values)
+
+    def test_the_candidate_run_is_re_read_until_it_reports_in_progress(self):
+        result, reads, sleeps, log = self.current_run(candidate_run("queued"), candidate_run("pending"),
+                                                      candidate_run())
+        self.assertEqual((result, reads, sleeps), (candidate_run(), [f"actions/runs/{RUN}"] * 3, [15, 15]))
+        self.assertEqual(log, [f"candidate run: repos/{REPO}/actions/runs/{RUN}: read 1/40 missed at 0 s: "
+                               "status=queued",
+                               f"candidate run: repos/{REPO}/actions/runs/{RUN}: read 2/40 missed at 15 s: "
+                               "status=pending"])
+
+    def test_a_candidate_run_never_in_progress_refuses_after_the_budget(self):
+        result, reads, sleeps, log = self.current_run(candidate_run("queued"))
+        self.assertEqual(str(result), "collection requires its in-progress candidate run (after 40 reads over 585 s)")
+        self.assertEqual((len(reads), sleeps, len(log)), (40, [15] * 39, 40))
+
+    def test_a_mismatched_candidate_run_refuses_at_once(self):
+        """Even while it is not yet reported in progress."""
+        cases = (({"run_attempt": 2}, "run identity/attempt changed"),
+                 ({"head_repository": {"full_name": "someone/meerkat-meta", "id": 2}}, "run repository mismatch"),
+                 ({"head_sha": OTHER}, "run source/workflow/event/ref mismatch"),
+                 ({"head_branch": "feature"}, "run source/workflow/event/ref mismatch"),
+                 ({"path": ".github/workflows/release.yml"}, "run source/workflow/event/ref mismatch"))
+        for change, message in cases:
+            with self.subTest(change):
+                result, reads, sleeps, log = self.current_run(candidate_run("queued", **change), candidate_run())
+                self.assertEqual((str(result), len(reads), sleeps, log), (message, 1, [], []))
+
+    def evidence(self, github):
+        with fixture_directory() as directory, github.installed(), settling_clock() as (sleeps, log):
+            try:
+                result = forge.forge_ci_evidence(SHA, directory)
+            except forge.ProtocolError as error:
+                result = error
+        return result, sleeps, log.getvalue().splitlines()
+
+    def evidence_github(self):
+        """The matching Forge run, and an older one of other Forge inputs."""
+        github = FakeGitHub()
+        github.commit(SHA, BASE_TREE)
+        github.commit(OTHER, BASE_TREE)
+        github.commit(THIRD, {**BASE_TREE, "console/src/app.ts": "older console"})
+        github.forge_run(FORGE_RUN, OTHER)
+        github.forge_run(FORGE_RUN - 1, THIRD)
+        return github
+
+    def test_forge_evidence_re_lists_until_the_matching_run_is_listed(self):
+        github = self.evidence_github()
+        github.hidden = {FORGE_RUN: 3}
+        result, sleeps, log = self.evidence(github)
+        self.assertEqual((result["run_id"], result["head_sha"]), (FORGE_RUN, OTHER))
+        self.assertEqual((len(github.listings), sleeps, len(log)), (4, [15, 15, 15], 3))
+        self.assertTrue(log[0].startswith(
+            f"Forge evidence: repos/{REPO}/{github.listings[0]}: read 1/40 missed at 0 s"))
+        self.assertTrue(all(line.endswith(": none of 1 listed green dispatched run(s) tested these Forge inputs")
+                            for line in log))
+        # One object cache spans the listings: no git object is read twice.
+        objects = [call for call in github.calls if call.startswith("git/")]
+        self.assertEqual(len(objects), len(set(objects)))
+        self.assertEqual(objects.count(f"git/commits/{THIRD}"), 1)
+
+    def test_forge_evidence_never_listed_refuses_after_the_budget_with_the_text_of_one_read(self):
+        github = self.evidence_github()
+        github.hidden = {FORGE_RUN: 1000}
+        result, sleeps, log = self.evidence(github)
+        self.assertEqual(str(result), "no green dispatched Forge run (backend and frontend) tested the Forge inputs at "
+                                      f"{SHA}; the newest green run {FORGE_RUN - 1} differs in trees:console. "
+                                      "Dispatch forge.yml for this commit, then rerun the candidate "
+                                      "(after 40 reads over 585 s)")
+        self.assertEqual((len(github.listings), sleeps, len(log)), (40, [15] * 39, 40))
+
+    def test_a_run_evaluated_on_every_listing_downloads_into_a_folder_per_listing(self):
+        github = FakeGitHub()
+        github.commit(SHA, BASE_TREE)
+        github.commit(OTHER, BASE_TREE)
+        github.forge_run(FORGE_RUN, OTHER, toolchain={"backend": {"python": "Python 3.13.1", "node": "v22.21.1"},
+                                                      "frontend": {"python": "Python 3.12.3", "node": "v22.21.1"}})
+        github.forge_run(FORGE_RUN + 1, SHA)
+        github.hidden = {FORGE_RUN + 1: 2}
+        result, sleeps, _ = self.evidence(github)
+        self.assertEqual((result["run_id"], result["head_sha"], sleeps), (FORGE_RUN + 1, SHA, [15, 15]))
+
+    def artifacts(self, *listings, names=None):
+        names = names or [forge.package_artifact_name(target, ATTEMPT) for target in forge.TARGETS]
+        return self.outcome(lambda: forge.candidate_artifacts(RUN, names),
+                            *([{"artifacts": listing}] for listing in listings))
+
+    def test_the_artifact_listing_is_re_read_until_every_package_is_listed(self):
+        linux, macos = package_artifact("linux-x86_64", 11), package_artifact("macos-arm64", 12)
+        result, reads, sleeps, log = self.artifacts([], [linux], [linux, macos])
+        self.assertEqual((result, sleeps), ({linux["name"]: linux, macos["name"]: macos}, [15, 15]))
+        self.assertEqual(reads, [f"actions/runs/{RUN}/artifacts?per_page=100"] * 3)
+        self.assertEqual(log, [
+            f"candidate artifacts: repos/{REPO}/actions/runs/{RUN}/artifacts?per_page=100: read 1/40 missed at 0 s: "
+            f"{linux['name']}, {macos['name']} not listed",
+            f"candidate artifacts: repos/{REPO}/actions/runs/{RUN}/artifacts?per_page=100: read 2/40 missed at 15 s: "
+            f"{macos['name']} not listed"])
+
+    def test_a_package_never_listed_refuses_after_the_budget_with_the_text_of_one_read(self):
+        result, reads, sleeps, log = self.artifacts([package_artifact("macos-arm64", 12)])
+        self.assertEqual(str(result),
+                         "missing package artifact forge-package-linux-x86_64-1 (after 40 reads over 585 s)")
+        self.assertEqual((len(reads), sleeps, len(log)), (40, [15] * 39, 40))
+
+    def test_duplicate_artifact_names_refuse_at_once(self):
+        result, reads, sleeps, log = self.artifacts([package_artifact(), package_artifact()], [package_artifact()],
+                                                    names=[package_artifact()["name"]])
+        self.assertEqual((str(result), len(reads), sleeps, log),
+                         ("duplicate artifact names in the candidate run", 1, [], []))
 
 
 class PublishTests(unittest.TestCase):
