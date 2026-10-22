@@ -212,6 +212,28 @@ pub enum AnnouncementStoreError {
     },
     /// A deletion on a source whose provider has no observable deletions.
     DeletionsUnobservable,
+    /// The source's audience (a forward topic's forward audience) does not
+    /// let the member receive the topic.
+    AudienceNotCovered {
+        source_id: SourceId,
+        topic: Topic,
+    },
+    /// No direct route of the source names the topic, and the member is not
+    /// the triage member that takes it.
+    NoDirectRoute {
+        source_id: SourceId,
+        topic: Topic,
+    },
+    /// The member would be reachable both directly and through a forward of
+    /// the same source.
+    RouteOverlap {
+        source_id: SourceId,
+        member: Member,
+    },
+    /// The member owns a live conversation on the source's scope.
+    ConversationMember {
+        source_id: SourceId,
+    },
 }
 
 impl AnnouncementStoreError {
@@ -359,6 +381,25 @@ impl fmt::Display for AnnouncementStoreError {
             Self::DeletionsUnobservable => {
                 f.write_str("the source declares no observable deletions, so it carries none")
             }
+            Self::AudienceNotCovered { source_id, topic } => write!(
+                f,
+                "the audience of source {source_id} does not let this member receive topic \
+                 {topic}"
+            ),
+            Self::NoDirectRoute { source_id, topic } => write!(
+                f,
+                "no direct route of source {source_id} names topic {topic}; only its triage \
+                 member takes it"
+            ),
+            Self::RouteOverlap { source_id, member } => write!(
+                f,
+                "member {member} would be reachable both directly and through a forward of \
+                 source {source_id}"
+            ),
+            Self::ConversationMember { source_id } => write!(
+                f,
+                "the member owns a live conversation on the scope of source {source_id}"
+            ),
         }
     }
 }

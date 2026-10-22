@@ -2464,6 +2464,21 @@ impl ScriptedNative {
 
 #[async_trait]
 impl NativeDelivery for ScriptedNative {
+    async fn member_facts(
+        &self,
+        member: &Member,
+    ) -> std::result::Result<Option<super::sources::MemberFacts>, NativeUnavailable> {
+        if member.mob_id != mob(OWN_MOB) {
+            return Ok(None);
+        }
+        Ok(self
+            .roster_facts
+            .lock()
+            .unwrap()
+            .get(member.identity.as_str())
+            .map(|(role, labels)| super::sources::MemberFacts::new(role.as_str(), labels.clone())))
+    }
+
     fn governs_work_authority(&self) -> std::result::Result<bool, NativeUnavailable> {
         Ok(self.governed)
     }
@@ -11519,7 +11534,17 @@ async fn a_new_subscription_on_a_busy_source_gets_no_history_and_an_explicit_fro
  {
     let harness = harness_with(native_serving_a_and_b());
     let service = &harness.service;
-    live_inbox(service).await;
+    // The audience covers both members: what they get is the frontier's and
+    // the replay's to decide.
+    let covering_both = with(
+        source_params("put-inbox", "inbox", "subject-1", &["mail.received"]),
+        "audience",
+        serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]),
+    );
+    try_host_call(service, SOURCES_PUT, covering_both)
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
     let advanced = try_host_call(
         service,
         SOURCES_ADVANCE,
@@ -12018,7 +12043,17 @@ async fn a_conflicting_item_is_recorded_with_both_digests_and_the_cursor_still_a
 async fn a_redeclared_source_replays_retained_versions_and_redelivers_no_held_item() {
     let harness = harness_with(native_serving_a_and_b());
     let service = &harness.service;
-    live_inbox(service).await;
+    // The audience covers both members: what they get is the frontier's and
+    // the replay's to decide.
+    let covering_both = with(
+        source_params("put-inbox", "inbox", "subject-1", &["mail.received"]),
+        "audience",
+        serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]),
+    );
+    try_host_call(service, SOURCES_PUT, covering_both.clone())
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
     let first = try_host_call(
         service,
         SOURCES_ADVANCE,
@@ -12040,7 +12075,7 @@ async fn a_redeclared_source_replays_retained_versions_and_redelivers_no_held_it
     let declared = try_host_call(
         service,
         SOURCES_PUT,
-        source_params("again", "inbox", "subject-1", &["mail.received"]),
+        with(covering_both, "operation_id", serde_json::json!("again")),
     )
     .await
     .unwrap();

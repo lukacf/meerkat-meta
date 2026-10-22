@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 use super::owner::{AnnouncementError, AnnouncementService};
 use super::sources::{
-    AdvanceSource, AnnouncementSource, AudienceGrant, Coverage, ObservationCapability, Observed,
-    Principal, PutSource, Rebaseline, RecordSourceFailure, SourceChange, SourceConfig,
+    AdvanceSource, AnnouncementSource, AudienceGrant, AuditQuery, Coverage, ObservationCapability,
+    Observed, Principal, PutSource, Rebaseline, RecordSourceFailure, SourceChange, SourceConfig,
     SourceConnection, SourceDelivery, SourceFailure, SourceHealthPolicy, SourceIdentity,
     SourceItem, SourcePage, SourceQuery, SourceRoute, SourceRunner, SourceStart, SourceState,
     StreamOnboarding,
@@ -60,6 +60,7 @@ pub const ANNOUNCEMENT_METHODS: &[&str] = &[
     "meta/mob_announcements/sources/list",
     "meta/mob_announcements/sources/advance",
     "meta/mob_announcements/sources/record_failure",
+    "meta/mob_announcements/audit/list",
 ];
 
 pub fn is_announcement_method(method: &str) -> bool {
@@ -372,6 +373,30 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
                 message,
                 Value::Null,
             ),
+            AnnouncementStoreError::AudienceNotCovered { source_id, topic } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "audience_not_covered",
+                message,
+                json!({ "source_id": source_id, "topic": topic }),
+            ),
+            AnnouncementStoreError::NoDirectRoute { source_id, topic } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "no_direct_route",
+                message,
+                json!({ "source_id": source_id, "topic": topic }),
+            ),
+            AnnouncementStoreError::RouteOverlap { source_id, member } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "route_overlap",
+                message,
+                json!({ "source_id": source_id, "member": member }),
+            ),
+            AnnouncementStoreError::ConversationMember { source_id } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "route_conflict",
+                message,
+                json!({ "conflict": "conversation", "source_id": source_id }),
+            ),
             AnnouncementStoreError::IllegalTransition { .. } => JsonRpcError::new(-32000, message),
             AnnouncementStoreError::TooLarge(_) | AnnouncementStoreError::Invalid(_) => {
                 invalid_params(message)
@@ -569,6 +594,25 @@ struct AdvanceSourceParams {
     observed: Option<Observed>,
     #[serde(default)]
     collected_at_ms: Option<u64>,
+}
+
+/// `meta/mob_announcements/audit/list`: refused subscriptions and withheld
+/// captures of one mob's sources, by source, by member, or both.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditListParams {
+    /// The mob whose sources' audit is read: this gateway's own when absent.
+    #[serde(default)]
+    mob_id: Option<MobId>,
+    #[serde(default)]
+    source_id: Option<SourceId>,
+    #[serde(default)]
+    member: Option<Member>,
+    /// Start after this audit row id.
+    #[serde(default)]
+    after: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// `meta/mob_announcements/sources/record_failure`.
@@ -885,6 +929,20 @@ pub async fn handle_announcement_method(
                 .await
                 .map_err(rpc_error)?;
             to_value(advance)
+        }
+        "meta/mob_announcements/audit/list" => {
+            let request: AuditListParams = params(raw)?;
+            let rows = service
+                .audit(&AuditQuery {
+                    mob_id: Some(request.mob_id.unwrap_or_else(|| own_mob.clone())),
+                    source_id: request.source_id,
+                    member: request.member,
+                    after: request.after,
+                    limit: request.limit.unwrap_or(DEFAULT_LIMIT),
+                })
+                .await
+                .map_err(rpc_error)?;
+            Ok(json!({ "audit": to_value(rows)? }))
         }
         "meta/mob_announcements/sources/record_failure" => {
             let request: RecordFailureParams = params(raw)?;

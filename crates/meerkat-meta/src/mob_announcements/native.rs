@@ -20,6 +20,7 @@ use super::availability::{
     BlockCause, EvidenceClass, MemberDeparture, NotServedHereCause, SuspendCause,
 };
 use super::remote::RemoteMemberDelivery;
+use super::sources::MemberFacts;
 pub use super::types::MemberRoute;
 use super::types::{
     Batch, Member, MemberIdentity, MemberRouteRecord, MobId, MobIncarnation, SubscriptionEnd,
@@ -498,6 +499,19 @@ pub trait NativeDelivery: Send + Sync {
             Some(end) => MemberMobScan::Ended(end),
             None => MemberMobScan::Running { through: after },
         })
+    }
+
+    /// What `member`'s mob roster records about it: its role (the profile it
+    /// was spawned from) and its labels, the facts role and label grants are
+    /// decided over. `None` when this gateway holds no roster for the
+    /// member's mob or the roster names no such member: then only a member
+    /// grant can cover it.
+    async fn member_facts(
+        &self,
+        member: &Member,
+    ) -> Result<Option<MemberFacts>, NativeUnavailable> {
+        let _ = member;
+        Ok(None)
     }
 }
 
@@ -1149,6 +1163,36 @@ impl MobNativeDelivery {
         })
     }
 
+    /// The roster facts of a member of this gateway's mob (its registered
+    /// row) or of a mob hosted here a member created (its roster entry).
+    pub async fn member_facts(
+        &self,
+        member: &Member,
+    ) -> Result<Option<MemberFacts>, NativeUnavailable> {
+        if member.mob_id == self.mob_id {
+            let identity = Self::agent_identity(&member.identity)?;
+            return match self.identities.registered_spec(&identity).await {
+                Ok(registered) => Ok(Some(MemberFacts::new(
+                    registered.spec.profile.as_str(),
+                    registered.spec.labels,
+                ))),
+                Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => Ok(None),
+                Err(error) => Err(NativeUnavailable(error.to_string())),
+            };
+        }
+        let Some(handle) = self.running_child(&member.mob_id).await? else {
+            return Ok(None);
+        };
+        match handle
+            .get_member(&meerkat_mob::AgentIdentity::from(member.identity.as_str()))
+            .await
+        {
+            Ok(Some(entry)) => Ok(Some(MemberFacts::new(entry.role.as_str(), entry.labels))),
+            Ok(None) => Ok(None),
+            Err(error) => Err(NativeUnavailable(error.to_string())),
+        }
+    }
+
     /// The running handle of a mob hosted here other than this gateway's
     /// own; `None` when it is gone; unavailable while it is held.
     async fn running_child(
@@ -1540,6 +1584,13 @@ impl NativeDelivery for MobNativeDelivery {
         MobNativeDelivery::governs_work_authority(self)
     }
 
+    async fn member_facts(
+        &self,
+        member: &Member,
+    ) -> Result<Option<MemberFacts>, NativeUnavailable> {
+        MobNativeDelivery::member_facts(self, member).await
+    }
+
     async fn route_for(&self, member: &Member) -> Result<MemberRouteRecord, MemberProblem> {
         if member.mob_id == self.mob_id {
             return Ok(MemberRouteRecord {
@@ -1712,6 +1763,15 @@ impl AnnouncementNativeDelivery {
 impl NativeDelivery for AnnouncementNativeDelivery {
     fn governs_work_authority(&self) -> Result<bool, NativeUnavailable> {
         self.local.governs_work_authority()
+    }
+
+    /// A member on a peer gateway has no roster here: only a member grant
+    /// covers it.
+    async fn member_facts(
+        &self,
+        member: &Member,
+    ) -> Result<Option<MemberFacts>, NativeUnavailable> {
+        self.local.member_facts(member).await
     }
 
     /// A mob id hosted here as a mob a member created and also filed in the

@@ -5,15 +5,15 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 
 use super::sources::{
-    AdvanceSource, AnnouncementSource, PutSource, RecordSourceFailure, SourceAdvance, SourceChange,
-    SourceQuery, SourceStream,
+    AdvanceSource, AnnouncementSource, AuditQuery, AuditRow, MemberFacts, PutSource,
+    RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceQuery, SourceStream,
 };
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
     BatchId, BatchPosition, BatchQuery, BatchStateTag, ExpiryReport, Member, MemberBacklog,
     MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport, PutSubscription, Result,
     SealingPolicy, SourceId, SourceKey, Subscription, SubscriptionChange,
-    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
+    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, Topic,
 };
 
 /// Durable mob announcements, member subscriptions and delivery batches.
@@ -339,6 +339,79 @@ pub trait AnnouncementStore: Send + Sync {
         source_id: &SourceId,
     ) -> Result<Vec<SourceStream>> {
         let _ = (mob_id, source_id);
+        Err(no_sources())
+    }
+
+    /// [`Self::put_subscription`] with the member's roster facts as the owner
+    /// read them (`None`: it has none). A topic a source owns admits the
+    /// member only if the topic's audience covers it, the member owns no
+    /// live conversation on the source's scope, a direct route names the
+    /// topic (or the member triages it), and the member would not reach the
+    /// source both directly and through a forward. A store that keeps no
+    /// sources owns no topic, so its default is the plain put.
+    async fn put_subscription_with_facts(
+        &self,
+        operation: &OperationId,
+        request: PutSubscription,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<Subscription> {
+        let _ = facts;
+        self.put_subscription(operation, request, now_ms).await
+    }
+
+    /// [`Self::announce`] with the roster facts of the members whose
+    /// subscriptions take a topic a source owns: on such a topic only a
+    /// covered member captures, and each withheld capture is an audit row.
+    /// A member the facts do not name is covered by a member grant alone.
+    async fn announce_with_facts(
+        &self,
+        request: AnnounceRequest,
+        facts: &RosterFacts,
+        now_ms: u64,
+    ) -> Result<AnnounceOutcome> {
+        let _ = facts;
+        self.announce(request, now_ms).await
+    }
+
+    /// [`Self::advance_source`] with the roster facts of the source's
+    /// subscribers, as for [`Self::announce_with_facts`].
+    async fn advance_source_with_facts(
+        &self,
+        operation: &OperationId,
+        request: AdvanceSource,
+        facts: &RosterFacts,
+        now_ms: u64,
+    ) -> Result<SourceAdvance> {
+        let _ = facts;
+        self.advance_source(operation, request, now_ms).await
+    }
+
+    /// The members whose live subscriptions take any of `topics` that a
+    /// source owns in `mob_id`.
+    async fn owned_topic_subscribers(
+        &self,
+        mob_id: &MobId,
+        topics: &BTreeSet<Topic>,
+    ) -> Result<BTreeSet<Member>> {
+        let _ = (mob_id, topics);
+        Ok(BTreeSet::new())
+    }
+
+    /// The members whose live subscriptions take any topic `source_id` owns
+    /// in `mob_id`.
+    async fn source_subscribers(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<BTreeSet<Member>> {
+        let _ = (mob_id, source_id);
+        Ok(BTreeSet::new())
+    }
+
+    /// Audited refusals and withholdings, in id order.
+    async fn audit(&self, query: &AuditQuery) -> Result<Vec<AuditRow>> {
+        let _ = query;
         Err(no_sources())
     }
 }

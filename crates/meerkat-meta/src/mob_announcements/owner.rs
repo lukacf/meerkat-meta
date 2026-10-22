@@ -26,8 +26,8 @@ use super::native::{
     route_contradiction,
 };
 use super::sources::{
-    AdvanceSource, AnnouncementSource, PutSource, RecordSourceFailure, SourceAdvance, SourceChange,
-    SourceQuery, SourceStream,
+    AdvanceSource, AnnouncementSource, AuditQuery, AuditRow, MemberFacts, PutSource,
+    RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceQuery, SourceStream,
 };
 use super::store::AnnouncementStore;
 use super::types::{
@@ -664,7 +664,19 @@ impl AnnouncementService {
     ) -> Result<AnnounceOutcome, AnnouncementError> {
         self.ensure_hosted(&BTreeSet::from([request.mob_id.clone()]))
             .await?;
-        let outcome = self.inner.store.announce(request, self.now()).await?;
+        // The roster facts of the members whose subscriptions take a topic a
+        // source owns: the store captures only covered members there.
+        let subscribers = self
+            .inner
+            .store
+            .owned_topic_subscribers(&request.mob_id, &request.topics)
+            .await?;
+        let facts = self.roster_facts(subscribers).await;
+        let outcome = self
+            .inner
+            .store
+            .announce_with_facts(request, &facts, self.now())
+            .await?;
         if !outcome.captured_for.is_empty() {
             self.wake();
         }
@@ -750,10 +762,16 @@ impl AnnouncementService {
     ) -> Result<SourceAdvance, AnnouncementError> {
         self.ensure_hosted(&BTreeSet::from([request.mob_id.clone()]))
             .await?;
+        let subscribers = self
+            .inner
+            .store
+            .source_subscribers(&request.mob_id, &request.source_id)
+            .await?;
+        let facts = self.roster_facts(subscribers).await;
         let advance = self
             .inner
             .store
-            .advance_source(operation, request, self.now())
+            .advance_source_with_facts(operation, request, &facts, self.now())
             .await?;
         super::faults::after_source_advance();
         if advance.captured {
@@ -774,6 +792,38 @@ impl AnnouncementService {
             .store
             .record_source_failure(operation, request, self.now())
             .await?)
+    }
+
+    /// Audited refusals and withholdings of sources' audiences and routes.
+    pub async fn audit(&self, query: &AuditQuery) -> Result<Vec<AuditRow>, AnnouncementError> {
+        Ok(self.inner.store.audit(query).await?)
+    }
+
+    /// The member's roster facts, or none when its roster cannot be read
+    /// now: the store then covers it by member grants alone.
+    async fn member_facts(&self, member: &Member) -> Option<MemberFacts> {
+        match self.inner.native.member_facts(member).await {
+            Ok(facts) => facts,
+            Err(error) => {
+                tracing::warn!(
+                    %member,
+                    error = %error.0,
+                    "a member's roster facts could not be read; a member grant alone covers it"
+                );
+                None
+            }
+        }
+    }
+
+    /// The roster facts of `members`, as far as they can be read.
+    async fn roster_facts(&self, members: BTreeSet<Member>) -> RosterFacts {
+        let mut facts = RosterFacts::default();
+        for member in members {
+            if let Some(found) = self.member_facts(&member).await {
+                facts.insert(member, found);
+            }
+        }
+        facts
     }
 
     /// The streams a source's current generation onboarded.
@@ -821,10 +871,13 @@ impl AnnouncementService {
         request.child_limits = self.inner.config.child_limits;
         let mobs = self.ensure_hosted(&request.selector.mobs).await?;
         let member_mob = request.member.mob_id.clone();
+        // A topic a source owns takes the member only if its audience
+        // covers it, as the member's roster facts say.
+        let facts = self.member_facts(&request.member).await;
         let subscription = self
             .inner
             .store
-            .put_subscription(operation, request, self.now())
+            .put_subscription_with_facts(operation, request, facts, self.now())
             .await
             .map_err(|error| match error {
                 // Another put kept the member on another route meanwhile.
