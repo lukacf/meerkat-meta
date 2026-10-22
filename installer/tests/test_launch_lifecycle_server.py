@@ -331,7 +331,7 @@ def test_rehearsal_status_and_cancel_preserve_service_receipts(client, services)
     services.rehearsal.status.return_value = running
     response = client.get(BASE + "/rehearsal")
     assert response.status_code == 200, response.text
-    assert response.json() == running
+    assert response.json() == {**running, "browser_console_url": None}
     services.rehearsal.status.assert_awaited_once_with(GUIDE_ID)
     interrupted = {**running, "status": "interrupted", "trace_complete": False}
     services.rehearsal.cancel.return_value = interrupted
