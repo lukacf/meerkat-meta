@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import React, { act } from "react";
 import { createHash, webcrypto } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createGcpPreflightGate, gcpPreflightAvailable, gcpPreflightScope, gcpPreflightUrl, gcpBindingMatches,
   gcpOptionsValid, gcpProjectsValid, gcpCheckValid, gcpCheckFresh, GCP_PREFLIGHT_FRESH_MS,
   gcpProjectFeedbackCurrent, gcpProjectBlueprint, gcpProjectBlueprintMatches } from "./gcp-preflight.mjs";
@@ -120,7 +121,8 @@ async function mounted(verify, integrated = false) {
     localStorage: dom.window.localStorage,
     crypto: { randomUUID: () => "33333333-3333-4333-8333-333333333333", subtle: { digest: (...args) => digestHandler(...args) } },
     setTimeout(callback, delay, ...args) {
-      if (delay < 100000 && delay !== 1500 && delay !== 2000) return originalSetTimeout(callback, delay, ...args);
+      // Held: the polls, the ordinary 30 s read deadline and every timer of 100 s or more.
+      if (delay < 100000 && delay !== 1500 && delay !== 2000 && delay !== 30000) return originalSetTimeout(callback, delay, ...args);
       const token = { cloudFreshness: ++nextTimer }; timers.set(token, { callback: () => callback(...args), delay }); return token;
     },
     clearTimeout(token) { if (!timers.delete(token)) originalClearTimeout(token); },
@@ -231,6 +233,53 @@ test("a CLI missing at Launch startup keeps the required restart step visible af
     assert.equal(ui.button("First account"), undefined);
     assert.match(ui.document.body.textContent, /restart Launch and reopen this saved setup/);
     assert.equal(ui.calls.filter((call) => call.target.includes("gcp-preflight/options")).length, 2);
+  });
+});
+
+// The server bounds one whole cloud access observation at PROBE_TIMEOUT. It
+// reads and checks the accepted package before and after the signed-in account
+// reads, refuses another probe until this one ends, and past the bound answers
+// with its own refusal. The page's read must stay open beyond it, yet stay bounded.
+function serverCloudProbeMs() {
+  const source = readFileSync(new URL("../launchkit/gcp_preflight.py", import.meta.url), "utf8");
+  return 1000 * Number(source.match(/^PROBE_TIMEOUT = (\d+)$/m)?.[1]);
+}
+
+test("a slow cloud access check keeps its read open past the ordinary 30 s deadline until the server's bounded probe answers", async () => {
+  const bound = serverCloudProbeMs();
+  assert.equal(Number.isFinite(bound) && bound > 30000, true, `The server's cloud probe bound reads as ${bound} ms.`);
+  await mounted(async (ui) => {
+    let answer; ui.setHandler("options", () => new Promise((done) => { answer = done; }));
+    ui.pendingClick("Check cloud access");
+    try {
+      const deadlines = [...ui.timers.values()].map(({ delay }) => delay);
+      assert.equal(deadlines.length, 1, "The cloud access read holds one deadline.");
+      assert.equal(deadlines[0] > bound, true, `The cloud access read deadline (${deadlines[0]} ms) outlasts the server's ${bound} ms probe bound.`);
+      // The server's bound passes: every held deadline at or under it fires.
+      await act(async () => { for (const [token, timer] of [...ui.timers]) if (timer.delay <= bound) { ui.timers.delete(token); timer.callback(); } });
+      assert.equal(ui.document.querySelector('[role="alert"]') === null, true, "No read timeout is shown while the server's probe can still answer.");
+      assert.equal(ui.button("Checking cloud access...") !== undefined, true, "The cloud access check is still waiting.");
+    } finally { await act(async () => answer(options())); }
+    assert.equal(ui.button("First account") !== undefined, true, "The late answer shows its accounts.");
+    assert.equal(ui.document.querySelector('[role="alert"]') === null, true);
+    assert.equal(ui.timers.size, 0, "The answered read leaves no deadline behind.");
+  });
+});
+
+test("a cloud access read the server never answers still ends at its explicit deadline and can be checked again", async () => {
+  await mounted(async (ui) => {
+    let reads = 0; ui.setHandler("options", () => ++reads === 1 ? new Promise(() => {}) : options());
+    ui.pendingClick("Check cloud access");
+    const held = [...ui.timers];
+    try {
+      assert.equal(held.length, 1, "The cloud access read holds one deadline.");
+      assert.equal(Number.isFinite(held[0][1].delay), true);
+    } finally { await act(async () => { for (const [token, timer] of held) { ui.timers.delete(token); timer.callback(); } }); }
+    assert.match(ui.document.querySelector('[role="alert"]')?.textContent ?? "", /taking too long to respond/);
+    assert.equal(ui.button("Check cloud access")?.disabled, false, "The cloud access check can run again.");
+    await ui.click("Check cloud access");
+    assert.equal(reads, 2); assert.equal(ui.button("First account") !== undefined, true);
+    assert.equal(ui.document.querySelector('[role="alert"]') === null, true, "The new read clears the timeout message.");
   });
 });
 
