@@ -1648,6 +1648,15 @@ pub struct RetiredIdentityMember {
     pub generation: u64,
     /// The incarnation's session document; `None` for a peer-only member.
     pub session_id: Option<meerkat_core::types::SessionId>,
+    /// The exact Core registration the incarnation held when the retire
+    /// began: the one a host's registration hook was given for its build
+    /// (`MemberRuntimeBuildIdentity::registration`), and never a later
+    /// registration, even one that resumes the same session. `None` names
+    /// no registration: this gateway observed none for the incarnation (no
+    /// local registration, as for a peer-only or placed member, or a bridge
+    /// without a runtime machine), or the registration was still current
+    /// after Core's retire answered, so the retire did not end it.
+    pub registration: Option<meerkat_runtime::RuntimeSessionRegistrationWitness>,
     /// Why it was retired.
     pub cause: RetiredIdentityCause,
 }

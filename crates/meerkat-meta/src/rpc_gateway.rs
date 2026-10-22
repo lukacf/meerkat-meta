@@ -14699,7 +14699,13 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// retire returned, and the incarnation's runtime and session
     /// registration were released. `retired` names that incarnation (its
     /// member id, role, runtime id, generation and session, read from Core
-    /// before the retire) and why it was retired.
+    /// before the retire) and why it was retired. Its `registration` is the
+    /// exact Core registration the incarnation held, the one a host's
+    /// registration hook was given for its build
+    /// (`MemberRuntimeBuildIdentity::registration`): a host that bound what
+    /// it decided there to that registration releases exactly that. It is
+    /// never a successor's, even when a still listed identity returns on the
+    /// same session before this call; `None` names no registration.
     ///
     /// What ended depends on [`crate::identity_first::RetiredIdentityCause`]:
     /// every cause ends that one incarnation, so state the host keeps for it

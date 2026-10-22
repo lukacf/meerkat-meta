@@ -11,23 +11,62 @@
 //! the pass fails, so a hook may refresh the roster itself. Replacements,
 //! held aborts and shutdowns never reach it, and a hook error leaves the
 //! retirement standing and reaches the error hook once.
+//!
+//! Each retired incarnation names the exact Core registration it held,
+//! read before the retire. A registration still current after Core's
+//! retire answered is not named, and a successor, even one registered on
+//! the same session before the hook returns, never holds the named one.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::identity_first::bridge::{
+    BridgeDelivery, BridgeError, BridgeMemberReload, MemberRuntimeBinding, ResumeSessionOutcome,
+    SessionBridge,
+};
 use crate::identity_first::core_test_bridge::{CoreReadsBridge, register_live};
+use crate::identity_first::core_test_members::CoreTestMembers;
 use crate::identity_first::runtime::RetiredMemberObserver;
 use crate::identity_first::{
-    AgentIdentity, ContinuityStore, DurabilityPolicy, HeldBootstrapStart,
-    IdentityFirstRuntimeContext, IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig,
-    LocalContinuityStore, LocalLeaseProvider, MutableRosterProvider, RetiredIdentityCause,
-    RetiredIdentityMember, RosterProvider, ScopedRetireError,
+    AgentBuildDraft, AgentIdentity, AgentRuntimeId, ContinuityStore, DurabilityPolicy,
+    DurableAgentSpec, HeldBootstrapStart, IdentityFirstRuntimeContext, IdentityLifecycleState,
+    IdentityRuntime, IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider,
+    MutableRosterProvider, RetiredIdentityCause, RetiredIdentityMember, RosterProvider,
+    ScopedRetireError, SessionSnapshot,
 };
 use crate::unified_runtime::types::ErrorEvent;
 
-use super::held_identity_test_support::{governed_runtime, identity_runtime, member};
+use super::held_identity_test_support::{governed_runtime, member};
+
+/// An identity runtime over `runtime`'s mob, its session bridge composed as
+/// a gateway composes it: with the mob runtime's session service, so it
+/// reads Core's registrations.
+fn gateway_identity_runtime(
+    runtime: &crate::UnifiedRuntime,
+    continuity: Arc<dyn ContinuityStore>,
+    instance: &str,
+) -> Arc<IdentityRuntime> {
+    let service = runtime
+        .mob_runtime()
+        .session_service()
+        .cloned()
+        .expect("a bootstrapped runtime has a session service");
+    let bridge = crate::identity_first::MobSessionBridge::with_session_service(
+        runtime.mob_handle(),
+        service,
+    );
+    Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+        continuity_store: continuity,
+        lease_provider: Arc::new(LocalLeaseProvider::new()),
+        runtime_instance_id: instance.to_string(),
+        has_runtime_store: true,
+        durability_policy: DurabilityPolicy::SyncWriteThrough,
+        bridge: Some(Arc::new(bridge)),
+        default_timeout: None,
+    }))
+}
 
 /// The setup deadline of the fixture's held passes.
 const HOLD: Duration = Duration::from_mins(1);
@@ -69,7 +108,7 @@ impl Fixture {
         let kept = AgentIdentity::parse(&format!("{prefix}-kept")).unwrap();
         let other = AgentIdentity::parse(&format!("{prefix}-other")).unwrap();
         let mut runtime = governed_runtime(dir, prefix).await;
-        let identities = identity_runtime(
+        let identities = gateway_identity_runtime(
             &runtime,
             Arc::clone(&continuity) as Arc<dyn ContinuityStore>,
             prefix,
@@ -267,7 +306,7 @@ async fn a_boot_pass_hands_its_unlisted_retirement_to_the_hook() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = Fixture::start(&dir, "retired-hook-boot").await;
     let continuity = Arc::new(LocalContinuityStore::in_memory().expect("continuity store"));
-    let rebooted = identity_runtime(
+    let rebooted = gateway_identity_runtime(
         &fixture.runtime,
         continuity as Arc<dyn ContinuityStore>,
         "retired-hook-boot-second",
@@ -563,4 +602,336 @@ async fn a_retirement_before_a_failed_step_still_reaches_the_hook() {
     assert_eq!(calls[0].identity, gone);
     assert_eq!(calls[0].cause, RetiredIdentityCause::Unlisted);
     assert_eq!(calls[0].generation, 1);
+}
+
+/// The runtime machine that holds the fixture's member registrations.
+fn fixture_machine(fixture: &Fixture) -> Arc<meerkat_runtime::MeerkatMachine> {
+    crate::mob_handle_runtime::observed_runtime_adapter(
+        fixture
+            .runtime
+            .mob_runtime()
+            .session_service()
+            .expect("a session service")
+            .as_ref(),
+    )
+    .expect("the runtime machine")
+}
+
+/// A retire hands the hook the exact Core registration the incarnation held:
+/// the machine's registration of its session right before the retire. Once
+/// the hook runs, that registration is no longer current.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_retired_member_carries_the_registration_it_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::start(&dir, "retired-hook-registration").await;
+    let machine = fixture_machine(&fixture);
+    let session = fixture
+        .status(&fixture.kept)
+        .await
+        .session_id
+        .expect("the member's session");
+    let held = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("the member's registration");
+    fixture
+        .identities()
+        .retire_tracked(&fixture.kept)
+        .await
+        .expect("the member retires");
+    let calls = fixture.seen.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].registration.as_ref(), Some(&held), "{calls:?}");
+    assert!(
+        machine.session_registration_use(&held).await.is_none(),
+        "the retired registration is no longer current"
+    );
+    let _ = fixture.runtime.shutdown().await;
+}
+
+/// A successor that registers before the hook returns (here the still listed
+/// identity, resumed at the next generation on the same session by the
+/// hook's own roster pass) holds another registration than the one the hook
+/// was handed: a host that releases what it bound to that registration never
+/// releases the successor's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successor_registered_before_the_hook_returns_holds_another_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::start(&dir, "retired-hook-successor").await;
+    let machine = fixture_machine(&fixture);
+    let session = fixture
+        .status(&fixture.kept)
+        .await
+        .session_id
+        .expect("the member's session");
+    let successor = Arc::new(Mutex::new(None));
+    let seen = fixture.seen.clone();
+    let context = Arc::downgrade(&fixture.context);
+    let observed = Arc::clone(&successor);
+    let hook_machine = Arc::clone(&machine);
+    let hook_session = session.clone();
+    let observer: RetiredMemberObserver = Arc::new(move |retired| {
+        seen.0.lock().unwrap().push(retired);
+        let context = context.clone();
+        let observed = Arc::clone(&observed);
+        let machine = Arc::clone(&hook_machine);
+        let session = hook_session.clone();
+        Box::pin(async move {
+            let context = context
+                .upgrade()
+                .ok_or_else(|| "the identity context is gone".to_string())?;
+            context
+                .refresh_desired_topology_tracked()
+                .await
+                .map_err(|error| error.to_string())?;
+            let current = machine.current_session_registration_witness(&session).await;
+            *observed.lock().unwrap() = current;
+            Ok(())
+        })
+    });
+    fixture
+        .identities()
+        .set_retired_member_observer(Some(observer));
+    fixture
+        .identities()
+        .retire_tracked(&fixture.kept)
+        .await
+        .expect("the member retires");
+    let calls = fixture.seen.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let retired = calls[0]
+        .registration
+        .clone()
+        .expect("the retired registration");
+    let successor = successor
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the hook's roster pass registered the same session again");
+    assert_eq!(
+        successor.session_id(),
+        retired.session_id(),
+        "the same session"
+    );
+    assert_ne!(successor, retired, "another registration");
+    assert!(machine.session_registration_use(&retired).await.is_none());
+    assert!(machine.session_registration_use(&successor).await.is_some());
+    let after = fixture.status(&fixture.kept).await;
+    assert_eq!(after.state, IdentityLifecycleState::Active, "{after:?}");
+    let _ = fixture.runtime.shutdown().await;
+}
+
+/// A Core-reads bridge whose members hold real registrations on `machine`:
+/// it reads them, and its retire ends the retired member's registration
+/// only when `retire_ends_registration`.
+struct MachineReadsBridge {
+    reads: CoreReadsBridge,
+    machine: Arc<meerkat_runtime::MeerkatMachine>,
+    retire_ends_registration: bool,
+}
+
+#[async_trait::async_trait]
+impl SessionBridge for MachineReadsBridge {
+    async fn create_session(
+        &self,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
+        draft: &AgentBuildDraft,
+    ) -> Result<MemberRuntimeBinding, BridgeError> {
+        self.reads.create_session(identity, spec, draft).await
+    }
+
+    async fn resume_session(
+        &self,
+        identity: &AgentIdentity,
+        spec: &DurableAgentSpec,
+        draft: &AgentBuildDraft,
+        session_id: &meerkat_core::types::SessionId,
+        resume_from_role: Option<&meerkat_mob::ProfileName>,
+    ) -> Result<ResumeSessionOutcome, BridgeError> {
+        self.reads
+            .resume_session(identity, spec, draft, session_id, resume_from_role)
+            .await
+    }
+
+    async fn live_member(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
+        self.reads.live_member(identity).await
+    }
+
+    async fn live_member_scope(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberDeliveryScope>, BridgeError> {
+        self.reads.live_member_scope(identity).await
+    }
+
+    async fn ensure_member_live(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<MemberRuntimeBinding>, BridgeError> {
+        self.reads.ensure_member_live(identity).await
+    }
+
+    async fn member_binding_history(
+        &self,
+    ) -> Result<meerkat_mob::MemberBindingHistory, BridgeError> {
+        self.reads.member_binding_history().await
+    }
+
+    async fn last_member_binding(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<meerkat_mob::MemberBinding>, BridgeError> {
+        self.reads.last_member_binding(identity).await
+    }
+
+    async fn identity_management(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<meerkat_mob::MemberIdentityManagement, BridgeError> {
+        self.reads.identity_management(identity).await
+    }
+
+    async fn deliver_admitted(
+        &self,
+        runtime_id: &AgentRuntimeId,
+        delivery: BridgeDelivery,
+    ) -> Result<meerkat_core::types::SessionId, BridgeError> {
+        self.reads.deliver_admitted(runtime_id, delivery).await
+    }
+
+    async fn checkpoint_session(
+        &self,
+        runtime_id: &AgentRuntimeId,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<SessionSnapshot, BridgeError> {
+        self.reads.checkpoint_session(runtime_id, session_id).await
+    }
+
+    async fn retire_member(&self, runtime_id: &AgentRuntimeId) -> Result<(), BridgeError> {
+        let session = self
+            .reads
+            .core
+            .live_incarnation(runtime_id)
+            .and_then(|(session, _)| session);
+        self.reads.retire_member(runtime_id).await?;
+        if self.retire_ends_registration
+            && let Some(session) = session
+        {
+            self.machine
+                .unregister_session(&session)
+                .await
+                .map_err(|error| BridgeError::Mob(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn reload_member_registration(
+        &self,
+        runtime_id: &AgentRuntimeId,
+    ) -> Result<Option<BridgeMemberReload>, BridgeError> {
+        self.reads.reload_member_registration(runtime_id).await
+    }
+
+    async fn member_registration(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Option<meerkat_runtime::RuntimeSessionRegistrationWitness> {
+        self.machine
+            .current_session_registration_witness(session_id)
+            .await
+    }
+}
+
+/// Retire `prefix`'s one live registered member, bound to `session`, through
+/// `bridge` (whose Core member reads are `core`) with the recording hook
+/// installed, and answer what the hook saw.
+async fn retire_one_through(
+    bridge: Arc<dyn SessionBridge>,
+    core: &CoreTestMembers,
+    prefix: &str,
+    session: meerkat_core::types::SessionId,
+) -> Vec<RetiredIdentityMember> {
+    let identities = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+        continuity_store: Arc::new(LocalContinuityStore::in_memory().expect("continuity store")),
+        lease_provider: Arc::new(LocalLeaseProvider::new()),
+        runtime_instance_id: prefix.to_string(),
+        has_runtime_store: true,
+        durability_policy: DurabilityPolicy::SyncWriteThrough,
+        bridge: Some(bridge),
+        default_timeout: None,
+    }));
+    let seen = Seen::default();
+    identities.set_retired_member_observer(Some(recording(&seen, Ok(()))));
+    let identity = AgentIdentity::parse(&format!("{prefix}-member")).unwrap();
+    register_live(&identities, core, member(&identity), 1, session)
+        .await
+        .expect("a live registered member");
+    identities
+        .retire_tracked(&identity)
+        .await
+        .expect("the member retires");
+    seen.calls()
+}
+
+/// The hook names only a registration Core's retire ended. A registration
+/// still current after the retire answered was not ended by it and is not
+/// named; neither is any registration when the bridge observes none.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_registration_the_retire_ended_is_named() {
+    for (prefix, retire_ends_registration) in [
+        ("retired-hook-ended", true),
+        ("retired-hook-still-current", false),
+    ] {
+        let machine = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+        let bridge = Arc::new(MachineReadsBridge {
+            reads: CoreReadsBridge::default(),
+            machine: Arc::clone(&machine),
+            retire_ends_registration,
+        });
+        let session = meerkat_core::types::SessionId::new();
+        machine
+            .register_session(session.clone())
+            .await
+            .expect("the session registers");
+        let held = machine
+            .current_session_registration_witness(&session)
+            .await
+            .expect("the session's registration");
+        let calls = retire_one_through(
+            Arc::clone(&bridge) as Arc<dyn SessionBridge>,
+            &bridge.reads.core,
+            prefix,
+            session,
+        )
+        .await;
+        assert_eq!(calls.len(), 1, "{prefix}: {calls:?}");
+        if retire_ends_registration {
+            assert_eq!(
+                calls[0].registration.as_ref(),
+                Some(&held),
+                "{prefix}: {calls:?}"
+            );
+        } else {
+            assert!(
+                machine.session_registration_use(&held).await.is_some(),
+                "{prefix}: the registration outlived the retire"
+            );
+            assert_eq!(calls[0].registration, None, "{prefix}: {calls:?}");
+        }
+    }
+
+    let bridge = Arc::new(CoreReadsBridge::default());
+    let calls = retire_one_through(
+        Arc::clone(&bridge) as Arc<dyn SessionBridge>,
+        &bridge.core,
+        "retired-hook-unobserved",
+        meerkat_core::types::SessionId::new(),
+    )
+    .await;
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].registration, None, "{calls:?}");
 }
