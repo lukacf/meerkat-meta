@@ -47,6 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Start failure instead of only a runtime log line. An installation from
   0.9.4 or earlier gets its list at its first Start. Forge 0.9.4 ignores the
   new installation record field.
+- The `SessionHook` documentation and the Rust SDK guide say how a host
+  narrows a member's mob operator authority: in `before_create`, with
+  `restrict_spawn_profiles_in_mob` on the build's
+  `mob_tool_authority_context`. The narrowing applies to one session build,
+  and so does a disable of the member's mob tools made in the hook. Neither
+  is restored as authority: the build that restores a member after a restart
+  reaches the hook with the profile's setting and the default authority
+  again (every profile of its mob spawnable). Make the edit on every build,
+  restores included, or a restored member returns to the default authority.
+  Behaviour is unchanged; end-to-end rows now pin it for host-spawned and
+  identity members, with host tools composed over the member's own, and
+  across a restart: with and without a hook that narrows the restore build,
+  and after a hook disabled the mob tools on the first build only.
 
 ### Fixed
 

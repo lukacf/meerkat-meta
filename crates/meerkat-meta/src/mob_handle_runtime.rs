@@ -8269,6 +8269,17 @@ pub struct SessionCreatedContext {
 ///   session creation (both Rust-native and Python/TS boundary).
 /// - `after_create` — runs after session creation succeeds. Best-effort: errors
 ///   are logged at `warn`, not propagated. The session is already live.
+///
+/// `before_create` runs on every build of a session, including the rebuild
+/// that restores a member after a restart, and an edit it makes applies to
+/// that build only. A narrowing of the member's mob operator spawn scope (the
+/// build's `mob_tool_authority_context`, for example with
+/// `meerkat_runtime::mob_operator_authority::restrict_spawn_profiles_in_mob`)
+/// is not restored as authority, and neither is a disable of the member's mob
+/// tools made in the hook: the restore build reaches this hook with the
+/// member's profile setting and default authority again. Make the edit on
+/// every build, restores included, or a restored member returns to the
+/// default authority.
 #[async_trait]
 pub trait SessionHook: Send + Sync {
     /// Called before session creation. Mutate the request to inject tools,
