@@ -553,7 +553,8 @@ refuses the fork instead.
 | `refuse` | Refused before anything is committed. | Refused before anything is committed. |
 
 A source with no activation rows in the copied prefix forks the same way
-under every policy.
+under every policy. The default is the least-privilege choice: no child runs
+an instruction that nobody activated for that child.
 
 Under `require_explicit_activation`, a Rust host activates an inherited key on
 the child with `MobHandle::activate_member_instruction(child, request)`
@@ -663,7 +664,9 @@ to revoke.
 The policy belongs to the host. It is never a tool argument or part of a mob
 definition, and it cannot be chosen per fork: every fork of the gateway's mob
 uses it. The gateway applies it to its mob on every create and resume. It is
-not stored with the mob, so set it on every boot.
+not stored with the mob, so set it on every boot. A fork applies the policy
+the gateway runs at the moment of the fork; changing the policy later does not
+touch children that already exist.
 
 | Surface | Setting |
 |---|---|
