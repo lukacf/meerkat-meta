@@ -1298,3 +1298,58 @@ async def test_remote_status_observation_leaves_the_event_loop_free(service, mon
     observed, gap = await longest_loop_gap(running(service, receipt))
     assert observed["status"] == "running" and observed["ready"]
     assert gap < 0.5
+
+
+def slow_package_hashing(monkeypatch):
+    from launchkit import remote_deployment
+    class Hashing:
+        def __getattr__(self, name):
+            return getattr(hashlib, name)
+        def sha256(self, data=b""):
+            if bytes(data[:4]) == b"PK\x03\x04":
+                time.sleep(1.0)  # Hashing a large package on a small host.
+            return hashlib.sha256(data)
+    monkeypatch.setattr(remote_deployment, "hashlib", Hashing())
+
+
+async def test_remote_connect_hashes_the_package_off_the_event_loop(service, monkeypatch):
+    slow_package_hashing(monkeypatch)
+    connected, gap = await longest_loop_gap(connect(service))
+    assert connected["status"] == "configuration-required"
+    assert gap < 0.5
+
+
+async def test_remote_install_hashes_the_package_off_the_event_loop(service, monkeypatch):
+    receipt = await connect(service)
+    slow_package_hashing(monkeypatch)
+    async def installed():
+        value = await install(service, receipt)
+        await asyncio.gather(*list(service.tasks.values()))
+        return value
+    accepted, gap = await longest_loop_gap(installed())
+    assert accepted["status"] == "installing" and not accepted["can_install"]
+    assert gap < 0.5
+
+
+async def test_remote_status_hashes_the_package_off_the_event_loop(service, monkeypatch):
+    receipt = await connect(service)
+    await install(service, receipt)
+    await asyncio.gather(*list(service.tasks.values()))
+    slow_package_hashing(monkeypatch)
+    observed, gap = await longest_loop_gap(running(service, receipt))
+    assert observed["status"] == "running" and observed["ready"]
+    assert gap < 0.5
+
+
+async def test_remote_stop_and_restart_hash_the_package_off_the_event_loop(service, monkeypatch):
+    receipt = await connect(service)
+    await install(service, receipt)
+    await asyncio.gather(*list(service.tasks.values()))
+    await running(service, receipt)
+    slow_package_hashing(monkeypatch)
+    async def stopped_and_restarted():
+        stopped = await service.action(service.guide.identity, receipt["deployment_id"], "stop")
+        return stopped, await service.action(service.guide.identity, receipt["deployment_id"], "restart")
+    (stopped, restarted), gap = await longest_loop_gap(stopped_and_restarted())
+    assert stopped["status"] == "stopped" and restarted["status"] == "running"
+    assert gap < 0.5
