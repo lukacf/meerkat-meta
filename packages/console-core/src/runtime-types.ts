@@ -262,6 +262,8 @@ export interface RuntimeCapabilities {
 }
 
 export interface ConsoleExperience {
+  /** Native store scopes exposed by a shared console, keyed by registration. */
+  panel_runtimes?: Array<{key: string; label: string; namespace: string; memory: boolean; workgraph: boolean}>;
   /** Opaque server-owned runtime and authenticated principal scope for local drafts. */
   storage_scope?: string;
   /**

@@ -1,6 +1,7 @@
 //! HTTP routes for the admin console REST API.
 
 mod mcp_apps;
+mod shared_panels;
 pub use mcp_apps::ConsoleToolApplicationIngress;
 
 use async_stream::stream;
@@ -776,6 +777,31 @@ pub async fn console_json_handler(
         snapshot
     });
 
+    let panel_runtimes = match state
+        .console_aggregator
+        .as_ref()
+        .filter(|_| state.runtime.is_none())
+        .map(|aggregator| aggregator.panel_runtimes())
+        .transpose()
+    {
+        Ok(runtimes) => runtimes,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Console runtime registry is unavailable"})),
+            );
+        }
+    };
+    let memory_available = state.memory_panel.is_some()
+        || panel_runtimes
+            .as_ref()
+            .is_some_and(|runtimes| runtimes.iter().any(|runtime| runtime.memory.is_some()));
+    let workgraph_available = state.workgraph.is_some()
+        || panel_runtimes.as_ref().is_some_and(|runtimes| {
+            runtimes
+                .iter()
+                .any(|runtime| runtime.runtime.workgraph_service().is_some())
+        });
     let mut response = handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph(
         &state.decisions,
         &ConsoleRestJsonRequest {
@@ -785,8 +811,8 @@ pub async fn console_json_handler(
         },
         live_snapshot.as_ref(),
         state.access.as_ref(),
-        state.memory_panel.is_some(),
-        state.workgraph.is_some(),
+        memory_available,
+        workgraph_available,
     );
     if response.status == 200
         && uri.path() == "/console/experience"
@@ -796,6 +822,16 @@ pub async fn console_json_handler(
     }
     if response.status == 200 && uri.path() == "/console/experience" {
         attach_console_send_dedupe(&mut response.body, state.console_aggregator.as_ref());
+        if let Some(runtimes) = panel_runtimes {
+            response.body["panel_runtimes"] = json!(
+                runtimes
+                    .iter()
+                    .map(shared_panels::descriptor)
+                    .collect::<Vec<_>>()
+            );
+            // Shared stores currently support inspection only.
+            response.body["workgraph"]["can_manage"] = json!(false);
+        }
     }
     if response.status == 200
         && uri.path() == "/console/experience"
@@ -7181,6 +7217,12 @@ async fn handle_console_aggregator_rpc(
     // a closure of references and one pointer here.
     let request = &request;
     match request.method.as_str() {
+        method if shared_panels::is_read(method) => {
+            let Some(aggregator) = &console_aggregator else {
+                return console_aggregator_unavailable(response_id);
+            };
+            Box::pin(shared_panels::dispatch(aggregator, request, access_view)).await
+        }
         "meta/capabilities" => {
             let mut methods = vec![
                 "meta/capabilities",
@@ -7188,6 +7230,23 @@ async fn handle_console_aggregator_rpc(
                 "meta/console/inspect_identity",
                 "meta/console/query_timeline",
             ];
+            if let Some(aggregator) = &console_aggregator {
+                let runtimes = match aggregator.panel_runtimes() {
+                    Ok(runtimes) => runtimes,
+                    Err(error) => return internal_error(response_id, error.to_string()),
+                };
+                methods.extend(
+                    shared_panels::MEMORY_READ_METHODS
+                        .iter()
+                        .chain(crate::rpc::workgraph_methods::WORKGRAPH_READ_METHODS)
+                        .copied()
+                        .filter(|method| {
+                            runtimes
+                                .iter()
+                                .any(|runtime| shared_panels::supports(runtime, method))
+                        }),
+                );
+            }
             if can_mutate {
                 methods.extend_from_slice(&[
                     "meta/retire",
@@ -7210,6 +7269,16 @@ async fn handle_console_aggregator_rpc(
                         ]);
                     }
                 }
+            }
+            if let Some(view) = access_view.filter(|view| view.enforced()) {
+                let probe = json!({"identity": "\u{0}cap-probe"});
+                methods.retain(|method| {
+                    console_rpc_access_requirements(method, &probe).is_none_or(|requirements| {
+                        requirements
+                            .iter()
+                            .all(|(action, target)| target.is_some() || view.allows(action))
+                    })
+                });
             }
             response_value(
                 response_id,
@@ -14129,6 +14198,136 @@ comms = true
                 .any(|f| f["code"] == "file-name-twins" && f["severity"] == "error"),
             "{findings:#?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregator_panels_read_registered_native_stores_and_require_runtime_scope()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn runtime(
+            name: &str,
+            memory_dir: &std::path::Path,
+        ) -> Result<Arc<crate::UnifiedRuntime>, Box<dyn std::error::Error + Send + Sync>> {
+            let definition = MobDefinition::from_toml(&format!(
+                "[mob]\nid = '{name}'\n[profiles.worker]\nmodel = 'gpt-6-astra'\n"
+            ))?;
+            let runtime = Arc::new(
+                crate::UnifiedRuntime::builder()
+                    .definition(definition)
+                    .default_llm_client(Arc::new(TestClient::default()))
+                    .build()
+                    .await?,
+            );
+            runtime.set_memory_panel_store(Arc::new(SqliteAgentMemoryStore::open(memory_dir)?));
+            Ok(runtime)
+        }
+        let memory_dir = tempfile::tempdir()?;
+        let memory_dir_b = tempfile::tempdir()?;
+        let runtime_a = runtime("panel-repository-a", memory_dir.path()).await?;
+        let runtime_b = runtime("panel-repository-b", memory_dir_b.path()).await?;
+        runtime_a
+            .workgraph_service()
+            .ok_or("missing work graph")?
+            .create(meerkat::CreateWorkItemRequest {
+                title: "Only repository A owns this task".into(),
+                ..Default::default()
+            })
+            .await?;
+        let aggregator = MetaConsoleAggregator::in_memory();
+        let register = |key: &str, runtime: Arc<crate::UnifiedRuntime>| {
+            aggregator.register_runtime(crate::console_aggregator::ConsoleRuntimeRegistration {
+                runtime_key: key.into(),
+                identity_namespace: key.into(),
+                runtime,
+                visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
+            })
+        };
+        register("repo-a", runtime_a.clone());
+        let call = |method: &str, params: Value| {
+            handle_console_aggregator_rpc(
+                Some(aggregator.clone()),
+                rpc_request_with_params(method, params),
+                true,
+                true,
+                None,
+                None,
+                &crate::console_aggregator::ConsoleSendScope::Anonymous,
+            )
+        };
+        let caps = call("meta/capabilities", json!({})).await;
+        let methods = caps["result"]["methods"]
+            .as_array()
+            .ok_or("missing methods")?;
+        assert!(
+            methods.contains(&json!("meta/memory/panel/records")),
+            "{caps}"
+        );
+        assert!(
+            methods.contains(&json!("meta/workgraph/snapshot")),
+            "{caps}"
+        );
+        assert!(!methods.contains(&json!("meta/workgraph/create")), "{caps}");
+        assert!(
+            !methods.contains(&json!("meta/memory/quarantine/decide")),
+            "{caps}"
+        );
+        let restricted = AccessController::new(crate::access::AccessControlConfig {
+            enabled: true,
+            admins: vec!["admin@example.test".into()],
+            ..Default::default()
+        })?;
+        let restricted_view = restricted.view_for_subject(Some("viewer@example.test"));
+        for method in ["meta/memory/panel/overview", "meta/workgraph/snapshot"] {
+            let denied = handle_console_aggregator_rpc(
+                Some(aggregator.clone()),
+                rpc_request_with_params(method, json!({"runtime_key":"repo-a"})),
+                true,
+                true,
+                Some(&restricted),
+                Some(&restricted_view),
+                &crate::console_aggregator::ConsoleSendScope::Anonymous,
+            )
+            .await;
+            assert_eq!(denied["error"]["data"]["kind"], "access_denied", "{denied}");
+        }
+        let readonly = call(
+            "meta/workgraph/create",
+            json!({"runtime_key":"repo-a","title":"Must not create"}),
+        )
+        .await;
+        assert_eq!(readonly["error"]["data"]["kind"], "read_only", "{readonly}");
+        for method in ["meta/memory/panel/records", "meta/workgraph/snapshot"] {
+            let result = call(method, json!({"runtime_key":"repo-a"})).await;
+            assert!(result.get("result").is_some(), "{result}");
+            assert!(result.get("error").is_none_or(Value::is_null), "{result}");
+        }
+        register("repo-b", runtime_b.clone());
+        let ambiguous = call("meta/workgraph/snapshot", json!({})).await;
+        assert_eq!(ambiguous["error"]["code"], -32602, "{ambiguous}");
+        let a = call("meta/workgraph/snapshot", json!({"runtime_key":"repo-a"})).await;
+        let b = call("meta/workgraph/snapshot", json!({"runtime_key":"repo-b"})).await;
+        assert_eq!(
+            a["result"]["items"]
+                .as_array()
+                .ok_or("missing A items")?
+                .len(),
+            1
+        );
+        assert_eq!(b["result"]["items"], json!([]), "{b}");
+        let previous = aggregator
+            .panel_runtimes()?
+            .into_iter()
+            .find(|runtime| runtime.key == "repo-a")
+            .ok_or("missing registered A")?;
+        aggregator.unregister_runtime("repo-a");
+        let removed = call("meta/memory/panel/records", json!({"runtime_key":"repo-a"})).await;
+        assert_eq!(removed["error"]["code"], -32602, "{removed}");
+        register("repo-a", runtime_b.clone());
+        assert!(!aggregator.panel_runtime_is_current(&previous));
+        let replaced = call("meta/workgraph/snapshot", json!({"runtime_key":"repo-a"})).await;
+        assert_eq!(replaced["result"]["items"], json!([]), "{replaced}");
+        runtime_a.mob_handle().stop().await?;
+        runtime_b.mob_handle().stop().await?;
         Ok(())
     }
 

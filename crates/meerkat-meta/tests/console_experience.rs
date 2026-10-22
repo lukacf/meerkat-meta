@@ -104,6 +104,99 @@ fn decision_state_with_console_policy(
     .expect("decision state builds")
 }
 
+#[tokio::test]
+async fn shared_console_exposes_registered_native_panels_and_removes_stale_scopes()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use axum::{body::Body, http::Request};
+    use meerkat_meta::console_aggregator::{
+        AllowAllConsoleVisibilityPolicy, ConsoleRuntimeRegistration, MetaConsoleAggregator,
+    };
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    async fn experience(app: axum::Router) -> serde_json::Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/console/experience")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), 200);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        serde_json::from_slice(&body).expect("JSON")
+    }
+
+    let aggregator = MetaConsoleAggregator::in_memory();
+    let app = meerkat_meta::http_console::console_json_router_with_aggregator(
+        decision_state(false),
+        aggregator.clone(),
+    );
+    let empty = experience(app.clone()).await;
+    assert_eq!(empty["memory"]["available"], false);
+    assert_eq!(empty["workgraph"]["available"], false);
+    assert_eq!(empty["panel_runtimes"], json!([]));
+
+    let memory_dir = tempfile::tempdir()?;
+    let runtime = Arc::new(
+        meerkat_meta::UnifiedRuntime::builder()
+            .definition(meerkat_mob::MobDefinition::from_toml(
+                "[mob]\nid = 'repository-team'\n[profiles.worker]\nmodel = 'gpt-6-astra'\n",
+            )?)
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .build()
+            .await?,
+    );
+    runtime.set_memory_panel_store(Arc::new(
+        meerkat_meta::memory::SqliteAgentMemoryStore::open(memory_dir.path())?,
+    ));
+    aggregator.register_runtime(ConsoleRuntimeRegistration {
+        runtime_key: "repository".into(),
+        identity_namespace: "repository".into(),
+        runtime: runtime.clone(),
+        visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
+    });
+    let registered = experience(app.clone()).await;
+    assert_eq!(registered["memory"]["available"], true);
+    assert_eq!(registered["memory"]["can_read"], true);
+    assert_eq!(registered["memory"]["can_review_quarantine"], true);
+    assert_eq!(registered["workgraph"]["available"], true);
+    assert_eq!(registered["workgraph"]["can_view"], true);
+    assert_eq!(registered["workgraph"]["can_manage"], false);
+    assert_eq!(
+        registered["panel_runtimes"],
+        json!([{
+            "key":"repository", "label":"repository-team", "namespace":"repository",
+            "memory":true, "workgraph":true,
+        }])
+    );
+
+    let protected = meerkat_meta::http_console::console_json_router_with_aggregator(
+        decision_state(true),
+        aggregator.clone(),
+    );
+    let denied = protected
+        .oneshot(
+            Request::builder()
+                .uri("/console/experience")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(denied.status(), 401);
+
+    aggregator.unregister_runtime("repository");
+    let removed = experience(app).await;
+    assert_eq!(removed["memory"]["available"], false);
+    assert_eq!(removed["workgraph"]["available"], false);
+    assert_eq!(removed["panel_runtimes"], json!([]));
+    runtime.mob_handle().stop().await?;
+    Ok(())
+}
+
 #[test]
 fn console_voice_is_unavailable_without_an_authenticated_voice_host() {
     for require_app_auth in [false, true] {
