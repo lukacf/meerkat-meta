@@ -18,6 +18,7 @@ import { ForgeWelcomePortrait } from "./first-experience.jsx";
 import { firstProposalStatus } from "./first-proposal-status.mjs";
 import { packagePreparationReason } from "./package-availability.mjs";
 import { NativeBundleSelection } from "./native-bundle-selection.jsx";
+import { IncomingDataReview } from "./incoming-data-review.jsx";
 
 function Arrow({ size = 16 }) {
   return (
@@ -350,6 +351,7 @@ export function EvolvingPlan({
           </details>
         )}
         <ScopeDecisions state={state} compact />
+        <IncomingDataReview brief={designBrief} plan={plan} disabled={disabled} onRequestChange={onRequestChange} />
 
         {!plan && hasAssessmentContext && requirementCount > 0 && (
           <div className="ep-requirements">

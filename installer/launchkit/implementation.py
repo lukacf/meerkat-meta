@@ -567,6 +567,20 @@ Finish the user's requested application around the ACTUAL proposed MobKit system
 Read inspect_implementation and the seeded app.py before writing code. The context
 contains the frozen brief, original user evidence, exact agents, tools, native flows,
 peer relationships and unmet requirements. Preserve the user's scope and choices.
+When brief.incoming_data is present, its scopes, routes and history choices are
+desired behavior, not native source bindings or access grants. Resolve them
+through the selected Meta mob-announcement source contract and Connect's declared
+observation capabilities. Use native scheduling and keyed delivery. Resolve a
+recipient_kind class route through actual native class/profile metadata and supported
+native declaration selectors, including zero initial members. A proposed class ID
+is not itself a native role or authority to broaden the source audience.
+Meta owns membership reconciliation for subscriptions. Do not build an application
+polling engine, second cursor store or replacement delivery inbox
+to bypass a missing platform capability. Keep missing adapter coverage, governed
+admission and native configuration explicit in the outcome. Application code owns
+domain interpretation and recipient policy. Test failed handling, history bounds,
+edits and duplicate routes against the actual exposed contract; a successful
+admission is not proof of successful handling or a connected useful result.
 Original messages also include comments about Forge and its proposal animation.
 Those refine the setup experience. Do not turn them into installed application
 features unless the current brief or an explicit application implementation request

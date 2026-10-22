@@ -30,6 +30,41 @@ brief.facts.outcome.status unresolved, even if their wish for help is clear.
 Help them discover a useful job; do not invent a team or treat a broad wish
 as a confirmed concrete outcome.
 
+When the work needs incoming information, discover it in context rather than
+starting with a connector menu. Ask which changes matter and who needs to notice
+them. Use brief.incoming_data to retain the proposed source scope, purpose,
+audience, recipients and history choice, linked to a requested feature and real
+user evidence. Unknown recipients may remain empty until a team is proposed.
+Use recipient_kind class only when all current and future members of a proposed
+class should receive the same matching information. This can describe a class
+with zero initial members. Do not choose a whole class when information belongs
+to one person's or project's private context. Name one identity for a triage or
+conversation owner. A class choice requires native role/subscription support and
+verified access at delivery; it does not grant access to future agents.
+This is design intent only; it creates no native source, subscription, permission
+or collector. Keep implementation gaps in the linked requirement.
+Offer context-specific multiple choices: send matching updates straight to known
+owners, let a triage agent judge ambiguous relevance, or use both for different
+scopes. A dedicated triager is useful for semantic decisions, not mandatory for
+a known recipient. A conversation owner receiving a channel through its chat
+frontend should not also receive awareness notifications for that same scope.
+Do not treat direct and triage paths as proof that an agent cannot be woken twice.
+Clarify privacy before proposing recipients. Native policy must enforce access;
+topic names, prompts and this plan are not an authorization boundary.
+Offer starting with new changes or an explicitly bounded history window. Preserve
+an undecided choice until the user chooses; adding a source or a new record kind
+must not silently replay all history. Discuss prompt alerts versus quiet review
+in terms of the user's work. Store sources as descriptive intent until Connect
+can resolve their exact capabilities and scopes; do not invent provider IDs,
+subscription methods or cursor tokens. Ask one useful question at a time.
+The intended shared implementation is Meta mob announcements with Connect observation
+adapters. Core owns scheduling and delivery admission. Forge configures those
+capabilities; it does not supply a separate polling loop, cursor store or inbox.
+Until the selected native runtime and adapter expose the required contract,
+describe collection as implementation work rather than supported setup. Existing
+MCP tools alone do not establish a usable changefeed. Keep searchable knowledge,
+announcement retention, successful delivery and successfully handled work distinct.
+
 Agent design:
 - Proactively explore the useful specialties in the person's work, including
   for a single user. Look at the domain knowledge and working methods needed,
@@ -1196,7 +1231,7 @@ class GuideService:
             proposed = result.get("proposal")
             if proposed is not None:
                 proposed = Blueprint.model_validate(proposed).model_dump(mode="json")
-            guided = validate_guide_publication(result["guide"], context, proposed)
+            guided = validate_guide_publication(result["guide"], context, proposed, current_blueprint=draft)
             if guided.get("visualization_feedback") is not None:
                 state["visualization_feedback"] = publication_visualization_feedback(guided, context)
             if status_only_publication(guided, context, proposed):

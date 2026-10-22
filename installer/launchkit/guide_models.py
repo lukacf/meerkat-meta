@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from pydantic import Field, StringConstraints, field_validator, model_validator
+from pydantic import Field, StringConstraints, field_validator, model_serializer, model_validator
 
 from .schema import StrictModel
 
@@ -80,14 +80,84 @@ class RequestedFeature(StrictModel):
         return self
 
 
+class IncomingDataRoute(StrictModel):
+    """Desired recipient, not a runtime subscription or an access grant."""
+
+    recipient: str = Field(min_length=1, max_length=60)
+    delivery: Literal["direct", "triage", "conversation"]
+    recipient_kind: Literal["identity", "class"] = Field(default="identity",
+        description="A proposed identity, or a whole proposed class including future members. A class is desired scope, not a native role selector or access grant.")
+
+    @model_serializer(mode="wrap")
+    def omit_default_recipient_kind(self, handler):
+        data = handler(self)
+        if self.recipient_kind == "identity":
+            data.pop("recipient_kind", None)
+        return data
+
+    @model_validator(mode="after")
+    def single_conversation_or_triage_owner(self):
+        if self.recipient_kind == "class":
+            from .blueprint import ID
+            if not re.fullmatch(ID, self.recipient):
+                raise ValueError("Choose a valid Blueprint class ID for a class recipient.")
+        elif len(self.recipient) < 3:
+            raise ValueError("An identity recipient must have at least 3 characters.")
+        if self.recipient_kind == "class" and self.delivery != "direct":
+            raise ValueError("Choose one identity for triage or conversation ownership; class routes describe direct awareness.")
+        return self
+
+
+class IncomingDataIntent(StrictModel):
+    """Human-readable source intent, before resolving a native source binding."""
+
+    id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,79}$")
+    requirement_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,79}$")
+    name: str = Field(min_length=1, max_length=100)
+    scope: str = Field(min_length=1, max_length=1000)
+    purpose: str = Field(min_length=1, max_length=1000)
+    audience: str = Field(default="", max_length=1000)
+    history: Literal["undecided", "new_only", "bounded_history"] = "undecided"
+    history_window: str = Field(default="", max_length=500)
+    routes: list[IncomingDataRoute] = Field(default_factory=list, max_length=64)
+    source_message_ids: list[str] = Field(min_length=1, max_length=40)
+
+    @model_validator(mode="after")
+    def coherent_intent(self):
+        recipients = [(route.recipient_kind, route.recipient) for route in self.routes]
+        if len(recipients) != len(set(recipients)):
+            raise ValueError("Choose one incoming route per source and recipient; conversation and awareness routes must not overlap.")
+        if self.history == "bounded_history" and not self.history_window:
+            raise ValueError("Describe the requested history window before proposing a backfill.")
+        if self.history != "bounded_history" and self.history_window:
+            raise ValueError("A history window belongs only to a bounded-history choice.")
+        if len(self.source_message_ids) != len(set(self.source_message_ids)):
+            raise ValueError("Incoming data evidence IDs must be distinct.")
+        return self
+
+
 class DesignBrief(StrictModel):
     facts: dict[FactTopic, BriefFact] = Field(default_factory=dict)
     requirements: list[RequestedFeature] = Field(default_factory=list, max_length=32)
+    incoming_data: list[IncomingDataIntent] = Field(default_factory=list, max_length=32,
+        description="Optional proposed incoming sources and routing choices. This is user intent, not native configuration, provider capability evidence or permission to collect. Track implementation and access in the linked requirement.")
+
+    @model_serializer(mode="wrap")
+    def omit_unused_incoming_data(self, handler):
+        data = handler(self)
+        if not self.incoming_data:
+            data.pop("incoming_data", None)
+        return data
 
     @model_validator(mode="after")
     def unique_requirements(self):
         if len({item.id for item in self.requirements}) != len(self.requirements):
             raise ValueError("Give each requested feature its own ID.")
+        if len({item.id for item in self.incoming_data}) != len(self.incoming_data):
+            raise ValueError("Give each incoming source its own ID.")
+        requirements = {item.id for item in self.requirements}
+        if any(item.requirement_id not in requirements for item in self.incoming_data):
+            raise ValueError("Link incoming data to an existing requested feature so its implementation remains visible.")
         return self
 
 
@@ -199,7 +269,7 @@ def review_readiness(brief: dict):
             "proposed_topics": [topic for topic, fact in value.facts.items() if fact.status == "proposed"]}
 
 
-def validate_guide_publication(args: dict, context: dict, proposal: dict | None):
+def validate_guide_publication(args: dict, context: dict, proposal: dict | None, *, current_blueprint=None):
     """Validate model output against actual user evidence and design readiness."""
     value = GuidePublication.model_validate(args)
     messages = context.get("evidence_messages", [])
@@ -226,6 +296,34 @@ def validate_guide_publication(args: dict, context: dict, proposal: dict | None)
             requested_at = min(positions[identity] for identity in requirement.source_message_ids)
             if not any(positions[identity] > requested_at for identity in requirement.decision_message_ids):
                 raise ValueError("The feature request itself cannot authorize its deferral, cancellation or handoff. Ask for the user's choice.")
+    selected = proposal if proposal is not None else current_blueprint
+    route_plan = None
+    for source in value.brief.incoming_data:
+        if any(identity not in evidence for identity in source.source_message_ids):
+            raise ValueError("Incoming data cites missing or non-user evidence.")
+        # Validate against the same desired plan being published, never a native
+        # roster or a guessed provider scope. Runtime admission is separate.
+        if source.routes:
+            from .blueprint import Blueprint
+            if not selected:
+                raise ValueError("Propose the team before assigning incoming data recipients.")
+            if route_plan is None:
+                route_plan = Blueprint.model_validate(selected)
+            classes = {item.id: item for item in route_plan.agent_classes}
+            identities = set(route_plan.identities())
+            selected_identities = set()
+            for route in source.routes:
+                if route.recipient_kind == "class":
+                    if route.recipient not in classes:
+                        raise ValueError("Incoming data class routes must name an existing class in the proposed team.")
+                    recipients = set(classes[route.recipient].identities())
+                else:
+                    if route.recipient not in identities:
+                        raise ValueError("Incoming data routes must name an existing identity in the proposed team.")
+                    recipients = {route.recipient}
+                if selected_identities & recipients:
+                    raise ValueError("Choose one incoming route per source and recipient; class and identity routes must not overlap.")
+                selected_identities.update(recipients)
     outcome = value.brief.facts.get("outcome")
     if (context.get("current_user_message", {}).get("intent_only")
             and (not outcome or outcome.status != "confirmed")
