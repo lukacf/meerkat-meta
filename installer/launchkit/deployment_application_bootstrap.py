@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import asyncio
 import hashlib
 import importlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -454,6 +455,26 @@ def retain_bootstrap_admission(directory, receipt, application_startup, *, sourc
 def read_bootstrap_admission(directory, selection):
     """Read the exact original envelope, never a newly found latest admission."""
     directory = _path(directory)
+    value = _admission_value(directory, selection)
+    _require_installation(directory, read_receipt(directory), value["installation"])
+    return deepcopy(value)
+
+
+def read_original_fresh_admission(directory, selection, *, in_flight=None):
+    """Read an entered Fresh's original admission across this installation's own lineage.
+
+    This is the one reader for the original Fresh admission that a retained
+    entry names. Per-start Restore admissions and update admissions keep the
+    exact binding of read_bootstrap_admission.
+    """
+    directory = _path(directory)
+    value = _admission_value(directory, selection)
+    require_installation_lineage(directory, read_receipt(directory), value["installation"],
+        in_flight=in_flight)
+    return deepcopy(value)
+
+
+def _admission_value(directory, selection):
     _private_directory(directory)
     pin = _artifact_pin(selection)
     if pin.path.parent != directory or not pin.path.name.startswith("bootstrap-admission-"):
@@ -464,8 +485,158 @@ def read_bootstrap_admission(directory, selection):
             or value["kind"] != "application-bootstrap"):
         raise CustodyError("The original bootstrap admission has changed fields.")
     _shape(value["application_startup"])
-    _require_installation(directory, read_receipt(directory), value["installation"])
-    return deepcopy(value)
+    return value
+
+
+LINEAGE_IDENTITY_KEYS = (*updates.UPDATE_INSTALLATION_KEYS, "source_id", "source_digest", "service",
+    "service_supervisor_pid", "service_instance_id", "service_cleanup_confirmed", "runtime_candidate")
+# Activation publishes these receipt keys from the candidate's own report.
+LINEAGE_SOURCE_KEYS = ("build_id", "package_sha256", "guide_version", "blueprint_hash", "brief_hash")
+MAX_LINEAGE_UPDATES = 2048
+MAX_LINEAGE_ADMISSIONS = 64
+# A worker is changing installed source in these statuses. Only that worker,
+# or the action that admits it, may read its own transaction as lineage.
+ACTIVE_UPDATE = frozenset({"snapshotting", "applying", "verifying", "restoring",
+    "recovering-candidate", "recovering-current"})
+UPDATE_IN_FLIGHT = ACTIVE_UPDATE | {"candidate-restored-stopped", "recovery-needed"}
+LINEAGE_CHANGED = ("This installation's source is not reached from its original setup through its own "
+    "completed updates. Keep its files and update history; install the current build into a new folder.")
+UNFINISHED_UPDATE = ("This application's installed source belongs to an update that has not finished. "
+    "Recover the current application or restore its previous source, then start it.")
+
+
+def _lineage_journals(directory, in_flight):
+    """Index this installation's update journals that can be source edges.
+
+    The listing and each journal read are bounded. Packages and admissions are
+    checked only for the edges that a walk takes.
+    """
+    root = directory / "updates"
+    if not root.exists() and not root.is_symlink():
+        return {}
+    if root.is_symlink() or not root.is_dir():
+        raise CustodyError(LINEAGE_CHANGED)
+    listed = list(itertools.islice(root.iterdir(), MAX_LINEAGE_UPDATES + 1))
+    if len(listed) > MAX_LINEAGE_UPDATES:
+        raise CustodyError(LINEAGE_CHANGED)
+    edges = {}
+    for child in sorted(listed):
+        if child.is_symlink():
+            raise CustodyError(LINEAGE_CHANGED)
+        if not child.is_dir():
+            continue
+        try:
+            journal = _json(_read(child / "update.json", 4 * 1024 * 1024))
+        except (OSError, CustodyError):
+            # An unreadable journal is no edge; a walk that needs it refuses.
+            continue
+        if not isinstance(journal, dict) or journal.get("update_id") != child.name:
+            raise CustodyError(LINEAGE_CHANGED)
+        status = journal.get("status")
+        if status == "completed" or (in_flight is not None and status in UPDATE_IN_FLIGHT
+                and _same_json_value(updates.update_binding(journal), in_flight)):
+            edges.setdefault((journal.get("from_build_id"), journal.get("previous_package_sha256")),
+                []).append((child, journal))
+    return edges
+
+
+def _require_lineage_edge(directory, child, journal):
+    """One walked edge: its exact packages, and this installation's admission of it."""
+    from .artifact_binding import report_brief_hash
+    try:
+        if updates.update_directory(directory, journal["update_id"]) != child:
+            raise CustodyError(LINEAGE_CHANGED)
+        _, candidate = updates.checked_package(child, "candidate.zip", journal["package_sha256"])
+        _, previous = updates.checked_package(child, "previous.zip", journal["previous_package_sha256"])
+        report = _json(candidate["implementation-report.json"][0])
+        prior = _json(previous["implementation-report.json"][0])
+        if (report["build_id"] != journal["to_build_id"] or prior["build_id"] != journal["from_build_id"]
+                or report["guide_version"] != journal["guide_version"]
+                or report["blueprint_hash"] != journal["blueprint_hash"]
+                or report_brief_hash(report) != journal["brief_hash"]
+                or report["verification"]["digest"] != journal["source_digest"]):
+            raise CustodyError(LINEAGE_CHANGED)
+        binding = updates.update_binding(journal)
+        # Apply retained this admission for this installation's own receipt.
+        for path in itertools.islice(sorted(child.glob("admission-*.json")), MAX_LINEAGE_ADMISSIONS):
+            try:
+                selected = updates.read_update_admission(directory, "update", {"path": str(path.absolute()),
+                    "sha256": updates.digest(_read(path, 1024 * 1024))})
+            except (updates.DraftConflict, CustodyError, OSError):
+                continue
+            if _same_json_value(selected["binding"], binding):
+                return
+    except (KeyError, TypeError, ValueError, OSError, updates.DraftConflict) as error:
+        raise CustodyError(LINEAGE_CHANGED) from error
+    raise CustodyError(LINEAGE_CHANGED)
+
+
+def _lineage_refusal(receipt, target):
+    pointer = receipt.get("update") or {}
+    status = pointer.get("status")
+    unfinished = status != "completed" and (status in ACTIVE_UPDATE
+        or (pointer.get("to_build_id"), pointer.get("package_sha256")) == target)
+    return CustodyError(UNFINISHED_UPDATE if unfinished else LINEAGE_CHANGED)
+
+
+def require_installation_lineage(directory, receipt, original, *, in_flight=None):
+    """The original installation, or its own source reached through completed updates.
+
+    Identity keys stay equal, and the update pointer is not lineage. The source
+    keys may differ only through a bounded walk of this installation's admitted,
+    completed transactions. in_flight is the binding of the one transaction an
+    update worker, or the action admitting it, is settling. Native validity of a
+    later Restore stays with the existing plan, policy, gateway and activation
+    checks.
+    """
+    directory = _path(directory)
+    service = restored_service(receipt)
+    if service:
+        from .deployment_service import verify_service
+        verify_service(directory, receipt)
+    current = bootstrap_installation_binding(receipt)
+    if (not isinstance(original, dict) or set(original) != set(current)
+            or (set(current) - {"runtime_candidate"}) != INSTALLATION_KEYS
+            or directory.name != receipt.get("deployment_id")
+            or directory.parent.name != receipt.get("guide_id")
+            or receipt.get("source_kind", "application") != "application"
+            or not service and (receipt.get("execution_mode") != "interactive" or receipt.get("service") is not None)
+            or any(not _same_json_value(current.get(key), original.get(key)) for key in LINEAGE_IDENTITY_KEYS)):
+        raise CustodyError("The original interactive application installation changed.")
+    state = (original["build_id"], original["package_sha256"])
+    target = (current["build_id"], current["package_sha256"])
+    values = {key: original[key] for key in LINEAGE_SOURCE_KEYS}
+    pointer = receipt.get("update")
+    edges = _lineage_journals(directory, in_flight) if state != target or pointer is not None else {}
+    walked = []
+    while state != target:
+        following = edges.get(state, [])
+        if not following:
+            raise _lineage_refusal(receipt, target)
+        if len(following) != 1 or len(walked) >= MAX_LINEAGE_UPDATES:
+            raise CustodyError(LINEAGE_CHANGED)
+        child, journal = following[0]
+        if any(row["update_id"] == journal["update_id"] for row in walked):
+            raise CustodyError(LINEAGE_CHANGED)
+        _require_lineage_edge(directory, child, journal)
+        walked.append(journal)
+        state = (journal["to_build_id"], journal["package_sha256"])
+        values.update({key: journal[key] for key in ("guide_version", "blueprint_hash", "brief_hash")},
+            build_id=journal["to_build_id"], package_sha256=journal["package_sha256"])
+    if any(not _same_json_value(current[key], values[key]) for key in LINEAGE_SOURCE_KEYS):
+        raise CustodyError(LINEAGE_CHANGED)
+    if pointer is None:
+        if walked:
+            raise CustodyError(LINEAGE_CHANGED)
+        return
+    if walked and walked[-1]["update_id"] == pointer.get("update_id"):
+        return
+    # Not an edge: a staged, blocked or settled transaction is transparent only
+    # from the current source. A changing one is visible only to its own worker.
+    own = in_flight is not None and _same_json_value(updates.update_binding(pointer), in_flight)
+    if (pointer.get("status") == "completed" or pointer.get("status") in ACTIVE_UPDATE and not own
+            or (pointer.get("from_build_id"), pointer.get("previous_package_sha256")) != target):
+        raise _lineage_refusal(receipt, target)
 
 
 def observe_bootstrap_admission(directory, selection, *, source_custody=None):
@@ -512,6 +683,10 @@ def require_bootstrap_admission_current(directory, selection, selected, observat
     require_bootstrap_history_settled(directory, selection)
 
 
+FRESH_RETAINED = ("This application retains a Fresh bootstrap attempt. Preserve its original inputs "
+    "and reconcile the native outcome before an ordinary start or source update.")
+
+
 def require_bootstrap_history_settled(directory, bootstrap_selection=None):
     """Only authentic Restore inputs may follow an entered uncertain Fresh."""
     directory = _path(directory)
@@ -519,12 +694,66 @@ def require_bootstrap_history_settled(directory, bootstrap_selection=None):
     if not entry.exists() and not entry.is_symlink():
         return
     if bootstrap_selection is None:
-        raise CustodyError("This application retains a Fresh bootstrap attempt. Preserve its original inputs and reconcile the native outcome before an ordinary start or source update.")
+        raise CustodyError(FRESH_RETAINED)
     selected = read_bootstrap_admission(directory, bootstrap_selection)
     require_restore_history_current(directory, selected["application_startup"])
 
 
-def require_restore_history_current(directory, application_startup):
+SETUP_RESTORE_CHANGED = ("The application's completed setup changed after this update was staged. Keep "
+    "its files and update history, and stage the accepted update again.")
+
+
+def require_update_bootstrap_history(directory, restore_selection, *, in_flight=None):
+    """Admit a source update after setup only through its owner's published Restore.
+
+    restore_selection is the exact pin of the completed Restore that the
+    trusted owner published on a normal Stop, recorded when the update was
+    staged. It is never request input. An entered Fresh without one refuses.
+    Returns the Restore value, or None for an installation that never entered
+    Fresh.
+    """
+    directory = _path(directory)
+    entry = directory / FRESH_ENTRY_NAME
+    if not entry.exists() and not entry.is_symlink():
+        if restore_selection is not None:
+            raise CustodyError(SETUP_RESTORE_CHANGED)
+        return None
+    if restore_selection is None:
+        raise CustodyError(FRESH_RETAINED)
+    try:
+        pin = _artifact_pin(restore_selection)
+        _private_parent(_path(pin.path))
+        value = _json(pin.read())
+    except (CustodyError, OSError, TypeError, ValueError) as error:
+        raise CustodyError(SETUP_RESTORE_CHANGED) from error
+    if _shape(value) != "restore":
+        raise CustodyError(FRESH_RETAINED)
+    require_restore_history_current(directory, value, in_flight=in_flight)
+    return value
+
+
+def setup_keeps_candidate(directory, application_startup, candidate):
+    """Whether a completed Restore's native inputs also hold for a candidate package.
+
+    These are the plan, roster, policy, runtime selection and model checks the
+    next Restore start applies to installed source, read from the candidate's
+    bytes. False means the update needs the application's replacement owner.
+    """
+    receipt = read_receipt(directory)
+    try:
+        plan = _json(_artifact_pin(application_startup["preparation_plan"]).read())
+        _plan_source(plan, candidate, _path(receipt["destination"]))
+        if not _same_json_value(updates._candidate_source_selection(candidate), receipt.get("runtime_candidate")):
+            return False
+        if (_managed_model_classes(_json(candidate["deployment.json"][0]))
+                and "model_configuration" not in application_startup):
+            return False
+    except (CustodyError, KeyError, TypeError, ValueError, UnicodeError, updates.DraftConflict):
+        return False
+    return True
+
+
+def require_restore_history_current(directory, application_startup, *, in_flight=None):
     """Read original Fresh lineage for an already selected Restore, without publishing."""
     directory = _path(directory)
     entry = directory / FRESH_ENTRY_NAME
@@ -544,7 +773,7 @@ def require_restore_history_current(directory, application_startup):
             or _path(read_receipt(directory)["destination"]) not in _path(value["provision_attempt_path"]).parents
             or _file_identity(entry) != identity):
         raise CustodyError("The retained original Fresh bootstrap entry changed.")
-    original = read_bootstrap_admission(directory, value["admission"])
+    original = read_original_fresh_admission(directory, value["admission"], in_flight=in_flight)
     if (original["application_startup"]["kind"] != "fresh"
             or original["application_startup"]["provision_attempt_path"] != value["provision_attempt_path"]):
         raise CustodyError("The retained entry lost its exact original Fresh selection.")
@@ -584,7 +813,7 @@ def bootstrap_output_paths(directory, application_startup):
         entry = directory / FRESH_ENTRY_NAME
         if entry.exists() or entry.is_symlink():
             value = _json(_read(entry, 16 * 1024))
-            original = read_bootstrap_admission(directory, value["admission"])["application_startup"]
+            original = read_original_fresh_admission(directory, value["admission"])["application_startup"]
         else:
             return root, (bundle, activation), activation
     paths = _fresh_paths(original, root, entered=True)

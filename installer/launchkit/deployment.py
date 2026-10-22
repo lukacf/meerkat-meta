@@ -1978,11 +1978,38 @@ class DeploymentService:
                 raise DraftConflict("The accepted application changed while preparing its update.")
             # No await separates the final source/design fences and publication.
             from .deployment_updates import stage
+            restore_selection = self._setup_update_restore(guide_id, deployment_id)
+            setup = {"restore_selection": restore_selection} if restore_selection is not None else {}
             if runtime_target is None:
-                stage(self._directory(guide_id), payload, report)
+                stage(self._directory(guide_id), payload, report, **setup)
             else:
-                stage(self._directory(guide_id), payload, report, runtime_target=runtime_target)
+                stage(self._directory(guide_id), payload, report, runtime_target=runtime_target, **setup)
             return await self.status(guide_id)
+
+    def _setup_update_restore(self, guide_id, deployment_id):
+        """The trusted owner's published completed Restore pin, after setup.
+
+        Only an installation that entered Fresh has one. The pin comes from the
+        selected application host, never from a request. Without a completed
+        Restore, the update path keeps its existing Fresh refusal. A background
+        Restore service keeps that refusal too.
+        """
+        from .deployment_application_bootstrap import FRESH_ENTRY_NAME, _shape, restored_service
+        from .forge_application_host import ForgeApplicationHost
+        directory = self._directory(guide_id, deployment_id)
+        entry = directory / FRESH_ENTRY_NAME
+        if not entry.exists() and not entry.is_symlink() or restored_service(read_receipt(directory)):
+            return None
+        select = getattr(self, "application_host_selection", None)
+        host = (select(guide_id, deployment_id) if callable(select)
+            else getattr(getattr(self, "application_setup_selection", None), "__self__", None))
+        if type(host) is not ForgeApplicationHost or host._startup_selection is None:
+            return None
+        try:
+            pin, value = host._selected_startup_observation(guide_id, deployment_id)
+        except FileNotFoundError:
+            return None
+        return pin.pin() if _shape(value) == "restore" else None
 
     async def _run(self, directory, mode, *, update_selection=None, bootstrap_selection=None,
             install_retention=None, install_binding=None, bootstrap_owner_source=None):
@@ -3425,12 +3452,29 @@ class DeploymentService:
                 raise DraftConflict("The original destination Restore selection changed before restart.")
             return await destination_owner.start_application(self, guide_id, deployment_id)
         if action != "stop":
-            from .deployment_application_bootstrap import require_bootstrap_history_settled, restored_service
+            from .deployment_application_bootstrap import (require_bootstrap_history_settled,
+                require_update_bootstrap_history, restored_service)
             bootstrap_selection = None
             if action == "restart" and restored_service(receipt):
                 from .deployment_service import verify_service
                 bootstrap_selection = verify_service(directory, receipt)["bootstrap_selection"]
-            require_bootstrap_history_settled(directory, bootstrap_selection)
+            if action in {"apply-update", "rollback", "recover-current"}:
+                # After setup, these admit only the completed Restore recorded at
+                # Stage, read from the private journal projection. Apply also
+                # requires the owner's current publication. Rollback and recovery
+                # may read their own unfinished transaction as lineage.
+                from .deployment_application_bootstrap import SETUP_RESTORE_CHANGED
+                from .deployment_updates import setup_restore_pin, update_binding
+                selected = read_receipt(directory).get("update") or {}
+                recorded = setup_restore_pin(directory, selected)
+                if (action == "apply-update" and recorded is not None
+                        and self._setup_update_restore(receipt["guide_id"], deployment_id) != recorded):
+                    raise DraftConflict(SETUP_RESTORE_CHANGED)
+                require_update_bootstrap_history(directory, recorded,
+                    in_flight=update_binding(selected) if action != "apply-update"
+                        and selected.get("update_id") == update_id else None)
+            else:
+                require_bootstrap_history_settled(directory, bootstrap_selection)
         if receipt.get("source_kind") == "native-team" and action in {"apply-update", "rollback", "recover-current"}:
             raise DraftConflict("Agent-team source updates are not supported here. Its installed source and state are preserved.")
         if (action == "stop" and receipt.get("execution_mode", "interactive") == "interactive"

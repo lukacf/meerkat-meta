@@ -1925,10 +1925,52 @@ def write_archive(path, payload):
         os.fsync(stream.fileno())
 
 
-def stage(directory, payload, report, *, runtime_target=None):
+SETUP_REPLACEMENT_BLOCKER = ("This update changes the application's native definition, instructions, tool "
+    "policy or runtime. After setup, Forge applies only updates that keep those unchanged. Keep the installed "
+    "build, or install the new build into a new folder.")
+
+
+SETUP_RESTORE_NAME = "setup-restore.json"
+
+
+def retain_setup_restore(root, restore_selection):
+    """Keep the owner's exact Restore pin private to one update journal.
+
+    The journal, and the receipt and status projections built from it, carry
+    only the selected file's digest, never its private path.
+    """
+    pin = {"path": restore_selection["path"], "sha256": restore_selection["sha256"]}
+    content = json.dumps(pin, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+    write_archive(Path(root) / SETUP_RESTORE_NAME, content)
+    return pin["sha256"]
+
+
+def setup_restore_pin(directory, update):
+    """The exact Restore pin recorded when this update was staged, or None."""
+    if not isinstance(update, dict) or "setup_restore_sha256" not in update:
+        return None
+    from .deployment_application_bootstrap import SETUP_RESTORE_CHANGED
+    from .connect_installer_caller import CustodyError, _json, _read
+    try:
+        pin = _json(_read(update_directory(directory, update["update_id"]) / SETUP_RESTORE_NAME, 64 * 1024))
+    except (CustodyError, OSError, DraftConflict) as error:
+        raise CustodyError(SETUP_RESTORE_CHANGED) from error
+    if (not isinstance(pin, dict) or set(pin) != {"path", "sha256"}
+            or pin["sha256"] != update["setup_restore_sha256"]):
+        raise CustodyError(SETUP_RESTORE_CHANGED)
+    return pin
+
+
+def stage(directory, payload, report, *, runtime_target=None, restore_selection=None):
+    """Stage one accepted package. After setup, only through the owner's completed Restore.
+
+    restore_selection is the pin the deployment service read from the trusted
+    owner. An update that keeps the Restore's native inputs is staged with that
+    pin; any other change after setup is blocked here.
+    """
     require_replacement_history_settled(directory)
-    from .deployment_application_bootstrap import require_bootstrap_history_settled
-    require_bootstrap_history_settled(directory)
+    from .deployment_application_bootstrap import require_update_bootstrap_history, setup_keeps_candidate
+    restore = require_update_bootstrap_history(directory, restore_selection)
     receipt = read_receipt(directory)
     if "supervisor_refresh" in receipt:
         from .deployment_supervisor import require_complete
@@ -1964,6 +2006,13 @@ def stage(directory, payload, report, *, runtime_target=None):
     write_private(root / "previous-receipt.json", {key: report_brief_hash(previous_report) if key == "brief_hash" else receipt[key] for key in BOUND_KEYS})
     changes, blockers = compatibility(previous, candidate, receipt, runtime_target=runtime_target)
     dependency_update = runtime_dependency_transition(previous, candidate, receipt, runtime_target=runtime_target)
+    native_definition_update = bool(instruction_configuration_update(previous, candidate)
+        or dependency_update and dependency_update["native_registry_update"])
+    host_instruction_update = bool(not maintained and has_host_instruction_carrier(candidate)
+        and not has_host_instruction_carrier(previous))
+    if restore is not None and (native_definition_update or host_instruction_update or dependency_update
+            or maintained or not setup_keeps_candidate(directory, restore, candidate)):
+        blockers.append(SETUP_REPLACEMENT_BLOCKER)
     transaction = {"update_id": identity, "status": "blocked" if blockers else "staged",
         "from_build_id": receipt["build_id"], "to_build_id": report["build_id"],
         "guide_version": report["guide_version"], "blueprint_hash": report["blueprint_hash"],
@@ -1972,14 +2021,16 @@ def stage(directory, payload, report, *, runtime_target=None):
         "previous_package_sha256": receipt["package_sha256"],
         "previous_source_digest": previous_report["verification"]["digest"], "changes": changes,
         "blockers": blockers, "rollback_available": False, "runtime_admission_possible": False,
-        "native_definition_update": bool(instruction_configuration_update(previous, candidate)
-            or dependency_update and dependency_update["native_registry_update"]),
+        "native_definition_update": native_definition_update,
         "runtime_dependency_update": dependency_update,
         "maintained_host_update": maintained,
-        "host_instruction_update": bool(not maintained and has_host_instruction_carrier(candidate) and not has_host_instruction_carrier(previous)),
+        "host_instruction_update": host_instruction_update,
         "host_instruction_scope": "Canonical profile skills on ordinary trusted-host send and keyed dispatch turns only; Console, native flows, schedules and internal peer turns are outside this carrier.",
         "detail": ("Update prepared for review, but cannot be applied yet. Installed source and private data have not changed."
                    if blockers else "The exact accepted update is staged. Installed source and private data have not changed.")}
+    if restore is not None:
+        # Apply and the worker re-verify this exact pin; the owner starts it.
+        transaction["setup_restore_sha256"] = retain_setup_restore(root, restore_selection)
     write_private(root / "update.json", transaction)
     return update_receipt(directory, update=transaction)
 
@@ -2625,11 +2676,17 @@ def retry_candidate(directory, expected_id, *, expected_binding=None, expected_i
     return candidate
 
 
-def committed(directory, expected_id, *, restored=False, expected_binding=None, expected_installation=None):
+def committed(directory, expected_id, *, restored=False, started=True, expected_binding=None, expected_installation=None):
+    """Settle a transaction. started=False: after setup, the owner's next Start runs this source."""
     _, root, update = transaction(directory, expected_id, expected_binding=expected_binding, expected_installation=expected_installation)
     rollback_available = not restored
-    detail = ("The previous verified source restarted and passed native bootstrap and live Console health." if restored
-              else "The accepted update passed native bootstrap and live Console health. External workflows still need their own verification.")
+    if started:
+        detail = ("The previous verified source restarted and passed native bootstrap and live Console health." if restored
+                  else "The accepted update passed native bootstrap and live Console health. External workflows still need their own verification.")
+    else:
+        detail = (("The previous source is restored and passed its application contract check." if restored
+                   else "The accepted update is installed and passed its application contract check.")
+                  + " The application is stopped. Start restores its completed setup with this source.")
     if (root / "application-replacement-attempt.json").exists():
         rollback_available = False
         detail += " The original replacement selection is retained. Native policy acceptance, definition commit and member adoption require their own exact receipts before a restart or rollback."
@@ -2641,5 +2698,7 @@ def committed(directory, expected_id, *, restored=False, expected_binding=None, 
         if not has_host_instruction_carrier(previous):
             rollback_available = False
             detail += " Previous source and history are retained, but its legacy host cannot restore continuing role instructions. Forward recovery remains available."
+    if not started and rollback_available:
+        detail += " If that Start fails, Roll back restores the previous source."
     return checkpoint(directory, root, update, expected_binding=expected_binding, expected_installation=expected_installation, status="rolled-back" if restored else "completed",
         rollback_available=rollback_available, detail=detail)

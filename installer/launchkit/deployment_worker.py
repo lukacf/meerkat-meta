@@ -1650,9 +1650,8 @@ async def _install_selected_product(supervisor, artifacts, require_current, comm
 async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=None, update_selection=None):
     """One source transaction, one verified startup, and at most one safe fallback."""
     from . import deployment_updates as updates
-    from .deployment_application_bootstrap import require_bootstrap_history_settled
+    from .deployment_application_bootstrap import require_update_bootstrap_history
     directory = supervisor.directory
-    require_bootstrap_history_settled(directory)
     if update_selection is not None:
         selected = updates.read_update_admission(directory, mode, update_selection)
         if update_id is not None and update_id != selected["binding"]["update_id"]:
@@ -1666,9 +1665,15 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
     # Existing trusted direct callers retain their first checked selection.
     # User-launched workers supply the earlier original admission explicitly.
     expected_binding = updates.update_binding(update) if expected_binding is None else updates.update_binding(expected_binding)
+    # After setup, the completed Restore recorded at Stage is the only history
+    # admission, and only its owner starts the application. This worker's own
+    # transaction may count as lineage while it changes source.
+    bootstrap_restore = updates.setup_restore_pin(directory, update)
+    require_update_bootstrap_history(directory, bootstrap_restore, in_flight=expected_binding)
+    owner_start = bootstrap_restore is not None
 
     def current_transaction(*, check_replacement=True):
-        require_bootstrap_history_settled(directory)
+        require_update_bootstrap_history(directory, bootstrap_restore, in_flight=expected_binding)
         if update_selection is not None:
             retained = updates.read_update_admission(directory, mode, update_selection)
             updates.require_update_binding(retained["binding"], expected_binding)
@@ -1691,6 +1696,8 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
     updates.require_application_policy_continuity(directory, update)
     updates.require_replacement_history_settled(directory)
     identity = update["update_id"]
+    if owner_start and replacement is not None:
+        raise DraftConflict("After setup, a replacement startup cannot follow its completed Restore. No source was changed.")
     if replacement is not None:
         from .deployment_application_startup import selected_inputs, ATTEMPT_NAME
         from .connect_application_startup import _joined
@@ -1722,7 +1729,7 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
     restore_data = rollback and update.get("runtime_admission_possible") is False and (
         update.get("rollback_kind") == "failed-update" or update["status"] in {"applying", "verifying", "recovery-needed"})
 
-    def publish(restored):
+    def publish(restored, *, started=True):
         nonlocal ready
         current = read_receipt(directory)
         _, _, bound = current_transaction()
@@ -1732,7 +1739,8 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
             raise DraftConflict("The started source no longer matches the admitted update transaction.")
         _, source = updates.checked_package(directory, "package.zip", current["package_sha256"])
         verify_destination(current, source)
-        updates.committed(directory, identity, restored=restored, expected_binding=expected_binding, expected_installation=expected_installation)
+        updates.committed(directory, identity, restored=restored, started=started,
+            expected_binding=expected_binding, expected_installation=expected_installation)
         ready = True
 
     async def observe_native_revision():
@@ -1915,7 +1923,8 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
                 # A ready new marker can survive an interruption before the
                 # checkpoint above. Ordinary startup re-inspects native truth;
                 # it does not repeat an already completed native apply.
-            checks = [("Updated application contract", "--application-check")] if product_update else [
+            # A set-up product's doctor needs its owner's startup, as at install.
+            checks = [("Updated application contract", "--application-check")] if product_update or owner_start else [
                 ("Update prerequisites", "--doctor"), ("Updated application contract", "--application-check")]
             for name, flag in checks:
                 verify_destination(read_receipt(directory), files)
@@ -1972,7 +1981,11 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
                 raise RuntimeError("Previous source and canonical configuration were restored as a new observed native revision, but its legacy host cannot restore continuing role instructions. Existing sessions and all current private records are preserved; recover the current accepted application rather than claiming role rollback.")
         updates._require_runtime_framework_configuration(read_receipt(directory), current)
         current_transaction()
-        if replacement is None:
+        if owner_start:
+            # The owner's next Start restores the completed setup with this
+            # checked source. No worker child selects bootstrap inputs.
+            publish(restored, started=False)
+        elif replacement is None:
             await supervisor.start(definition, on_ready=lambda: publish(restored))
         else:
             from .deployment_application_startup import selected_inputs, retain_attempt
@@ -2239,14 +2252,20 @@ async def run(directory, mode, *, update_selection=None, bootstrap_selection=Non
         if bootstrap_lifecycle_binding(read_receipt(directory)) != original_lifecycle:
             raise DraftConflict("The original bootstrap worker lifecycle changed before supervisor admission.")
         require_bootstrap_history_settled(directory, bootstrap_selection=original_bootstrap)
-    from .deployment_application_bootstrap import require_bootstrap_history_settled
-    require_bootstrap_history_settled(directory, bootstrap_selection=original_bootstrap)
+    from .deployment_application_bootstrap import (require_bootstrap_history_settled,
+        require_update_bootstrap_history)
+    if update_selection is None:
+        require_bootstrap_history_settled(directory, bootstrap_selection=original_bootstrap)
     expected = None
     if update_selection is not None:
         from .deployment_updates import read_update_admission, transaction, require_recovery_source
         expected = read_update_admission(directory, mode, update_selection)
-        receipt, _, _ = transaction(directory, expected["binding"]["update_id"],
+        receipt, _, staged = transaction(directory, expected["binding"]["update_id"],
                                     expected_binding=expected["binding"], expected_installation=expected["installation"])
+        # After setup, only the completed Restore recorded at Stage admits it.
+        from .deployment_updates import setup_restore_pin
+        require_update_bootstrap_history(directory, setup_restore_pin(directory, staged),
+            in_flight=expected["binding"])
         require_recovery_source(directory, expected)
     if mode in {"update", "rollback", "recover-current"}:
         if expected is None:

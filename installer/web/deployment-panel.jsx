@@ -8,7 +8,7 @@ import { packagePreparationReason } from "./package-availability.mjs";
 import { deploymentRequiredFields, deploymentFieldId, deploymentRemovableFields, deploymentFieldIssues } from "./deployment-configuration.mjs";
 import { deploymentCanPrepare, deploymentCanFreshInstall, deploymentFreshInstallRestriction, deploymentCanSubmit, deploymentConsole, deploymentIsActive,
   deploymentPhase, deploymentDiagnostic, deploymentUpdateDiagnostics, deploymentFailedAttempts, deploymentSettings, deploymentUrl, deploymentExecutionModes, deploymentHandoff,
-  deploymentDestinationLabel, deploymentOptionsCurrent, deploymentFreshInstallNeedsSetup, deploymentRequiresApplicationStartup, deploymentCanStageUpdate, deploymentUpdateAction,
+  deploymentDestinationLabel, deploymentOptionsCurrent, deploymentFreshInstallNeedsSetup, deploymentRequiresApplicationStartup, deploymentCanStageUpdate, deploymentUpdateAction, deploymentUpdateOwnerStart,
   deploymentUpdatePreparation, deploymentBackgroundUpdate,
   deploymentExperienceKey, deploymentExperiences, createDeploymentPollingGate,
   deploymentCanConfigure, deploymentCanConfirmCleanup, deploymentCanStopFailedBackground, deploymentNeedsCleanup, deploymentResumeAction, deploymentApplicationStartupPending, deploymentConfigurationForm, deploymentConfigurationHints,
@@ -137,6 +137,7 @@ export function DeploymentPanel({ state, plan, build, designBusy, pendingManual,
   const portObservation = deploymentPortObservation(portCheck.key === configurationKey ? portCheck.options : formOptions,
     build, state, values.MOBKIT_PORT || "", receipt);
   const update = receipt?.update;
+  const ownerStart = deploymentUpdateOwnerStart(update);
   const backgroundUpdate = deploymentBackgroundUpdate(receipt, state);
   const recoverCurrent = deploymentUpdateAction(receipt, build, state, "recover-current");
   const stale = receipt && (!artifactIsCurrent(receipt, state) ||
@@ -937,9 +938,11 @@ export function DeploymentPanel({ state, plan, build, designBusy, pendingManual,
     </DeploymentInstallationArea>
     <DeploymentSettingsGuidance receipt={receipt} />
     {update && <div className="deployment-update" data-update-status={update.status}>
-      <h3>{update.status === "completed" ? "Accepted application update verified" : update.status === "rolled-back" ? "Previous application restored and verified" : update.status === "blocked" ? receipt.execution_mode === "background" && !backgroundUpdate.supported ? "Update compatibility preview" : "This update needs a migration" : ["recovery-needed", "recovering-current"].includes(update.status) ? "Recover this application" : "Update this installed application"}</h3>
+      <h3>{update.status === "completed" ? ownerStart ? "Accepted application update installed" : "Accepted application update verified" : update.status === "rolled-back" ? ownerStart ? "Previous application restored" : "Previous application restored and verified" : update.status === "blocked" ? receipt.execution_mode === "background" && !backgroundUpdate.supported ? "Update compatibility preview" : "This update needs a migration" : ["recovery-needed", "recovering-current"].includes(update.status) ? "Recover this application" : "Update this installed application"}</h3>
       <p>{update.detail}</p>
-      {(receipt.execution_mode !== "background" || backgroundUpdate.supported) && <p className="deployment-note">Application-only updates keep private settings and local application data and native history. If startup fails, Forge attempts to restore the previous source, preserves recorded activity, and reports whether recovery passed. Rollback does not undo external service actions.</p>}
+      {(receipt.execution_mode !== "background" || backgroundUpdate.supported) && <p className="deployment-note">{ownerStart
+        ? "After setup, applying an update installs and checks the accepted source while the application stays stopped. Start restores its completed setup with the installed source. If that Start fails, Roll back restores the previous source when it is offered. Rollback does not undo external service actions."
+        : "Application-only updates keep private settings and local application data and native history. If startup fails, Forge attempts to restore the previous source, preserves recorded activity, and reports whether recovery passed. Rollback does not undo external service actions."}</p>}
       {update.blockers?.length > 0 && <ul className="deployment-warning">{update.blockers.map((item, index) => <li key={index}>{item}</li>)}</ul>}
       <DeploymentUpdateActions receipt={receipt} build={build} state={state}
         disabled={mutationBlocked || busy || designBusy || pendingManual} onAction={action} />

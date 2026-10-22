@@ -283,7 +283,7 @@ class LocalApplicationPreparationOwner:
         """
         from .local_application_recovery import _pin
         from .deployment_application_bootstrap import (FRESH_ENTRY_NAME, _artifact_pin,
-            _observe_inputs, _shape, read_bootstrap_admission, require_restore_history_current)
+            _observe_inputs, _shape, read_original_fresh_admission, require_restore_history_current)
         from .deployment_worker import read_receipt
         directory, inputs = self._directory, self._inputs
         path, entry = inputs.startup_selection_path, directory / FRESH_ENTRY_NAME
@@ -318,7 +318,7 @@ class LocalApplicationPreparationOwner:
             if (not isinstance(record, dict) or set(record) != {"kind", "admission", "provision_attempt_path"}
                     or record["kind"] != "application-bootstrap-entry"
                     or record["provision_attempt_path"] != fresh["provision_attempt_path"]
-                    or read_bootstrap_admission(directory, record["admission"])["application_startup"] != fresh):
+                    or read_original_fresh_admission(directory, record["admission"])["application_startup"] != fresh):
                 raise CustodyError("The entered original Fresh lineage changed during recovery.")
         observed.require_current()
         from .connect_installer_caller import NativeInstallerCaller, ProductGatewayFile
