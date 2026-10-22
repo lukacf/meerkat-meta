@@ -10023,6 +10023,12 @@ fn the_version_two_schema_is_pinned() {
     assert_eq!(
         objects_added_by(&tx, &before),
         vec![
+            "table announcement_audit: id INTEGER pk1, mob_id TEXT notnull, source_id TEXT \
+             notnull, member TEXT notnull, at_ms INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "index announcement_audit_by_member on announcement_audit: member, id".to_string(),
+            "index announcement_audit_by_source on announcement_audit: mob_id, source_id, id"
+                .to_string(),
             "table announcement_source_streams: mob_id TEXT notnull pk1, source_id TEXT \
              notnull pk2, stream TEXT notnull pk3, generation INTEGER notnull, phase TEXT \
              notnull, mode TEXT notnull, max_items INTEGER, backfilled INTEGER notnull, \
@@ -10133,12 +10139,12 @@ async fn a_version_one_store_migrates_to_version_two_in_place() {
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
              AND name IN ('announcement_sources', 'announcement_source_topics',
-                          'announcement_source_streams')",
+                          'announcement_source_streams', 'announcement_audit')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 3);
+    assert_eq!(tables, 4);
 }
 
 // ---------------------------------------------------------------------------
