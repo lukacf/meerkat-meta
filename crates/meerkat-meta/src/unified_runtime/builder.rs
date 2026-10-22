@@ -1853,16 +1853,26 @@ impl UnifiedRuntimeBuilder {
         // publication, the run-start holds it stages for those members and
         // the identity bootstrap all use this one roster, so a hold never
         // names an identity the bootstrap's roster lacks.
+        //
+        // The roster is resolved from the definition the mob runs: on a
+        // resume the stored one, judged against the supplied composition
+        // first, so a resume preparation would refuse is refused before the
+        // roster provider sees its definition. Preparation then resumes
+        // exactly what was judged here, even when the supplied definition
+        // differs (a candidate launch that boots the stored one knowingly).
         let identity_roster_specs = if wants_identity_first {
             let provider = self.roster_provider.as_ref().ok_or_else(|| {
                 UnifiedRuntimeBuilderError::Bootstrap(UnifiedRuntimeBootstrapError::IdentityFirst(
                     "identity-first validation requires roster_provider".to_string(),
                 ))
             })?;
+            let launch_definition = mob_spec.read_launch_definition().await.map_err(|error| {
+                UnifiedRuntimeBuilderError::Bootstrap(UnifiedRuntimeBootstrapError::Mob(error))
+            })?;
             Some(
                 provider
                     .roster(&RosterContext {
-                        mob_definition: Some(mob_spec.definition.clone()),
+                        mob_definition: Some(launch_definition),
                         previous_identities: Vec::new(),
                     })
                     .await
@@ -1919,7 +1929,13 @@ impl UnifiedRuntimeBuilder {
             )
         })
         .await
-        .map_err(UnifiedRuntimeBuilderError::Bootstrap)?;
+        .map_err(|error| {
+            UnifiedRuntimeBuilderError::Bootstrap(if wants_identity_first {
+                name_a_definition_change_after_the_roster(error)
+            } else {
+                error
+            })
+        })?;
 
         #[cfg(feature = "extension-state")]
         {
@@ -3189,6 +3205,30 @@ fn storage_resolution_builder_error(
             UnifiedRuntimeBuilderError::Delivery(error)
         }
     }
+}
+
+/// An identity-first resume binds to the stored definition its roster was
+/// resolved from, and Core refuses it when that definition changed in
+/// between. Core's message names only epochs; say what changed relative to
+/// the roster.
+fn name_a_definition_change_after_the_roster(
+    error: UnifiedRuntimeBootstrapError,
+) -> UnifiedRuntimeBootstrapError {
+    let UnifiedRuntimeBootstrapError::Mob(crate::mob_handle_runtime::MobRuntimeError::Mob(
+        changed @ meerkat_mob::MobError::MobDefinitionAuthorityChanged { expected_epoch, .. },
+    )) = &error
+    else {
+        return error;
+    };
+    let cause = if *expected_epoch == crate::mob_handle_runtime::NO_STORED_DEFINITION_EPOCH {
+        "the mob storage gained a definition after this boot resolved its roster from the \
+         supplied one"
+    } else {
+        "the mob storage's definition changed after this boot resolved its roster from it"
+    };
+    UnifiedRuntimeBootstrapError::IdentityFirst(format!(
+        "{cause}, so the mob is not resumed: {changed}"
+    ))
 }
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]

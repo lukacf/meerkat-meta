@@ -5275,3 +5275,651 @@ async fn identity_persistent_builder_registers_owners_before_dirty_prepare() {
     let shutdown = runtime.shutdown().await;
     assert!(shutdown.cleanup_completed(), "{shutdown:?}");
 }
+
+/// One `[profiles.<name>]` per name, the shape the stored-definition rows
+/// resume.
+fn roster_definition(mob_id: &str, profiles: &[&str]) -> meerkat_mob::MobDefinition {
+    let mut toml = format!("[mob]\nid = \"{mob_id}\"\n");
+    for profile in profiles {
+        toml.push_str(&format!(
+            r#"
+[profiles.{profile}]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+external_addressable = true
+
+[profiles.{profile}.tools]
+comms = true
+"#
+        ));
+    }
+    meerkat_mob::MobDefinition::from_toml(&toml).expect("roster fixture definition")
+}
+
+/// Resolves one identity per profile of the definition it is handed
+/// (`agent:<profile>`) and records each call's profile names, so a row can
+/// tell which definition a roster was resolved from.
+#[derive(Default)]
+struct DefinitionRosterProvider {
+    calls: Mutex<Vec<Option<Vec<String>>>>,
+}
+
+impl DefinitionRosterProvider {
+    fn calls(&self) -> Vec<Option<Vec<String>>> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl RosterProvider for DefinitionRosterProvider {
+    async fn roster(&self, context: &RosterContext) -> Result<Vec<DurableAgentSpec>, RosterError> {
+        let profiles = context.mob_definition.as_ref().map(|definition| {
+            definition
+                .profiles
+                .keys()
+                .map(|profile| profile.as_str().to_string())
+                .collect::<Vec<_>>()
+        });
+        self.calls.lock().unwrap().push(profiles.clone());
+        Ok(profiles
+            .unwrap_or_default()
+            .iter()
+            .map(|profile| durable_spec_with_profile(&format!("agent:{profile}"), profile))
+            .collect())
+    }
+}
+
+/// A [`DefinitionRosterProvider`] that first writes `seed` into the mob's
+/// event log: host code landing a write between the builder's read of the
+/// mob storage and the mob's preparation.
+struct SeedingRosterProvider {
+    roster: DefinitionRosterProvider,
+    events: Arc<meerkat_mob::InMemoryMobEventStore>,
+    seed: Mutex<Option<meerkat_mob::MobDefinition>>,
+}
+
+#[async_trait]
+impl RosterProvider for SeedingRosterProvider {
+    async fn roster(&self, context: &RosterContext) -> Result<Vec<DurableAgentSpec>, RosterError> {
+        let seed = self.seed.lock().unwrap().take();
+        if let Some(definition) = seed {
+            seed_mob_created(&self.events, definition).await;
+        }
+        self.roster.roster(context).await
+    }
+}
+
+/// Writes the `MobCreated` event a create would, so the log holds `definition`.
+async fn seed_mob_created(
+    events: &meerkat_mob::InMemoryMobEventStore,
+    definition: meerkat_mob::MobDefinition,
+) {
+    meerkat_mob::MobEventStore::append(
+        events,
+        meerkat_mob::NewMobEvent::for_test(
+            definition.id.clone(),
+            meerkat_mob::MobEventKind::MobCreated {
+                definition: Box::new(definition),
+            },
+        ),
+    )
+    .await
+    .expect("seed the mob event log");
+}
+
+/// The persistent composition of [`activation_regression_spec`] over a
+/// chosen definition, on a durable mob ledger beside the sessions.
+async fn roster_definition_spec(
+    root: &std::path::Path,
+    definition: meerkat_mob::MobDefinition,
+) -> meerkat_meta::MobBootstrapSpec {
+    let (storage, provenance) =
+        meerkat_meta::mob_composition_manifest::persistent_mob_storage(root.join("mob.sqlite3"))
+            .expect("persistent mob ledger");
+    roster_definition_spec_over(root, definition, storage, provenance).await
+}
+
+/// [`roster_definition_spec`] over a chosen mob storage and provenance; the
+/// sessions stay durable under `root`.
+async fn roster_definition_spec_over(
+    root: &std::path::Path,
+    definition: meerkat_mob::MobDefinition,
+    storage: meerkat_mob::MobStorage,
+    provenance: meerkat_meta::mob_composition_manifest::MobStorageProvenance,
+) -> meerkat_meta::MobBootstrapSpec {
+    std::fs::create_dir_all(root).expect("roster fixture root");
+    meerkat_meta::MobBootstrapSpec::persistent(
+        definition,
+        storage,
+        provenance,
+        root.to_path_buf(),
+        8,
+    )
+    .await
+    .expect("persistent spec with agent mob tools")
+    .with_child_mob_storage(meerkat_meta::ChildMobStorage::ProcessBound)
+    .with_options(meerkat_meta::MobBootstrapOptions {
+        allow_ephemeral_sessions: false,
+        notify_orchestrator_on_resume: true,
+        default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+    })
+}
+
+async fn build_roster_definition_runtime(
+    root: &std::path::Path,
+    mob_id: &str,
+    spec: meerkat_meta::MobBootstrapSpec,
+    roster: Arc<dyn RosterProvider>,
+) -> Result<meerkat_meta::UnifiedRuntime, meerkat_meta::UnifiedRuntimeBuilderError> {
+    Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .mob_spec(spec)
+            .persistent_state(root)
+            .module_config(meerkat_meta::MetaConfig {
+                modules: Vec::new(),
+                discovery: meerkat_meta::DiscoverySpec {
+                    namespace: mob_id.to_string(),
+                    modules: Vec::new(),
+                },
+                pre_spawn: Vec::new(),
+            })
+            .timeout(Duration::from_secs(2))
+            .roster_provider(roster)
+            .build(),
+    )
+    .await
+}
+
+/// Stops a runtime and releases it, so a successor can open the same state.
+/// Callers drop their exported identity views (public owners, D67) first.
+async fn stop_roster_definition_runtime(runtime: meerkat_meta::UnifiedRuntime) {
+    let shutdown = runtime.shutdown().await;
+    assert!(shutdown.cleanup_completed(), "{shutdown:?}");
+    drop(runtime);
+}
+
+fn lead_only() -> Option<Vec<String>> {
+    Some(vec!["lead".to_string()])
+}
+
+/// A candidate launch that knowingly boots the STORED mob definition
+/// (`CandidateDefinition::Stored`) while its supplied definition adds a
+/// profile resolves its roster from the stored definition: the roster
+/// provider is handed the definition the resumed mob runs, so no identity is
+/// resolved for the supplied profile the running mob does not have.
+#[tokio::test]
+async fn a_candidate_resume_resolves_its_roster_from_the_stored_definition() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let mob_id = unique_builder_mob_id();
+    let lead = AgentIdentity::parse("agent:lead").expect("lead identity");
+    let worker = AgentIdentity::parse("agent:worker").expect("worker identity");
+
+    let first = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec(temp.path(), roster_definition(&mob_id, &["lead"])).await,
+        Arc::new(DefinitionRosterProvider::default()),
+    )
+    .await
+    .expect("authoritative first boot");
+    assert!(
+        first
+            .identity_runtime()
+            .expect("first identity runtime")
+            .identity_bootstrap_status()
+            .ready
+    );
+    stop_roster_definition_runtime(first).await;
+
+    let roster = Arc::new(DefinitionRosterProvider::default());
+    let candidate = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec(temp.path(), roster_definition(&mob_id, &["lead", "worker"]))
+            .await
+            .with_composition_authority(
+                meerkat_meta::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+            )
+            .with_candidate_definition(
+                meerkat_meta::mob_composition_manifest::CandidateDefinition::Stored,
+            ),
+        roster.clone(),
+    )
+    .await;
+    // Judged before the build result: a roster resolved from the supplied
+    // definition names an identity whose profile the resumed mob lacks.
+    let calls = roster.calls();
+    assert_eq!(
+        calls.first(),
+        Some(&lead_only()),
+        "the roster resolved before mob preparation must come from the stored definition \
+         the candidate resumes, not the supplied one: {calls:?}"
+    );
+    let candidate = candidate.expect("the candidate boots the stored definition");
+    assert_eq!(
+        candidate
+            .mob_handle()
+            .status()
+            .await
+            .expect("candidate mob state"),
+        meerkat_mob::MobState::Running
+    );
+    let identities = candidate.identity_runtime().expect("identity runtime");
+    let bootstrap = identities.identity_bootstrap_status();
+    assert!(bootstrap.ready, "{bootstrap:?}");
+    let status = identities.status(&lead).await.expect("lead resumes");
+    assert_eq!(status.state, IdentityLifecycleState::Active);
+    assert!(
+        matches!(
+            identities.status(&worker).await,
+            Err(meerkat_meta::identity_first::IdentityRuntimeError::UnknownIdentity(_))
+        ),
+        "no identity is resolved for the supplied profile the running mob lacks"
+    );
+    let calls = roster.calls();
+    assert!(
+        calls.iter().all(|call| call == &lead_only()),
+        "every roster call of the candidate boot sees the stored definition: {calls:?}"
+    );
+    drop(identities);
+    stop_roster_definition_runtime(candidate).await;
+}
+
+/// Existing behaviour: a fresh boot resolves its roster from the supplied
+/// definition (nothing is stored yet), and an authoritative resume of the
+/// unchanged definition resolves the same roster and resumes the same
+/// identity session.
+#[tokio::test]
+async fn an_unchanged_resume_and_a_fresh_boot_resolve_the_supplied_roster() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let mob_id = unique_builder_mob_id();
+    let lead = AgentIdentity::parse("agent:lead").expect("lead identity");
+
+    let fresh_roster = Arc::new(DefinitionRosterProvider::default());
+    let fresh = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec(temp.path(), roster_definition(&mob_id, &["lead"])).await,
+        fresh_roster.clone(),
+    )
+    .await
+    .expect("fresh boot");
+    let calls = fresh_roster.calls();
+    assert_eq!(calls.first(), Some(&lead_only()), "{calls:?}");
+    let identities = fresh.identity_runtime().expect("fresh identity runtime");
+    assert!(identities.identity_bootstrap_status().ready);
+    let before = identities.status(&lead).await.expect("fresh lead");
+    assert_eq!(before.state, IdentityLifecycleState::Active);
+    assert!(before.session_id.is_some());
+    drop(identities);
+    stop_roster_definition_runtime(fresh).await;
+
+    let resume_roster = Arc::new(DefinitionRosterProvider::default());
+    let resumed = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec(temp.path(), roster_definition(&mob_id, &["lead"])).await,
+        resume_roster.clone(),
+    )
+    .await
+    .expect("unchanged authoritative resume");
+    let calls = resume_roster.calls();
+    assert_eq!(calls.first(), Some(&lead_only()), "{calls:?}");
+    let identities = resumed
+        .identity_runtime()
+        .expect("resumed identity runtime");
+    assert!(identities.identity_bootstrap_status().ready);
+    let after = identities.status(&lead).await.expect("resumed lead");
+    assert_eq!(after.state, IdentityLifecycleState::Active);
+    assert_eq!(after.session_id, before.session_id);
+    drop(identities);
+    stop_roster_definition_runtime(resumed).await;
+}
+
+/// An authoritative resume whose supplied definition differs from the stored
+/// one is refused by the composition pin before its roster is resolved: the
+/// roster provider never sees a stored definition that has not passed the
+/// composition checks.
+#[tokio::test]
+async fn an_authoritative_resume_of_a_changed_definition_is_refused_before_the_roster() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let mob_id = unique_builder_mob_id();
+
+    let first = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec(temp.path(), roster_definition(&mob_id, &["lead"])).await,
+        Arc::new(DefinitionRosterProvider::default()),
+    )
+    .await
+    .expect("authoritative first boot");
+    stop_roster_definition_runtime(first).await;
+
+    let roster = Arc::new(DefinitionRosterProvider::default());
+    let refused = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec(temp.path(), roster_definition(&mob_id, &["lead", "worker"])).await,
+        roster.clone(),
+    )
+    .await;
+    let calls = roster.calls();
+    assert!(
+        calls.is_empty(),
+        "the roster provider must not see a definition that failed the composition checks: \
+         {calls:?}"
+    );
+    let Err(error) = refused else {
+        panic!("an authoritative resume of a changed definition must be refused");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("diverges from the canonical definition"),
+        "{error}"
+    );
+}
+
+/// A candidate launch whose supplied definition differs from the stored one,
+/// without acknowledging the stored definition (the default,
+/// `CandidateDefinition::RequireMatch`), is refused before its roster is
+/// resolved.
+#[tokio::test]
+async fn a_candidate_resume_of_a_changed_definition_is_refused_before_the_roster() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let mob_id = unique_builder_mob_id();
+
+    let first = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec(temp.path(), roster_definition(&mob_id, &["lead"])).await,
+        Arc::new(DefinitionRosterProvider::default()),
+    )
+    .await
+    .expect("authoritative first boot");
+    stop_roster_definition_runtime(first).await;
+
+    let roster = Arc::new(DefinitionRosterProvider::default());
+    let refused = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec(temp.path(), roster_definition(&mob_id, &["lead", "worker"]))
+            .await
+            .with_composition_authority(
+                meerkat_meta::mob_composition_manifest::CompositionAuthority::NonAuthoritative,
+            ),
+        roster.clone(),
+    )
+    .await;
+    let calls = roster.calls();
+    assert!(
+        calls.is_empty(),
+        "the roster provider must not see a definition that failed the composition checks: \
+         {calls:?}"
+    );
+    let Err(error) = refused else {
+        panic!("a candidate resume of a changed definition must be refused");
+    };
+    assert!(
+        matches!(
+            &error,
+            meerkat_meta::UnifiedRuntimeBuilderError::Bootstrap(
+                meerkat_meta::UnifiedRuntimeBootstrapError::Mob(
+                    meerkat_meta::MobRuntimeError::CompositionProvenance(
+                        meerkat_meta::mob_composition_manifest::MobCompositionProvenanceError::CandidateDivergent {
+                            fields
+                        }
+                    )
+                )
+            ) if fields.iter().any(|field| field.starts_with("profiles.worker"))
+        ),
+        "{error}"
+    );
+}
+
+/// An authoritative resume of a storage whose composition manifest is gone
+/// adopts the supplied definition as its recorded composition, as before:
+/// the judgement made before the roster is resolved defers that write to
+/// the mob's preparation, which records the manifest.
+#[tokio::test]
+async fn a_resume_without_its_manifest_records_the_supplied_composition() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let mob_id = unique_builder_mob_id();
+    let manifest =
+        meerkat_meta::mob_composition_manifest::manifest_path(&temp.path().join("mob.sqlite3"));
+
+    let first = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec(temp.path(), roster_definition(&mob_id, &["lead"])).await,
+        Arc::new(DefinitionRosterProvider::default()),
+    )
+    .await
+    .expect("authoritative first boot");
+    stop_roster_definition_runtime(first).await;
+    assert!(manifest.exists(), "the first boot records its composition");
+    std::fs::remove_file(&manifest).expect("remove the composition manifest");
+
+    let roster = Arc::new(DefinitionRosterProvider::default());
+    let resumed = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec(temp.path(), roster_definition(&mob_id, &["lead"])).await,
+        roster.clone(),
+    )
+    .await
+    .expect("a resume without a manifest adopts the supplied composition");
+    let calls = roster.calls();
+    assert_eq!(calls.first(), Some(&lead_only()), "{calls:?}");
+    assert!(
+        manifest.exists(),
+        "the resume records the supplied definition as the composition"
+    );
+    stop_roster_definition_runtime(resumed).await;
+}
+
+/// The in-process arm: a mob storage declared in-process (a shared
+/// in-memory event log here, with the sessions on disk) resumes without
+/// composition verification, so it boots the stored definition whatever was
+/// supplied. An unchanged resume still boots, bound to the snapshot its
+/// roster was resolved from, and a resume whose supplied definition adds a
+/// profile resolves its roster from the stored definition it runs.
+#[tokio::test]
+async fn an_in_process_resume_resolves_its_roster_from_the_stored_definition() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let mob_id = unique_builder_mob_id();
+    let lead = AgentIdentity::parse("agent:lead").expect("lead identity");
+    let worker = AgentIdentity::parse("agent:worker").expect("worker identity");
+    let storage = meerkat_mob::MobStorage::in_memory();
+    let in_process =
+        meerkat_meta::mob_composition_manifest::MobStorageProvenance::declared_ephemeral;
+
+    let first = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec_over(
+            temp.path(),
+            roster_definition(&mob_id, &["lead"]),
+            storage.clone(),
+            in_process(),
+        )
+        .await,
+        Arc::new(DefinitionRosterProvider::default()),
+    )
+    .await
+    .expect("in-process first boot");
+    let identities = first.identity_runtime().expect("first identity runtime");
+    let before = identities.status(&lead).await.expect("first lead");
+    assert_eq!(before.state, IdentityLifecycleState::Active);
+    drop(identities);
+    stop_roster_definition_runtime(first).await;
+
+    let roster = Arc::new(DefinitionRosterProvider::default());
+    let unchanged = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec_over(
+            temp.path(),
+            roster_definition(&mob_id, &["lead"]),
+            storage.clone(),
+            in_process(),
+        )
+        .await,
+        roster.clone(),
+    )
+    .await
+    .expect("an unchanged in-process resume boots");
+    let calls = roster.calls();
+    assert_eq!(calls.first(), Some(&lead_only()), "{calls:?}");
+    let identities = unchanged
+        .identity_runtime()
+        .expect("resumed identity runtime");
+    let after = identities.status(&lead).await.expect("resumed lead");
+    assert_eq!(after.state, IdentityLifecycleState::Active);
+    assert_eq!(after.session_id, before.session_id);
+    drop(identities);
+    stop_roster_definition_runtime(unchanged).await;
+
+    let roster = Arc::new(DefinitionRosterProvider::default());
+    let changed = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec_over(
+            temp.path(),
+            roster_definition(&mob_id, &["lead", "worker"]),
+            storage.clone(),
+            in_process(),
+        )
+        .await,
+        roster.clone(),
+    )
+    .await;
+    let calls = roster.calls();
+    assert_eq!(
+        calls.first(),
+        Some(&lead_only()),
+        "the in-process resume runs the stored definition, so its roster must be resolved \
+         from it, not from the supplied one: {calls:?}"
+    );
+    let changed = changed.expect("the in-process resume boots the stored definition");
+    let identities = changed.identity_runtime().expect("identity runtime");
+    assert_eq!(
+        identities.status(&lead).await.expect("lead").state,
+        IdentityLifecycleState::Active
+    );
+    assert!(
+        matches!(
+            identities.status(&worker).await,
+            Err(meerkat_meta::identity_first::IdentityRuntimeError::UnknownIdentity(_))
+        ),
+        "no identity is resolved for the supplied profile the running mob lacks"
+    );
+    drop(identities);
+    stop_roster_definition_runtime(changed).await;
+}
+
+/// A definition written into the mob's event log after the builder read it
+/// empty (by the roster provider itself, which runs between that read and
+/// the mob's preparation) is refused, not resumed: the roster was resolved
+/// from the supplied definition, not from the one that appeared.
+#[tokio::test]
+async fn a_definition_written_after_the_roster_was_resolved_is_refused() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let mob_id = unique_builder_mob_id();
+    let events = Arc::new(meerkat_mob::InMemoryMobEventStore::new());
+    let roster = Arc::new(SeedingRosterProvider {
+        roster: DefinitionRosterProvider::default(),
+        events: events.clone(),
+        seed: Mutex::new(Some(roster_definition(&mob_id, &["lead", "worker"]))),
+    });
+
+    let result = build_roster_definition_runtime(
+        temp.path(),
+        &mob_id,
+        roster_definition_spec_over(
+            temp.path(),
+            roster_definition(&mob_id, &["lead"]),
+            meerkat_mob::MobStorage::with_events(events.clone()),
+            meerkat_meta::mob_composition_manifest::MobStorageProvenance::declared_ephemeral(),
+        )
+        .await,
+        roster.clone(),
+    )
+    .await;
+    let calls = roster.roster.calls();
+    assert_eq!(
+        calls.first(),
+        Some(&lead_only()),
+        "the roster was resolved from the supplied definition: {calls:?}"
+    );
+    let Err(error) = result else {
+        panic!("a definition that appeared after the roster was resolved must not be resumed");
+    };
+    // Core's typed refusal (expected epoch 0: the storage held no definition
+    // when the roster was resolved), named by its cause.
+    assert!(
+        matches!(
+            &error,
+            meerkat_meta::UnifiedRuntimeBuilderError::Bootstrap(
+                meerkat_meta::UnifiedRuntimeBootstrapError::IdentityFirst(detail)
+            ) if detail.contains(
+                "the mob storage gained a definition after this boot resolved its roster"
+            ) && detail.contains("mob definition authority changed before resume: expected epoch 0")
+        ),
+        "{error}"
+    );
+}
+
+/// A storage that already holds events, with nothing declared about what it
+/// is, is refused before its stored definition reaches the roster provider:
+/// the `UnprovenStorage` refusal mob preparation makes, now ahead of the host
+/// code the builder's read of the storage feeds.
+#[tokio::test]
+async fn an_undeclared_storage_holding_events_is_refused_before_the_roster_is_resolved() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let mob_id = unique_builder_mob_id();
+    let events = Arc::new(meerkat_mob::InMemoryMobEventStore::new());
+    seed_mob_created(&events, roster_definition(&mob_id, &["lead"])).await;
+    let roster = Arc::new(DefinitionRosterProvider::default());
+
+    // A persistent spec refuses undeclared mob storage when composed, so
+    // this row composes the identity-first external path, which takes it.
+    let result = Box::pin(
+        UnifiedRuntimeBuilder::default()
+            .definition(roster_definition(&mob_id, &["lead"]))
+            .mob_storage(
+                meerkat_mob::MobStorage::with_events(events.clone()),
+                meerkat_meta::mob_composition_manifest::MobStorageProvenance::default(),
+            )
+            .continuity_store(Arc::new(StubContinuityStore))
+            .lease_provider(Arc::new(StubLeaseProvider))
+            .roster_provider(roster.clone())
+            .scratch_dir(temp.path())
+            .ephemeral_runtime_store(true)
+            .identity_runtime_instance_id("undeclared-storage")
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .build(),
+    )
+    .await;
+    let calls = roster.calls();
+    assert!(
+        calls.is_empty(),
+        "the roster provider must not see an undeclared storage's definition: {calls:?}"
+    );
+    let Err(error) = result else {
+        panic!("an undeclared storage holding events must be refused");
+    };
+    assert!(
+        matches!(
+            &error,
+            meerkat_meta::UnifiedRuntimeBuilderError::Bootstrap(
+                meerkat_meta::UnifiedRuntimeBootstrapError::Mob(
+                    meerkat_meta::MobRuntimeError::CompositionProvenance(
+                        meerkat_meta::mob_composition_manifest::MobCompositionProvenanceError::UnprovenStorage
+                    )
+                )
+            )
+        ),
+        "{error}"
+    );
+}

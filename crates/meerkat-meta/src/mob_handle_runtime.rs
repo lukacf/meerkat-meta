@@ -5755,6 +5755,37 @@ pub(crate) fn persistent_runtime_machine(
     }
 }
 
+/// What a judgement of a spec's mob storage before preparation found
+/// ([`MobBootstrapSpec::read_launch_definition`]).
+enum LaunchDefinitionRead {
+    /// The event log was empty: a fresh boot, which creates the mob from the
+    /// supplied definition.
+    Fresh,
+    /// The event log held events: the resume, judged.
+    Resume(Box<JudgedResume>),
+}
+
+/// A resume of a non-empty mob storage, judged against the supplied
+/// composition by [`judge_resume`]: what the resume binds to, and what the
+/// judgement leaves for preparation to apply.
+struct JudgedResume {
+    /// The canonical definition snapshot the resume binds to. `None` for a
+    /// storage declared in-process whose definition was not read: that
+    /// resume is not verified, and Core reads the definition itself.
+    snapshot: Option<meerkat_mob::MobDefinitionSnapshot>,
+    /// The storage this launch speaks for has no composition manifest beside
+    /// it: preparation records the supplied definition as its composition.
+    record_supplied_composition: bool,
+    /// The fields in which the stored definition a candidate knowingly boots
+    /// differs from the supplied one (empty when they match).
+    candidate_diverged: Vec<String>,
+}
+
+/// The expected epoch a resume refuses with
+/// (`MobError::MobDefinitionAuthorityChanged`) when the read before
+/// preparation found no definition. Core numbers definition epochs from 1.
+pub(crate) const NO_STORED_DEFINITION_EPOCH: u64 = 0;
+
 pub struct MobBootstrapSpec {
     pub definition: MobDefinition,
     pub storage: MobStorage,
@@ -5779,6 +5810,11 @@ pub struct MobBootstrapSpec {
     /// declares a storage census ([`Self::resolved_storage`]), reports them
     /// in a degraded `mob_composition` slot.
     pub candidate_definition: crate::mob_composition_manifest::CandidateDefinition,
+    /// What [`Self::read_launch_definition`] judged of [`Self::storage`]
+    /// before preparation. Preparation applies that judgement and binds the
+    /// resume to its snapshot instead of judging again; `None` when nothing
+    /// judged it.
+    launch_definition_read: Option<LaunchDefinitionRead>,
     pub session_service: Arc<dyn MobSessionService>,
     /// The host config the member builder resolves models with: the image
     /// checks judge a member's model the way Core's model registry does,
@@ -6024,6 +6060,7 @@ impl MobBootstrapSpec {
             // external embedder's durable storage resume unverified.
             composition_authority: crate::mob_composition_manifest::CompositionAuthority::default(),
             candidate_definition: crate::mob_composition_manifest::CandidateDefinition::default(),
+            launch_definition_read: None,
             mob_storage_provenance: crate::mob_composition_manifest::MobStorageProvenance::default(
             ),
             session_service,
@@ -6743,6 +6780,53 @@ impl MobBootstrapSpec {
     ) -> Self {
         self.candidate_definition = policy;
         self
+    }
+
+    /// The definition this launch runs, judged before preparation: on a
+    /// resume the one its event log holds, which preparation resumes whatever
+    /// definition was supplied (the supplied one is only checked against it);
+    /// on a fresh boot the supplied one.
+    ///
+    /// A resume is judged here exactly as preparation would judge it
+    /// ([`judge_resume`]): an undeclared storage, a diverged composition and
+    /// a refused candidate are refused now, so the definition returned has
+    /// passed the composition checks before it reaches host code (the
+    /// identity-first roster). Preparation applies the kept judgement and
+    /// binds the resume to its snapshot, so what was resolved from the
+    /// returned definition describes the mob that then runs: a definition
+    /// epoch committed in between refuses the resume instead.
+    pub(crate) async fn read_launch_definition(
+        &mut self,
+    ) -> Result<MobDefinition, MobRuntimeError> {
+        let event_log_empty = self
+            .storage
+            .is_event_log_empty()
+            .await
+            .map_err(|err| MobRuntimeError::Mob(MobError::from(err)))?;
+        if event_log_empty {
+            self.launch_definition_read = Some(LaunchDefinitionRead::Fresh);
+            return Ok(self.definition.clone());
+        }
+        // The form preparation judges in (`auto_mark_declared_resume_overrides`
+        // runs there before the resume).
+        let mut normalized = self.definition.clone();
+        auto_mark_declared_resume_overrides(&mut normalized);
+        let judged = judge_resume(
+            &self.storage,
+            &self.mob_storage_provenance,
+            self.composition_authority,
+            self.candidate_definition,
+            &normalized,
+            &self.definition,
+            true,
+        )
+        .await?;
+        let definition = judged.snapshot.as_ref().map_or_else(
+            || self.definition.clone(),
+            |snapshot| snapshot.definition().clone(),
+        );
+        self.launch_definition_read = Some(LaunchDefinitionRead::Resume(Box::new(judged)));
+        Ok(definition)
     }
 
     /// The host's fork instruction policy for member forks of this mob:
@@ -8364,6 +8448,172 @@ fn legacy_auto_mark_declared_resume_overrides(definition: &mut MobDefinition) {
     }
 }
 
+/// Judges a resume of a non-empty mob storage against the supplied
+/// composition before any of the mob is built: the checks the resume makes
+/// before the mob can actuate. It only reads; preparation applies what it
+/// decides to record and report.
+///
+/// `definition` is the supplied definition in the form preparation judges
+/// (normalized by [`auto_mark_declared_resume_overrides`]); `raw_definition`
+/// is the supplied one as given, from which the released-representation
+/// allowance derives its legacy form. `bind_in_process` also reads, and binds
+/// the resume to, the definition of a storage declared in-process, which is
+/// otherwise resumed unverified as Core reads it.
+async fn judge_resume(
+    storage: &MobStorage,
+    provenance: &crate::mob_composition_manifest::MobStorageProvenance,
+    authority: crate::mob_composition_manifest::CompositionAuthority,
+    candidate_definition: crate::mob_composition_manifest::CandidateDefinition,
+    definition: &MobDefinition,
+    raw_definition: &MobDefinition,
+    bind_in_process: bool,
+) -> Result<JudgedResume, MobRuntimeError> {
+    // Fail closed on undeclared storage. `MobBootstrapSpec::new` accepts
+    // arbitrary storage from any caller including external embedders, so a
+    // non-empty log with nothing declared about it could be a durable
+    // database opened directly, and resuming it would skip composition
+    // verification entirely. An explicit in-process declaration is
+    // permitted: a pre-seeded in-memory storage has no composition that
+    // outlives the process to disagree with.
+    if !provenance.permits_unverified_resume() {
+        return Err(MobRuntimeError::CompositionProvenance(
+            crate::mob_composition_manifest::MobCompositionProvenanceError::UnprovenStorage,
+        ));
+    }
+    let persistent_mob_path = provenance.persistent_path();
+    // A launch that does not speak for the durable composition is exempt from
+    // VERIFICATION: verifying it would refuse the candidate for exactly the
+    // fields it exists to differ in, wedging a candidate/promote pipeline in
+    // the other direction.
+    //
+    // It is NOT exempt from RECORDING. Skipping the record would leave a store
+    // whose composition nobody has spoken for, and the authoritative resume
+    // that follows would adopt its OWN definition as the record while
+    // `for_resume` boots the rehearsal definition the event log holds - a
+    // manifest certifying a composition that is not running. Recording the
+    // creating authority instead lets that resume refuse with the real reason.
+    let speaks_for_composition = authority.speaks_for_composition();
+    let mut judged = JudgedResume {
+        snapshot: None,
+        record_supplied_composition: false,
+        candidate_diverged: Vec::new(),
+    };
+    // The event log's current definition is authoritative. Verify the
+    // supplied composition against a storage-minted snapshot; the resume
+    // binds to that exact snapshot.
+    if let Some(path) = persistent_mob_path.filter(|_| speaks_for_composition) {
+        let snapshot = canonical_definition_snapshot(storage).await?;
+        match crate::mob_composition_manifest::verify_before_resume(
+            path,
+            snapshot.definition(),
+            definition,
+        ) {
+            Ok(()) => {}
+            Err(crate::mob_composition_manifest::MobCompositionProvenanceError::Divergent {
+                ..
+            }) => {
+                let mut legacy_definition = raw_definition.clone();
+                legacy_auto_mark_declared_resume_overrides(&mut legacy_definition);
+                crate::mob_composition_manifest::verify_legacy_synthesized_definition_before_resume(
+                    path,
+                    snapshot.epoch(),
+                    snapshot.definition(),
+                    definition,
+                    &legacy_definition,
+                )
+                .map_err(MobRuntimeError::CompositionProvenance)?;
+                tracing::info!(
+                    mob_id = %definition.id,
+                    epoch = snapshot.epoch(),
+                    "resuming a canonical definition written with the MobKit 0.8.28 \
+                     synthesized profile representation"
+                );
+            }
+            // No manifest exists, so there is no recorded composition to
+            // contradict. Refusing here reports a conflict that cannot be
+            // shown and blocks a boot for a claim nobody made.
+            //
+            // What remains reachable is narrow, and deliberately so: a
+            // store from a build that predates the manifest, or one whose
+            // manifest an operator removed during recovery surgery. A
+            // rehearsal-created store is NOT in that set any more - it
+            // carries a manifest tagged non-authoritative, and
+            // `verify_before_resume` refuses it by name. Without that tag
+            // this branch would adopt a definition the event log does not
+            // hold and certify it.
+            //
+            // THIS launch speaks for the composition, so it records one
+            // rather than refusing to start.
+            Err(crate::mob_composition_manifest::MobCompositionProvenanceError::Missing {
+                ..
+            }) => judged.record_supplied_composition = true,
+            Err(other) => return Err(MobRuntimeError::CompositionProvenance(other)),
+        }
+        judged.snapshot = Some(snapshot);
+    } else if !speaks_for_composition {
+        // A candidate never writes or claims the pin, but it is not exempt
+        // from presenting what it runs: the resume boots the stored
+        // definition, so a supplied definition that differs refuses unless
+        // the launch acknowledges the stored one.
+        let snapshot = canonical_definition_snapshot(storage).await?;
+        let mut diverged = crate::mob_composition_manifest::diverged_definition_fields(
+            snapshot.definition(),
+            definition,
+        );
+        // The same released-representation allowance the authoritative arm
+        // makes: a store a 0.8.9-0.8.28 writer created (proven by its
+        // manifest) carries that release's auto-marked resume overrides, so
+        // an unchanged operator config is judged in that form.
+        if !diverged.is_empty()
+            && let Some(path) = persistent_mob_path
+        {
+            let mut legacy_definition = raw_definition.clone();
+            legacy_auto_mark_declared_resume_overrides(&mut legacy_definition);
+            if crate::mob_composition_manifest::verify_legacy_synthesized_definition_before_resume(
+                path,
+                snapshot.epoch(),
+                snapshot.definition(),
+                definition,
+                &legacy_definition,
+            )
+            .is_ok()
+            {
+                diverged.clear();
+            }
+        }
+        judged.candidate_diverged = crate::mob_composition_manifest::verify_candidate_resume(
+            diverged,
+            candidate_definition,
+        )
+        .map_err(MobRuntimeError::CompositionProvenance)?;
+        judged.snapshot = Some(snapshot);
+    } else if bind_in_process {
+        // A storage declared in-process resumes unverified. A launch that
+        // resolves anything from its definition before preparation still
+        // binds the resume to the definition it read.
+        judged.snapshot = storage
+            .created_definition_snapshot()
+            .await
+            .map_err(|err| MobRuntimeError::Mob(MobError::from(err)))?;
+    }
+    Ok(judged)
+}
+
+/// The canonical definition a non-empty mob storage holds.
+async fn canonical_definition_snapshot(
+    storage: &MobStorage,
+) -> Result<meerkat_mob::MobDefinitionSnapshot, MobRuntimeError> {
+    storage
+        .created_definition_snapshot()
+        .await
+        .map_err(|err| MobRuntimeError::Mob(MobError::from(err)))?
+        .ok_or_else(|| {
+            MobRuntimeError::Mob(MobError::Internal(
+                "non-empty mob storage has no canonical definition".to_string(),
+            ))
+        })
+}
+
 /// Bound on [`MobRuntime::session_commit_pending`]'s runtime read. A read
 /// still waiting for the session's runtime driver (held by a boundary commit
 /// until it lands) when this elapses answers `None`.
@@ -8784,30 +9034,6 @@ impl MobRuntime {
             .await
             .map_err(|err| MobRuntimeError::Mob(MobError::from(err)))?;
         let persistent_mob_path = spec.mob_storage_provenance.persistent_path();
-        // Fail closed on undeclared storage. `MobBootstrapSpec::new` accepts
-        // arbitrary storage from any caller including external embedders, so a
-        // non-empty log with nothing declared about it could be a durable
-        // database opened directly, and resuming it would skip composition
-        // verification entirely. An explicit in-process declaration is
-        // permitted: a pre-seeded in-memory storage has no composition that
-        // outlives the process to disagree with.
-        if !event_log_empty && !spec.mob_storage_provenance.permits_unverified_resume() {
-            return Err(MobRuntimeError::CompositionProvenance(
-                crate::mob_composition_manifest::MobCompositionProvenanceError::UnprovenStorage,
-            ));
-        }
-        // A launch that does not speak for the durable composition is exempt from
-        // VERIFICATION: verifying it would refuse the candidate for exactly the
-        // fields it exists to differ in, wedging a candidate/promote pipeline in
-        // the other direction.
-        //
-        // It is NOT exempt from RECORDING. Skipping the record would leave a store
-        // whose composition nobody has spoken for, and the authoritative resume
-        // that follows would adopt its OWN definition as the record while
-        // `for_resume` boots the rehearsal definition the event log holds - a
-        // manifest certifying a composition that is not running. Recording the
-        // creating authority instead lets that resume refuse with the real reason.
-        let speaks_for_composition = spec.composition_authority.speaks_for_composition();
         // Health-visible record of a candidate that knowingly boots a stored
         // definition differing from the supplied one.
         let mut candidate_composition_slot: Option<crate::storage_health::StorageSlotSummary> =
@@ -8825,154 +9051,87 @@ impl MobRuntime {
             }
             MobBuilder::new(spec.definition, spec.storage)
         } else {
-            // The event log's current definition is authoritative. Verify the
-            // supplied composition against a storage-minted snapshot, then bind
-            // the builder to that exact snapshot so a concurrent epoch refuses
-            // before the mob can actuate.
-            let verified_definition = if let Some(path) =
-                persistent_mob_path.filter(|_| speaks_for_composition)
+            let read = spec.launch_definition_read.take();
+            // A launch that read no definition here before preparation (an
+            // empty log, or an in-process one holding none) resolved what it
+            // read from the supplied definition (the identity-first roster).
+            // A definition written since is not what it resolved from, so it
+            // is refused rather than resumed.
+            let read_no_definition = match &read {
+                Some(LaunchDefinitionRead::Fresh) => true,
+                Some(LaunchDefinitionRead::Resume(judged)) => judged.snapshot.is_none(),
+                None => false,
+            };
+            if read_no_definition
+                && let Some(written) = spec
+                    .storage
+                    .created_definition_snapshot()
+                    .await
+                    .map_err(|err| MobRuntimeError::Mob(MobError::from(err)))?
             {
-                let snapshot = spec
-                    .storage
-                    .created_definition_snapshot()
-                    .await
-                    .map_err(|err| MobRuntimeError::Mob(MobError::from(err)))?
-                    .ok_or_else(|| {
-                        MobRuntimeError::Mob(MobError::Internal(
-                            "non-empty mob storage has no canonical definition".to_string(),
-                        ))
-                    })?;
-                match crate::mob_composition_manifest::verify_before_resume(
-                    path,
-                    snapshot.definition(),
-                    &spec.definition,
-                ) {
-                    Ok(()) => {}
-                    Err(
-                        crate::mob_composition_manifest::MobCompositionProvenanceError::Divergent {
-                            ..
-                        },
-                    ) => {
-                        let mut legacy_definition = raw_definition.clone();
-                        legacy_auto_mark_declared_resume_overrides(&mut legacy_definition);
-                        crate::mob_composition_manifest::verify_legacy_synthesized_definition_before_resume(
-                            path,
-                            snapshot.epoch(),
-                            snapshot.definition(),
-                            &spec.definition,
-                            &legacy_definition,
-                        )
-                        .map_err(MobRuntimeError::CompositionProvenance)?;
-                        tracing::info!(
-                            mob_id = %mob_id,
-                            epoch = snapshot.epoch(),
-                            "resuming a canonical definition written with the MobKit 0.8.28 \
-                             synthesized profile representation"
-                        );
-                    }
-                    // No manifest exists, so there is no recorded composition to
-                    // contradict. Refusing here reports a conflict that cannot be
-                    // shown and blocks a boot for a claim nobody made.
-                    //
-                    // What remains reachable is narrow, and deliberately so: a
-                    // store from a build that predates the manifest, or one whose
-                    // manifest an operator removed during recovery surgery. A
-                    // rehearsal-created store is NOT in that set any more - it
-                    // carries a manifest tagged non-authoritative, and
-                    // `verify_before_resume` refuses it by name. Without that tag
-                    // this branch would adopt a definition the event log does not
-                    // hold and certify it.
-                    //
-                    // THIS launch speaks for the composition, so it records one
-                    // rather than refusing to start.
-                    Err(
-                        crate::mob_composition_manifest::MobCompositionProvenanceError::Missing {
-                            ..
-                        },
-                    ) => {
-                        tracing::info!(
-                            manifest = %crate::mob_composition_manifest::manifest_path(path).display(),
-                            "no composition manifest beside this mob storage; adopting the                              supplied definition as its recorded composition"
-                        );
-                        crate::mob_composition_manifest::record_on_create(
-                            path,
-                            &spec.definition,
-                            spec.composition_authority,
-                        )
-                        .map_err(MobRuntimeError::CompositionProvenance)?;
-                    }
-                    Err(other) => return Err(MobRuntimeError::CompositionProvenance(other)),
-                }
-                Some(snapshot)
-            } else if !speaks_for_composition {
-                // A candidate never writes or claims the pin, but it is not
-                // exempt from presenting what it runs: the resume boots the
-                // stored definition, so a supplied definition that differs
-                // refuses unless the launch acknowledges the stored one.
-                let snapshot = spec
-                    .storage
-                    .created_definition_snapshot()
-                    .await
-                    .map_err(|err| MobRuntimeError::Mob(MobError::from(err)))?
-                    .ok_or_else(|| {
-                        MobRuntimeError::Mob(MobError::Internal(
-                            "non-empty mob storage has no canonical definition".to_string(),
-                        ))
-                    })?;
-                let mut diverged = crate::mob_composition_manifest::diverged_definition_fields(
-                    snapshot.definition(),
-                    &spec.definition,
-                );
-                // The same released-representation allowance the
-                // authoritative arm makes: a store a 0.8.9-0.8.28 writer
-                // created (proven by its manifest) carries that release's
-                // auto-marked resume overrides, so an unchanged operator
-                // config is judged in that form.
-                if !diverged.is_empty()
-                    && let Some(path) = persistent_mob_path
-                {
-                    let mut legacy_definition = raw_definition.clone();
-                    legacy_auto_mark_declared_resume_overrides(&mut legacy_definition);
-                    if crate::mob_composition_manifest::verify_legacy_synthesized_definition_before_resume(
-                        path,
-                        snapshot.epoch(),
-                        snapshot.definition(),
+                return Err(MobRuntimeError::Mob(
+                    MobError::MobDefinitionAuthorityChanged {
+                        expected_epoch: NO_STORED_DEFINITION_EPOCH,
+                        expected_event_cursor: 0,
+                        actual_epoch: Some(written.epoch()),
+                        actual_event_cursor: Some(written.event_cursor()),
+                    },
+                ));
+            }
+            let judged = match read {
+                // Judged before preparation
+                // (`MobBootstrapSpec::read_launch_definition`): apply that
+                // judgement, so what was resolved from its definition
+                // describes the mob that runs.
+                Some(LaunchDefinitionRead::Resume(judged)) => *judged,
+                Some(LaunchDefinitionRead::Fresh) | None => {
+                    judge_resume(
+                        &spec.storage,
+                        &spec.mob_storage_provenance,
+                        spec.composition_authority,
+                        spec.candidate_definition,
                         &spec.definition,
-                        &legacy_definition,
+                        &raw_definition,
+                        false,
                     )
-                    .is_ok()
-                    {
-                        diverged.clear();
-                    }
+                    .await?
                 }
-                let diverged = crate::mob_composition_manifest::verify_candidate_resume(
-                    diverged,
-                    spec.candidate_definition,
+            };
+            if judged.record_supplied_composition
+                && let Some(path) = persistent_mob_path
+            {
+                tracing::info!(
+                    manifest = %crate::mob_composition_manifest::manifest_path(path).display(),
+                    "no composition manifest beside this mob storage; adopting the                              supplied definition as its recorded composition"
+                );
+                crate::mob_composition_manifest::record_on_create(
+                    path,
+                    &spec.definition,
+                    spec.composition_authority,
                 )
                 .map_err(MobRuntimeError::CompositionProvenance)?;
-                if !diverged.is_empty() {
-                    tracing::warn!(
-                        mob_id = %mob_id,
-                        diverged_fields = %diverged.join(", "),
-                        "candidate launch boots the STORED mob definition, which differs from \
-                         the supplied one (runtime_options.mob_composition.candidate_definition \
-                         = \"stored\"); the supplied definition is not in effect"
-                    );
-                    candidate_composition_slot =
-                        Some(crate::storage_health::StorageSlotSummary::degraded(
-                            "mob_composition",
-                            format!(
-                                "candidate launch runs the stored mob definition, not the \
-                                 supplied one; diverged: {}",
-                                diverged.join(", ")
-                            ),
-                        ));
-                }
-                Some(snapshot)
-            } else {
-                None
-            };
-            if let Some(snapshot) = verified_definition {
+            }
+            if !judged.candidate_diverged.is_empty() {
+                tracing::warn!(
+                    mob_id = %mob_id,
+                    diverged_fields = %judged.candidate_diverged.join(", "),
+                    "candidate launch boots the STORED mob definition, which differs from \
+                     the supplied one (runtime_options.mob_composition.candidate_definition \
+                     = \"stored\"); the supplied definition is not in effect"
+                );
+                candidate_composition_slot =
+                    Some(crate::storage_health::StorageSlotSummary::degraded(
+                        "mob_composition",
+                        format!(
+                            "candidate launch runs the stored mob definition, not the \
+                             supplied one; diverged: {}",
+                            judged.candidate_diverged.join(", ")
+                        ),
+                    ));
+            }
+            // Bind the builder to the judged snapshot, so a concurrent epoch
+            // refuses before the mob can actuate.
+            if let Some(snapshot) = judged.snapshot {
                 MobBuilder::for_resume_verified(spec.storage, snapshot)
             } else {
                 MobBuilder::for_resume(spec.storage)
