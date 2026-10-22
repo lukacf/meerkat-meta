@@ -20,7 +20,7 @@ from .connect_application_startup import _ModelConfiguration
 from .connect_application_update_startup import _file_identity
 from .connect_installer_caller import CustodyError, ExactFile, _path, _private_directory, _private_parent
 from .deployment_application_bootstrap import (bootstrap_installation_binding, require_bootstrap_history_settled,
-    same_installation_apart_from_staged_update)
+    require_owner_installation, same_installation_apart_from_staged_update)
 from .deployment_updates import checked_package
 from .forge_application_host import application_setup_binding
 from .projects import DraftConflict, fingerprint
@@ -32,6 +32,23 @@ def ordinary_application(spec):
     spec = spec if isinstance(spec, Blueprint) else Blueprint.model_validate(spec)
     return (spec.target in {"mac", "linux"} and spec.acquisition is None
         and not any(row.tools.rust_bundles for row in spec.agent_classes))
+
+
+def ordinary_installation(receipt, files):
+    """Whether an installed package is a helperless application on the selected Meta product.
+
+    Its Start needs its owner's ordinary startup inputs, so no update worker
+    starts it: the owner's next Start runs the installed source.
+    """
+    selection = receipt.get("runtime_candidate")
+    if (receipt.get("source_kind", "application") != "application" or selection is None
+            or "application/runtime-selection.json" not in files or "blueprint.json" not in files):
+        return False
+    try:
+        return (type(parse_candidate_selection(selection)) is MetaToolkitRuntimeTarget
+            and ordinary_application(json.loads(files["blueprint.json"][0])))
+    except (TypeError, ValueError):
+        return False
 
 
 def _console_source(guide_id):
@@ -160,9 +177,15 @@ class OrdinaryApplicationHost:
             inputs["model_configuration"] = self._model.selection()
         binding = bootstrap_installation_binding(receipt)
         previous = self._startups.get(deployment_id)
-        if previous is not None and (previous[1] != inputs
-                or not same_installation_apart_from_staged_update(previous[0], binding, receipt)):
-            raise CustodyError("The original ordinary installation inputs cannot be rebound.")
+        rebound = "The original ordinary installation inputs cannot be rebound."
+        if previous is not None:
+            if previous[1] != inputs:
+                raise CustodyError(rebound)
+            # The original anchor stays; the installation's own completed
+            # updates, and a restored previous source, keep its inputs.
+            if not same_installation_apart_from_staged_update(previous[0], binding, receipt):
+                require_owner_installation(directory, receipt, previous[0], rebound, setup_entry=False)
+            binding = previous[0]
         current()
         self.require_current()
         self._startups[deployment_id] = (deepcopy(binding), deepcopy(inputs))

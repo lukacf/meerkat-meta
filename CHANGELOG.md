@@ -357,6 +357,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   idle window, and the sweep reads the member's session again right before it
   retires the member, so it never retires a newer incarnation on an older
   session's clock.
+- Meta Forge updates an application without a setup helper in place.
+  "Apply and verify update" installs and checks the new source and leaves
+  the application stopped; "Start installed application" then runs it, also
+  after Forge restarts, and "Restore previous application" returns to the
+  previous source. Stage blocks an update that is not built from the
+  installed application's own source, or that changes its plan, definition,
+  protected settings, native instructions or runtime. A Meta Toolkit product
+  application that has not finished its setup now refuses Apply before
+  anything changes with every launcher; with a launcher that selects a Meta
+  Forge application host directly, its update could stop as "recovery
+  needed" before.
 
 ### Known limitations
 
@@ -369,17 +380,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Meta Toolkit Connect route, an update staged before the application's
   first setup can still make that setup refuse. After Forge restarts, use
   "Continue setup" once before you stage or apply an update.
-- In a Meta Forge started from a product package or a product launcher, an
-  application without a setup helper cannot take a staged update in place
-  yet, and neither can a Meta Toolkit product application that has not
-  finished its setup. "Apply and verify update" refuses such an update
-  before anything changes. Install the new build into a new empty folder;
-  for a Meta Toolkit product application, you can instead finish its setup
-  and then stage the accepted update again. A launcher that selects a Meta
-  Forge application host directly does not refuse that Apply for a Meta
-  Toolkit product application that has not finished its setup: the update
-  stops as "recovery needed", and its previous package and private data are
-  kept. Finish such an application's setup before you apply an update.
+- A Meta Toolkit product application that has not finished its setup cannot
+  take a staged update in place yet. "Apply and verify update" refuses such
+  an update before anything changes. Finish its setup, then stage the
+  accepted update again, or install the new build into a new empty folder.
 - A macOS LaunchAgent keeps the stop timeout it was installed with (397
   seconds from Forge before 0.9.5). launchd has no drop-in, so a longer
   horizon that its application reports later is not applied. The

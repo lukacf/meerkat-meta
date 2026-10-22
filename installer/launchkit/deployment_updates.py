@@ -2006,6 +2006,14 @@ SETUP_OWNER_BLOCKER = ("This update is not built from the installed application'
     "that keep them. Keep the installed build, or install the new build into a new folder.")
 SETUP_OWNER_RECONNECT = ("Forge has not reconnected this application's completed setup since it restarted. "
     "Use Continue setup once, then stage or apply the update again.")
+ORDINARY_REPLACEMENT_BLOCKER = ("This update changes the application's native definition, instructions or "
+    "runtime. Forge applies only updates that keep those unchanged to an application without a setup helper. "
+    "Keep the installed build, or install the new build into a new folder.")
+ORDINARY_OWNER_BLOCKER = ("This update is not built from the installed application's own source, or it changes "
+    "its plan, definition, protected settings or runtime. Forge applies only same-source updates that keep them "
+    "to an application without a setup helper. Keep the installed build, or install the new build into a new folder.")
+FIRST_SETUP_UPDATE = ("This application has not finished its setup, so it cannot take a staged update in "
+    "place yet. Its installed application is unchanged. Finish its setup, then stage the accepted update again.")
 
 
 SETUP_RESTORE_NAME = "setup-restore.json"
@@ -2039,16 +2047,19 @@ def setup_restore_pin(directory, update):
     return pin
 
 
-def stage(directory, payload, report, *, runtime_target=None, restore_selection=None, setup_blockers=()):
+def stage(directory, payload, report, *, runtime_target=None, restore_selection=None, setup_blockers=(),
+        ordinary_owner=False):
     """Stage one accepted package. After setup, only through the owner's completed Restore.
 
     restore_selection is the pin the deployment service read from the trusted
     owner. An update that keeps the Restore's native inputs is staged with that
     pin; any other change after setup is blocked here. setup_blockers are the
     owner's own refusals of this candidate, which the deployment service read.
+    ordinary_owner marks an application without a setup helper: its owner
+    starts it, so only an update that keeps its native inputs is staged.
     """
     return publish_stage(directory, prepare_stage(directory, payload, report, runtime_target=runtime_target,
-        restore_selection=restore_selection, setup_blockers=setup_blockers))
+        restore_selection=restore_selection, setup_blockers=setup_blockers, ordinary_owner=ordinary_owner))
 
 
 STAGE_CHANGED = "The installation changed while its update was being prepared. No update was staged; stage it again."
@@ -2064,13 +2075,15 @@ def _stage_binding(receipt):
         "update": receipt.get("update")}
 
 
-def prepare_stage(directory, payload, report, *, runtime_target=None, restore_selection=None, setup_blockers=()):
+def prepare_stage(directory, payload, report, *, runtime_target=None, restore_selection=None, setup_blockers=(),
+        ordinary_owner=False):
     """Read and check one accepted package for staging, without writing anything.
 
     This is the long part of a Stage: it reads both packages, the installed
     source and every selected runtime, which can be a full native product. The
     deployment service runs it in a worker thread. Each selected runtime is
     read in full once. publish_stage rechecks the result and writes it.
+    restore_selection, setup_blockers and ordinary_owner are as for stage().
     """
     require_replacement_history_settled(directory)
     from .deployment_application_bootstrap import require_update_bootstrap_history, setup_keeps_candidate
@@ -2123,6 +2136,10 @@ def prepare_stage(directory, payload, report, *, runtime_target=None, restore_se
         if (native_definition_update or host_instruction_update or dependency_update
                 or maintained or not setup_keeps_candidate(directory, restore, candidate)):
             blockers.append(SETUP_REPLACEMENT_BLOCKER)
+    elif ordinary_owner:
+        blockers.extend(setup_blockers)
+        if native_definition_update or host_instruction_update or dependency_update or maintained:
+            blockers.append(ORDINARY_REPLACEMENT_BLOCKER)
     transaction = {"update_id": str(uuid.uuid4()), "status": "blocked" if blockers else "staged",
         "from_build_id": receipt["build_id"], "to_build_id": report["build_id"],
         "guide_version": report["guide_version"], "blueprint_hash": report["blueprint_hash"],
@@ -2815,8 +2832,13 @@ def retry_candidate(directory, expected_id, *, expected_binding=None, expected_i
     return candidate
 
 
-def committed(directory, expected_id, *, restored=False, started=True, expected_binding=None, expected_installation=None):
-    """Settle a transaction. started=False: after setup, the owner's next Start runs this source."""
+def committed(directory, expected_id, *, restored=False, started=True, setup=True, expected_binding=None,
+        expected_installation=None):
+    """Settle a transaction. started=False: the owner's next Start runs this source.
+
+    setup=False marks an application without a setup helper: its next Start
+    runs the source with its owner's ordinary startup inputs.
+    """
     _, root, update = transaction(directory, expected_id, expected_binding=expected_binding, expected_installation=expected_installation)
     rollback_available = not restored
     if started:
@@ -2825,7 +2847,8 @@ def committed(directory, expected_id, *, restored=False, started=True, expected_
     else:
         detail = (("The previous source is restored and passed its application contract check." if restored
                    else "The accepted update is installed and passed its application contract check.")
-                  + " The application is stopped. Start restores its completed setup with this source.")
+                  + (" The application is stopped. Start restores its completed setup with this source." if setup
+                     else " The application is stopped. Its next Start runs this source."))
     if (root / "application-replacement-attempt.json").exists():
         rollback_available = False
         detail += " The original replacement selection is retained. Native policy acceptance, definition commit and member adoption require their own exact receipts before a restart or rollback."

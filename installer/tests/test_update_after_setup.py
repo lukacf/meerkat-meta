@@ -565,6 +565,35 @@ async def test_apply_with_an_action_request_on_a_host_without_a_replacement_owne
 
 
 @pytest.mark.parametrize("with_request", [False, True], ids=["no-action-request", "action-request"])
+async def test_apply_before_the_first_setup_refuses_on_a_host_without_a_replacement_owner(local, monkeypatch,
+        with_request):
+    """A Meta Toolkit application before its first setup has no update worker that can start it.
+
+    On a selected host without a replacement owner, Apply refuses with guidance
+    before any worker is queued: no failed receipt and no recovery-needed
+    transaction. The installed source and the staged update stay as they were.
+    """
+    f = local
+    f.select()
+    f.service.application_setup_continuation = f.host.continue_application_startup
+    await retain(f)
+    assert f.service.application_replacement_selection is None
+    candidate, report = candidate_update(f)
+    update = updates.stage(f.directory, packed(candidate), report)["update"]
+    assert update["status"] == "staged" and "setup_restore_sha256" not in update
+    accept_candidate(f, monkeypatch, report)
+    keys = ("status", "build_id", "package_sha256", "update", "update_action")
+    before = deployment.read_receipt(f.directory)
+    f.service.launched.clear()
+    options = {"action_request_id": str(uuid4())} if with_request else {}
+    with pytest.raises(DraftConflict, match="has not finished its setup, so it cannot take a staged update in place yet"):
+        await f.service.action(f.guide_id, f.directory.name, "apply-update", update["update_id"], **options)
+    assert not f.service.launched
+    after = deployment.read_receipt(f.directory)
+    assert {key: after.get(key) for key in keys} == {key: before.get(key) for key in keys}
+
+
+@pytest.mark.parametrize("with_request", [False, True], ids=["no-action-request", "action-request"])
 async def test_apply_in_a_forge_without_a_selected_host_takes_the_ordinary_update_path(tmp_path, with_request):
     """A Forge started from source selects no application host and no replacement owner."""
     service, directory, _, previous, _, identity = await staged(tmp_path)

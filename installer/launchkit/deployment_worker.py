@@ -1824,7 +1824,13 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
     # transaction may count as lineage while it changes source.
     bootstrap_restore = updates.setup_restore_pin(directory, update)
     require_update_bootstrap_history(directory, bootstrap_restore, in_flight=expected_binding)
-    owner_start = bootstrap_restore is not None
+    # A helperless application on the selected Meta product starts only with
+    # its owner's ordinary startup inputs, so this worker never starts it
+    # either: it installs and checks the source, and the owner's Start runs it.
+    from .ordinary_application_source import ordinary_installation
+    ordinary_owner = (bootstrap_restore is None and replacement is None and ordinary_installation(receipt,
+        updates.checked_package(directory, "package.zip", receipt["package_sha256"])[1]))
+    owner_start = bootstrap_restore is not None or ordinary_owner
 
     def current_transaction(*, check_replacement=True):
         require_update_bootstrap_history(directory, bootstrap_restore, in_flight=expected_binding)
@@ -1893,7 +1899,7 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
             raise DraftConflict("The started source no longer matches the admitted update transaction.")
         _, source = updates.checked_package(directory, "package.zip", current["package_sha256"])
         verify_destination(current, source)
-        updates.committed(directory, identity, restored=restored, started=started,
+        updates.committed(directory, identity, restored=restored, started=started, setup=not ordinary_owner,
             expected_binding=expected_binding, expected_installation=expected_installation)
         ready = True
 
@@ -2077,7 +2083,7 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
                 # A ready new marker can survive an interruption before the
                 # checkpoint above. Ordinary startup re-inspects native truth;
                 # it does not repeat an already completed native apply.
-            # A set-up product's doctor needs its owner's startup, as at install.
+            # A product owner's doctor needs that owner's startup, as at install.
             checks = [("Updated application contract", "--application-check")] if product_update or owner_start else [
                 ("Update prerequisites", "--doctor"), ("Updated application contract", "--application-check")]
             for name, flag in checks:
@@ -2136,8 +2142,9 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
         updates._require_runtime_framework_configuration(read_receipt(directory), current)
         current_transaction()
         if owner_start:
-            # The owner's next Start restores the completed setup with this
-            # checked source. No worker child selects bootstrap inputs.
+            # The owner's next Start runs this checked source; a set-up
+            # application restores its completed setup with it. No worker
+            # child selects bootstrap or ordinary startup inputs.
             publish(restored, started=False)
         elif replacement is None:
             await supervisor.start(definition, on_ready=lambda: publish(restored))

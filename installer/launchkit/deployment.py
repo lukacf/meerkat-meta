@@ -2118,7 +2118,9 @@ class DeploymentService:
         from .deployment_updates import prepare_stage
         restore_selection = self._setup_update_restore(guide_id, deployment_id)
         setup = ({"restore_selection": restore_selection, "setup_blockers": setup_blockers}
-            if restore_selection is not None else {})
+            if restore_selection is not None else
+            {"ordinary_owner": True, "setup_blockers": setup_blockers}
+            if self._ordinary_restart_selected(guide_id, deployment_id) else {})
         if runtime_target is not None:
             setup["runtime_target"] = runtime_target
         return prepare_stage(self._directory(guide_id), payload, report, **setup)
@@ -2173,22 +2175,59 @@ class DeploymentService:
         per-installation registry, its signed source chain must also continue
         the installed Build. A single selected host owns every Build's source.
         """
-        from .deployment_updates import SETUP_OWNER_BLOCKER
+        from .deployment_updates import ORDINARY_OWNER_BLOCKER, SETUP_OWNER_BLOCKER
         from .forge_application_host import owner_choices_match
         from .local_application_registry import LocalApplicationRegistry
-        host = self._setup_owner(guide_id, deployment_id)
+        host, blocker = self._setup_owner(guide_id, deployment_id), SETUP_OWNER_BLOCKER
+        if host is None:
+            host, blocker = (await asyncio.to_thread(self._ordinary_owner, guide_id, deployment_id),
+                ORDINARY_OWNER_BLOCKER)
         if host is None:
             return ()
         if not owner_choices_match(host, files):
-            return (SETUP_OWNER_BLOCKER,)
+            return (blocker,)
         select = getattr(self, "application_host_selection", None)
         registry = getattr(select, "__self__", None)
         if type(registry) is LocalApplicationRegistry and select == registry.selected_host:
             continues = await asyncio.to_thread(registry.continues_installed_source, guide_id, deployment_id,
                 report.get("build_id"), report.get("verification", {}).get("digest"))
             if not continues:
-                return (SETUP_OWNER_BLOCKER,)
+                return (blocker,)
         return ()
+
+    def _ordinary_owner(self, guide_id, deployment_id):
+        """The retained owner of an installed application without a setup helper, or None.
+
+        Only the launcher's registry selection supplies it, never a request.
+        Before that owner is reconnected after a Forge restart, Stage keeps its
+        existing checks; Apply checks the owner's choices once it reconnects.
+        """
+        from .local_application_registry import LocalApplicationRegistry
+        from .ordinary_application_source import OrdinaryApplicationHost
+        if not self._ordinary_restart_selected(guide_id, deployment_id):
+            return None
+        select = getattr(self, "application_host_selection", None)
+        registry = getattr(select, "__self__", None)
+        if (type(registry) is not LocalApplicationRegistry or select != registry.selected_host
+                or registry._reconnect_status(self, guide_id, deployment_id) is not None):
+            return None
+        host = select(guide_id, deployment_id)
+        return host if type(host) is OrdinaryApplicationHost else None
+
+    def _product_before_setup(self, guide_id, deployment_id):
+        """A Meta Toolkit product installation that has not entered its setup.
+
+        No update worker can start it without its setup's startup inputs. An
+        application without a setup helper starts through its owner instead.
+        """
+        from .deployment_application_bootstrap import FRESH_ENTRY_NAME
+        from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
+        directory = self._directory(guide_id, deployment_id)
+        selection = read_receipt(directory).get("runtime_candidate")
+        entry = directory / FRESH_ENTRY_NAME
+        return (selection is not None and type(parse_candidate_selection(selection)) is MetaToolkitRuntimeTarget
+            and not entry.exists() and not entry.is_symlink()
+            and not self._ordinary_restart_selected(guide_id, deployment_id))
 
     async def _run(self, directory, mode, *, update_selection=None, bootstrap_selection=None,
             install_retention=None, install_binding=None, bootstrap_owner_source=None):
@@ -3657,6 +3696,10 @@ class DeploymentService:
                 require_update_bootstrap_history(directory, recorded,
                     in_flight=update_binding(selected) if action != "apply-update"
                         and selected.get("update_id") == update_id else None)
+                if (action == "apply-update" and application_startup is None
+                        and await await_validation(self._product_before_setup, guide_id, deployment_id)):
+                    from .deployment_updates import FIRST_SETUP_UPDATE
+                    raise DraftConflict(FIRST_SETUP_UPDATE)
             else:
                 require_bootstrap_history_settled(directory, bootstrap_selection)
         if receipt.get("source_kind") == "native-team" and action in {"apply-update", "rollback", "recover-current"}:

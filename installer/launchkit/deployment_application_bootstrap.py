@@ -670,14 +670,15 @@ def require_installation_lineage(directory, receipt, original, *, in_flight=None
         raise _lineage_refusal(receipt, target)
 
 
-def require_owner_installation(directory, receipt, retained, changed):
+def require_owner_installation(directory, receipt, retained, changed, *, setup_entry=True):
     """An owner's retained installation binding still selects this installation.
 
     The retained binding is the anchor an owner holds in memory, and nothing
     re-anchors it. It holds exactly, apart from a staged or blocked update
     pointer, or, after setup, through this installation's own completed source
-    updates. Any other difference refuses with the owner's own text. Returns
-    the current binding.
+    updates. An owner without a setup (setup_entry=False) follows its own
+    completed updates the same way. Any other difference refuses with the
+    owner's own text. Returns the current binding.
     """
     current = bootstrap_installation_binding(receipt)
     if not isinstance(retained, dict) or set(retained) != set(current):
@@ -685,10 +686,17 @@ def require_owner_installation(directory, receipt, retained, changed):
     if same_installation_apart_from_staged_update(retained, current, receipt):
         return current
     entry = _path(directory) / FRESH_ENTRY_NAME
-    if (not entry.exists() and not entry.is_symlink() or receipt.get("update") is None
+    if (setup_entry and not entry.exists() and not entry.is_symlink() or receipt.get("update") is None
             or any(not _same_json_value(current.get(key), retained.get(key)) for key in LINEAGE_IDENTITY_KEYS)):
         raise CustodyError(changed)
-    require_installation_lineage(directory, receipt, retained)
+    try:
+        require_installation_lineage(directory, receipt, retained)
+    except CustodyError as error:
+        # Without a setup, a source not reached through the installation's own
+        # updates keeps the owner's own refusal; an unfinished one says so.
+        if not setup_entry and str(error) == LINEAGE_CHANGED:
+            raise CustodyError(changed) from None
+        raise
     return current
 
 
