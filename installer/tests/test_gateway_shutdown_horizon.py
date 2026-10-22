@@ -145,14 +145,16 @@ def background(tmp_path, monkeypatch, request):
 
 
 @pytest.mark.parametrize("background", ["darwin", "linux"], indirect=True)
-@pytest.mark.parametrize("recorded", [None, 432_000], ids=["unreported", "reported-432s"])
+@pytest.mark.parametrize("recorded", [None, 347_000, 432_000], ids=["unreported", "reported-347s", "reported-432s"])
 async def test_service_unit_stop_budget_follows_the_recorded_gateway_horizon(background, recorded):
     f = background
     directory = await f.prepared()
     if recorded is not None:
         f.deployment.update_receipt(directory, gateway_shutdown_horizon_ms=recorded)
     service = f.service.prepare_service(directory, f.deployment.read_receipt(directory))
-    expected = service_budget(gateway_horizon_ms() if recorded is None else recorded)
+    # A new unit never gets less than the unreported horizon's budget; a
+    # longer report widens it.
+    expected = max(service_budget(gateway_horizon_ms()), service_budget(recorded) if recorded else 0)
     assert service["stop_timeout_seconds"] == expected
     assert f.stop_timeout(Path(service["unit_path"]).read_bytes()) == expected
 
