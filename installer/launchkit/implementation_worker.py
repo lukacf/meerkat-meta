@@ -23,7 +23,7 @@ from .implementation import (APPLICATION_CONTRACT, IMPLEMENTATION_PROMPT, now,
 from .owned_worker import begin_worker_cleanup, owned_job_deadline
 from .implementation_workspace import ImplementationWorkspace
 from .implementation_timing import ImplementationTiming, TimedDraft
-from .native_schedule_reference import schedule_reference, selected_recurrence_guidance
+from .native_schedule_reference import meta_schedule_reference, selected_recurrence_guidance
 from .planner import gateway_path, planner_capability
 from .projects import fingerprint
 from .templates.storage_setup import prepare_storage, project_lock, write_private
@@ -289,14 +289,13 @@ class BuildTools:
                 reference_metadata.update(snapshot["metadata"])
                 package, product = snapshot["package"], snapshot["product"]
             if selected == "schedule":
-                if snapshot is None and not product:
-                    pinned = schedule_reference(installed_version)
-                    if not pinned["ok"]:
-                        return "", [], pinned
-                    reference_metadata = {key: value for key, value in pinned.items() if key != "content"}
-                else:
-                    pinned = {"content": selected_recurrence_guidance()}
-                    reference_metadata["native_authoring_schema"] = "Not supplied by selected SDK source; inspect the actual granted native tools."
+                version = (installed_version if snapshot is None else
+                    snapshot["metadata"]["selected_sdk_versions"].get("meerkat-meta"))
+                pinned = (meta_schedule_reference(version) if product else
+                    {"content": selected_recurrence_guidance()})
+                if pinned.get("ok") is False:
+                    return "", [], pinned
+                reference_metadata.update({key: value for key, value in pinned.items() if key != "content"})
             if snapshot is None:
                 import meerkat_meta
                 root = Path(inspect.getfile(meerkat_meta)).parent
@@ -371,8 +370,9 @@ class BuildTools:
                 source = "\n\n".join(pieces)
                 if selected == "schedule":
                     prefix = pinned["content"] + "\n\nSDK callback registration methods (not schedule authoring):\n"
-                    path = ("launchkit/native_schedule_reference.py#selected_recurrence_guidance" if product
-                        else "launchkit/native_schedule_reference.json#rendered_contract")
+                    path = ("launchkit/" + pinned["schedule_reference_file"] + "#rendered_contract"
+                        if "schedule_reference_file" in pinned else
+                        "launchkit/native_schedule_reference.py#selected_recurrence_guidance")
                     digest = hashlib.sha256(pinned["content"].encode("utf-8")).hexdigest()
                     prefix_origins = [(path, i + 1, digest) for i in range(len(pinned["content"].splitlines()))]
                     origins = prefix_origins + [None, None] + origins
@@ -496,7 +496,7 @@ class BuildTools:
                                 "new_text": {"type": "string"}}, ["old_text", "new_text"])}},
                         ["kind", "path", "expected_sha256", "edits"])]}}}, ["operations"]))
         draft.register_tool("check_implementation", self.check, description="Run host-owned syntax checks, authored unittest tests/test_*.py and offline tests/test_*.dom.cjs checks when the reviewed DOM runtime is available, in an isolated snapshot without network, user files or credentials. DOM files export a registration function receiving test, createDOM, assert, sourceRoot and scratchRoot. Inspect failures and repair.", input_schema=_schema())
-        draft.register_tool("read_runtime_reference", self.reference, description="Find or read exact installed public SDK source and the application contract. Start with query='MemberSnapshot' or query='list_members' instead of guessing pages. Query is literal and case-insensitive, searches all advertised references unless name is supplied, and returns at most 40 attributed matches; offset pages matches. Read a match using its name and offset without query (offset then means source lines, at most 250). Types provides public result models from types.py; runtime, builder and identity provide full source. Roster, messaging and flows provide focused contracts. Selected runtime pages read its exact protected SDK wheel source without importing it. Schedule preserves common recurrence guidance; only a matching ordinary legacy SDK reference includes its pinned native schemas. SDK callback wiring and documentation are not observed execution. Application describes seeded host hooks. No arbitrary paths or private SDK modules are accepted.", input_schema=_schema({"name": {"type": "string", "enum": ["application", "messaging", "flows", "schedule", "roster", "runtime", "builder", "identity", "types"]}, "query": {"type": "string", "minLength": 1, "maxLength": 160}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 250}}))
+        draft.register_tool("read_runtime_reference", self.reference, description="Find or read exact installed public SDK source and the application contract. Start with query='MemberSnapshot' or query='list_members' instead of guessing pages. Query is literal and case-insensitive, searches all advertised references unless name is supplied, and returns at most 40 attributed matches; offset pages matches. Read a match using its name and offset without query (offset then means source lines, at most 250). Types provides public result models from types.py; runtime, builder and identity provide full source. Roster, messaging and flows provide focused contracts. Selected runtime pages read its exact protected SDK wheel source without importing it. Schedule includes pinned Meta/Core 0.9.4 authoring schemas only when the selected Meta SDK (or, without a selection, the installed Meta SDK) matches; other versions receive recurrence guidance and an explicit missing-schema notice. SDK callback wiring and documentation are not observed execution. Application describes seeded host hooks. No arbitrary paths or private SDK modules are accepted.", input_schema=_schema({"name": {"type": "string", "enum": ["application", "messaging", "flows", "schedule", "roster", "runtime", "builder", "identity", "types"]}, "query": {"type": "string", "minLength": 1, "maxLength": 160}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 250}}))
         draft.register_tool("publish_implementation", self.publish, description="Publish implemented source only after current host-issued passing checks. Explicitly retain unresolved external contracts and live verification needs.", input_schema=_schema({"summary": {"type": "string"}, "unresolved": {"type": "array", "items": {"type": "string"}}}, ["summary", "unresolved"]))
 
 
