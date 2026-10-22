@@ -227,9 +227,10 @@ def widen_service_stop_budget(directory, horizon_ms):
 
     The unit bytes and the service identity never change: an owned systemd
     drop-in carries the larger TimeoutStopSec. Its record is written first, so
-    an interrupted write leaves a controllable unit that the next readiness
-    completes. It never narrows a budget. launchd reads ExitTimeOut only when
-    it loads a job, so a recorded plist keeps its own.
+    an interrupted write leaves a controllable unit, and every readiness while
+    a record exists rewrites a missing drop-in and reloads the manager again,
+    completing an interrupted step. It never narrows a budget. launchd reads
+    ExitTimeOut only when it loads a job, so a recorded plist keeps its own.
     """
     from .deployment import now, read_receipt, receipt_lock
     from .templates.storage_setup import write_private
@@ -248,22 +249,22 @@ def widen_service_stop_budget(directory, horizon_ms):
         if budget > max(service.get("stop_timeout_seconds", LEGACY_USER_SERVICE_STOP_TIMEOUT), recorded):
             record = {"gateway_shutdown_horizon_ms": horizon_ms, "stop_timeout_seconds": budget}
             write_private(directory / "receipt.json", {**receipt, "service_stop_budget": record, "updated_at": now()})
-        elif record is None or _drop_in_content(drop_in) == drop_in_bytes(recorded):
+        elif record is None:
             return None
         content = drop_in_bytes(record["stop_timeout_seconds"])
-        drop_in.parent.mkdir(mode=0o700, exist_ok=True)
-        _drop_in_content(drop_in)
-        temporary = drop_in.with_name("." + drop_in.name + "." + uuid.uuid4().hex)
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        try:
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, drop_in)
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
+        if _drop_in_content(drop_in) != content:
+            drop_in.parent.mkdir(mode=0o700, exist_ok=True)
+            temporary = drop_in.with_name("." + drop_in.name + "." + uuid.uuid4().hex)
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, drop_in)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
     return [service["manager_executable"], "--user", "daemon-reload"]
 
 

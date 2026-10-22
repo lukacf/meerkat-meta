@@ -575,7 +575,9 @@ class Operations:
         """Widen the unit's stop budget to a reported horizon; never narrow it.
 
         The record is written before the drop-in, so an interrupted write
-        leaves a controllable unit that the next readiness completes.
+        leaves a controllable unit. Every readiness while a record exists
+        rewrites a missing drop-in and reloads the manager again, completing
+        an interrupted step.
         """
         receipt = self.load()
         budget = shutdown_budget(horizon_ms)['service']
@@ -585,22 +587,23 @@ class Operations:
         if budget > max(service_stop_timeout(receipt), recorded):
             record = {'gateway_shutdown_horizon_ms': horizon_ms, 'stop_timeout_seconds': budget}
             write_private(self.path, {**receipt, 'service_stop_budget': record})
-        elif record is None or drop_in_content(drop_in) == drop_in_bytes(recorded):
+        elif record is None:
             return False
-        drop_in.parent.mkdir(mode=0o700, exist_ok=True)
-        drop_in_content(drop_in)
-        import uuid
-        temporary = drop_in.with_name('.' + drop_in.name + '.' + uuid.uuid4().hex)
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        try:
-            with os.fdopen(descriptor, 'wb') as channel:
-                channel.write(drop_in_bytes(record['stop_timeout_seconds']))
-                channel.flush()
-                os.fsync(channel.fileno())
-            temporary.replace(drop_in)
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
+        content = drop_in_bytes(record['stop_timeout_seconds'])
+        if drop_in_content(drop_in) != content:
+            drop_in.parent.mkdir(mode=0o700, exist_ok=True)
+            import uuid
+            temporary = drop_in.with_name('.' + drop_in.name + '.' + uuid.uuid4().hex)
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                with os.fdopen(descriptor, 'wb') as channel:
+                    channel.write(content)
+                    channel.flush()
+                    os.fsync(channel.fileno())
+                temporary.replace(drop_in)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
         self.manager(['daemon-reload'])
         return True
 
@@ -726,15 +729,21 @@ class Operations:
             # Recheck authority and manager state immediately before deletion.
             if self.load(require_source=False, allow_legacy_directory=True) != receipt:
                 raise DestinationError('The owned service receipt changed. Its definition was preserved.')
+            # The widened budget goes first: its drop-in, a manager reload, then
+            # its record. Each step leaves a receipt that a rerun can remove.
+            if 'service_stop_budget' in receipt:
+                drop_in = stop_budget_drop_in(receipt)
+                if drop_in_content(drop_in) is not None:
+                    drop_in.unlink()
+                try:
+                    # Only an empty drop-in directory is removed; other files are not ours.
+                    drop_in.parent.rmdir()
+                except OSError:
+                    pass
+                self.manager(['daemon-reload'])
+                receipt = {key: value for key, value in receipt.items() if key != 'service_stop_budget'}
+                write_private(self.path, receipt)
             Path(receipt['unit_path']).unlink()
-            drop_in = stop_budget_drop_in(receipt)
-            if drop_in_content(drop_in) is not None:
-                drop_in.unlink()
-            try:
-                # Only an empty drop-in directory is removed; other files are not ours.
-                drop_in.parent.rmdir()
-            except OSError:
-                pass
             self.path.unlink()
             self.manager(['daemon-reload'])
             return {'status': 'service-removed', 'ready': False, 'files_and_private_state_preserved': True}

@@ -1619,8 +1619,8 @@ def test_remote_removal_deletes_the_drop_in_reloads_then_drops_the_record(packag
     original_manager, original_write = operations.manager, module.write_private
     def manager(arguments, **kwargs):
         if arguments[0] == 'daemon-reload':
-            order.append(('reload', remote_drop_in(earlier).exists(),
-                          'service_stop_budget' in json.loads(operations.path.read_text())))
+            recorded = operations.path.exists() and 'service_stop_budget' in json.loads(operations.path.read_text())
+            order.append(('reload', remote_drop_in(earlier).exists(), recorded))
         return original_manager(arguments, **kwargs)
     def write_private(path, value, **kwargs):
         order.append(('record', 'service_stop_budget' in value))
