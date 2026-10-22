@@ -33,8 +33,19 @@ use serde_json::{Value, json};
 const HOST_PROCESS: &str = "META_GATEWAY_AGENT_CUSTOMIZER_HOST";
 const RECORD: &str = "META_GATEWAY_AGENT_CUSTOMIZER_RECORD";
 const BACKSTOP: Duration = Duration::from_mins(3);
-const MOB_CONFIG: &str =
-    "[mob]\nid = \"gateway-agent-customizer\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n";
+/// Mob members need comms; `turn_driven` keeps the member from starting
+/// turns of its own.
+const MOB_CONFIG: &str = r#"
+[mob]
+id = "gateway-agent-customizer"
+
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+
+[profiles.worker.tools]
+comms = true
+"#;
 /// The one roster member, and the tool the SDK customizer gives it.
 const IDENTITY: &str = "keeper";
 const TOOL: &str = "lookup";
