@@ -1039,7 +1039,7 @@ test('starting context: cancel restores applied choices and removal never change
     assert.match(example.textContent, /Turn scattered notes into a clear weekly update/);
     assert.equal(document.querySelector('#setup-message').value, written, 'Updated inspiration leaves exact user writing untouched.');
     await clickStarting(document, 'Remove starting point');
-    assert.equal(document.querySelector('.forge-starting-context'), null);
+    assert.equal(document.querySelector('.forge-starting-context') === null, true, '.forge-starting-context stays absent');
     assert.equal(document.querySelector('.forge-starting-example'), null, 'Removing the context removes its inspiration.');
     assert.equal(document.querySelector('#setup-message').value, written);
     assert.equal(JSON.parse(values.get(inputKey(guide))).starting_help, undefined);
@@ -1073,7 +1073,7 @@ test('starting context: removing an applied starting point also dismisses its un
     await clickStarting(document, 'Change who this helps: A team');
     await clickStarting(document, 'Remove starting point');
     assert.equal(document.querySelector('.forge-starting-conversation').dataset.open, 'false', 'Removal dismisses the unfinished edit.');
-    assert.equal(document.querySelector('.forge-starting-context'), null);
+    assert.equal(document.querySelector('.forge-starting-context') === null, true, '.forge-starting-context stays absent');
     assert.equal(document.querySelector('#setup-message').value, 'My actual task stays here.');
     assert.equal(document.activeElement?.id, 'setup-message');
     assert.equal(JSON.parse(values.get(inputKey(guide))).starting_help, undefined);
@@ -1093,7 +1093,7 @@ test('starting context reload: a changed question restores writing without borro
   const changed = { ...anonymous, question: { ...anonymous.question, description: 'A changed decision owns its own composer.' } };
   await mounted(changed, async ({ document, calls, values }) => {
     assert.equal(document.querySelector('#setup-message').value, written);
-    assert.equal(document.querySelector('.forge-starting-context'), null);
+    assert.equal(document.querySelector('.forge-starting-context') === null, true, '.forge-starting-context stays absent');
     assert.equal(JSON.parse(values.get(inputKey(changed))).starting_help, undefined);
     await clickStarting(document, 'Answer two questions');
     assert.equal(startingContextButton(document, 'A team').getAttribute('aria-pressed'), 'false');

@@ -338,7 +338,7 @@ for (const narrow of [false, true]) test(`organization opening replaces stock ex
     assert.ok(document.querySelector('.setup-welcome'));
     assert.equal(document.querySelectorAll('.forge-organization-start').length, 1);
     assert.doesNotMatch(document.body.textContent, /household|school dates|Run a club/);
-    assert.equal(document.querySelector('.forge-example-disclosure'), null);
+    assert.equal(document.querySelector('.forge-example-disclosure') === null, true, '.forge-example-disclosure stays absent');
     const pick = document.querySelector('[aria-label="Use Find work that needs attention"]');
     await click(pick);
     const editor = document.querySelector('#setup-message');
@@ -387,7 +387,7 @@ test('organization opening drops saved stock context while preserving and sendin
   const draft = '  Discover projects I might care about.  ';
   await mounted('empty', async ({ document, a, calls, values, list, finish }) => {
     await finish(list, response({ setups: [] }));
-    assert.equal(document.querySelector('.forge-starting-context'), null);
+    assert.equal(document.querySelector('.forge-starting-context') === null, true, '.forge-starting-context stays absent');
     assert.doesNotMatch(document.querySelector('#setup-message').placeholder, /For example:/);
     assert.doesNotMatch(document.body.textContent, /For a team, help with repetitive work/);
     assert.equal(document.querySelector('#setup-message').value, draft);
