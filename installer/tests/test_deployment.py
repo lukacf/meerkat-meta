@@ -1757,3 +1757,37 @@ async def test_retry_admission_checks_leave_the_event_loop_free(service, tmp_pat
         await probe
     assert retried["status"] == "queued" and stalls and max(stalls) < 0.5
     await service.shutdown()
+
+
+async def test_installed_source_evidence_leaves_the_event_loop_free(tmp_path, monkeypatch):
+    from launchkit import deployment
+    guide = Guide()
+    implementation = Implementation(guide)
+    implementation.digest = "b" * 64
+    service = Service(tmp_path / "private-server", guide, implementation)
+    await submit(service, tmp_path / "application")
+    directory = service._directory(guide.identity)
+    materialize(directory)
+    await service.shutdown()
+    update_receipt(directory, status="stopped", interactive_lifecycle_id=None, interactive_cleanup=None)
+    state = {**guide.state, "id": guide.identity}
+    original = deployment.verify_destination
+    def slowed(*args, **kwargs):
+        time.sleep(1.0)  # A large installed copy on a small host.
+        return original(*args, **kwargs)
+    monkeypatch.setattr(deployment, "verify_destination", slowed)
+    stalls, done = [], asyncio.Event()
+    async def other_request():
+        while not done.is_set():
+            started = time.monotonic()
+            await asyncio.sleep(0.01)
+            stalls.append(time.monotonic() - started)
+    probe = asyncio.create_task(other_request())
+    await asyncio.sleep(0)  # The other request is waiting on the loop.
+    try:
+        evidence = await service.guide_status(guide.identity, state=state)
+    finally:
+        done.set()
+        await probe
+    assert evidence["source_verified"] is True and evidence["source_digest"] == "b" * 64
+    assert stalls and max(stalls) < 0.5

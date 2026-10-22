@@ -2600,10 +2600,10 @@ class DeploymentService:
 
     async def guide_status(self, guide_id, *, state):
         """Project exact installed source evidence without importing application code."""
+        from .deployment_updates import checked_package
         receipt = await self.status(guide_id, state=state)
         result = {**receipt, "source_verified": False, "source_digest": None}
-        try:
-            from .deployment_updates import checked_package
+        def verified_source():
             _, files = checked_package(self._directory(guide_id), "package.zip", receipt["package_sha256"])
             source = read_package_source(files, receipt)
             digest = source["source_digest"]
@@ -2611,8 +2611,12 @@ class DeploymentService:
             for name in files:
                 info = (destination / name).stat()
                 if info.st_uid != os.getuid() or info.st_nlink != 1:
-                    return result
-            result.update(source_verified=True, source_digest=digest)
+                    return {}
+            return {"source_verified": True, "source_digest": digest}
+        try:
+            # Reading and hashing the saved package and its installed copy
+            # must not hold the event loop.
+            result.update(await await_validation(verified_source))
         except (OSError, ValueError, KeyError, TypeError, DraftConflict):
             # A failed source check is evidence of uncertainty, never a model
             # instruction to repair source or permission to use old acceptance.
