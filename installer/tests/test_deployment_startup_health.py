@@ -737,14 +737,25 @@ async def test_service_worker_widens_its_unit_to_the_reported_horizon_at_readine
     assert reloads == ([["/usr/bin/systemctl", "--user", "daemon-reload"]] if service_owned else [])
 
 
-async def test_a_failed_stop_budget_widening_is_logged_and_never_blocks_readiness(fixture, monkeypatch):
+@pytest.mark.parametrize("failure", ["refused", "unexpected", "reload-timed-out"])
+async def test_a_failed_stop_budget_widening_is_logged_and_never_blocks_readiness(fixture, monkeypatch, failure):
+    import subprocess
     from launchkit import deployment_service
     supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})],
         readiness_extra={"gateway_shutdown_horizon_ms": 432_000})
     supervisor.service_owned = True
+    reload = ["/usr/bin/systemctl", "--user", "daemon-reload"]
     def widen(directory, horizon_ms):
-        raise deployment_service.DraftConflict("The owned service definition changed. No service was controlled.")
+        if failure == "refused":
+            raise deployment_service.DraftConflict("The owned service definition changed. No service was controlled.")
+        if failure == "unexpected":
+            raise KeyError("unit_path")
+        return reload
+    class Manager:
+        async def command(self, arguments, **kwargs):
+            raise subprocess.TimeoutExpired(arguments, 60)
     monkeypatch.setattr(deployment_service, "widen_service_stop_budget", widen, raising=False)
+    monkeypatch.setattr(deployment_service, "UserServiceManager", Manager)
     published = []
     def ready():
         published.append(True)
@@ -752,3 +763,37 @@ async def test_a_failed_stop_budget_widening_is_logged_and_never_blocks_readines
     await asyncio.wait_for(supervisor.start(definition, on_ready=ready), 3)
     assert published == [True]
     assert any("stop budget" in item["text"] for item in read_receipt(supervisor.directory)["logs"])
+
+
+async def test_each_child_is_stopped_as_unreported_until_it_reports_a_horizon(fixture, monkeypatch):
+    # A horizon the previous child reported never sizes a stop before the next
+    # child's own readiness: neither the worker's stop nor the host's wait.
+    from launchkit import deployment
+    from test_gateway_shutdown_horizon import gateway_horizon_ms, TRANSPORT_AND_ADAPTER_MARGIN
+    supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})])
+    (supervisor.destination / "app.py").write_text("import time\ntime.sleep(60)\n")
+    supervisor.gateway_shutdown_horizon_ms = 300_000
+    update_receipt(supervisor.directory, gateway_shutdown_horizon_ms=300_000)
+    import launchkit.deployment_worker as module
+    actual_wait = asyncio.wait_for
+    windows = []
+    async def observe(awaitable, timeout):
+        if getattr(getattr(awaitable, "cr_code", None), "co_name", None) == "parent_exit":
+            windows.append(timeout)
+        return await actual_wait(awaitable, timeout)
+    monkeypatch.setattr(module.asyncio, "wait_for", observe)
+    task = asyncio.create_task(supervisor.start(definition))
+    observed = []
+    try:
+        deadline = time.monotonic() + 10
+        while supervisor.child is None and not task.done() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        observed.append((supervisor.gateway_shutdown_horizon_ms,
+                         read_receipt(supervisor.directory).get("gateway_shutdown_horizon_ms", "absent"),
+                         deployment.worker_stop_timeout(supervisor.directory)))
+    finally:
+        supervisor.stop.set()
+        await asyncio.gather(actual_wait(task, 5), return_exceptions=True)
+    application = gateway_horizon_ms() // 1000 + TRANSPORT_AND_ADAPTER_MARGIN
+    assert observed == [(None, None, application + 10 + 5)]
+    assert windows and set(windows) == {application}

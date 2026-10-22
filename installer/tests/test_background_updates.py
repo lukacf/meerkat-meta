@@ -6,6 +6,7 @@ checks are production code. No operating-system service or native agent runs.
 import asyncio
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import uuid
 
@@ -711,7 +712,7 @@ async def test_first_update_on_an_earlier_unit_widens_its_stop_budget_without_ro
 RELOAD = ["/usr/bin/systemctl", "--user", "daemon-reload"]
 
 
-@pytest.mark.parametrize("killed", ["after-record", "before-reload"])
+@pytest.mark.parametrize("killed", ["after-record", "before-reload", "re-widening-after-record"])
 async def test_an_interrupted_stop_budget_widening_stays_controllable_and_completes(
         unit_from_earlier_forge, background, monkeypatch, killed):
     service, directory, target, old, private, identity, manager, definition = background
@@ -726,10 +727,26 @@ async def test_an_interrupted_stop_budget_widening_stays_controllable_and_comple
                 services.widen_service_stop_budget(directory, 432_000)
         assert read_receipt(directory)["service_stop_budget"]["stop_timeout_seconds"] == 482
         assert not drop_in.exists()
-    else:
+    elif killed == "before-reload":
         # The worker dies after writing the drop-in, before it reloads the manager.
         assert services.widen_service_stop_budget(directory, 432_000) == RELOAD
         assert drop_in.exists()
+    else:
+        # An earlier readiness widened the unit for a 392-second horizon. A
+        # longer report records its budget, then the worker dies before its
+        # drop-in replaces the earlier one.
+        assert services.widen_service_stop_budget(directory, 392_000) == RELOAD
+        replace = os.replace
+        def killed_replace(source, destination, *args, **kwargs):
+            if Path(destination).name == drop_in.name:
+                raise RuntimeError("killed")
+            return replace(source, destination, *args, **kwargs)
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "replace", killed_replace)
+            with pytest.raises(RuntimeError, match="killed"):
+                services.widen_service_stop_budget(directory, 432_000)
+        assert read_receipt(directory)["service_stop_budget"]["stop_timeout_seconds"] == 482
+        assert drop_in.read_bytes() == b"[Service]\nTimeoutStopSec=442\n"
     # Status, stop and a fresh start keep working on the interrupted state.
     await services.background_status(directory, manager)
     await services.stop_background(directory, manager)

@@ -269,6 +269,34 @@ async def test_a_stop_budget_drop_in_is_verified_byte_exact(background):
             f.service.verify_service(directory, {**receipt, "service_stop_budget": forged})
 
 
+# Under a unit at the earlier 397-second budget and a record for a 432-second
+# horizon, a re-widening killed after its record leaves the drop-in an earlier,
+# shorter report wrote: a canonical budget above the unit's and below the
+# record's. Nothing else in the owned drop-in is accepted.
+EARLIER_DROP_IN_BUDGETS = [398, service_budget(392_000), service_budget(432_000) - 1]
+FOREIGN_DROP_INS = [b"[Service]\nTimeoutStopSec=397\n", b"[Service]\nTimeoutStopSec=45\n",
+                    f"[Service]\nTimeoutStopSec={service_budget(432_000) + 1}\n".encode(),
+                    b"[Service]\nTimeoutStopSec=0442\n", b"[Service]\nTimeoutStopSec=442\nKillMode=none\n",
+                    b"[Service]\nTimeoutStopSec=442", b"[Unit]\nTimeoutStopSec=442\n"]
+
+
+@pytest.mark.parametrize("background", ["linux"], indirect=True)
+async def test_an_earlier_owned_drop_in_below_its_record_stays_controllable(background):
+    f = background
+    directory = await f.prepared()
+    earlier, _ = earlier_unit(f, directory)
+    drop_in = Path(earlier["unit_path"] + ".d") / DROP_IN
+    f.service.widen_service_stop_budget(directory, 432_000)
+    receipt = f.deployment.read_receipt(directory)
+    for budget in EARLIER_DROP_IN_BUDGETS:
+        drop_in.write_bytes(f"[Service]\nTimeoutStopSec={budget}\n".encode())
+        assert f.service.verify_service(directory, receipt) == earlier
+    for content in FOREIGN_DROP_INS:
+        drop_in.write_bytes(content)
+        with pytest.raises(Exception, match="definition changed"):
+            f.service.verify_service(directory, receipt)
+
+
 @pytest.mark.parametrize("background", ["linux"], indirect=True)
 async def test_the_manager_stop_command_outlasts_a_stop_budget_drop_in(background):
     f = background

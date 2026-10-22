@@ -21,7 +21,8 @@ import pytest
 from launchkit.blueprint import starter_blueprint
 from launchkit.compiler import generate_files
 from launchkit import deployment_deadlines
-from test_gateway_shutdown_horizon import TRANSPORT_AND_ADAPTER_MARGIN, gateway_horizon_ms
+from test_gateway_shutdown_horizon import (EARLIER_DROP_IN_BUDGETS, FOREIGN_DROP_INS, TRANSPORT_AND_ADAPTER_MARGIN,
+                                           gateway_horizon_ms)
 
 
 def load_helper(path=None):
@@ -1511,6 +1512,22 @@ def test_remote_stop_budget_drop_in_is_verified_byte_exact(package, tmp_path):
             operations.load()
 
 
+def test_remote_earlier_owned_drop_in_below_its_record_stays_controllable(package, tmp_path):
+    module = load_helper(package / 'remote_operations.py')
+    operations = fake_operations(module, package, tmp_path / 'home')
+    earlier, _ = remote_earlier_unit(module, operations)
+    operations.widen_unit(432_000)
+    drop_in = remote_drop_in(earlier)
+    recorded = json.loads(operations.path.read_text())
+    for budget in EARLIER_DROP_IN_BUDGETS:
+        drop_in.write_bytes(f'[Service]\nTimeoutStopSec={budget}\n'.encode())
+        assert operations.load() == recorded
+    for content in FOREIGN_DROP_INS:
+        drop_in.write_bytes(content)
+        with pytest.raises(ValueError, match='definition changed'):
+            operations.load()
+
+
 def test_remote_stop_and_restart_wait_for_the_widened_budget(package, tmp_path, monkeypatch):
     module = load_helper(package / 'remote_operations.py')
     monkeypatch.setattr(module, 'console_healthy', lambda *args: True)
@@ -1547,7 +1564,7 @@ def failing_once(operations, verb):
     return original
 
 
-@pytest.mark.parametrize('killed', ['after-record', 'before-reload'])
+@pytest.mark.parametrize('killed', ['after-record', 'before-reload', 're-widening-after-record'])
 def test_remote_interrupted_widening_stays_controllable_and_completes(package, tmp_path, monkeypatch, killed):
     module = load_helper(package / 'remote_operations.py')
     monkeypatch.setattr(module, 'console_healthy', lambda *args: True)
@@ -1562,12 +1579,27 @@ def test_remote_interrupted_widening_stays_controllable_and_completes(package, t
             with pytest.raises(RuntimeError, match='killed'):
                 operations.widen_unit(432_000)
         assert not drop_in.exists()
-    else:
+    elif killed == 'before-reload':
         original = failing_once(operations, 'daemon-reload')
         with pytest.raises(RuntimeError, match='killed'):
             operations.widen_unit(432_000)
         operations.manager = original
         assert drop_in.exists()
+    else:
+        # An earlier readiness widened the unit for a 392-second horizon. A
+        # longer report records its budget, then the supervisor dies before
+        # its drop-in replaces the earlier one.
+        assert operations.widen_unit(392_000) is True
+        replace = Path.replace
+        def killed_replace(path, destination):
+            if Path(destination).name == drop_in.name:
+                raise RuntimeError('killed')
+            return replace(path, destination)
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, 'replace', killed_replace)
+            with pytest.raises(RuntimeError, match='killed'):
+                operations.widen_unit(432_000)
+        assert drop_in.read_bytes() == f"[Service]\nTimeoutStopSec={remote_budget('service', 392_000)}\n".encode()
     assert operations.load()['service_stop_budget']['stop_timeout_seconds'] == remote_budget('service', 432_000)
     # Status, stop and restart keep working on the interrupted state.
     assert operations.status()['definition_verified'] is True
@@ -1637,8 +1669,9 @@ FIXTURE_APP_REPORTING = FIXTURE_APP.replace("payload = {'pid'", "payload = {'gat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('reported, widening', [(432_000, 'widened'), (432_000, 'refused'), ('432000', 'widened')],
-                         ids=['reported', 'widening-refused', 'malformed'])
+@pytest.mark.parametrize('reported, widening', [(432_000, 'widened'), (432_000, 'refused'), (432_000, 'timed-out'),
+                                                ('432000', 'widened')],
+                         ids=['reported', 'widening-refused', 'widening-timed-out', 'malformed'])
 async def test_actual_supervisor_widens_at_readiness_and_stops_within_the_reported_horizon(
         package, tmp_path, monkeypatch, capsys, reported, widening):
     assert FIXTURE_APP_REPORTING != FIXTURE_APP
@@ -1651,6 +1684,9 @@ async def test_actual_supervisor_widens_at_readiness_and_stops_within_the_report
         widened.append(horizon_ms)
         if widening == 'refused':
             raise module.DestinationError('The owned service definition changed. No existing unit was replaced or controlled.')
+        if widening == 'timed-out':
+            # A manager reload that outlives its bound.
+            raise subprocess.TimeoutExpired(['/usr/bin/systemctl', '--user', 'daemon-reload'], 60)
         return True
     monkeypatch.setattr(operations, 'widen_unit', widen, raising=False)
     owned_stop = module.stop_supervised_application
@@ -1672,7 +1708,7 @@ async def test_actual_supervisor_widens_at_readiness_and_stops_within_the_report
         assert isinstance(outcome, ValueError) and 'gateway shutdown horizon' in str(outcome)
         assert (widened, stops) == ([], [None])
     else:
-        # A refused widening is reported and never blocks readiness.
+        # A refused or failed widening is reported and never blocks readiness.
         assert isinstance(outcome, asyncio.CancelledError)
         assert (widened, stops) == ([432_000], [432_000])
-        assert ('stop budget' in capsys.readouterr().out) is (widening == 'refused')
+        assert ('stop budget' in capsys.readouterr().out) is (widening != 'widened')
