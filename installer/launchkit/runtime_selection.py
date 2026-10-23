@@ -45,6 +45,7 @@ def parse_candidate_selection(value):
     binding = value["accepted"]
     if (binding["repository"] != "lukacf/meerkat-mobkit"
             or binding["native_version"] != "0.8.48" or binding["core_version"] != "0.8.51"
+            or not isinstance(binding["platform"], str)
             or binding["platform"] not in {"aarch64-apple-darwin", "x86_64-apple-darwin",
                 "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"}
             or any(type(binding[key]) is not int or binding[key] < 1
