@@ -3014,16 +3014,16 @@ async fn live_open_config_for_session<B: SessionAgentBuilder + 'static>(
 }
 
 /// Deliver the session's staged create-time prompt for a live open, as
-/// Meerkat's own opens do: a deferred session whose first interaction is this
-/// open hands the prompt to the realtime model once, through the `RunStarted`
-/// hooks a turn carrying it would run. Like Meerkat's mirrored-channel and
-/// concurrent summary opens, the delivery only tries the session's turn
-/// boundary and never waits behind a running turn: a held boundary delivers
-/// nothing (a turn in flight has consumed the prompt already; any other holder
-/// leaves it staged for the next open or the first text turn). A session with
-/// nothing staged answers at once, with no guard, actor command or store read.
-/// A hook that refuses the prompt keeps it staged for the first text turn and
-/// the open goes ahead without it: the answer is `true`, reported as the
+/// Meerkat's ordinary open does: a deferred session whose first interaction
+/// is this open hands the prompt to the realtime model once, through the
+/// `RunStarted` hooks a turn carrying it would run. The delivery takes the
+/// session's turn boundary, which the snapshot export after it waits for
+/// anyway, so it adds no wait to the open: another holder of the boundary
+/// delays it and it then delivers once, and a turn in flight consumes the
+/// prompt itself, leaving nothing to deliver. A session with nothing staged
+/// answers at once, with no guard, actor command or store read. A hook that
+/// refuses the prompt keeps it staged for the first text turn and the open
+/// goes ahead without it: the answer is `true`, reported as the
 /// `staged_prompt_refused` advisory.
 #[cfg(not(feature = "openai-live"))]
 async fn deliver_staged_prompt_for_live_open<B: SessionAgentBuilder + 'static>(
@@ -3031,7 +3031,7 @@ async fn deliver_staged_prompt_for_live_open<B: SessionAgentBuilder + 'static>(
     session_id: &SessionId,
 ) -> Result<bool, meerkat_core::SessionError> {
     let delivery = service
-        .try_deliver_staged_prompt_for_live_open(session_id)
+        .deliver_staged_prompt_for_live_open(session_id)
         .await?;
     if let meerkat_session::StagedPromptLiveOpenDelivery::Refused(refusal) = delivery {
         tracing::warn!(
@@ -5455,14 +5455,14 @@ mod tests {
         );
     }
 
-    /// The ordinary open's staged-prompt delivery only tries the session's
-    /// turn boundary and never waits behind it: while another holder has the
-    /// boundary, the delivery answers at once and commits nothing, so the
-    /// prompt stays staged for the next open or the first text turn; once the
-    /// boundary is free the same delivery commits it once.
+    /// The ordinary open delivers the staged prompt at the session's turn
+    /// boundary, as Meerkat's ordinary open does: while a holder other than a
+    /// turn has the boundary the delivery waits and commits nothing, and once
+    /// the boundary is free it commits the prompt once. A later delivery finds
+    /// nothing staged and commits no second row.
     #[cfg(not(feature = "openai-live"))]
     #[tokio::test]
-    async fn the_ordinary_open_delivery_never_waits_behind_a_held_turn_boundary() {
+    async fn a_held_turn_boundary_delays_the_ordinary_open_delivery_which_delivers_once() {
         use meerkat_core::service::SessionService as _;
 
         const STAGED: &str = "Remember the codeword ORBIT-7 for later.";
@@ -5507,29 +5507,39 @@ mod tests {
             .await
             .expect("create the deferred session with its prompt staged");
 
+        // Another holder of the turn boundary (not a turn: nothing consumed
+        // the prompt). The delivery waits for it without committing anything.
         let boundary = service
             .acquire_runtime_turn_finalization_guard(&session_id)
             .await;
-        let while_held = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            deliver_staged_prompt_for_live_open(&service, &session_id),
-        )
-        .await
-        .expect("the delivery never waits for the held turn boundary")
-        .expect("the delivery answers");
+        let mut delivery =
+            std::pin::pin!(deliver_staged_prompt_for_live_open(&service, &session_id));
+        let while_held =
+            tokio::time::timeout(std::time::Duration::from_millis(250), delivery.as_mut()).await;
         let rows_while_held = committed_user_rows(&service, &session_id).await;
         drop(boundary);
-        let once_free = deliver_staged_prompt_for_live_open(&service, &session_id)
+        let refused = tokio::time::timeout(std::time::Duration::from_secs(20), delivery.as_mut())
             .await
+            .expect("the delivery completes once the boundary is free")
             .expect("the delivery answers");
         let rows = committed_user_rows(&service, &session_id).await;
+        let refused_again = deliver_staged_prompt_for_live_open(&service, &session_id)
+            .await
+            .expect("a later delivery answers");
+        let rows_after_again = committed_user_rows(&service, &session_id).await;
         service.shutdown().await;
 
         assert!(
-            !while_held && rows_while_held.is_empty() && !once_free && rows == [STAGED.to_string()],
-            "a held boundary must leave the prompt staged without waiting, and a free one \
-             must deliver it once: while_held={while_held} \
-             rows_while_held={rows_while_held:?} once_free={once_free} rows={rows:?}"
+            while_held.is_err()
+                && rows_while_held.is_empty()
+                && !refused
+                && rows == [STAGED.to_string()]
+                && !refused_again
+                && rows_after_again == [STAGED.to_string()],
+            "a held boundary must delay the delivery without committing, and the delivery \
+             must then commit the prompt once: while_held={while_held:?} \
+             rows_while_held={rows_while_held:?} refused={refused} rows={rows:?} \
+             refused_again={refused_again} rows_after_again={rows_after_again:?}"
         );
     }
 

@@ -1037,10 +1037,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   opened with `meta/live/open` had its prompt held back until its first text
   turn. The open now delivers it once, through the
   `RunStarted` hooks a turn carrying it would run, as the member's newest user
-  row before the seed is read. The delivery only tries the member's turn
-  boundary and never waits behind a running turn, and a member with nothing
-  staged costs the open nothing. On an `openai-live` gateway Meerkat's own open
-  projections deliver it. A hook that refuses the prompt keeps it staged for
+  row before the seed is read. As in Meerkat's ordinary open, the delivery
+  takes the member's turn boundary, which the seed read waits for anyway, so
+  it adds no wait; a member with nothing staged costs the open nothing. On an
+  `openai-live` gateway Meerkat's own open projections deliver it. A hook that refuses the prompt keeps it staged for
   the first text turn and the open goes ahead without it: the `meta/live/open`
   result, the pending handle (also from `meta/console/voice/open`) and a
   replacement handle carry `advisories: ["staged_prompt_refused"]`, a key left

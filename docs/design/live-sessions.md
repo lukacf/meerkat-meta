@@ -732,18 +732,20 @@ published-version limitations below do not require a development pin today.
    model once, through the `RunStarted` hooks a turn carrying it would run,
    committed as the member's newest user row before the seed is read; a
    later open or first text turn finds nothing staged. The ordinary gateway
-   delivers it itself and only tries the member's turn boundary, never
-   waiting behind a running turn (a turn in flight has consumed the prompt
-   already). An `openai-live` gateway's opens go through Meerkat's own open
+   delivers it itself, as Meerkat's ordinary open does, at the member's turn
+   boundary, which its seed read waits for anyway: another holder of the
+   boundary delays the delivery, and a turn in flight consumes the prompt
+   itself. An `openai-live` gateway's opens go through Meerkat's own open
    projections, which deliver it too: the mirrored-channel and concurrent
-   summary opens only try the boundary, and the ordinary and summary opens
-   deliver at the boundary their seed read waits for anyway. A
-   member with nothing staged costs the open nothing. A hook that refuses
-   the prompt keeps it staged for the first text turn and the open goes
-   ahead without it: the open result (and the pending or replacement handle)
-   carries `advisories: ["staged_prompt_refused"]`. `advisories` is left out
-   when there are none, and its vocabulary may grow: the SDKs keep an
-   advisory they do not know as the string the server sent.
+   summary opens only try the boundary and never wait behind a running turn,
+   and the ordinary and summary opens deliver at the boundary their seed
+   read waits for. A member with nothing staged costs the open nothing. A
+   hook that refuses the prompt keeps it staged for the first text turn and
+   the open goes ahead without it: the open result (and the pending or
+   replacement handle) carries `advisories: ["staged_prompt_refused"]`.
+   `advisories` is left out when there are none, and its vocabulary may
+   grow: the SDKs keep an advisory they do not know as the string the server
+   sent.
 8. **Gating**: `runtime_options.live = true | {ws: true}` opt-in on
    `meta/init` (default OFF). ABAC: live methods map to `agent.send` on
    the target member (console surface); stdin surface is host-trusted as

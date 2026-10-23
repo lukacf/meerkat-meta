@@ -1220,6 +1220,56 @@ printf '%s' '{}'"#;
         );
     }
 
+    /// A voice-first member whose turn boundary a holder other than a turn
+    /// has when the open arrives: the open delivers the staged prompt at the
+    /// boundary, which its seed read waits for anyway, so it completes only
+    /// once the boundary is free, and it still delivers the prompt once,
+    /// ahead of its seed, with no advisory.
+    #[tokio::test]
+    async fn a_held_turn_boundary_delays_a_voice_first_open_which_still_delivers_once() {
+        let _open_guard = LIVE_OPEN_TEST_LOCK.lock().await;
+        let stack = anthropic_member_stack_with(MemberSetup {
+            staged_prompt: Some(STAGED),
+            run_start_hook: true,
+        })
+        .await;
+
+        let boundary = stack
+            .service
+            .acquire_runtime_turn_finalization_guard(&stack.session_id)
+            .await;
+        let mut opening = std::pin::pin!(open(&stack, cross_provider_open_params()));
+        let while_held =
+            tokio::time::timeout(std::time::Duration::from_millis(250), opening.as_mut()).await;
+        // Only the hook log is read while the boundary is held: the delivery
+        // has not run its hook yet.
+        let hook_calls_while_held = run_start_hook_calls(&stack);
+        drop(boundary);
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(30), opening.as_mut())
+            .await
+            .expect("the open completes once the boundary is free");
+        let rows = committed_user_rows(&stack).await;
+        let hook_calls = run_start_hook_calls(&stack);
+        let seeds = stack.seeds.seeded_user_rows();
+        let _ = close_opened(&stack, &opened).await;
+        stack.service.shutdown().await;
+
+        let staged = vec![STAGED.to_string()];
+        assert!(
+            while_held.is_err()
+                && hook_calls_while_held == 0
+                && opened.error.is_none()
+                && advisories(&opened).is_none()
+                && rows == staged
+                && hook_calls == 1
+                && seeds == [staged.clone()],
+            "a held boundary must delay the open, which must then deliver the staged prompt \
+             once ahead of its seed: while_held={while_held:?} \
+             hook_calls_while_held={hook_calls_while_held} opened={opened:?} rows={rows:?} \
+             hook_calls={hook_calls} seeds={seeds:?}"
+        );
+    }
+
     /// A member with nothing staged: the open does no delivery work. The
     /// run-start hook never runs, nothing is committed, the seed carries no
     /// user row, and the open result carries no advisory.
