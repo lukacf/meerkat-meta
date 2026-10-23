@@ -394,6 +394,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   best-effort: an error is logged at WARN and the build stands. A member Core
   rebuilds on its own (its restore at a restart, a delivery-time repair) gets
   the identity's customizer tools attached without either call.
+- The Python SDK gives an identity customizer's `after_create` the context the
+  gateway sends: the model, labels and system prompt beside the identity and
+  the session. It read a nested `context` object, which the gateway does not
+  send, and passed an empty context; a nested object is still read when one
+  is present.
 
 ### Known limitations
 
