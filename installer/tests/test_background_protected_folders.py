@@ -28,6 +28,10 @@ PROTECTED_IDS = ("Desktop", "Documents", "Downloads", "iCloud-Drive", "CloudStor
 FOLDER_REFUSAL = ("macOS does not let a background login item read Desktop, Documents, Downloads, iCloud Drive or "
     "cloud storage folders. Move the Forge folder and the installation folder to a folder such as ~/MetaForge, or "
     "choose 'While Forge is open'.")
+# An installed unit is not moved: moving its folders would break its installation.
+EARLIER_REFUSAL = ("macOS does not let a background login item read Desktop, Documents, Downloads, iCloud Drive or "
+    "cloud storage folders. Stop this service and install the application again in a folder such as ~/MetaForge, "
+    "or install it to run while Forge is open.")
 VOLUME_REFUSAL = ("macOS does not let a background login item read external or network volumes, which may also be "
     "unavailable at login. Move the Forge folder and the installation folder to a folder such as ~/MetaForge, "
     "or choose 'While Forge is open'.")
@@ -272,7 +276,7 @@ async def test_earlier_service_in_a_protected_folder_refuses_a_start_before_any_
     manager.calls.clear()
     with pytest.raises(DraftConflict) as refused:
         await service.action(service.guide.identity, directory.name, action)
-    assert str(refused.value) == FOLDER_REFUSAL
+    assert str(refused.value) == EARLIER_REFUSAL
     assert no_manager_effect(manager)
     after = read_receipt(directory)
     assert after["status"] == before["status"]
@@ -290,7 +294,7 @@ async def test_earlier_service_in_a_protected_folder_refuses_a_support_refresh_b
     with pytest.raises(Exception) as refused:
         await service.action(service.guide.identity, directory.name, action,
                              action_request_id=str(uuid.uuid4()), **support)
-    assert (type(refused.value), str(refused.value)) == (DraftConflict, FOLDER_REFUSAL)
+    assert (type(refused.value), str(refused.value)) == (DraftConflict, EARLIER_REFUSAL)
     assert no_manager_effect(manager)
     assert not (directory / "supervisor-refresh").exists()
 
@@ -321,8 +325,8 @@ async def test_status_names_the_folder_an_earlier_service_waits_on(earlier_servi
     _, manager, directory = earlier_service
     waiting_in_start_up(directory, manager)
     status = await deployment_service.background_status(directory, manager)
-    assert (status["status"], status["detail"]) == ("starting", FOLDER_REFUSAL)
-    assert read_receipt(directory)["detail"] != FOLDER_REFUSAL, "The reason is a status projection only."
+    assert (status["status"], status["detail"]) == ("starting", EARLIER_REFUSAL)
+    assert read_receipt(directory)["detail"] != EARLIER_REFUSAL, "The reason is a status projection only."
 
 
 async def test_status_of_an_earlier_service_running_in_a_protected_folder_is_unchanged(earlier_service):
@@ -332,4 +336,4 @@ async def test_status_of_an_earlier_service_running_in_a_protected_folder_is_unc
                    service_instance_id=str(uuid.uuid4()), service_cleanup_confirmed=False)
     manager.observation = {"loaded": True, "pid": 4567, "state": "running"}
     status = await deployment_service.background_status(directory, manager)
-    assert status["detail"] != FOLDER_REFUSAL
+    assert status["detail"] != EARLIER_REFUSAL

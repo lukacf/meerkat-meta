@@ -135,6 +135,9 @@ _NEW_INSTALLATION = ("Move the Forge folder and the installation folder to a fol
 # The setup card's own button is Start installed application.
 _SETUP_CARD = ("To run this application in the background, install it again with the Forge folder and the "
     "installation folder in a folder such as ~/MetaForge. Start installed application runs it while Forge is open.")
+# An installed unit is not moved: moving its folders would break its installation.
+_EARLIER_SERVICE = ("Stop this service and install the application again in a folder such as ~/MetaForge, "
+    "or install it to run while Forge is open.")
 PROTECTED_FOLDER_REFUSAL = _PROTECTED_REASONS["folder"] + " " + _NEW_INSTALLATION
 OTHER_VOLUME_REFUSAL = _PROTECTED_REASONS["volume"] + " " + _NEW_INSTALLATION
 
@@ -218,10 +221,11 @@ def _protected_location(path, protected, home, volumes):
     return location(_folded(current))
 
 
-def launchd_folder_refusal(paths, *, home=None, volumes=None, setup_card=False):
+def launchd_folder_refusal(paths, *, home=None, volumes=None, setup_card=False, installed=False):
     """Why a launchd login item could not read one of these paths, or None.
 
-    ``setup_card`` words the advice for the completed-setup card.
+    ``setup_card`` words the advice for the completed-setup card and
+    ``installed`` for a service that already exists there.
     """
     home = Path(home) if home is not None else Path.home()
     homes = {_folded(home)}
@@ -235,7 +239,8 @@ def launchd_folder_refusal(paths, *, home=None, volumes=None, setup_card=False):
     kind = "folder" if "folder" in found else "volume" if "volume" in found else None
     if kind is None:
         return None
-    return _PROTECTED_REASONS[kind] + " " + (_SETUP_CARD if setup_card else _NEW_INSTALLATION)
+    return _PROTECTED_REASONS[kind] + " " + (_SETUP_CARD if setup_card else _EARLIER_SERVICE if installed
+                                            else _NEW_INSTALLATION)
 
 
 def installed_service_folder_refusal(service, receipt):
@@ -248,7 +253,7 @@ def installed_service_folder_refusal(service, receipt):
     if not isinstance(service, dict) or service.get("manager") != "launchd":
         return None
     paths = [service.get("interpreter"), service.get("receipt_directory"), receipt.get("destination")]
-    return launchd_folder_refusal([path for path in paths if isinstance(path, str) and path])
+    return launchd_folder_refusal([path for path in paths if isinstance(path, str) and path], installed=True)
 
 
 def service_plan(identity, directory, *, platform=None, home=None):
