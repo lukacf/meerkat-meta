@@ -1,12 +1,9 @@
-import io
-import zipfile
-
 import pytest
 from fastapi.testclient import TestClient
 
 from launchkit.planner import starter_design
 from launchkit.schema import DesignRequest
-from launchkit.server import app
+from launchkit.server import LEGACY_PACKAGE_RETIRED, app
 
 
 @pytest.fixture
@@ -22,20 +19,13 @@ def spec():
             "gcp": {"project": "", "region": "europe-west1", "zone": "europe-west1-b", "machine_type": "e2-medium"}, "advanced": {"port": 4110}}
 
 
-def test_preview_and_archive_have_identical_contents(client, spec):
-    preview = client.post("/api/preview", json=spec)
-    assert preview.status_code == 200, preview.text
-    files = {f["path"]: f["content"] for f in preview.json()["files"]}
-    assert {"app.py", "install.sh", "README.md"} <= files.keys()
-    response = client.post("/api/package", json=spec)
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "application/zip"
-    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-        assert {path.removeprefix("my-home/") for path in archive.namelist()} == files.keys()
-        for path, content in files.items():
-            assert archive.read(f"my-home/{path}").decode() == content
-        assert archive.getinfo("my-home/install.sh").external_attr >> 16 & 0o111
-    assert response.headers["cache-control"] == "no-store"
+def test_legacy_package_routes_are_retired(client, spec):
+    # The first wizard's routes exported MobKit 0.8 packages; the guide replaces them.
+    for route in ("/api/preview", "/api/package"):
+        response = client.post(route, json=spec)
+        assert response.status_code == 410, route
+        assert response.json() == {"detail": LEGACY_PACKAGE_RETIRED}
+        assert "content-disposition" not in response.headers
 
 
 @pytest.mark.parametrize("mutation", [
