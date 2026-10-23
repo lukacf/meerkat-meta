@@ -19,6 +19,7 @@ Logs are written into the work folder. Any failed check exits non-zero.
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -144,11 +145,26 @@ def start_until_ready_then_interrupt(team, work, name, definition):
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
     # A first start can run and settle a preparatory gateway before the serving one.
-    settled = [line for line in log.read_text(errors="replace").splitlines()
+    settled = [shutdown_fields(line) for line in log.read_text(errors="replace").splitlines()
         if "rpc_gateway shutdown complete; exiting" in line]
-    check(settled and "signal=SIGINT" in settled[-1] and all(
-        "cleanup_complete=true" in line and "runtime_cleanup_complete=true" in line for line in settled),
-        f"{name}: SIGINT stops the gateway with complete cleanup")
+    check(settled and interrupt_stopped(settled[-1]) and all(
+        fields.get("cleanup_complete") == "true" and fields.get("runtime_cleanup_complete") == "true"
+        for fields in settled),
+        f"{name}: SIGINT stops the gateway with complete cleanup (signal or handshake path)")
+
+
+def shutdown_fields(line):
+    """The key=value fields of one gateway shutdown line."""
+    return dict(re.findall(r"(\w+)=(\S+)", line))
+
+
+def interrupt_stopped(fields):
+    """SIGINT reaches the start's whole process group, and the launcher's SDK
+    shutdown handshake can reach the gateway before the signal does, so either
+    is the interrupt's stop. Any other reason is not."""
+    if fields.get("reason") == "signal":
+        return fields.get("signal") == "SIGINT"
+    return fields.get("reason") == "sdk_shutdown_handshake" and "signal" not in fields
 
 
 def application_leg(work, team):
