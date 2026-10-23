@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `memory::coordinator::TurnInjectionSkip` gains `KeyedContinuation`
   (`keyed_continuation`). See Added. Both enums are public and not
   `#[non_exhaustive]`, so exhaustive matches need the new arms.
+- `ErrorEvent::ReconcileIncomplete` names the failed edge operations: its new
+  `failed` field holds the first five, in the order the reconcile met them,
+  each with its `operation`, its `edge` (`{a, b}`) and its `error`, beside the
+  `failures` and `skipped` counts, and the event's line names the first one.
+  Rust code that builds the variant, or matches it naming its fields without
+  `..`, adds the field. On the wire (`meta/on_error`, and the SDKs'
+  `ErrorEvent.context`) the key is new beside the old ones, and an event
+  recorded without it reads as an empty list.
 
 ### Added
 

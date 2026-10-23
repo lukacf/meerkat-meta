@@ -676,9 +676,11 @@ pub(crate) async fn reconcile_edges_over_members(
 }
 
 /// The alert an edge reconcile pages: only when an edge operation failed,
-/// with `skipped` counting the edges skipped beside the failures. An edge
-/// skipped because an endpoint is not a member yet failed nothing: lazy
-/// identity bootstrap leaves it pending until both endpoints materialize.
+/// naming the first [`LOGGED_RECONCILE_FAILURES`] failed operations beside
+/// the counts, with `skipped` counting the edges skipped beside the
+/// failures. An edge skipped because an endpoint is not a member yet failed
+/// nothing: lazy identity bootstrap leaves it pending until both endpoints
+/// materialize.
 fn reconcile_incomplete_alert(report: &UnifiedRuntimeReconcileEdgesReport) -> Option<ErrorEvent> {
     if report.failures.is_empty() {
         return None;
@@ -686,15 +688,21 @@ fn reconcile_incomplete_alert(report: &UnifiedRuntimeReconcileEdgesReport) -> Op
     Some(ErrorEvent::ReconcileIncomplete {
         failures: report.failures.len(),
         skipped: report.skipped_missing_members.len(),
+        failed: report
+            .failures
+            .iter()
+            .take(LOGGED_RECONCILE_FAILURES)
+            .cloned()
+            .collect(),
     })
 }
 
-/// How many failed edge operations an incomplete reconcile logs a line each
-/// for; one more line counts the rest.
+/// How many failed edge operations an incomplete reconcile names, in its
+/// alert and in a log line each; one more line counts the rest.
 const LOGGED_RECONCILE_FAILURES: usize = 5;
 
 /// Log the failed edge operations behind a `ReconcileIncomplete` alert, which
-/// carries only the counts: one ERROR line per failure with its operation,
+/// names the same first ones: one ERROR line per failure with its operation,
 /// edge endpoints and error, for the first [`LOGGED_RECONCILE_FAILURES`], then
 /// one line counting the rest. They use the alert line's target, so a filter
 /// that shows the alert shows them too.
@@ -745,6 +753,7 @@ mod reconcile_incomplete_alert_tests {
             Some(ErrorEvent::ReconcileIncomplete {
                 failures: 1,
                 skipped: 1,
+                failed: report.failures.clone(),
             })
         );
     }
@@ -764,8 +773,8 @@ mod reconcile_incomplete_alert_tests {
     }
 
     /// An early return replaces the whole report with one synthetic failure
-    /// (here the recovery preparation's), and the alert carries only the
-    /// counts: the failure's own line names its operation, edge and error.
+    /// (here the recovery preparation's): the failure's own line names its
+    /// operation, edge and error, as the alert does.
     #[test]
     fn a_synthetic_early_return_logs_its_operation_edge_and_error() {
         let report = crate::topology_control::recovery_failure_report(
@@ -817,6 +826,26 @@ mod reconcile_incomplete_alert_tests {
             lines[5].contains("edge reconcile operation failed: +2 more")
                 && lines[5].contains("more=2"),
             "the rest are counted: {logged}"
+        );
+    }
+
+    /// An alert recorded before it named its failed operations reads with
+    /// none.
+    #[test]
+    fn an_alert_recorded_with_counts_only_reads_with_no_failed_operations() {
+        let recorded: ErrorEvent = serde_json::from_value(serde_json::json!({
+            "category": "reconcile_incomplete",
+            "failures": 2,
+            "skipped": 1,
+        }))
+        .expect("a counts-only alert reads");
+        assert_eq!(
+            recorded,
+            ErrorEvent::ReconcileIncomplete {
+                failures: 2,
+                skipped: 1,
+                failed: Vec::new(),
+            }
         );
     }
 

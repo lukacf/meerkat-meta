@@ -767,9 +767,10 @@ impl From<meerkat_core::event::CompactionPreservedHistoryFit> for CompactionPres
 /// - `SpawnFailure` — `mob_ops.rs` spawn error path
 /// - `ReconcileIncomplete` - `edge_reconcile.rs` after `reconcile_edges`, when
 ///   an edge operation failed; a reconcile that only skipped edges for an
-///   endpoint that is not a member yet logs at INFO instead. The event
-///   carries only the counts: an ERROR line beside it names each failed
-///   operation, its edge and its error (the first five, then a count)
+///   endpoint that is not a member yet logs at INFO instead. The event names
+///   the first five failed operations, each with its edge and its error,
+///   beside the counts, and an ERROR line beside it names each of them too
+///   (then a count of the rest)
 /// - `RediscoverFailure` — `lifecycle.rs` rediscover error path
 /// - `HostLoopCrash` - `lifecycle.rs` drain fires the alert the agent-event
 ///   forwarder extracted from a member `RunFailed` whose typed class is not
@@ -800,8 +801,16 @@ pub enum ErrorEvent {
         error: String,
     },
     ReconcileIncomplete {
+        /// How many edge operations failed.
         failures: usize,
+        /// How many edges were skipped beside them, an endpoint not being a
+        /// member yet.
         skipped: usize,
+        /// The failed edge operations, the first five in the order the
+        /// reconcile met them, each with its operation, its edge and its
+        /// error. Empty on events recorded before the field existed.
+        #[serde(default)]
+        failed: Vec<EdgeReconcileFailure>,
     },
     CheckpointFailure {
         session_id: String,
@@ -932,11 +941,24 @@ impl Display for ErrorEvent {
             } => {
                 write!(f, "spawn_failure: {member_id}: {error}")
             }
-            Self::ReconcileIncomplete { failures, skipped } => {
+            Self::ReconcileIncomplete {
+                failures,
+                skipped,
+                failed,
+            } => {
                 write!(
                     f,
                     "reconcile_incomplete: {failures} failures, {skipped} skipped"
-                )
+                )?;
+                if let Some(first) = failed.first() {
+                    let (a, b) = first.edge.endpoints();
+                    write!(
+                        f,
+                        "; first: {} {a} <-> {b}: {}",
+                        first.operation, first.error
+                    )?;
+                }
+                Ok(())
             }
             Self::CheckpointFailure { session_id, error } => {
                 write!(f, "checkpoint_failure: {session_id}: {error}")
