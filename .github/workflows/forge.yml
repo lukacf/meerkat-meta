@@ -55,7 +55,7 @@ jobs:
           path: forge-toolchain.json
           if-no-files-found: error
 
-  # The backend suite runs in shards balanced on collected test items
+  # The backend suite runs in shards balanced on recorded test time
   # (installer/tests/forge_shards.py). forge-release.py binds the backend job
   # below, which runs only once every shard has passed.
   backend-shard:
@@ -139,7 +139,7 @@ jobs:
       - name: Backend regression tests
         run: python -m pytest -vv --tb=short --durations=20 --junitxml=forge-pytest.xml $(cat forge-shard-files.txt)
       # Application startup code runs against the selected product's Meta SDK,
-      # not the Guide SDK installed above. Recheck this shard's share of
+      # not the Guide SDK installed above. Rerun this shard's share of
       # installer/tests/checkout_sdk_startup_tests.txt with this checkout's SDK,
       # also after a failure above, so that every failure is reported.
       - name: Application startup checks with this checkout's Meta SDK

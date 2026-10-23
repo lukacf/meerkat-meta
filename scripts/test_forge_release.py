@@ -470,18 +470,50 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertNotEqual(subprocess.run([sys.executable, "-c", script], cwd=folder, capture_output=True,
                                            text=True).returncode, 0)
 
-    def test_the_shard_plan_runs_every_test_file_exactly_once_and_balances_items(self):
+    def test_the_shard_plan_runs_every_file_and_every_rerun_exactly_once_and_balances_them(self):
         shards = load("forge_shards", ROOT / "installer/tests/forge_shards.py")
         files = shards.test_files()
         self.assertGreater(len(files), 100)
-        counts = {name: (index * 37) % 101 for index, name in enumerate(files)}
-        plan = shards.plan(counts, 12)
-        flat = [name for names in plan for name in names]
-        self.assertEqual(sorted(flat), files)
-        self.assertEqual(len(flat), len(set(flat)))
-        loads = [sum(counts[name] for name in names) for names in plan]
-        self.assertLessEqual(max(loads) - min(loads), max(counts.values()))
-        self.assertEqual(shards.plan(counts, 12), plan)
+        weighted = {name: float((index * 37) % 101) for index, name in enumerate(files)}
+        reruns = set(files[::5])
+        plan = shards.plan(weighted, 12, reruns)
+        ran = [name for mine, _ in plan for name in mine]
+        again = [name for _, rerun in plan for name in rerun]
+        self.assertEqual(sorted(ran), files)
+        self.assertEqual(sorted(again), sorted(reruns))
+        loads = [sum(weighted[name] for name in mine + rerun) for mine, rerun in plan]
+        self.assertLessEqual(max(loads) - min(loads), max(weighted.values()))
+        self.assertEqual(shards.plan(weighted, 12, reruns), plan)
+
+    def test_weights_use_recorded_seconds_and_fall_back_to_items_at_the_median_rate(self):
+        shards = load("forge_shards", ROOT / "installer/tests/forge_shards.py")
+        counts = {"test_a.py": 10, "test_b.py": 4, "test_c.py": 6, "test_new.py": 3, "test_empty.py": 0}
+        recorded = {"test_a.py": 20.0, "test_b.py": 40.0, "test_c.py": 6.0, "test_gone.py": 99.0}
+        # Median recorded rate: 2 s per item, from 2, 10 and 1 s per item.
+        weighted = shards.weights(counts, recorded)
+        self.assertEqual(weighted, {"test_a.py": 20.0, "test_b.py": 40.0, "test_c.py": 6.0, "test_new.py": 6.0,
+                                    "test_empty.py": 0.0})
+        self.assertEqual(shards.weights({"test_x.py": 5}, {}), {"test_x.py": 5.0})
+        # The rerun of b is its own run of 40 s, so b's two runs land on different shards.
+        self.assertEqual(shards.plan(weighted, 2, {"test_b.py"}),
+                         [(["test_a.py", "test_b.py"], []),
+                          (["test_c.py", "test_empty.py", "test_new.py"], ["test_b.py"])])
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder)
+        (folder / "seconds.json").write_text('{"test_a.py": "slow"}')
+        with self.assertRaises(SystemExit):
+            shards.recorded_seconds(folder / "seconds.json")
+        junit = folder / "junit.xml"
+        junit.write_text('<testsuites><testsuite>'
+                         '<testcase classname="tests.test_a" name="one" time="1.25"/>'
+                         '<testcase classname="tests.test_a" name="two" time="2"/>'
+                         '<testcase classname="tests.test_b" name="one" time="0.5"/>'
+                         '</testsuite></testsuites>')
+        shards.record([junit], folder / "seconds.json")
+        self.assertEqual(json.loads((folder / "seconds.json").read_text()), {"test_a.py": 3.2, "test_b.py": 0.5})
+        committed = shards.recorded_seconds()
+        self.assertGreater(len(committed), 100)
+        self.assertTrue(all(re.fullmatch(r"test_[A-Za-z0-9_]+\.py", name) for name in committed))
 
     def test_a_failed_collection_runs_no_shard(self):
         shards = load("forge_shards", ROOT / "installer/tests/forge_shards.py")
@@ -497,13 +529,13 @@ class WorkflowShapeTests(unittest.TestCase):
         with mock.patch.object(shards.subprocess, "run", return_value=listed), self.assertRaises(SystemExit):
             shards.main(["0", "12", str(folder / "files.txt"), str(folder / "startup.txt")])
 
-    def test_each_shard_reruns_its_own_listed_startup_files_with_the_checkout_sdk(self):
+    def test_the_shards_rerun_every_listed_startup_file_once_with_the_checkout_sdk(self):
         shards = load("forge_shards", ROOT / "installer/tests/forge_shards.py")
         files = shards.test_files()
         output = "".join(f"tests/{name}: {index % 7 + 1}\n" for index, name in enumerate(files))
         folder = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, folder)
-        startup = set(shards.startup_files())
+        startup = shards.startup_files()
         seen, rerun = [], []
         for shard in range(12):
             with mock.patch.object(shards.subprocess, "run",
@@ -511,8 +543,7 @@ class WorkflowShapeTests(unittest.TestCase):
                 shards.main([str(shard), "12", str(folder / "files.txt"), str(folder / "startup.txt")])
             mine = (folder / "files.txt").read_text().splitlines()
             again = (folder / "startup.txt").read_text().splitlines()
-            self.assertTrue(all(line.startswith("installer/tests/test_") for line in mine))
-            self.assertEqual(again, [line for line in mine if line.removeprefix("installer/tests/") in startup])
+            self.assertTrue(all(line.startswith("installer/tests/test_") for line in mine + again))
             seen += mine
             rerun += again
         self.assertEqual(sorted(seen), [f"installer/tests/{name}" for name in files])

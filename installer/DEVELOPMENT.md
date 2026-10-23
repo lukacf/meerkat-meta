@@ -79,8 +79,12 @@ installer/.venv/bin/python -m pytest -vv installer/tests --tb=short --durations=
 
 Allow substantial time for the full backend suite: in one process it took about
 two hours on a busy development host. The Forge workflow splits it into twelve
-shards balanced on collected test items, each with a 120-minute limit and its
-own 20 slowest tests, and the `backend` job passes only once every shard has.
+shards balanced on the test time a hosted run recorded
+(`installer/tests/forge_shard_seconds.json`), each with a 120-minute limit and
+its own 20 slowest tests, and the `backend` job passes only once every shard
+has. Refresh the record from a complete run's junit files with
+`python installer/tests/forge_shards.py record forge-pytest.xml...`; a stale
+record only affects the balance, never which files run.
 No failure limit stops a run early, so every failure is reported. A run
 stopped by a job timeout is incomplete even when its earlier cases passed.
 Preserve the failure output and XML before making a correction. To run one
@@ -91,10 +95,11 @@ installer/.venv/bin/python installer/tests/forge_shards.py 3 12 shard-files.txt 
 installer/.venv/bin/python -m pytest -vv --tb=short $(cat shard-files.txt)
 ```
 
-Each shard then reruns its files listed in
-`installer/tests/checkout_sdk_startup_tests.txt` with
+The shards also rerun each file listed in
+`installer/tests/checkout_sdk_startup_tests.txt` once, with
 `PYTHONPATH=sdk/python:installer`, so the startup code imports this checkout's
-Meta SDK rather than the Guide SDK.
+Meta SDK rather than the Guide SDK: `$(cat shard-startup.txt)` holds a shard's
+share.
 
 Generated-host wiring checks use the installed Guide SDK, without a private
 source intake. Toolkit-specific doctor checks additionally require the selected
