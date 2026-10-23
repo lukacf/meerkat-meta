@@ -119,6 +119,13 @@ struct AnnouncementOptions {
     member_tools_in_child_mobs: bool,
     #[serde(default)]
     child_member_limits: Option<ChildMemberLimitOptions>,
+    /// The sources and subscriptions this gateway declares, inline.
+    #[serde(default)]
+    declarations: Option<declarations::Declarations>,
+    /// A packaged sidecar file holding them instead, read at init and at
+    /// each `declarations/apply`.
+    #[serde(default)]
+    declarations_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -189,9 +196,12 @@ pub(crate) fn parse_runtime_options(
 
 /// Parse a mob announcement options object (`{enabled, batch?,
 /// retention_ms?, member_limits?, member_tools_in_child_mobs?,
-/// child_member_limits?}`), as every gateway takes it; `path` is where the
-/// surface takes it, for the messages. `Ok(None)` when it is disabled. The
-/// result has passed [`AnnouncementConfig::validate`].
+/// child_member_limits?, declarations?, declarations_path?}`), as every
+/// gateway takes it; `path` is where the surface takes it, for the
+/// messages. `Ok(None)` when it is disabled. The result has passed
+/// [`AnnouncementConfig::validate`]. A sidecar of declarations is read
+/// here, once; [`AnnouncementComposition::compose`] checks the
+/// declarations against the gateway's mob.
 pub fn parse_options(
     value: &serde_json::Value,
     path: &str,
@@ -235,6 +245,25 @@ pub fn parse_options(
         current.subscriptions = limits.subscriptions.unwrap_or(current.subscriptions);
         current.per_mob = limits.per_mob.unwrap_or(current.per_mob);
     }
+    // One source of declarations per gateway: inline, or a sidecar read now.
+    config.declarations = match (options.declarations, options.declarations_path) {
+        (None, None) => None,
+        (Some(declarations), None) => Some(Arc::new(DeclarationsSource::Inline(declarations))),
+        (None, Some(sidecar)) => {
+            let declarations = declarations::load_sidecar(&sidecar)
+                .map_err(|message| format!("{path}.declarations_path: {message}"))?;
+            Some(Arc::new(DeclarationsSource::Sidecar {
+                path: sidecar,
+                declarations,
+            }))
+        }
+        (Some(_), Some(_)) => {
+            return Err(AnnouncementOptionsError::Invalid(format!(
+                "{path}: declarations and declarations_path are exclusive; a gateway has one \
+                 source of declarations"
+            )));
+        }
+    };
     config
         .validate()
         .map_err(|AnnouncementOptionsError::Invalid(message)| {
@@ -343,6 +372,12 @@ impl AnnouncementComposition {
             .ok_or("mob announcements require an identity-first gateway")?;
         let own_mob = MobId::new(runtime.mob_handle().mob_id().to_string())
             .map_err(|error| format!("this gateway's mob id: {error}"))?;
+        // Declarations a static check refuses fail the gateway closed, as a
+        // refused announcement configuration does, before the store opens.
+        if let Some(source) = config.declarations.as_deref() {
+            declarations::validate(source.declarations(), &own_mob)
+                .map_err(|error| format!("mob announcement declarations: {error}"))?;
+        }
         let path = layout
             .mob_announcements_db()
             .map_err(|error| format!("mob announcement database: {error}"))?;

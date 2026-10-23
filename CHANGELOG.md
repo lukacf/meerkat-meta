@@ -141,6 +141,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     of an item its member no longer passes: on a gateway without a
     governed binder nothing Meta controls stands between a commit and its
     admission.
+- Mob announcement sources and subscriptions can be declared. A host
+  declares them in its mob announcement options, inline (`declarations`)
+  or in a packaged JSON sidecar file (`declarations_path`, read at init and
+  at each apply), as `{revision, sources, subscriptions}`: each source as
+  `sources/put` takes it, and each subscription of one member (`member`) or
+  of every member of a mob with a role (`members: {mob_id, role}`),
+  starting now. Meta reconciles them at startup and, without a restart, on
+  the new method `meta/mob_announcements/declarations/apply`.
+  - A lower revision is refused (`declaration_rollback`, with the applied
+    revision), and so is the applied revision with other declarations
+    (`declaration_digest_conflict`); the applied revision with the same
+    declarations changes nothing. With a sidecar, an apply carries no
+    declarations and reads the file again.
+  - A declaration the static checks refuse is refused whole, and refuses
+    init: bounds and shapes, duplicate ids, a topic two declared sources
+    own, a triage member its source's audience leaves out, a member whose
+    declared subscriptions would reach a declared source both directly and
+    through its forward, a conversation member subscribed to its own scope,
+    and a stream route selector.
+  - Meta creates, replaces and ends only the records a declaration made,
+    each marked with the revision and the digest of its declared form;
+    records made at runtime are never touched. A changed subscription is
+    replaced in place: what it captured stays owed, and its new selector
+    captures from now. A record dropped from the declarations is ended (a
+    source) or cancelled (a subscription). An operator's pause holds, and
+    an operator's end or cancel holds until the declaration of that record
+    changes.
+  - A declared record the runtime refuses for now (a member not yet
+    registered, an audience that does not cover it yet, an id a record made
+    at runtime holds: `unmanaged_record`) is pending with its refusal and is
+    retried at the next member registration, mob set change and health
+    pass; the rest of the declarations apply.
+  - A role-selected subscription is a template that never delivers by
+    itself: at each announcement it captures for every member the mob's
+    roster gives the role, through a child subscription named for the
+    template and the member, so a member spawned with the role later
+    captures from its first matching announcement. A member that loses the
+    role stops capturing at once and keeps what it already owes; its child
+    is cancelled at the next reconcile. A template has at most 256 children
+    (`role_template_limit`). The host's `subscriptions/put` takes `members`
+    too; the member tools cannot make a template.
+  - New method `meta/mob_announcements/declarations/get` reads the applied
+    revision and digest and each declared record's status (`applied`,
+    `pending` or `suppressed`), with its refusal, a source's collection
+    phase and a subscription's delivery readiness.
 
 ### Changed
 

@@ -452,7 +452,11 @@ pub fn role_child_id(template: &SubscriptionId, member: &Member) -> Result<Subsc
 /// declared subscription that names both or neither of `member` and
 /// `members`, one that starts anywhere but now, and the handling wait a
 /// later release adds to declared subscriptions; each declared source's
-/// own configuration as `sources/put` checks it.
+/// own configuration as `sources/put` checks it; a triage member its
+/// source's audience can never cover; and declared subscriptions the
+/// declared sources never admit (a conversation member subscribed to its
+/// own scope, a member reaching a source both directly and through its
+/// forward).
 pub fn validate(declarations: &Declarations, own: &MobId) -> Result<()> {
     let mut sources = BTreeSet::new();
     let mut owned: std::collections::BTreeMap<(MobId, Topic), SourceId> =
@@ -466,17 +470,22 @@ pub fn validate(declarations: &Declarations, own: &MobId) -> Result<()> {
                 source.source_id
             )));
         }
-        source.config().validate()?;
-        for topic in &source.topics {
+        let config = source.config();
+        config.validate()?;
+        config.validate_for(&mob_id)?;
+        // A triage route's forward topics are the source's as much as its
+        // own topics are.
+        for (topic, _) in config.owned_topics() {
             if let Some(other) =
                 owned.insert((mob_id.clone(), topic.clone()), source.source_id.clone())
             {
                 return Err(super::types::AnnouncementStoreError::TopicOwned {
-                    topic: topic.clone(),
+                    topic,
                     source_id: other,
                 });
             }
         }
+        validate_triage_members(source, &config)?;
     }
     let mut subscriptions = BTreeSet::new();
     for subscription in &declarations.subscriptions {
@@ -521,25 +530,106 @@ pub fn validate(declarations: &Declarations, own: &MobId) -> Result<()> {
         }
         subscription.selector(own).validate()?;
     }
+    validate_subscribers(declarations, own)
+}
+
+/// Whether `audience` may cover `member` whatever the roster holds: a
+/// member grant is decided here, and a role or label grant of the member's
+/// mob is decided over the roster when the member subscribes.
+fn may_cover(audience: &[AudienceGrant], member: &Member) -> bool {
+    super::sources::covers(audience, member, None)
+        || audience.iter().any(|grant| match grant {
+            AudienceGrant::Member { .. } => false,
+            AudienceGrant::Role { mob_id, .. } | AudienceGrant::Label { mob_id, .. } => {
+                *mob_id == member.mob_id
+            }
+        })
+}
+
+/// Refuse a declared source whose audience can never cover its triage
+/// member, who takes the source's items as any subscriber does.
+fn validate_triage_members(
+    source: &DeclaredSource,
+    config: &super::sources::SourceConfig,
+) -> Result<()> {
+    for route in &config.routes {
+        let SourceRoute::Triage { member, topics, .. } = route else {
+            continue;
+        };
+        let taken = topics.as_ref().unwrap_or(&config.topics);
+        if let Some(topic) = taken.iter().next()
+            && !may_cover(&config.audience, member)
+        {
+            return Err(super::types::AnnouncementStoreError::AudienceNotCovered {
+                source_id: source.source_id.clone(),
+                topic: topic.clone(),
+            });
+        }
+    }
     Ok(())
 }
 
-/// Read and check a declarations sidecar: at init (a failure fails the
-/// gateway closed) and once per `declarations/apply` (a failure refuses
-/// the apply and changes nothing).
+/// Refuse declared one-member subscriptions the declared sources they
+/// select never admit, as `subscriptions/put` refuses them against live
+/// sources: a conversation member of a source subscribed to a topic the
+/// source owns, and a member whose declared subscriptions together reach a
+/// source both directly and through its forward. A template's members are
+/// known only at capture, where its children pass the same checks.
+fn validate_subscribers(declarations: &Declarations, own: &MobId) -> Result<()> {
+    let mut selectors: std::collections::BTreeMap<&Member, Vec<super::types::Selector>> =
+        std::collections::BTreeMap::new();
+    for subscription in &declarations.subscriptions {
+        if let Some(member) = &subscription.member {
+            selectors
+                .entry(member)
+                .or_default()
+                .push(subscription.selector(own));
+        }
+    }
+    for source in &declarations.sources {
+        let mob_id = source.mob(own);
+        let config = source.config();
+        let owned: BTreeSet<Topic> = config
+            .owned_topics()
+            .into_iter()
+            .map(|(topic, _)| topic)
+            .collect();
+        for (&member, selected) in &selectors {
+            let selects = selected.iter().any(|selector| {
+                selector.mobs.contains(&mob_id) && !selector.topics.is_disjoint(&owned)
+            });
+            if selects && config.conversation_members.contains(member) {
+                return Err(super::types::AnnouncementStoreError::ConversationMember {
+                    source_id: source.source_id.clone(),
+                });
+            }
+            if super::sqlite::reaches(&config, &mob_id, selected.iter()) == (true, true) {
+                return Err(super::types::AnnouncementStoreError::RouteOverlap {
+                    source_id: source.source_id.clone(),
+                    member: member.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read a declarations sidecar: the declarations its bytes hold,
+/// unchecked, or why it cannot be read. Init reads it this way before the
+/// gateway's mob is known; [`read_sidecar`] reads and checks it for an
+/// apply.
+pub fn load_sidecar(path: &std::path::Path) -> std::result::Result<Declarations, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{} is not declarations: {error}", path.display()))
+}
+
+/// Read and check a declarations sidecar for `declarations/apply`: a
+/// failure refuses the apply and changes nothing.
 pub fn read_sidecar(path: &std::path::Path, own: &MobId) -> Result<Declarations> {
-    let bytes = std::fs::read(path).map_err(|error| {
-        invalid(format!(
-            "declarations_path {} cannot be read: {error}",
-            path.display()
-        ))
-    })?;
-    let declarations: Declarations = serde_json::from_slice(&bytes).map_err(|error| {
-        invalid(format!(
-            "declarations_path {} is not declarations: {error}",
-            path.display()
-        ))
-    })?;
+    let declarations =
+        load_sidecar(path).map_err(|message| invalid(format!("declarations_path {message}")))?;
     validate(&declarations, own)?;
     Ok(declarations)
 }

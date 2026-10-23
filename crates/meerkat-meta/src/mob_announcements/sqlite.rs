@@ -3832,7 +3832,7 @@ fn member_live_subscriptions(db: &Connection, member: &Member) -> Result<Vec<Sub
 /// Whether subscriptions with these selectors reach `config`'s source in
 /// `mob_id` directly (one of its own topics) and through a forward (one of
 /// its forward topics).
-fn reaches<'a>(
+pub(super) fn reaches<'a>(
     config: &SourceConfig,
     mob_id: &MobId,
     selectors: impl Iterator<Item = &'a Selector>,
