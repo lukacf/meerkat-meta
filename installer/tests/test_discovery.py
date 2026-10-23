@@ -34,6 +34,54 @@ def test_remote_headers_variables_and_blueprint_compatibility():
     Connection.model_validate(conn)
 
 
+def test_hyphenated_remote_variable_becomes_an_exact_required_input():
+    result = discovery.normalize_registry_entry(entry(remotes=[{
+        "type": "streamable-http", "url": "https://{baseUrl}/mcp/{server-name}/{server-name}",
+        "variables": {"baseUrl": {"isRequired": True},
+                      "server-name": {"isRequired": True, "description": "The MCP server name"}},
+    }]))
+    assert result["installable"] is True
+    conn = result["connection"]
+    host, server = result["required_environment"]
+    assert host["name"].endswith("_BASEURL")
+    assert server["name"].endswith("_SERVER_NAME")
+    assert server["description"] == "The MCP server name"
+    assert host["required"] is server["required"] is True
+    assert conn["required_environment"] == [host["name"], server["name"]]
+    assert conn["url"] == ("https://${" + host["name"] + "}/mcp/${" + server["name"]
+                           + "}/${" + server["name"] + "}")
+    Connection.model_validate(conn)
+
+
+@pytest.mark.parametrize("path", ["{server.name}", "{server", "server}", "${lower_case}"])
+def test_unresolved_remote_placeholders_are_not_installable(path):
+    result = discovery.normalize_registry_entry(entry(remotes=[{
+        "type": "streamable-http", "url": "https://example.org/" + path,
+    }]))
+    assert result["installable"] is False
+    assert result["connection"] is None
+    assert any("unresolved placeholder" in warning for warning in result["warnings"])
+
+
+def test_different_remote_variables_cannot_share_a_normalized_input():
+    result = discovery.normalize_registry_entry(entry(remotes=[{
+        "type": "streamable-http", "url": "https://example.org/{server-name}/{server_name}",
+        "variables": {"server-name": {"isRequired": True}, "server_name": {"isRequired": True}},
+    }]))
+    assert result["installable"] is False
+    assert result["connection"] is None
+    assert any("same environment input" in warning for warning in result["warnings"])
+
+
+def test_custom_url_requires_resolved_or_explicit_environment_placeholders():
+    with pytest.raises(discovery.DiscoveryError, match="unresolved placeholder"):
+        discovery.normalize_custom_config({"url": "https://example.org/mcp/{server-name}"})
+    result = discovery.normalize_custom_config({"url": "https://${MCP_HOST}/mcp/${MCP_SERVER_NAME}"})
+    conn = result["connections"][0]
+    assert conn["url"] == "https://${MCP_HOST}/mcp/${MCP_SERVER_NAME}"
+    Connection.model_validate(conn)
+
+
 def test_github_auth_is_from_provider_contract():
     result = discovery.normalize_registry_entry(entry(name="io.github.github/github-mcp-server", remotes=[{"type": "streamable-http", "url": "https://api.githubcopilot.com/mcp/", "headers": [{"name": "Authorization", "isSecret": True}]}]))
     assert result["auth"]["kind"] == "bearer"
