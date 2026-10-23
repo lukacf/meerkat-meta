@@ -1058,9 +1058,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   mob session-service wrappers now forward that acknowledgement; the trait
   default refuses it, which would have kept the refused turn for those
   members. Both wrappers also forward three methods they answered with
-  trait defaults until now: the authenticated and authorized system-context
-  appends, which refused as unavailable, so a governed append through the
-  mob's session service failed, and `send_comms`, which sent on the raw comms
+  trait defaults until now. The authenticated and authorized system-context
+  appends refused with the default `Unavailable`, so the outcome of a
+  governed live delegation through a mob, which is appended to the member's
+  session, was refused as `Unavailable`. `send_comms` sent on the raw comms
   runtime instead of through the wrapped service. The decorator conformance
   check (`scripts/verify-session-service-decorators.py`) now covers the comms
   and control extension traits as well.
