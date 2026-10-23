@@ -64,6 +64,7 @@ test_remote_product_access.py
 test_remote_product_custom_ports_background.py
 test_repository_application_selection.py
 test_runtime_history_v2.py
+test_selected_member_classes.py
 test_selected_startup_host.py
 test_trusted_product_shipping.py
 test_update_after_setup.py
