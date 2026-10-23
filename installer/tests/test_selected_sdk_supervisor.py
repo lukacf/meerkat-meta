@@ -383,12 +383,15 @@ async def test_pair_deadline_is_not_reset_for_dependency_phase(supervised_files,
     original_time = loop.time
     original = files.owner.command
     deadlines = []
+    # The deadline covers staging too, so it must outlast slow staging. The
+    # fixture clock then moves past it once the first child has run.
+    pair_deadline = 3
 
     async def command(args, phase, timeout, **options):
         deadlines.append(timeout)
         result = await original(args, phase, timeout, **options)
         if len(deadlines) == 1:
-            clock[0] = original_time() + 1
+            clock[0] = original_time() + pair_deadline + 1
         return result
 
     files.owner.command = command
@@ -400,7 +403,7 @@ async def test_pair_deadline_is_not_reset_for_dependency_phase(supervised_files,
     loop.time = time
     try:
         with pytest.raises(TimeoutError):
-            await selected_install(files, timeout=0.7)
+            await selected_install(files, timeout=pair_deadline)
     finally:
         loop.time = original_time
     assert len(deadlines) == len(files.children) == 1
