@@ -97,7 +97,7 @@ pub use sources::{
     SourceStart, SourceState, SourceStream, SourceStreamCounts, SourceTotals, StreamOnboarding,
     StreamPhase, TopicOwnership, UnhandledPolicy,
 };
-pub use sqlite::{ConnectionGuard, SCHEMA, SCHEMA_V2, SqliteAnnouncementStore};
+pub use sqlite::{ConnectionGuard, SCHEMA, SCHEMA_V2, SCHEMA_V3, SqliteAnnouncementStore};
 pub use store::{AnnouncementStore, SubmissionCheck};
 pub use types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementRef, AnnouncementStoreError,

@@ -1395,8 +1395,8 @@ fn catalog_of(path: &std::path::Path) -> (Vec<(String, String, Option<String>)>,
 }
 
 /// A store opened without the index of batches that reported gaps (one that
-/// 0.9.4 left at version 1) gets it in the upgrade to version 2 and reads
-/// its member gaps; a second open changes nothing.
+/// 0.9.4 left at version 1) gets it in the upgrade (version 3 creates it) and
+/// reads its member gaps; a second open changes nothing.
 #[tokio::test]
 async fn a_store_without_the_gap_batch_index_gets_it_on_open_and_keeps_it() {
     use super::escalations::EscalationPass;
@@ -1482,7 +1482,7 @@ async fn a_store_without_the_gap_batch_index_gets_it_on_open_and_keeps_it() {
     };
     assert!(!has_index(&path));
     let store = super::storage::open_disk_store(path.clone()).unwrap();
-    assert!(has_index(&path), "the upgrade to version 2 created it");
+    assert!(has_index(&path), "the upgrade created it");
     let pass = EscalationPass {
         renotify_after_ms: DAY,
         health_audience: Vec::new(),
@@ -1500,17 +1500,17 @@ async fn a_store_without_the_gap_batch_index_gets_it_on_open_and_keeps_it() {
     assert_eq!(open[0].since_ms, sealed_at);
     drop(store);
     let before = catalog_of(&path);
-    assert_eq!(before.1, 2);
+    assert_eq!(before.1, 3);
     drop(super::storage::open_disk_store(path.clone()).unwrap());
     assert_eq!(catalog_of(&path), before, "a second open changes nothing");
 }
 
 /// A release that knows only version 1 (0.9.4) refuses a store this release
 /// opened, as a schema from the future, before it reads or changes
-/// anything: no object of version 2, the gap batch index among them, is its
-/// to read.
+/// anything: no object of a later version, the gap batch index among them,
+/// is its to read.
 #[test]
-fn a_release_that_knows_only_version_one_refuses_a_version_two_store() {
+fn a_release_that_knows_only_version_one_refuses_a_newer_store() {
     fn released_version_one(
         tx: &rusqlite::Transaction<'_>,
     ) -> std::result::Result<(), rusqlite::Error> {
@@ -1543,7 +1543,7 @@ fn a_release_that_knows_only_version_one_refuses_a_version_two_store() {
         matches!(
             refused,
             meerkat_sqlite::SqliteStoreError::SchemaFromTheFuture {
-                found: 2,
+                found: 3,
                 supported: 1,
                 ..
             }
@@ -1553,8 +1553,74 @@ fn a_release_that_knows_only_version_one_refuses_a_version_two_store() {
     assert!(
         refused
             .to_string()
-            .contains("is from the future: file has version 2, this binary supports up to 1"),
+            .contains("is from the future: file has version 3, this binary supports up to 1"),
         "{refused}"
+    );
+    drop(connection);
+    assert_eq!(catalog_of(&path), before, "the refusal changed nothing");
+}
+
+/// A build that knows versions 1 and 2 only (the first 0.9.5 builds) refuses
+/// a store this build opened, as a schema from the future, before it reads
+/// or changes anything.
+#[test]
+fn a_build_that_knows_only_version_two_refuses_a_version_three_store() {
+    fn version_one(tx: &rusqlite::Transaction<'_>) -> std::result::Result<(), rusqlite::Error> {
+        tx.execute_batch(super::sqlite::SCHEMA)
+    }
+    fn version_two(tx: &rusqlite::Transaction<'_>) -> std::result::Result<(), rusqlite::Error> {
+        tx.execute_batch(super::sqlite::SCHEMA_V2)
+    }
+    fn current_two(tx: &rusqlite::Transaction<'_>) -> std::result::Result<(), rusqlite::Error> {
+        tx.execute_batch(super::sqlite::SCHEMA)?;
+        tx.execute_batch(super::sqlite::SCHEMA_V2)
+    }
+    fn verify_one(_: &rusqlite::Connection) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    static EARLIER: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomain {
+        name: "meta-mob-announcements",
+        migrations: &[
+            meerkat_sqlite::Migration {
+                version: 1,
+                name: "announcements-subscriptions-batches",
+                apply: version_one,
+            },
+            meerkat_sqlite::Migration {
+                version: 2,
+                name: "announcement-sources",
+                apply: version_two,
+            },
+        ],
+        initialize_current: current_two,
+        allowed_existing_versions: &[1, 2],
+        bridge_recoverable_versions: &[],
+        released_predecessors: &[meerkat_sqlite::SchemaPredecessor {
+            version: 1,
+            verify: verify_one,
+        }],
+        owned_objects: &[meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "announcements",
+        }],
+        retired_objects: &[],
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mob_announcements.sqlite3");
+    drop(super::storage::open_disk_store(path.clone()).unwrap());
+    let before = catalog_of(&path);
+    let mut connection = rusqlite::Connection::open(&path).unwrap();
+    let refused = meerkat_sqlite::apply_domain_migrations(&mut connection, &EARLIER).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            meerkat_sqlite::SqliteStoreError::SchemaFromTheFuture {
+                found: 3,
+                supported: 2,
+                ..
+            }
+        ),
+        "{refused:?}"
     );
     drop(connection);
     assert_eq!(catalog_of(&path), before, "the refusal changed nothing");

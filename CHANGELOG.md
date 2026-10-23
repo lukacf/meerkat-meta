@@ -250,11 +250,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The key prefix `source:` is reserved for source items: a new host
   announcement under it is refused as invalid params. A retry of one made
   before the upgrade still answers its original.
-- The mob announcement database moves to schema version 2, which only adds
-  the source, audit, hold and handling tables. A version 1 database is
-  migrated in place on first open; an older binary refuses a version 2
-  database, so going back means disabling mob announcements or keeping
-  this binary.
+- The mob announcement database moves to schema version 3, which only adds
+  tables and columns: the source, audit and hold tables (version 2), then
+  each hold's kind and the handling, redelivery, source item, escalation
+  and declaration tables (version 3). A version 1 or 2 database is migrated
+  in place on first open; an older binary refuses a newer database, so
+  going back means disabling mob announcements or keeping this binary.
 - Docs: the configuration reference has a new "Fork instruction policy"
   section. It covers what a durable fork copies (activation rows only as
   history, the session configuration, no mob operator authority), what each

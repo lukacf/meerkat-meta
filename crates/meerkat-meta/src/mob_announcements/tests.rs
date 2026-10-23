@@ -10059,20 +10059,30 @@ fn objects_added_by(tx: &rusqlite::Transaction<'_>, before: &BTreeSet<String>) -
     lines
 }
 
-/// Version 2 of the announcement schema, the sources, freezes with the
-/// release that ships it: after that, a change is a new version with its
+/// Version 2 of the announcement schema, the sources, froze with the first
+/// 0.9.5 builds that created it: a change to it is a new version with its
 /// migration. The pin makes a change fail here instead of at a user's open.
 #[test]
 fn the_version_two_schema_is_pinned() {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
     let domain = &super::storage::ANNOUNCEMENT_SCHEMA_DOMAIN;
-    let versions: Vec<i64> = domain
-        .migrations
-        .iter()
-        .map(|migration| migration.version)
-        .collect();
-    assert_eq!(versions, vec![1, 2]);
     let version_two = &domain.migrations[1];
-    assert_eq!(version_two.name, "announcement-sources");
+    assert_eq!(
+        (version_two.version, version_two.name),
+        (2, "announcement-sources")
+    );
+    let digest = Sha256::digest(super::sqlite::SCHEMA_V2.as_bytes())
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+    assert_eq!(
+        digest, "f65833c5918c1e669d599348125c4dbfcf1e4bd584538e7a691333f15daa51b3",
+        "the version 2 schema changed: it is frozen, so a change is a new version with its \
+         migration"
+    );
     let mut connection = rusqlite::Connection::open_in_memory().unwrap();
     let tx = connection.transaction().unwrap();
     (domain.migrations[0].apply)(&tx).unwrap();
@@ -10099,52 +10109,13 @@ fn the_version_two_schema_is_pinned() {
             "index announcement_audit_counted on announcement_audit: mob_id, source_id, \
              generation, member, action, reason"
                 .to_string(),
-            "index announcement_batches_reporting_gaps on announcement_batches: sealed_at_ms, \
-             member"
-                .to_string(),
-            "table announcement_escalation_events: cursor INTEGER pk1, escalation_id TEXT \
-             notnull, at_ms INTEGER notnull, record TEXT notnull"
-                .to_string(),
-            "table announcement_escalation_passes: id INTEGER notnull pk1, evaluated_at_ms \
-             INTEGER notnull"
-                .to_string(),
-            "table announcement_escalations: escalation_id TEXT notnull pk1, cause TEXT \
-             notnull, subject TEXT notnull, mob_id TEXT, open INTEGER notnull, notified_at_ms \
-             INTEGER notnull, record TEXT notnull"
-                .to_string(),
-            "index announcement_escalations_by_subject on announcement_escalations: subject"
-                .to_string(),
-            "index announcement_escalations_open on announcement_escalations: cause, subject"
-                .to_string(),
-            "table announcement_handling: batch_id TEXT notnull pk1, member TEXT notnull, \
-             state TEXT notnull, next_read_at_ms INTEGER, updated_at_ms INTEGER notnull, \
-             record TEXT notnull"
-                .to_string(),
-            "index announcement_handling_by_member on announcement_handling: member, state, \
-             updated_at_ms"
-                .to_string(),
-            "index announcement_handling_reads on announcement_handling: next_read_at_ms, \
-             batch_id"
-                .to_string(),
             "table announcement_holds: subscription_id TEXT notnull pk1, mob_id TEXT notnull \
              pk2, sequence INTEGER notnull pk3, member TEXT notnull, source_id TEXT notnull, \
              generation INTEGER notnull, held_at_ms INTEGER notnull, checked_at_ms INTEGER \
-             notnull, record TEXT notnull, kind TEXT notnull, batch_id TEXT"
-                .to_string(),
-            "index announcement_holds_by_batch on announcement_holds: batch_id".to_string(),
-            "index announcement_holds_by_check on announcement_holds: checked_at_ms".to_string(),
-            "index announcement_holds_by_member on announcement_holds: member, checked_at_ms"
-                .to_string(),
-            "table announcement_member_markers: member TEXT notnull pk1, written_at_ms INTEGER \
              notnull, record TEXT notnull"
                 .to_string(),
-            "table announcement_redeliveries: subscription_id TEXT notnull pk1, mob_id TEXT \
-             notnull pk2, sequence INTEGER notnull pk3, count INTEGER notnull, record TEXT \
-             notnull"
-                .to_string(),
-            "table announcement_source_items: mob_id TEXT notnull pk1, sequence INTEGER \
-             notnull pk2, source_id TEXT notnull, generation INTEGER notnull, record TEXT \
-             notnull"
+            "index announcement_holds_by_check on announcement_holds: checked_at_ms".to_string(),
+            "index announcement_holds_by_member on announcement_holds: member, checked_at_ms"
                 .to_string(),
             "table announcement_source_streams: mob_id TEXT notnull pk1, source_id TEXT \
              notnull pk2, stream TEXT notnull pk3, generation INTEGER notnull, phase TEXT \
@@ -10165,16 +10136,125 @@ fn the_version_two_schema_is_pinned() {
              identity_key, state"
                 .to_string(),
         ],
-        "the version 2 schema changed: before the release that ships it, update this pin; \
-         after it, add version 3 with its migration instead"
+        "the version 2 schema changed: it is frozen, so a change is a new version with its \
+         migration"
     );
 }
 
+/// Version 3 of the announcement schema (each hold's kind and batch, the
+/// handling, redelivery, source item, escalation and declaration tables)
+/// freezes with the first build that ships it: after that, a change is a new
+/// version with its migration. A hold version 2 wrote reads as a coverage
+/// hold.
+#[test]
+fn the_version_three_schema_is_pinned() {
+    let domain = &super::storage::ANNOUNCEMENT_SCHEMA_DOMAIN;
+    let versions: Vec<i64> = domain
+        .migrations
+        .iter()
+        .map(|migration| migration.version)
+        .collect();
+    assert_eq!(versions, vec![1, 2, 3]);
+    let version_three = &domain.migrations[2];
+    assert_eq!(
+        version_three.name,
+        "announcement-handling-escalations-declarations"
+    );
+    let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+    let tx = connection.transaction().unwrap();
+    (domain.migrations[0].apply)(&tx).unwrap();
+    (domain.migrations[1].apply)(&tx).unwrap();
+    // The holds table is read again: version 3 gives it two columns.
+    let before: BTreeSet<String> = {
+        let mut statement = tx
+            .prepare("SELECT name FROM sqlite_master WHERE name <> 'announcement_holds'")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    };
+    (version_three.apply)(&tx).unwrap();
+    assert_eq!(
+        objects_added_by(&tx, &before),
+        vec![
+            "index announcement_batches_reporting_gaps on announcement_batches: sealed_at_ms, \
+             member"
+                .to_string(),
+            "table announcement_declaration_records: kind TEXT notnull pk1, id TEXT notnull pk2, \
+             revision INTEGER notnull, digest TEXT notnull, status TEXT notnull, since_ms INTEGER \
+             notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_declarations: slot INTEGER pk1, revision INTEGER notnull, digest \
+             TEXT notnull, applied_at_ms INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_escalation_events: cursor INTEGER pk1, escalation_id TEXT notnull, \
+             at_ms INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_escalation_passes: id INTEGER notnull pk1, evaluated_at_ms INTEGER \
+             notnull"
+                .to_string(),
+            "table announcement_escalations: escalation_id TEXT notnull pk1, cause TEXT notnull, \
+             subject TEXT notnull, mob_id TEXT, open INTEGER notnull, notified_at_ms INTEGER \
+             notnull, record TEXT notnull"
+                .to_string(),
+            "index announcement_escalations_by_subject on announcement_escalations: subject"
+                .to_string(),
+            "index announcement_escalations_open on announcement_escalations: cause, subject"
+                .to_string(),
+            "table announcement_handling: batch_id TEXT notnull pk1, member TEXT notnull, state \
+             TEXT notnull, next_read_at_ms INTEGER, updated_at_ms INTEGER notnull, record TEXT \
+             notnull"
+                .to_string(),
+            "index announcement_handling_by_member on announcement_handling: member, state, \
+             updated_at_ms"
+                .to_string(),
+            "index announcement_handling_reads on announcement_handling: next_read_at_ms, batch_id"
+                .to_string(),
+            "table announcement_holds: subscription_id TEXT notnull pk1, mob_id TEXT notnull pk2, \
+             sequence INTEGER notnull pk3, member TEXT notnull, source_id TEXT notnull, generation \
+             INTEGER notnull, held_at_ms INTEGER notnull, checked_at_ms INTEGER notnull, record \
+             TEXT notnull, kind TEXT notnull, batch_id TEXT"
+                .to_string(),
+            "index announcement_holds_by_batch on announcement_holds: batch_id".to_string(),
+            "table announcement_member_markers: member TEXT notnull pk1, written_at_ms INTEGER \
+             notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_redeliveries: subscription_id TEXT notnull pk1, mob_id TEXT \
+             notnull pk2, sequence INTEGER notnull pk3, count INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_role_children: template_id TEXT notnull pk1, member TEXT notnull \
+             pk2, subscription_id TEXT notnull, status TEXT notnull, since_ms INTEGER notnull, \
+             record TEXT notnull"
+                .to_string(),
+            "table announcement_role_templates: id TEXT notnull pk1, mob_id TEXT notnull, role \
+             TEXT notnull, state TEXT notnull, updated_at_ms INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "index announcement_role_templates_by_mob on announcement_role_templates: mob_id, state"
+                .to_string(),
+            "table announcement_source_items: mob_id TEXT notnull pk1, sequence INTEGER notnull \
+             pk2, source_id TEXT notnull, generation INTEGER notnull, record TEXT notnull"
+                .to_string(),
+        ],
+        "the version 3 schema changed: before the release that ships it, update this pin; \
+         after it, add version 4 with its migration instead"
+    );
+    let kind_default: Option<String> = tx
+        .query_row(
+            "SELECT dflt_value FROM pragma_table_info('announcement_holds') WHERE name = 'kind'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind_default.as_deref(), Some("'coverage'"));
+}
+
 /// A store as 0.9.4 left it (the version 1 schema under its ledger row, with
-/// an announcement in it) opens migrated to version 2 in place: the ledger
-/// moves, the source tables exist, and what it held is still there.
+/// an announcement in it) opens migrated to the current version in place:
+/// the ledger moves, the later tables exist, and what it held is still there.
 #[tokio::test]
-async fn a_version_one_store_migrates_to_version_two_in_place() {
+async fn a_version_one_store_migrates_to_the_current_version_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mob_announcements.sqlite3");
     {
@@ -10251,7 +10331,7 @@ async fn a_version_one_store_migrates_to_version_two_in_place() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let tables: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
@@ -10261,12 +10341,120 @@ async fn a_version_one_store_migrates_to_version_two_in_place() {
                           'announcement_redeliveries', 'announcement_source_items',
                           'announcement_escalations', 'announcement_escalation_events',
                           'announcement_member_markers',
-                          'announcement_escalation_passes')",
+                          'announcement_escalation_passes',
+                          'announcement_declarations', 'announcement_declaration_records',
+                          'announcement_role_templates', 'announcement_role_children')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 12);
+    assert_eq!(tables, 16);
+}
+
+/// The objects of the announcement database at `path` as SQLite records
+/// them, the ledger aside.
+fn announcement_catalog(path: &std::path::Path) -> Vec<(String, String, Option<String>)> {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, sql FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%' AND name <> 'meerkat_schema'
+             ORDER BY type, name",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+}
+
+/// A store at version 2 as the first 0.9.5 builds left it (the version 1
+/// and 2 schemas under their ledger row, with a hold in it) opens migrated
+/// to version 3 in place: the ledger moves, the hold is a coverage hold of
+/// no batch, and the catalog is a fresh store's.
+#[test]
+fn a_version_two_store_migrates_to_version_three_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mob_announcements.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(super::sqlite::SCHEMA).unwrap();
+        connection.execute_batch(super::sqlite::SCHEMA_V2).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE main.meerkat_schema (
+                     domain TEXT PRIMARY KEY,
+                     version INTEGER NOT NULL
+                 );
+                 INSERT INTO main.meerkat_schema (domain, version)
+                     VALUES ('meta-mob-announcements', 2);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO announcement_holds (subscription_id, mob_id, sequence, member,
+                   source_id, generation, held_at_ms, checked_at_ms, record)
+                 VALUES ('s1', ?1, 1, 'member', 'inbox', 1, 5, 5, '{}')",
+                rusqlite::params![OWN_MOB],
+            )
+            .unwrap();
+    }
+    drop(super::storage::open_disk_store(path.clone()).unwrap());
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row(
+            "SELECT version FROM meerkat_schema WHERE domain = 'meta-mob-announcements'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 3);
+    let hold: (String, Option<String>) = connection
+        .query_row(
+            "SELECT kind, batch_id FROM announcement_holds WHERE subscription_id = 's1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(hold, ("coverage".to_string(), None));
+    drop(connection);
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh = fresh_dir.path().join("mob_announcements.sqlite3");
+    drop(super::storage::open_disk_store(fresh.clone()).unwrap());
+    assert_eq!(announcement_catalog(&path), announcement_catalog(&fresh));
+}
+
+/// A store stamped version 2 whose catalog is not the frozen version 2 (here
+/// one that already has a version 3 table, as no build that stamped version
+/// 2 and shipped wrote it) is refused before anything changes.
+#[test]
+fn a_version_two_store_unlike_the_frozen_one_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mob_announcements.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(super::sqlite::SCHEMA).unwrap();
+        connection.execute_batch(super::sqlite::SCHEMA_V2).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE announcement_handling (batch_id TEXT NOT NULL PRIMARY KEY);
+                 CREATE TABLE main.meerkat_schema (
+                     domain TEXT PRIMARY KEY,
+                     version INTEGER NOT NULL
+                 );
+                 INSERT INTO main.meerkat_schema (domain, version)
+                     VALUES ('meta-mob-announcements', 2);",
+            )
+            .unwrap();
+    }
+    let before = announcement_catalog(&path);
+    assert!(super::storage::open_disk_store(path.clone()).is_err());
+    assert_eq!(
+        announcement_catalog(&path),
+        before,
+        "the refusal changed nothing"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -13556,6 +13744,7 @@ async fn an_onboarding_refusal_survives_a_failure_to_count_it() {
         rusqlite::Connection::open(dir.path().join("mob_announcements.sqlite3")).unwrap();
     connection.execute_batch(super::sqlite::SCHEMA).unwrap();
     connection.execute_batch(super::sqlite::SCHEMA_V2).unwrap();
+    connection.execute_batch(super::sqlite::SCHEMA_V3).unwrap();
     let guard = Arc::new(AllowanceGuard::default());
     let store = SqliteAnnouncementStore::from_connection(
         connection,
@@ -16910,6 +17099,7 @@ fn the_per_member_handling_reads_are_served_by_an_index() {
     let connection = rusqlite::Connection::open_in_memory().unwrap();
     connection.execute_batch(super::sqlite::SCHEMA).unwrap();
     connection.execute_batch(super::sqlite::SCHEMA_V2).unwrap();
+    connection.execute_batch(super::sqlite::SCHEMA_V3).unwrap();
     for query in [
         "SELECT MAX(b.updated_at_ms) FROM announcement_handling h
          JOIN announcement_batches b ON b.id = h.batch_id

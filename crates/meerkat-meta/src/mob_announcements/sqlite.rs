@@ -47,9 +47,9 @@ use super::types::{
 };
 
 /// The mob announcement store's version 1 tables, frozen with the release
-/// that shipped them (0.9.4). A provider applies this and then [`SCHEMA_V2`]
-/// through its own migration ledger before handing a connection to
-/// [`SqliteAnnouncementStore::from_connection`].
+/// that shipped them (0.9.4). A provider applies this, then [`SCHEMA_V2`] and
+/// [`SCHEMA_V3`], through its own migration ledger before handing a
+/// connection to [`SqliteAnnouncementStore::from_connection`].
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS announcement_logs (
  mob_id TEXT PRIMARY KEY,
@@ -124,11 +124,8 @@ CREATE INDEX IF NOT EXISTS member_routes_by_route ON member_routes (route, membe
 /// sources own, the streams each generation onboarded, the counted audit
 /// of what sources' audiences and routes refused, withheld, held, released
 /// or let through, one entry per source, generation, member, action and
-/// reason, the owed items held while their member does not pass or for an
-/// operator after their turn ended unhandled, what became of each
-/// delivered batch's turn, the marks of items owed again with a notice,
-/// and what each source item's announcement was (its stream, item id and
-/// version). A provider applies this after [`SCHEMA`].
+/// reason, and the owed items held while their member does not pass. A
+/// provider applies this after [`SCHEMA`].
 pub const SCHEMA_V2: &str = "
 CREATE TABLE IF NOT EXISTS announcement_sources (
  mob_id TEXT NOT NULL, source_id TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -161,12 +158,27 @@ CREATE TABLE IF NOT EXISTS announcement_holds (
  subscription_id TEXT NOT NULL, mob_id TEXT NOT NULL, sequence INTEGER NOT NULL,
  member TEXT NOT NULL, source_id TEXT NOT NULL, generation INTEGER NOT NULL,
  held_at_ms INTEGER NOT NULL, checked_at_ms INTEGER NOT NULL, record TEXT NOT NULL,
- kind TEXT NOT NULL, batch_id TEXT,
  PRIMARY KEY (subscription_id, mob_id, sequence));
 CREATE INDEX IF NOT EXISTS announcement_holds_by_member
  ON announcement_holds (member, checked_at_ms);
 CREATE INDEX IF NOT EXISTS announcement_holds_by_check
- ON announcement_holds (checked_at_ms);
+ ON announcement_holds (checked_at_ms);";
+
+/// What version 3 adds: each hold's kind ("coverage" while its member does
+/// not pass, as every hold version 2 wrote is, or "operator" for an item
+/// held for an operator after its turn ended unhandled) and the batch an
+/// operator's hold came from; what became of each delivered batch's turn;
+/// the marks of items owed again with a notice; what each source item's
+/// announcement was (its stream, item id and version); the escalations,
+/// their events, the persisted member markers and the passes, with the
+/// index of batches that reported gaps; and the declarations the reconciler
+/// follows (one row), a mark per declared record, the role templates, and
+/// the children each template made, one per member. It changes a version 2
+/// table, so a provider applies it once, after [`SCHEMA_V2`], through its
+/// migration ledger.
+pub const SCHEMA_V3: &str = "
+ALTER TABLE announcement_holds ADD COLUMN kind TEXT NOT NULL DEFAULT 'coverage';
+ALTER TABLE announcement_holds ADD COLUMN batch_id TEXT;
 CREATE INDEX IF NOT EXISTS announcement_holds_by_batch
  ON announcement_holds (batch_id) WHERE batch_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS announcement_handling (
@@ -199,7 +211,23 @@ CREATE TABLE IF NOT EXISTS announcement_member_markers (
 CREATE TABLE IF NOT EXISTS announcement_escalation_passes (
  id INTEGER NOT NULL PRIMARY KEY, evaluated_at_ms INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS announcement_batches_reporting_gaps
- ON announcement_batches (sealed_at_ms, member) WHERE json_array_length(record, '$.gaps') > 0;";
+ ON announcement_batches (sealed_at_ms, member) WHERE json_array_length(record, '$.gaps') > 0;
+CREATE TABLE IF NOT EXISTS announcement_declarations (
+ slot INTEGER PRIMARY KEY, revision INTEGER NOT NULL, digest TEXT NOT NULL,
+ applied_at_ms INTEGER NOT NULL, record TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS announcement_declaration_records (
+ kind TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL, digest TEXT NOT NULL,
+ status TEXT NOT NULL, since_ms INTEGER NOT NULL, record TEXT NOT NULL,
+ PRIMARY KEY (kind, id));
+CREATE TABLE IF NOT EXISTS announcement_role_templates (
+ id TEXT NOT NULL PRIMARY KEY, mob_id TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL,
+ updated_at_ms INTEGER NOT NULL, record TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS announcement_role_templates_by_mob
+ ON announcement_role_templates (mob_id, state);
+CREATE TABLE IF NOT EXISTS announcement_role_children (
+ template_id TEXT NOT NULL, member TEXT NOT NULL, subscription_id TEXT NOT NULL,
+ status TEXT NOT NULL, since_ms INTEGER NOT NULL, record TEXT NOT NULL,
+ PRIMARY KEY (template_id, member));";
 
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
@@ -253,11 +281,26 @@ impl SqliteAnnouncementStore {
             .map_err(storage)?;
         connection.execute_batch(SCHEMA).map_err(storage)?;
         connection.execute_batch(SCHEMA_V2).map_err(storage)?;
+        // Version 3 changes a version 2 table, so it runs once, in one
+        // transaction: a store that has it already is left as it is.
+        let has_version_three: bool = connection
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('announcement_holds')
+                 WHERE name = 'kind')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        if !has_version_three {
+            let transaction = connection.unchecked_transaction().map_err(storage)?;
+            transaction.execute_batch(SCHEMA_V3).map_err(storage)?;
+            transaction.commit().map_err(storage)?;
+        }
         Ok(Self::from_connection(connection, None))
     }
 
-    /// The caller must have applied [`SCHEMA`] and [`SCHEMA_V2`] under its
-    /// migration contract.
+    /// The caller must have applied [`SCHEMA`], [`SCHEMA_V2`] and
+    /// [`SCHEMA_V3`] under its migration contract.
     pub fn from_connection(
         connection: Connection,
         guard: Option<Arc<dyn ConnectionGuard>>,
