@@ -16,8 +16,9 @@ from launchkit.blueprint import Blueprint, starter_blueprint
 from launchkit.connect_installer_caller import MAX_INVENTORY_BYTES, _inventory_input
 
 
-META_SOURCE = (Path(__file__).parents[1] / ".artifacts/forge-maccomp2-intake-20261010"
-               / "source/meta/sdk/python")
+# Exercise this checkout's SDK, rather than silently skipping on machines
+# without a developer's historical source-intake directory.
+META_SOURCE = Path(__file__).parents[2] / "sdk/python"
 
 
 def selected_blueprint(*, named=False, helper="research:2", instances=2):
@@ -68,8 +69,7 @@ def test_compiler_inventory_matches_actual_generated_roster_types(
     application = generated_application(spec, tmp_path, monkeypatch)
     if sdk == "meta":
         source = META_SOURCE / "meerkat_meta/identity_first_models.py"
-        if not source.is_file():
-            pytest.skip("The optional exact Meta source intake is not present in this checkout.")
+        assert source.is_file(), "The compiler contract tests require this checkout's Meta SDK source."
         monkeypatch.syspath_prepend(str(META_SOURCE))
         from meerkat_meta.identity_first_models import DurableAgentSpec
         assert Path(sys.modules[DurableAgentSpec.__module__].__file__).resolve() == source.resolve()
