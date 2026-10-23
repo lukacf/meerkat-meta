@@ -716,14 +716,32 @@ async def test_trial_repair_rechecks_source_inside_build_admission_and_rejects_l
     await service.shutdown()
 
 
+# A progress gate for real threaded preparation, not a speed claim. Under a 15%
+# CPU quota the preparation before the paused step took up to 6.7 s, so a 5 s
+# wait failed although it was only slow. A stuck or lost wake-up still fails,
+# with its recorded cause, in reach_preparation.
+PREPARATION_BARRIER_SECONDS = 60
+
+
+class PreparationBarrier(asyncio.Event):
+    """The paused step's wake-up plus the timeline that explains a miss."""
+
+    def __init__(self, method):
+        super().__init__()
+        self.method = method
+        self.entered = self.returned = None
+
+
 def pause_build_preparation(monkeypatch, method):
     """Hold real threaded preparation before admission, permitting a competing edit."""
     loop = asyncio.get_running_loop()
-    reached, release = asyncio.Event(), threading.Event()
+    reached, release = PreparationBarrier(method), threading.Event()
     original = getattr(ImplementationWorkspace, method)
 
     def paused(project, *args, **kwargs):
+        reached.entered = time.monotonic()
         result = original(project, *args, **kwargs)
+        reached.returned = time.monotonic()
         loop.call_soon_threadsafe(reached.set)
         if not release.wait(10):
             raise TimeoutError("The test did not release build preparation.")
@@ -731,6 +749,32 @@ def pause_build_preparation(monkeypatch, method):
 
     monkeypatch.setattr(ImplementationWorkspace, method, paused)
     return reached, release
+
+
+async def reach_preparation(reached, admission):
+    """Wait for the paused preparation step, or fail with why it was not reached."""
+    started = time.monotonic()
+    waiter = asyncio.ensure_future(reached.wait())
+    try:
+        await asyncio.wait({waiter, admission}, timeout=PREPARATION_BARRIER_SECONDS,
+                           return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        waiter.cancel()
+    if reached.is_set():
+        assert reached.returned is not None, "The barrier woke without its paused step returning."
+        return
+
+    def at(moment):
+        return "never" if moment is None else f"{moment - started:+.1f}s"
+
+    if reached.returned is not None:
+        pytest.fail(f"{reached.method} returned at {at(reached.returned)}, but its wake-up never reached the "
+                    "event loop (lost wake-up).")
+    if admission.done():
+        cause = "cancelled" if admission.cancelled() else repr(admission.exception() or admission.result())
+        pytest.fail(f"Build admission ended before preparation reached {reached.method}: {cause}")
+    pytest.fail(f"Preparation did not reach {reached.method} within {PREPARATION_BARRIER_SECONDS}s "
+                f"(entered {at(reached.entered)}, returned {at(reached.returned)}).")
 
 
 async def test_selected_build_changed_during_preparation_does_not_publish_worker(service, monkeypatch):
@@ -745,7 +789,7 @@ async def test_selected_build_changed_during_preparation_does_not_publish_worker
     admission = asyncio.create_task(service.submit(service.guide.identity, 3, "Repair the displayed source",
                                    expected_selected_build_id=first["build_id"]))
     try:
-        await asyncio.wait_for(reached.wait(), 5)
+        await reach_preparation(reached, admission)
         write_private(parent / "latest.json", {"build_id": second["build_id"]})
         release.set()
         with pytest.raises(DraftConflict, match="application changed while preparing"):
@@ -764,7 +808,7 @@ async def test_build_rechecks_setup_after_threaded_preparation_before_publishing
     reached, release = pause_build_preparation(monkeypatch, "seed")
     admission = asyncio.create_task(service.submit(service.guide.identity, 3))
     try:
-        await asyncio.wait_for(reached.wait(), 5)
+        await reach_preparation(reached, admission)
         if change == "version":
             service.guide.state["version"] += 1
         elif change == "proposal":
@@ -793,7 +837,7 @@ async def test_refused_first_preparation_allows_current_setup_retry_without_losi
     reached, release = pause_build_preparation(monkeypatch, "seed")
     admission = asyncio.create_task(service.submit(service.guide.identity, 3, "Prepare my first application"))
     try:
-        await asyncio.wait_for(reached.wait(), 5)
+        await reach_preparation(reached, admission)
         service.guide.state["version"] = 4
         service.guide.state["messages"].append({"role": "user", "text": "Include the revised household approval."})
         release.set()
@@ -891,7 +935,7 @@ async def test_continued_build_rechecks_copied_source_and_trial_proof_at_final_a
                 "expected_source_digest": checked["source_digest"]} if repair else {}
     admission = asyncio.create_task(service.submit(service.guide.identity, 3, "Improve from the trial", **expected))
     try:
-        await asyncio.wait_for(reached.wait(), 5)
+        await reach_preparation(reached, admission)
         if change == "source":
             old.write_file("application/__init__.py", "def build(context):\n    return 'later source'\n")
         else:
@@ -1523,7 +1567,7 @@ async def test_framework_refresh_keeps_guide_selection_source_and_trial_admissio
         options.update(expected_previous_build_id=first["build_id"], expected_source_digest=checked["source_digest"])
     admission = asyncio.create_task(service.submit(service.guide.identity, 3, "Refresh this framework", **options))
     try:
-        await asyncio.wait_for(reached.wait(), 5)
+        await reach_preparation(reached, admission)
         if change == "version":
             service.guide.state["version"] += 1
         elif change == "selection":
@@ -1602,7 +1646,7 @@ async def test_organization_change_during_preparation_refuses_new_admission(serv
     reached, release = pause_build_preparation(monkeypatch, "seed")
     admission = asyncio.create_task(service.submit(service.guide.identity, 3, "Prepare the application"))
     try:
-        await asyncio.wait_for(reached.wait(), 5)
+        await reach_preparation(reached, admission)
         service.guide.state["organization"]["guide_context"] = "Different identity constraints"
         release.set()
         with pytest.raises(DraftConflict, match="changed while preparing"):
