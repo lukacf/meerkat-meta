@@ -473,6 +473,185 @@ async fn a_pending_template_replace_keeps_its_children_listed() {
     assert_eq!(children[0]["status"], "applied", "{view}");
 }
 
+/// Pause, resume or cancel the template `id` at `revision` as an operator
+/// does, through the subscription verbs.
+async fn template_change(
+    service: &AnnouncementService,
+    verb: &str,
+    id: &str,
+    revision: u64,
+) -> serde_json::Value {
+    try_host_call(
+        service,
+        &format!("meta/mob_announcements/subscriptions/{verb}"),
+        serde_json::json!({
+            "operation_id": format!("operator-{verb}-{id}-{revision}"),
+            "subscription_id": id,
+            "expected_revision": revision,
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+/// The subscription verbs take a template's id and cascade to its children
+/// in one step, the template's revision rising each time. A paused
+/// template's children capture nothing and keep what they owe; a resumed
+/// one's capture again; a cancelled one's end as a cancel ends a
+/// subscription, and a declared template cancelled this way is suppressed.
+#[tokio::test]
+async fn a_template_pause_resume_and_cancel_cascade_to_its_children() {
+    let harness = harness_with(native_serving(&["agent:b", "agent:c"]));
+    let service = &harness.service;
+    harness.native.set_roster_facts("agent:b", "reviewer", &[]);
+    harness.native.set_roster_facts("agent:c", "reviewer", &[]);
+    try_apply(
+        service,
+        1,
+        serde_json::json!([]),
+        serde_json::json!([declared_template("reviewers", "reviewer", &["deploy.done"])]),
+    )
+    .await
+    .unwrap();
+    host_announces(service, "deploy-1", &["deploy.done"]).await;
+    let children: Vec<String> = role_children(&declared(service).await, "reviewers")
+        .iter()
+        .map(|child| child["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(children.len(), 2, "{children:?}");
+
+    let paused = template_change(service, "pause", "reviewers", 1).await;
+    assert_eq!(paused["template"]["state"], "paused", "{paused}");
+    assert_eq!(paused["template"]["revision"], 2, "{paused}");
+    for child in &children {
+        assert_eq!(
+            subscription_state(service, child).await.as_deref(),
+            Some("paused")
+        );
+    }
+    host_announces(service, "deploy-2", &["deploy.done"]).await;
+
+    let resumed = template_change(service, "resume", "reviewers", 2).await;
+    assert_eq!(resumed["template"]["state"], "active", "{resumed}");
+    assert_eq!(resumed["template"]["revision"], 3, "{resumed}");
+    for child in &children {
+        assert_eq!(
+            subscription_state(service, child).await.as_deref(),
+            Some("active")
+        );
+    }
+    let owed_now = owed(&harness).await;
+    assert_eq!(
+        (owed_now.get("agent:b"), owed_now.get("agent:c")),
+        (Some(&1), Some(&1)),
+        "nothing was captured while the template was paused: {owed_now:?}"
+    );
+    host_announces(service, "deploy-3", &["deploy.done"]).await;
+    let owed_now = owed(&harness).await;
+    assert_eq!(
+        (owed_now.get("agent:b"), owed_now.get("agent:c")),
+        (Some(&2), Some(&2)),
+        "{owed_now:?}"
+    );
+
+    let cancelled = template_change(service, "cancel", "reviewers", 3).await;
+    assert_eq!(cancelled["template"]["state"], "cancelled", "{cancelled}");
+    assert_eq!(cancelled["template"]["revision"], 4, "{cancelled}");
+    for child in &children {
+        assert_eq!(
+            subscription_state(service, child).await.as_deref(),
+            Some("cancelled")
+        );
+    }
+    assert_eq!(owed(&harness).await, BTreeMap::new(), "a cancel settles");
+    service.reconcile_mobs().await.unwrap();
+    let view = declared(service).await;
+    assert_eq!(
+        record(&view, "subscription", "reviewers").map(|record| &record["status"]),
+        Some(&serde_json::json!("suppressed")),
+        "{view}"
+    );
+}
+
+/// A template replace re-admits each child with the checks of a put: a
+/// child whose member the new selector's source audience leaves out is
+/// pending with the refusal and captures nothing, while what it owes stays
+/// owed; once its member is covered, the next trigger admits it again.
+#[tokio::test]
+async fn a_template_replace_re_admits_its_children() {
+    let harness = harness_with(native_serving(&["agent:b", "agent:c"]));
+    let service = &harness.service;
+    harness
+        .native
+        .set_roster_facts("agent:b", "reviewer", &[("mail", "yes")]);
+    harness.native.set_roster_facts("agent:c", "reviewer", &[]);
+    let inbox = declared_inbox(serde_json::json!([
+        { "kind": "label", "mob_id": OWN_MOB, "key": "mail", "value": "yes" }
+    ]));
+    try_apply(
+        service,
+        1,
+        serde_json::json!([inbox]),
+        serde_json::json!([declared_template("reviewers", "reviewer", &["deploy.done"])]),
+    )
+    .await
+    .unwrap();
+    host_announces(service, "deploy-1", &["deploy.done"]).await;
+    let child_of = |identity: &str| {
+        super::super::declarations::role_child_id(&sid("reviewers"), &member(identity))
+            .unwrap()
+            .to_string()
+    };
+    let status_of = |view: &serde_json::Value, identity: &str| {
+        record(view, "role_child", &child_of(identity))
+            .unwrap_or_else(|| panic!("the child of {identity} is listed: {view}"))
+            .clone()
+    };
+
+    // Revision 2 adds the inbox's topic, whose audience covers b only.
+    try_apply(
+        service,
+        2,
+        serde_json::json!([inbox]),
+        serde_json::json!([declared_template(
+            "reviewers",
+            "reviewer",
+            &["deploy.done", "mail.received"]
+        )]),
+    )
+    .await
+    .unwrap();
+    let view = declared(service).await;
+    assert_eq!(status_of(&view, "agent:b")["status"], "applied", "{view}");
+    let refused = status_of(&view, "agent:c");
+    assert_eq!(refused["status"], "pending", "{view}");
+    assert_eq!(refused["refusal"]["kind"], "audience_not_covered", "{view}");
+    host_announces(service, "deploy-2", &["deploy.done"]).await;
+    let owed_now = owed(&harness).await;
+    assert_eq!(
+        (owed_now.get("agent:b"), owed_now.get("agent:c")),
+        (Some(&2), Some(&1)),
+        "the pending child captures nothing and keeps what it owes: {owed_now:?}"
+    );
+
+    // c is labelled: the next trigger admits its child again.
+    harness
+        .native
+        .set_roster_facts("agent:c", "reviewer", &[("mail", "yes")]);
+    service.reconcile_mobs().await.unwrap();
+    assert_eq!(
+        status_of(&declared(service).await, "agent:c")["status"],
+        "applied"
+    );
+    host_announces(service, "deploy-3", &["deploy.done"]).await;
+    let owed_now = owed(&harness).await;
+    assert_eq!(
+        (owed_now.get("agent:b"), owed_now.get("agent:c")),
+        (Some(&3), Some(&2)),
+        "{owed_now:?}"
+    );
+}
+
 /// Change the subscription `id` at its revision as an operator does:
 /// `verb` is "pause", "resume" or "cancel".
 async fn operator_changes(service: &AnnouncementService, verb: &str, id: &str) {

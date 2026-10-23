@@ -644,12 +644,7 @@ impl AnnouncementService {
         operation: &OperationId,
         request: super::declarations::PutRoleTemplate,
     ) -> Result<super::declarations::RoleTemplate, AnnouncementError> {
-        self.ensure_hosted(&request.mobs).await?;
-        Ok(self
-            .inner
-            .store
-            .put_role_template(operation, request, self.now())
-            .await?)
+        self.put_template(operation, request).await
     }
 
     /// Why the member's deliveries wait now, if they do: the latest

@@ -16,15 +16,17 @@ use crate::mob_announcements::declarations::{
     Declarations, DeclarationsSource, DeclarationsView, DeclaredCollection, DeclaredDelivery,
     DeclaredSource, DeclaredSubscription, read_sidecar, validate,
 };
+use crate::mob_announcements::declarations::{PutRoleTemplate, RoleTemplate};
 use crate::mob_announcements::native::MemberRoute;
+use crate::mob_announcements::sources::RosterFacts;
 use crate::mob_announcements::sources::{SourceChange, SourceHealthStatus, SourceState};
 use crate::mob_announcements::store::{
     AppliedDeclarations, DeclarationMark, RoleChildStatus, RoleExpansion, RoleExpansions,
-    RoleMember, TemplateChildren,
+    RoleMember, SubscriptionVerbOutcome, TemplateChildren,
 };
 use crate::mob_announcements::types::{
     AnnouncementStoreError, Member, MemberRouteRecord, MobId, OperationId, SubscriptionChange,
-    SubscriptionState, sha256_hex,
+    SubscriptionId, SubscriptionState, sha256_hex,
 };
 
 use super::{AnnouncementError, AnnouncementService, member_problem};
@@ -594,7 +596,7 @@ impl AnnouncementService {
             let put = self.put_role_template(&operation, request).await;
             return self.mark_put(before, base, put, managed).await;
         };
-        if template.state != SubscriptionState::Active {
+        if template.state == SubscriptionState::Cancelled {
             // Cancelled: held while its declaration is unchanged; declared
             // anew or changed, it starts again at its next revision.
             if managed && before.is_some_and(|mark| mark.digest == digest) {
@@ -726,7 +728,7 @@ impl AnnouncementService {
         let Some(template) = self.inner.store.role_template(&id).await? else {
             return Ok(());
         };
-        if template.state != SubscriptionState::Active {
+        if template.state == SubscriptionState::Cancelled {
             return Ok(());
         }
         let operation = step_operation(
@@ -799,6 +801,8 @@ impl AnnouncementService {
                 );
                 continue;
             }
+            // A child pending or left captures again only once its member
+            // passes the checks again.
             let made = children
                 .iter()
                 .map(|(child, state)| (&child.member, (child.status, state.is_some())))
@@ -809,7 +813,7 @@ impl AnnouncementService {
             };
             for member in members {
                 let kept = made.get(&member).is_some_and(|(status, recorded)| {
-                    *status != RoleChildStatus::Pending && *recorded
+                    !matches!(status, RoleChildStatus::Pending | RoleChildStatus::Left) && *recorded
                 });
                 let found = if kept {
                     RoleMember::Kept
@@ -830,6 +834,91 @@ impl AnnouncementService {
             roles.templates.insert(template.id.clone(), expansion);
         }
         (roles, admitted)
+    }
+
+    /// `subscriptions/put` with `members`, and the reconciler's put of a
+    /// declared template: on a replace, each live child is admitted again,
+    /// the owner checking its member and the store the sources' audiences
+    /// and routes.
+    pub(super) async fn put_template(
+        &self,
+        operation: &OperationId,
+        request: PutRoleTemplate,
+    ) -> Result<RoleTemplate, AnnouncementError> {
+        self.ensure_hosted(&request.mobs).await?;
+        let (children, facts) = self.readmission(&request.id).await?;
+        Ok(self
+            .inner
+            .store
+            .put_role_template(operation, request, &children, &facts, self.now())
+            .await?)
+    }
+
+    /// The owner's verdict on the member of each live child of the template
+    /// `id` that captures (one applied or pending), and the roster facts of
+    /// the admitted ones: what a replace admits them again with.
+    async fn readmission(
+        &self,
+        id: &SubscriptionId,
+    ) -> Result<(RoleExpansion, RosterFacts), AnnouncementError> {
+        let mut expansion = RoleExpansion {
+            revision: 0,
+            members: BTreeMap::new(),
+        };
+        let Some(found) = self.inner.store.role_template_children(id).await? else {
+            return Ok((expansion, RosterFacts::default()));
+        };
+        expansion.revision = found.template.revision;
+        let mut admitted = BTreeSet::new();
+        for (child, state) in &found.children {
+            if !matches!(
+                child.status,
+                RoleChildStatus::Applied | RoleChildStatus::Pending
+            ) || !state.is_some_and(SubscriptionState::is_live)
+            {
+                continue;
+            }
+            let verdict = match self.admit_role_member(&child.member).await {
+                Ok((route, member_mob_cursor)) => {
+                    admitted.insert(child.member.clone());
+                    RoleMember::Admitted {
+                        route,
+                        member_mob_cursor,
+                    }
+                }
+                Err(error) => RoleMember::Refused(refusal_from(&error)),
+            };
+            expansion.members.insert(child.member.clone(), verdict);
+        }
+        let facts = self.roster_facts(admitted).await;
+        Ok((expansion, facts))
+    }
+
+    /// `subscriptions/pause`, `resume` and `cancel`: of the subscription with
+    /// this id, or, when none has it, of the role template with it and its
+    /// children in one step.
+    pub async fn change_subscription_or_template(
+        &self,
+        operation: &OperationId,
+        id: &SubscriptionId,
+        expected_revision: u64,
+        change: SubscriptionChange,
+    ) -> Result<SubscriptionVerbOutcome, AnnouncementError> {
+        if self.subscription(id).await?.is_none()
+            && self.inner.store.role_template(id).await?.is_some()
+        {
+            let outcome = self
+                .inner
+                .store
+                .change_role_template(operation, id, expected_revision, change, self.now())
+                .await?;
+            self.wake();
+            return Ok(SubscriptionVerbOutcome::Template(outcome));
+        }
+        Ok(SubscriptionVerbOutcome::Subscription(
+            self.change_subscription(operation, id, expected_revision, change)
+                .await?,
+        ))
     }
 
     /// The checks a put of `member`'s subscription makes before the store:
