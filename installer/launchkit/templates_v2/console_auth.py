@@ -352,6 +352,9 @@ class ConsoleFront:
     configure Strict-Transport-Security (HSTS) for that public host. This front
     supplies neither TLS termination nor HSTS policy. Route the selected public
     origin to this listener; forwarded headers never select its browser origin.
+
+    The /host/availability header and 405 contract covers routed methods only.
+    Unrouted methods (such as TRACE) receive Starlette's 405 without no-store.
     """
 
     def __init__(self, root, port, principal, password, on_input=None, *, transport=None, connect_factory=None,
