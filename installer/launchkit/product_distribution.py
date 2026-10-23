@@ -355,6 +355,10 @@ def verify(root):
             or not (legacy.REQUIRED | {"LICENSE-MIT", "LICENSE-APACHE", "vendor/guide/rpc_gateway"}) <= data["files"].keys()
             or not 0 < len(data["files"]) <= MAX_FILES):
         raise legacy.DistributionError("The extracted product distribution manifest is invalid.")
+    product = data["product"]
+    if (type(product) is not dict or not {"selection", "paths"} <= product.keys()
+            or type(product["selection"]) is not dict or type(product["paths"]) is not dict):
+        raise legacy.DistributionError("The product distribution needs its original selection and paths.")
     total = 0
     for name, record in data["files"].items():
         if (type(name) is not str or not _public_path(name) or type(record) is not dict
@@ -404,7 +408,7 @@ def verify(root):
         if parent.is_symlink() or not parent.is_dir() or parent.stat().st_uid != os.getuid():
             raise legacy.DistributionError("The product runtime parent is not an owned ordinary directory.")
         parent.chmod(0o700)
-    target = relocate_selection(data["product"]["selection"], data["product"]["paths"], root)
+    target = relocate_selection(product["selection"], product["paths"], root)
     selected_runtime_artifacts(target)
     if ordinary is not None and ordinary["version"] != target.meta.version:
         raise legacy.DistributionError("The ordinary Meta gateway is not the selected Meta SDK's release.")

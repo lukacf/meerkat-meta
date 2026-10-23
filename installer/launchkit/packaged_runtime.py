@@ -79,8 +79,10 @@ def configure_private_model_route(route, custody):
 
 
 def _local(root, name):
+    if type(name) is not str or not name:
+        raise ValueError("A packaged runtime locator must stay inside its distribution.")
     path = PurePosixPath(name)
-    if (type(name) is not str or not name or path.is_absolute()
+    if (path.is_absolute()
             or path.as_posix() != name or any(part in {"", ".", ".."} for part in path.parts)):
         raise ValueError("A packaged runtime locator must stay inside its distribution.")
     selected = root.joinpath(*path.parts)
@@ -97,16 +99,22 @@ def relocate_selection(selection, paths, root):
             or type(paths) is not dict):
         raise ValueError("The package needs its original selected Meta and Toolkit product.")
     value = deepcopy(selection)
-    value["artifact_root"] = str(_local(root, paths["artifact_root"]))
+    value["artifact_root"] = str(_local(root, paths.get("artifact_root")))
     names = ("assembly", "meta_wheel", "toolkit_wheel", "dependency_requirements", "model_catalog")
     if "source_manifest" in value:
         names += ("source_manifest",)
     for name in names:
-        value[name]["path"] = str(_local(root, paths[name]))
-    dependencies = value["dependency_wheels"]
-    if len(dependencies) != len(paths["dependency_wheels"]):
+        if type(value.get(name)) is not dict:
+            raise ValueError("The package needs its original selected Meta and Toolkit product.")
+        value[name]["path"] = str(_local(root, paths.get(name)))
+    # Check only the containers needed for relocation here. The native
+    # selection reader still owns the full product and artifact contract.
+    dependencies, dependency_paths = value.get("dependency_wheels"), paths.get("dependency_wheels")
+    if (type(dependencies) is not list or type(dependency_paths) is not list
+            or any(type(item) is not dict for item in dependencies)
+            or len(dependencies) != len(dependency_paths)):
         raise ValueError("The packaged dependency inventory changed.")
-    for item, name in zip(dependencies, paths["dependency_wheels"]):
+    for item, name in zip(dependencies, dependency_paths):
         item["path"] = str(_local(root, name))
     return parse_candidate_selection(value)
 
