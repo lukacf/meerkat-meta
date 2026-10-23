@@ -204,6 +204,26 @@ async def test_background_follows_links_without_looking_inside_protected_folders
     assert not [path for path in lookups if protected in path.parents], lookups
 
 
+async def test_options_and_submit_walk_the_folders_off_the_event_loop(home, monkeypatch):
+    # The walk looks up path parts on disk; like the setup card's check, it
+    # runs in a worker thread so a slow disk cannot hold the event loop.
+    import threading
+    threads = []
+    original = deployment_service.launchd_folder_refusal
+
+    def record(*args, **kwargs):
+        threads.append(threading.current_thread() is threading.main_thread())
+        return original(*args, **kwargs)
+    monkeypatch.setattr(deployment_service, "launchd_folder_refusal", record)
+    await read_options(forge(home / "MetaForge/.studio"))
+    service = forge(home / "MetaForge/forge/.studio")
+    try:
+        await submit(service, home / "Projects/team", execution_mode="background")
+    finally:
+        await service.shutdown()
+    assert threads == [False, False]
+
+
 @pytest.fixture(params=["darwin"])
 async def earlier_service(request, home, tmp_path, monkeypatch):
     """A service installed before this preflight, with its Python in Documents.

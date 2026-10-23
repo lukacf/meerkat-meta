@@ -1692,7 +1692,8 @@ class DeploymentService:
         supported = target == host_target and host_target is not None
         background = ({"available": False, "detail": PRODUCT_CONFIGURE_REQUIRED} if product is not None else
             await self.service_manager.capability() if supported else {"available": False})
-        refusal = self._background_folder_refusal(background) if background["available"] else None
+        refusal = (await await_validation(self._background_folder_refusal, background)
+                   if background["available"] else None)
         if refusal is not None:
             background = {**background, "available": False, "detail": refusal}
         if source_kind == "native-team":
@@ -1752,7 +1753,8 @@ class DeploymentService:
                 capability = await self.service_manager.capability()
                 if not capability["available"]:
                     raise ValueError("This user's operating-system service manager is unavailable. Choose interactive deployment.")
-                refusal = self._background_folder_refusal(capability, self._requested_destination(destination))
+                refusal = await await_validation(self._background_folder_refusal, capability,
+                    self._requested_destination(destination))
                 if refusal is not None:
                     raise ValueError(refusal)
             state = await self._guide(guide_id)
