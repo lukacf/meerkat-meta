@@ -1901,10 +1901,7 @@ impl UnifiedRuntimeBuilder {
         // A restored member without its tools must not start a run before its
         // materialization publishes them: meerkat holds its run starts from
         // registration until the identity runtime releases the hold.
-        mob_spec.restored_members_awaiting_tools = early_customizer_tools_pending
-            .keys()
-            .map(|identity| crate::member_comms_id::mob_member_id(identity.as_str()))
-            .collect();
+        mob_spec = mob_spec.with_restored_members_awaiting_tools(&early_customizer_tools_pending);
         let module_agent_events = self.module_agent_events;
         let options = self.options;
         #[allow(unused_mut)]
