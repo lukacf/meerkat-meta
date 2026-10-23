@@ -336,3 +336,104 @@ async def test_first_guide_turn_saves_only_unassigned_source_intent(tmp_path, mo
         assert result["version"] == original["version"] + 1
         assert reopened["brief"]["incoming_data"][0]["routes"] == []
         assert reopened["proposal"] is None and reopened["blueprint"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fresh_proposal", [False, True])
+@pytest.mark.parametrize("omission", ["missing_field", "empty_list", "partial_list", "replaced_id"])
+async def test_source_omission_cannot_erase_saved_choices(tmp_path, monkeypatch, fresh_proposal, omission):
+    from launchkit.guide import GuideService
+    from launchkit.guide_store import GuideStore
+    from launchkit.server import GuideResponse
+
+    monkeypatch.setattr("launchkit.guide.planner_capability", lambda: {"available": True})
+
+    class Author:
+        reject = False
+
+        async def message(self, prompt, blueprint, *, guide_context):
+            saved = guide_context["saved_plan_available"]
+            if saved:
+                value = copy.deepcopy(guide_context["brief"])
+                source = value["incoming_data"][0]
+                source.update(history="bounded_history", history_window="The last two weeks")
+                source["source_message_ids"].append(guide_context["current_user_message"]["id"])
+                if self.reject:
+                    if omission == "missing_field":
+                        value.pop("incoming_data")
+                    elif omission == "empty_list":
+                        value["incoming_data"] = []
+                    elif omission == "partial_list":
+                        value["incoming_data"].pop()
+                    else:
+                        value["incoming_data"][0]["id"] = "replacement"
+            else:
+                value = brief()
+                second = copy.deepcopy(value["incoming_data"][0])
+                second.update(id="release_changes", name="Release updates", scope="Selected release notes")
+                value["incoming_data"].append(second)
+                for item in [*value["facts"].values(), *value["requirements"], *value["incoming_data"]]:
+                    item["source_message_ids"] = [guide_context["current_user_message"]["id"]]
+            result = {"guide": {"message": "Which sources should the team use?", "brief": value,
+                "question": default_question("connections"), "design_changed": not saved or fresh_proposal}}
+            if not saved or fresh_proposal:
+                result["proposal"] = starter_blueprint().model_dump(mode="json")
+            return result
+
+    store, author = GuideStore(tmp_path), Author()
+    service = GuideService(store, author)
+    empty = await service.create()
+    saved = await service.respond(empty["id"], GuideResponse(
+        version=empty["version"], action="chat", text="Notice project changes and release updates."))
+    before = copy.deepcopy(store.get(saved["id"]))
+    request = GuideResponse(version=saved["version"], action="chat", text="Include two weeks of project changes.")
+    author.reject = True
+    with pytest.raises(ValueError, match="Do not drop an incoming source"):
+        await service.respond(saved["id"], request)
+    assert GuideStore(tmp_path).get(saved["id"]) == before
+
+    # The rejected turn must not consume its version or partially replace the brief.
+    author.reject = False
+    corrected = await service.respond(saved["id"], request)
+    reopened = GuideStore(tmp_path).get(saved["id"])
+    assert corrected["version"] == reopened["version"] == before["version"] + 1
+    assert reopened["proposal"] == before["proposal"]
+    assert reopened["messages"][:-2] == before["messages"]
+    assert reopened["brief"]["incoming_data"][1] == before["brief"]["incoming_data"][1]
+    assert reopened["brief"]["incoming_data"][0] == {
+        **before["brief"]["incoming_data"][0], "history": "bounded_history",
+        "history_window": "The last two weeks",
+        "source_message_ids": [*before["brief"]["incoming_data"][0]["source_message_ids"], reopened["messages"][-2]["id"]]}
+
+
+@pytest.mark.parametrize("disposition", ["deferred", "cancelled", "handoff"])
+def test_source_retention_allows_explicit_scope_decisions_and_recipient_revision(disposition):
+    previous = brief()
+    revised = copy.deepcopy(previous)
+    revised["requirements"][0].update(disposition=disposition, decision_message_ids=["decision"])
+    revised["incoming_data"][0].update(routes=[], source_message_ids=["request", "decision"])
+    result = validate_guide_publication({"message": "The source remains recorded outside this version.",
+        "brief": revised, "question": default_question("connections"), "design_changed": True},
+        {"brief": previous, "evidence_messages": [
+            {"id": "request", "role": "user"}, {"id": "decision", "role": "user"}]},
+        starter_blueprint().model_dump(mode="json"))
+    assert result["brief"] == DesignBrief.model_validate(revised).model_dump(mode="json")
+    assert previous == brief()
+
+
+def test_source_retention_allows_new_sources_and_revised_choices():
+    previous = brief()
+    revised = copy.deepcopy(previous)
+    source = revised["incoming_data"][0]
+    source.update(scope="The selected project", history="bounded_history", history_window="The last two weeks",
+        routes=[{"recipient": "lead:main", "delivery": "conversation"}], source_message_ids=["request", "revision"])
+    additional = copy.deepcopy(source)
+    additional.update(id="release_changes", name="Release updates", scope="Selected release notes")
+    revised["incoming_data"].insert(0, additional)
+    result = validate_guide_publication({"message": "Updated the sources and their choices.", "brief": revised,
+        "question": default_question("connections"), "design_changed": True},
+        {"brief": previous, "evidence_messages": [
+            {"id": "request", "role": "user"}, {"id": "revision", "role": "user"}]},
+        starter_blueprint().model_dump(mode="json"))
+    assert result["brief"] == DesignBrief.model_validate(revised).model_dump(mode="json")
+    assert previous == brief()

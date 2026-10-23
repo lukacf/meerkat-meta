@@ -17,6 +17,11 @@ feature through `requirement_id` and cites user messages through
 `source_message_ids`. The linked requirement records implementation gaps and
 scope decisions. Marking a feature deferred, cancelled or handed off requires a
 later user decision; it does not erase the source from the displayed proposal.
+Every revision retains existing source IDs. The guide can revise their choices
+and add sources, but omitting the field, dropping an item or replacing its ID
+is rejected. This keeps an unrelated answer from silently losing saved scope,
+recipients or history choices. Briefs that have never recorded a source can
+continue to omit the field.
 
 | Choice | Meaning |
 | --- | --- |

@@ -283,6 +283,9 @@ def validate_guide_publication(args: dict, context: dict, proposal: dict | None,
     old_requirements = {item.id for item in old.requirements}
     if old_requirements - {item.id for item in value.brief.requirements}:
         raise ValueError("Do not drop a requested feature. Update its disposition and supporting evidence.")
+    old_sources = {item.id for item in old.incoming_data}
+    if old_sources - {item.id for item in value.brief.incoming_data}:
+        raise ValueError("Do not drop an incoming source. Revise its choices and record scope decisions in its linked feature.")
     for topic, fact in value.brief.facts.items():
         if any(identity not in evidence for identity in fact.source_message_ids):
             raise ValueError(f"The {topic} fact cites a missing or non-user message. Use evidence_messages IDs.")
