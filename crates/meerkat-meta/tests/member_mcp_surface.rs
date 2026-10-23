@@ -3,11 +3,13 @@
 //! surface its host decides on is captured once those servers have connected
 //! or failed, never while they are pending. On the composed stdio gateway,
 //! a server the member's profile configures reaches that surface with its MCP
-//! provenance. On the library builder, a member whose server fails still
-//! spawns: its session holds the typed setup-failure notice, and its surface
-//! carries the healthy server's tool and nothing of the failed one. The host
-//! here governs its members (a grant owner, a destination and a policy per
-//! member) and allows every configured server.
+//! provenance. On the library builder, persistent and ephemeral, a member
+//! whose server fails still spawns: its session holds the typed setup-failure
+//! notice, and its surface carries the healthy server's tool and nothing of
+//! the failed one. A member of the plain public ephemeral spec is built once
+//! its slow server has connected, so its first request already offers that
+//! server's tool. The governed host here (a grant owner, a destination and a
+//! policy per member) allows every configured server.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -37,6 +39,9 @@ use meerkat_runtime::meerkat_machine::{
     RuntimeSessionRegistrationWitness, SessionAgentBinding,
 };
 use serde_json::{Value, json};
+
+#[path = "support/llm_usage.rs"]
+mod llm_usage;
 
 /// Set only in the gateway host process; `RECORD` names its record file.
 const HOST_PROCESS: &str = "META_MEMBER_MCP_SURFACE_HOST";
@@ -554,12 +559,18 @@ fn a_profile_mcp_server_reaches_the_prepared_surface_on_the_stdio_gateway() {
     assert!(exited, "the gateway ends after its run");
 }
 
-/// On the library builder, a member whose configured server fails still
-/// spawns once that server has failed: its session holds the typed
-/// setup-failure notice for the server, and the surface its host decided on
-/// carries the healthy server's tool and nothing of the failed one.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_member_whose_mcp_server_fails_spawns_with_its_notice_and_without_its_tools() {
+/// One member of a library-built runtime (persistent or ephemeral) whose
+/// profile configures the listing server and one that exits before its
+/// handshake: it still spawns, once the failed server has failed. Its
+/// session holds the typed setup-failure notice for that server, and the
+/// surface its host decided on carries the healthy server's tool and nothing
+/// of the failed one.
+async fn assert_a_failed_server_leaves_the_member_spawned(persistent: bool) {
+    let mode = if persistent {
+        "persistent"
+    } else {
+        "ephemeral"
+    };
     let dir = tempfile::tempdir().unwrap();
     let listing = listing_server(dir.path());
     let hook = Arc::new(SurfaceRecordingHook::default());
@@ -569,21 +580,21 @@ async fn a_member_whose_mcp_server_fails_spawns_with_its_notice_and_without_its_
         meerkat_core::RealmConfigSection::from_inline_api_keys(&[("openai", FIXTURE_OPENAI_KEY)]),
     );
     let definition = meerkat_mob::MobDefinition::from_toml(&mob_config(
-        "member-mcp-surface-library",
+        &format!("member-mcp-surface-library-{mode}"),
         &listing,
         true,
     ))
     .expect("mob definition");
-    let runtime = UnifiedRuntime::builder()
+    let mut builder = UnifiedRuntime::builder()
         .definition(definition)
         .meerkat_config(config)
-        .persistent_state(dir.path().join("state"))
         .native_grant_work_configuration(governed_configuration())
         .member_runtime_registration_hook(hook.clone())
-        .tool_consequence_policy_registry(host_registry())
-        .build()
-        .await
-        .expect("build");
+        .tool_consequence_policy_registry(host_registry());
+    if persistent {
+        builder = builder.persistent_state(dir.path().join("state"));
+    }
+    let runtime = builder.build().await.expect("build");
     runtime
         .mob_handle()
         .ensure_member(meerkat_mob::SpawnMemberSpec::new(
@@ -591,25 +602,27 @@ async fn a_member_whose_mcp_server_fails_spawns_with_its_notice_and_without_its_
             meerkat_mob::ids::AgentIdentity::from("worker-1"),
         ))
         .await
-        .expect("a member whose server fails still spawns");
+        .unwrap_or_else(|error| {
+            panic!("{mode}: a member whose server fails still spawns: {error}")
+        });
 
     let surfaces = hook.surfaces();
     assert_eq!(
         surfaces.len(),
         1,
-        "the member's one construction is decided by its host: {surfaces:?}"
+        "{mode}: the member's one construction is decided by its host: {surfaces:?}"
     );
     let tools = tools_of(&surfaces[0]);
     let lookup = format!("{LOOKUP}=Mcp:{LISTING}");
     assert!(
         tools.contains(&lookup.as_str()),
-        "the healthy server's tool is on the prepared surface: {}",
+        "{mode}: the healthy server's tool is on the prepared surface: {}",
         surfaces[0]
     );
     let broken = format!(":{BROKEN}");
     assert!(
         !tools.iter().any(|tool| tool.ends_with(&broken)),
-        "nothing of the failed server is on the prepared surface: {}",
+        "{mode}: nothing of the failed server is on the prepared surface: {}",
         surfaces[0]
     );
 
@@ -621,7 +634,7 @@ async fn a_member_whose_mcp_server_fails_spawns_with_its_notice_and_without_its_
         .list(meerkat_core::service::SessionQuery::default())
         .await
         .expect("sessions");
-    assert_eq!(sessions.len(), 1, "the member's one session");
+    assert_eq!(sessions.len(), 1, "{mode}: the member's one session");
     let history = service
         .read_history(
             &sessions[0].session_id,
@@ -647,8 +660,194 @@ async fn a_member_whose_mcp_server_fails_spawns_with_its_notice_and_without_its_
     });
     assert!(
         told,
-        "the member's session holds the typed setup-failure notice for {BROKEN}: {:?}",
+        "{mode}: the member's session holds the typed setup-failure notice for {BROKEN}: {:?}",
         history.messages
     );
     let _ = runtime.shutdown().await;
+}
+
+/// On the persistent library builder, a member whose configured server fails
+/// still spawns, told of the failure and without that server's tools.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_whose_mcp_server_fails_spawns_with_its_notice_and_without_its_tools() {
+    assert_a_failed_server_leaves_the_member_spawned(true).await;
+}
+
+/// The same on the ephemeral library builder.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ephemeral_member_whose_mcp_server_fails_spawns_with_its_notice_and_without_its_tools() {
+    assert_a_failed_server_leaves_the_member_spawned(false).await;
+}
+
+/// How long the slow listing server reads nothing after it starts.
+const SLOW_START: Duration = Duration::from_secs(3);
+
+/// [`LISTING_SERVER`] that reads nothing for [`SLOW_START`] first, so its
+/// handshake completes only then.
+fn slow_listing_server(dir: &Path) -> PathBuf {
+    let path = dir.join("slow-listing.sh");
+    std::fs::write(
+        &path,
+        format!("sleep {}\n{LISTING_SERVER}", SLOW_START.as_secs()),
+    )
+    .expect("write the slow listing server");
+    path
+}
+
+/// Records the tools of each request the model is sent.
+#[derive(Clone, Default)]
+struct CaptureClient {
+    requests: Arc<Mutex<Vec<Vec<String>>>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl CaptureClient {
+    async fn first_request(&self) -> Vec<String> {
+        tokio::time::timeout(BACKSTOP, async {
+            loop {
+                let notified = self.notify.notified();
+                if let Some(first) = self.requests.lock().unwrap().first() {
+                    return first.clone();
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("the member's first turn reaches the model")
+    }
+}
+
+impl meerkat_client::LlmClient for CaptureClient {
+    fn project_replay_messages(
+        &self,
+        messages: &[meerkat_core::Message],
+    ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+        Ok(messages.to_vec())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a meerkat_client::LlmRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, meerkat_client::LlmError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let tools = request
+            .tools
+            .iter()
+            .map(|tool| match &tool.provenance {
+                Some(provenance) => format!(
+                    "{}={:?}:{}",
+                    tool.name,
+                    provenance.kind,
+                    provenance.source_id.as_str()
+                ),
+                None => format!("{}=none", tool.name),
+            })
+            .collect();
+        self.requests.lock().unwrap().push(tools);
+        self.notify.notify_waiters();
+        let [usage, done] = llm_usage::usage_then_done(
+            request,
+            meerkat::Provider::OpenAI,
+            meerkat_core::types::StopReason::EndTurn,
+        );
+        Box::pin(async_stream::stream! {
+            yield Ok(meerkat_client::LlmEvent::TextDelta { delta: "ok".to_string(), meta: None });
+            yield Ok(usage);
+            yield Ok(done);
+        })
+    }
+
+    fn provider(&self) -> meerkat::Provider {
+        meerkat::Provider::OpenAI
+    }
+
+    fn health_check<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), meerkat_client::LlmError>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A member of a spec from the plain public constructor
+/// (`MobBootstrapSpec::ephemeral`) is built once its slow server has
+/// connected, so the first request its turn sends the model already offers
+/// that server's tool. Built while the server was still starting, the first
+/// request would not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plain_ephemeral_spec_builds_its_member_after_its_slow_server_connects() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = slow_listing_server(dir.path());
+    let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+        r#"
+[mob]
+id = "member-mcp-surface-plain"
+
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "autonomous_host"
+external_addressable = true
+
+[profiles.worker.tools]
+comms = true
+
+[[profiles.worker.tools.mcp_servers]]
+name = "{LISTING}"
+command = "/bin/sh"
+args = [{server:?}]
+"#,
+        server = server.display().to_string(),
+    ))
+    .expect("mob definition");
+    let client = CaptureClient::default();
+    let spec = meerkat_meta::MobBootstrapSpec::ephemeral(
+        definition,
+        meerkat_mob::MobStorage::in_memory(),
+        dir.path().join("store"),
+        4,
+        None,
+    )
+    .expect("plain ephemeral spec")
+    .with_options(meerkat_meta::MobBootstrapOptions {
+        allow_ephemeral_sessions: true,
+        notify_orchestrator_on_resume: false,
+        default_llm_client: Some(Arc::new(client.clone())),
+    });
+    let runtime = meerkat_meta::MobRuntime::bootstrap(spec)
+        .await
+        .expect("bootstrap");
+    Box::pin(
+        runtime
+            .handle()
+            .spawn_spec(meerkat_mob::SpawnMemberSpec::host_root(
+                "worker",
+                meerkat_mob::AgentIdentity::from("worker-1"),
+            )),
+    )
+    .await
+    .expect("spawn");
+    meerkat_meta::send_message_on_mob(&runtime.handle(), "worker-1", "hello".to_string())
+        .await
+        .expect("send");
+    let first = client.first_request().await;
+    let lookup = format!("{LOOKUP}=Mcp:{LISTING}");
+    assert!(
+        first.contains(&lookup),
+        "the first request offers the slow server's tool: {first:?}"
+    );
+    let _ = runtime.handle().shutdown().await;
 }
