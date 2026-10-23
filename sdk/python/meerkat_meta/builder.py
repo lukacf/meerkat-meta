@@ -33,6 +33,8 @@ class MetaBuilderConfig:
     access_config_path: str | None = None
     meerkat_config_path: str | None = None
     workgraph_enabled: bool | str | None = None
+    # ``runtime_options.mob_announcements``, sent as given; ``None`` sends nothing.
+    mob_announcements: dict[str, Any] | None = None
     fork_instruction_policy: str | None = None
     routing_config_path: str | None = None
     host_runnables: list[str] = field(default_factory=list)
@@ -333,6 +335,22 @@ class MetaBuilder:
         memory-backed.
         """
         self._config.workgraph_enabled = enabled if isinstance(enabled, str) else bool(enabled)
+        return self
+
+    def mob_announcements(self, config: Mapping[str, Any] | bool = True) -> MetaBuilder:
+        """Enable mob announcements (``runtime_options.mob_announcements``).
+
+        ``True`` sends ``{"enabled": true}`` and ``False`` sends
+        ``{"enabled": false}``. A mapping is sent unchanged, for the batch,
+        retention and limit options (``{"enabled": true, "batch": {...},
+        "retention_ms": ...}``; see the configuration reference). The gateway
+        enables them only on a persistent, identity-first launch, and refuses
+        the init otherwise. Omitted entirely when never called.
+        """
+        if isinstance(config, bool):
+            self._config.mob_announcements = {"enabled": config}
+        else:
+            self._config.mob_announcements = dict(config)
         return self
 
     def fork_instruction_policy(self, policy: str) -> MetaBuilder:

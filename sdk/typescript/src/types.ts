@@ -291,6 +291,11 @@ export interface CapabilitiesResult {
   readonly runtimeCapabilities?: RuntimeCapabilities;
   readonly workgraph: boolean;
   readonly storage?: StorageSummary;
+  /**
+   * What the gateway's mob announcements offer; `null` when they are
+   * disabled or the gateway predates the object.
+   */
+  readonly mobAnnouncements?: MobAnnouncementsCapability | null;
 }
 
 export function parseCapabilitiesResult(raw: unknown): CapabilitiesResult {
@@ -304,6 +309,7 @@ export function parseCapabilitiesResult(raw: unknown): CapabilitiesResult {
     runtimeCapabilities: parseRuntimeCapabilities(d.runtime_capabilities),
     workgraph: Boolean(d.workgraph ?? false),
     ...(storage !== undefined ? { storage } : {}),
+    mobAnnouncements: parseOptionalMobAnnouncementsCapability(d.mob_announcements),
   };
 }
 
@@ -4610,4 +4616,663 @@ export function parseIdentityBootstrapStatus(raw: unknown): IdentityBootstrapSta
       ? d.first_boot_pending.map(parseFirstBootPendingRow)
       : [],
   };
+}
+
+// -- Mob announcements ----------------------------------------------------
+//
+// Result models for `meta/mob_announcements/*`. Every wire vocabulary
+// (states, phases, statuses, outcomes, actions, reasons, kinds) is an open
+// union, so a newer gateway's value reaches the caller instead of failing the
+// parse. Nested declarations the caller wrote (a source's identity principal,
+// audience, start, delivery, health policy, ...) are kept as the gateway sent
+// them, in wire (snake_case) form.
+
+/** The `feature_capabilities` entry of a gateway that serves sources. */
+export const MOB_ANNOUNCEMENT_SOURCES_V1 = "mob_announcements.sources.v1" as const;
+
+function wireInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
+}
+
+function wireRecordOrNull(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function wireNumberRecord(value: unknown): Record<string, number> {
+  const result: Record<string, number> = {};
+  for (const [key, entry] of Object.entries(asRecord(value))) {
+    result[key] = Number(entry ?? 0);
+  }
+  return result;
+}
+
+/** The member a subscription delivers to: an identity within a mob. */
+export interface AnnouncementMember {
+  readonly mobId: string;
+  readonly identity: string;
+}
+
+export function parseAnnouncementMember(raw: unknown): AnnouncementMember {
+  const d = asRecord(raw);
+  return { mobId: String(d.mob_id ?? ""), identity: String(d.identity ?? "") };
+}
+
+/** One announcement by its stable identity: its mob and source key. */
+export interface AnnouncementRef {
+  readonly mobId: string;
+  readonly sourceKey: string;
+}
+
+/**
+ * Who made an announcement: the host, a member (`identity`), a source
+ * (`sourceId`) or a newer kind. `raw` keeps the object as sent.
+ */
+export interface Announcer {
+  readonly kind: "host" | "member" | "source" | (string & {});
+  readonly identity: string | null;
+  readonly sourceId: string | null;
+  readonly raw: Readonly<Record<string, unknown>>;
+}
+
+/** A committed, immutable mob announcement. */
+export interface Announcement {
+  readonly mobId: string;
+  readonly sequence: number;
+  readonly announcedBy: Announcer;
+  readonly sourceKey: string;
+  readonly topics: readonly string[];
+  readonly body: string;
+  readonly correlationId: string | null;
+  readonly causes: readonly AnnouncementRef[];
+  readonly digest: string;
+  readonly announcedAtMs: number;
+}
+
+export function parseAnnouncement(raw: unknown): Announcement {
+  const d = asRecord(raw);
+  const by = asRecord(d.announced_by);
+  return {
+    mobId: String(d.mob_id ?? ""),
+    sequence: Number(d.sequence ?? 0),
+    announcedBy: {
+      kind: String(by.kind ?? ""),
+      identity: optionalString(by.identity),
+      sourceId: optionalString(by.source_id),
+      raw: by,
+    },
+    sourceKey: String(d.source_key ?? ""),
+    topics: asStringArray(d.topics),
+    body: String(d.body ?? ""),
+    correlationId: optionalString(d.correlation_id),
+    causes: asRecordArray(d.causes).map((cause) => ({
+      mobId: String(cause.mob_id ?? ""),
+      sourceKey: String(cause.source_key ?? ""),
+    })),
+    digest: String(d.digest ?? ""),
+    announcedAtMs: Number(d.announced_at_ms ?? 0),
+  };
+}
+
+/**
+ * The answer to an announce: the committed announcement, whether it replayed
+ * an identical earlier one, and how many subscriptions captured it (a count,
+ * never their names).
+ */
+export interface AnnounceResult {
+  readonly announcement: Announcement;
+  readonly replayed: boolean;
+  readonly captured: number;
+}
+
+export function parseAnnounceResult(raw: unknown): AnnounceResult {
+  const d = asRecord(raw);
+  return {
+    announcement: parseAnnouncement(d.announcement),
+    replayed: d.replayed === true,
+    captured: Number(d.captured ?? 0),
+  };
+}
+
+/**
+ * A durable subscription. `frontier` maps each mob to the sequence after
+ * which the selector in force captures; `ended` says why an ended
+ * subscription ended.
+ */
+export interface AnnouncementSubscription {
+  readonly id: string;
+  readonly member: AnnouncementMember;
+  readonly topics: readonly string[];
+  readonly mobs: readonly string[];
+  readonly state: "active" | "paused" | "cancelled" | "ended" | (string & {});
+  readonly revision: number;
+  readonly selectorRevision: number;
+  readonly frontier: Readonly<Record<string, number>>;
+  readonly endedMobs: readonly string[];
+  readonly ended: Readonly<Record<string, unknown>> | null;
+  readonly memberMobCursor: number | null;
+  readonly createdAtMs: number;
+  readonly updatedAtMs: number;
+}
+
+export function parseAnnouncementSubscription(raw: unknown): AnnouncementSubscription {
+  const d = asRecord(raw);
+  const selector = asRecord(d.selector);
+  return {
+    id: String(d.id ?? ""),
+    member: parseAnnouncementMember(d.member),
+    topics: asStringArray(selector.topics),
+    mobs: asStringArray(selector.mobs),
+    state: String(d.state ?? ""),
+    revision: Number(d.revision ?? 0),
+    selectorRevision: Number(d.selector_revision ?? 0),
+    frontier: wireNumberRecord(d.frontier),
+    endedMobs: asStringArray(d.ended_mobs),
+    ended: wireRecordOrNull(d.ended),
+    memberMobCursor: wireInteger(d.member_mob_cursor),
+    createdAtMs: Number(d.created_at_ms ?? 0),
+    updatedAtMs: Number(d.updated_at_ms ?? 0),
+  };
+}
+
+/**
+ * A subscription pause, resume or cancel: the subscription as it is now, and
+ * the batches that still hold its announcements and have not settled (a
+ * change never rewrites a sealed batch).
+ */
+export interface AnnouncementSubscriptionChange {
+  readonly subscription: AnnouncementSubscription;
+  readonly unresolvedBatches: readonly string[];
+}
+
+export function parseAnnouncementSubscriptionChange(raw: unknown): AnnouncementSubscriptionChange {
+  const d = asRecord(raw);
+  return {
+    subscription: parseAnnouncementSubscription(d.subscription),
+    unresolvedBatches: asStringArray(d.unresolved_batches),
+  };
+}
+
+/**
+ * Why a member's deliveries wait now, and on what evidence. `causeKind` is
+ * the cause's kind (`"peer_composing"`, `"member_not_live"`, ... or newer);
+ * `cause` keeps the object as sent.
+ */
+export interface AnnouncementSuspendMarker {
+  readonly cause: Readonly<Record<string, unknown>>;
+  readonly causeKind: string;
+  readonly evidence: string;
+  readonly sinceMs: number;
+}
+
+function parseOptionalSuspendMarker(raw: unknown): AnnouncementSuspendMarker | null {
+  const d = wireRecordOrNull(raw);
+  if (d === null) return null;
+  const cause = asRecord(d.cause);
+  return {
+    cause,
+    causeKind: String(cause.kind ?? ""),
+    evidence: String(d.evidence ?? ""),
+    sinceMs: Number(d.since_ms ?? 0),
+  };
+}
+
+/**
+ * `subscriptions/get`: the subscription (`null` when unknown), why its
+ * member's deliveries wait if they do, and its backlog when the gateway
+ * reports one.
+ */
+export interface AnnouncementSubscriptionView {
+  readonly subscription: AnnouncementSubscription | null;
+  readonly marker: AnnouncementSuspendMarker | null;
+  readonly backlog: Readonly<Record<string, unknown>> | null;
+}
+
+export function parseAnnouncementSubscriptionView(raw: unknown): AnnouncementSubscriptionView {
+  const d = asRecord(raw);
+  const subscription = wireRecordOrNull(d.subscription);
+  return {
+    subscription: subscription === null ? null : parseAnnouncementSubscription(subscription),
+    marker: parseOptionalSuspendMarker(d.marker),
+    backlog: wireRecordOrNull(d.backlog),
+  };
+}
+
+/** One captured announcement in a batch, under the subscription revision that captured it. */
+export interface AnnouncementBatchItem {
+  readonly subscriptionId: string;
+  readonly subscriptionRevision: number;
+  readonly mobId: string;
+  readonly sequence: number;
+  readonly sourceKey: string;
+}
+
+/** Announcements owed to a batch's member that it reports as not delivered. */
+export interface AnnouncementGap {
+  readonly mobId: string;
+  readonly count: number;
+  readonly reason:
+    | "expired"
+    | "not_retained"
+    | "delivery_not_confirmed"
+    | "admission_not_confirmed"
+    | (string & {});
+}
+
+/**
+ * An immutable delivery batch for one member. `state` is the delivery
+ * state's tag and `stateDetail` the full state object as sent. `route` is
+ * `"local"`, `"child"`, `"peer"` or newer. `handling` is `null` from a
+ * gateway that does not report it.
+ */
+export interface AnnouncementBatch {
+  readonly id: string;
+  readonly member: AnnouncementMember;
+  readonly items: readonly AnnouncementBatchItem[];
+  readonly gaps: readonly AnnouncementGap[];
+  readonly route: "local" | "child" | "peer" | (string & {});
+  readonly body: string;
+  readonly contentDigest: string;
+  readonly predecessor: string | null;
+  readonly successor: string | null;
+  readonly state:
+    | "sealed"
+    | "submitting"
+    | "committed"
+    | "delivered"
+    | "refused"
+    | "stranded"
+    | "cancelled"
+    | "blocked"
+    | "expired"
+    | "expired_unverified"
+    | "committed_unconfirmed"
+    | (string & {});
+  readonly stateDetail: Readonly<Record<string, unknown>>;
+  readonly handling: Readonly<Record<string, unknown>> | null;
+  readonly sealedAtMs: number;
+  readonly updatedAtMs: number;
+}
+
+export function parseAnnouncementBatch(raw: unknown): AnnouncementBatch {
+  const d = asRecord(raw);
+  const state = asRecord(d.state);
+  return {
+    id: String(d.id ?? ""),
+    member: parseAnnouncementMember(d.member),
+    items: asRecordArray(d.items).map((item) => ({
+      subscriptionId: String(item.subscription_id ?? ""),
+      subscriptionRevision: Number(item.subscription_revision ?? 0),
+      mobId: String(item.mob_id ?? ""),
+      sequence: Number(item.sequence ?? 0),
+      sourceKey: String(item.source_key ?? ""),
+    })),
+    gaps: asRecordArray(d.gaps).map((gap) => ({
+      mobId: String(gap.mob_id ?? ""),
+      count: Number(gap.count ?? 0),
+      reason: String(gap.reason ?? ""),
+    })),
+    route: String(d.route ?? ""),
+    body: String(d.body ?? ""),
+    contentDigest: String(d.content_digest ?? ""),
+    predecessor: optionalString(d.predecessor),
+    successor: optionalString(d.successor),
+    state: String(state.state ?? ""),
+    stateDetail: state,
+    handling: wireRecordOrNull(d.handling),
+    sealedAtMs: Number(d.sealed_at_ms ?? 0),
+    updatedAtMs: Number(d.updated_at_ms ?? 0),
+  };
+}
+
+/**
+ * `deliveries/observe` and `deliveries/reconcile`: the batch, the native
+ * owner's live status (`native`, as sent; `nativeStatus` is its `status`),
+ * the admitted input's own state once admitted, and why the member's
+ * deliveries wait, if they do.
+ */
+export interface AnnouncementDeliveryObservation {
+  readonly batch: AnnouncementBatch;
+  readonly native: Readonly<Record<string, unknown>>;
+  readonly nativeStatus: string;
+  readonly input: Readonly<Record<string, unknown>> | null;
+  readonly marker: AnnouncementSuspendMarker | null;
+}
+
+export function parseAnnouncementDeliveryObservation(raw: unknown): AnnouncementDeliveryObservation {
+  const d = asRecord(raw);
+  const native = asRecord(d.native);
+  return {
+    batch: parseAnnouncementBatch(d.batch),
+    native,
+    nativeStatus: String(native.status ?? ""),
+    input: wireRecordOrNull(d.input),
+    marker: parseOptionalSuspendMarker(d.marker),
+  };
+}
+
+/**
+ * One of a source's routes: `kind` is `"direct"`, `"triage"` or newer; `raw`
+ * keeps the route as sent.
+ */
+export interface AnnouncementSourceRoute {
+  readonly kind: "direct" | "triage" | (string & {});
+  readonly raw: Readonly<Record<string, unknown>>;
+}
+
+/** A source's health. `totals` counts what its collections did. */
+export interface AnnouncementSourceHealth {
+  readonly status:
+    | "baselining"
+    | "backfilling"
+    | "ok"
+    | "failing"
+    | "stale"
+    | "paused"
+    | "ended"
+    | (string & {});
+  readonly lastSuccessAtMs: number | null;
+  readonly lastNewItemAtMs: number | null;
+  readonly lastObserved: Readonly<Record<string, unknown>> | null;
+  readonly lastObservedAtMs: number | null;
+  readonly emptySnapshotSinceMs: number | null;
+  readonly consecutiveFailures: number;
+  readonly totals: Readonly<Record<string, number>>;
+  readonly lastFailure: Readonly<Record<string, unknown>> | null;
+  readonly lastConflict: Readonly<Record<string, unknown>> | null;
+}
+
+/**
+ * A durable announcement source, one generation of it. `revision` rises on
+ * every change, across generations, and every collector step names it with
+ * the cursor version. The cursor's token and a failure's detail appear only
+ * in `sources/get`; a list shows the principal as its kind and digest only.
+ */
+export interface AnnouncementSource {
+  readonly mobId: string;
+  readonly sourceId: string;
+  readonly generation: number;
+  readonly revision: number;
+  readonly identity: {
+    readonly provider: string;
+    readonly principal: Readonly<Record<string, unknown>>;
+    readonly scope: Readonly<Record<string, unknown>>;
+  };
+  readonly connection: Readonly<Record<string, unknown>> | null;
+  readonly observation: Readonly<Record<string, unknown>>;
+  readonly topics: readonly string[];
+  readonly audience: readonly Readonly<Record<string, unknown>>[];
+  readonly routes: readonly AnnouncementSourceRoute[];
+  readonly conversationMembers: readonly AnnouncementMember[];
+  readonly start: Readonly<Record<string, unknown>>;
+  readonly delivery: Readonly<Record<string, unknown>>;
+  readonly healthPolicy: Readonly<Record<string, unknown>>;
+  readonly runner: { readonly hostRunnable: string; readonly everySeconds: number } | null;
+  readonly state: "active" | "paused" | "ended" | (string & {});
+  readonly collection: "baselining" | "backfilling" | "live" | (string & {});
+  readonly cursor: {
+    readonly version: number;
+    readonly token: string | null;
+    readonly advancedAtMs: number | null;
+  };
+  readonly streams: Readonly<Record<string, number>>;
+  readonly backfilled: number;
+  readonly health: AnnouncementSourceHealth;
+  readonly createdAtMs: number;
+  readonly updatedAtMs: number;
+}
+
+export function parseAnnouncementSource(raw: unknown): AnnouncementSource {
+  const d = asRecord(raw);
+  const identity = asRecord(d.identity);
+  const cursor = asRecord(d.cursor);
+  const runner = wireRecordOrNull(d.runner);
+  const health = asRecord(d.health);
+  return {
+    mobId: String(d.mob_id ?? ""),
+    sourceId: String(d.source_id ?? ""),
+    generation: Number(d.generation ?? 0),
+    revision: Number(d.revision ?? 0),
+    identity: {
+      provider: String(identity.provider ?? ""),
+      principal: asRecord(identity.principal),
+      scope: asRecord(identity.scope),
+    },
+    connection: wireRecordOrNull(d.connection),
+    observation: asRecord(d.observation),
+    topics: asStringArray(d.topics),
+    audience: asRecordArray(d.audience),
+    routes: asRecordArray(d.routes).map((route) => ({ kind: String(route.kind ?? ""), raw: route })),
+    conversationMembers: asRecordArray(d.conversation_members).map(parseAnnouncementMember),
+    start: asRecord(d.start),
+    delivery: asRecord(d.delivery),
+    healthPolicy: asRecord(d.health_policy),
+    runner:
+      runner === null
+        ? null
+        : { hostRunnable: String(runner.host_runnable ?? ""), everySeconds: Number(runner.every_seconds ?? 0) },
+    state: String(d.state ?? ""),
+    collection: String(d.collection ?? ""),
+    cursor: {
+      version: Number(cursor.version ?? 0),
+      token: optionalString(cursor.token),
+      advancedAtMs: wireInteger(cursor.advanced_at_ms),
+    },
+    streams: wireNumberRecord(d.streams),
+    backfilled: Number(d.backfilled ?? 0),
+    health: {
+      status: String(health.status ?? ""),
+      lastSuccessAtMs: wireInteger(health.last_success_at_ms),
+      lastNewItemAtMs: wireInteger(health.last_new_item_at_ms),
+      lastObserved: wireRecordOrNull(health.last_observed),
+      lastObservedAtMs: wireInteger(health.last_observed_at_ms),
+      emptySnapshotSinceMs: wireInteger(health.empty_snapshot_since_ms),
+      consecutiveFailures: Number(health.consecutive_failures ?? 0),
+      totals: wireNumberRecord(health.totals),
+      lastFailure: wireRecordOrNull(health.last_failure),
+      lastConflict: wireRecordOrNull(health.last_conflict),
+    },
+    createdAtMs: Number(d.created_at_ms ?? 0),
+    updatedAtMs: Number(d.updated_at_ms ?? 0),
+  };
+}
+
+/**
+ * `sources/put`: the source as declared. `affectedSubscriptions` and
+ * `deliveryReadiness` are `null` from a gateway that does not report them.
+ */
+export interface AnnouncementSourcePutResult {
+  readonly source: AnnouncementSource;
+  readonly affectedSubscriptions: number | null;
+  readonly deliveryReadiness: Readonly<Record<string, unknown>> | null;
+}
+
+export function parseAnnouncementSourcePutResult(raw: unknown): AnnouncementSourcePutResult {
+  const d = asRecord(raw);
+  return {
+    source: parseAnnouncementSource(d.source),
+    affectedSubscriptions: wireInteger(d.affected_subscriptions),
+    deliveryReadiness: wireRecordOrNull(d.delivery_readiness),
+  };
+}
+
+/** A stream of a source as `sources/get` lists it. */
+export interface AnnouncementSourceStream {
+  readonly stream: string;
+  readonly phase: "baselining" | "backfilling" | "live" | (string & {});
+  readonly mode: unknown;
+  readonly maxItems: number | null;
+  readonly backfilled: number;
+  readonly sinceMs: number | null;
+}
+
+/**
+ * `sources/get`: the source (`null` when the mob has none by that id), and
+ * its streams when asked for them.
+ */
+export interface AnnouncementSourceView {
+  readonly source: AnnouncementSource | null;
+  readonly streams: readonly AnnouncementSourceStream[] | null;
+}
+
+export function parseAnnouncementSourceView(raw: unknown): AnnouncementSourceView {
+  const d = asRecord(raw);
+  const source = wireRecordOrNull(d.source);
+  return {
+    source: source === null ? null : parseAnnouncementSource(source),
+    streams: Array.isArray(d.streams)
+      ? asRecordArray(d.streams).map((stream) => ({
+          stream: String(stream.stream ?? ""),
+          phase: String(stream.phase ?? ""),
+          mode: stream.mode ?? null,
+          maxItems: wireInteger(stream.max_items),
+          backfilled: Number(stream.backfilled ?? 0),
+          sinceMs: wireInteger(stream.since_ms),
+        }))
+      : null,
+  };
+}
+
+/**
+ * What became of one item of a collector step. `sequence` is the
+ * announcement's (for a conflict, the original's); `captured` counts the
+ * subscriptions that captured it.
+ */
+export interface SourceItemOutcome {
+  readonly itemId: string;
+  readonly version: string;
+  readonly sourceKey: string;
+  readonly outcome: "announced" | "replayed" | "conflict" | (string & {});
+  readonly sequence: number | null;
+  readonly captured: number | null;
+  readonly existingDigest: string | null;
+  readonly offeredDigest: string | null;
+}
+
+/**
+ * `sources/advance`: the source as the step committed it, each item's
+ * outcome, and the phases of the streams it onboarded. `replayed` says the
+ * step was answered from its receipt.
+ */
+export interface SourceAdvanceResult {
+  readonly source: AnnouncementSource;
+  readonly replayed: boolean;
+  readonly items: readonly SourceItemOutcome[];
+  readonly streams: readonly {
+    readonly stream: string;
+    readonly phase: "baselining" | "backfilling" | "live" | (string & {});
+  }[];
+}
+
+export function parseSourceAdvanceResult(raw: unknown): SourceAdvanceResult {
+  const d = asRecord(raw);
+  return {
+    source: parseAnnouncementSource(d.source),
+    replayed: d.replayed === true,
+    items: asRecordArray(d.items).map((item) => ({
+      itemId: String(item.item_id ?? ""),
+      version: String(item.version ?? ""),
+      sourceKey: String(item.source_key ?? ""),
+      outcome: String(item.outcome ?? ""),
+      sequence: wireInteger(item.sequence),
+      captured: wireInteger(item.captured),
+      existingDigest: optionalString(item.existing_digest),
+      offeredDigest: optionalString(item.offered_digest),
+    })),
+    streams: asRecordArray(d.streams).map((stream) => ({
+      stream: String(stream.stream ?? ""),
+      phase: String(stream.phase ?? ""),
+    })),
+  };
+}
+
+/**
+ * One counted audit entry: every refusal or withholding of one member by one
+ * generation of one source, for one reason.
+ */
+export interface AnnouncementAuditEntry {
+  readonly id: number;
+  readonly atMs: number;
+  readonly action:
+    | "subscription_refused"
+    | "capture_withheld"
+    | "items_held"
+    | "items_released"
+    | "expired_while_held"
+    | "delivered_across_revocation"
+    | (string & {});
+  readonly mobId: string;
+  readonly sourceId: string;
+  readonly generation: number;
+  readonly member: AnnouncementMember;
+  readonly reason:
+    | "audience_not_covered"
+    | "no_direct_route"
+    | "route_overlap"
+    | "route_conflict"
+    | (string & {});
+  readonly count: number;
+  readonly firstAtMs: number;
+  readonly lastAtMs: number;
+}
+
+export function parseAnnouncementAuditEntry(raw: unknown): AnnouncementAuditEntry {
+  const d = asRecord(raw);
+  return {
+    id: Number(d.id ?? 0),
+    atMs: Number(d.at_ms ?? 0),
+    action: String(d.action ?? ""),
+    mobId: String(d.mob_id ?? ""),
+    sourceId: String(d.source_id ?? ""),
+    generation: Number(d.generation ?? 0),
+    member: parseAnnouncementMember(d.member),
+    reason: String(d.reason ?? ""),
+    count: Number(d.count ?? 0),
+    firstAtMs: Number(d.first_at_ms ?? 0),
+    lastAtMs: Number(d.last_at_ms ?? 0),
+  };
+}
+
+/**
+ * `meta/capabilities.mob_announcements`: what this gateway's mob
+ * announcements offer. `sources` is `"v1"` when sources are served.
+ * `localDelivery` is `{kind: "ready"}`, `{kind: "refused", cause}`,
+ * `{kind: "unavailable", detail}` or newer, as sent; `localDeliveryKind` is
+ * its kind.
+ */
+export interface MobAnnouncementsCapability {
+  readonly sources: string | null;
+  readonly localDelivery: Readonly<Record<string, unknown>> | null;
+  readonly localDeliveryKind: "ready" | "refused" | "unavailable" | (string & {}) | null;
+  readonly governedAdmission: boolean;
+}
+
+function parseOptionalMobAnnouncementsCapability(raw: unknown): MobAnnouncementsCapability | null {
+  const d = wireRecordOrNull(raw);
+  if (d === null) return null;
+  const localDelivery = wireRecordOrNull(d.local_delivery);
+  return {
+    sources: optionalString(d.sources),
+    localDelivery,
+    localDeliveryKind: localDelivery === null ? null : optionalString(localDelivery.kind),
+    governedAdmission: d.governed_admission === true,
+  };
+}
+
+/**
+ * Whether the gateway serves mob announcement sources: its
+ * `featureCapabilities` name `"mob_announcements.sources.v1"`. Takes a
+ * {@link CapabilitiesResult} or its `featureCapabilities`. A gateway that
+ * lists `meta/mob_announcements/announce` among its methods without it runs
+ * mob announcements without sources; an older one answers the source methods
+ * with method-not-found.
+ */
+export function supportsAnnouncementSources(
+  capabilities: CapabilitiesResult | readonly string[],
+): boolean {
+  const features = Array.isArray(capabilities)
+    ? (capabilities as readonly string[])
+    : (capabilities as CapabilitiesResult).featureCapabilities;
+  return features.includes(MOB_ANNOUNCEMENT_SOURCES_V1);
 }

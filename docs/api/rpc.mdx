@@ -258,11 +258,11 @@ errors. SDKs surface it on `RpcError.data`.
 | `-32018` | stdio gateway: an ordinary request arrived before `meta/init` settled. It was refused at once, not queued. Startup provider callbacks must not issue ordinary RPCs on the runtime that is starting. `meta/shutdown` is still admitted. | `{kind: "init_in_progress", method}` |
 | `-32019` | `meta/init` mob composition provenance refusal: the persistent mob storage's recorded composition cannot be proven to match the launch. Raised before the mob actuates, for a supplied definition that differs from the recorded one, a candidate launch whose definition differs from the stored one it would boot, a store created by a rehearsal launch, a composition manifest that is unreadable, malformed, of an unsupported version or could not be written, or undeclared non-empty storage. (`missing` is part of the kind vocabulary but the gateway does not raise it today: an authoritative launch adopts and records the definition when the manifest is absent.) The message keeps the `Runtime bootstrap failed: ` prefix and names the remedy. The gateway writes the error response (or, for an accepted init, the `failed` settlement) and exits. | `{kind, fields, manifest?, storage?, found_version?, supported_version?}`; `kind` is `divergent`, `candidate_divergent`, `created_by_rehearsal`, `missing`, `unreadable`, `malformed`, `unsupported_version`, `not_recorded` or `unproven_storage`; `fields` is always present and lists the diverged definition fields as dotted paths (empty for other kinds) |
 | `-32030` | HTTP console ABAC gate refused the operation | `{kind: "access_denied", ...}` |
-| `-32044` | A mob announcement method on a gateway that did not enable mob announcements (see [Mob announcements](#mob-announcements-optional)) | `{kind: "mob_announcements_unavailable"}` |
-| `-32045` | Mob announcement conflict: a source key already bound to other content, a stale subscription revision, a reused operation id, a batch that moved | `{kind: "announcement_conflict", existing}`, `{kind: "stale_revision", current_revision}`, `{kind: "operation_reused"}` or `{kind: "batch_moved", current}` |
-| `-32046` | `meta/mob_announcements/subscriptions/put` start frontier outside a mob's announcements: older than what is retained, or beyond its head (a mob that has announced nothing yet is at head 0) | `{kind: "gap", mob_id, earliest_retained}` or `{kind: "frontier_beyond_head", mob_id, head}` |
-| `-32047` | Mob announcement typed refusal | `{kind}`: `governed_runtime`, `unknown_member` (with `member`), `unusable_member`, `unusable_peer`, `subscription_cancelled`, `subscription_ended` (with `end`), `member_mismatch`, `unrelated_mob` (with `mob_id`; member tools only), `ambiguous_mob` (with `mob_id`, or `kept_route`), `child_member_limit` (with `limit`, and `mob_id` for the bound per mob) or `native_unavailable` |
-| `-32048` | A mob announcement method names a subscription, delivery or mob that does not exist here | `{kind: "unknown_subscription"}`, `{kind: "unknown_delivery"}` or `{kind: "unknown_mob", mobs}` |
+| `-32044` | A mob announcement method on a gateway that did not enable mob announcements (see [Mob announcements](#mob-announcements-optional)). `MobAnnouncementsUnavailableError` in both SDKs. | `{kind: "mob_announcements_unavailable"}` |
+| `-32045` | Mob announcement conflict: a source key already bound to other content, a stale subscription or source revision, a collector step from a cursor version another step already moved, a reused operation id, a batch that moved. `AnnouncementConflictError` in both SDKs; a source's stale revision is `SourceStaleRevisionError` and a moved cursor `SourceVersionConflictError`, both carrying the source's current position. | `{kind: "announcement_conflict", existing}`, `{kind: "stale_revision", current_revision}` (a subscription), `{kind: "stale_revision", current_revision, current_version, generation, cursor}` (a source), `{kind: "source_version_conflict", current_version, cursor, state, revision}`, `{kind: "operation_reused"}` or `{kind: "batch_moved", current}` |
+| `-32046` | `meta/mob_announcements/subscriptions/put` start frontier outside a mob's announcements: older than what is retained, or beyond its head (a mob that has announced nothing yet is at head 0). `AnnouncementFrontierError` in both SDKs. | `{kind: "gap", mob_id, earliest_retained}` or `{kind: "frontier_beyond_head", mob_id, head}` |
+| `-32047` | Mob announcement typed refusal. `AnnouncementRefusedError` in both SDKs. | `{kind}`: `governed_runtime`, `unknown_member` (with `member`), `unusable_member`, `unusable_peer`, `subscription_cancelled`, `subscription_ended` (with `end`), `member_mismatch`, `unrelated_mob` (with `mob_id`; member tools only), `ambiguous_mob` (with `mob_id`, or `kept_route`), `child_member_limit` (with `limit`, and `mob_id` for the bound per mob) or `native_unavailable`; for sources (see [Mob announcement sources](#mob-announcement-sources)) `source_paused`, `source_ended`, `principal_changed` (with `pinned_digest`, `offered_digest`), `baseline_required`, `stream_not_baselined` (with `streams`), `backfill_bound_exceeded` (with `remaining`, and `stream` for a stream's bound), `deletions_unobservable`, `topic_owned` and `topic_owned_by_source` (with `topic`, `source_id`), `source_identity_taken` (with `source_id`), `identity_immutable`, `principal_not_allowed` (with `principal_kind`), `audience_not_covered` and `no_direct_route` (with `source_id`, `topic`), `route_overlap` (with `source_id`, `member`), `route_conflict` (with `conflict: "conversation"`, `source_id`), `route_selector_unsupported` (with `selector`) or `source_limit` (with `limit`, and `mob_id`, `null` for the gateway's bound) |
+| `-32048` | A mob announcement method names a subscription, delivery, source or mob that does not exist here. `AnnouncementNotFoundError` in both SDKs. | `{kind: "unknown_subscription"}`, `{kind: "unknown_delivery"}`, `{kind: "unknown_source"}` or `{kind: "unknown_mob", mobs}` |
 
 A wake that Core holds until an operator acts answers `-32603` with a
 structured `kind` (`IdentityWakeHeldError` in both SDKs):
@@ -2188,7 +2188,8 @@ announcements answers them there exactly as `rpc_gateway` does:
 `-32044` `mob_announcements_unavailable`. On the console every method, the
 reads included, requires the `runtime.admin` grant, and a read-only console
 refuses the ones that change state (`announce`,
-`subscriptions/{put,pause,resume,cancel}` and `deliveries/reconcile`). On the
+`subscriptions/{put,pause,resume,cancel}`, `deliveries/reconcile` and
+`sources/{put,pause,resume,end,advance,record_failure}`). On the
 console, `subscriptions/put` refuses a `member` whose identity is `_system`
 or `__console__` (`-32602`), the identities the console reserves for its own
 events. The host announces a development to a mob hosted on
@@ -2324,6 +2325,168 @@ that rules a batch out blocks it on the local route only. A blocked batch's
 with its typed reason: `conflict`, `peer_invalid_request`,
 `request_oversize`, `native_invalid`, `native_inconsistent` or
 `native_key_invalid`.
+
+### Mob announcement sources
+
+A source is a durable record, per mob and `source_id`, of one external scope
+a collector observes; see [Sources](/concepts/mob-announcements#sources). A
+gateway that serves sources lists `mob_announcements.sources.v1` in
+`meta/capabilities.feature_capabilities`; one that serves mob announcements
+without sources lists the methods above but not that capability, and an
+older one answers the methods below with `-32601`. Every method takes
+`mob_id?`, this gateway's mob by default, and every one that changes state
+takes an `operation_id`: the same id with the same request returns the
+original answer, and with another request it is refused `operation_reused`.
+
+| Method | Params | Result |
+|--------|--------|--------|
+| `meta/mob_announcements/sources/put` | `{operation_id, mob_id?, source_id, expected_revision?, new_generation?, identity, connection?, observation, topics, audience, routes?, conversation_members?, start?, delivery?, health_policy?, runner?}` | `{source, affected_subscriptions?, delivery_readiness?}` |
+| `meta/mob_announcements/sources/pause`, `resume`, `end` | `{operation_id, mob_id?, source_id, expected_revision}`; `resume` also takes `rebaseline?` | `{source}` |
+| `meta/mob_announcements/sources/get` | `{mob_id?, source_id, include_streams?}` | `{source, streams?}` (`source` `null` when absent) |
+| `meta/mob_announcements/sources/list` | `{mob_id?, after?, state?, limit?}` | `{sources}` |
+| `meta/mob_announcements/sources/advance` | `{operation_id, mob_id?, source_id, expected_revision, expected_version, principal, next_cursor, page?, coverage?, items?, streams?, rebaseline?, observed?, collected_at_ms?}` | `{source, replayed, items, streams}` |
+| `meta/mob_announcements/sources/record_failure` | `{operation_id, mob_id?, source_id, expected_revision, expected_version, principal, failure}` | `{source}` |
+| `meta/mob_announcements/audit/list` | `{mob_id?, source_id?, member?, action?, after?, limit?}` | `{entries}` |
+
+`sources/put` creates a source when `expected_revision` is absent and
+replaces its configuration at that revision otherwise; with
+`"new_generation": true` it ends the current generation and starts the next
+in the same transaction. Its fields:
+
+- `identity` is `{provider, principal, scope: {kind, id}}` and is fixed
+  within a generation (`identity_immutable`). `principal` is the account the
+  collector reads as: `{"kind": "connector_verified_account", "issuer",
+  "strategy_id", "subject"}`, the identity a connector login verified, or
+  `{"kind": "host_attested", "attester", "account"}`, which only a
+  `{"kind": "host"}` connection may carry (`principal_not_allowed`
+  otherwise). Two sources of one mob cannot share a provider, principal and
+  scope (`source_identity_taken`).
+- `connection` is `{"kind": "connect_setup" | "host", "id"}`, a reference
+  Meta keeps and never dereferences.
+- `observation` is `{"baseline": "delta" | "snapshot", "deletions":
+  "explicit" | "unobservable"}`: how the adapter takes the provider's
+  position, and whether it can see deletions.
+- `topics` (1 to 16) are owned by the source in its mob (`topic_owned` for
+  another source's, and a plain announce on one is refused
+  `topic_owned_by_source`).
+- `audience` lists who may receive its items, as grants over roster facts:
+  `{"kind": "member", "member"}`, `{"kind": "role", "mob_id", "role"}` or
+  `{"kind": "label", "mob_id", "key", "value"}`. A grant never matches
+  another mob's members, and a member on a peer gateway is covered only by
+  a member grant.
+- `routes` (default one direct route) are `{"kind": "direct", "topics"?}`,
+  which lets members subscribe to those topics, or `{"kind": "triage",
+  "member", "topics"?, "forward_topics", "forward_audience"?}`, which hands
+  them to one triage member that may announce on the forward topics, owned
+  by the source, to the forward audience (the audience by default). One
+  member may not hold both a direct subscription and a forward subscription
+  of one source (`route_overlap`), and a route selects by topic
+  (`route_selector_unsupported` for `streams`).
+- `conversation_members` own a live conversation on the source's scope and
+  are never its recipients (`route_conflict`).
+- `start` is `{"kind": "baseline"}` (default) or `{"kind": "backfill",
+  "max_items"}` (at most 1000). `delivery` is `{priority, max_per_batch,
+  on_unhandled}`, by default `normal`, 20 and `redeliver`.
+  `health_policy` is `{escalate_after_failures, escalate_after_ms,
+  stale_after_ms, quiet_after_ms?, empty_after_ms?}`, by default 3, six
+  hours and one day, with the last two off; each window is one minute to 30
+  days.
+- `runner` is `{"host_runnable", "every_seconds"}` (60 to 2,592,000) or
+  absent: the host runnable that collects the source, and its cadence (see
+  [Configuration](/reference/configuration#mob-announcement-source-runners)).
+
+An audience or route change is never refused for existing subscriptions:
+capture, seal and the last check before submission apply it.
+`affected_subscriptions` counts the subscriptions it affects, and
+`delivery_readiness` reads, for this gateway, whether deliveries can reach
+members locally, in the shape of `meta/capabilities.mob_announcements.local_delivery`.
+A gateway that does not report them leaves them out.
+
+A source answers as `{mob_id, source_id, generation, revision, identity,
+connection, observation, topics, audience, routes, conversation_members,
+start, delivery, health_policy, runner, state, collection, cursor, streams,
+backfilled, health, created_at_ms, updated_at_ms}`. `revision` rises with
+every change, across generations. `state` is `active`, `paused` or `ended`;
+`collection` is `baselining`, `backfilling` or `live`. `cursor` is
+`{version, token, advanced_at_ms}`, `version` 0 until the first step of the
+generation commits. `streams` counts `{live, onboarding}`. `health` is
+`{status, last_success_at_ms, last_new_item_at_ms, last_observed,
+last_observed_at_ms, empty_snapshot_since_ms, consecutive_failures, totals,
+last_failure, last_conflict}`, `status` one of `baselining`, `backfilling`,
+`ok`, `failing`, `stale`, `paused` or `ended`. Only `sources/get` returns the
+cursor token and a failure's `detail`; `sources/list` shows the principal as
+`{kind, digest}`. `sources/get` with `"include_streams": true` adds the
+generation's streams, `[{stream, phase, mode, max_items?, backfilled,
+since_ms}]`. A paused source refuses steps (`source_paused`) and keeps its
+cursor; an ended one refuses them (`source_ended`), and its topics stay
+reserved to its `source_id`.
+
+`sources/advance` is one collector step, in one transaction: the operation
+receipt, then the source (`unknown_source`, `source_paused`,
+`source_ended`), its revision (`stale_revision` with the current revision,
+version, generation and cursor), the principal (`principal_changed`), the
+cursor version (`source_version_conflict` with the current version, cursor,
+state and revision), onboarding, then each item, and last the new cursor,
+`version` one higher, even for a step with no items. A refusal changes
+nothing but the source's health, which counts the onboarding refusals: read
+`sources/get` and start again from the position it reports.
+An item is `{item_id, version, stream?, change: "upsert" | "delete",
+topics, body, correlation_id?}`: `topics` are the source's own, a `stream`
+is the item's one container (`""` by default), and a `delete` on a source
+whose deletions are `unobservable` is refused `deletions_unobservable`.
+Meta derives its key, `source:` followed by the source id and a digest of
+the principal, scope, stream, item id, version and change, and a host
+announce may not use the `source:` prefix. It announces the item as
+`{"kind": "source", "source_id"}`, a new announcer kind that readers of raw
+announcements may now see; a batch line names the source id, never its
+connection, principal or cursor. Each item's outcome is `{item_id, version,
+source_key, outcome, sequence?, captured?, existing_digest?,
+offered_digest?}`: `announced` (with `sequence` and `captured`, a count),
+`replayed` (the same content under the key), or `conflict` (other content
+under the key, with both content digests: recorded and counted, the
+original stands, and the step still commits). At most 100 items and 1 MiB
+of bodies per step, and a cursor token of at most 8 KiB.
+
+Onboarding: while a source is `baselining` a step carries no items
+(`baseline_required`) and may span pages, `"page": {"index", "final"}`; a
+step without `page` is a single final page. While `backfilling` a step
+announces history, up to `start.max_items` across its pages
+(`backfill_bound_exceeded` with `remaining`). The final page carries
+`"coverage": "complete"` or `{"gap": {"reason"}}`, and the source turns
+`live` when it commits. A step onboards streams with `"streams": [{stream,
+mode: "baseline" | "backfill", max_items?, final}]`; an item of a stream
+that has not started onboarding refuses the step (`stream_not_baselined`
+with `streams`). `"rebaseline": {"reason": "cursor_expired" |
+"reauthorized" | "operator"}` turns the source `baselining` again and
+announces one gap notice on its topics. `observed` is `{"kind": "delta"}`
+or `{"kind": "snapshot", "records"}`, what the provider read reported;
+`collected_at_ms` is when the collector read it.
+
+`sources/record_failure` takes `failure`, `{"class": "auth_required" |
+"provider_unavailable" | "rate_limited" | "cursor_invalid" |
+"adapter_error" | "other", retry_after_ms?, detail?}` (`detail` at most 512
+bytes), fenced like a step; the cursor does not move, and the source's
+health counts it.
+
+`audit/list` reads a mob's counted audit entries, `{id, at_ms, action,
+mob_id, member, source_id, generation, reason, count, first_at_ms,
+last_at_ms}`, by source, member, action or any of them. One entry counts
+one source generation, member, action and reason: its `count` rises and
+`last_at_ms` (also `at_ms`) moves with each repeat. `action` is
+`subscription_refused`, `capture_withheld`, `items_held`, `items_released`,
+`expired_while_held` or `delivered_across_revocation`; `reason` is
+`audience_not_covered`, `no_direct_route`, `route_overlap` or
+`route_conflict`. Entries list in `id` order, the order each was first
+counted, and `after` is the `id` of the last entry read; an entry is kept
+for the retention window from its last count.
+
+`meta/capabilities.mob_announcements` is `null` when mob announcements are
+disabled, and otherwise `{"sources": "v1", "local_delivery": {"kind":
+"ready"} | {"kind": "refused", "cause": "governed_runtime"} | {"kind":
+"unavailable", "detail"}, "governed_admission": false}`: whether deliveries
+can reach this gateway's members now. Sources collect on every gateway. The
+SDKs keep every kind and state above as an open string, and an unknown
+refusal kind on its code's error class.
 
 ## See also
 
