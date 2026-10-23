@@ -439,6 +439,7 @@ class WorkflowShapeTests(unittest.TestCase):
         startup = shard.split("      - name: Application startup checks with this checkout's Meta SDK\n", 1)[1]
         startup = startup.split("\n      - ", 1)[0]
         self.assertIn("          PYTHONPATH: sdk/python:installer\n", startup)
+        self.assertIn("        if: ${{ !cancelled() }}\n", startup)
         self.assertIn("python -m pytest -q --tb=short $(cat forge-shard-startup.txt)", startup)
         self.assertIn("      - name: Isolated controller subprocess checks\n        if: matrix.shard == 0\n", shard)
         self.assertNotIn("--maxfail", source)
