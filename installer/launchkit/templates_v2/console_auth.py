@@ -345,6 +345,14 @@ class _ConsoleLogin:
 
 
 class ConsoleFront:
+    """Loopback Console front with an optional trusted public HTTPS origin.
+
+    With public_origin, deployment-owned TLS ingress must enforce HTTPS and
+    configure Strict-Transport-Security (HSTS) for that public host. This front
+    supplies neither TLS termination nor HSTS policy. Route the selected public
+    origin to this listener; forwarded headers never select its browser origin.
+    """
+
     def __init__(self, root, port, principal, password, on_input=None, *, transport=None, connect_factory=None,
                  console_assets=None, document_transform=None, controller_review_factory=None,
                  console_login_factory=None, runtime_namespace="mobkit", public_origin=None):
@@ -366,6 +374,8 @@ class ConsoleFront:
         self.key = _private_key(root, create=True)
         self.password_digest = hashlib.sha256(password.encode()).digest()
         self.cookie = "mobkit_console_" + hashlib.sha256((str(self.root.resolve()) + str(port)).encode()).hexdigest()[:16]
+        if self._secure_cookie:
+            self.cookie = "__Host-" + self.cookie
         self.sessions, self.delivered = {}, set()
         self._logins, self._closing, self._close_task = {}, False, None
         self.login_tokens, self.failures = {}, []
@@ -714,7 +724,7 @@ class ConsoleFront:
         self.login_tokens[nonce] = now + 300
         response = HTMLResponse(_login_form(nonce, error), status_code=status_code)
         response.set_cookie(self.cookie + "_login", nonce, httponly=True, samesite="strict", max_age=300,
-                            secure=self._secure_cookie)
+                            secure=self._secure_cookie, path="/")
         response.headers.update({"Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"})
         return response
 
@@ -777,8 +787,9 @@ class ConsoleFront:
             login.expiry_task = asyncio.create_task(self._expire_login(login))
             response = RedirectResponse("/console", status_code=303)
             response.set_cookie(self.cookie, session, httponly=True, samesite="strict", max_age=SESSION_SECONDS,
-                                secure=self._secure_cookie)
-            response.delete_cookie(self.cookie + "_login", secure=self._secure_cookie, httponly=True, samesite="strict")
+                                secure=self._secure_cookie, path="/")
+            response.delete_cookie(self.cookie + "_login", secure=self._secure_cookie, httponly=True,
+                                   samesite="strict", path="/")
             response.headers["Cache-Control"] = "no-store"
             return response
         # Provider navigation can omit the Strict cookie. This fixed landing
@@ -810,7 +821,8 @@ class ConsoleFront:
                 except Exception:
                     return Response("Console access was revoked but cleanup is unconfirmed.", status_code=503)
             response = RedirectResponse("/login", status_code=303)
-            response.delete_cookie(self.cookie, secure=self._secure_cookie, httponly=True, samesite="strict")
+            response.delete_cookie(self.cookie, secure=self._secure_cookie, httponly=True,
+                                   samesite="strict", path="/")
             return response
         if path == "/":
             return RedirectResponse("/console", status_code=303)

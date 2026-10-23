@@ -1,6 +1,7 @@
 """HTTPS front transport controls; no real TLS ingress or provider acceptance."""
 import json
 import sys
+from http.cookies import SimpleCookie
 from types import SimpleNamespace
 
 import httpx
@@ -64,17 +65,46 @@ async def test_trusted_origin_and_cookie_transport(tmp_path, selected, expected)
 
     try:
         assert front.origin == expected and front.local_origin == "http://127.0.0.1:8855"
+        assert front.cookie.startswith("__Host-") is (selected is not None)
+        assert front.cookie.removeprefix("__Host-").startswith("mobkit_console_")
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=ingress), base_url=expected) as client:
             form, result = await sign_in(client, front)
-            for response in (form, result):
-                for value in response.headers.get_list("set-cookie"):
-                    assert "httponly" in value.lower() and "samesite=strict" in value.lower()
-                    assert ("; secure" in value.lower()) is (selected is not None)
             assert (await client.get("/console/experience")).status_code == 200
             assert len(observed) == 1
             logout = await client.post("/logout", headers={"Origin": expected})
             assert logout.status_code == 303 and not front.sessions
-            assert ("; secure" in logout.headers["set-cookie"].lower()) is (selected is not None)
+            # Include both nonce/session creation and deletion. Browser prefix
+            # enforcement requires Secure, Path=/ and no Domain on every write.
+            cookies = [next(iter(SimpleCookie(value).values()))
+                for response in (form, result, logout) for value in response.headers.get_list("set-cookie")]
+            assert len(cookies) == 4
+            for cookie in cookies:
+                assert cookie.key in {front.cookie, front.cookie + "_login"}
+                assert cookie["httponly"] and cookie["samesite"] == "strict"
+                assert bool(cookie["secure"]) is (selected is not None)
+                assert cookie["path"] == "/" and not cookie["domain"]
+    finally:
+        await front.close()
+
+
+async def test_public_mode_does_not_admit_unprefixed_cookie_names(tmp_path):
+    front = ConsoleFront(tmp_path, 8855, "owner", PASSWORD, public_origin=ORIGIN,
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json={})))
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=front.application("http://127.0.0.1:61347")),
+                                     base_url=ORIGIN) as client:
+            await client.get("/login")
+            nonce = client.cookies[front.cookie + "_login"]
+            client.cookies.clear()
+            legacy = front.cookie.removeprefix("__Host-")
+            refused = await client.post("/login", data={"nonce": nonce, "password": PASSWORD},
+                headers={"Origin": ORIGIN, "Cookie": f"{legacy}_login={nonce}"})
+            assert refused.status_code == 403 and not front.sessions
+            await sign_in(client, front)
+            session = client.cookies[front.cookie]
+            client.cookies.clear()
+            assert (await client.get("/console/experience", headers={"Cookie": f"{legacy}={session}"})).status_code == 401
+            assert (await client.get("/console/experience", headers={"Cookie": f"{front.cookie}={session}"})).status_code == 200
     finally:
         await front.close()
 
