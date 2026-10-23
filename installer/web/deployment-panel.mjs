@@ -227,6 +227,13 @@ export function deploymentNeedsCleanup(receipt) {
 }
 
 /** Ordinary Stop uses checked service ownership, independently of update support. */
+/** A launchd service whose own files are in a protected macOS folder keeps its projected note. */
+export function deploymentProtectedFolderNote(receipt) {
+  const note = receipt?.protected_folder;
+  return receipt?.execution_mode === "background" && receipt?.service?.manager === "launchd" &&
+    typeof note === "string" && note.trim() && note.length <= 500 ? note : null;
+}
+
 export function deploymentCanStopFailedBackground(receipt, guide) {
   const service = receipt?.service, observed = receipt?.service_observation, summary = service?.public_summary;
   return deploymentInstalledSourceKind(receipt, guide?.id) !== null && receipt.execution_mode === "background" &&

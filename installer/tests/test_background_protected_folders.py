@@ -32,6 +32,9 @@ FOLDER_REFUSAL = ("macOS does not let a background login item read Desktop, Docu
 EARLIER_REFUSAL = ("macOS does not let a background login item read Desktop, Documents, Downloads, iCloud Drive or "
     "cloud storage folders. Stop this service and install the application again in a folder such as ~/MetaForge, "
     "or install it to run while Forge is open.")
+FOLDER_NOTE = ("macOS does not let a background login item read Desktop, Documents, Downloads, iCloud Drive or "
+    "cloud storage folders. This service runs only while this computer lets background login items read them, "
+    "for example with Full Disk Access.")
 VOLUME_REFUSAL = ("macOS does not let a background login item read external or network volumes, which may also be "
     "unavailable at login. Move the Forge folder and the installation folder to a folder such as ~/MetaForge, "
     "or choose 'While Forge is open'.")
@@ -337,3 +340,107 @@ async def test_status_of_an_earlier_service_running_in_a_protected_folder_is_unc
     manager.observation = {"loaded": True, "pid": 4567, "state": "running"}
     status = await deployment_service.background_status(directory, manager)
     assert status["detail"] != EARLIER_REFUSAL
+
+
+def ready_evidence(directory, **changes):
+    """The record this unit's registered instance writes when it reaches ready."""
+    receipt = read_receipt(directory)
+    service = receipt["service"]
+    evidence = {"instance_id": receipt["service_instance_id"],
+                **{key: service[key] for key in ("manager", "domain", "label", "unit_path", "interpreter",
+                                                 "receipt_directory")},
+                "destination": receipt["destination"]}
+    return {**evidence, **changes}
+
+
+async def attempt(service, directory, action):
+    """The refusal of an action, or None when it was admitted."""
+    try:
+        await service.action(service.guide.identity, directory.name, action)
+    except DraftConflict as error:
+        return str(error)
+    return None
+
+
+def registered(directory, manager, *, ready=True, **changes):
+    update_receipt(directory, status="running", phase="run", service_supervisor_pid=4567,
+                   service_instance_id=str(uuid.uuid4()), service_cleanup_confirmed=False)
+    if ready:
+        update_receipt(directory, service_folder_evidence=ready_evidence(directory, **changes))
+    manager.observation = {"loaded": True, "pid": 4567, "state": "running"}
+
+
+async def test_a_registered_unit_without_ready_evidence_is_refused(earlier_service):
+    service, manager, directory = earlier_service
+    registered(directory, manager, ready=False)
+    manager.calls.clear()
+    with pytest.raises(DraftConflict) as refused:
+        await service.action(service.guide.identity, directory.name, "restart")
+    assert str(refused.value) == EARLIER_REFUSAL
+    assert no_manager_effect(manager)
+
+
+async def test_ready_evidence_lets_restart_reach_the_manager_and_the_status_notes_the_folder(earlier_service):
+    # This exact unit reached ready there, so this computer lets it read the folder.
+    service, manager, directory = earlier_service
+    registered(directory, manager)
+    status = await deployment_service.background_status(directory, manager)
+    assert status.get("protected_folder") == FOLDER_NOTE and status["detail"] != EARLIER_REFUSAL
+    manager.cleanup = directory
+    manager.calls.clear()
+    assert await attempt(service, directory, "restart") is None
+    assert read_receipt(directory)["status"] == "starting"
+    assert [call[0] for call in manager.calls if call[0] != "observe"] == ["stop", "start"]
+
+
+@pytest.mark.parametrize("action", ["restart", "retry"])
+async def test_a_start_that_never_registers_clears_the_evidence(earlier_service, action):
+    service, manager, directory = earlier_service
+    registered(directory, manager)
+    manager.cleanup = directory
+    assert await attempt(service, directory, action) is None
+    # The fake unit never registers a new lifetime, so it never reaches ready.
+    assert read_receipt(directory).get("service_folder_evidence") is None
+    for task in list(service.tasks.values()):
+        task.cancel()
+    await asyncio.gather(*service.tasks.values(), return_exceptions=True)
+    service.tasks.clear()
+    stopped = await service.action(service.guide.identity, directory.name, "stop")
+    assert stopped["status"] == "stopped"
+    manager.calls.clear()
+    with pytest.raises(DraftConflict) as refused:
+        await service.action(service.guide.identity, directory.name, "restart")
+    assert str(refused.value) == EARLIER_REFUSAL
+    assert no_manager_effect(manager)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("interpreter", "/Users/someone/Documents/OtherForge/.venv/bin/python"),
+    ("receipt_directory", "/Users/someone/Documents/OtherForge/.studio/deployments/moved"),
+    ("destination", "/Users/someone/Documents/other-application"),
+    ("instance_id", "an-earlier-lifetime"),
+    ("label", "ai.mobkit.launch.another-unit"),
+])
+async def test_ready_evidence_does_not_transfer(earlier_service, field, value):
+    service, manager, directory = earlier_service
+    registered(directory, manager, **{field: value})
+    manager.calls.clear()
+    with pytest.raises(DraftConflict) as refused:
+        await service.action(service.guide.identity, directory.name, "restart")
+    assert str(refused.value) == EARLIER_REFUSAL
+    assert no_manager_effect(manager)
+
+
+async def test_installation_support_follows_the_ready_evidence(earlier_service):
+    service, manager, directory = earlier_service
+    registered(directory, manager)
+    update_receipt(directory, status="stopped", service_cleanup_confirmed=True)
+    manager.observation = {"loaded": False, "pid": None, "state": "stopped"}
+    manager.calls.clear()
+    try:
+        await service.action(service.guide.identity, directory.name, "prepare-support",
+                             action_request_id=str(uuid.uuid4()), expected_service_digest="a" * 64)
+    except DraftConflict as error:
+        # A synthetic digest may be refused later; never for the folder.
+        assert str(error) != EARLIER_REFUSAL
+    assert any(call[0] == "observe" for call in manager.calls), "Support reached the service manager."

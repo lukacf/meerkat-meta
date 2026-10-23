@@ -3983,6 +3983,8 @@ class DeploymentService:
                         # Preserve the old lifetime's confirmed cleanup until
                         # the actual manager worker publishes its successor;
                         # a successor that never registers then stops at once.
+                        # Only reaching ready again re-records folder evidence.
+                        service_folder_evidence=None,
                         startup_attempt_id=None, startup_console_health=None, startup_port_observation=None,
                         health="unknown", health_checked_at=None, process_live=False)
                 destination_current()
@@ -4093,7 +4095,8 @@ class DeploymentService:
             journal(directory, "Restart admitted for the installed checked source.", status="queued",
                     phase="install" if action == "retry" else "start", console_url=None, runtime_pid=None, bootstrap=None,
                     startup_attempt_id=None, startup_console_health=None, startup_port_observation=None,
-                    health="unknown", health_checked_at=None, process_live=False)
+                    health="unknown", health_checked_at=None, process_live=False,
+                    **({"service_folder_evidence": None} if receipt.get("service") else {}))
             if selection is not None:
                 self._launch(directory, mode, update_selection=selection)
             else:

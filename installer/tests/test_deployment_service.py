@@ -612,6 +612,22 @@ async def test_manager_owned_automatic_restart_clears_old_health_before_private_
     assert stored["runtime_pid"] is None and stored["service_cleanup_confirmed"] is True
 
 
+async def test_a_new_service_lifetime_starts_without_folder_evidence(owned, monkeypatch):
+    # Only reaching ready again re-records it; a lifetime that fails first has none.
+    _, _, directory, _ = owned
+    update_receipt(directory, service_folder_evidence={"instance_id": "an-earlier-lifetime"})
+    (Path(read_receipt(directory)["destination"]) / ".env").write_text("invalid private configuration\n")
+
+    async def observe(self, service):
+        return {"loaded": True, "pid": os.getpid(), "state": "running"}
+
+    monkeypatch.setattr(UserServiceManager, "observe", observe)
+    with pytest.raises(ValueError, match="invalid name"):
+        await run(directory, "service")
+    stored = read_receipt(directory)
+    assert stored["service_supervisor_pid"] == os.getpid() and stored["service_folder_evidence"] is None
+
+
 async def test_unconfirmed_cleanup_never_allows_replacement(owned, monkeypatch):
     import launchkit.deployment_service as module
     service, manager, directory, _ = owned

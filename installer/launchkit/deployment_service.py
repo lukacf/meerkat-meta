@@ -138,6 +138,8 @@ _SETUP_CARD = ("To run this application in the background, install it again with
 # An installed unit is not moved: moving its folders would break its installation.
 _EARLIER_SERVICE = ("Stop this service and install the application again in a folder such as ~/MetaForge, "
     "or install it to run while Forge is open.")
+_RUNS_WITH_PERMISSION = ("This service runs only while this computer lets background login items read them, "
+    "for example with Full Disk Access.")
 PROTECTED_FOLDER_REFUSAL = _PROTECTED_REASONS["folder"] + " " + _NEW_INSTALLATION
 OTHER_VOLUME_REFUSAL = _PROTECTED_REASONS["volume"] + " " + _NEW_INSTALLATION
 
@@ -221,11 +223,12 @@ def _protected_location(path, protected, home, volumes):
     return location(_folded(current))
 
 
-def launchd_folder_refusal(paths, *, home=None, volumes=None, setup_card=False, installed=False):
+def launchd_folder_refusal(paths, *, home=None, volumes=None, setup_card=False, installed=False, running=False):
     """Why a launchd login item could not read one of these paths, or None.
 
-    ``setup_card`` words the advice for the completed-setup card and
-    ``installed`` for a service that already exists there.
+    ``setup_card`` words the advice for the completed-setup card,
+    ``installed`` for a service that already exists there and ``running``
+    for one that has shown it can read them.
     """
     home = Path(home) if home is not None else Path.home()
     homes = {_folded(home)}
@@ -239,8 +242,28 @@ def launchd_folder_refusal(paths, *, home=None, volumes=None, setup_card=False, 
     kind = "folder" if "folder" in found else "volume" if "volume" in found else None
     if kind is None:
         return None
-    return _PROTECTED_REASONS[kind] + " " + (_SETUP_CARD if setup_card else _EARLIER_SERVICE if installed
-                                            else _NEW_INSTALLATION)
+    return _PROTECTED_REASONS[kind] + " " + (_SETUP_CARD if setup_card else _RUNS_WITH_PERMISSION if running
+                                            else _EARLIER_SERVICE if installed else _NEW_INSTALLATION)
+
+
+SERVICE_FOLDER_EVIDENCE_KEYS = ("manager", "domain", "label", "unit_path", "interpreter", "receipt_directory")
+
+
+def service_folder_evidence(service, receipt):
+    """The record this unit's registered instance writes when it reaches ready.
+
+    It names the instance, the unit (manager, domain, label and unit path) and
+    the paths the unit itself reads. A supervisor refresh changes the
+    service's file digests but none of these, so it keeps the record.
+    """
+    return {"instance_id": receipt.get("service_instance_id"),
+            **{key: service.get(key) for key in SERVICE_FOLDER_EVIDENCE_KEYS},
+            "destination": receipt.get("destination")}
+
+
+def _service_folder_paths(service, receipt):
+    paths = [service.get("interpreter"), service.get("receipt_directory"), receipt.get("destination")]
+    return [path for path in paths if isinstance(path, str) and path]
 
 
 def installed_service_folder_refusal(service, receipt):
@@ -248,12 +271,26 @@ def installed_service_folder_refusal(service, receipt):
 
     No migration: the unit runs the interpreter its definition names, from the
     deployment directory that holds service-host/launcher.py, for the
-    installation folder. Stop is never refused.
+    installation folder. It is not refused when this exact unit's current
+    registered instance recorded that it reached ready there, which shows
+    macOS lets it read them. Any other start clears that record. Stop is never
+    refused.
     """
     if not isinstance(service, dict) or service.get("manager") != "launchd":
         return None
-    paths = [service.get("interpreter"), service.get("receipt_directory"), receipt.get("destination")]
-    return launchd_folder_refusal([path for path in paths if isinstance(path, str) and path], installed=True)
+    refusal = launchd_folder_refusal(_service_folder_paths(service, receipt), installed=True)
+    evidence = receipt.get("service_folder_evidence")
+    if (refusal is not None and isinstance(evidence, dict) and receipt.get("service_instance_id")
+            and evidence == service_folder_evidence(service, receipt)):
+        return None
+    return refusal
+
+
+def installed_service_folder_note(service, receipt):
+    """The status note for a launchd unit whose own files are in a protected folder, or None."""
+    if not isinstance(service, dict) or service.get("manager") != "launchd":
+        return None
+    return launchd_folder_refusal(_service_folder_paths(service, receipt), running=True)
 
 
 def service_plan(identity, directory, *, platform=None, home=None):
@@ -938,13 +975,18 @@ async def background_status(directory, manager):
             }
             if changes["status"] in details:
                 changes["detail"] = details[changes["status"]]
-        if changes.get("status", observed.get("status")) == "starting" and not matching:
-            # An earlier unit whose files are in a protected macOS folder waits
-            # in Python start-up and never registers. Say why, as a projection.
-            from .deployment import await_validation
-            reason = await await_validation(installed_service_folder_refusal, service, observed)
-            if reason is not None:
-                changes["detail"] = reason
+        from .deployment import await_validation
+        note = await await_validation(installed_service_folder_note, service, observed)
+        if note is not None:
+            # Projected only: a unit whose files are in a protected macOS
+            # folder runs only while macOS lets it read them.
+            changes["protected_folder"] = note
+            if changes.get("status", observed.get("status")) == "starting" and not matching:
+                # Without this unit's own ready record it waits in Python
+                # start-up and never registers. Say why.
+                reason = await await_validation(installed_service_folder_refusal, service, observed)
+                if reason is not None:
+                    changes["detail"] = reason
         return {**observed, **changes}
     except (OSError, ValueError, DraftConflict, RuntimeError, TimeoutError) as error:
         observation = {"owned": False, "state": "unknown", "checked_at": now()}
@@ -1296,7 +1338,9 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
             journal(self.directory, "Starting the exact owned background service; awaiting fresh native startup and authenticated Console health.",
                     status="starting", phase="update", runtime_pid=None, bootstrap=None,
                     startup_attempt_id=None, startup_console_health=None, admission_health=None, console_url=None,
-                    health="unknown", health_checked_at=None, process_live=False)
+                    health="unknown", health_checked_at=None, process_live=False,
+                    # Only reaching ready again re-records folder evidence.
+                    service_folder_evidence=None)
             await manager.start(service)
             require_original()
             deadline = asyncio.get_running_loop().time() + SERVICE_START_TIMEOUT

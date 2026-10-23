@@ -666,11 +666,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `~/MetaForge`, or **While Forge is open** (on the setup card, **Start
   installed application**). Forge does not look inside those folders to
   decide this and changes no privacy setting. A background service installed
-  earlier with its files in such a folder is not moved: **Restart**, **Retry**
-  and **Installation support** refuse it before any service manager call, and
+  earlier with its files in such a folder is not moved. Once that exact
+  service has reached ready there, which shows macOS lets it read them (for
+  example with Full Disk Access), it starts and restarts as before and its
+  status notes the folder. Otherwise **Restart**, **Retry** and
+  **Installation support** refuse it before any service manager call, and
   advise stopping it and installing the application again in a folder such as
-  `~/MetaForge`. Its status says why it is still starting, and **Stop** still
-  works.
+  `~/MetaForge`. A start that does not reach ready clears that record. Its
+  status says why it is still starting, and **Stop** still works.
 - A background service that ended before it started the application, such
   as one whose Python stalled while starting, now stops at once and no
   longer blocks a restart. Its Stop waited 60 seconds for a cleanup report

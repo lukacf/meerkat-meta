@@ -438,6 +438,44 @@ async def test_delayed_authenticated_console_and_complete_identities_gate_ready(
     assert supervisor.child is None
 
 
+def launchd_unit(supervisor, *, pid):
+    import uuid
+    receipt = read_receipt(supervisor.directory)
+    service = {"manager": "launchd", "domain": "gui/501", "label": "ai.mobkit.launch." + receipt["deployment_id"],
+        "unit_path": "/Users/fixture/Library/LaunchAgents/ai.mobkit.launch.plist",
+        "interpreter": "/Users/fixture/Documents/MetaForge/.venv/bin/python",
+        "receipt_directory": str(supervisor.directory), "stop_timeout_seconds": 45}
+    instance = str(uuid.uuid4())
+    update_receipt(supervisor.directory, service=service, service_supervisor_pid=pid,
+                   service_instance_id=instance, service_cleanup_confirmed=False)
+    supervisor.own_service()
+    return service, instance, receipt["destination"]
+
+
+async def test_a_launchd_unit_records_folder_evidence_when_it_reaches_ready(fixture, monkeypatch):
+    # The registered instance itself records that it read its own folders.
+    from launchkit import deployment_service
+    supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})])
+    service, instance, destination = launchd_unit(supervisor, pid=os.getpid())
+    monkeypatch.setattr(deployment_service, "widen_service_stop_budget", lambda directory, horizon_ms: None)
+    await asyncio.wait_for(supervisor.start(definition, on_ready=supervisor.stop.set), 3)
+    stored = read_receipt(supervisor.directory)
+    assert stored["health"] == "ready"
+    assert stored.get("service_folder_evidence") == {"instance_id": instance, "manager": "launchd", "domain": "gui/501",
+        "label": service["label"], "unit_path": service["unit_path"], "interpreter": service["interpreter"],
+        "receipt_directory": service["receipt_directory"], "destination": destination}
+
+
+async def test_another_process_reaching_ready_records_no_folder_evidence(fixture, monkeypatch):
+    from launchkit import deployment_service
+    supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})])
+    launchd_unit(supervisor, pid=os.getpid() + 100000)
+    monkeypatch.setattr(deployment_service, "widen_service_stop_budget", lambda directory, horizon_ms: None)
+    await asyncio.wait_for(supervisor.start(definition, on_ready=supervisor.stop.set), 3)
+    stored = read_receipt(supervisor.directory)
+    assert stored["health"] == "ready" and stored.get("service_folder_evidence") is None
+
+
 async def test_pre_bootstrap_eof_cannot_retain_previous_ready_health(fixture):
     supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})])
     update_receipt(supervisor.directory, health="ready", health_checked_at="2026-09-30T23:00:00+00:00")
