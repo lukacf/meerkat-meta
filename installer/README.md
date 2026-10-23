@@ -820,8 +820,10 @@ inferred from a saved receipt. Preserve the selected files at their original
 paths and preserve the application's original credential configuration.
 
 Normal **Start** or **Restart** then authenticates that installation's signed
-build, complete package, private source and installed runtime proof before
-reconstructing its original owner. This does not make the older build available
+build, complete package, private source and stopped ownership before
+reconstructing its original owner. The ordinary worker retains its physical
+runtime verification before execution; source recovery is not that proof.
+This does not make the older build available
 for a new Install or change the default for a new Build. A changed or unselected
 installed source is refused. An application update that changes the accepted
 package needs a corresponding explicit launcher selection before a later Forge

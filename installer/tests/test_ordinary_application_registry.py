@@ -515,6 +515,11 @@ async def test_helperless_application_installed_without_custody_starts_once_forg
     assert len(f.service.launched) == before
     # Forge restarts with the launcher's application model configuration.
     selection = model_source(tmp_path, monkeypatch)
+    # model_source selects Linux model-custody policy. The ordinary bootstrap
+    # has its own feature guard; keep it consistent without changing global
+    # platform or the inert Mac artifact fixture.
+    from launchkit import deployment_application_bootstrap
+    monkeypatch.setattr(deployment_application_bootstrap, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setenv("XDG_CONFIG_HOME", selection["credential_config_root"])
     store, implementation, service, owner = reloaded_registry(f, model_configuration=selection)
     launched = []
