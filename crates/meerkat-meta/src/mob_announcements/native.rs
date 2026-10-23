@@ -779,10 +779,17 @@ pub(crate) trait HostedListings: Send + Sync {
 impl HostedListings for meerkat_mob_mcp::MobMcpState {
     type Handle = meerkat_mob::MobHandle;
 
+    /// Meerkat lists each mob with its lifecycle observation. The hosted set
+    /// needs only its phase: a mob whose actor has stopped is still hosted
+    /// here, and a restart recovers it.
     async fn mob_list(
         &self,
     ) -> Result<Vec<(meerkat_mob::MobId, meerkat_mob::MobState)>, meerkat_mob::MobError> {
-        meerkat_mob_mcp::MobMcpState::mob_list(self).await
+        Ok(meerkat_mob_mcp::MobMcpState::mob_list(self)
+            .await?
+            .into_iter()
+            .map(|(mob_id, observation)| (mob_id, observation.phase))
+            .collect())
     }
 
     async fn held_child_mobs(&self) -> Vec<(meerkat_mob::MobId, meerkat_core::types::SessionId)> {
