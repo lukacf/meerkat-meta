@@ -123,6 +123,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   controller, and say that a listed, owed member can be added again without
   unlisting it first.
 
+### Changed
+
+- The stdio gateway reads its identity roster once per boot, before it builds
+  the mob, from the definition the mob runs (on a resume, the stored one),
+  and its identity bootstrap takes that roster instead of reading it again
+  after the build. The roster callback therefore arrives during the
+  `prepare` init phase, and a roster provider that stalls reports
+  `last_phase` `"prepare"` instead of `"roster"`, which now begins the
+  roster bootstrap. A failed roster callback still fails init with `-32603`
+  ("roster provider failed"), and a refused composition keeps its code.
+
 ### Fixed
 
 - A persistent gateway holds the run starts of each member its bootstrap
@@ -133,6 +144,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   or a peer message could start a run without them. Each roster identity of a
   persistent gateway reports `customizer_tools_pending` until its tools are
   published.
+- A restored member whose identity the roster no longer lists holds its run
+  starts until the roster pass retires it, on the gateway and the library
+  builder. The restart revived it like any other member and nothing published
+  its customizer tools, so it could start a run without them before it was
+  retired.
 - Every Meta member builder waits for a member's configured MCP servers before
   its construction is prepared: the stdio and console gateways, the library
   builder, and the plain ephemeral spec. A member's authoritative tool surface

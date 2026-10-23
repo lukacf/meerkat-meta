@@ -79,10 +79,11 @@ not opt in never receives `accepted`.
 
 2. **`meta/init_progress`** notifications, one per startup phase as it
    begins: `storage` (first touch of durable state), `owner_publication`
-   (the early roster callback), `prepare` (runtime and storage prepare,
-   module startup), `roster`, `register_owners`, `activate`, `restore`,
-   `schedules`, `serve`, and `cleanup` (failure cleanup). Meta 0.9.4 no
-   longer reports `prewarm`.
+   (the early roster callback), `prepare` (the identity roster callback,
+   before the mob is built, then runtime and storage prepare and module
+   startup), `roster` (the roster bootstrap begins with that roster),
+   `register_owners`, `activate`, `restore`, `schedules`, `serve`, and
+   `cleanup` (failure cleanup). Meta 0.9.4 no longer reports `prewarm`.
    Progress events are non-terminal, and their order follows the native init
    order. Callback requests continue to arrive between them.
 

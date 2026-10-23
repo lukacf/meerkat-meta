@@ -943,7 +943,9 @@ is restored, so every restored member starts with its tools. They are listed by
 activation (a queued input, a kickoff) sees them. A gateway that stopped
 uncleanly left its mob running, so its restart restores the members while it
 builds the mob, before that call: each one starts no run until the call has
-published its tools. The materialization that follows runs `customize_build`
+published its tools. A restored member whose identity the roster no longer
+lists starts no run either, until the roster retires it. The materialization
+that follows runs `customize_build`
 again and republishes. On a persistent gateway each roster identity reports
 `customizer_tools_pending` (with the reason) in its identity status until its
 tools are published; if that early call fails, the failure is logged for the
