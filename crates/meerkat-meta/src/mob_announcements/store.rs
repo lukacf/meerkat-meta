@@ -1,18 +1,20 @@
 //! The mob announcement store contract.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
+use super::handling::{BatchHandling, HandlingRead};
 use super::sources::{
     AdvanceSource, AnnouncementSource, AuditQuery, AuditRow, MemberFacts, PutSource,
     RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceQuery, SourceStream,
+    UnhandledPolicy,
 };
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
-    BatchId, BatchPosition, BatchQuery, BatchStateTag, ExpiryReport, Member, MemberBacklog,
-    MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport, PutSubscription, Result,
-    SealingPolicy, SourceId, SourceKey, Subscription, SubscriptionChange,
+    BatchId, BatchItem, BatchPosition, BatchQuery, BatchStateTag, ExpiryReport, Member,
+    MemberBacklog, MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport, PutSubscription,
+    Result, SealingPolicy, SourceId, SourceKey, Subscription, SubscriptionChange,
     SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, Topic,
 };
 
@@ -304,6 +306,103 @@ pub trait AnnouncementStore: Send + Sync {
         next_read_at_ms: Option<u64>,
     ) -> Result<Batch>;
 
+    /// The handling of batch `id` once it was admitted: what became of its
+    /// turn, and what was done about it.
+    async fn handling(&self, id: &BatchId) -> Result<Option<BatchHandling>> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// The handling of each of `ids` that was admitted.
+    async fn handlings(&self, ids: Vec<BatchId>) -> Result<BTreeMap<BatchId, BatchHandling>> {
+        let _ = ids;
+        Ok(BTreeMap::new())
+    }
+
+    /// Admitted batches whose next handling read is due at `now_ms`, the
+    /// longest due first. A batch enters this set when it is admitted, and
+    /// leaves it when [`Self::record_handling`] records a final read or
+    /// retention removes it.
+    async fn handling_reads_due(&self, now_ms: u64, limit: usize) -> Result<Vec<Batch>> {
+        let _ = (now_ms, limit);
+        Ok(Vec::new())
+    }
+
+    /// When the next handling read is due, if any is.
+    async fn next_handling_read(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Record one handling read of the admitted batch `id`. A final read
+    /// settles the handling, and one that finds the turn unhandled decides
+    /// in the same transaction what happens to each item the batch
+    /// delivered: a source item follows its source's
+    /// `delivery.on_unhandled`, a plain announcement `plain`. Redeliver owes
+    /// the item again for the member's next batch, first, under a notice;
+    /// past [`super::handling::MAX_REDELIVERIES`], with hold, or for a cause
+    /// a replay could mislead on, the item is held for an operator; report
+    /// changes nothing. A read of a final handling changes nothing.
+    async fn record_handling(
+        &self,
+        id: &BatchId,
+        read: HandlingRead,
+        plain: UnhandledPolicy,
+        now_ms: u64,
+    ) -> Result<BatchHandling> {
+        let _ = (id, read, plain, now_ms);
+        Err(no_handling())
+    }
+
+    /// The notice a successor carrying `items` on renders: a line for each
+    /// item the member is owed again after an unhandled turn.
+    async fn redelivery_notice(&self, member: &Member, items: &[BatchItem]) -> Result<String> {
+        let _ = (member, items);
+        Ok(String::new())
+    }
+
+    /// The answer an operator's redelivery of batch `id` recorded under
+    /// `operation`, if it was made: a retry answers it without reading
+    /// anything else. The same operation id with another request is
+    /// refused.
+    async fn redeliver_receipt(
+        &self,
+        operation: &OperationId,
+        id: &BatchId,
+    ) -> Result<Option<BatchHandling>> {
+        let _ = (operation, id);
+        Ok(None)
+    }
+
+    /// An operator's redelivery of what batch `id` holds after its turn
+    /// ended unhandled: each held item is checked afresh for coverage with
+    /// the member's roster `facts`, and what passes is owed again for the
+    /// member's next batch; what fails waits on coverage. Refused
+    /// [`AnnouncementStoreError::NotHeld`] for a batch whose handling is not
+    /// unhandled with items held.
+    async fn redeliver_held(
+        &self,
+        operation: &OperationId,
+        id: &BatchId,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<BatchHandling> {
+        let _ = (operation, id, facts, now_ms);
+        Err(no_handling())
+    }
+
+    /// An operator's dismissal of what batch `id` holds: each held item
+    /// settles as handled by an operator. Refused as
+    /// [`Self::redeliver_held`] is.
+    async fn dismiss_held(
+        &self,
+        operation: &OperationId,
+        id: &BatchId,
+        now_ms: u64,
+    ) -> Result<BatchHandling> {
+        let _ = (operation, id, now_ms);
+        Err(no_handling())
+    }
+
     /// Settle as expired what waited longer than the retention window with
     /// nothing native holding it, at most `limit` of each kind: owed
     /// announcements no batch holds (each once per member), and sealed
@@ -514,4 +613,8 @@ pub enum SubmissionCheck {
 
 fn no_sources() -> AnnouncementStoreError {
     AnnouncementStoreError::Storage("this announcement store keeps no sources".to_string())
+}
+
+fn no_handling() -> AnnouncementStoreError {
+    AnnouncementStoreError::Storage("this announcement store keeps no handling".to_string())
 }

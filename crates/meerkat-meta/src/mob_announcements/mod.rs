@@ -23,8 +23,10 @@
 //! For each delivery, `meta/mob_announcements/deliveries/observe` reports
 //! separately: the announcements it carries, the sealed batch (what the
 //! member is owed), the native commit receipt, native admission as an input,
-//! and that input's own runtime state. There is no single "processed" flag:
-//! admission says nothing about what the agent did.
+//! that input's own runtime state, and its handling: what became of the
+//! turn, read from the input's own receipt (see [`handling`]). There is no
+//! single "processed" flag: admission says nothing about what the agent
+//! did, and a turn that ended before completing is reported as such.
 //!
 //! # Attention policy
 //!
@@ -37,6 +39,7 @@
 
 pub mod availability;
 mod faults;
+pub mod handling;
 pub mod native;
 pub mod owner;
 pub mod remote;
@@ -61,6 +64,7 @@ pub use availability::{
     BlockCause, DepartureEvidence, EvidenceClass, MemberDeparture, NotServedHereCause,
     SuspendCause, SuspendMarker,
 };
+pub use handling::{BatchHandling, HandlingRead, HandlingState, MAX_REDELIVERIES};
 pub use native::{
     ANNOUNCEMENT_CONTINUATION_NAMESPACE, AnnouncementNativeDelivery, IdentityService, MemberMobEnd,
     MemberMobScan, MemberProblem, MemberRoute, MobNativeDelivery, MobPresence, NativeDelivery,
@@ -112,6 +116,8 @@ struct AnnouncementOptions {
     member_tools_in_child_mobs: bool,
     #[serde(default)]
     child_member_limits: Option<ChildMemberLimitOptions>,
+    #[serde(default)]
+    on_unhandled: Option<UnhandledPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -182,9 +188,9 @@ pub(crate) fn parse_runtime_options(
 
 /// Parse a mob announcement options object (`{enabled, batch?,
 /// retention_ms?, member_limits?, member_tools_in_child_mobs?,
-/// child_member_limits?}`), as every gateway takes it; `path` is where the
-/// surface takes it, for the messages. `Ok(None)` when it is disabled. The
-/// result has passed [`AnnouncementConfig::validate`].
+/// child_member_limits?, on_unhandled?}`), as every gateway takes it;
+/// `path` is where the surface takes it, for the messages. `Ok(None)` when
+/// it is disabled. The result has passed [`AnnouncementConfig::validate`].
 pub fn parse_options(
     value: &serde_json::Value,
     path: &str,
@@ -198,6 +204,9 @@ pub fn parse_options(
         member_tools_in_child_mobs: options.member_tools_in_child_mobs,
         ..AnnouncementConfig::default()
     };
+    if let Some(policy) = options.on_unhandled {
+        config.on_unhandled = policy;
+    }
     if let Some(batch) = options.batch {
         let policy = &mut config.policy;
         policy.max_count = batch.max_count.unwrap_or(policy.max_count);

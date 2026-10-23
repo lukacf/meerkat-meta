@@ -2340,6 +2340,12 @@ struct ScriptedNative {
     roster_facts: Mutex<BTreeMap<String, RosterRow>>,
     /// Members whose roster facts cannot be read now.
     unreadable_facts: Mutex<BTreeSet<String>>,
+    /// How an input reads by its id, before anything below.
+    input_ids: Mutex<BTreeMap<String, serde_json::Value>>,
+    /// How each batch's admitted input reads, by batch id; a batch missing
+    /// here reads as `input_default`, or as consumed with no receipt.
+    inputs: Mutex<BTreeMap<String, serde_json::Value>>,
+    input_default: Mutex<Option<serde_json::Value>>,
 }
 
 /// A member's role and labels, as a scripted roster records them.
@@ -2370,6 +2376,9 @@ impl ScriptedNative {
             log_reads: Mutex::new(Vec::new()),
             roster_facts: Mutex::new(BTreeMap::new()),
             unreadable_facts: Mutex::new(BTreeSet::new()),
+            input_ids: Mutex::new(BTreeMap::new()),
+            inputs: Mutex::new(BTreeMap::new()),
+            input_default: Mutex::new(None),
         }
     }
 
@@ -2796,12 +2805,23 @@ impl NativeDelivery for ScriptedNative {
 
     async fn input(
         &self,
-        _: &Batch,
+        batch: &Batch,
         _: &str,
-        _: &str,
+        input_id: &str,
     ) -> std::result::Result<Option<serde_json::Value>, NativeUnavailable> {
         self.ledger.lock().unwrap().input_reads += 1;
-        Ok(Some(serde_json::json!({ "phase": "consumed" })))
+        if let Some(reading) = self.input_ids.lock().unwrap().get(input_id) {
+            return Ok(Some(reading.clone()));
+        }
+        Ok(Some(
+            self.inputs
+                .lock()
+                .unwrap()
+                .get(batch.id.as_str())
+                .cloned()
+                .or_else(|| self.input_default.lock().unwrap().clone())
+                .unwrap_or_else(|| serde_json::json!({ "phase": "consumed" })),
+        ))
     }
 }
 
@@ -7954,6 +7974,7 @@ fn the_walk_parses_every_declared_module_and_reexport() {
 fn every_public_announcement_enum_is_non_exhaustive() {
     let public_modules = [
         ("availability", include_str!("availability.rs")),
+        ("handling", include_str!("handling.rs")),
         ("native", include_str!("native.rs")),
         ("owner", include_str!("owner.rs")),
         ("remote", include_str!("remote.rs")),
@@ -10063,13 +10084,29 @@ fn the_version_two_schema_is_pinned() {
             "index announcement_audit_counted on announcement_audit: mob_id, source_id, \
              generation, member, action, reason"
                 .to_string(),
+            "table announcement_handling: batch_id TEXT notnull pk1, member TEXT notnull, \
+             state TEXT notnull, next_read_at_ms INTEGER, updated_at_ms INTEGER notnull, \
+             record TEXT notnull"
+                .to_string(),
+            "index announcement_handling_reads on announcement_handling: next_read_at_ms, \
+             batch_id"
+                .to_string(),
             "table announcement_holds: subscription_id TEXT notnull pk1, mob_id TEXT notnull \
              pk2, sequence INTEGER notnull pk3, member TEXT notnull, source_id TEXT notnull, \
              generation INTEGER notnull, held_at_ms INTEGER notnull, checked_at_ms INTEGER \
-             notnull, record TEXT notnull"
+             notnull, record TEXT notnull, kind TEXT notnull, batch_id TEXT"
                 .to_string(),
+            "index announcement_holds_by_batch on announcement_holds: batch_id".to_string(),
             "index announcement_holds_by_check on announcement_holds: checked_at_ms".to_string(),
             "index announcement_holds_by_member on announcement_holds: member, checked_at_ms"
+                .to_string(),
+            "table announcement_redeliveries: subscription_id TEXT notnull pk1, mob_id TEXT \
+             notnull pk2, sequence INTEGER notnull pk3, count INTEGER notnull, record TEXT \
+             notnull"
+                .to_string(),
+            "table announcement_source_items: mob_id TEXT notnull pk1, sequence INTEGER \
+             notnull pk2, source_id TEXT notnull, generation INTEGER notnull, record TEXT \
+             notnull"
                 .to_string(),
             "table announcement_source_streams: mob_id TEXT notnull pk1, source_id TEXT \
              notnull pk2, stream TEXT notnull pk3, generation INTEGER notnull, phase TEXT \
@@ -10182,12 +10219,13 @@ async fn a_version_one_store_migrates_to_version_two_in_place() {
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
              AND name IN ('announcement_sources', 'announcement_source_topics',
                           'announcement_source_streams', 'announcement_audit',
-                          'announcement_holds')",
+                          'announcement_holds', 'announcement_handling',
+                          'announcement_redeliveries', 'announcement_source_items')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 5);
+    assert_eq!(tables, 8);
 }
 
 // ---------------------------------------------------------------------------
@@ -15313,4 +15351,748 @@ async fn a_member_whose_hold_cannot_be_read_does_not_stop_another_members_releas
     );
     let released = entries_for(service, agent_b(), "items_released").await;
     assert_eq!(released.len(), 1, "{released:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Handling: what became of a delivered batch's turn, read from the member's
+// admitted input, and what Meta does when it did not complete.
+// ---------------------------------------------------------------------------
+
+const DELIVERIES_OBSERVE: &str = "meta/mob_announcements/deliveries/observe";
+const DELIVERIES_LIST: &str = "meta/mob_announcements/deliveries/list";
+const DELIVERIES_REDELIVER: &str = "meta/mob_announcements/deliveries/redeliver";
+const DELIVERIES_DISMISS: &str = "meta/mob_announcements/deliveries/dismiss";
+
+/// The admitted input of a turn, as the native owner reads it: its phase,
+/// its terminal outcome and its receipt's completion type.
+fn input_reading(
+    phase: &str,
+    outcome: serde_json::Value,
+    completion: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({ "phase": phase, "terminal_outcome": outcome, "completion": completion })
+}
+
+/// A Consumed input, with this receipt.
+fn consumed_with(completion: &str) -> serde_json::Value {
+    input_reading(
+        "consumed",
+        serde_json::json!({ "outcome_type": "consumed" }),
+        serde_json::json!(completion),
+    )
+}
+
+/// An input Abandoned for `reason`, with no receipt.
+fn abandoned_for(reason: serde_json::Value) -> serde_json::Value {
+    input_reading(
+        "abandoned",
+        serde_json::json!({ "outcome_type": "abandoned", "reason": reason }),
+        serde_json::Value::Null,
+    )
+}
+
+/// "agent:a"'s batches, oldest first.
+async fn batches_of_a(service: &AnnouncementService) -> Vec<Batch> {
+    service
+        .deliveries(&BatchQuery {
+            member: Some(member("agent:a")),
+            limit: 10,
+            ..BatchQuery::default()
+        })
+        .await
+        .unwrap()
+}
+
+/// "agent:a" subscribes to the live "inbox", captures one item, "m-1", and
+/// its batch is delivered: admitted as one input of a's session. The
+/// native owner reads every admitted input as `reading`.
+async fn a_is_delivered_an_inbox_item(harness: &Harness, reading: serde_json::Value) -> Batch {
+    let service = &harness.service;
+    *harness.native.input_default.lock().unwrap() = Some(reading);
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first mail")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert!(!batches.is_empty(), "a's batch is sealed");
+    assert_eq!(
+        batches[0].state.tag(),
+        BatchStateTag::Delivered,
+        "{batches:?}"
+    );
+    batches[0].clone()
+}
+
+/// What `deliveries/observe` says of the batch's handling.
+async fn handling_of(service: &AnnouncementService, batch: &Batch) -> serde_json::Value {
+    try_host_call(
+        service,
+        DELIVERIES_OBSERVE,
+        serde_json::json!({ "batch_id": batch.id }),
+    )
+    .await
+    .unwrap()["handling"]
+        .clone()
+}
+
+/// A turn whose receipt says it completed settles its batch handled.
+#[tokio::test]
+async fn a_completed_turn_settles_its_batch_handled() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let batch = a_is_delivered_an_inbox_item(&harness, consumed_with("completed")).await;
+    let handling = handling_of(service, &batch).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("handled"),
+        "{handling}"
+    );
+    harness.round_after_pause().await;
+    assert_eq!(
+        batches_of_a(service).await.len(),
+        1,
+        "nothing is delivered again"
+    );
+}
+
+/// An agent-level failure after the turn changed the session ends the input
+/// Consumed with an abandoned_with_error receipt: the receipt decides, and
+/// the batch is unhandled.
+#[tokio::test]
+async fn an_agent_level_failure_consumes_the_input_and_the_batch_is_unhandled() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let batch = a_is_delivered_an_inbox_item(&harness, consumed_with("abandoned_with_error")).await;
+    let handling = handling_of(service, &batch).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("unhandled"),
+        "{handling}"
+    );
+    assert_eq!(handling["cause"], serde_json::json!("abandoned_with_error"));
+}
+
+/// A source item whose turn ended unhandled is redelivered by default: the
+/// member's next batch carries it again, first, under a notice that names
+/// the earlier batch and warns that the turn may have started things.
+#[tokio::test]
+async fn an_input_that_ends_unhandled_is_redelivered_with_notice() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first = a_is_delivered_an_inbox_item(&harness, consumed_with("cancelled")).await;
+    assert_eq!(
+        handling_of(service, &first).await["state"],
+        serde_json::json!("unhandled")
+    );
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    let again = &batches[1];
+    assert_eq!(again.items.len(), 1);
+    assert_eq!(again.items[0].source_key, first.items[0].source_key);
+    assert!(
+        again.body.contains(&format!(
+            "These redeliver announcements of batch {}: it was admitted, and its turn ended",
+            first.id
+        )),
+        "{}",
+        again.body
+    );
+    assert!(
+        again.body.contains(
+            "Anything that turn started may already have happened: check before you repeat it."
+        ),
+        "{}",
+        again.body
+    );
+}
+
+/// The redelivery notice names each redelivered announcement by mob,
+/// sequence and source key, and a source item by its item id, stream and
+/// version, every name quoted.
+#[tokio::test]
+async fn a_redelivery_notice_names_each_original_key_and_version() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first = a_is_delivered_an_inbox_item(&harness, consumed_with("abandoned")).await;
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    let body = &batches[1].body;
+    let item = &first.items[0];
+    for expected in [
+        format!("mob {}", quoted(item.mob_id.as_str())),
+        format!("sequence {}", item.sequence),
+        format!("key {}", quoted(item.source_key.as_str())),
+        "item \"m-1\"".to_string(),
+        "stream \"\"".to_string(),
+        "version \"v1\"".to_string(),
+    ] {
+        assert!(body.contains(&expected), "{expected:?} in {body}");
+    }
+}
+
+/// A plain announcement's batch reports unhandled and is not redelivered:
+/// the gateway's on_unhandled defaults to "report".
+#[tokio::test]
+async fn a_plain_announcement_batch_reports_unhandled_but_is_not_redelivered_by_default() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    *harness.native.input_default.lock().unwrap() = Some(consumed_with("cancelled"));
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let batch = harness.only_batch().await;
+    let handling = handling_of(service, &batch).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("unhandled"),
+        "{handling}"
+    );
+    harness.round_after_pause().await;
+    assert_eq!(batches_of_a(service).await.len(), 1, "no redelivery");
+}
+
+/// An input abandoned with no receipt is classified by its abandon reason:
+/// a revival's cancel is unhandled, named by that reason.
+#[tokio::test]
+async fn a_revival_abandon_without_a_receipt_is_unhandled_by_reason() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let batch =
+        a_is_delivered_an_inbox_item(&harness, abandoned_for(serde_json::json!("cancelled"))).await;
+    let handling = handling_of(service, &batch).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("unhandled"),
+        "{handling}"
+    );
+    assert_eq!(handling["cause"], serde_json::json!("cancelled"));
+}
+
+/// A source item admitted to an incarnation that retired before its turn
+/// ran reaches the member's current incarnation with the notice.
+#[tokio::test]
+async fn a_source_item_admitted_to_a_retired_incarnation_reaches_the_next_one_with_notice() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first =
+        a_is_delivered_an_inbox_item(&harness, abandoned_for(serde_json::json!("retired"))).await;
+    assert_eq!(
+        handling_of(service, &first).await["cause"],
+        serde_json::json!("retired")
+    );
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    assert!(
+        batches[1].body.contains(&format!(
+            "These redeliver announcements of batch {}",
+            first.id
+        )),
+        "{}",
+        batches[1].body
+    );
+}
+
+/// A held cause (a reset, an interrupted tool process) keeps the items owed
+/// and held instead of redelivering them, and so does a source whose
+/// on_unhandled is "hold".
+#[tokio::test]
+async fn a_held_cause_or_the_hold_policy_keeps_items_owed_and_escalates() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first =
+        a_is_delivered_an_inbox_item(&harness, abandoned_for(serde_json::json!("reset"))).await;
+    let handling = handling_of(service, &first).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("unhandled"),
+        "{handling}"
+    );
+    assert_eq!(handling["held"], serde_json::json!(1), "{handling}");
+    harness.round_after_pause().await;
+    assert_eq!(
+        batches_of_a(service).await.len(),
+        1,
+        "held, not redelivered"
+    );
+
+    // A source whose on_unhandled is "hold" holds what a cancel ended.
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    *harness.native.input_default.lock().unwrap() = Some(consumed_with("cancelled"));
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            source_params("put-inbox", "inbox", "subject-1", &["mail.received"]),
+            "delivery",
+            serde_json::json!({ "on_unhandled": "hold" }),
+        ),
+    )
+    .await
+    .unwrap();
+    baseline_inbox(service, 1).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first mail")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    let first = batches_of_a(service).await.remove(0);
+    let handling = handling_of(service, &first).await;
+    assert_eq!(
+        handling["cause"],
+        serde_json::json!("cancelled"),
+        "{handling}"
+    );
+    assert_eq!(
+        handling["held"],
+        serde_json::json!(1),
+        "the policy holds: {handling}"
+    );
+    harness.round_after_pause().await;
+    harness.round_after_pause().await;
+    assert_eq!(
+        batches_of_a(service).await.len(),
+        1,
+        "held, not redelivered"
+    );
+}
+
+/// Automatic redeliveries stop at their bound: an item whose turn ends
+/// unhandled a third time is held for an operator.
+#[tokio::test]
+async fn redeliveries_stop_at_their_bound_and_hold() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    a_is_delivered_an_inbox_item(&harness, consumed_with("cancelled")).await;
+    for _ in 0..8 {
+        harness.round_after_pause().await;
+    }
+    let batches = batches_of_a(service).await;
+    assert_eq!(
+        batches.len(),
+        3,
+        "the first and two redeliveries: {batches:?}"
+    );
+    let handling = handling_of(service, &batches[2]).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("unhandled"),
+        "{handling}"
+    );
+    assert_eq!(
+        handling["held"],
+        serde_json::json!(1),
+        "past the bound: {handling}"
+    );
+}
+
+/// An operator settles what is held: redeliver checks coverage afresh and
+/// reopens the items for the member's next batch; dismiss settles them as
+/// handled by an operator. Both are counted in the audit.
+#[tokio::test]
+async fn held_items_are_redelivered_or_dismissed_by_an_operator() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first =
+        a_is_delivered_an_inbox_item(&harness, abandoned_for(serde_json::json!("reset"))).await;
+    try_host_call(
+        service,
+        DELIVERIES_REDELIVER,
+        serde_json::json!({ "operation_id": "redeliver-1", "batch_id": first.id }),
+    )
+    .await
+    .unwrap();
+    harness.round_after_pause().await;
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    harness.round_after_pause().await;
+    try_host_call(
+        service,
+        DELIVERIES_DISMISS,
+        serde_json::json!({ "operation_id": "dismiss-1", "batch_id": batches[1].id }),
+    )
+    .await
+    .unwrap();
+    harness.round_after_pause().await;
+    assert_eq!(
+        batches_of_a(service).await.len(),
+        2,
+        "dismissed, not redelivered"
+    );
+    let a = serde_json::json!({ "mob_id": OWN_MOB, "identity": "agent:a" });
+    let actions: Vec<serde_json::Value> = audit_rows(service, serde_json::json!({ "member": a }))
+        .await
+        .into_iter()
+        .map(|entry| entry["action"].clone())
+        .collect();
+    assert!(
+        actions.contains(&serde_json::json!("redelivered")),
+        "{actions:?}"
+    );
+    assert!(
+        actions.contains(&serde_json::json!("dismissed")),
+        "{actions:?}"
+    );
+}
+
+/// An input Consumed with no receipt is handled_unverified, its own state:
+/// a failed run never disappears as "handled".
+#[tokio::test]
+async fn a_handled_unverified_batch_is_counted_and_escalated() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let batch = a_is_delivered_an_inbox_item(
+        &harness,
+        input_reading(
+            "consumed",
+            serde_json::json!({ "outcome_type": "consumed" }),
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    let handling = handling_of(service, &batch).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("handled_unverified"),
+        "{handling}"
+    );
+}
+
+/// Every announcement batch, a redelivery's too, is a Queue continuation:
+/// never a Steer, whose CompletedWithoutResult would mark a failed turn
+/// handled.
+#[tokio::test]
+async fn announcement_batches_are_queue_handled() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first = a_is_delivered_an_inbox_item(&harness, consumed_with("cancelled")).await;
+    harness.round_after_pause().await;
+    for batch in batches_of_a(service).await {
+        assert!(
+            matches!(
+                continuation_for(&batch).unwrap().handling,
+                meerkat::ContinuationHandling::Queue
+            ),
+            "{}",
+            batch.id
+        );
+    }
+    assert!(matches!(
+        continuation_for(&first).unwrap().handling,
+        meerkat::ContinuationHandling::Queue
+    ));
+}
+
+/// `deliveries/list` carries each batch's handling beside it: null until
+/// the batch is admitted, then what became of its turn.
+#[tokio::test]
+async fn deliveries_list_carries_each_batchs_handling() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let batch = a_is_delivered_an_inbox_item(&harness, consumed_with("completed")).await;
+    let listed = try_host_call(
+        service,
+        DELIVERIES_LIST,
+        serde_json::json!({ "member": { "mob_id": OWN_MOB, "identity": "agent:a" } }),
+    )
+    .await
+    .unwrap();
+    let entry = listed["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == serde_json::json!(batch.id))
+        .cloned()
+        .expect("the batch is listed");
+    assert_eq!(
+        entry["handling"]["state"],
+        serde_json::json!("handled"),
+        "{entry}"
+    );
+}
+
+/// An operator's remedy applies only to a batch whose turn ended unhandled
+/// with items held: any other batch is refused `not_held`, and nothing
+/// changes.
+#[tokio::test]
+async fn a_batch_holding_nothing_refuses_an_operator_remedy_as_not_held() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let batch = a_is_delivered_an_inbox_item(&harness, consumed_with("completed")).await;
+    for method in [DELIVERIES_REDELIVER, DELIVERIES_DISMISS] {
+        let refused = try_host_call(
+            service,
+            method,
+            serde_json::json!({ "operation_id": format!("{method}-1"), "batch_id": batch.id }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refusal_kind(&refused).as_deref(),
+            Some("not_held"),
+            "{method}"
+        );
+    }
+    assert_eq!(
+        handling_of(service, &batch).await["state"],
+        serde_json::json!("handled")
+    );
+}
+
+/// A superseded input is classified as the input that absorbed it: the
+/// absorbing input's receipt decides.
+#[tokio::test]
+async fn a_superseded_input_is_classified_as_the_input_that_absorbed_it() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    harness
+        .native
+        .input_ids
+        .lock()
+        .unwrap()
+        .insert("input-2".to_string(), consumed_with("completed"));
+    let batch = a_is_delivered_an_inbox_item(
+        &harness,
+        input_reading(
+            "superseded",
+            serde_json::json!({ "outcome_type": "superseded", "superseded_by": "input-2" }),
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(
+        handling_of(service, &batch).await["state"],
+        serde_json::json!("handled")
+    );
+}
+
+/// A gateway whose `on_unhandled` is "redeliver" redelivers a plain
+/// announcement whose turn ended unhandled, with the notice, as a source
+/// item is by default.
+#[tokio::test]
+async fn a_plain_announcement_follows_the_gateways_on_unhandled_option() {
+    let config = super::parse_options(
+        &serde_json::json!({
+            "enabled": true,
+            "batch": { "max_delay_ms": 60_000, "min_wake_interval_ms": 60_000 },
+            "on_unhandled": "redeliver",
+        }),
+        "mob_announcements",
+    )
+    .unwrap()
+    .expect("enabled");
+    let native = ScriptedNative::new();
+    *native.input_default.lock().unwrap() = Some(consumed_with("cancelled"));
+    let harness = harness_with_config(native, config);
+    let service = &harness.service;
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    harness.round_after_pause().await;
+    harness.round_after_pause().await;
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert!(batches.len() >= 2, "redelivered: {batches:?}");
+    assert!(
+        batches[1].body.contains(&format!(
+            "These redeliver announcements of batch {}",
+            batches[0].id
+        )),
+        "{}",
+        batches[1].body
+    );
+}
+
+/// A batch that redelivers and is stranded before admission hands its
+/// items to a successor that carries the same notice.
+#[tokio::test]
+async fn a_successor_of_a_redelivery_keeps_its_notice() {
+    let mut native = ScriptedNative::new();
+    native.apply_on_commit = false;
+    *native.input_default.lock().unwrap() = Some(consumed_with("cancelled"));
+    let harness = harness_with(native);
+    let service = &harness.service;
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first mail")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let first = batches_of_a(service).await.remove(0);
+    harness
+        .native
+        .ledger
+        .lock()
+        .unwrap()
+        .bindings
+        .get_mut(first.id.as_str())
+        .unwrap()
+        .2 = true;
+    // Admitted, read unhandled and owed again; then redelivered.
+    harness.round_after_pause().await;
+    harness.round_after_pause().await;
+    let batches = batches_of_a(service).await;
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    let redelivery = batches[1].clone();
+    harness
+        .native
+        .ledger
+        .lock()
+        .unwrap()
+        .strand
+        .insert(redelivery.id.to_string());
+    harness.round_after_pause().await;
+    let stranded = harness.store.batch(&redelivery.id).await.unwrap().unwrap();
+    let successor = harness
+        .store
+        .batch(&stranded.successor.expect("a successor"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        successor.body.contains(&format!(
+            "These redeliver announcements of batch {}",
+            first.id
+        )),
+        "{}",
+        successor.body
+    );
+}
+
+/// No subscription interest, no redelivery: an unhandled turn whose
+/// subscription was cancelled meanwhile owes nothing again.
+#[tokio::test]
+async fn an_unhandled_turn_of_a_cancelled_subscription_is_not_redelivered() {
+    let mut native = ScriptedNative::new();
+    native.apply_on_commit = false;
+    *native.input_default.lock().unwrap() = Some(consumed_with("cancelled"));
+    let harness = harness_with(native);
+    let service = &harness.service;
+    live_inbox(service).await;
+    subscribe_to_inbox(service, "sub-a", "agent:a").await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first mail")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let first = batches_of_a(service).await.remove(0);
+    service
+        .change_subscription(
+            &op("cancel-a"),
+            &sid("sub-a"),
+            1,
+            SubscriptionChange::Cancel,
+        )
+        .await
+        .unwrap();
+    harness
+        .native
+        .ledger
+        .lock()
+        .unwrap()
+        .bindings
+        .get_mut(first.id.as_str())
+        .unwrap()
+        .2 = true;
+    for _ in 0..3 {
+        harness.round_after_pause().await;
+    }
+    let handling = handling_of(service, &first).await;
+    assert_eq!(
+        handling["state"],
+        serde_json::json!("unhandled"),
+        "{handling}"
+    );
+    assert_eq!(handling["redelivered"], serde_json::json!(0), "{handling}");
+    assert_eq!(batches_of_a(service).await.len(), 1, "nothing owed again");
+}
+
+/// A harness whose service runs with `config`.
+fn harness_with_config(native: ScriptedNative, config: AnnouncementConfig) -> Harness {
+    let (dir, store) = temp_store();
+    let store = Arc::new(store);
+    let native = Arc::new(native);
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let reader = Arc::clone(&clock);
+    let service = AnnouncementService::with_clock(
+        Arc::clone(&store) as Arc<dyn AnnouncementStore>,
+        Arc::clone(&native) as Arc<dyn NativeDelivery>,
+        config,
+        Arc::new(move || reader.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    Harness {
+        _dir: dir,
+        store,
+        native,
+        clock,
+        service,
+    }
+}
+
+/// A retried operator redelivery answers what the first one recorded,
+/// even while the member's roster cannot be read: only a new redelivery
+/// needs the roster.
+#[tokio::test]
+async fn a_retried_redelivery_answers_its_receipt_while_the_roster_is_unreadable() {
+    let harness = harness_with(ScriptedNative::new());
+    let service = &harness.service;
+    let first =
+        a_is_delivered_an_inbox_item(&harness, abandoned_for(serde_json::json!("reset"))).await;
+    let params = serde_json::json!({ "operation_id": "redeliver-1", "batch_id": first.id });
+    let answered = try_host_call(service, DELIVERIES_REDELIVER, params.clone())
+        .await
+        .unwrap();
+    harness
+        .native
+        .unreadable_facts
+        .lock()
+        .unwrap()
+        .insert("agent:a".to_string());
+    let replayed = try_host_call(service, DELIVERIES_REDELIVER, params)
+        .await
+        .unwrap();
+    assert_eq!(replayed, answered, "the receipt answers");
 }

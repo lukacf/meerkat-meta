@@ -141,9 +141,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     of an item its member no longer passes: on a gateway without a
     governed binder nothing Meta controls stands between a commit and its
     admission.
+- Mob announcement deliveries report what became of each turn. Once a
+  batch is admitted, Meta reads the admitted input's terminal receipt (its
+  terminal outcome and abandon reason when it has none) until it is final:
+  `handled`, `handled_unverified` (consumed with no receipt, never counted
+  as handled), `unhandled` with its cause, or `unknown` when nothing could
+  be learned within the retention window. Every announcement batch stays a
+  Queue continuation.
+  - An item whose turn ended unhandled and whose policy says redeliver is
+    owed again: the member's next batch carries it first, under a notice
+    that names the earlier batch and how its turn ended, lists each item by
+    mob, sequence and key (and a source item's item id, stream and
+    version), and warns that what the turn started may already have
+    happened. At most 2 automatic redeliveries per item; past them, with
+    `"hold"`, or after a reset or an interrupted tool process, the items
+    are held for an operator.
+  - New methods `meta/mob_announcements/deliveries/redeliver` (each held
+    item is checked afresh for coverage, then owed again) and
+    `meta/mob_announcements/deliveries/dismiss` (settled as handled by an
+    operator), for a batch whose turn ended unhandled with items held; any
+    other batch is refused `not_held`.
+  - `deliveries/observe` and `deliveries/list` carry each batch's
+    `handling`, null until it is admitted. `audit/list` counts the new
+    actions `redelivered` and `dismissed`, and items held this way, with
+    the reason `unhandled`; an entry for a plain announcement names no
+    source.
 
 ### Changed
 
+- Batches now report a handling outcome; source items are redelivered with
+  notice by default (their source's `delivery.on_unhandled`); plain
+  announcements keep their 0.9.4 behaviour unless
+  `mob_announcements.on_unhandled` (`"report"`, the default, `"redeliver"`
+  or `"hold"`) says otherwise.
 - A source owns its topics and its triage routes' forward topics in its
   mob, and keeps them after it ends. Another source cannot claim them
   (`topic_owned`), and a host or member announcement on one is refused
@@ -156,9 +186,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   announcement under it is refused as invalid params. A retry of one made
   before the upgrade still answers its original.
 - The mob announcement database moves to schema version 2, which only adds
-  the source tables. A version 1 database is migrated in place on first
-  open; an older binary refuses a version 2 database, so going back means
-  disabling mob announcements or keeping this binary.
+  the source, audit, hold and handling tables. A version 1 database is
+  migrated in place on first open; an older binary refuses a version 2
+  database, so going back means disabling mob announcements or keeping
+  this binary.
 - Docs: the configuration reference has a new "Fork instruction policy"
   section. It covers what a durable fork copies (activation rows only as
   history, the session configuration, no mob operator authority), what each
