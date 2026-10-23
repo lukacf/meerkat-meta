@@ -6767,6 +6767,30 @@ impl MobBootstrapSpec {
         self
     }
 
+    /// Hold the run starts of each member meerkat's own resume revives while
+    /// this mob is built (a log left Running) for an identity whose
+    /// customizer tools are `pending` then
+    /// ([`meerkat_mob::HostRunStartHoldReason::ToolsNotPublished`]): it
+    /// starts no run (a restored queued input, a kickoff, a peer message)
+    /// until the identity runtime publishes its tools and releases the hold.
+    /// The same `pending` set must be recorded on the identity runtime
+    /// (`IdentityRuntime::record_customizer_tools_pending`), which releases
+    /// a hold only for an identity it holds pending.
+    #[must_use]
+    pub(crate) fn with_restored_members_awaiting_tools(
+        mut self,
+        pending: &std::collections::BTreeMap<
+            crate::identity_first::AgentIdentity,
+            crate::identity_first::CustomizerToolsPending,
+        >,
+    ) -> Self {
+        self.restored_members_awaiting_tools = pending
+            .keys()
+            .map(|identity| crate::member_comms_id::mob_member_id(identity.as_str()))
+            .collect();
+        self
+    }
+
     pub fn with_spawn_member_customizer(
         mut self,
         customizer: Arc<dyn meerkat_mob::SpawnMemberCustomizer>,

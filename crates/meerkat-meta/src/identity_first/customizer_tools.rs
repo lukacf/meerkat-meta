@@ -546,6 +546,32 @@ pub(crate) async fn prepublish_before_mob_build(
     .await
 }
 
+/// Why a member's customizer tools wait for the identity bootstrap when its
+/// composition publishes none before the mob build.
+const PUBLISHED_AT_THE_IDENTITY_BOOTSTRAP: &str =
+    "customizer tools are published by the identity bootstrap, after the mob build";
+
+/// Every roster identity's customizer tools as pending, for a composition
+/// that publishes none before its mob build: the gateway composes its
+/// agent customizer only after the build, so its identity bootstrap
+/// publishes them all, as it publishes those an early publication could not.
+pub(crate) fn unpublished_before_mob_build(
+    roster: &[super::types::DurableAgentSpec],
+) -> BTreeMap<AgentIdentity, super::types::CustomizerToolsPending> {
+    roster
+        .iter()
+        .map(|spec| {
+            (
+                spec.identity.clone(),
+                super::types::CustomizerToolsPending {
+                    reason: PUBLISHED_AT_THE_IDENTITY_BOOTSTRAP.to_string(),
+                    artifact_refusal: None,
+                },
+            )
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 enum PrepublishFailureLog {
     Warn,

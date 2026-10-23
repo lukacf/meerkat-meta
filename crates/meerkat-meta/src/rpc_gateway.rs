@@ -16598,22 +16598,28 @@ external_addressable = true
     // the roster this early is contract-preserving; nothing is registered
     // yet, so there are no previous identities to report. Any other roster
     // failure is the identity runtime's to report on its own roster pass.
-    if has_roster_provider {
+    // The roster read here also names the members whose run starts the mob
+    // build holds until their customizer tools publish (see below).
+    let early_roster = if has_roster_provider {
         let roster_provider = gateway_roster_provider(bridge.clone(), prepared.as_ref());
         let roster_context = crate::identity_first::RosterContext {
             mob_definition: Some(definition.clone()),
             previous_identities: Vec::new(),
         };
-        if let Err(error @ crate::identity_first::RosterError::Refused(_)) =
-            roster_provider.roster(&roster_context).await
-        {
-            return Err(fail_init(
-                &request_id,
-                -32602,
-                format!("prepared_application roster refused: {error}"),
-            ));
+        match roster_provider.roster(&roster_context).await {
+            Ok(roster) => Some(roster),
+            Err(error @ crate::identity_first::RosterError::Refused(_)) => {
+                return Err(fail_init(
+                    &request_id,
+                    -32602,
+                    format!("prepared_application roster refused: {error}"),
+                ));
+            }
+            Err(_) => None,
         }
-    }
+    } else {
+        None
+    };
 
     // 5. Build session service with callback bridge.
     // Stable owner id for the schedule driver, captured before `definition` is
@@ -17503,6 +17509,25 @@ external_addressable = true
         )),
         None => mob_spec,
     };
+    // A persistent mob can be restored while the bootstrap below builds it
+    // (a log left Running revives every member inside meerkat's own
+    // resume), before the identity bootstrap publishes any member's
+    // customizer tools: the gateway composes its agent customizer only
+    // after the build, so it publishes none before it. As on the library
+    // builder, each roster identity's member holds its run starts until the
+    // identity runtime publishes its tools and releases the hold. A
+    // process-local mob restores nothing here.
+    let customizer_tools_pending = match (
+        customizer_tool_registry.as_ref(),
+        early_roster.as_deref(),
+        persistent_state.is_some(),
+    ) {
+        (Some(_), Some(roster), true) => {
+            crate::identity_first::customizer_tools::unpublished_before_mob_build(roster)
+        }
+        _ => BTreeMap::new(),
+    };
+    let mob_spec = mob_spec.with_restored_members_awaiting_tools(&customizer_tools_pending);
     // Wire callback/after_create — notify Python/TS SDK after each session creation.
     // Uses notify_reliable to avoid silent drops under backpressure.
     let mob_spec = if has_session_builder {
@@ -17810,6 +17835,10 @@ external_addressable = true
         irt.set_held_completion_state_dir(persistent_state.clone());
         irt.set_customizer_tool_registry(customizer_tool_registry.clone())
             .await;
+        // The members the mob build holds until their tools publish: the
+        // identity bootstrap's publication releases the hold of each one it
+        // holds pending.
+        irt.record_customizer_tools_pending(customizer_tools_pending);
         // A member parked with a session repair hold names the exact
         // `rkat session repair-wholeblob` commands for the runtime store this
         // launch opened; an in-memory store has nothing to repair.
