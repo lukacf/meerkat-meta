@@ -18388,6 +18388,22 @@ external_addressable = true
                  host-runnable schedule targets will never fire"
             );
         }
+        // A Rust host's runnables have no schedule host here either: said
+        // once, as for the SDK's, never dropped silently.
+        let host_runnables = match host {
+            Some(host) => host
+                .host_runnables()
+                .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?,
+            None => Vec::new(),
+        };
+        if !host_runnables.is_empty() {
+            tracing::warn!(
+                runnables = host_runnables.len(),
+                "the gateway host composes schedule runnables but this gateway runs no \
+                 schedule host (ephemeral mode, or schedule store unavailable): \
+                 host-runnable schedule targets will never fire"
+            );
+        }
         (None, None, None)
     };
 
