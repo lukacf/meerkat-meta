@@ -28,7 +28,7 @@ from .deployment_deadlines import (APPLICATION_STOP_TIMEOUT, LEGACY_USER_SERVICE
                                    reported_gateway_horizon, shutdown_budget)
 from .deployment_ports import require_available_console_port, LocalConsolePortUnavailable
 from .native_definition_continuity import valid_continuity_projection
-from .owned_worker import end_after_owner_loss, spawn_owned_worker
+from .owned_worker import end_after_owner_loss, serve_as_owned_worker, spawn_owned_worker
 
 INSTALL_TIMEOUT = 1200
 CHECK_TIMEOUT = 180
@@ -2686,4 +2686,5 @@ if __name__ == "__main__":
     selection = ({"path": sys.argv[3], "sha256": sys.argv[4]} if len(sys.argv) == 5 else None)
     if len(sys.argv) not in {3, 5}:
         raise ValueError("The fixed deployment worker arguments changed.")
+    serve_as_owned_worker()
     sys.exit(asyncio.run(run(Path(sys.argv[1]), sys.argv[2], update_selection=selection)) or 0)
