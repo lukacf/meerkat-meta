@@ -601,6 +601,8 @@ struct Gateway {
     stderr: Arc<Mutex<Vec<String>>>,
     next_id: u64,
     roster: Vec<Value>,
+    /// Every `callback/schedule_fire` the gateway sent, in order.
+    fires: Vec<Value>,
 }
 
 impl Gateway {
@@ -659,6 +661,7 @@ impl Gateway {
             stderr,
             next_id: 0,
             roster: Vec::new(),
+            fires: Vec::new(),
         }
     }
 
@@ -740,8 +743,16 @@ impl Gateway {
                 let roster = Value::Array(self.roster.clone());
                 self.send(&json!({ "jsonrpc": "2.0", "id": id, "result": roster }));
             }
+            // A host runnable this harness registered fired: it collects
+            // nothing, and the fire completes.
+            "callback/schedule_fire" => {
+                self.fires
+                    .push(message.get("params").cloned().unwrap_or(Value::Null));
+                self.send(&json!({ "jsonrpc": "2.0", "id": id, "result": {} }));
+            }
             other if other.starts_with("callback/") => panic!(
-                "[{}] unexpected host callback {other}: this harness provides only a roster",
+                "[{}] unexpected host callback {other}: this harness provides a roster and \
+                 schedule fires",
                 self.label
             ),
             _ => {}
@@ -828,30 +839,56 @@ fn boot_with(
     bootstrap_mode: &str,
     max_delay_ms: u64,
 ) -> Gateway {
+    boot_with_runnables(
+        label,
+        state,
+        host_config,
+        fault,
+        roster,
+        bootstrap_mode,
+        max_delay_ms,
+        &[],
+    )
+}
+
+/// [`boot_with`], registering `runnables` as the host's schedule runnables
+/// (`runtime_options.host_runnables`): their fires arrive as
+/// `callback/schedule_fire` and are recorded in [`Gateway::fires`].
+#[allow(clippy::too_many_arguments)]
+fn boot_with_runnables(
+    label: &str,
+    state: &Path,
+    host_config: &Path,
+    fault: Option<&str>,
+    roster: Vec<Value>,
+    bootstrap_mode: &str,
+    max_delay_ms: u64,
+    runnables: &[&str],
+) -> Gateway {
     let mut gateway = Gateway::start(label, fault);
     gateway.roster = roster;
-    let response = gateway.request(
-        "meta/init",
-        json!({
-            "persistent_state": state,
-            "mob_config": mob_config(),
-            "has_roster_provider": true,
-            "runtime_options": {
-                "meerkat_config_path": host_config,
-                "identity_bootstrap_mode": { "mode": bootstrap_mode },
-                "mob_announcements": {
-                    "enabled": true,
-                    "batch": {
-                        "max_count": 256,
-                        "max_bytes": 1_048_576,
-                        "max_delay_ms": max_delay_ms,
-                        "min_wake_interval_ms": 0
-                    }
+    let mut params = json!({
+        "persistent_state": state,
+        "mob_config": mob_config(),
+        "has_roster_provider": true,
+        "runtime_options": {
+            "meerkat_config_path": host_config,
+            "identity_bootstrap_mode": { "mode": bootstrap_mode },
+            "mob_announcements": {
+                "enabled": true,
+                "batch": {
+                    "max_count": 256,
+                    "max_bytes": 1_048_576,
+                    "max_delay_ms": max_delay_ms,
+                    "min_wake_interval_ms": 0
                 }
             }
-        }),
-        INIT_TIMEOUT,
-    );
+        }
+    });
+    if !runnables.is_empty() {
+        params["runtime_options"]["host_runnables"] = json!(runnables);
+    }
+    let response = gateway.request("meta/init", params, INIT_TIMEOUT);
     assert!(
         response.get("error").is_none(),
         "[{label}] init failed: {response}\n{}",
@@ -2027,4 +2064,73 @@ fn a_gateway_killed_after_an_advance_delivers_its_items_exactly_once() {
     );
     assert_eq!(invoice_turns(&log), 1, "{observed}");
     third.shutdown_and_reap();
+}
+
+/// A source's runner first fires at its declaration, within the schedule
+/// host's own pickup of due occurrences.
+const RUNNER_FIRE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// A source declared with a runner gets a schedule that fires the host's
+/// runnable (here an SDK one, `callback/schedule_fire`) with the source it
+/// collects, without waiting a whole interval.
+#[test]
+fn a_source_runner_fires_the_hosts_runnable_with_its_source() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    let mut gateway = boot_with_runnables(
+        "runner",
+        state.path(),
+        &host_config,
+        None,
+        vec![roster_spec()],
+        "eager_materialize",
+        0,
+        &["inbox-collector"],
+    );
+    let declared = gateway.call(
+        "meta/mob_announcements/sources/put",
+        json!({
+            "operation_id": "put-inbox",
+            "source_id": "inbox",
+            "identity": {
+                "provider": "google.gmail",
+                "principal": inbox_principal(),
+                "scope": { "kind": "mailbox_label", "id": "INBOX" }
+            },
+            "connection": { "kind": "connect_setup", "id": "setup-1" },
+            "observation": { "baseline": "delta", "deletions": "explicit" },
+            "topics": [SOURCE_TOPIC],
+            "audience": [{ "kind": "member", "member": member(IDENTITY) }],
+            "runner": { "host_runnable": "inbox-collector", "every_seconds": 60 }
+        }),
+    );
+    assert_eq!(
+        declared["source"]["runner"],
+        json!({ "host_runnable": "inbox-collector", "every_seconds": 60 })
+    );
+    // The schedule Meta keeps for the runner fires the host's runnable with
+    // the source it collects.
+    let start = Instant::now();
+    while gateway.fires.is_empty() {
+        assert!(
+            start.elapsed() < RUNNER_FIRE_TIMEOUT,
+            "the runner never fired\n{}",
+            gateway.stderr_tail()
+        );
+        gateway.pump();
+        thread::sleep(Duration::from_millis(200));
+    }
+    let fire = gateway.fires[0].clone();
+    assert_eq!(fire["runnable"], json!("inbox-collector"), "{fire}");
+    assert_eq!(
+        fire["occurrence"]["payload"],
+        json!({ "mob_id": MOB_ID, "source_id": "inbox" }),
+        "{fire}"
+    );
+    gateway.shutdown_and_reap();
 }

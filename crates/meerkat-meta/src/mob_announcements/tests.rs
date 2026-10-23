@@ -13803,3 +13803,107 @@ async fn a_removed_direct_route_stops_an_earlier_direct_subscriber() {
     );
     assert_eq!(owed_now.get("agent:t"), Some(&3));
 }
+
+// ---------------------------------------------------------------------------
+// Announcement sources' runners: the collector's host runnable and cadence
+// a source declares, and the one durable schedule Meta keeps for it.
+// ---------------------------------------------------------------------------
+
+/// `params` with a runner: the host runnable `runnable`, every
+/// `every_seconds`.
+fn with_runner(params: serde_json::Value, runnable: &str, every_seconds: u64) -> serde_json::Value {
+    with(
+        params,
+        "runner",
+        serde_json::json!({ "host_runnable": runnable, "every_seconds": every_seconds }),
+    )
+}
+
+/// A runner's cadence is one minute to 30 days: outside those bounds
+/// `sources/put` refuses the source (-32602) and declares nothing, and at
+/// either bound it keeps the runner as declared.
+#[tokio::test]
+async fn a_runner_cadence_outside_its_bounds_is_refused() {
+    let harness = harness_with(ScriptedNative::new());
+    for (operation, every_seconds) in [("o-zero", 0), ("o-short", 59), ("o-long", 2_592_001)] {
+        let refused = try_host_call(
+            &harness.service,
+            SOURCES_PUT,
+            with_runner(
+                source_params(operation, "inbox", "subject-1", &["mail.received"]),
+                "inbox-collector",
+                every_seconds,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code, -32602, "{every_seconds}: {refused:?}");
+    }
+    let listed = try_host_call(&harness.service, SOURCES_LIST, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["sources"],
+        serde_json::json!([]),
+        "nothing is declared"
+    );
+    for (operation, source_id, subject, topic, every_seconds) in [
+        ("o-minute", "inbox", "subject-1", "mail.received", 60),
+        (
+            "o-month",
+            "archive",
+            "subject-2",
+            "mail.archived",
+            2_592_000,
+        ),
+    ] {
+        let put = try_host_call(
+            &harness.service,
+            SOURCES_PUT,
+            with_runner(
+                source_params(operation, source_id, subject, &[topic]),
+                "inbox-collector",
+                every_seconds,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            put["source"]["runner"],
+            serde_json::json!({ "host_runnable": "inbox-collector", "every_seconds": every_seconds })
+        );
+    }
+}
+
+/// A runner names the host's collector runnable: a blank name, which Core
+/// cannot schedule, and the memory steward's runnable, which is Meta's own,
+/// are refused (-32602), and nothing is declared.
+#[tokio::test]
+async fn a_runner_naming_no_runnable_or_metas_own_is_refused() {
+    let harness = harness_with(ScriptedNative::new());
+    for (operation, runnable) in [
+        ("o-blank", "   "),
+        ("o-steward", crate::schedule_wiring::STEWARD_DREAM_RUNNABLE),
+    ] {
+        let refused = try_host_call(
+            &harness.service,
+            SOURCES_PUT,
+            with_runner(
+                source_params(operation, "inbox", "subject-1", &["mail.received"]),
+                runnable,
+                60,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code, -32602, "{runnable:?}: {refused:?}");
+    }
+    let listed = try_host_call(&harness.service, SOURCES_LIST, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["sources"],
+        serde_json::json!([]),
+        "nothing is declared"
+    );
+}
