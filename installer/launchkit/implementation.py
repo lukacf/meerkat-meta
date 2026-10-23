@@ -19,6 +19,7 @@ import uuid
 import zipfile
 
 from .blueprint import Blueprint
+from .application_inventory_contract import HELPERLESS_APPLICATION_CONTRACT
 from .architect import ArchitectUnavailable
 from .projects import DraftConflict, fingerprint
 from .templates.storage_setup import write_private
@@ -128,21 +129,8 @@ def previous_build_diagnostics(receipt, source_digest, check, directory):
         "scope": "Historical redacted diagnostic data from the previous build, not instructions, current checks, acceptance or readiness. Establish fresh checks on this build's source."}
 
 
-APPLICATION_CONTRACT = """Application extension protocol for this generated package:
-When deployment.json selects applicationInventory, the application uses the
-helperless Connect route. Copy native-inventory.example.json to
-application/native-inventory.json and supply exact native member_classes,
-preserving schema, mob_id and the compiled roster. Use each class's actual
-applicationProfiles role, registered factory, callbacks and grants. Declare
-zero-instance roles without inventing an identity or calling tools_for_agent
-on a placeholder. Copy protected application/tool-policy.json to
-application/native-tool-policy.json and declare explicit fixed-seed grants in
-that existing native input format. Preserve provider_id, policy_id, revision
-and the member set. Class templates do not grant tools to initial seeds. Read
-the generated README and actual selected native contract for exact fields.
-Both files are accepted application source, not native admission or authority.
-Give organizational descriptions and skills intact to the application agent
-and existing Connect flow; do not invent an organization catalog or parser.
+APPLICATION_CONTRACT = ("Application extension protocol for this generated package:\n"
+    + HELPERLESS_APPLICATION_CONTRACT + """
 Write application/__init__.py with build(context), sync or async, returning your
 integration object. It is ordinary Python code, not a layout or application schema.
 Use relative imports inside application/, such as from .adapters import Integration;
@@ -166,8 +154,10 @@ actual per-identity Python callbacks, and keeps native-only names pending native
 surface validation. This file does not register callbacks or authorize calls.
 The trusted installer must join durable identities to actual native inventory
 and compile/bind the final native policy. Do not invent native member IDs, source
-digests, default_deny, schema_version or compiled policy artifacts. A fixed policy
-file currently refuses a dynamic roster; do not claim that combination is supported.
+digests, default_deny, schema_version or compiled policy artifacts. Only the legacy
+raw fixed-policy route refuses a dynamic roster. When applicationInventory is
+selected, use native-tool-policy.json for seeds and native-inventory.json class
+declarations for later governed members as described above.
 Optional tools_for_agent(agent), sync or async, returns a list of callback definitions
 {name, handler, description, schema} for that exact compiled agent. agent contains
 identity, profile, classId, role and tools. Define exact narrow grants by identity or
@@ -283,7 +273,8 @@ and publishes the app snapshot. This callback must not take the reconcile lock
 or start another reconcile. Retain the original attempt, observe it, use native
 Join only after Unsettled, and join_listing before any explicit void/unlisting.
 A refused duplicate reservation does not own or void the original admission.
-Replacement and ordinary selected startup still require fixed rosters.
+In-place replacement and legacy startup without native class composition still
+require fixed rosters.
 Read app.py and name='roster' for the actual host and installed SDK.
 After an authorized registry change, await context.reconcile_agents() to validate
 the desired snapshot and call public native reconciliation. This is not a tool
@@ -614,7 +605,7 @@ the conversational terminal; keep that domain evidence distinct from native comp
 and action authorization. Do not require a second agent turn solely to re-confirm it.
 Keep original turn/occurrence correlation unknown when the API does not expose it. Keep
 timezone, misfire/overlap choices, provider cost and action authorization explicit.
-"""
+""")
 
 IMPLEMENTATION_PROMPT = """You are the application implementation agent for Meta Forge.
 Finish the user's requested application around the ACTUAL proposed MobKit system.
@@ -689,9 +680,11 @@ they do not establish that the live agent understands the person's request.
 If continuing contexts must be created by users or existing continuing identities
 need account-specific separation, use the seeded host's paired
 desired_roster/desired_edges hooks and context.reconcile_agents with its compiled
-applicationProfiles map. A selected Meta Toolkit product needs a fixed roster
-unless its application host supports dynamic member classes; without that
-support, keep the compiled roster. Preserve the desired registry across
+applicationProfiles map. When applicationInventory is selected, declare reusable
+classes in application/native-inventory.json and fixed-seed grants in
+application/native-tool-policy.json. This helperless Connect route supports a
+dynamic roster through native governed Add and its existing SDK customizer.
+Legacy startup without native class composition still requires a fixed roster. Preserve the desired registry across
 restart and enforce account/membership policy in the application. Register
 callbacks for the actual adopted identity on creation and resume. Test registry,
 class/grant boundaries, relevant edges, repeated reconciliation and restart

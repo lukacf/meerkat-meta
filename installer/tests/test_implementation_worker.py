@@ -1292,3 +1292,16 @@ async def test_domain_failures_and_cancellation_do_not_admit_review_retry(team, 
     assert calls == ["acceptance-1"]
     assert reviewer.acceptance.verification() is None
     assert not read_receipt(tools.directory)["ready_to_package"]
+
+
+@pytest.mark.parametrize("agent_index", (0, 1))
+async def test_builder_and_reviewer_can_read_helperless_factory_contract_without_sdk_lookup(team, agent_index, monkeypatch):
+    from launchkit.application_inventory_contract import HELPERLESS_APPLICATION_CONTRACT
+    def unavailable():
+        raise AssertionError("The application declaration contract must not require factory discovery.")
+    monkeypatch.setattr(team[0], "_selected_reference_sources", unavailable)
+    page = await team[agent_index].reference({"name": "application", "limit": 180})
+    content = "\n".join(line.split(": ", 1)[1] for line in page["content"].splitlines())
+    assert HELPERLESS_APPLICATION_CONTRACT.strip() in content
+    assert '"factory":"application:project"' in content
+    assert "seed policy can coexist with a dynamic roster" in content
