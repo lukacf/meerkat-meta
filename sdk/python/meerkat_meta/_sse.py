@@ -5,6 +5,8 @@ import asyncio
 import json
 from typing import Any, AsyncIterator
 
+from .errors import TransportError
+
 
 class SseEvent:
     __slots__ = ("id", "event", "data")
@@ -80,8 +82,10 @@ async def parse_sse_stream(
 
     Lines are split on bytes and each complete line is decoded as strict
     UTF-8, so a multi-byte character that a chunk boundary splits arrives
-    whole. A complete line that is not UTF-8 raises ``UnicodeDecodeError``
-    instead of being repaired with U+FFFD.
+    whole. Bytes that are not UTF-8, in a complete line or in a stream that
+    ends inside a character, raise :class:`~meerkat_meta.errors.TransportError`
+    (caused by the ``UnicodeDecodeError``) instead of being repaired with
+    U+FFFD.
     """
     buffer = b""
     current_id: str | None = None
@@ -92,7 +96,7 @@ async def parse_sse_stream(
         buffer += chunk
         while b"\n" in buffer:
             raw_line, buffer = buffer.split(b"\n", 1)
-            line = raw_line.rstrip(b"\r").decode("utf-8")
+            line = _decode_sse_line(raw_line.rstrip(b"\r"))
 
             if not line:
                 if current_data:
@@ -114,3 +118,15 @@ async def parse_sse_stream(
                 current_data.append(line[6:])
             elif line.startswith("data:"):
                 current_data.append(line[5:])
+
+    # An unterminated last line is dropped, as before; one that ends inside a
+    # character means the stream was cut mid-character, which is refused too.
+    _decode_sse_line(buffer)
+
+
+def _decode_sse_line(raw: bytes) -> str:
+    """One SSE line as strict UTF-8; bytes that are not UTF-8 refuse the stream."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise TransportError("SSE stream is not valid UTF-8") from error

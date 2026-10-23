@@ -467,10 +467,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The Python SDK's SSE reader (`parse_sse_stream`, behind the agent and mob
   event streams) decodes each complete line as UTF-8 instead of decoding each
   network chunk with replacement: a multi-byte character that a chunk
-  boundary split arrived as U+FFFD. A complete line that is not UTF-8 now
-  raises `UnicodeDecodeError` instead of being repaired. The TypeScript SDK's
-  reader already reassembled split characters; it now throws the decoder's
-  `TypeError` for bytes that are not UTF-8 instead of replacing them.
+  boundary split arrived as U+FFFD. The TypeScript SDK's reader already
+  reassembled split characters. In both SDKs, bytes that are not UTF-8, and
+  a stream that ends inside a character, now raise the SDK's
+  `TransportError` (caused by the decode error) instead of being replaced
+  with U+FFFD.
 
 ### Known limitations
 

@@ -5,6 +5,8 @@
  * SSE bridge for streaming agent and mob events.
  */
 
+import { TransportError } from "./errors.js";
+
 // -- Types ----------------------------------------------------------------
 
 export interface SseEvent {
@@ -41,8 +43,9 @@ export function encodeSseEvent(event: SseEvent): string {
  * Events are emitted on blank-line boundaries per the SSE spec.
  *
  * The stream is decoded as UTF-8 incrementally, so a character that a chunk
- * boundary splits arrives whole. Bytes that are not UTF-8 throw the decoder's
- * `TypeError` instead of being replaced with U+FFFD.
+ * boundary splits arrives whole. Bytes that are not UTF-8, including a stream
+ * that ends inside a character, throw {@link TransportError} (caused by the
+ * decoder's `TypeError`) instead of being replaced with U+FFFD.
  */
 export async function* parseSseStream(
   body: AsyncIterable<Uint8Array>,
@@ -54,7 +57,7 @@ export async function* parseSseStream(
   const currentData: string[] = [];
 
   for await (const chunk of body) {
-    buffer += decoder.decode(chunk, { stream: true });
+    buffer += decodeUtf8(decoder, chunk);
 
     while (buffer.includes("\n")) {
       const idx = buffer.indexOf("\n");
@@ -94,6 +97,10 @@ export async function* parseSseStream(
     }
   }
 
+  // A stream that ends inside a character is refused; an unterminated last
+  // line is still dropped.
+  decodeUtf8(decoder);
+
   // Flush any remaining event if the stream ended without a trailing blank line.
   if (currentData.length > 0) {
     yield {
@@ -101,5 +108,18 @@ export async function* parseSseStream(
       event: currentEvent,
       data: currentData.join("\n"),
     };
+  }
+}
+
+/**
+ * One step of the stream's fatal UTF-8 decode (the final flush when `chunk` is
+ * absent): bytes that are not UTF-8 refuse the stream with the SDK's
+ * transport error.
+ */
+function decodeUtf8(decoder: InstanceType<typeof TextDecoder>, chunk?: Uint8Array): string {
+  try {
+    return chunk === undefined ? decoder.decode() : decoder.decode(chunk, { stream: true });
+  } catch (error) {
+    throw new TransportError("SSE stream is not valid UTF-8", { cause: error });
   }
 }
