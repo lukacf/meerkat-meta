@@ -4,6 +4,16 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+- Breaking: a tool's output moves from `ToolExecutionCompleted` to
+  `ToolResultReceived`, following the gateway, which sends it once, on
+  `tool_result_received`. `ToolResultReceived` gains `result`, its last field,
+  and `ToolExecutionCompleted` no longer has it, so a positional pattern on
+  `ToolExecutionCompleted` loses its `result` slot. Read a tool's output from
+  the result event for the same `id`. An event from an older gateway still
+  parses: a completion's `result` is ignored, and a result event without one
+  reads `""`. Upgrade the SDK together with the gateway: a 0.9.4 SDK against a
+  0.9.5 gateway reads an empty `result` on the completion and loses the
+  output.
 - `LiveChannelHandle` and `PendingLiveChannelHandle` carry `advisories`, a
   tuple of what the live open went ahead without, empty when the gateway
   reported nothing. `"staged_prompt_refused"` means a run-start hook refused

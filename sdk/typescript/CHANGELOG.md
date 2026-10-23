@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Breaking: a tool's output moves from `ToolExecutionCompletedEvent` to
+  `ToolResultReceivedEvent`, following the gateway, which sends it once, on
+  `tool_result_received`. `ToolResultReceivedEvent` gains `result` and
+  `ToolExecutionCompletedEvent` no longer has it. Read a tool's output from
+  the result event for the same `id`. An event from an older gateway still
+  parses: a completion's `result` is ignored, and a result event without one
+  reads `""`. Upgrade the SDK together with the gateway: a 0.9.4 SDK against a
+  0.9.5 gateway reads an empty `result` on the completion and loses the
+  output.
+- Breaking: `MetaBuilderConfig` gains the required field
+  `shutdownInFlightDrainMs: number | null`, so a config object written by hand
+  for `new MetaRuntime(config)` adds it (`null` sends nothing; `MetaBuilder`
+  fills it in).
+- Breaking: `MetaRuntime.send` is overloaded, the keyed form (`{
+  idempotencyKey }`, resolving a `KeyedSendResult`) last, so
+  `ReturnType<MetaRuntime["send"]>` and `Parameters<MetaRuntime["send"]>` name
+  the keyed form, and a test double typed as `MetaRuntime["send"]` adds the
+  keyed overload.
 - `LiveChannelHandle` and `PendingLiveChannelHandle` have an optional
   `advisories`, what the live open went ahead without, present only when the
   gateway reported something. `"staged_prompt_refused"` means a run-start hook

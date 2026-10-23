@@ -7,8 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Forge 0.3.0, part of the Meerkat 0.9.5 release; use with the Meta 0.9.5
+gateway and Core 0.9.5.
+
 ### Breaking
 
+- A tool's output travels once, on `tool_result_received`, following Meerkat's
+  `AgentEvent::ToolExecutionCompleted`, which no longer carries the result
+  body. Meta's projection (every SSE stream, `meta/events/subscribe`,
+  event-log row and console frame) derives the flat `result` string on
+  `tool_result_received`, beside its `content`, and `tool_execution_completed`
+  carries neither: its tool fields are `id`, `tool_call_id`, `name`,
+  `is_error` and `duration_ms`, the execution fact for the same `id`. The
+  Python SDK moves `result` from `ToolExecutionCompleted` to
+  `ToolResultReceived` (its last field), and the TypeScript SDK moves it from
+  `ToolExecutionCompletedEvent` to `ToolResultReceivedEvent`. Code that read a
+  tool's output from the completion reads it from the result event for the
+  same `id`, and a positional pattern on `ToolExecutionCompleted` loses its
+  `result` slot. Console timeline frames rebuilt from session history keep the
+  `tool_execution_completed` kind and their output. An event from an older
+  server still parses: a completion's `result` is ignored, and a result event
+  without one reads `""`. A 0.9.4 SDK against a 0.9.5 gateway reads an empty
+  `result` on the completion and ignores the result event's, so it loses the
+  output: upgrade the SDKs together with the gateway.
+- A graceful shutdown (`meta/shutdown`, or SIGTERM to the gateway) no longer
+  ends a durable member's running turn (one whose session lives on a
+  persistent session service): the shutdown suspends the run without a
+  terminal frame, and the run continues at the member's next start, where its
+  `interaction_complete` or `interaction_failed` frame comes when it ends. A
+  client that waits for every in-flight turn's terminal frame before the
+  gateway exits bounds that wait. Any other member's running turn still ends
+  with its terminal frame (see Changed).
+- `LiveChannelHandle` and `PendingLiveChannelHandle` gain `advisories:
+  Vec<WireLiveOpenAdvisory>`, what the open went ahead without (see Fixed).
+  Rust code that builds either handle as a struct literal adds the field
+  (`Vec::new()` for none); `from_open_result` and `new` carry it from
+  Meerkat's `LiveOpenResult`. On the wire the key is left out when empty.
+  Older Meta crates, older Python and TypeScript SDKs and an outdated
+  embedded console refuse a live channel handle that carries `advisories`,
+  which is only sent after a hook refuses a staged prompt; upgrade clients
+  together with the gateway.
+- Mob announcements refuse two inputs 0.9.4 accepted: a new host announcement
+  whose key starts with `source:`, which is reserved for source items (a retry
+  of one made before the upgrade still answers its original), and a host or
+  member announcement on the reserved topic `mob_announcements.health`.
+  Announcements also gain the announcer kind `{"kind": "source",
+  "source_id"}`, which a raw reader of announcements may see once sources
+  announce (see Added and Changed).
+- `mob_announcements` types gain public fields, so Rust code that builds
+  them as struct literals, or destructures them without `..`, adds the
+  fields. `AnnouncementConfig` gains `on_unhandled`, `renotify_after_ms`,
+  `health_audience`, `handled_unverified_threshold` and `declarations` (a
+  literal that ends in `..AnnouncementConfig::default()` still compiles) and
+  is no longer `Copy`, so code that copies a config clones it instead.
+  `Subscription` and `PutSubscription` gain `delivery` (`SubscriptionDelivery`),
+  which an `AnnouncementStore` implementation also sets on the subscriptions
+  it returns, and `DeliveryObservation` gains `handling`
+  (`Option<BatchHandling>`). A subscription whose `delivery` is the default
+  serializes as before (see Added).
+- The stdio gateway reads its identity roster once per boot, before it builds
+  the mob, so a roster provider that stalls reports `last_phase` `"prepare"`
+  instead of `"roster"` (see Changed).
+- TypeScript SDK: `MetaBuilderConfig` gains the required field
+  `shutdownInFlightDrainMs: number | null`, so a config object written by hand
+  for `new MetaRuntime(config)` adds it (`null` sends nothing; `MetaBuilder`
+  fills it in). `MetaRuntime.send` is overloaded, the keyed form (`{
+  idempotencyKey }`, resolving a `KeyedSendResult`) last, so
+  `ReturnType<MetaRuntime["send"]>` and `Parameters<MetaRuntime["send"]>` name
+  the keyed form, and a test double typed as `MetaRuntime["send"]` adds the
+  keyed overload.
 - Forge native agent-team packages with saved organization context now use
   manifest protocol 2 and require a lowercase SHA256 `organization_hash`.
   The readers in Meta v0.9.3/v0.9.4, whose Forge package metadata is 0.2.0,
@@ -39,6 +106,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `memory::coordinator::TurnInjectionSkip` gains `KeyedContinuation`
   (`keyed_continuation`). See Added. Both enums are public and not
   `#[non_exhaustive]`, so exhaustive matches need the new arms.
+- `IdentityRuntimeError` gains `IdentityNameHeldByRawMember { identity,
+  member, session_id }`: the roster compile or wake that meets a member the
+  host made directly on the mob under the identity's member id. An exhaustive
+  match on `IdentityRuntimeError` adds the arm. The identity's wake no longer
+  resumes such a member's retired session, and reset and delete no longer read
+  its transcript as the identity's history (see Changed).
 - `ErrorEvent::ReconcileIncomplete` names the failed edge operations: its new
   `failed` field holds the first five, in the order the reconcile met them,
   each with its `operation`, its `edge` (`{a, b}`) and its `error`, beside the
@@ -47,35 +120,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `..`, adds the field. On the wire (`meta/on_error`, and the SDKs'
   `ErrorEvent.context`) the key is new beside the old ones, and an event
   recorded without it reads as an empty list.
-- `IdentityRuntimeError` gains `IdentityNameHeldByRawMember { identity, member,
-  session_id }`: the roster compile or wake that meets a member the host made
-  directly on the mob under the identity's member id. An exhaustive match on
-  `IdentityRuntimeError` adds the arm.
-- A tool's output travels once, on `tool_result_received`, following Meerkat's
-  `AgentEvent::ToolExecutionCompleted`, which no longer carries the result
-  body. Meta's projection (every SSE stream, `meta/events/subscribe`,
-  event-log row and console frame) derives the flat `result` string on
-  `tool_result_received`, beside its `content`, and `tool_execution_completed`
-  carries neither: its tool fields are `id`, `tool_call_id`, `name`,
-  `is_error` and `duration_ms`, the execution fact for the same `id`. The
-  Python SDK moves `result` from `ToolExecutionCompleted` to
-  `ToolResultReceived` (its last field), and the TypeScript SDK moves it from
-  `ToolExecutionCompletedEvent` to `ToolResultReceivedEvent`. Code that read a
-  tool's output from the completion reads it from the result event for the
-  same `id`, and a positional pattern on `ToolExecutionCompleted` loses its
-  `result` slot. Console timeline frames rebuilt from session history keep the
-  `tool_execution_completed` kind and their output. An event from an older
-  server still parses: a completion's `result` is ignored, and a result event
-  without one reads `""`.
-- `LiveChannelHandle` and `PendingLiveChannelHandle` gain `advisories:
-  Vec<WireLiveOpenAdvisory>`, what the open went ahead without (see Fixed).
-  Rust code that builds either handle as a struct literal adds the field
-  (`Vec::new()` for none); `from_open_result` and `new` carry it from
-  Meerkat's `LiveOpenResult`. On the wire the key is left out when empty.
-  Older Meta crates, older Python and TypeScript SDKs and an outdated
-  embedded console refuse a live channel handle that carries `advisories`,
-  which is only sent after a hook refuses a staged prompt; upgrade clients
-  together with the gateway.
+
+### Security
+
+- tokio updated to 1.53.3 for RUSTSEC-2026-0386. Meta's crates still accept
+  any tokio 1.x release, so update tokio to >= 1.53.3 in your lockfile
+  (RUSTSEC-2026-0386).
+
+### Upgrade
+
+- Upgrade Meta Forge together with the Meta gateway and Meerkat 0.9.5, and
+  Meerkat together with its SDKs. Upgrade the Meta Python and TypeScript SDKs
+  and an embedded console together with the gateway too: Breaking names what
+  an older one refuses or no longer reads.
+- A state directory that `meta_gateway storage-migrate-native` migrated before
+  needs no repair command: a stale first-boot row (a `fresh` row for a helper
+  or a fork child the host made on the mob and retired) settles on the next
+  roster compile.
 
 ### Added
 
@@ -650,20 +711,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   each file's identity (device, inode, mode, owner, link count, size,
   modification and change times) in a private file in the installation's
   folder, and the installation record names that file by its SHA-256. Each
-  Start still checks every installed native runtime file against the list,
-  and refuses a changed, added or removed file or a changed mode as before.
-  It reads a file's bytes again only when the file's identity changed, and
-  always reads the gateway it runs. Writing to a file always moves its change
-  time, which only an administrator can set back. Forge uses the recorded
-  identities on ext4, xfs and btrfs only, and reads every file on other
-  filesystems.
-- A kept list that differs from the copy the installation record names is
+  Start still checks every installed native runtime file against the list, and
+  refuses a changed, added or removed file or a changed mode as before. It
+  reads a file's bytes again only when the file's identity changed, and always
+  reads the gateway it runs. Writing to a file always moves its change time,
+  which only an administrator can set back. Forge uses the recorded identities
+  on ext4, xfs and btrfs only, and reads every file on other filesystems. A
+  kept list that differs from the copy the installation record names is
   refused, and the refusal names the file: remove it, and the next Start runs
   the full verification and keeps a new list. When the application's own
-  startup refuses its installed source, that refusal is now the reported
-  Start failure instead of only a runtime log line. An installation from
-  0.9.4 or earlier gets its list at its first Start. Forge 0.9.4 ignores the
-  new installation record field.
+  startup refuses its installed source, that refusal is now the reported Start
+  failure instead of only a runtime log line. An installation from 0.9.4 or
+  earlier gets its list at its first Start. Forge 0.9.4 ignores the new
+  installation record field.
 - The `SessionHook` documentation and the Rust SDK guide say how a host
   narrows a member's mob operator authority: in `before_create`, with
   `restrict_spawn_profiles_in_mob` on the build's
@@ -1151,16 +1211,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ceil(members / concurrency) to the init. Before, only a host with a document
   MCP binding waited, and any other member's surface was captured while its
   servers were still connecting, without their tools or their MCP provenance.
-- `meta_gateway storage-migrate-native` admits a live mob member the host
-  made directly on the mob (for example with `meta/ensure_member` on the
-  stdio gateway, or through its own mob calls) that no continuity record
-  names: the census classifies it `raw_member` instead of refusing it as
-  `identity_disagrees`, whose remedy (settle the record with 0.9.3) could not
-  be met, because 0.9.3 never records such a member. `--apply` leaves the
-  member, its session and its history in Core and writes no first-boot row
-  for it. A live member the identity runtime spawned (its spawn carries the
-  `agent_identity` label) without its record is still refused, and so is a
-  member an export entry names.
+- `meta_gateway storage-migrate-native` admits a mob member the host made
+  directly on the mob (for example with `meta/ensure_member` on the stdio
+  gateway, a helper, a fork child, or the host's own mob calls) that no
+  continuity record names, live or retired: the census classifies it
+  `raw_member`. A live one was refused as `identity_disagrees`, whose remedy
+  (settle the record with 0.9.3) could not be met, because 0.9.3 never records
+  such a member, and a retired one got a planned `fresh` row that waited for a
+  roster that never lists the identity, so the bootstrap status kept listing
+  it in `first_boot_pending` and a host that waits for no pending row before a
+  mob reset waited for good. `--apply` leaves the member, its session and its
+  history in Core and writes no first-boot row for it. A live member the
+  identity runtime spawned (its spawn carries the `agent_identity` label)
+  without its record is still refused, and so is a member an export entry
+  names. A directory an earlier migration left with such rows needs nothing:
+  every roster compile now settles each pending row that Core's member history
+  shows done, whether the roster lists its identity or not, and a `fresh` row
+  over a retired member no identity-first spawn made reads done, since an
+  identity's wake resumes only a member the identity runtime spawned.
 - A voice-first member's staged create-time prompt reaches the realtime model.
   A member created with its first turn deferred and its prompt staged
   (`InitialTurnPolicy::Defer` with `DeferredPromptPolicy::Stage`) and then
@@ -1191,18 +1259,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   runtime instead of through the wrapped service. The decorator conformance
   check (`scripts/verify-session-service-decorators.py`) now covers the comms
   and control extension traits as well.
-- `meta_gateway storage-migrate-native` writes no first-boot row for a retired
-  member the host made directly on the mob (a helper or a fork child): the
-  census admits it as `raw_member`, as it does a live one. Before, it planned
-  a `fresh` row for it that waited for a roster that never lists the
-  identity, so the bootstrap status kept listing it in `first_boot_pending`
-  and a host that waits for no pending row before a mob reset waited for
-  good. A directory an earlier migration left with such rows needs nothing:
-  every roster compile now settles each pending row that Core's member
-  history shows done, whether the roster lists its identity or not, and a
-  `fresh` row over a retired member no identity-first spawn made reads done,
-  since an identity's wake resumes only a member the identity runtime
-  spawned.
+- Both mob session-service wrappers forward
+  `MobSessionService::suspend_run_with_machine_authority`, Meerkat 0.9.5's
+  exact-run suspend of a graceful requeue stop, which the graceful shutdown
+  that keeps durable runs (see Changed) relies on: through the trait's
+  default, which answers that the service cannot suspend, the stop would
+  hard-cancel a durable member's run instead of keeping it for the member's
+  next start.
 
 ### Known limitations
 
