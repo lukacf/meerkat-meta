@@ -125,6 +125,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A persistent gateway holds the run starts of each member its bootstrap
+  restores until the identity bootstrap publishes the member's customizer
+  tools, as the library builder does. A gateway that stopped uncleanly left
+  its mob's log Running, so the restart's mob build revived the members before
+  any customizer tools were published, and a restored queued input, a kickoff
+  or a peer message could start a run without them. Each roster identity of a
+  persistent gateway reports `customizer_tools_pending` until its tools are
+  published.
 - Every Meta member builder waits for a member's configured MCP servers before
   its construction is prepared: the stdio and console gateways, the library
   builder, and the plain ephemeral spec. A member's authoritative tool surface
