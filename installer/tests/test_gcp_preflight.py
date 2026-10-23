@@ -458,11 +458,11 @@ async def test_package_cannot_borrow_fixed_cloud_plan_after_source_or_scope_chan
 
 
 def replace_package_evidence(local, location, value):
-    name = "deployment.json" if location == "definition" else "implementation-report.json"
-    if location == "verification":
-        report = json.loads(local.files[name])
-        report["verification"] = value
-        value = report
+    name = "deployment.json" if location in {"definition", "knowledge"} else "implementation-report.json"
+    if location in {"verification", "knowledge"}:
+        document = json.loads(local.files[name])
+        document[location] = value
+        value = document
     local.files[name] = json.dumps(value).encode()
     local.package_bytes = local.archive()
 
@@ -522,6 +522,62 @@ async def test_empty_or_missing_package_verification_keeps_existing_mismatch_ref
     with pytest.raises(DraftConflict, match=r"^The accepted package differs from the current proposal or checked source\. Rebuild before cloud preparation\.$"):
         await checked(harness)
     assert cli.calls == [] and cloud.calls == []
+    assert service._active is None
+
+
+@pytest.mark.parametrize("guided", [False, True])
+@pytest.mark.parametrize("value", [False, [], ["local"], "private-knowledge-shape", 0, 1.5, True])
+async def test_nonobject_knowledge_refuses_before_cloud_probe_and_allows_repair(harness, guided, value):
+    service, local, cli, cloud = harness
+    accepted_package = local.package_bytes
+    replace_package_evidence(local, "knowledge", value)
+    check = service.check_guided if guided else service.check
+    with pytest.raises(DraftConflict, match=r"^The accepted cloud package has invalid deployment evidence\.$"):
+        await check(local.state["id"], local.state["version"], local.build_id, ACCOUNT, PROJECT)
+    assert cli.calls == [] and cloud.calls == []
+    assert service._active is None
+    local.package_bytes = accepted_package
+    result = await checked(harness)
+    assert result["ready_for_plan"] is True and result["provisioning_verified"] is False
+    assert result["binding"]["package_sha256"] == hashlib.sha256(accepted_package).hexdigest()
+    assert service._active is None
+
+
+@pytest.mark.parametrize("value", ["missing", None, {}])
+async def test_legacy_optional_knowledge_keeps_the_base_cloud_plan(harness, value):
+    service, local, _, _ = harness
+    if value == "missing":
+        definition = json.loads(local.files["deployment.json"])
+        del definition["knowledge"]
+        replace_package_evidence(local, "definition", definition)
+    else:
+        replace_package_evidence(local, "knowledge", value)
+    result = await checked(harness)
+    assert result["ready_for_plan"] is True and result["provisioning_verified"] is False
+    assert result["binding"]["package_sha256"] == hashlib.sha256(local.package_bytes).hexdigest()
+    assert service._active is None
+
+
+@pytest.mark.parametrize("value", [["local"], "private-knowledge-shape", 1.5])
+async def test_knowledge_becoming_nonobject_during_probe_refuses_the_plan(harness, value):
+    service, local, cli, cloud = harness
+    accepted_package = local.package_bytes
+    request = cloud.request
+    async def changing(method, url, body, token):
+        result = await request(method, url, body, token)
+        if urlsplit(url).path == "/v1/userinfo":
+            replace_package_evidence(local, "knowledge", value)
+        return result
+    cloud.request = changing
+    with pytest.raises(DraftConflict, match=r"^The accepted cloud package has invalid deployment evidence\.$"):
+        await checked(harness)
+    assert cli.calls and cloud.calls
+    assert service._active is None
+    cloud.request = request
+    local.package_bytes = accepted_package
+    result = await checked(harness)
+    assert result["ready_for_plan"] is True and result["provisioning_verified"] is False
+    assert result["binding"]["package_sha256"] == hashlib.sha256(accepted_package).hexdigest()
     assert service._active is None
 
 
