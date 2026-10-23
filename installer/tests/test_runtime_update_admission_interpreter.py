@@ -85,6 +85,23 @@ def test_staged_runtime_refusal_admits_an_interpreter_the_product_supports(produ
     assert deployment.staged_runtime_refusal(staged_product_update(product.target)) is None
 
 
+def test_staged_runtime_refusal_names_a_glibc_floor_above_this_computer(product, monkeypatch):
+    # Apply asks Stage's glibc question before the worker moves the runtime
+    # aside. The inert product's floor is modelled at its cheap reader.
+    from launchkit import runtime_candidates
+    from test_meta_toolkit_initial_install import CP311_LINUX
+    selected = candidate_selection(product.target)
+
+    def declared(target):
+        assert candidate_selection(target) == selected
+        return (2, 39)
+    monkeypatch.setattr(runtime_candidates, "declared_glibc_floor", declared, raising=False)
+    monkeypatch.setattr(deployment, "forge_interpreter", lambda: {**CP311_LINUX, "glibc_minimum": [2, 35]},
+        raising=False)
+    refusal = deployment.staged_runtime_refusal(staged_product_update(product.target))
+    assert re.search(r"glibc 2\.39 or newer, but this computer has glibc 2\.35", refusal or "")
+
+
 @pytest.mark.parametrize("update", [{}, {"runtime_dependency_update": None},
     {"runtime_dependency_update": {"runtime_candidate": None}}], ids=["no-update", "source-only", "no-product"])
 def test_staged_runtime_refusal_ignores_an_update_without_a_selected_product(update):
