@@ -15,7 +15,7 @@ import {
   type IdleWatermark,
 } from "./lib/idle-reconcile";
 import React from "react";
-import { selectedPanelRuntime, scopedPanelParams, framesForPanelRuntime } from "./lib/panel-runtime";
+import { selectedPanelRuntime, scopedPanelParams, framesForPanelRuntime, loadPanelRuntimeSelection, savePanelRuntimeSelection } from "./lib/panel-runtime";
 import "@console-components/styles";
 import "./console-host.css";
 
@@ -861,12 +861,22 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const [experience, setExperience] = React.useState<ConsoleExperience | null>(
     null,
   );
-  const [panelRuntimeSelection, setPanelRuntimeSelection] = React.useState("");
-  const panelRuntimeKey = selectedPanelRuntime(panelRuntimeSelection, experience?.panel_runtimes);
+  const persistentSendScope = storageNamespace?.trim() || (experience?.storage_scope?.trim()
+    ? JSON.stringify([baseUrl, experience.storage_scope]) : null);
+  const savedPanelRuntimeSelection = React.useMemo(
+    () => loadPanelRuntimeSelection(browserLocalStorage(), persistentSendScope),
+    [persistentSendScope],
+  );
+  const [panelRuntimeSelection, setPanelRuntimeSelection] = React.useState<{scope: string | null; key: string} | null>(null);
+  const explicitPanelRuntime = panelRuntimeSelection?.scope === persistentSendScope
+    ? panelRuntimeSelection.key : savedPanelRuntimeSelection;
+  const panelRuntimeKey = selectedPanelRuntime(explicitPanelRuntime, experience?.panel_runtimes);
   React.useEffect(() => {
-    const first = experience?.panel_runtimes?.[0]?.key;
-    if (first) setPanelRuntimeSelection(current => current || first);
-  }, [experience?.panel_runtimes]);
+    if (!panelRuntimeKey) return;
+    setPanelRuntimeSelection(current => current?.scope === persistentSendScope && current.key === panelRuntimeKey
+      ? current : {scope: persistentSendScope, key: panelRuntimeKey});
+    savePanelRuntimeSelection(browserLocalStorage(), persistentSendScope, panelRuntimeKey);
+  }, [persistentSendScope, panelRuntimeKey]);
   const panelRuntimeKeyRef = React.useRef(panelRuntimeKey);
   panelRuntimeKeyRef.current = panelRuntimeKey;
   const [memoryDataRuntimeKey, setMemoryDataRuntimeKey] = React.useState("");
@@ -1216,7 +1226,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     return <div className="runtime-scoped-panel" key={`${kind}:${panelRuntimeKey}`}>
       <label className="runtime-panel-selector">Mob
         <select aria-label={`${kind === "memory" ? "Memory" : "Work Graph"} mob`} value={panelRuntimeKey}
-          onChange={event => setPanelRuntimeSelection(event.target.value)}>
+          onChange={event => setPanelRuntimeSelection({scope: persistentSendScope, key: event.target.value})}>
           {!runtimes.some(runtime => runtime.key === panelRuntimeKey) && <option value={panelRuntimeKey}>Runtime unavailable</option>}
           {runtimes.map(runtime => <option key={runtime.key} value={runtime.key}>{runtime.label}</option>)}
         </select>
@@ -1901,8 +1911,6 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const sendControllerRef = React.useRef(consoleController);
   sendControllerRef.current = consoleController;
   const transientSendScope = React.useMemo(() => `transient:${createIdempotencyKey()}`, [consoleController]);
-  const persistentSendScope = storageNamespace?.trim() || (experience?.storage_scope?.trim()
-    ? JSON.stringify([baseUrl, experience.storage_scope]) : null);
   const sendScope = persistentSendScope || `${transientSendScope}:${baseUrl}`;
   const [composerTabId] = React.useState(() => {
     try { return consoleComposerTabId(window.sessionStorage, createIdempotencyKey); }
