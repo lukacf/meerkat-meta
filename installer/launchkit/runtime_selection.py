@@ -186,7 +186,7 @@ def _parse_product_selection(value):
     required = {"format", *MetaToolkitRuntimeTarget.__dataclass_fields__} - {"source_manifest"}
     if set(value) not in (required, required | {"source_manifest"}):
         raise ValueError("The protected native product selection has an invalid shape.")
-    if value["target"] not in PRODUCT_TARGETS:
+    if not isinstance(value["target"], str) or value["target"] not in PRODUCT_TARGETS:
         raise ValueError("The selected native product target is invalid.")
     fields = {"artifact_root": _product_path(value["artifact_root"]), "target": value["target"]}
     for name in ("assembly", "meta_wheel", "toolkit_wheel", "dependency_requirements", "model_catalog"):
