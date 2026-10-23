@@ -55,7 +55,6 @@ from .provider_settings import ProviderSettings, ProviderSettingsUnavailable, ca
 from .checker_setup import CheckerSetupService
 from .toolkit_saved_requests import ToolkitSavedRequests, ToolkitSavedRequestsError, MAX_MANIFEST_BYTES
 
-VERSION = "0.8.47"
 APP_ROOT = Path(__file__).resolve().parents[1]
 checker_setup = CheckerSetupService(APP_ROOT)
 LOG = logging.getLogger(__name__)
@@ -422,9 +421,34 @@ def cloud_capability() -> dict:
     return {"available": True, "project": project, "reason": "Google Cloud CLI found. Check the selected account and project in guided deployment before provisioning."}
 
 
+def forge_release():
+    """The Forge release: installer/pyproject.toml's version, which forge-release.py tags."""
+    import tomllib
+    return tomllib.loads((APP_ROOT / "pyproject.toml").read_text())["project"]["version"]
+
+
+def ordinary_runtime():
+    """The Meta runtime and gateway the trusted launcher selected for ordinary
+    applications; None without such a selection, as in the developer entry."""
+    host = application_host
+    if type(host) is not LocalApplicationRegistry or host.runtime_target is None or host.ordinary_meta_gateway is None:
+        return None
+    target = host.runtime_target
+    return {"sdk": target.meta.distribution, "version": target.meta.version, "target": target.target,
+            "gateway_sha256": host.ordinary_meta_gateway.sha256}
+
+
+def agent_team_runtime():
+    """The public Meta release every compiled agent team installs, in every entry."""
+    from . import public_meta_runtime
+    return {"sdk": public_meta_runtime.SDK_DISTRIBUTION, "version": public_meta_runtime.VERSION,
+            "release": public_meta_runtime.RELEASE_URL}
+
+
 @app.get("/api/capabilities")
 async def capabilities():
-    return {"planner": planner_capability(), "platform": "mac" if platform.system() == "Darwin" else "linux", "gcp": await asyncio.to_thread(cloud_capability), "version": VERSION,
+    return {"planner": planner_capability(), "platform": "mac" if platform.system() == "Darwin" else "linux", "gcp": await asyncio.to_thread(cloud_capability),
+            "version": forge_release(), "ordinary_runtime": ordinary_runtime(), "agent_team_runtime": agent_team_runtime(),
             "rehearsal": {"start_request_replay": True}, "agent_team": deployment.agent_team_availability()}
 
 

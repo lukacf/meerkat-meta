@@ -352,6 +352,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the source tables. A version 1 database is migrated in place on first
   open; an older binary refuses a version 2 database, so going back means
   disabling mob announcements or keeping this binary.
+- Meta Forge's `/api/capabilities` reports Forge's own release as `version`:
+  the version in `installer/pyproject.toml` that a Forge release is tagged
+  with. It reported `0.8.47`, the MobKit version a developer-entry Build
+  compiles with. Two new fields name the runtimes Forge builds on:
+  `agent_team_runtime`, the public Meta release every compiled agent team
+  installs (`meerkat-meta` 0.9.4, with its release URL), and
+  `ordinary_runtime`, the Meta SDK version, target and gateway SHA-256 a
+  trusted launcher selected for ordinary applications, or `null` without
+  such a selection, as in the developer entry.
 
 ### Removed
 
