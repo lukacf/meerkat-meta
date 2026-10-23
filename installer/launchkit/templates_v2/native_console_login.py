@@ -7,6 +7,7 @@ a human, select application policy, replace a login or close the host client.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 import inspect
 
@@ -139,6 +140,15 @@ class NativeConsoleLogin:
         """Fence disclosure synchronously before any asynchronous cleanup."""
         self._revoked = True
 
+    def hosted_mcp(self, context, target):
+        """Dormant host-owned ceremony on this original enrollment and pipe."""
+        self._require_current()
+        if (not isinstance(context, ConsoleConnectLogin)
+                or (context.principal, context.login_scope_id, context.expires_at_ms, context.origin)
+                != (self.subject, self.login_scope_id, self.expires_at_ms, self.origin)):
+            raise NativeConsoleLoginError("invalid_binding")
+        return NativeConsoleMcp(self, context, target)
+
     async def retire(self, reason):
         self.revoke()
         if self._retire_task is None:
@@ -178,3 +188,105 @@ class NativeConsoleLogin:
 
     async def close(self):
         return await self.retire("application_stopping")
+
+
+class NativeConsoleMcp:
+    """Retain the SDK's original binding across browser waiter cancellation.
+
+    ConsoleFront owns this object before prepare enters native describe. It
+    mounts redirect_uri before begin or presentation, and closes every attempt
+    before retiring the original enrollment. This owns no credential store.
+    """
+    def __init__(self, owner, context, target):
+        self.owner, self.context, self.target = owner, context, target
+        self._original_target = deepcopy(target)
+        self.client = self.binding = None
+        self._prepare_task = self._close_task = None
+        self._closed = False
+        self._begin_entered = False
+        self._presenter = None
+        self._presentation_lock = asyncio.Lock()
+
+    def __repr__(self):
+        return "NativeConsoleMcp(<host-private>)"
+
+    def _current(self):
+        if (self._closed or self.target != self._original_target
+                or not self.owner.is_current() or self.context.is_current() is not True):
+            raise NativeConsoleLoginError("invalid_binding")
+
+    async def prepare(self):
+        self._current()
+        if self._prepare_task is None:
+            self._prepare_task = NativeConsoleLogin._retain(asyncio.create_task(self._prepare()))
+        await asyncio.shield(self._prepare_task)
+        self._current()
+        return self.client.redirect_uri
+
+    async def _prepare(self):
+        from meerkat_toolkit.mcp_auth_host import HostedMcpAuthBinding
+        from meerkat_toolkit.mcp_auth_native import NativeHostedMcpClient
+        enrollment = await self.owner.ready()
+        self._current()
+        self.client = await NativeHostedMcpClient.for_target(self.owner._client, enrollment, self.target)
+        # Retain even a late describe result before checking revoked admission.
+        self.binding = HostedMcpAuthBinding(self.client, self.target,
+            login_context=self.context, redirect_uri=self.client.redirect_uri,
+            protected_presenter=self._present)
+        self._current()
+
+    async def begin(self):
+        self._current()
+        self._begin_entered = True
+        result = await self.binding.begin(self.context)
+        self._current()
+        return result
+
+    async def _present(self, url):
+        self._current()
+        if self._presenter is None:
+            raise NativeConsoleLoginError("unavailable")
+        await self._presenter(url)
+        self._current()
+
+    async def present(self, presenter):
+        async with self._presentation_lock:
+            self._current()
+            self._presenter = presenter
+            try:
+                result = await self.binding.present(self.context)
+                self._current()
+                return result
+            finally:
+                self._presenter = None
+
+    async def observe(self):
+        self._current()
+        result = await self.binding.observe(self.context)
+        self._current()
+        return result
+
+    async def callback(self, **request):
+        self._current()
+        result = await self.binding.handle_callback(self.context, **request)
+        self._current()
+        return result
+
+    async def close(self):
+        self._closed = True
+        if self._close_task is None:
+            self._close_task = NativeConsoleLogin._retain(asyncio.create_task(self._close()))
+        return await asyncio.shield(self._close_task)
+
+    async def _close(self):
+        if self._prepare_task is not None:
+            await asyncio.gather(asyncio.shield(self._prepare_task), return_exceptions=True)
+        if self.binding is not None:
+            cleanup = await self.binding.shutdown()
+            # An unstarted SDK binding has no claimed callback inbox and
+            # reports callback_closed=False, native_cancel=not_requested.
+            if ((self._begin_entered and not cleanup.callback_closed)
+                    or cleanup.native_cancel == "unconfirmed"):
+                raise NativeConsoleLoginError("cleanup_unconfirmed")
+        elif self.client is not None:
+            await self.client.close_owned_hosted_login()

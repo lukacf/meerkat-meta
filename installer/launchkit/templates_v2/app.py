@@ -1393,10 +1393,17 @@ async def run(spec, args, *, application_startup=None):
         and getattr(application_startup, "require_tool_policy_source", True))
     tools = ConnectorTools(ROOT, {"connectors": [{"id": "files"}]})
     pool = MCPPool(spec)
+    hosted_origin = getattr(application_startup, "console_public_origin", None)
+    hosted_targets = getattr(application_startup, "hosted_mcp_targets", ())
+    if hosted_origin is not None and not authenticated_console:
+        raise ValueError("Hosted MCP requires the configured authenticated Console.")
+    hosted_console = ({} if hosted_origin is None else
+        {"public_origin": hosted_origin, "hosted_mcp_targets": hosted_targets})
     console_front = (ConsoleFront(ROOT, port, os.environ.get("CONSOLE_USER_ID"),
         os.environ.get("CONSOLE_LOGIN_PASSWORD"), application.on_console_input,
-        runtime_namespace="meta" if meta else "mobkit") if authenticated_console else None)
-    application.context.console_url = f"http://127.0.0.1:{port}/console"
+        runtime_namespace="meta" if meta else "mobkit",
+        **hosted_console) if authenticated_console else None)
+    application.context.console_url = f"{hosted_origin or f'http://127.0.0.1:{port}'}/console"
     configured_tools = {}
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

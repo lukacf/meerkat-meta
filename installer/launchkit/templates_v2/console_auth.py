@@ -46,6 +46,8 @@ MAX_FRONTEND_BODY = 256 * 1024
 FRONTEND_APPROVAL_SECONDS = 300
 CONNECT_PATH = "/console/forge/connect"
 CONTROLLER_REVIEW_PATH = "/console/forge/controller-review"
+HOSTED_MCP_PATH = "/console/forge/mcp"
+MAX_HOSTED_MCP_BODY = 64 * 1024
 MAX_CONTROLLER_REVIEW_BODY = 4096
 MAX_CONNECT_BODY = 64 * 1024 * 1024
 CONSOLE_ASSET_PATH = "/console/forge/assets"
@@ -343,6 +345,8 @@ class _ConsoleLogin:
     console_login_failure: str | None = None
     console_login_close: asyncio.Task | None = None
     console_login_revoke_failed: bool = False
+    mcp_attempts: dict = field(default_factory=dict)
+    mcp_close: asyncio.Task | None = None
 
 
 class ConsoleFront:
@@ -359,7 +363,8 @@ class ConsoleFront:
 
     def __init__(self, root, port, principal, password, on_input=None, *, transport=None, connect_factory=None,
                  console_assets=None, document_transform=None, controller_review_factory=None,
-                 console_login_factory=None, runtime_namespace="mobkit", public_origin=None):
+                 console_login_factory=None, runtime_namespace="mobkit", public_origin=None,
+                 hosted_mcp_targets=()):
         if type(runtime_namespace) is not str or runtime_namespace not in ("mobkit", "meta"):
             raise ValueError("The application must select the mobkit or meta Console runtime namespace.")
         # The trusted application selects one SDK before serving. Browser RPC
@@ -375,6 +380,18 @@ class ConsoleFront:
         self.origin = _console_origin(public_origin, self.local_origin)
         self._browser_host = urlsplit(self.origin).netloc
         self._secure_cookie = public_origin is not None
+        if type(hosted_mcp_targets) is not tuple or len(hosted_mcp_targets) > 32:
+            raise ValueError("Hosted MCP needs a bounded tuple of trusted configured targets.")
+        if hosted_mcp_targets:
+            from meerkat_toolkit.mcp_auth import McpTarget
+            if (not self._secure_cookie or any(type(target) is not McpTarget for target in hosted_mcp_targets)
+                    or len(set(hosted_mcp_targets)) != len(hosted_mcp_targets)):
+                raise ValueError("Hosted MCP needs distinct configured targets and the trusted HTTPS origin.")
+        # Browser aliases name only these original targets. Request JSON never
+        # supplies a target, account, native handle or redirect selection.
+        self._mcp_targets = MappingProxyType({secrets.token_urlsafe(24): target for target in hosted_mcp_targets})
+        self._mcp_original_targets = {key: copy.deepcopy(target) for key, target in self._mcp_targets.items()}
+        self._mcp_routes = {}
         self.key = _private_key(root, create=True)
         self.password_digest = hashlib.sha256(password.encode()).digest()
         self.cookie = "mobkit_console_" + hashlib.sha256((str(self.root.resolve()) + str(port)).encode()).hexdigest()[:16]
@@ -473,7 +490,7 @@ class ConsoleFront:
         fences = [asyncio.create_task(owner.retire(reason))
                   for owner in (login.connect, login.controller_review) if owner is not None]
         if login.console_login is not None:
-            fences.append(asyncio.create_task(self._console_login_cleanup(login.console_login, "retire", reason)))
+            fences.append(asyncio.create_task(self._retire_native_login(login, "retire", reason)))
         if login.expiry_task and not login.expiry_task.done():
             login.expiry_task.cancel()
             await asyncio.gather(login.expiry_task, return_exceptions=True)
@@ -633,6 +650,28 @@ class ConsoleFront:
             raise RuntimeError("Console login cleanup is unconfirmed.")
         return await result
 
+    async def _close_mcp(self, login):
+        if login.mcp_close is None:
+            async def close():
+                results = await asyncio.gather(*(attempt.close() for attempt in login.mcp_attempts.values()),
+                                               return_exceptions=True)
+                if any(isinstance(result, BaseException) for result in results):
+                    raise RuntimeError("MCP sign-in cleanup is unconfirmed.")
+            login.mcp_close = asyncio.create_task(close())
+        return await asyncio.shield(login.mcp_close)
+
+    async def _retire_native_login(self, login, method, *args):
+        # Local admission is already revoked. Join ceremonies while the same
+        # enrollment still permits their native cancel/release, then retire it.
+        failure = None
+        try:
+            await self._close_mcp(login)
+        except Exception:
+            failure = True
+        await self._console_login_cleanup(login.console_login, method, *args)
+        if failure:
+            raise RuntimeError("MCP sign-in cleanup is unconfirmed.")
+
     def _queue_controller_review(self, login):
         if not login.console_login_required:
             self._reserve_controller_review(login)
@@ -676,7 +715,7 @@ class ConsoleFront:
                 if login.controller_review is not None and login.controller_review_close is None:
                     login.controller_review_close = asyncio.create_task(login.controller_review.close())
                 if login.console_login is not None and login.console_login_close is None:
-                    login.console_login_close = asyncio.create_task(self._console_login_cleanup(login.console_login, "close"))
+                    login.console_login_close = asyncio.create_task(self._retire_native_login(login, "close"))
             # Joined close can release an entered startup/presenter while its
             # retirement is pending. Neither is abandoned on a view loss.
             joined = await asyncio.gather(*(task for login in logins for task in
@@ -705,6 +744,7 @@ class ConsoleFront:
                 raise RuntimeError("Console access cleanup is unconfirmed." if any(login.connect is not None or login.controller_review is not None or login.console_login is not None for login in logins)
                                    else "Console subscription cleanup is unconfirmed.")
             self._logins.clear()
+            self._mcp_routes.clear()
         finally:
             if self.listener:
                 self.listener.close()
@@ -735,18 +775,32 @@ class ConsoleFront:
     async def handle(self, request):
         from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
         path = request.url.path
+        mcp_callback = self._mcp_routes.get(path)
+        mcp_landing = mcp_callback is not None and request.method in ("GET", "HEAD")
+        if mcp_callback is not None and request.scope.get("raw_path") != path.encode("ascii"):
+            return Response(status_code=400, headers=_console_public_headers())
         availability = path == AVAILABILITY_PATH
-        availability_headers = _console_public_headers() if availability else None
+        availability_headers = (_console_public_headers() if availability or mcp_callback is not None
+                                or path == HOSTED_MCP_PATH or path.startswith(HOSTED_MCP_PATH + "/") else None)
         toolkit_callback_landing = path == "/host/toolkit/setup/callback" and request.method == "GET"
         # Internal health probes keep their existing loopback URL and separate
         # read-only bearer credential. A browser cookie never admits this alias.
         local_health = (self._secure_cookie and request.method == "GET" and path in HEALTH_PATHS
                         and request.headers.get("host") == urlsplit(self.local_origin).netloc)
         if (request.headers.get("host") != self._browser_host and not local_health
-                or not toolkit_callback_landing and any(key == "auth_token" for key, _ in parse_qsl(request.url.query))):
+                or not (toolkit_callback_landing or mcp_landing) and any(key == "auth_token" for key, _ in parse_qsl(request.url.query))):
             return Response("Invalid Console address.", status_code=400, headers=availability_headers)
-        if request.headers.get("origin") not in (None, self.origin) and not toolkit_callback_landing:
+        if request.headers.get("origin") not in (None, self.origin) and not (toolkit_callback_landing or mcp_landing):
             return Response("Cross-origin Console requests are refused.", status_code=403, headers=availability_headers)
+        if mcp_landing:
+            # The SDK fixed landing is independent of browser/native login.
+            # Never parse, log or forward the provider query on this GET.
+            if len(request.scope["query_string"]) > MAX_HOSTED_MCP_BODY:
+                return Response(status_code=413, headers=_console_public_headers())
+            redirect, binding = mcp_callback
+            response = await binding.handle_callback(method="GET", redirect_uri=redirect)
+            return Response(b"" if request.method == "HEAD" else response.body,
+                            status_code=response.status, headers=dict(response.headers))
         if availability:
             # Deployment relays may probe this front without allocating a login
             # nonce, inspecting a session, driving retirement or calling native.
@@ -826,9 +880,11 @@ class ConsoleFront:
             if not health:
                 if request.method == "GET" and path in ("/", "/console", "/console/"):
                     return RedirectResponse("/login", status_code=303)
-                return JSONResponse({"error": "Console login required."}, status_code=401)
+                return JSONResponse({"error": "Console login required."}, status_code=401,
+                                    headers=availability_headers)
         if request.method not in ("GET", "HEAD") and request.headers.get("origin") != self.origin:
-            return Response("Console changes require a same-origin authenticated browser.", status_code=403)
+            return Response("Console changes require a same-origin authenticated browser.", status_code=403,
+                            headers=availability_headers)
         if path == "/logout" and request.method == "POST":
             retirement = self._retire_login(login.session, "logout")
             if retirement is not None:
@@ -861,6 +917,10 @@ class ConsoleFront:
                                 headers=_console_public_headers())
         if path == FRONTEND_DESCRIPTOR_PATH:
             return await self._frontend_descriptor(request, login)
+        if mcp_callback is not None:
+            return await self._mcp_callback(request, login, mcp_callback[0])
+        if path == HOSTED_MCP_PATH or path.startswith(HOSTED_MCP_PATH + "/"):
+            return await self._mcp_request(request, login)
         if path == FRONTEND_PATH or path.startswith(FRONTEND_PATH + "/"):
             return await self._frontend_request(request, login)
         if path == CONTROLLER_REVIEW_PATH or path.startswith(CONTROLLER_REVIEW_PATH + "/"):
@@ -1073,6 +1133,142 @@ class ConsoleFront:
             return JSONResponse({"error": "Console login required."}, status_code=401,
                                 headers=_console_public_headers())
         return Response(payload, status_code=upstream.status_code, headers=forwarded)
+
+    async def _mcp_callback(self, request, login, redirect):
+        from starlette.responses import Response
+        headers = _console_public_headers()
+        if (request.method != "POST" or request.scope["query_string"]
+                or request.headers.get("content-type", "").split(";", 1)[0].strip() != "application/json"):
+            return Response(status_code=400, headers=headers)
+        if login is None or not self._disclosure_current(request, login):
+            return Response(status_code=403, headers=headers)
+        # Select only the attempt owned by this exact authenticated login.
+        matches = [attempt for attempt in login.mcp_attempts.values()
+                   if attempt.client is not None and attempt.client.redirect_uri == redirect]
+        if len(matches) != 1:
+            return Response(status_code=403, headers=headers)
+        try:
+            body = await self._body(request, MAX_HOSTED_MCP_BODY)
+            if not self._disclosure_current(request, login):
+                return Response(status_code=403, headers=headers)
+            result = await matches[0].callback(method="POST", redirect_uri=redirect,
+                origin=request.headers.get("origin"), body=body)
+            if not self._disclosure_current(request, login):
+                return Response(status_code=403, headers=headers)
+            return Response(result.body, status_code=result.status, headers=dict(result.headers))
+        except ValueError:
+            return Response(status_code=400, headers=headers)
+        except Exception:
+            return Response(status_code=503, headers=headers)
+
+    def _mount_mcp(self, login, attempt, redirect):
+        parsed = urlsplit(redirect)
+        path = parsed.path
+        if (parsed.scheme + "://" + parsed.netloc != self.origin or not path.startswith("/")
+                or parsed.query or parsed.fragment or "%" in path or "//" in path
+                or any(part in (".", "..") for part in path.split("/"))
+                or path in ("/", "/login", "/logout", AVAILABILITY_PATH)
+                or path.startswith(("/console", "/blobs/", "/host/toolkit/setup"))):
+            raise ValueError("The native callback cannot be mounted on this Console.")
+        if any(other is not attempt and other.client is not None and other.client.redirect_uri == redirect
+               for other in login.mcp_attempts.values()):
+            raise ValueError("The native callback has an ambiguous login target.")
+        previous = self._mcp_routes.get(path)
+        if previous is not None and previous[0] != redirect:
+            raise ValueError("The native callback changed its selected route.")
+        self._mcp_routes[path] = (redirect, attempt.binding)
+
+    async def _mcp_request(self, request, login):
+        from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+        headers = _console_public_headers()
+        if not self._mcp_targets:
+            return Response(status_code=404, headers=headers)
+        if login is None or not self._disclosure_current(request, login) or not login.console_login_required:
+            return Response(status_code=403, headers=headers)
+        if request.scope["query_string"]:
+            return Response(status_code=400, headers=headers)
+        path = request.url.path
+        if path == HOSTED_MCP_PATH:
+            if request.method != "GET":
+                return Response(status_code=405, headers={**headers, "Allow": "GET"})
+            rows = "".join("<li><p>" + html.escape(target.server_name) + "</p>"
+                '<form method="post" action="' + HOSTED_MCP_PATH + "/" + key + '/start">'
+                '<button type="submit">Sign in</button></form><a href="' + HOSTED_MCP_PATH
+                + "/" + key + '">Check credential status</a></li>' for key, target in self._mcp_targets.items())
+            return HTMLResponse('<!doctype html><html lang="en"><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width, initial-scale=1">'
+                '<title>MCP sign-in</title><h1>MCP sign-in</h1><p>Sign in to a configured service. '
+                'A saved credential does not confirm a connection or permission to use it.</p><ul>' + rows
+                + '</ul><a href="/console">Return to Console</a></html>', headers={**headers,
+                    "Content-Security-Policy": "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"})
+        parts = path.removeprefix(HOSTED_MCP_PATH + "/").split("/")
+        key = parts[0]
+        target = self._mcp_targets.get(key)
+        action = "status" if len(parts) == 1 else parts[1] if len(parts) == 2 else None
+        if target is None or action not in ("status", "start", "close"):
+            return Response(status_code=404, headers=headers)
+        if target != self._mcp_original_targets[key]:
+            return Response(status_code=409, headers=headers)
+        method = "GET" if action == "status" else "POST"
+        if request.method != method:
+            return Response(status_code=405, headers={**headers, "Allow": method})
+        try:
+            if await self._body(request, 0):
+                return Response(status_code=400, headers=headers)
+            if not self._disclosure_current(request, login) or login.mcp_close is not None:
+                return Response(status_code=403, headers=headers)
+            attempt = login.mcp_attempts.get(key)
+            if attempt is None:
+                if action == "close":
+                    return Response(status_code=204, headers=headers)
+                # The factory is synchronous and dormant. Retain it before
+                # describe, even if this HTTP waiter is subsequently cancelled.
+                attempt = login.console_login.hosted_mcp(self._login_context(login), target)
+                login.mcp_attempts[key] = attempt
+            if action == "close":
+                await attempt.close()
+                return Response(status_code=204, headers=headers)
+            redirect = await attempt.prepare()
+            if not self._disclosure_current(request, login):
+                return Response(status_code=403, headers=headers)
+            self._mount_mcp(login, attempt, redirect)
+            if action == "status":
+                observed = await attempt.observe()
+                if not self._disclosure_current(request, login):
+                    return Response(status_code=403, headers=headers)
+                return JSONResponse({"phase": observed.phase}, headers=headers)
+            disposition = await attempt.begin()
+            if disposition == "joined":
+                return JSONResponse({"phase": "joined"}, status_code=202, headers=headers)
+            response = None
+
+            async def present(url):
+                nonlocal response
+                if not self._disclosure_current(request, login):
+                    raise ValueError("The Console login changed during presentation.")
+                response = RedirectResponse(url, status_code=303, headers=headers)
+
+            presented = await attempt.present(present)
+            if not presented or response is None or not self._disclosure_current(request, login):
+                return Response(status_code=503, headers=headers)
+            return response
+        except ValueError:
+            return Response(status_code=400, headers=headers)
+        except Exception as error:
+            # Preserve native diagnostic tokens, never provider text or frames.
+            from meerkat_toolkit.mcp_auth import McpAuthError, NativeAuthFailure
+            payload = {"error": "mcp_sign_in_unavailable"}
+            failure = error.native_failure if isinstance(error, McpAuthError) else None
+            if not self._disclosure_current(request, login):
+                return Response(status_code=403, headers=headers)
+            if isinstance(failure, NativeAuthFailure):
+                codes = {"reason": failure.reason}
+                if failure.detail is not None:
+                    codes["detail"] = failure.detail
+                if all(type(code) is str and re.fullmatch(r"[a-z][a-z0-9_]{0,127}", code)
+                       for code in codes.values()):
+                    payload["native_failure"] = codes
+            return JSONResponse(payload, status_code=503, headers=headers)
 
     def _reserve_controller_review(self, login, *, reserved=False):
         """Trusted login lifecycle hook; no browser route starts native review.

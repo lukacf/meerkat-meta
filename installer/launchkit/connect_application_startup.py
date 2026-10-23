@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+from urllib.parse import urlsplit
 
 from .connect_application_finalizer import ApplicationPolicyFinalizer, _Current, application_command_executor
 from .connect_installer_caller import (
@@ -59,6 +60,64 @@ def member_mcp_runtime_options(application):
     """
     factory = getattr(application, "member_mcp_runtime_options", None)
     return factory() if factory is not None else {}
+
+
+def _hosted_mcp_origin(base):
+    """Check the Console mount only; Core validates the registered OAuth base.
+
+    The trusted Python startup owner selects this value. Neither blueprint,
+    environment, forwarded headers nor browser input can select or replace it.
+    Preserve the original base bytes when passing them to the native child.
+    """
+    if base is None:
+        return None
+    try:
+        if (type(base) is not str or not base.isascii() or not base
+                or any(ord(c) <= 32 or ord(c) == 127 for c in base) or "\\" in base):
+            raise ValueError
+        parsed = urlsplit(base)
+        if parsed.scheme != "https" or parsed.query or parsed.fragment or "?" in base or "#" in base:
+            raise ValueError
+        # Select the shipped layout explicitly. An editable installation can
+        # otherwise resolve a missing submodule from an unrelated checkout.
+        if (Path(__file__).parent / "templates_v2/console_auth.py").is_file():
+            from .templates_v2.console_auth import _console_origin
+        else:
+            # Generated applications ship the protected Console at their root.
+            from console_auth import _console_origin
+        return _console_origin("https://" + parsed.netloc, None)
+    except (TypeError, ValueError):
+        raise CustodyError("The trusted hosted MCP base requires a valid HTTPS Console mount.") from None
+
+
+def _select_hosted_mcp(owner, base, targets=()):
+    if type(targets) is not tuple or len(targets) > 32 or targets and base is None:
+        raise CustodyError("The trusted hosted MCP targets require their selected HTTPS base.")
+    if targets:
+        from meerkat_toolkit.mcp_auth import McpTarget
+        if any(type(target) is not McpTarget for target in targets) or len(set(targets)) != len(targets):
+            raise CustodyError("The trusted hosted MCP targets must be distinct configured McpTarget objects.")
+    owner.console_public_origin = _hosted_mcp_origin(base)
+    owner.hosted_mcp_redirect_base = base
+    owner.hosted_mcp_targets = targets
+    owner._original_hosted_mcp = (base, owner.console_public_origin, targets, deepcopy(targets))
+
+
+def _hosted_mcp_runtime_options(owner):
+    selected = (owner.hosted_mcp_redirect_base, owner.console_public_origin)
+    if any(type(a) is not type(b) or a != b for a, b in zip(selected, owner._original_hosted_mcp)):
+        raise CustodyError("The original hosted MCP startup selection changed.")
+    if (owner.hosted_mcp_targets is not owner._original_hosted_mcp[2]
+            or owner.hosted_mcp_targets != owner._original_hosted_mcp[3]):
+        raise CustodyError("The original hosted MCP target selection changed.")
+    return {} if selected[0] is None else {"hosted_mcp_redirect_base": selected[0]}
+
+
+def _hosted_mcp_startup_options(owner):
+    options = _hosted_mcp_runtime_options(owner)
+    if options:
+        options["hosted_mcp_targets"] = owner.hosted_mcp_targets
+    return options
 
 
 def _prepare_context_parents(root, project_lease, require_current, *, initialize):
@@ -383,7 +442,9 @@ class FreshApplicationStartup:
             activation_template: ExactFile, command, command_timeout: float,
             startup_timeout: float, provision_attempt_path: Path,
             working_directory: Path, bundle_path: Path, activation_path: Path,
-            source_files: tuple[ExactFile, ...] = (), model_configuration=None):
+            source_files: tuple[ExactFile, ...] = (), model_configuration=None,
+            hosted_mcp_redirect_base=None, hosted_mcp_targets=()):
+        _select_hosted_mcp(self, hosted_mcp_redirect_base, hosted_mcp_targets)
         if (not callable(getattr(project_lease, "require_current", None))
                 or not isinstance(getattr(project_lease, "root", None), Path)
                 or any(not isinstance(pin, ExactFile) for pin in
@@ -423,6 +484,7 @@ class FreshApplicationStartup:
         self._shutdown_task = self._shutdown_runtime = None
 
     def _require_owner(self):
+        _hosted_mcp_runtime_options(self)
         self.lease.require_current()
         if self.lease.root != self.root:
             raise CustodyError("The fresh application project owner changed its selected root.")
@@ -566,7 +628,8 @@ class FreshApplicationStartup:
         from meerkat_toolkit.host_control import ApplicationPreparation, SelectedHostArtifact
         runtime = ToolkitApplicationRuntime(config,
             ApplicationPreparation(SelectedHostArtifact(str(self.plan.path), self.plan.sha256),
-                timeout=self.hold_timeout), self.finalizer, **member_mcp_runtime_options(application))
+                timeout=self.hold_timeout), self.finalizer, **member_mcp_runtime_options(application),
+            **_hosted_mcp_runtime_options(self))
         self.runtime = runtime
         application.context.runtime = runtime
         try:
@@ -608,7 +671,9 @@ class RestoredApplicationStartup:
 
     def __init__(self, *, project_lease, accepted_source, gateway: ExactFile,
             selection_file: ExactFile, preparation_plan: ExactFile,
-            completed_setup: ExactFile, startup_timeout: float, model_configuration=None):
+            completed_setup: ExactFile, startup_timeout: float, model_configuration=None,
+            hosted_mcp_redirect_base=None, hosted_mcp_targets=()):
+        _select_hosted_mcp(self, hosted_mcp_redirect_base, hosted_mcp_targets)
         if (not callable(getattr(project_lease, "require_current", None))
                 or not isinstance(getattr(project_lease, "root", None), Path)
                 or any(not isinstance(pin, ExactFile) for pin in
@@ -634,6 +699,7 @@ class RestoredApplicationStartup:
         self._shutdown_task = self._shutdown_runtime = None
 
     def _require_owner(self):
+        _hosted_mcp_runtime_options(self)
         self.lease.require_current()
         if self.lease.root != self.root:
             raise CustodyError("The installed restart project owner changed its selected root.")
@@ -799,7 +865,8 @@ class RestoredApplicationStartup:
         selection = HostBootstrapSelection(deployment_root=self._selected["deployment_root"],
             **{name: SelectedHostArtifact(**self._selected[name]) for name in
                 ("activation", "policy_manifest", "local_policy")})
-        runtime = ToolkitMobKitRuntime(config, selection, **member_mcp_runtime_options(application))
+        runtime = ToolkitMobKitRuntime(config, selection, **member_mcp_runtime_options(application),
+            **_hosted_mcp_runtime_options(self))
         self.runtime = runtime
         application.context.runtime = runtime
         try:

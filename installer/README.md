@@ -1701,6 +1701,49 @@ the required capability cannot perform a continuing instruction update. The
 accepted Reading upgrade preserved unchanged roles; it does not establish
 changed-role adoption.
 
+### Hosted MCP sign-in on the selected Console
+
+The trusted Python launcher can supply `hosted_mcp_redirect_base` and a tuple
+of configured `meerkat_toolkit.mcp_auth.McpTarget` objects as
+`hosted_mcp_targets`. Fresh, restored and replacement application startup owners
+accept these inputs. `BootstrapFactory`, `InstalledBootstrapFactory` and
+`run_child` carry them for fresh and restored Toolkit startup. Ordinary Meta
+startup does not supply the native hosted-auth endpoint. Omission preserves the
+existing local Console. These inputs are not blueprint fields, environment
+overrides, agent tools or request JSON; the trusted launcher must select them
+again when starting an installed host.
+
+The base is passed unchanged to the Connect runtime constructor and its native
+startup option, outside model configuration. Its HTTPS origin selects the whole
+authenticated Console mount. The listener remains on loopback at the normal
+application port; deployment owns the TLS ingress, HSTS and exact routing.
+Supplying the input does not provision a route, register a provider client or
+prove that an existing public origin reaches this application.
+
+Authenticated humans open `/console/forge/mcp` to sign in to the selected
+services. The host issues aliases for its configured targets. A target is a
+locator, not permission: native resolves it against the actual configured
+realm, server and account. The host first describes it over the original
+enrolled private connection, mounts Core's exact redirect URI, and then uses
+Connect's `HostedMcpAuthBinding` to begin and present the login. Each target has
+one retained attempt per Console login. Repeated requests reuse that attempt;
+they do not retry an uncertain start. A joined native attempt does not disclose
+another caller's authorization URL.
+
+Callback GET serves the SDK's fixed, uncached landing without inspecting a login
+or forwarding the query. Its bounded same-origin POST requires the original
+live Console login and binding. Callback receipt, credential observation,
+connection readiness and permission to invoke a tool are separate outcomes.
+The host retains attempts across cancelled HTTP waiters and closes them before
+retiring their enrollment on logout or shutdown. It never closes the runtime's
+shared private client. Provider callbacks and authorization URLs are excluded
+from logs and ordinary Console/model context.
+
+The source tests exercise the actual SDK over anonymous test pipes and ASGI.
+They do not establish a real TLS route, provider login, native configuration
+resolution, installed persistence or cold restore. Those require the reviewed
+matching Core/Meta/Connect artifacts and the deployment owner's selected route.
+
 ### Explicit application tool selection
 
 A generated application can retain `application/tool-policy.json` alongside its

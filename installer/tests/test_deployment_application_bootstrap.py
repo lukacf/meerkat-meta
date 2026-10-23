@@ -141,13 +141,16 @@ async def inputs(tmp_path, monkeypatch):
     return Inputs(directory, receipt, destination, monkeypatch)
 
 
-async def test_fresh_retains_real_source_and_original_startup_with_durable_entry(inputs):
+@pytest.mark.parametrize("hosted_base", [None, "https://console.example.test/native-auth"])
+async def test_fresh_retains_real_source_and_original_startup_with_durable_entry(inputs, hosted_base):
     pin, observation = inputs.admit()
     observation.require_current()
-    factory = module.BootstrapFactory(inputs.directory, pin)
+    factory = module.BootstrapFactory(inputs.directory, pin, hosted_mcp_redirect_base=hosted_base)
     with project_lock(inputs.destination) as lease:
         async with factory(lease) as startup:
             assert isinstance(startup, FreshApplicationStartup)
+            assert startup.hosted_mcp_redirect_base == hosted_base
+            assert startup.console_public_origin == (None if hosted_base is None else "https://console.example.test")
             assert startup.lease is lease and factory.source.receipt == inputs.receipt
             assert startup.caller.provision_attempt_path == Path(inputs.fresh["provision_attempt_path"])
             assert startup._startup_timeout == 240
