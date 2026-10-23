@@ -1219,3 +1219,23 @@ def test_ordinary_child_without_relocated_source_keeps_existing_factory(inputs, 
     assert imported == ["meerkat_meta.builder", "meerkat_toolkit.host_control",
         "meerkat_toolkit.application_runtime", "app"]
     assert not (inputs.directory / bootstrap.FRESH_ENTRY_NAME).exists()
+
+
+def test_child_prints_one_timestamped_line_per_startup_phase(inputs, monkeypatch, capsys):
+    # The worker stamps every captured child line, so these lines split a slow
+    # Start into its phases without a profiler.
+    import re
+    pin, _ = inputs.admit("restore")
+    def load(name):
+        if name != "app":
+            return ModuleType(name)
+        return SimpleNamespace(__file__=str(inputs.destination / "app.py"),
+            main=lambda *, application_startup_factory: None)
+    monkeypatch.setattr(bootstrap.importlib, "import_module", load)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(sys, "argv", list(sys.argv))
+    bootstrap.run_child(str(inputs.directory), pin["path"], pin["sha256"])
+    lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith("forge-child-phase: ")]
+    assert [line.split()[1] for line in lines] == [
+        "entered", "custody-observed", "sdk-imported", "app-imported", "app-main"]
+    assert all(re.fullmatch(r"forge-child-phase: [a-z-]+ \+[0-9]+\.[0-9]{3}s", line) for line in lines)

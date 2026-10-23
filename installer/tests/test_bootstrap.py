@@ -4,7 +4,6 @@ import hashlib
 import io
 import json
 from pathlib import Path
-import sys
 import tarfile
 
 import pytest
@@ -157,27 +156,6 @@ def test_native_maintenance_binary_uses_its_own_release_artifact(tmp_path, monke
     assert json.loads(result.with_name('mobkit_gateway.receipt.json').read_text())['archive']==filename
     with pytest.raises(bootstrap.GatewayInstallError):
         bootstrap.download_gateway(tmp_path/'invented',binary_name='invented')
-
-
-@pytest.mark.parametrize("explicit", [False, True])
-def test_cli_stages_release_pair_and_preserves_explicit_destination(tmp_path, monkeypatch, explicit):
-    package = tmp_path / "same-checkout"
-    monkeypatch.setattr(bootstrap, "__file__", str(package / "launchkit/bootstrap.py"))
-    destination = tmp_path / "custom-tools/rpc_gateway" if explicit else (
-        package / ".tools/releases" / bootstrap.VERSION / ".tools/rpc_gateway")
-    arguments = ["bootstrap", "--maintenance"]
-    if explicit:
-        arguments.extend(["--destination", str(destination)])
-    monkeypatch.setattr(sys, "argv", arguments)
-    calls = []
-
-    def download(selected, *, binary_name="rpc_gateway"):
-        calls.append((selected, binary_name))
-        return selected
-
-    monkeypatch.setattr(bootstrap, "download_gateway", download)
-    bootstrap.main()
-    assert calls == [(destination, "rpc_gateway"), (destination.with_name("mobkit_gateway"), "mobkit_gateway")]
 
 
 def test_package_tool_path_rejects_non_official_binary_name(tmp_path):

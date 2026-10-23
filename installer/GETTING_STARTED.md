@@ -629,6 +629,15 @@ setup with the new source. If that Start fails, choose **Restore previous
 application** when offered. After Forge restarts, use **Continue setup** once
 before you stage or apply an update.
 
+An application without a setup helper takes the same kind of update: Forge
+applies only updates built from its own application source that keep its plan,
+definition, protected settings, native instructions and runtime. **Apply and
+verify update** installs and checks the new source and leaves the application
+stopped; **Start installed application** then runs it, and **Restore previous
+application** returns to the previous source. After Forge restarts, use
+**Continue setup** or **Start installed application** once before you apply an
+update.
+
 For an agent team, tell the setup guide what should change and review the revised
 plan. This does not modify the installed team.
 

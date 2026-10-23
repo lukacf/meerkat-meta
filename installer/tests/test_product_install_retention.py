@@ -8,6 +8,7 @@ from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -334,6 +335,52 @@ async def test_retainer_refusal_preserves_original_install_and_single_handle(ret
     async with f.service.lock:
         with pytest.raises(CustodyError, match="only once"):
             f.host.retain_installation_inputs(f.service, f.guide_id, f.directory.name)
+
+
+@pytest.mark.parametrize("kind", ["custody", "draft", "other"])
+async def test_retention_refusal_shows_only_the_installers_own_typed_text(retaining, caplog, kind):
+    # The installer's typed refusals are authored, user-facing text: the journal
+    # and the Forge log show it. Any other error keeps only its type name.
+    f = retaining
+    text = {"custody": "The inert typed custody refusal names its remedy.",
+        "draft": "The inert typed draft refusal names its remedy.",
+        "other": "inert-private-retainer-detail"}[kind]
+    error = {"custody": CustodyError, "draft": DraftConflict, "other": OSError}[kind](text)
+    def refused(guide, installation, supervisor):
+        raise error
+    f.host._retain_preparation_inputs = refused
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(type(error)):
+            await finished(f)
+        await asyncio.sleep(0)
+    receipt = deployment.read_receipt(f.directory)
+    assert receipt["status"] == "stopped" and receipt["phase"] == "configure"
+    logged = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    if kind == "other":
+        assert receipt["detail"] == ("Trusted setup inputs were not retained (OSError). "
+            "Your files are preserved. Check setup status before continuing.")
+        assert len(logged) == 1 and "(OSError)" in logged[0]
+        assert text not in receipt["detail"] and not any(text in line for line in logged)
+    else:
+        assert receipt["detail"] == ("Trusted setup inputs were not retained: " + text
+            + " Your files are preserved. Check setup status before continuing.")
+        assert receipt["progress"][-1]["message"] == receipt["detail"]
+        assert len(logged) == 1 and text in logged[0]
+    assert f.service.tasks == {} and f.service.processes == {}
+
+
+async def test_retention_refusal_text_is_one_bounded_sentence(retaining):
+    f = retaining
+    def refused(guide, installation, supervisor):
+        raise CustodyError("A typed refusal\nover two lines" + " without an end" * 400)
+    f.host._retain_preparation_inputs = refused
+    with pytest.raises(CustodyError):
+        await finished(f)
+    detail = deployment.read_receipt(f.directory)["detail"]
+    shown = detail.removeprefix("Trusted setup inputs were not retained: ").removesuffix(
+        " Your files are preserved. Check setup status before continuing.")
+    assert shown != detail and "\n" not in detail and len(shown) <= 2001
+    assert shown.startswith("A typed refusal over two lines without an end") and shown.endswith(".")
 
 
 async def test_later_read_only_supplier_cannot_replace_retained_object(retaining):

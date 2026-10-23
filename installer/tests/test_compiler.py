@@ -91,12 +91,15 @@ def test_deployment_and_rehearsal_resolve_newer_model_from_the_same_native_regis
 
 def test_package_zip_hashes_modes_and_preview_match():
     spec = starter_blueprint()
-    files = generate_files(spec)
-    checksums = dict(line.split("  ", 1)[::-1] for line in files["SHA256SUMS"].splitlines())
-    for path, digest in checksums.items():
-        assert hashlib.sha256(files[path].encode()).hexdigest() == digest
+    legacy = generate_files(spec)
+    public = {item.path: item.content for item in generate_package(spec, public_runtime=True)}
+    for files in (legacy, public):
+        checksums = dict(line.split("  ", 1)[::-1] for line in files["SHA256SUMS"].splitlines())
+        for path, digest in checksums.items():
+            assert hashlib.sha256(files[path].encode()).hexdigest() == digest
+    # The download is the package Install agent team installs: the public Meta release.
     with zipfile.ZipFile(io.BytesIO(build_archive(spec))) as archive:
-        for path, text in files.items():
+        for path, text in public.items():
             assert archive.read(f"{spec.project.slug}/{path}").decode() == text
         assert archive.getinfo(f"{spec.project.slug}/start.sh").external_attr >> 16 & 0o777 == 0o755
     assert package_preview(spec)["summary"]["agents"] == 4

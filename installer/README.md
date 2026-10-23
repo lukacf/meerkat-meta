@@ -170,11 +170,12 @@ A packaged standalone copy runs with Python 3.11+, including `venv` and
 `ensurepip`, on macOS or glibc Linux (2.31+).
 It contains the prebuilt wizard, its assets and source examples, exact runtime
 dependency pins, and a checksum-bound compatible Python SDK wheel. Node.js and a
-source checkout are not required to open this wizard. New bundles use the
-published MobKit 0.8.47 SDK and official native release, which pins Meerkat
-0.8.51. Packaging and startup verify the SDK's fixed PyPI checksum, package
-identity, release provenance and matching SDK/native version pins. Native
-downloads retain separate release-checksum and local receipt checks.
+source checkout are not required to open this wizard. New bundles carry the
+published MobKit 0.8.47 SDK, which pins Meerkat 0.8.51, for the packages they
+build. Packaging and startup verify the SDK's fixed PyPI checksum, package
+identity, release provenance and matching SDK/native version pins. The bundle
+downloads no native runtime of its own: each exported package installs its
+runtime and checks the release checksums itself.
 
 This is a developer alpha bundle. Dependency verification establishes the
 selected artifact identities, not a complete application or animation acceptance
@@ -188,10 +189,8 @@ bash start.sh
 ```
 
 Use `bash start.sh --prepare-only` to verify the bundle, create its Python
-environment, install its pinned dependencies and download the verified gateway
-binaries without starting the web server or native agents. Python package and
-gateway downloads require internet access. An explicit `MOBKIT_GATEWAY_BIN`
-retains the existing gateway-download override.
+environment and install its pinned dependencies without starting the web server
+or native agents. Python package downloads require internet access.
 
 Application builds containing JavaScript need Node.js for syntax checks. Builds
 with offline DOM acceptance tests require the reviewed Node.js 25.9.0 runtime;

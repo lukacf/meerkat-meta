@@ -79,11 +79,47 @@ pub(crate) fn acquisition_observation_probe(
     tests::acquisition_observation_probe(reject, reads)
 }
 
+/// A session service whose execution snapshot fails as `NotFound`, whose
+/// live-actor read answers `live` (`None`: the read fails), and whose durable
+/// store holds the session when `persisted`.
+#[cfg(test)]
+pub(crate) fn failed_snapshot_probe(
+    live: Option<bool>,
+    persisted: bool,
+) -> Arc<dyn MobSessionService> {
+    tests::failed_snapshot_probe(live, persisted)
+}
+
 /// A session service whose archive authority answers `answer`: whether it
 /// knows the session, or `None` when the read fails.
 #[cfg(test)]
 pub(crate) fn archive_authority_probe(answer: Option<bool>) -> Arc<dyn MobSessionService> {
     tests::archive_authority_probe(answer)
+}
+
+/// Whether durable input rows include one short of a terminal phase
+/// (consumed, superseded, coalesced or abandoned). `None` when a row does not
+/// decode. A phase this build does not know counts as not terminal.
+pub(crate) fn durable_inputs_owe_work(
+    rows: &[meerkat_runtime::store::InputStateRow],
+) -> Option<bool> {
+    use meerkat_runtime::input_state::InputLifecycleState;
+    let mut owes = false;
+    for row in rows {
+        match row {
+            meerkat_runtime::store::InputStateRow::Decoded(state) => {
+                owes |= !matches!(
+                    state.seed.phase,
+                    InputLifecycleState::Consumed
+                        | InputLifecycleState::Superseded
+                        | InputLifecycleState::Coalesced
+                        | InputLifecycleState::Abandoned
+                );
+            }
+            meerkat_runtime::store::InputStateRow::Corrupt { .. } => return None,
+        }
+    }
+    Some(owes)
 }
 
 pub(crate) const DELEGATE_IDLE_RETIRE_SECS_LABEL: &str = "implicit_delegate_idle_retire_secs";
@@ -10102,6 +10138,21 @@ impl MobRuntime {
         settled
     }
 
+    /// Whether the composition's durable runtime store holds an input of
+    /// `session_id` short of a terminal phase (accepted, queued, staged or
+    /// applied): work the session owes even while no live runtime serves it.
+    /// `None` without a durable store, when the read fails, or when a row does
+    /// not decode: inconclusive, never a guessed `false`.
+    pub(crate) async fn session_owes_durable_input(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Option<bool> {
+        let store = self.durable_runtime_store.as_ref()?;
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(session_id);
+        let rows = store.load_input_states(&runtime_id).await.ok()?;
+        durable_inputs_owe_work(&rows)
+    }
+
     /// Whether a session holds run input its runtime has taken up but not yet
     /// committed at a run boundary: meerkat's
     /// `MeerkatMachine::session_has_uncommitted_run_input`, read within
@@ -15308,8 +15359,21 @@ comms = true
         Fails,
     }
 
+    /// A failed execution snapshot, and what the typed local reads answer
+    /// for its session.
+    #[derive(Clone, Copy)]
+    struct FailedSnapshot {
+        /// The live-actor read's answer; `None`: the read fails.
+        live: Option<bool>,
+        /// The durable store holds the session.
+        persisted: bool,
+    }
+
     #[derive(Default)]
     struct ForwardingProbe {
+        /// Set: the execution snapshot fails and the typed local reads answer
+        /// this.
+        failed_snapshot: Mutex<Option<FailedSnapshot>>,
         acquisition_outcome: std::sync::atomic::AtomicU8,
         execution_snapshot_reads: Arc<std::sync::atomic::AtomicUsize>,
         acquisition_inputs: Mutex<Vec<Option<Arc<meerkat_runtime::MeerkatMachine>>>>,
@@ -15627,6 +15691,18 @@ comms = true
             _session_id: &meerkat_core::SessionId,
         ) -> Result<Option<meerkat_core::PersistedSessionMetadataView>, SessionError> {
             self.record("load_persisted_session_metadata");
+            let persisted = self
+                .failed_snapshot
+                .lock()
+                .expect("failed snapshot")
+                .is_some_and(|failed| failed.persisted);
+            if persisted {
+                let session = meerkat_core::Session::new();
+                return Ok(Some(
+                    meerkat_core::PersistedSessionMetadataView::try_from_session(&session)
+                        .expect("a fresh session's metadata view"),
+                ));
+            }
             Ok(None)
         }
 
@@ -15862,11 +15938,42 @@ comms = true
 
         async fn execution_snapshot(
             &self,
-            _session_id: &meerkat_core::SessionId,
+            session_id: &meerkat_core::SessionId,
         ) -> Result<Option<meerkat_core::AgentExecutionSnapshot>, SessionError> {
             self.execution_snapshot_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self
+                .failed_snapshot
+                .lock()
+                .expect("failed snapshot")
+                .is_some()
+            {
+                return Err(SessionError::NotFound {
+                    id: session_id.clone(),
+                });
+            }
             Ok(None)
+        }
+
+        async fn live_session_actor_registered(
+            &self,
+            session_id: &meerkat_core::SessionId,
+        ) -> Result<bool, SessionError> {
+            let failed = *self.failed_snapshot.lock().expect("failed snapshot");
+            match failed {
+                Some(FailedSnapshot {
+                    live: Some(live), ..
+                }) => Ok(live),
+                Some(FailedSnapshot { live: None, .. }) => Err(SessionError::Store(Box::new(
+                    std::io::Error::other("probe: the live-actor read fails"),
+                ))),
+                None => {
+                    <Self as meerkat_core::service::SessionService>::has_live_session(
+                        self, session_id,
+                    )
+                    .await
+                }
+            }
         }
 
         fn acquire_runtime_adapter(
@@ -19501,6 +19608,19 @@ image_generation = true
         Arc::new(ForwardingProbe {
             acquisition_outcome: std::sync::atomic::AtomicU8::new(if reject { 2 } else { 1 }),
             execution_snapshot_reads: reads,
+            ..ForwardingProbe::default()
+        })
+    }
+
+    pub(super) fn failed_snapshot_probe(
+        live: Option<bool>,
+        persisted: bool,
+    ) -> Arc<dyn MobSessionService> {
+        Arc::new(ForwardingProbe {
+            failed_snapshot: Mutex::new(Some(FailedSnapshot { live, persisted })),
+            // No runtime owner: the snapshot alone decides, as for a member
+            // whose machine holds no run.
+            acquisition_outcome: std::sync::atomic::AtomicU8::new(1),
             ..ForwardingProbe::default()
         })
     }

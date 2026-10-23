@@ -31,7 +31,9 @@ else:
 
 # Existing installer native and distribution bounds, applied to external bytes.
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
-MAX_BINARY_BYTES = 512 * 1024 * 1024
+# A sanity bound: _native expands and hashes a payload in 1 MiB chunks after
+# its archive matched the accepted record. The same 1 GiB as deployment_worker.
+MAX_BINARY_BYTES = 1024 * 1024 * 1024
 MAX_TAR_OVERHEAD = 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_WHEEL_BYTES = 32 * 1024 * 1024

@@ -31,6 +31,7 @@ import uuid
 
 from .blueprint import Blueprint
 from .compiler import continuation_contract, generate_package, generate_runtime_refresh
+from .projects import DraftConflict
 from .generator import PackageFile
 from .dom_check import is_dom_test, run_dom_tests
 from .checker_runtime import CheckerRuntimeError, resolve_node
@@ -56,6 +57,10 @@ PROTECTED_APPLICATION_PATHS = frozenset({"application/tool-policy.json",
 
 class WorkspaceError(ValueError):
     """A project path, mutation, or verification violated the workspace boundary."""
+
+
+class WorkspaceBusy(DraftConflict):
+    """Another owner held the workspace lock for longer than a read may wait."""
 
 
 @dataclass(frozen=True)
@@ -199,7 +204,7 @@ class ImplementationWorkspace:
     outside every executable check's sandbox. No API accepts a shell command.
     """
 
-    def __init__(self, root: str | Path, blueprint: Blueprint | dict):
+    def __init__(self, root: str | Path, blueprint: Blueprint | dict, *, read_lock_timeout=None):
         candidate = Path(root).absolute()
         if candidate.is_symlink():
             raise WorkspaceError("The workspace root cannot be a symlink.")
@@ -216,17 +221,32 @@ class ImplementationWorkspace:
         )
         self._blueprint_digest = _sha(_json(self.blueprint.model_dump(mode="json")))
         self._preparation_checks = []
+        # A server view waits at most this long to read; the builder's writes wait.
+        self._read_lock_timeout = read_lock_timeout
         for path in (self.project, self._state_path, self._key_path, self._lock_path, self._batch_path):
             if path.is_symlink():
                 raise WorkspaceError("Workspace storage cannot contain symlinks.")
 
     @contextmanager
-    def _locked(self):
+    def _locked(self, *, timeout=None):
+        """Hold the workspace lock. A read with a timeout refuses instead of waiting longer."""
         descriptor = os.open(self._lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             if os.fstat(descriptor).st_nlink != 1:
                 raise WorkspaceError("Workspace lock cannot be a hard link.")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if timeout is None:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            else:
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise WorkspaceBusy("The application workspace is busy with another operation. "
+                                "Try again in a moment.") from None
+                        time.sleep(0.05)
             self._recover_batch_locked()
             yield
         finally:
@@ -603,7 +623,7 @@ class ImplementationWorkspace:
 
     def framework_provenance(self):
         """Public source provenance, excluding the private host attestation."""
-        with self._locked():
+        with self._locked(timeout=self._read_lock_timeout):
             state = self._state()
             self._files(state)
             return {key: value for key, value in (state.get("framework") or {}).items() if key != "signature"}
@@ -686,13 +706,13 @@ class ImplementationWorkspace:
                 for item in files]
 
     def list_files(self):
-        with self._locked():
+        with self._locked(timeout=self._read_lock_timeout):
             state = self._state()
             return self._list(self._files(state), state)
 
     def read_file(self, path: str):
         _safe_name(path)
-        with self._locked():
+        with self._locked(timeout=self._read_lock_timeout):
             state = self._state()
             self._target(path)
             for item in self._files(state):
@@ -1029,7 +1049,7 @@ class ImplementationWorkspace:
                 "modified": True, "digest": self._digest(self._files(state))}
 
     def digest(self):
-        with self._locked():
+        with self._locked(timeout=self._read_lock_timeout):
             state = self._state()
             return self._digest(self._files(state))
 
@@ -1051,12 +1071,12 @@ class ImplementationWorkspace:
 
     def verification(self):
         """Return only the current, authentic receipt; edits make it disappear."""
-        with self._locked():
+        with self._locked(timeout=self._read_lock_timeout):
             state = self._state()
             return self._verification(state, self._files(state))
 
     def export_files(self, require_verified=True):
-        with self._locked():
+        with self._locked(timeout=self._read_lock_timeout):
             state = self._state()
             files = self._files(state)
             receipt = self._verification(state, files)

@@ -488,3 +488,41 @@ async def test_retained_live_task_same_request_returns_original_build_without_ne
     assert service.tasks == {directory.name: live_task} and not service.processes
     service.status.assert_awaited_once_with(service.guide.identity)
     service._run.assert_not_awaited()
+
+
+async def test_recovery_releases_its_locks_when_the_loop_waits_for_them(saved, monkeypatch):
+    # The recovery thread checks the guide on the event loop while it holds
+    # the build's selection locks. If the loop is itself waiting for one of
+    # those locks, the thread must give up within a bound and release them.
+    import fcntl
+    import time
+    service, directory, workspace, frozen, receipt = saved
+    choice = await candidate(saved)
+    monkeypatch.setattr(implementation, "SELECTION_FENCE_TIMEOUT", 0.5, raising=False)
+    original, calls, observed = service._guide, [], {}
+
+    async def guide(identity):
+        calls.append(identity)
+        if len(calls) > 1 and not observed:
+            # A synchronous on-loop wait for the receipt lock, bounded here
+            # so that a wedge fails this row instead of hanging it.
+            descriptor = os.open(directory / ".receipt.lock", os.O_RDWR)
+            try:
+                deadline = time.monotonic() + 5
+                while not observed:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        observed["acquired"] = True
+                    except BlockingIOError:
+                        if time.monotonic() > deadline:
+                            observed["acquired"] = False
+                        time.sleep(0.05)
+            finally:
+                os.close(descriptor)
+        return await original(identity)
+
+    monkeypatch.setattr(service, "_guide", guide)
+    with pytest.raises(DraftConflict):
+        await restore(saved, choice)
+    assert observed == {"acquired": True}
+    assert not (directory.parent / "latest.json").exists()

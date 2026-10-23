@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import io
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import platform
@@ -41,6 +42,7 @@ PRIVATE_RUNTIME_UPDATE_ONLY = "This private runtime candidate is admitted only t
 PRODUCT_CONFIGURE_REQUIRED = "This selected Meta/Toolkit installation needs its original Configure startup inputs. Ordinary Start and background startup are unavailable."
 AGENT_TEAM_PRODUCT_UNAVAILABLE = ("Agent team packages are not available in this Forge: they install the older MobKit 0.8 "
     "runtime. Use Build application to build and install your agents as an application on Meta 0.9.4.")
+LOG = logging.getLogger(__name__)
 
 
 def forge_interpreter():
@@ -132,6 +134,20 @@ def selected_update_refusal(target, interpreter=None):
     from .runtime_candidates import declared_glibc_floor
     return (selected_host_refusal(declared_glibc_floor(target), interpreter)
         or selected_interpreter_refusal(target, interpreter))
+
+
+def staged_runtime_refusal(update):
+    """Why this computer cannot install a staged update's selected product, or None.
+
+    The product's declared glibc floor and this Forge's interpreter are both
+    checked, as Stage checks them, before the worker moves the runtime aside.
+    """
+    selection = (update.get("runtime_dependency_update") or {}).get("runtime_candidate")
+    if selection is None:
+        return None
+    from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
+    target = parse_candidate_selection(selection)
+    return selected_update_refusal(target) if type(target) is MetaToolkitRuntimeTarget else None
 
 
 def product_runtime_source(files, selected, *, verified_artifacts=None, source_custody=None):
@@ -271,6 +287,30 @@ def journal(root, message, **changes):
         value.update(changes, updated_at=now(), progress=entries, detail=message)
         write_private(Path(root) / "receipt.json", value)
         return value
+
+
+def refusal_detail(error):
+    """The installer's own typed refusal as one bounded sentence, else its type name.
+
+    CustodyError and DraftConflict carry authored, user-facing text. Any other
+    error may carry private values, so only its type name is shown. The result
+    follows a clause: ": <text>" or " (<TypeName>)."
+    """
+    from .connect_installer_caller import CustodyError
+    text = " ".join(str(error).split())[:2000] if isinstance(error, (CustodyError, DraftConflict)) else ""
+    if not text:
+        return f" ({type(error).__name__})."
+    return ": " + text + ("" if text.endswith((".", "!", "?")) else ".")
+
+
+def _log_install_completion(directory_name):
+    def completed(task):
+        # Retrieve the task's exception without changing its result or custody.
+        if task.cancelled() or task.exception() is None:
+            return
+        LOG.warning("Meta Forge: the Install completion of deployment %s failed%s",
+            directory_name, refusal_detail(task.exception()))
+    return completed
 
 
 def interactive_cleanup_matches(receipt, *, require_worker_exit=True):
@@ -1070,6 +1110,8 @@ class DeploymentService:
         self.application_replacement_selection = None
         self.application_host_selection = None
         self._application_preparations = {}
+        # First reads of selected products in flight; deployment_updates keeps the reads.
+        self._product_reading = []
         from .deployment_service import UserServiceManager
         self.service_manager = service_manager or UserServiceManager()
 
@@ -1556,8 +1598,8 @@ class DeploymentService:
             if expected is not None:
                 raise DraftConflict("The original implementation-selected product changed before installation.")
             return None
-        artifacts = await await_validation(selected_runtime_artifacts, target,
-            verified_artifacts=expected.artifacts if expected is not None else None)
+        artifacts = (await self._selected_product_artifacts(target) if expected is None else
+            await await_validation(selected_runtime_artifacts, target, verified_artifacts=expected.artifacts))
         selected = candidate_selection(target, verified_artifacts=artifacts)
         if expected is not None and selected != expected.selection:
             raise DraftConflict("The original implementation-selected product changed before installation.")
@@ -1572,6 +1614,24 @@ class DeploymentService:
         return SimpleNamespace(selection=selected, artifacts=artifacts,
             interpreter_refusal=selected_host_refusal(artifacts.glibc_floor)
                 or selected_interpreter_refusal(artifacts.selection))
+
+    async def _selected_product_artifacts(self, target):
+        """A selected product's verified artifacts, read in full once while it is unchanged.
+
+        The process's kept read (deployment_updates.KEPT_RUNTIME_READS) is
+        returned after every verified input's file fingerprint is rechecked; a
+        changed input is read again in full. Concurrent first reads of one
+        product share a single read.
+        """
+        from .deployment_updates import KEPT_RUNTIME_READS
+        reading = self.__dict__.setdefault("_product_reading", [])
+        task = next((pending for selected, pending in reading if selected == target), None)
+        if task is None:
+            task = asyncio.create_task(await_validation(KEPT_RUNTIME_READS, target))
+            reading.append((target, task))
+            task.add_done_callback(lambda done: reading.__setitem__(slice(None),
+                [row for row in reading if row[1] is not done]))
+        return await asyncio.shield(task)
 
     async def options(self, guide_id, build_id=None, *, console_port=None, source_kind="application", version=None):
         if source_kind not in {"application", "native-team"}:
@@ -1943,8 +2003,9 @@ class DeploymentService:
         self.tasks[directory.name] = task
         if mode == "install" and self.application_setup_retention is not None:
             # Retention may refuse after the exited handle is retired. Retrieve
-            # that same task's exception without changing its result or custody.
-            task.add_done_callback(lambda completed: None if completed.cancelled() else completed.exception())
+            # that same task's exception without changing its result or custody,
+            # and keep its typed text, or only its type name, in the Forge log.
+            task.add_done_callback(_log_install_completion(directory.name))
 
     async def prepare_supervisor_refresh(self, guide_id, deployment_id, *, expected_service_digest):
         """Prepare host support separately from application update or startup."""
@@ -2020,7 +2081,8 @@ class DeploymentService:
             if receipt["build_id"] == build_id:
                 raise DraftConflict("This accepted application is already installed.")
             payload, _ = await self.implementation.package(guide_id, build_id)
-            files = package_files(payload)
+            # Unpacking the whole package must not hold the event loop.
+            files = await asyncio.to_thread(package_files, payload)
             report = json.loads(files["implementation-report.json"][0])
             runtime_target = None
             if "runtimeCandidate" in json.loads(files["deployment.json"][0]):
@@ -2032,6 +2094,10 @@ class DeploymentService:
                 if runtime_target is None:
                     raise DraftConflict("The candidate package has no exact accepted host runtime selection.")
             setup_blockers = await self._setup_owner_blockers(guide_id, deployment_id, files, report)
+            # Reading the installed source and every selected runtime, which
+            # can be a full native product, must not hold the event loop.
+            prepared = await await_validation(self._prepare_update_stage, guide_id, deployment_id,
+                payload, report, runtime_target, setup_blockers)
             current = await self.implementation.status(guide_id)
             require_accepted(current)
             latest = await self._guide(guide_id)
@@ -2041,16 +2107,23 @@ class DeploymentService:
                     or not package_matches(report, latest) or report.get("build_id") != build_id
                     or report.get("blueprint_hash") != proposal_hash(latest.get("proposal") or latest.get("blueprint"))):
                 raise DraftConflict("The accepted application changed while preparing its update.")
-            # No await separates the final source/design fences and publication.
-            from .deployment_updates import stage
-            restore_selection = self._setup_update_restore(guide_id, deployment_id)
-            setup = ({"restore_selection": restore_selection, "setup_blockers": setup_blockers}
-                if restore_selection is not None else {})
-            if runtime_target is None:
-                stage(self._directory(guide_id), payload, report, **setup)
-            else:
-                stage(self._directory(guide_id), payload, report, runtime_target=runtime_target, **setup)
+            # No await separates the final source/design fences and publication,
+            # which rechecks what the preparation read.
+            from .deployment_updates import publish_stage
+            publish_stage(self._directory(guide_id), prepared)
             return await self.status(guide_id)
+
+    def _prepare_update_stage(self, guide_id, deployment_id, payload, report, runtime_target, setup_blockers):
+        """Read and check a Stage in a worker thread; nothing is written here."""
+        from .deployment_updates import prepare_stage
+        restore_selection = self._setup_update_restore(guide_id, deployment_id)
+        setup = ({"restore_selection": restore_selection, "setup_blockers": setup_blockers}
+            if restore_selection is not None else
+            {"ordinary_owner": True, "setup_blockers": setup_blockers}
+            if self._ordinary_restart_selected(guide_id, deployment_id) else {})
+        if runtime_target is not None:
+            setup["runtime_target"] = runtime_target
+        return prepare_stage(self._directory(guide_id), payload, report, **setup)
 
     def _setup_owner(self, guide_id, deployment_id):
         """The selected host that owns a set-up installation's completed setup, or None.
@@ -2102,22 +2175,59 @@ class DeploymentService:
         per-installation registry, its signed source chain must also continue
         the installed Build. A single selected host owns every Build's source.
         """
-        from .deployment_updates import SETUP_OWNER_BLOCKER
+        from .deployment_updates import ORDINARY_OWNER_BLOCKER, SETUP_OWNER_BLOCKER
         from .forge_application_host import owner_choices_match
         from .local_application_registry import LocalApplicationRegistry
-        host = self._setup_owner(guide_id, deployment_id)
+        host, blocker = self._setup_owner(guide_id, deployment_id), SETUP_OWNER_BLOCKER
+        if host is None:
+            host, blocker = (await asyncio.to_thread(self._ordinary_owner, guide_id, deployment_id),
+                ORDINARY_OWNER_BLOCKER)
         if host is None:
             return ()
         if not owner_choices_match(host, files):
-            return (SETUP_OWNER_BLOCKER,)
+            return (blocker,)
         select = getattr(self, "application_host_selection", None)
         registry = getattr(select, "__self__", None)
         if type(registry) is LocalApplicationRegistry and select == registry.selected_host:
             continues = await asyncio.to_thread(registry.continues_installed_source, guide_id, deployment_id,
                 report.get("build_id"), report.get("verification", {}).get("digest"))
             if not continues:
-                return (SETUP_OWNER_BLOCKER,)
+                return (blocker,)
         return ()
+
+    def _ordinary_owner(self, guide_id, deployment_id):
+        """The retained owner of an installed application without a setup helper, or None.
+
+        Only the launcher's registry selection supplies it, never a request.
+        Before that owner is reconnected after a Forge restart, Stage keeps its
+        existing checks; Apply checks the owner's choices once it reconnects.
+        """
+        from .local_application_registry import LocalApplicationRegistry
+        from .ordinary_application_source import OrdinaryApplicationHost
+        if not self._ordinary_restart_selected(guide_id, deployment_id):
+            return None
+        select = getattr(self, "application_host_selection", None)
+        registry = getattr(select, "__self__", None)
+        if (type(registry) is not LocalApplicationRegistry or select != registry.selected_host
+                or registry._reconnect_status(self, guide_id, deployment_id) is not None):
+            return None
+        host = select(guide_id, deployment_id)
+        return host if type(host) is OrdinaryApplicationHost else None
+
+    def _product_before_setup(self, guide_id, deployment_id):
+        """A Meta Toolkit product installation that has not entered its setup.
+
+        No update worker can start it without its setup's startup inputs. An
+        application without a setup helper starts through its owner instead.
+        """
+        from .deployment_application_bootstrap import FRESH_ENTRY_NAME
+        from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
+        directory = self._directory(guide_id, deployment_id)
+        selection = read_receipt(directory).get("runtime_candidate")
+        entry = directory / FRESH_ENTRY_NAME
+        return (selection is not None and type(parse_candidate_selection(selection)) is MetaToolkitRuntimeTarget
+            and not entry.exists() and not entry.is_symlink()
+            and not self._ordinary_restart_selected(guide_id, deployment_id))
 
     async def _run(self, directory, mode, *, update_selection=None, bootstrap_selection=None,
             install_retention=None, install_binding=None, bootstrap_owner_source=None):
@@ -2328,7 +2438,8 @@ class DeploymentService:
                             self.processes.pop(directory.name)
                             retention(self, latest["guide_id"], directory.name)
                     except Exception as error:
-                        journal(directory, f"Trusted setup inputs were not retained ({type(error).__name__}). Your files are preserved. Check setup status before continuing.")
+                        journal(directory, "Trusted setup inputs were not retained" + refusal_detail(error)
+                            + " Your files are preserved. Check setup status before continuing.")
                         raise
             finally:
                 if self.tasks.get(directory.name) is asyncio.current_task():
@@ -3585,6 +3696,10 @@ class DeploymentService:
                 require_update_bootstrap_history(directory, recorded,
                     in_flight=update_binding(selected) if action != "apply-update"
                         and selected.get("update_id") == update_id else None)
+                if (action == "apply-update" and application_startup is None
+                        and await await_validation(self._product_before_setup, guide_id, deployment_id)):
+                    from .deployment_updates import FIRST_SETUP_UPDATE
+                    raise DraftConflict(FIRST_SETUP_UPDATE)
             else:
                 require_bootstrap_history_settled(directory, bootstrap_selection)
         if receipt.get("source_kind") == "native-team" and action in {"apply-update", "rollback", "recover-current"}:
@@ -3618,6 +3733,13 @@ class DeploymentService:
                 eligible = {"staged", "snapshotting"} if action == "apply-update" else CURRENT_RECOVERY_STATES
                 if update["status"] not in eligible or update["blockers"]:
                     raise DraftConflict("This staged package has update requirements that must be resolved first.")
+                if action == "apply-update":
+                    # The worker moves the current runtime aside before it
+                    # installs the selected product with this interpreter, so
+                    # refuse here a computer that product cannot run on.
+                    refusal = staged_runtime_refusal(update)
+                    if refusal is not None:
+                        raise DraftConflict(refusal)
                 checked = await self.implementation.status(guide_id)
                 require_accepted(checked)
                 latest = await self._guide(guide_id)

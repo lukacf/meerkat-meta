@@ -95,6 +95,42 @@ def _console_public_headers():
             "Content-Security-Policy": "frame-ancestors 'none'", "Referrer-Policy": "no-referrer"}
 
 
+def _console_origin(value, local_origin):
+    """Select the browser origin from trusted host construction, never headers.
+
+    This checks the Console's HTTP address, not OAuth provider registration.
+    Core separately validates the registered MCP callback base. The listener
+    stays on loopback; the deployment owner supplies the actual TLS ingress.
+    """
+    if value is None:
+        return local_origin
+    try:
+        if (type(value) is not str or not value.isascii()
+                or any(ord(char) <= 32 or ord(char) == 127 for char in value)
+                or any(char in value for char in ("\\", "%", "?", "#"))):
+            raise ValueError
+        parsed = urlsplit(value)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.path
+                or parsed.username is not None or parsed.password is not None):
+            raise ValueError
+        port = parsed.port
+        if port is not None and port == 0:
+            raise ValueError
+        host = parsed.hostname
+        if ":" in host:
+            # urlsplit validates bracketed IPv6 addresses.
+            host = "[" + host + "]"
+        elif any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                 for label in host.split(".")):
+            raise ValueError
+        authority = host + (":" + str(port) if port not in (None, 443) else "")
+        if parsed.netloc.lower() not in (authority, authority + ":443" if port == 443 else authority):
+            raise ValueError
+        return "https://" + authority
+    except (ValueError, TypeError):
+        raise ValueError("The trusted Console origin must be an HTTPS origin without a path.") from None
+
+
 def _frontend_descriptor_error(status):
     from starlette.responses import JSONResponse
     if status == 401:
@@ -290,6 +326,7 @@ class _ConsoleLogin:
     retirement_task: asyncio.Task | None = None
     retired: bool = False
     login_scope_id: str = field(default_factory=lambda: secrets.token_urlsafe(32))
+    context: ConsoleConnectLogin | None = None
     connect_created: bool = False
     connect: object = None
     connect_start: asyncio.Task | None = None
@@ -308,9 +345,17 @@ class _ConsoleLogin:
 
 
 class ConsoleFront:
+    """Loopback Console front with an optional trusted public HTTPS origin.
+
+    With public_origin, deployment-owned TLS ingress must enforce HTTPS and
+    configure Strict-Transport-Security (HSTS) for that public host. This front
+    supplies neither TLS termination nor HSTS policy. Route the selected public
+    origin to this listener; forwarded headers never select its browser origin.
+    """
+
     def __init__(self, root, port, principal, password, on_input=None, *, transport=None, connect_factory=None,
                  console_assets=None, document_transform=None, controller_review_factory=None,
-                 console_login_factory=None, runtime_namespace="mobkit"):
+                 console_login_factory=None, runtime_namespace="mobkit", public_origin=None):
         if type(runtime_namespace) is not str or runtime_namespace not in ("mobkit", "meta"):
             raise ValueError("The application must select the mobkit or meta Console runtime namespace.")
         # The trusted application selects one SDK before serving. Browser RPC
@@ -322,10 +367,15 @@ class ConsoleFront:
             raise ValueError("The Console document transform must be application-owned and callable.")
         self.document_transform = document_transform
         self.root, self.port, self.principal = Path(root), port, principal
-        self.origin = f"http://127.0.0.1:{port}"
+        self.local_origin = f"http://127.0.0.1:{port}"
+        self.origin = _console_origin(public_origin, self.local_origin)
+        self._browser_host = urlsplit(self.origin).netloc
+        self._secure_cookie = public_origin is not None
         self.key = _private_key(root, create=True)
         self.password_digest = hashlib.sha256(password.encode()).digest()
         self.cookie = "mobkit_console_" + hashlib.sha256((str(self.root.resolve()) + str(port)).encode()).hexdigest()[:16]
+        if self._secure_cookie:
+            self.cookie = "__Host-" + self.cookie
         self.sessions, self.delivered = {}, set()
         self._logins, self._closing, self._close_task = {}, False, None
         self.login_tokens, self.failures = {}, []
@@ -510,13 +560,23 @@ class ConsoleFront:
         except Exception:
             return False
 
+    def _login_context(self, login):
+        """Retain one object for private adapters that admit by login identity."""
+        if login.context is None:
+            principal, origin = self.principal, self.origin
+            scope, expiry = login.login_scope_id, login.expires
+            login.context = ConsoleConnectLogin(principal, scope, int(expiry * 1000), origin,
+                lambda: (self._login_current(login) and self.principal == principal
+                         and self.origin == origin and login.login_scope_id == scope
+                         and login.expires == expiry))
+        return login.context
+
     def _reserve_console_login(self, login):
         """Retain the selected dormant owner before validation or eager entry."""
         login.console_login_required = self.console_login_factory is not None
         if not login.console_login_required:
             return
-        context = ConsoleConnectLogin(self.principal, login.login_scope_id,
-            int(login.expires * 1000), self.origin, lambda: self._login_current(login))
+        context = self._login_context(login)
         try:
             owner = self.console_login_factory(context)
             if inspect.isawaitable(owner):
@@ -663,7 +723,8 @@ class ConsoleFront:
         nonce = secrets.token_urlsafe(32)
         self.login_tokens[nonce] = now + 300
         response = HTMLResponse(_login_form(nonce, error), status_code=status_code)
-        response.set_cookie(self.cookie + "_login", nonce, httponly=True, samesite="strict", max_age=300)
+        response.set_cookie(self.cookie + "_login", nonce, httponly=True, samesite="strict", max_age=300,
+                            secure=self._secure_cookie, path="/")
         response.headers.update({"Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"})
         return response
 
@@ -671,7 +732,11 @@ class ConsoleFront:
         from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
         path = request.url.path
         toolkit_callback_landing = path == "/host/toolkit/setup/callback" and request.method == "GET"
-        if (request.headers.get("host") != self.origin.removeprefix("http://")
+        # Internal health probes keep their existing loopback URL and separate
+        # read-only bearer credential. A browser cookie never admits this alias.
+        local_health = (self._secure_cookie and request.method == "GET" and path in HEALTH_PATHS
+                        and request.headers.get("host") == urlsplit(self.local_origin).netloc)
+        if (request.headers.get("host") != self._browser_host and not local_health
                 or not toolkit_callback_landing and any(key == "auth_token" for key, _ in parse_qsl(request.url.query))):
             return Response("Invalid Console address.", status_code=400)
         if request.headers.get("origin") not in (None, self.origin) and not toolkit_callback_landing:
@@ -721,13 +786,15 @@ class ConsoleFront:
             self._queue_controller_review(login)
             login.expiry_task = asyncio.create_task(self._expire_login(login))
             response = RedirectResponse("/console", status_code=303)
-            response.set_cookie(self.cookie, session, httponly=True, samesite="strict", max_age=SESSION_SECONDS)
-            response.delete_cookie(self.cookie + "_login")
+            response.set_cookie(self.cookie, session, httponly=True, samesite="strict", max_age=SESSION_SECONDS,
+                                secure=self._secure_cookie, path="/")
+            response.delete_cookie(self.cookie + "_login", secure=self._secure_cookie, httponly=True,
+                                   samesite="strict", path="/")
             response.headers["Cache-Control"] = "no-store"
             return response
         # Provider navigation can omit the Strict cookie. This fixed landing
         # GET never borrows a viewer; only its later same-origin POST may do so.
-        login = None if toolkit_callback_landing else self._live_login(request)
+        login = None if toolkit_callback_landing or local_health else self._live_login(request)
         is_human = login is not None
         health = False
         if not is_human and not toolkit_callback_landing:
@@ -754,7 +821,8 @@ class ConsoleFront:
                 except Exception:
                     return Response("Console access was revoked but cleanup is unconfirmed.", status_code=503)
             response = RedirectResponse("/login", status_code=303)
-            response.delete_cookie(self.cookie)
+            response.delete_cookie(self.cookie, secure=self._secure_cookie, httponly=True,
+                                   samesite="strict", path="/")
             return response
         if path == "/":
             return RedirectResponse("/console", status_code=303)
@@ -1008,8 +1076,7 @@ class ConsoleFront:
                 from .native_controller_review import NativeControllerReview
             else:
                 from native_controller_review import NativeControllerReview
-            context = ConsoleConnectLogin(self.principal, login.login_scope_id,
-                int(login.expires * 1000), self.origin, lambda: self._login_current(login))
+            context = self._login_context(login)
             owner = self.controller_review_factory(context)
             if owner is None:
                 return
@@ -1099,8 +1166,7 @@ class ConsoleFront:
             raise ConnectError("unsupported_presenter")
         if not login.connect_created:
             login.connect_created = True
-            context = ConsoleConnectLogin(self.principal, login.login_scope_id,
-                int(login.expires * 1000), self.origin, lambda: self._login_current(login))
+            context = self._login_context(login)
             try:
                 bridge = self.connect_factory(context)
                 if not isinstance(bridge, ConsoleConnect):

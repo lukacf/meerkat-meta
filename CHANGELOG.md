@@ -156,6 +156,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (when its panel is open) and the roster again on a newer revision. It
   used to read Access again on 16 kinds of activity event, such as tool
   calls and run starts, none of which can change it.
+- Meta Forge reads and verifies a selected native product in full once while
+  its files are unchanged. Installation options, the Install checks, "Stage
+  accepted update" and each status check of a staged update reuse that
+  verified read after checking every verified file's identity again (device,
+  inode, mode, owner, link count, size, modification and change times), and
+  read a changed file in full again. A repeated installation options request
+  for a large product now takes a fraction of a second instead of several
+  seconds, and a staged runtime refresh no longer reads both products again on
+  every status check.
+- A Meta Toolkit product application's own startup now writes one line per
+  phase to the runtime log that Forge keeps for each Start: entered, custody
+  observed, SDKs imported, application imported and application main entered,
+  each with the seconds since it started. Forge already timestamps every line
+  it keeps, so a slow Start can be split by phase.
+- The standalone Meta Forge bundle no longer downloads the MobKit 0.8.47
+  runtime and maintenance tools (about 850 MB) when it starts. Nothing in the
+  bundle ran them: its guide uses its selected Meta runtime, and each exported
+  package installs and verifies its own runtime.
+  `bash start.sh --prepare-only` now prepares only the Python environment.
+
+### Removed
+
+- The first wizard's package routes in the Forge local API,
+  `POST /api/preview` and `POST /api/package`, answer `410 Gone`. They
+  exported MobKit 0.8.47 packages and the current web app no longer calls
+  them. Build an agent team in the guided setup and use its package or
+  installation controls.
 
 ### Fixed
 
@@ -286,6 +313,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and checking again was refused until the first check had finished. The
   page now waits up to 240 s, so it shows the check's result, or Forge's own
   refusal when the check runs out of time.
+- Meta Forge keeps answering other requests while "Stage accepted update"
+  prepares an update. Unpacking the packages, checking the installed source
+  and reading the selected native product now run outside the server's event
+  loop, and each product is read in full once. Staging a "Rebuild with
+  updated runtime" package read the full product, the new one and the
+  installed one, 12 times while every other request waited, which kept Forge
+  unresponsive for minutes on a small host. A short final step checks the
+  installation again and writes the staged update; if the installation
+  changed in the meantime, nothing is staged.
+- When an Install finished but Forge could not retain its trusted setup
+  inputs, the installation's activity showed only the error's type, for
+  example "(CustodyError)", and no log held the reason. It now shows the
+  reason Forge's own check gave, and the Forge log has one warning line with
+  it. Any other error still shows only its type.
+- Installing or retrying a Meta Toolkit product application into a folder
+  whose `.venv` another CPython created, for example after Forge was started
+  again with a different `PYTHON_BIN`, reused that environment. `venv` only
+  adds missing links, so the environment kept running the other CPython and
+  its packages were installed for the wrong interpreter. Forge now refuses
+  before it reuses such an environment, names the CPython that created it and
+  the remedy, and keeps your saved setups. It also refuses an environment
+  whose CPython it cannot read.
+- The CPython check before an Install refused pure Python wheels tagged for
+  an older CPython minor (for example `py38` or `py311`) that pip installs.
+  It now admits them, as pip does.
+- A build status check, packaging or the installed runtime selection could
+  wait without limit for a build's workspace while another operation held it,
+  and requests the browser had given up on kept queuing behind it. They now
+  wait at most 15 seconds and then refuse with "The application workspace is
+  busy with another operation. Try again in a moment." Recovering a saved
+  build selection likewise gives up after a bounded wait instead of holding
+  the build's locks.
+- The idle sweep now retires a member that a restart left without a live
+  session once its window has passed, when the member owes no work: no
+  kickoff in flight and no input of its session short of a terminal state.
+  This covers the sweep's usual candidates: opted-in primary-mob members and
+  the members of implicit delegation mobs. Such a member used to stay on the
+  roster for good, because the execution of a session no live runtime serves
+  could not be read. A member whose session
+  this process does not hold, such as one placed on another host, still
+  stays. A member re-seated or woken under a new session now starts a fresh
+  idle window, and the sweep reads the member's session again right before it
+  retires the member, so it never retires a newer incarnation on an older
+  session's clock.
+- Meta Forge updates an application without a setup helper in place.
+  "Apply and verify update" installs and checks the new source and leaves
+  the application stopped; "Start installed application" then runs it, also
+  after Forge restarts, and "Restore previous application" returns to the
+  previous source. Stage blocks an update that is not built from the
+  installed application's own source, or that changes its plan, definition,
+  protected settings, native instructions or runtime. A Meta Toolkit product
+  application that has not finished its setup now refuses Apply before
+  anything changes with every launcher; with a launcher that selects a Meta
+  Forge application host directly, its update could stop as "recovery
+  needed" before.
 
 ### Known limitations
 
@@ -298,17 +380,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Meta Toolkit Connect route, an update staged before the application's
   first setup can still make that setup refuse. After Forge restarts, use
   "Continue setup" once before you stage or apply an update.
-- In a Meta Forge started from a product package or a product launcher, an
-  application without a setup helper cannot take a staged update in place
-  yet, and neither can a Meta Toolkit product application that has not
-  finished its setup. "Apply and verify update" refuses such an update
-  before anything changes. Install the new build into a new empty folder;
-  for a Meta Toolkit product application, you can instead finish its setup
-  and then stage the accepted update again. A launcher that selects a Meta
-  Forge application host directly does not refuse that Apply for a Meta
-  Toolkit product application that has not finished its setup: the update
-  stops as "recovery needed", and its previous package and private data are
-  kept. Finish such an application's setup before you apply an update.
+- A Meta Toolkit product application that has not finished its setup cannot
+  take a staged update in place yet. "Apply and verify update" refuses such
+  an update before anything changes. Finish its setup, then stage the
+  accepted update again, or install the new build into a new empty folder.
 - A macOS LaunchAgent keeps the stop timeout it was installed with (397
   seconds from Forge before 0.9.5). launchd has no drop-in, so a longer
   horizon that its application reports later is not applied. The

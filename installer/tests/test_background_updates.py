@@ -284,11 +284,13 @@ async def test_pending_update_is_bounded_and_rolls_back(background, monkeypatch,
     monkeypatch.setattr(services, "SERVICE_PENDING_MAX_WAIT", 2 if condition == "silent" else .3)
     manager.behaviors = ["pending", "ready"]
     original_observe = manager.observe
-    entered_at = None
+    entered_at, candidate_observations = None, 0
     records = (target / "data/ledger.db").read_bytes()
 
     async def observe(definition):
-        nonlocal entered_at
+        nonlocal entered_at, candidate_observations
+        if len(manager.starts) == 1 and not manager.stops:
+            candidate_observations += 1
         if len(manager.starts) == 1:
             elapsed = asyncio.get_running_loop().time()
             if entered_at is None:
@@ -301,16 +303,32 @@ async def test_pending_update_is_bounded_and_rolls_back(background, monkeypatch,
     monkeypatch.setattr(manager, "observe", observe)
     task = asyncio.create_task(services.update_background(directory, manager, "update", update_id=identity))
     try:
+        # The rows observe the transaction ending by itself: a candidate attempt
+        # that its own startup bound ended, then the rollback. The wait is only a
+        # hang guard. Under I/O pressure the rollback took up to 3.1 s here, so a
+        # 2 s wall-clock bound failed rows that ended correctly.
         try:
-            await asyncio.wait_for(asyncio.shield(task), 2)
+            await asyncio.wait_for(asyncio.shield(task), 30)
         except TimeoutError:
             pytest.fail("Pending evidence must not hold the transaction open until external cancellation")
         result = read_receipt(directory)
         assert result["update"]["status"] == "rolled-back" and result["build_id"] == old["build_id"]
+        # The candidate's own startup bound ends it, in either of its two places:
+        # at the first pending check, if writes were slow enough to spend the
+        # start deadline first, or after pending.
+        [attempt] = result["update"]["failed_attempts"]
+        assert (attempt["source"], attempt["error_type"]) == ("candidate", "TimeoutError")
+        assert attempt["error"] in {
+            "The update startup deadline expired before admission recovery was observed.",
+            "The owned background service did not supply fresh native startup and authenticated Console health in time."}
         assert manager.starts == [service.implementation.identity, old["build_id"]]
         assert manager.stops == [service.implementation.identity]
         assert (target / ".env").read_bytes() == private
         assert (target / "data/ledger.db").read_bytes() == records
+        # The cap's size, without a clock: the startup loop polls every 0.2 s and
+        # pending adds at most the cap to its deadline, so the candidate gets at
+        # most this many observations. Slow I/O can only lower the count.
+        assert candidate_observations <= int((services.SERVICE_START_TIMEOUT + services.SERVICE_PENDING_MAX_WAIT) / .2) + 2
     finally:
         if not task.done():
             task.cancel()

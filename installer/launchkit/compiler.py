@@ -35,6 +35,9 @@ GCP_PROJECT_PENDING = (
     "Tell the guide your Google Cloud project ID, or enter it in the advanced editor, "
     "before preparing the deployment package.")
 MCP_VERSION = "1.30.0"
+# Host dependencies every generated package pins beside its runtime SDK.
+HOST_REQUIREMENTS = (f"mcp=={MCP_VERSION}\nhttpx==0.28.1\nstarlette==1.7.0\nuvicorn==0.54.0\n"
+    "PyJWT==2.15.0\njsonschema==4.26.0\n")
 # A Console operator panel for the host's Toolkit setup page on the selected
 # Connect route. The native Console accepts only same-origin panel paths.
 CONNECT_SETUP_BUTTON = {"id": "connect-setup", "label": "Connect setup", "panel": "/host/toolkit/setup"}
@@ -88,14 +91,18 @@ def _product_setup_authoring(spec, *, runtime_target):
     }
 
 
-def package_availability(value, *, runtime_target=None, verified_artifacts=None):
+def package_availability(value, *, runtime_target=None, verified_artifacts=None, public_runtime=False):
     """Keep ordinary guards; only an exact selected product supports setup source.
 
     The optional target belongs to the protected host source owner. Public guide
     and browser previews pass no target. Artifact integrity is not qualification,
     application acceptance, native preparation or installation permission.
+    public_runtime selects the public Meta release a compiled agent team installs;
+    its recorded catalog must list every selected model.
     """
     spec = _spec(value)
+    if public_runtime and (runtime_target is not None or verified_artifacts is not None):
+        raise ValueError("The public agent-team runtime takes no selected product or candidate.")
     product_setup = False
     authoring = {}
     if runtime_target is not None:
@@ -119,6 +126,12 @@ def package_availability(value, *, runtime_target=None, verified_artifacts=None)
     if spec.target == "gcp" and spec.gcp.provisioning == "existing_host" and not spec.gcp.existing_zone_confirmed:
         return {"available": False, "status": "pending-configuration", "reason":
             "Confirm the existing VM's actual zone for this project and instance before preparing its package. The suggested zone may not be where your VM runs.", **authoring}
+    if public_runtime:
+        from .public_meta_runtime import models_unlisted_reason, unlisted_models
+        missing = unlisted_models((item.provider, item.model) for item in spec.agent_classes)
+        if missing:
+            return {"available": False, "status": "pending-configuration",
+                "reason": models_unlisted_reason(missing), **authoring}
     return {"available": True, "status": "ready", "reason": None, **authoring}
 
 
@@ -281,7 +294,8 @@ def connect_route(spec, runtime_target):
     return type(runtime_target) is MetaToolkitRuntimeTarget and _spec(spec).acquisition is not None
 
 
-def mob_toml(value, *, native_version=None, runtime_target=None, verified_artifacts=None, guide_runtime=None):
+def mob_toml(value, *, native_version=None, runtime_target=None, verified_artifacts=None, guide_runtime=None,
+             public_runtime=False):
     spec = _spec(value)
     scoped_connect = connect_route(spec, runtime_target)
     resolved = resolved_blueprint(spec)
@@ -299,7 +313,7 @@ def mob_toml(value, *, native_version=None, runtime_target=None, verified_artifa
              "[skills.launch_comms]", 'source = "inline"', f"content = {_json(comms_protocol)}", ""]
     lines += model_registry_lines(((item.provider, item.model) for item in spec.agent_classes),
         native_version=native_version or MOBKIT_VERSION, runtime_target=runtime_target,
-        verified_artifacts=verified_artifacts, guide_runtime=guide_runtime)
+        verified_artifacts=verified_artifacts, guide_runtime=guide_runtime, public_runtime=public_runtime)
     for item in spec.agent_classes:
         class_identities = item.identities()
         collaboration = ("Ordinary peer messaging is unavailable on this selected Connect route. "
@@ -366,7 +380,15 @@ def _console(spec, *, runtime_target=None):
     return "\n".join(lines)
 
 
-def _readme(spec, *, native_version=None, candidate=False, product=False):
+def _readme(spec, *, native_version=None, candidate=False, product=False, public=False):
+    # public: the public Meta release that a compiled agent team installs.
+    runtime_name = "Meta" if public else "MobKit"
+    runtime_pin = (f"the pinned Meta {native_version} SDK, checked against its published SHA-256,"
+        if public else f"pinned Meerkat/MobKit {native_version or MOBKIT_VERSION}")
+    principal_note = ("This is" if public else
+        "In MobKit 0.8.42, timeline frames do not retain an authenticated human principal; this is")
+    schedule_targets = (f"Pinned Meta {native_version} advertises session, identity, mob and `host_runnable` targets in its native schedule create/update tool schema. A `host_runnable` target names a runnable this host already registered through `schedule_runnables()`; it does not register one, grant tool access or establish permission to act. Do not bypass the advertised tool contract or invent a Python schedule-creation client. A recurring agent-owned workflow can also use the granted native tools' `current_session` shortcut with a prompt action; read the returned target to check its owner (a resumable session, a stable mob-member identity or Meta's bridged member target). That agent then uses its actual scoped application tools. Keep provider cost, timezone, missed-run policy, overlap policy, the exact action authorization and live integration requirements visible. Installation requires actual native create/get/occurrence receipts and a restart check; assistant prose and offline callback tests are insufficient." if public else
+        "Pinned MobKit 0.8.42 advertises session, identity and mob targets in its native schedule create/update tool schema; it omits the deterministic `host_runnable` target despite the callback runtime support. Do not bypass the advertised tool contract or invent a Python schedule-creation client. A recurring agent-owned workflow can use the granted native tools' `current_session` shortcut with a prompt action; MobKit persists its stable mob-member target. That agent then uses its actual scoped application tools. This performs an agent turn on each firing, rather than direct deterministic host-runnable delivery. Keep provider cost, timezone, missed-run policy, overlap policy, the exact action authorization and live integration requirements visible. Installation requires actual native create/get/occurrence receipts and a restart check; assistant prose and offline callback tests are insufficient.")
     rows = "\n".join(f"| {item.name.replace('|', '/')} | {item.instances} | {item.provider} / {item.model} | {item.description.replace('|', '/')} |" for item in spec.agent_classes)
     flow_cmd = f"bash start.sh --run-flow {shlex.quote(spec.flows[0].id)} --params '{{\"topic\":\"Your question\"}}'" if spec.flows else "bash start.sh --list-flows"
     install = [f"Extract the ZIP into a new empty folder you own. Open the project folder containing `install.sh` and `start.sh`; if the ZIP created an inner `{spec.project.slug}` folder, use that folder. Open a terminal there for the commands below. The project folder must not allow group or other write access. If the installer reports that permission problem, run `chmod go-w .` here, then retry the same install command. This repair changes only this folder's permissions; keep `.venv`, `.env`, `workspace`, `data` and `.mobkit` in place."]
@@ -378,7 +400,7 @@ def _readme(spec, *, native_version=None, candidate=False, product=False):
                   if candidate else "verifies native gateway downloads using published SHA-256 checksums.")
         recovery = (" If dependencies fail to install, correct the reported cause and use the printed retry command in the same project folder; keep `.venv`, `.env`, `workspace`, `data` and `.mobkit`, and continue after installation succeeds."
                     if not candidate else "")
-        install += [f"Run `bash install.sh` with Python 3.11+ available. This installs pinned Meerkat/MobKit {native_version or MOBKIT_VERSION} and the official MCP Python SDK {MCP_VERSION}, then {origin}{recovery}",
+        install += [f"Run `bash install.sh` with Python 3.11+ available. This installs {runtime_pin} and the official MCP Python SDK {MCP_VERSION}, then {origin}{recovery}",
                     "Enter provider keys and connector values when the local interview asks. Values stay in a mode-600 `.env` on the deployment machine. The workbench never receives them."]
     if spec.connections:
         install += ["Install the selected MCP prerequisites listed below on the deployment machine before checking connections."]
@@ -388,7 +410,7 @@ def _readme(spec, *, native_version=None, candidate=False, product=False):
         install += ["Verify the existing knowledge service endpoint, token and space with `.venv/bin/python knowledge/manage.py verify`."]
     install += ["Run `bash start.sh --doctor`. For selected MCPs or the knowledge service, run `bash start.sh --connections-check` to perform real handshakes and validate selected tool names."]
     install += ["On the VM, run `bash deploy/install-service.sh`. Back on your computer, run `bash deploy/tunnel-gcp.sh` and keep that tunnel open." if spec.target == "gcp" else "Run `bash start.sh` and keep the terminal open. Stop with Control-C.",
-                (f"With the tunnel open, open [the native MobKit console](http://127.0.0.1:{spec.advanced.port}/console) on your computer. "
+                (f"With the tunnel open, open [the native {runtime_name} console](http://127.0.0.1:{spec.advanced.port}/console) on your computer. "
                 "This is the configured default browser address. The generated tunnel forwards to the VM's configured default port. "
                 f"If you changed `MOBKIT_PORT` on the VM, stop that tunnel and run `gcloud compute ssh {spec.project.slug} --project {spec.gcp.project} --zone {spec.gcp.zone} --tunnel-through-iap -- -N -L {spec.advanced.port}:127.0.0.1:VM_PORT` on your computer, replacing `VM_PORT` with the private port. "
                 "Keep this tunnel open; the browser address above stays the same." if spec.target == "gcp" else
@@ -401,7 +423,7 @@ Open the current interface links shown there; an exported default port
 or an older bookmark may differ from the installed address. Do not start a second
 terminal process over the same running installation. The terminal steps below are
 for installing and operating the exported package yourself."""
-    startup_guidance = "First startup initializes storage with MobKit's official offline migration tool. Agents normally wait for input, but saved schedules and application adapters may resume work on startup. Review their configured behavior before restarting. `--smoke` makes one paid provider request. The console is loopback-only; its session, topology, flow and tool activity are real runtime projections."
+    startup_guidance = f"First startup initializes storage with {runtime_name}'s official offline migration tool. Agents normally wait for input, but saved schedules and application adapters may resume work on startup. Review their configured behavior before restarting. `--smoke` makes one paid provider request. The console is loopback-only; its session, topology, flow and tool activity are real runtime projections."
     return_guidance = """Stopping keeps the installed files, private settings and saved state. Resume the
 same saved Forge installation, or use the same package folder and its existing
 terminal or service controls. A restart resumes the configured identities;
@@ -409,14 +431,21 @@ installing into another folder creates separate state. Keep `.mobkit/`, `data/`,
 `workspace/` and private configuration together when backing up while stopped.
 Application results and conversation history do not by themselves prove that
 an agent can recall a preference through native memory."""
-    workflow_guidance = f'```bash\nbash start.sh --list-flows\n{flow_cmd}\n```\n\nStop the main app before these commands, because they acquire the same deployment lock. The native MobKit flow engine owns dependency dispatch, parallel steps, timeouts, run state and terminal outcomes. Prior step outputs and activation parameters are delivered by the native flow engine. Flows also appear in the console. Steps targeting the same identity share its durable conversation; use separate class instances for independent parallel work. Closing this CLI while a flow is active stops this process; resume normal startup and inspect native run state rather than launching a duplicate.'
+    workflow_guidance = f'```bash\nbash start.sh --list-flows\n{flow_cmd}\n```\n\nStop the main app before these commands, because they acquire the same deployment lock. The native {runtime_name} flow engine owns dependency dispatch, parallel steps, timeouts, run state and terminal outcomes. Prior step outputs and activation parameters are delivered by the native flow engine. Flows also appear in the console. Steps targeting the same identity share its durable conversation; use separate class instances for independent parallel work. Closing this CLI while a flow is active stops this process; resume normal startup and inspect native run state rather than launching a duplicate.'
     change_guidance = 'Keep `blueprint.json` as editable source and use Forge to compile changes. Review the generated file diff before replacing configuration in a stopped deployment. Back up `.mobkit/`, `data/`, `workspace/`, configuration and secure credentials first.\n\nNative storage pins the canonical mob definition. To activate a changed `config/mob.toml`, run `bash start.sh --activate-revision N`, supplying the revision observed with `bash start.sh --definition-revision` before replacing the configuration. That command reads the native structural event ledger and performs no agent requests. If the configuration is already replaced, restore the previous config to inspect the revision first. The native compare-and-swap ceremony rejects a stale revision. Later ordinary restarts omit the flag. Do not guess or increment revisions in local state files. Tool callback grants and desired roster/topology are product configuration read from `deployment.json`; changes to durable roles can require native identity role migration. Do not reuse an existing identity for a different class.'
     application_check_guidance = 'Put additional pinned Python dependencies in optional `requirements.application.txt`; `install.sh` installs them into the deployment environment when present. Both that file and `application/` are included in GCP transfer, excluding private environment files, state and caches. `bash start.sh --check` syntax-checks application Python without importing it. `bash start.sh --application-check` imports/builds the integration and validates callback definitions, but does not call `start()` or any tool handler; it is a contract check, not proof of a working adapter. Forge may load application code in isolated offline checks. Live adapters run when the user starts the exported application.'
     service_guidance = f"On Linux, `bash deploy/install-service.sh` runs one guided private setup interview, then checks the installed application and starts an owned user systemd service. It waits for actual native bootstrap and authenticated Console health. Repeat `bash deploy/install-service.sh status`, `stop`, `restart` or `remove-service` to operate that exact unit. Removal preserves source, private configuration and native state. It never overwrites an unrelated unit. The interview explicitly asks before enabling this user's services after logout; that system setting can require sudo. Without it the service runs only while that user is logged in. On macOS, keep the terminal open. Stop with Control-C.\n\nFor GCP, inspect `bash deploy/deploy-gcp.sh --dry-run`, then run it. It asks for the exact configured project ID before creating billed resources: Debian 12 VM ({spec.gcp.machine_type}), {spec.gcp.disk_gb} GB boot disk, IAP SSH rule. The console is never exposed by a public firewall rule. Enter credentials on the VM; private `.env`, data, runtime state, and workspace files are excluded from transfer. The VM has no service account. Existing project network rules still apply. Granted Node/npm/npx and uv/uvx prerequisites are prepared automatically with checksum-pinned tools. Local knowledge also prepares Git and Docker Engine, Buildx and Compose from the official Docker Debian repository, starts Docker, and gives the SSH login account root-equivalent Docker group access. The script discloses these changes before project confirmation and in its dry run. Other MCP commands still need manual preparation on the VM. Background user-service privileges remain a separate setup choice. `bash deploy/tunnel-gcp.sh` opens local access. Delete the VM when finished to stop compute charges; the script prints cleanup commands.\n\nAfter provisioning, run `bash deploy/deploy-gcp.sh --setup` from the original local package folder. This opens an interactive IAP SSH terminal for the private interview and verified service start; credentials never enter command arguments or this local folder. Later use `--status`, `--stop`, `--restart` or `--remove-service`. These commands require the matching VM ownership label and never create a replacement VM. Stopping or removing the application service does not stop VM charges. Console health does not prove custom UI, external chat, scheduled actions or other external workflows.\n\nIf upload, SSH readiness or remote installation fails, keep the original package folder and run `bash deploy/deploy-gcp.sh --resume`. The private `.mobkit/gcp-deployment.json` receipt must match the configured project, zone, VM, complete transferred source and VM ownership label. Upload verifies the accepted SHA256SUMS manifest, includes ordinary custom UI/assets paths, and excludes private credentials, data and runtime state. Resume retries upload and installation without creating another VM or replacing credentials and runtime data. It refuses unrelated VMs and changed source. Recovery and cleanup commands are printed even when installation fails."
     connection_check_guidance = '`--connections-check` fails if a selected tool disappeared.'
     application_loading_guidance = 'Initial application loading has no connected host catalog: `--application-check` validates hook callability, not enforced selection.'
     definition_role_guidance = f"""Activating edited class instructions updates the canonical definition without rewriting an existing conversation. This host projects the canonical native profile skills onto each ordinary application-authored `send` or keyed `dispatch` as explicit native System content, preserving identity, admission keys and history. A same-key dispatch retry replays its original admission and does not adopt newly authored instructions; a new actual host turn uses the current role. A gateway that advertises host System authoring supplies that carrier. A shipping older gateway retains ordinary SDK host admission when its actual native ledger proves the unchanged initial definition at epoch 1. After a later definition revision, unsupported role authoring is rejected before the turn; role-changing updates are blocked before source replacement without both send and dispatch support. The pinned Python SDK can use the supported native request carrier without replacing SDK bytes. The currently pinned official release may lack that native capability; a verified local development runtime is separate evidence from an official installation. Native flows, schedules, internal peer turns and direct Console input are outside this host carrier. Definition activation or healthy bootstrap alone is not evidence that continuing sessions adopted the edited role. Role-changing updates retain all current private data and observe the real native definition revision before CAS activation. A previous legacy host without this carrier cannot establish continuing-role rollback after native admission; recover the current accepted application instead of deleting or rewinding history."""
-    application_integration_guidance = f"""Optional ordinary Python code in `application/__init__.py` can export `build(context)`, synchronous or asynchronous, returning an integration object. The context exposes `root` (this package's Path), `deployment` (compiled configuration), `stop_event` (an asyncio.Event requesting host shutdown), and `runtime` (None during construction, the real native MobKit runtime after bootstrap). Keep construction and imports free of external actions; open connections and start background adapters in `start()`.
+    if public:
+        # The Meta shell host refuses revision activation before startup and adds no
+        # instruction carrier to application turns (templates_v2/app.py run()).
+        change_guidance = ("Keep `blueprint.json` as editable source and use Forge to compile changes. Back up `.mobkit/`, `data/`, `workspace/`, configuration and secure credentials while stopped.\n\n"
+            "Native storage pins the canonical mob definition, and this Meta package keeps the definition it was installed with. Activating an edited definition is not available: `bash start.sh --activate-revision N` refuses before anything starts. To use changed instructions, classes or flows, build the changed team in Forge and install it into a new folder; that folder starts its own state. Keep `config/mob.toml` as installed. `bash start.sh --definition-revision` reads the revision from the native structural event ledger and performs no agent requests. Do not guess or increment revisions in local state files, and do not reuse an existing identity for a different class.")
+        definition_role_guidance = ("Each identity runs the class instructions of its installed native profile. This Meta package does not activate edited class instructions, and its host adds no System content to application-authored `send` or keyed `dispatch` turns: Meta's send and dispatch carry no host instruction override. Native flows, schedules, internal peer turns and direct Console input use the same installed definition. "
+            "Editing source, a successful build or healthy startup is not evidence that a continuing conversation uses edited instructions; a changed team installed into a new folder starts new identities and history.")
+    application_integration_guidance = f"""Optional ordinary Python code in `application/__init__.py` can export `build(context)`, synchronous or asynchronous, returning an integration object. The context exposes `root` (this package's Path), `deployment` (compiled configuration), `stop_event` (an asyncio.Event requesting host shutdown), and `runtime` (None during construction, the real native {runtime_name} runtime after bootstrap). Keep construction and imports free of external actions; open connections and start background adapters in `start()`.
 
 The integration may implement `tools_for_agent(agent)`, `start()` and `stop()`, synchronously or asynchronously. `tools_for_agent` receives each compiled agent including its `identity`, `classId`, `profile` and configured grants. Return a list of exact callbacks with `name`, `handler`, `description` and JSON `schema`; return an empty list for other classes. Names must be provider-safe ASCII letters, digits, underscores or hyphens, beginning with a letter, up to 64 characters. The host validates definitions/collisions, registers callbacks through native SessionBuilder, and treats their outputs as untrusted evidence for memory. Application handlers can accept named JSON fields as keyword parameters or a single argument dictionary. The host checks keyword binding first, then dictionary binding before invoking once; sync and async results are supported. For a dictionary handler, choose a parameter name distinct from JSON field names so binding is unambiguous. Non-inspectable callables use the SDK one-dictionary convention. Exceptions from application code propagate without another invocation. Package code owns its explicit class scoping; the integration does not add blueprint grants or confer user authorization.
 
@@ -439,21 +468,21 @@ history for a supported repair.
 `start()` runs after native identity bootstrap only in normal service mode. Inspection, connection checks, definition activation and flow CLI commands do not start background adapters. `stop()` runs before native shutdown, including failed starts and diagnostics, and must tolerate an integration that never started. Keep task cancellation, connections and servers in your integration's lifecycle; use native runtime methods for agent sends and flows rather than a parallel agent engine. File layout, UI, domain adapters and their configuration remain ordinary application code, outside the blueprint schema.
 
 An optional `rehearse(context, fixtures)` factory, synchronous or asynchronous, returns an offline integration with the same `tools_for_agent(agent)` protocol. Reuse the production callbacks and domain state logic, substituting explicitly supplied fake I/O through ordinary adapter interfaces. Keep production tool names, input schemas and per-identity scoping. The trial context's `runtime` remains `None`; only its private `root/data` and `scratch_root` are writable. Network, credentials, user files, process creation and source writes are unavailable. Fixtures are bounded ordinary JSON supplied for that trial; document the values needed and omit callbacks whose fake dependencies are missing. Trial `start()` and `stop()` own fake resources and must handle partial startup. Forge executes this code in a separate constrained process while actual native agents own the conversation and collaboration. Retained results describe the exact source's offline behavior; they are not independent acceptance, connected adapter evidence or deployment proof."""
-    schedule_hook_guidance = f"""Optional `schedule_runnables()` returns a list of exact `{{name, handler}}` definitions, synchronously or asynchronously. The host supplies these names through the published SDK's `MobKitBuilderConfig.host_runnables`, constructs `MobKitRuntime`, and binds handlers through `runtime.on_schedule_fire` before `connect()` can restore due occurrences. `context.runtime` is assigned before binding. Each handler receives the native occurrence dictionary (`schedule_id`, `occurrence_id`, `due_at`, optional `payload`); returning completes the attempt and raising fails it. This hook does not create schedules or add schedule tools to any agent. Create and inspect schedules through existing granted `meerkat_schedule_*` tools; if the design has no authoring grant, that remains a setup requirement. The native schedule store owns timing, claims and occurrence outcomes. Flow CLI tool handlers and schedule handlers must lazily open needed adapters because `start()` only runs in service mode, and restored occurrences can arrive before it."""
+    schedule_hook_guidance = f"""Optional `schedule_runnables()` returns a list of exact `{{name, handler}}` definitions, synchronously or asynchronously. The host supplies these names through the published SDK's `{runtime_name}BuilderConfig.host_runnables`, constructs `{runtime_name}Runtime`, and binds handlers through `runtime.on_schedule_fire` before `connect()` can restore due occurrences. `context.runtime` is assigned before binding. Each handler receives the native occurrence dictionary (`schedule_id`, `occurrence_id`, `due_at`, optional `payload`); returning completes the attempt and raising fails it. This hook does not create schedules or add schedule tools to any agent. Create and inspect schedules through existing granted `meerkat_schedule_*` tools; if the design has no authoring grant, that remains a setup requirement. The native schedule store owns timing, claims and occurrence outcomes. Flow CLI tool handlers and schedule handlers must lazily open needed adapters because `start()` only runs in service mode, and restored occurrences can arrive before it."""
     console_guidance = f"""For authenticated human chat, ordinary application source may add `application/console.json` containing exactly `{{"authentication":"local-password"}}` and declare two required fields without source defaults in `application/configuration.json`: `CONSOLE_USER_ID` (nonsecret) and `CONSOLE_LOGIN_PASSWORD` (secret, at least 12 characters). Install collects these fields privately; source and model conversations must never contain their values. This option provides one local human account. It does not provide multi-user login or authenticate Telegram or Slack.
 
 The host serves the unchanged native Console at the configured loopback URL with a password login and an HttpOnly, SameSite=Strict session cookie. Native runs on an internal ephemeral loopback port with JWT authentication. Bearer tokens stay in the host, never in browser URLs or storage. The signing key is generated in private `.mobkit/console-signing.key`; a restart clears browser sessions. Health credentials are read-only and cannot submit human messages.
 
 An optional integration `on_console_input(event)` receives only successfully admitted authenticated Console submissions. Its frozen event has `channel="host-authenticated-console"`, the configured `principal`, submitted `identity` and `content`, and the native `interaction_id`, `session_id`, `input_frame_id`, `cursor`, optional `conversation_id` and `handling_mode`. The host validates native admission before calling this hook. Plain SDK sends, tools, timeline frames, caller-supplied principal/origin, rejected admissions and health probes cannot emit it. String and multipart Console submissions are supported; uploaded image references in `content` remain submitted references, and native owns blob conversion. Live voice interactions do not produce this chat hook. The application owns domain interpretation and must bind any approval to the exact action, human, scope, expiry and current state at the side-effect boundary. Receiving a message does not itself grant authority.
 
-Native may start its agent turn before this hook runs. Never let an agent tool infer approval from the chat text or a reply; it must read application-owned authorization state. The host awaits hook delivery and deduplicates successful native interaction IDs for this process. A failed delivery returns an explicit error even though native may have admitted the turn. Persist application deduplication using native IDs, make the handler idempotent, and fail closed after interrupted delivery or restart. Do not add a parallel native event log. In MobKit 0.8.42, timeline frames do not retain an authenticated human principal; this is host-authenticated channel evidence, not a principal-attesting native timeline. Native gating UI can also provide explicit gate decisions through its existing supported APIs; agent tools must never expose trusted-host `gating_decide` approver authority.
+Native may start its agent turn before this hook runs. Never let an agent tool infer approval from the chat text or a reply; it must read application-owned authorization state. The host awaits hook delivery and deduplicates successful native interaction IDs for this process. A failed delivery returns an explicit error even though native may have admitted the turn. Persist application deduplication using native IDs, make the handler idempotent, and fail closed after interrupted delivery or restart. Do not add a parallel native event log. {principal_note} host-authenticated channel evidence, not a principal-attesting native timeline. Native gating UI can also provide explicit gate decisions through its existing supported APIs; agent tools must never expose trusted-host `gating_decide` approver authority.
 
 An optional trusted integration `frontend_management(request)` exposes frontend setup on the installed authenticated Console at `/console/forge/frontends`, with `/prepare`, `/submit` and `/changes/<change_id>` beneath that path. Read `console_auth.py` and `app.py` for the exact host request and HTTP envelope; these are ordinary application hooks, not agent tools. Use the configured human account; approve the exact prepared proposal through the protected human presenter. Keep passwords, session cookies and literal frontend secrets out of configuration/observation JSON and model context; use credentials only in the existing protected login/session channel; configuration can reference declared private setup fields. The application owns permitted participants and routing, its durable configuration and revision, expected-revision CAS, exact change identity, duplicate/uncertain submission readback, activation observations and restart reconstruction. Use its existing state and `start()`/`stop()` hooks, not a second supervisor or native event ledger. Committed configuration, a running adapter, native input completion and a permitted transport reply are separate facts. The facade does not implement a component producer or imply support for an undeclared application. Private settings and package updates stay with the original stopped-deployment owner; this endpoint does not start a stopped installation or migrate private field declarations.
 
 If the installed Console offers **Set up your app**, ask which setup options this application supports. Enter passwords and tokens only in its protected forms. Closing the panel leaves the application running; reopen it to check the original work after an uncertain result. Complete setup and send a permitted message through the configured channel to verify its actual reply. This panel does not add arbitrary integrations to an existing build."""
     schedule_runtime_guidance = f"""Schedule handlers are bound before native startup, including storage preparation and restored due delivery. Offline contract checks verify names and callback wiring; they do not prove an installed schedule, persisted delivery or restart recovery. Verify those behaviors on the installed system before depending on scheduled application actions. Native create has no submission idempotency key: inspect exact owned schedule IDs or labels before creating, serialize initialization, and do not stack another recurrence on every startup.
 
-Pinned MobKit 0.8.42 advertises session, identity and mob targets in its native schedule create/update tool schema; it omits the deterministic `host_runnable` target despite the callback runtime support. Do not bypass the advertised tool contract or invent a Python schedule-creation client. A recurring agent-owned workflow can use the granted native tools' `current_session` shortcut with a prompt action; MobKit persists its stable mob-member target. That agent then uses its actual scoped application tools. This performs an agent turn on each firing, rather than direct deterministic host-runnable delivery. Keep provider cost, timezone, missed-run policy, overlap policy, the exact action authorization and live integration requirements visible. Installation requires actual native create/get/occurrence receipts and a restart check; assistant prose and offline callback tests are insufficient."""
+{schedule_targets}"""
     if candidate:
         install_guidance = """This private runtime candidate is for the checked update of an existing
 installation in Forge. It cannot create a fresh installation. Keep the saved
@@ -536,7 +565,7 @@ native memory."""
 
 {spec.project.description}
 
-A complete MobKit deployment compiled from `blueprint.json` by Meta Forge.
+A complete {runtime_name} deployment compiled from `blueprint.json` by Meta Forge.
 
 ## Install and start
 
@@ -625,8 +654,12 @@ def product_entrypoint(name):
     raise ValueError("Unknown selected product entrypoint.")
 
 
-def generate_package(value, *, runtime_target=None, verified_artifacts=None):
+def generate_package(value, *, runtime_target=None, verified_artifacts=None, public_runtime=False):
+    """Compile a package. public_runtime selects the public Meta release that a
+    compiled agent team installs from PyPI and the release's checksum manifests."""
     spec = _spec(value)
+    if public_runtime and (runtime_target is not None or verified_artifacts is not None):
+        raise ValueError("The public agent-team runtime takes no selected product or candidate.")
     if runtime_target is None and verified_artifacts is not None:
         raise ValueError("Verified artifacts require an explicit candidate target.")
     if runtime_target is not None:
@@ -634,11 +667,14 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None):
         if type(runtime_target) is MetaToolkitRuntimeTarget:
             verified_artifacts = selected_runtime_artifacts(runtime_target, verified_artifacts=verified_artifacts)
     availability = package_availability(spec, runtime_target=runtime_target,
-        verified_artifacts=verified_artifacts)
+        verified_artifacts=verified_artifacts, public_runtime=public_runtime)
     if not availability["available"]:
         raise ValueError(availability["reason"])
     selection = None
     native_version = MOBKIT_VERSION
+    if public_runtime:
+        from . import public_meta_runtime
+        native_version = public_meta_runtime.VERSION
     product = False
     if runtime_target is not None:
         from .runtime_selection import (MetaToolkitRuntimeTarget, implementation_candidate_selection,
@@ -696,6 +732,12 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None):
                 raise ValueError("The protected application installer dependency steps changed.")
             text = text.replace(gateway_step,
                 'if [[ -f requirements.application.txt ]]; then\n  prepare_application_dependency_step "installing application dependencies" .venv/bin/python -m pip install --disable-pip-version-check -r requirements.application.txt\nfi\n' + gateway_step)
+            if public_runtime:
+                # One universal wheel and its hash; its own step keeps the
+                # third-party pins below out of pip's hash-checking mode.
+                text = text.replace(dependency_step,
+                    'prepare_application_dependency_step "installing the pinned Meta SDK" .venv/bin/python -m pip install --disable-pip-version-check --no-deps --require-hashes -r requirements.sdk.txt\n'
+                    + dependency_step)
             if selection is not None:
                 missing_python = '  echo "Install Python 3.11 or newer, then run this installer again." >&2\n'
                 version_check = '"$PYTHON_BIN" -c \'import sys; sys.exit(0 if sys.version_info >= (3, 11) else "Python 3.11 or newer is required")\''
@@ -729,7 +771,10 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None):
             PackageFile("runtime_candidates.py", (Path(__file__).parent / "runtime_candidates.py").read_text()),
             PackageFile("sdk_wheel_integrity.py", (Path(__file__).parent / "sdk_wheel_integrity.py").read_text()),
             PackageFile("install_candidate.py", (TEMPLATES / "install_candidate.py").read_text())]
-    requirements = f"meerkat-mobkit=={native_version}\nmcp=={MCP_VERSION}\nhttpx==0.28.1\nstarlette==1.7.0\nuvicorn==0.54.0\nPyJWT==2.15.0\njsonschema==4.26.0\n"
+    requirements = f"meerkat-mobkit=={native_version}\n{HOST_REQUIREMENTS}"
+    if public_runtime:
+        requirements = HOST_REQUIREMENTS
+        files.append(PackageFile("requirements.sdk.txt", public_meta_runtime.sdk_requirements()))
     if product:
         from .runtime_candidates import _Inputs, MAX_METADATA_BYTES
         inputs = _Inputs(runtime_target.artifact_root)
@@ -744,10 +789,12 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None):
               PackageFile("deployment.json", json.dumps(runtime, ensure_ascii=True, indent=2) + "\n"),
               PackageFile("requirements.txt", requirements),
               PackageFile("config/mob.toml", mob_toml(spec, native_version=native_version,
-                  runtime_target=runtime_target if product else None, verified_artifacts=verified_artifacts)),
+                  runtime_target=runtime_target if product else None, verified_artifacts=verified_artifacts,
+                  public_runtime=public_runtime)),
               PackageFile("config/console.toml", _console(spec, runtime_target=runtime_target if product else None)),
               PackageFile("config/connections.json", json.dumps(runtime["mcpConnections"], ensure_ascii=True, indent=2) + "\n"),
-              PackageFile("README.md", _readme(spec, native_version=native_version, candidate=selection is not None, product=product)),
+              PackageFile("README.md", _readme(spec, native_version=native_version, candidate=selection is not None,
+                  product=product, public=public_runtime)),
               PackageFile(".gitignore", ".env\n.venv/\n.bin/\n.mobkit/\ndata/\nworkspace/\nknowledge/.env\nknowledge/.source/\n__pycache__/\n*.pyc\n"),
               PackageFile("workspace/START-HERE.txt", "Place text references here. Only classes with workspace access may read them.\n")]
     env = ["# Private values are entered on this deployment computer.", f"MOBKIT_PORT={spec.advanced.port}"]
@@ -801,7 +848,7 @@ def maintained_host_export():
 
 
 def generate_runtime_refresh(value, accepted_files, *, runtime_target=None, verified_artifacts=None,
-                             protected_application_paths=None):
+                             protected_application_paths=None, predecessor_artifacts=None):
     """Derive a current host from an exact host-accepted framework snapshot.
 
     Application source is copied separately under its existing workspace lock.
@@ -809,6 +856,8 @@ def generate_runtime_refresh(value, accepted_files, *, runtime_target=None, veri
     product successor retains its host-protected application inputs while
     replacing the selected SDK/native dependency tuple and framework source.
     Keeping accepted design and MCP source preserves their declared closure.
+    predecessor_artifacts are the caller's verified artifacts of the accepted
+    predecessor product, rechecked here instead of read again.
     """
     import re
     from .native_models import _exact
@@ -837,7 +886,9 @@ def generate_runtime_refresh(value, accepted_files, *, runtime_target=None, veri
                            or "\0" in accepted[name].content for name in protected_application_paths)
                     or old.get("mobkitVersion") != prior.meta.version
                     or old.get("runtimeCandidate") != selected_runtime_marker(prior)
-                    or json.loads(accepted["runtime-candidate.json"].content) != candidate_selection(prior)):
+                    or json.loads(accepted["runtime-candidate.json"].content) != candidate_selection(prior,
+                        verified_artifacts=predecessor_artifacts
+                            if getattr(predecessor_artifacts, "selection", None) == prior else None)):
                 raise ValueError("The product successor requires its exact protected predecessor snapshot and selected artifacts.")
             protected = protected_application_paths
         elif protected_application_paths:
@@ -962,18 +1013,24 @@ def continuation_contract(files):
 
 
 def package_preview(value):
+    # The agent-team download and its preview are the package Install agent
+    # team installs: the public Meta release, not MobKit 0.8.
+    from .public_meta_runtime import VERSION as AGENT_TEAM_VERSION, models_unlisted_reason, unlisted_models
     spec = _spec(value)
-    availability = package_availability(spec)
+    availability = package_availability(spec, public_runtime=True)
     if not availability["available"]:
         # Keep desired plans reviewable without exporting an unconfigured package.
+        missing = unlisted_models((item.provider, item.model) for item in spec.agent_classes)
+        label = ("Model catalog" if missing and availability["reason"] == models_unlisted_reason(missing)
+            else "Google Cloud project" if availability["status"] == "pending-configuration" else "Connection helper")
         return {"valid": True, "issues": [], "package_availability": availability,
             "resolved": resolved_blueprint(spec),
-            "files": [], "checks": [{"label": "Google Cloud project" if availability["status"] == "pending-configuration" else "Connection helper",
+            "files": [], "checks": [{"label": label,
                 "status": availability["status"], "detail": availability["reason"]}],
             "summary": {"classes": len(spec.agent_classes), "agents": len(spec.identities()),
                 "connections": len(spec.connections), "flows": len(spec.flows), "files": 0},
-            "file_count": 0, "name": spec.project.slug + ".zip", "mobkit_version": MOBKIT_VERSION}
-    files = generate_package(spec)
+            "file_count": 0, "name": spec.project.slug + ".zip", "mobkit_version": AGENT_TEAM_VERSION}
+    files = generate_package(spec, public_runtime=True)
     checks = [{"label": "Native runtime", "status": "configured", "detail": f"{len(spec.identities())} durable identities across {len(spec.agent_classes)} classes"},
               {"label": "Topology", "status": "configured", "detail": f"{len(spec.resolved_edges())} peer edges"},
               {"label": "Workflows", "status": "configured", "detail": f"{len(spec.flows)} native DAG workflows"},
@@ -981,14 +1038,15 @@ def package_preview(value):
     return {"valid": True, "issues": [], "package_availability": availability,
             "resolved": resolved_blueprint(spec), "files": [item.to_dict() for item in files],
             "checks": checks, "summary": {"classes": len(spec.agent_classes), "agents": len(spec.identities()), "connections": len(spec.connections), "flows": len(spec.flows), "files": len(files)},
-            "file_count": len(files), "name": spec.project.slug + ".zip", "mobkit_version": MOBKIT_VERSION}
+            "file_count": len(files), "name": spec.project.slug + ".zip", "mobkit_version": AGENT_TEAM_VERSION}
 
 
 def build_archive(value):
+    """The agent-team download: the public Meta package that Install agent team installs."""
     spec = _spec(value)
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        for item in generate_package(spec):
+        for item in generate_package(spec, public_runtime=True):
             info = zipfile.ZipInfo(f"{spec.project.slug}/{item.path}")
             info.create_system = 3
             info.external_attr = (0o100000 | item.mode) << 16

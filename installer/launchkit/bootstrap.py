@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 from copy import deepcopy
 from dataclasses import dataclass, field
 import hashlib
@@ -332,22 +331,3 @@ def download_gateway(destination: Path, *, binary_name: str = "rpc_gateway") -> 
                     "archive_sha256": archive_digest, "binary_sha256": hashlib.sha256(binary).hexdigest()}
     _atomic_write(receipt, (json.dumps(receipt_data, indent=2) + "\n").encode(), 0o600)
     return destination
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Install the verified MobKit gateway for the local studio")
-    parser.add_argument("--destination", type=Path,
-                        default=package_tool_path(Path(__file__).resolve().parents[1], "rpc_gateway"))
-    parser.add_argument("--maintenance", action="store_true", help="Also install the native storage maintenance tool")
-    args = parser.parse_args()
-    try:
-        path = download_gateway(args.destination)
-        if args.maintenance:
-            download_gateway(args.destination.with_name("mobkit_gateway"), binary_name="mobkit_gateway")
-    except (GatewayInstallError, OSError) as error:
-        parser.exit(1, f"Gateway setup needs attention: {error}\n")
-    print(f"Verified MobKit {VERSION} gateway: {path}")
-
-
-if __name__ == "__main__":
-    main()

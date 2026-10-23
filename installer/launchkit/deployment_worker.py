@@ -39,6 +39,10 @@ STOP_TIMEOUT = APPLICATION_STOP_TIMEOUT
 MAX_LOG_BYTES = 64 * 1024
 MAX_READY_BYTES = 2 * 1024 * 1024
 MAX_PRIVATE_COMMAND_BYTES = 1024 * 1024
+# A sanity bound on an installed gateway before its receipt hash, which reads
+# the file in 1 MiB chunks. The installer already checked the release bytes
+# against their published checksum; Meta's rpc_gateway is 471 MiB at 0.9.4.
+MAX_NATIVE_BINARY_BYTES = 1024 * 1024 * 1024
 # Two bounded SDK source/cache files encoded as base64, plus their JSON/path
 # overhead. This stdin is never rendered or retained in the public log buffer.
 MAX_PRIVATE_COMMAND_INPUT_BYTES = 2 * ((32 * 1024 * 1024 + 2) // 3 * 4) + 64 * 1024
@@ -867,7 +871,7 @@ class Supervisor:
         override = read_settings(self.destination).get("MOBKIT_RPC_GATEWAY_BIN")
         if override and Path(override).resolve() != binary.resolve():
             raise RuntimeError("Native definition observation cannot use a gateway outside this installation's verified artifact receipt.")
-        for path, limit in ((binary, 512 * 1024 * 1024), (receipt, 1024 * 1024)):
+        for path, limit in ((binary, MAX_NATIVE_BINARY_BYTES), (receipt, 1024 * 1024)):
             info = path.lstat()
             if (path.is_symlink() or any(parent.is_symlink() for parent in path.parents)
                     or not path.is_file() or info.st_uid != os.getuid() or info.st_nlink != 1
@@ -1634,6 +1638,57 @@ class _InitialProductFence:
         selected_runtime_artifacts(self.artifacts.selection, verified_artifacts=self.artifacts)
 
 
+MAX_VENV_CONFIG_BYTES = 64 * 1024
+
+
+def existing_environment_refusal(venv, running=None):
+    """Why an existing application venv cannot be reused by this Forge, or None.
+
+    venv adds only missing links. Over a venv that another CPython created,
+    bin/python keeps running that CPython, so pip would install this Forge's
+    checked closure with an interpreter that nothing checked. The venv's own
+    configuration, links and library folders all name the CPython it holds.
+    """
+    running = tuple(sys.version_info[:2] if running is None else running)
+    unreadable = ("This application's environment does not show which CPython created it, so Forge cannot "
+        "safely reuse it. Install into a new empty folder.")
+    found = set()
+    try:
+        descriptor = os.open(venv / "pyvenv.cfg", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        descriptor = None
+    except OSError:
+        return unreadable
+    if descriptor is not None:
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            content = stream.read(MAX_VENV_CONFIG_BYTES + 1)
+        if not stat.S_ISREG(info.st_mode) or len(content) > MAX_VENV_CONFIG_BYTES:
+            return unreadable
+        for line in content.decode("utf-8", "replace").splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip() in {"version", "version_info"}:
+                version = re.fullmatch(r"([0-9]+)\.([0-9]+)(\.[0-9A-Za-z.+-]*)?", value.strip())
+                if version is None:
+                    return unreadable
+                found.add((int(version[1]), int(version[2])))
+    for folder in (venv / "bin", venv / "lib"):
+        if folder.is_dir() and not folder.is_symlink():
+            for path in folder.iterdir():
+                version = re.fullmatch(r"python([0-9]+)\.([0-9]+)", path.name)
+                if version is not None:
+                    found.add((int(version[1]), int(version[2])))
+    others = sorted(found - {running})
+    if not others:
+        return None
+    created = " and ".join(f"CPython {major}.{minor}" for major, minor in others)
+    return (f"This application's environment was created by {created}, but this Forge runs CPython "
+        f"{running[0]}.{running[1]}, so reusing it would install the application's packages for another "
+        f"interpreter. Stop Forge, move only Forge's own .venv folder aside and start it again with PYTHON_BIN "
+        f"set to a CPython {others[-1][0]}.{others[-1][1]} interpreter, as the README describes, or install "
+        "into a new empty folder. Your saved setups are kept.")
+
+
 async def _install_selected_product(supervisor, artifacts, require_current, command,
         *, source_custody=None, files=None, report_progress=lambda message: None):
     """Prepare selected bytes using the original child executor and fence.
@@ -1697,6 +1752,11 @@ async def _install_selected_product(supervisor, artifacts, require_current, comm
     if not venv.exists() and not venv.is_symlink():
         venv.mkdir(mode=0o700)
     owned_directory(venv, private=True)
+    # An existing venv keeps the interpreter that created it: check it before
+    # the venv command below reuses it.
+    refusal = existing_environment_refusal(venv)
+    if refusal is not None:
+        raise DraftConflict(refusal)
     current()
     report_progress("Preparing the application environment.")
     await command([sys.executable, "-I", "-m", "venv", str(venv)],
@@ -1764,7 +1824,13 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
     # transaction may count as lineage while it changes source.
     bootstrap_restore = updates.setup_restore_pin(directory, update)
     require_update_bootstrap_history(directory, bootstrap_restore, in_flight=expected_binding)
-    owner_start = bootstrap_restore is not None
+    # A helperless application on the selected Meta product starts only with
+    # its owner's ordinary startup inputs, so this worker never starts it
+    # either: it installs and checks the source, and the owner's Start runs it.
+    from .ordinary_application_source import ordinary_installation
+    ordinary_owner = (bootstrap_restore is None and replacement is None and ordinary_installation(receipt,
+        updates.checked_package(directory, "package.zip", receipt["package_sha256"])[1]))
+    owner_start = bootstrap_restore is not None or ordinary_owner
 
     def current_transaction(*, check_replacement=True):
         require_update_bootstrap_history(directory, bootstrap_restore, in_flight=expected_binding)
@@ -1833,7 +1899,7 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
             raise DraftConflict("The started source no longer matches the admitted update transaction.")
         _, source = updates.checked_package(directory, "package.zip", current["package_sha256"])
         verify_destination(current, source)
-        updates.committed(directory, identity, restored=restored, started=started,
+        updates.committed(directory, identity, restored=restored, started=started, setup=not ordinary_owner,
             expected_binding=expected_binding, expected_installation=expected_installation)
         ready = True
 
@@ -2017,7 +2083,7 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
                 # A ready new marker can survive an interruption before the
                 # checkpoint above. Ordinary startup re-inspects native truth;
                 # it does not repeat an already completed native apply.
-            # A set-up product's doctor needs its owner's startup, as at install.
+            # A product owner's doctor needs that owner's startup, as at install.
             checks = [("Updated application contract", "--application-check")] if product_update or owner_start else [
                 ("Update prerequisites", "--doctor"), ("Updated application contract", "--application-check")]
             for name, flag in checks:
@@ -2076,8 +2142,9 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
         updates._require_runtime_framework_configuration(read_receipt(directory), current)
         current_transaction()
         if owner_start:
-            # The owner's next Start restores the completed setup with this
-            # checked source. No worker child selects bootstrap inputs.
+            # The owner's next Start runs this checked source; a set-up
+            # application restores its completed setup with it. No worker
+            # child selects bootstrap or ordinary startup inputs.
             publish(restored, started=False)
         elif replacement is None:
             await supervisor.start(definition, on_ready=lambda: publish(restored))

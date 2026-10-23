@@ -470,3 +470,60 @@ async def test_apply_of_a_non_product_application_takes_the_ordinary_update_path
     receipt = deployment.read_receipt(directory)
     assert calls == ["--doctor", "--application-check", "start"]
     assert receipt["update"]["status"] == "completed" and receipt["build_id"] == second["build_id"]
+
+
+async def test_after_a_forge_restart_apply_waits_for_the_reconnected_setup_owner(set_up, monkeypatch):
+    f = set_up
+    second = await continuation(f)
+    update = await stage(f, second["build_id"])
+    await f.implementation.shutdown()
+    restarted = reloaded(f, monkeypatch)
+    try:
+        keys = ("status", "build_id", "package_sha256", "update", "update_action")
+        before = deployment.read_receipt(f.directory)
+        with pytest.raises(CustodyError, match="has not reconnected this application since it restarted"):
+            await restarted.service.action(f.guide_id, f.directory.name, "apply-update", update["update_id"],
+                action_request_id=str(uuid4()))
+        after = deployment.read_receipt(f.directory)
+        assert not restarted.service.launched
+        assert {key: after.get(key) for key in keys} == {key: before.get(key) for key in keys}
+        # Continue setup once reconnects the owner; then Apply installs the update.
+        reconnected = await restarted.service.action(f.guide_id, f.directory.name, "prepare-setup",
+            action_request_id=str(uuid4()))
+        assert reconnected["action_request"]["outcome"] == "returned"
+        restarted.service.launched.clear()
+        applied = await restarted.service.action(f.guide_id, f.directory.name, "apply-update",
+            update["update_id"], action_request_id=str(uuid4()))
+        assert applied["action_request"]["outcome"] == "returned", applied["action_request"]
+        directory, mode, options = restarted.service.launched[-1]
+        assert (directory, mode) == (f.directory, "update")
+        worker_type = await run_worker(f, monkeypatch, "update", options["update_selection"])
+        receipt = deployment.read_receipt(f.directory)
+        assert worker_type.starts == [] and receipt["update"]["status"] == "completed"
+        assert receipt["build_id"] == second["build_id"]
+    finally:
+        await restarted.implementation.shutdown()
+
+
+async def test_after_a_forge_restart_apply_before_the_first_setup_waits_for_the_owner(registry, monkeypatch):
+    f = registry
+    saved = new_guide(f)
+    installed = await build(f, saved)
+    await accept_source_fixture(f, installed)
+    directory, destination = await install_fixture(f, saved, installed, monkeypatch)
+    f.saved, f.installed, f.guide_id, f.directory, f.destination = saved, installed, saved["id"], directory, destination
+    second = await continuation(f)
+    update = await stage(f, second["build_id"])
+    await f.implementation.shutdown()
+    restarted = reloaded(f, monkeypatch)
+    try:
+        keys = ("status", "build_id", "package_sha256", "update", "update_action")
+        before = deployment.read_receipt(directory)
+        with pytest.raises(CustodyError, match="has not reconnected this application since it restarted"):
+            await restarted.service.action(f.guide_id, directory.name, "apply-update", update["update_id"],
+                action_request_id=str(uuid4()))
+        after = deployment.read_receipt(directory)
+        assert not restarted.service.launched
+        assert {key: after.get(key) for key in keys} == {key: before.get(key) for key in keys}
+    finally:
+        await restarted.implementation.shutdown()

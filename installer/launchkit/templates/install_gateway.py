@@ -12,21 +12,42 @@ import stat
 import tarfile
 import tempfile
 import time
+import urllib.error
 from urllib.parse import urlsplit
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent
 VERSION = json.loads((ROOT / "deployment.json").read_text())["mobkitVersion"]
-RELEASE_URL = f"https://github.com/lukacf/meerkat-mobkit/releases/download/v{VERSION}"
+
+
+def release_line(version):
+    """The (major, minor) of a runtime version, compared as numbers."""
+    try:
+        return tuple(int(part) for part in version.split(".")[:2])
+    except (AttributeError, ValueError):
+        raise SystemExit("The package names an invalid runtime version.") from None
+
+
+# A package from 0.9 on installs the public Meta release; a 0.8 package keeps MobKit.
+META = release_line(VERSION) >= (0, 9)
+RUNTIME = "Meta" if META else "MobKit"
+RELEASE_URL = (f"https://github.com/lukacf/meerkat-meta/releases/download/v{VERSION}" if META
+    else f"https://github.com/lukacf/meerkat-mobkit/releases/download/v{VERSION}")
 ARCHITECTURES = {"arm64": "aarch64", "aarch64": "aarch64", "x86_64": "x86_64", "AMD64": "x86_64"}
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
-MAX_BINARY_BYTES = 512 * 1024 * 1024
+MAX_BINARY_BYTES = (1024 if META else 512) * 1024 * 1024
 MAX_TAR_OVERHEAD = 1024 * 1024
 PROGRESS_SECONDS = 5
 PROGRESS_BYTES = 8 * 1024 * 1024
 HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
-BINARIES = {"rpc_gateway": "mobkit-rpc-gateway", "mobkit_gateway": "mobkit-gateway"}
+BINARIES = ({"rpc_gateway": "meta-rpc-gateway", "meta_gateway": "meta-gateway"} if META
+    else {"rpc_gateway": "mobkit-rpc-gateway", "mobkit_gateway": "mobkit-gateway"})
+
+
+def checksum_manifest(target):
+    """Meta publishes macOS Intel in a later, add-only tier with its own manifest."""
+    return "checksums-trailing.sha256" if META and target == "x86_64-apple-darwin" else "checksums.sha256"
 
 
 def platform_target():
@@ -46,7 +67,7 @@ def platform_target():
     return f"{architecture}-{suffix}"
 
 
-def download(url, limit=MAX_ARCHIVE_BYTES):
+def download(url, limit=MAX_ARCHIVE_BYTES, missing=None):
     request = urllib.request.Request(url, headers={"User-Agent": "Meta-Forge/1", "Accept": "application/octet-stream"})
     # Display only the requested asset name, never URLs, redirects or auth data.
     asset = re.sub(r"[^A-Za-z0-9_.-]", "_", urlsplit(url).path.rsplit("/", 1)[-1])[:200] or "release asset"
@@ -80,6 +101,10 @@ def download(url, limit=MAX_ARCHIVE_BYTES):
             if total is not None and size != total:
                 raise SystemExit("The release download was incomplete. Retry installation; no binary was installed.")
             return b"".join(chunks)
+    except urllib.error.HTTPError as error:
+        if missing and error.code == 404:
+            raise SystemExit(missing) from error
+        raise SystemExit("Could not download the official release. Check network access and try again.") from error
     except OSError as error:
         raise SystemExit("Could not download the official release. Check network access and try again.") from error
 
@@ -202,11 +227,17 @@ def main():
     for name in BINARIES:
         if name not in pending and verified_cache(directory, name, target):
             reused.add(name)
-            print(f"Reusing verified official MobKit {VERSION} .bin/{name}; binary SHA-256 checked.", flush=True)
+            print(f"Reusing verified official {RUNTIME} {VERSION} .bin/{name}; binary SHA-256 checked.", flush=True)
     required = [name for name in BINARIES if name not in pending and name not in reused]
     if required:
-        print(f"Downloading MobKit {VERSION} runtime and maintenance tools for {target}...", flush=True)
-        checksum_bytes = download(f"{RELEASE_URL}/checksums.sha256", MAX_MANIFEST_BYTES)
+        print(f"Downloading {RUNTIME} {VERSION} runtime and maintenance tools for {target}...", flush=True)
+        manifest_name = checksum_manifest(target)
+        if manifest_name == "checksums.sha256":
+            checksum_bytes = download(f"{RELEASE_URL}/{manifest_name}", MAX_MANIFEST_BYTES)
+        else:
+            checksum_bytes = download(f"{RELEASE_URL}/{manifest_name}", MAX_MANIFEST_BYTES,
+                missing=f"Meta {VERSION} has not published its macOS Intel tools yet. Install on an "
+                    "Apple silicon Mac or Linux, or retry after they are published.")
         if len(checksum_bytes) > MAX_MANIFEST_BYTES:
             raise SystemExit("The release checksum manifest exceeded its size limit.")
         try:

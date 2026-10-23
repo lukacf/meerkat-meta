@@ -23,9 +23,6 @@ from test_local_application_registry import (
 )
 
 
-HELPERLESS_UPDATE = "An application without a setup helper cannot take a staged update in place yet"
-
-
 def ordinary_guide(f):
     saved = new_guide(f, ordinary=True)
     # Use the same exact model in this inert selected native catalog as the
@@ -416,9 +413,8 @@ async def test_staged_update_keeps_the_stopped_original_startable(ordinary_regis
     current = deployment.read_receipt(directory)["update"]
     assert (current["update_id"], current["status"]) == (staged["update"]["update_id"], staged["update"]["status"])
     assert record.read_bytes() == recorded
-    # The staged update still cannot replace this original installation's source.
-    with pytest.raises(CustodyError, match=HELPERLESS_UPDATE):
-        f.registry._selected_replacement(saved["id"], directory.name, staged["update"]["update_id"])
+    # Apply selects no replacement owner; the ordinary update path admits it.
+    assert f.registry._selected_replacement(saved["id"], directory.name, staged["update"]["update_id"]) is None
 
 
 async def test_forge_reload_with_a_staged_update_recovers_the_original_start(ordinary_registry, monkeypatch):
@@ -446,13 +442,14 @@ async def test_only_a_pending_staged_update_keeps_the_original_owner(ordinary_re
     f.registry._selected_startup(saved["id"], directory.name)
     staged = await staged_improvement(f, saved, result, directory)
     from launchkit.deployment_updates import update_receipt
-    # A test-only status edit: any other update state keeps the strict owner check.
+    # A test-only status edit: an update that has not finished keeps refusing
+    # the original owner's Start, and says so.
     update_receipt(directory, update={**staged["update"], "status": "snapshotting"})
-    with pytest.raises(CustodyError, match="cannot be redirected to another build or source owner"):
+    with pytest.raises(CustodyError, match="belongs to an update that has not finished"):
         f.registry._selected_startup(saved["id"], directory.name)
 
 
-async def test_apply_after_reload_refuses_a_helperless_staged_update_cleanly(ordinary_registry, monkeypatch):
+async def test_apply_after_reload_selects_no_replacement_owner_for_a_helperless_update(ordinary_registry, monkeypatch):
     f = ordinary_registry
     saved = ordinary_guide(f)
     result = await build(f, saved)
@@ -463,35 +460,5 @@ async def test_apply_after_reload_refuses_a_helperless_staged_update_cleanly(ord
     monkeypatch.setattr(service, "_launch", lambda *args, **kwargs: None)
     # After a Forge restart, Start retains the staged binding as the original.
     await service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
-    with pytest.raises(CustodyError, match=HELPERLESS_UPDATE):
-        owner._selected_replacement(saved["id"], directory.name, staged["update"]["update_id"])
+    assert owner._selected_replacement(saved["id"], directory.name, staged["update"]["update_id"]) is None
     assert deployment.read_receipt(directory)["update"]["update_id"] == staged["update"]["update_id"]
-
-
-async def test_apply_of_a_helperless_staged_update_refuses_before_any_worker(ordinary_registry, monkeypatch):
-    """Apply as the browser sends it, through the launcher's callbacks.
-
-    An application without a setup helper has no in-place update path yet.
-    Apply refuses with guidance before any worker is queued: the installed
-    source, the staged update and the stopped application stay as they were.
-    """
-    f = ordinary_registry
-    assert f.service.application_replacement_selection == f.registry._selected_replacement
-    saved = ordinary_guide(f)
-    result = await build(f, saved)
-    await accept_source_fixture(f, result)
-    directory, _ = await install_fixture(f, saved, result, monkeypatch)
-    staged = await staged_improvement(f, saved, result, directory)
-    before = deployment.read_receipt(directory)
-    f.service.launched.clear()
-    with pytest.raises(CustodyError, match=HELPERLESS_UPDATE):
-        await f.service.action(saved["id"], directory.name, "apply-update",
-            staged["update"]["update_id"], action_request_id=str(uuid4()))
-    assert f.service.launched == [] and not f.service.tasks
-    after = deployment.read_receipt(directory)
-    assert {key: after.get(key) for key in ("status", "build_id", "package_sha256", "update", "update_action")} == {
-        key: before.get(key) for key in ("status", "build_id", "package_sha256", "update", "update_action")}
-    assert after["update"]["update_id"] == staged["update"]["update_id"]
-    # The stopped original stays startable after the refusal.
-    await f.service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
-    assert f.service.launched[-1][1] == "start"

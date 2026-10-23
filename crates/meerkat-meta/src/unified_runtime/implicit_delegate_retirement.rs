@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use meerkat_core::{AgentExecutionSnapshot, TurnPhase};
 use meerkat_mob::{
-    AgentIdentity, MobMemberStatus, RetirementSettlement, RetirementSettlementWatch,
+    AgentIdentity, MobMemberKickoffPhase, MobMemberStatus, RetirementSettlement,
+    RetirementSettlementWatch,
 };
 use meerkat_mob_mcp::MobMcpState;
 
@@ -60,7 +61,10 @@ async fn run_implicit_delegate_retirement(
 ) {
     let primary_mob_id = runtime.handle().mob_id().to_string();
     let session_service = state.session_service();
-    let mut idle_since: BTreeMap<(String, String), Instant> = BTreeMap::new();
+    // Each member's idle clock, with the session it was started on: a member
+    // re-seated or re-woken under another session starts a fresh window.
+    let mut idle_since: BTreeMap<(String, String), (meerkat_core::types::SessionId, Instant)> =
+        BTreeMap::new();
     // A retirement that outlives `retire`'s wait stays owned by the mob
     // (meerkat 0.8.51): its settlement is awaited here, off the sweep, and
     // reported. Dropping the set with this task aborts the waits.
@@ -134,21 +138,49 @@ async fn run_implicit_delegate_retirement(
                     idle_since.remove(&key);
                     continue;
                 };
-                let idle =
-                    match observe_member_execution(session_service.as_ref(), &session_id).await {
-                        MemberExecution::Idle => true,
-                        MemberExecution::Busy => false,
-                        MemberExecution::Unreadable(error) => {
+                let idle = match observe_member_execution(session_service.as_ref(), &session_id)
+                    .await
+                {
+                    MemberExecution::Idle => true,
+                    MemberExecution::Busy => false,
+                    // Retiring a member ends the work it still owes, so a
+                    // member no live session serves is idle only once it
+                    // owes none: no kickoff in flight and no input of its
+                    // session short of a terminal phase.
+                    MemberExecution::NotLive(error) => {
+                        let owes_input = tokio::time::timeout(
+                            MEMBER_EXECUTION_OBSERVATION_TIMEOUT,
+                            runtime.session_owes_durable_input(&session_id),
+                        )
+                        .await
+                        .ok()
+                        .flatten();
+                        let owes = owes_work_while_not_live(
+                            member.kickoff.as_ref().map(|kickoff| kickoff.phase),
+                            owes_input,
+                        );
+                        if owes {
                             tracing::debug!(
                                 mob_id = %mob_id,
                                 agent_identity = %identity,
                                 session_id = %session_id,
                                 error = %error,
-                                "implicit delegate idle sweep skipped member after snapshot error"
+                                "implicit delegate idle sweep kept a member no live session serves: it still owes work"
                             );
-                            false
                         }
-                    };
+                        !owes
+                    }
+                    MemberExecution::Unreadable(error) => {
+                        tracing::debug!(
+                            mob_id = %mob_id,
+                            agent_identity = %identity,
+                            session_id = %session_id,
+                            error = %error,
+                            "implicit delegate idle sweep skipped member after snapshot error"
+                        );
+                        false
+                    }
+                };
                 if !idle {
                     idle_since.remove(&key);
                     continue;
@@ -173,8 +205,29 @@ async fn run_implicit_delegate_retirement(
                     idle_since.remove(&key);
                     continue;
                 }
-                let since = idle_since.entry(key.clone()).or_insert_with(Instant::now);
+                let since = match idle_since.get(&key) {
+                    Some((clock_session, since)) if *clock_session == session_id => *since,
+                    _ => {
+                        let now = Instant::now();
+                        idle_since.insert(key.clone(), (session_id.clone(), now));
+                        now
+                    }
+                };
                 if since.elapsed() < idle_after {
+                    continue;
+                }
+                #[cfg(test)]
+                tests::pause_before_retire(mob_id.as_str(), &member.agent_identity).await;
+                // Retire is member-addressed: a member re-seated or re-woken
+                // under another session since this pass read it is not the
+                // member this clock timed.
+                if handle
+                    .resolve_bridge_session_id(&member.agent_identity)
+                    .await
+                    .as_ref()
+                    != Some(&session_id)
+                {
+                    idle_since.remove(&key);
                     continue;
                 }
                 let public_alias =
@@ -326,6 +379,11 @@ enum MemberExecution {
     /// Mid-turn: the runtime machine has a run open for the session, or the
     /// session did not answer within [`MEMBER_EXECUTION_OBSERVATION_TIMEOUT`].
     Busy,
+    /// The execution snapshot failed, and the typed local reads say why: this
+    /// process's durable store holds the session and no live actor serves it,
+    /// as for a member a restart left without a live session. Idle unless it
+    /// still owes work ([`owes_work_while_not_live`]).
+    NotLive(meerkat_core::service::SessionError),
     Unreadable(meerkat_core::service::SessionError),
 }
 
@@ -366,8 +424,60 @@ async fn observe_member_execution(
         Ok(Ok(Some(snapshot))) if delegate_execution_is_idle(&snapshot) => MemberExecution::Idle,
         Ok(Ok(Some(_))) | Err(_) => MemberExecution::Busy,
         Ok(Ok(None)) => MemberExecution::Idle,
-        Ok(Err(error)) => MemberExecution::Unreadable(error),
+        Ok(Err(error)) => not_live_or_unreadable(session_service, session_id, error).await,
     }
+}
+
+/// A member whose execution snapshot failed, read with typed local reads and
+/// never by the error's variant. Only a session this process's durable store
+/// holds and no live actor serves is [`MemberExecution::NotLive`]. A session
+/// the store does not hold (a placed member's session is resident on its
+/// host, or the session is gone), a live session, and a read that fails or
+/// does not answer in time stay [`MemberExecution::Unreadable`].
+async fn not_live_or_unreadable(
+    session_service: &dyn meerkat_mob::MobSessionService,
+    session_id: &meerkat_core::types::SessionId,
+    error: meerkat_core::service::SessionError,
+) -> MemberExecution {
+    let live = tokio::time::timeout(
+        MEMBER_EXECUTION_OBSERVATION_TIMEOUT,
+        session_service.live_session_actor_registered(session_id),
+    )
+    .await;
+    if !matches!(live, Ok(Ok(false))) {
+        return MemberExecution::Unreadable(error);
+    }
+    let persisted = tokio::time::timeout(
+        MEMBER_EXECUTION_OBSERVATION_TIMEOUT,
+        session_service.load_persisted_session_metadata(session_id),
+    )
+    .await;
+    if matches!(persisted, Ok(Ok(Some(_)))) {
+        MemberExecution::NotLive(error)
+    } else {
+        MemberExecution::Unreadable(error)
+    }
+}
+
+/// Whether a member no live session serves still owes work: its kickoff has
+/// not resolved, or its session holds an input short of a terminal phase. An
+/// input read that did not answer owes too, never a guessed `false`.
+fn owes_work_while_not_live(
+    kickoff: Option<MobMemberKickoffPhase>,
+    owes_durable_input: Option<bool>,
+) -> bool {
+    kickoff.is_some_and(kickoff_is_pending) || owes_durable_input != Some(false)
+}
+
+/// A kickoff that has not resolved: not yet started, starting, or waiting on
+/// its callback. A phase this build does not know counts as pending.
+fn kickoff_is_pending(phase: MobMemberKickoffPhase) -> bool {
+    !matches!(
+        phase,
+        MobMemberKickoffPhase::Started
+            | MobMemberKickoffPhase::Failed
+            | MobMemberKickoffPhase::Cancelled
+    )
 }
 
 fn delegate_execution_is_idle(snapshot: &AgentExecutionSnapshot) -> bool {
@@ -2908,6 +3018,469 @@ comms = true
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(mob_id);
+    }
+
+    /// Holds sweep passes over one mob right before they retire a member.
+    static RETIRE_PAUSES: std::sync::Mutex<BTreeMap<String, SweepPause>> =
+        std::sync::Mutex::new(BTreeMap::new());
+
+    /// Called by the sweep right before it retires `member` of `mob_id`: when
+    /// a test paused that mob's retires, report the member and wait for its
+    /// release.
+    pub(super) async fn pause_before_retire(mob_id: &str, member: &AgentIdentity) {
+        let pause = RETIRE_PAUSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(mob_id)
+            .map(|pause| (pause.reached.clone(), Arc::clone(&pause.release)));
+        let Some((reached, release)) = pause else {
+            return;
+        };
+        if reached
+            .send(vec![(member.clone(), MobMemberStatus::Active)])
+            .is_ok()
+        {
+            let _ = release.lock().await.recv().await;
+        }
+    }
+
+    /// Hold every retire the sweep is about to make in `mob_id`: each reports
+    /// its member on the returned receiver and waits for one release on the
+    /// returned sender. [`unpause_retire`] lets retires run freely again.
+    fn pause_retire(
+        mob_id: &str,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<SweepSnapshot>,
+        tokio::sync::mpsc::UnboundedSender<()>,
+    ) {
+        let (reached, reached_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release) = tokio::sync::mpsc::unbounded_channel();
+        RETIRE_PAUSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                mob_id.to_string(),
+                SweepPause {
+                    reached,
+                    release: Arc::new(tokio::sync::Mutex::new(release)),
+                },
+            );
+        (reached_rx, release_tx)
+    }
+
+    fn unpause_retire(mob_id: &str) {
+        RETIRE_PAUSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(mob_id);
+    }
+
+    /// The idle-retirement runtime as a gateway composes it over a durable
+    /// root: persistent mob storage, Core's persistent session service and
+    /// runtime store, and the opt-ins in `<root>/metadata.sqlite3`. A second
+    /// boot over the same root restores the roster, the sessions and the
+    /// opt-ins. No identity-first activation runs, so nothing revives a
+    /// restored member's session. Members run on `client`.
+    async fn boot_restartable_sweeping_runtime(
+        mob_id: &str,
+        root: &std::path::Path,
+        sweep_interval_ms: u64,
+        client: Arc<dyn meerkat_client::LlmClient>,
+    ) -> UnifiedRuntime {
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).expect("state root");
+        let (storage, provenance) =
+            crate::mob_composition_manifest::persistent_mob_storage(root.join("mob.sqlite3"))
+                .expect("open persistent mob storage");
+        let spec = crate::MobBootstrapSpec::persistent(
+            sweeping_definition(mob_id),
+            storage,
+            provenance,
+            state_root,
+            16,
+        )
+        .await
+        .expect("compose persistent Meta stores")
+        // Both boots run in one process: a durable child-mob default would
+        // hold the state root's child mobs for the process lifetime.
+        .with_child_mob_storage(crate::ChildMobStorage::ProcessBound)
+        .with_options(crate::MobBootstrapOptions {
+            default_llm_client: Some(client),
+            ..sweeping_options()
+        });
+        bootstrap_sweeping(
+            spec,
+            mob_id,
+            &root.join("metadata.sqlite3"),
+            sweep_interval_ms,
+        )
+        .await
+    }
+
+    /// L11: a member a restart left without a live session, that owes no
+    /// work, is retired after its window like any idle member. The first boot
+    /// seats `worker` with an opt-in and `bystander` without one, and never
+    /// sweeps. While the worker's kickoff turn is held on the model, the
+    /// durable store read finds its open input under the worker's session;
+    /// once the turn ends it finds none. The second boot over the same
+    /// durable root restores both members, and nothing revives their
+    /// sessions: the store holds the worker's session and no live actor
+    /// serves it, so its execution snapshot fails. The sweep retires `worker`
+    /// and clears its opt-in; `bystander` stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restart_retires_an_opted_in_worker_no_live_session_serves() {
+        const MOB_ID: &str = "restart-not-live";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let metadata_path = temp.path().join("metadata.sqlite3");
+        let (open_gate, gate) = tokio::sync::watch::channel(false);
+        let first = boot_restartable_sweeping_runtime(
+            MOB_ID,
+            temp.path(),
+            3_600_000,
+            Arc::new(GatedLlmClient { gate }),
+        )
+        .await;
+        let handle = first.mob_handle();
+        // Autonomous: the worker's kickoff turn starts at once and holds on
+        // the gate.
+        let worker_session = seat(&handle, "worker").await;
+        await_member_run_open(&handle, &AgentIdentity::from("worker")).await;
+        assert_eq!(
+            first
+                .mob_runtime
+                .session_owes_durable_input(&worker_session)
+                .await,
+            Some(true),
+            "the store read does not find the held kickoff turn's input under the worker's session"
+        );
+        open_gate.send(true).expect("open the gate");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while first
+                .mob_runtime
+                .session_owes_durable_input(&worker_session)
+                .await
+                != Some(false)
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the worker's input stayed open after its turn ended");
+        seat(&handle, "bystander").await;
+        first
+            .mob_runtime
+            .implicit_delegate_retirement_overrides()
+            .expect("overrides")
+            .set(MOB_ID, "worker", DelegateIdleRetireOverride::Seconds(1))
+            .await;
+        assert_eq!(persisted_members(&metadata_path).await, vec!["worker"]);
+        drop(handle);
+        first.shutdown().await;
+        drop(first);
+
+        let second = boot_restartable_sweeping_runtime(
+            MOB_ID,
+            temp.path(),
+            1_000,
+            Arc::new(meerkat_client::TestClient::default()),
+        )
+        .await;
+        let handle = second.mob_handle();
+        let service = second
+            .mob_runtime
+            .agent_mob_mcp_state()
+            .expect("agent mob tool state")
+            .session_service();
+        let worker = AgentIdentity::from("worker");
+        assert_eq!(
+            handle.resolve_bridge_session_id(&worker).await,
+            Some(worker_session.clone()),
+            "the restored worker keeps its session"
+        );
+        assert!(
+            matches!(
+                service.live_session_actor_registered(&worker_session).await,
+                Ok(false)
+            ),
+            "no live actor serves the restored worker's session"
+        );
+        assert!(
+            matches!(
+                service
+                    .load_persisted_session_metadata(&worker_session)
+                    .await,
+                Ok(Some(_))
+            ),
+            "this process's store holds the restored worker's session"
+        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while is_live(&handle, "worker").await {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the sweep never retired the restored worker no live session serves");
+        assert!(
+            is_live(&handle, "bystander").await,
+            "a member without an opt-in stays"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !persisted_members(&metadata_path).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the retired worker's opt-in was not cleared");
+        drop(handle);
+        second.shutdown().await;
+    }
+
+    /// C1/C5: a failed execution snapshot is never idle by its error alone.
+    /// A session this process's store does not hold (a placed member's
+    /// session is resident on its host), a session a live actor serves, and a
+    /// live-actor read that fails all stay unreadable.
+    #[tokio::test]
+    async fn a_failed_snapshot_of_a_session_not_held_here_or_live_is_never_idle() {
+        for (live, persisted, case) in [
+            (
+                Some(false),
+                false,
+                "a session this process's store does not hold",
+            ),
+            (Some(true), true, "a session a live actor serves"),
+            (None, true, "a live-actor read that fails"),
+        ] {
+            let service = crate::mob_handle_runtime::failed_snapshot_probe(live, persisted);
+            let observed =
+                observe_member_execution(service.as_ref(), &meerkat_core::SessionId::new()).await;
+            assert!(
+                matches!(
+                    observed,
+                    MemberExecution::Unreadable(meerkat_core::SessionError::NotFound { .. })
+                ),
+                "{case} must stay unreadable"
+            );
+        }
+    }
+
+    /// C1: a failed execution snapshot of a session this process's store
+    /// holds and no live actor serves reads not live, so the owed-work check
+    /// decides it.
+    #[tokio::test]
+    async fn a_failed_snapshot_of_a_held_session_no_live_actor_serves_reads_not_live() {
+        let service = crate::mob_handle_runtime::failed_snapshot_probe(Some(false), true);
+        assert!(matches!(
+            observe_member_execution(service.as_ref(), &meerkat_core::SessionId::new()).await,
+            MemberExecution::NotLive(meerkat_core::SessionError::NotFound { .. })
+        ));
+    }
+
+    /// C2: a member no live session serves owes work while its kickoff has
+    /// not resolved, while an input of its session is open, and when the
+    /// input read did not answer. Only a resolved kickoff, or none, with no
+    /// open input leaves it idle.
+    #[test]
+    fn a_member_no_live_session_serves_owes_work_while_its_kickoff_or_an_input_is_open() {
+        use MobMemberKickoffPhase as Phase;
+        assert!(!owes_work_while_not_live(None, Some(false)));
+        for resolved in [Phase::Started, Phase::Failed, Phase::Cancelled] {
+            assert!(
+                !owes_work_while_not_live(Some(resolved), Some(false)),
+                "{resolved:?}"
+            );
+        }
+        for pending in [Phase::Pending, Phase::Starting, Phase::CallbackPending] {
+            assert!(
+                owes_work_while_not_live(Some(pending), Some(false)),
+                "{pending:?}"
+            );
+        }
+        assert!(owes_work_while_not_live(None, Some(true)), "an open input");
+        assert!(
+            owes_work_while_not_live(None, None),
+            "an input read that did not answer"
+        );
+    }
+
+    /// C2: a session's durable inputs owe work while any row is short of a
+    /// terminal phase; a row that does not decode is inconclusive.
+    #[test]
+    fn durable_inputs_owe_work_until_every_row_is_terminal() {
+        use crate::mob_handle_runtime::durable_inputs_owe_work;
+        use meerkat_runtime::input_state::{InputLifecycleState as Phase, StoredInputState};
+        use meerkat_runtime::store::InputStateRow;
+        let row = |phase| {
+            let mut state = StoredInputState::new_accepted(meerkat_core::lifecycle::InputId::new());
+            state.seed.phase = phase;
+            InputStateRow::Decoded(Box::new(state))
+        };
+        let terminal = [
+            Phase::Consumed,
+            Phase::Superseded,
+            Phase::Coalesced,
+            Phase::Abandoned,
+        ];
+        assert_eq!(durable_inputs_owe_work(&[]), Some(false));
+        assert_eq!(durable_inputs_owe_work(&terminal.map(row)), Some(false));
+        for open in [
+            Phase::Accepted,
+            Phase::Queued,
+            Phase::Staged,
+            Phase::Applied,
+            Phase::AppliedPendingConsumption,
+        ] {
+            let mut rows = terminal.map(row).to_vec();
+            rows.push(row(open));
+            assert_eq!(durable_inputs_owe_work(&rows), Some(true), "{open:?}");
+        }
+        let corrupt = InputStateRow::Corrupt {
+            input_id: "unreadable".to_string(),
+            detail: "does not decode".to_string(),
+        };
+        assert_eq!(
+            durable_inputs_owe_work(&[row(Phase::Consumed), corrupt]),
+            None
+        );
+    }
+
+    /// C4: an idle clock belongs to the session it started on. Pass 1 starts
+    /// the worker's clock; pass 2 is held while the worker is re-seated under
+    /// a new session, until the old clock is past the window. Pass 2 must
+    /// start a fresh window for the new session, so pass 3 still finds the
+    /// worker seated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_member_reseated_inside_its_window_is_not_retired_on_the_old_clock() {
+        const MOB_ID: &str = "reseated-inside-window";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = boot_sweeping_runtime(
+            MOB_ID,
+            &temp.path().join("state"),
+            &temp.path().join("metadata.sqlite3"),
+            1_000,
+        )
+        .await;
+        let handle = runtime.mob_handle();
+        let overrides = runtime
+            .mob_runtime
+            .implicit_delegate_retirement_overrides()
+            .expect("overrides");
+        let (mut reached, release) = pause_sweep(MOB_ID);
+        let first = seat(&handle, "worker").await;
+        overrides
+            .set(MOB_ID, "worker", DelegateIdleRetireOverride::Seconds(3))
+            .await;
+        let pass = Duration::from_secs(30);
+        // Pass 1 sees the worker idle and starts its clock.
+        tokio::time::timeout(pass, reached.recv())
+            .await
+            .expect("pass 1");
+        release.send(()).expect("release pass 1");
+        // Pass 2 is held while the worker is re-seated under a new session.
+        tokio::time::timeout(pass, reached.recv())
+            .await
+            .expect("pass 2");
+        let member = AgentIdentity::from("worker");
+        crate::mob_handle_runtime::respawn_carrying_idle_retire_opt_in(
+            Some(&overrides),
+            &handle,
+            &member,
+            handle.respawn(member.clone(), None),
+            Result::is_ok,
+        )
+        .await
+        .expect("respawn");
+        let second = handle
+            .resolve_bridge_session_id(&member)
+            .await
+            .expect("the re-seated worker's session");
+        assert_ne!(second, first, "a respawn mints a new session");
+        // Past the window on the old clock, well inside it on a new one.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        release.send(()).expect("release pass 2");
+        // Pass 3 starts only after pass 2 finished.
+        tokio::time::timeout(pass, reached.recv())
+            .await
+            .expect("pass 3");
+        assert!(
+            is_live(&handle, "worker").await,
+            "pass 2 retired the re-seated worker on its old session's clock"
+        );
+        assert_eq!(
+            handle.resolve_bridge_session_id(&member).await,
+            Some(second)
+        );
+        unpause_sweep(MOB_ID);
+        drop(release);
+        runtime.shutdown().await;
+    }
+
+    /// C4: retire is member-addressed, so the sweep reads the member's session
+    /// again right before it: a member re-seated between the pass's read and
+    /// its retire is not the member the clock timed. Here the retire is held
+    /// while the worker is re-seated; the pass must leave the new incarnation
+    /// seated, and the next pass finds it there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_member_reseated_before_its_retire_is_not_retired_on_the_old_session() {
+        const MOB_ID: &str = "reseated-before-retire";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = boot_sweeping_runtime(
+            MOB_ID,
+            &temp.path().join("state"),
+            &temp.path().join("metadata.sqlite3"),
+            1_000,
+        )
+        .await;
+        let handle = runtime.mob_handle();
+        let overrides = runtime
+            .mob_runtime
+            .implicit_delegate_retirement_overrides()
+            .expect("overrides");
+        let (mut retiring, release_retire) = pause_retire(MOB_ID);
+        let first = seat(&handle, "worker").await;
+        overrides
+            .set(MOB_ID, "worker", DelegateIdleRetireOverride::Seconds(0))
+            .await;
+        let wait = Duration::from_secs(30);
+        let held = tokio::time::timeout(wait, retiring.recv())
+            .await
+            .expect("the sweep reached the worker's retire")
+            .expect("a held retire");
+        assert_eq!(held[0].0.as_str(), "worker");
+        let member = AgentIdentity::from("worker");
+        crate::mob_handle_runtime::respawn_carrying_idle_retire_opt_in(
+            Some(&overrides),
+            &handle,
+            &member,
+            handle.respawn(member.clone(), None),
+            Result::is_ok,
+        )
+        .await
+        .expect("respawn");
+        let second = handle
+            .resolve_bridge_session_id(&member)
+            .await
+            .expect("the re-seated worker's session");
+        assert_ne!(second, first, "a respawn mints a new session");
+        // The next pass is held right after its snapshot: by then the held
+        // pass has finished.
+        let (mut reached, release) = pause_sweep(MOB_ID);
+        release_retire.send(()).expect("release the held retire");
+        tokio::time::timeout(wait, reached.recv())
+            .await
+            .expect("the next pass");
+        assert!(
+            is_live(&handle, "worker").await,
+            "the held pass retired the worker re-seated under a new session"
+        );
+        assert_eq!(
+            handle.resolve_bridge_session_id(&member).await,
+            Some(second)
+        );
+        unpause_retire(MOB_ID);
+        drop(release_retire);
+        unpause_sweep(MOB_ID);
+        drop(release);
+        runtime.shutdown().await;
     }
 
     /// `source` forks turn-driven `child` from its own turn; the child's

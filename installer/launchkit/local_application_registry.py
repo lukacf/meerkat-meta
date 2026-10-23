@@ -21,7 +21,8 @@ from .deployment import DeploymentService, read_receipt
 from .deployment_application_bootstrap import (FRESH_ENTRY_NAME, bootstrap_installation_binding,
     require_owner_installation, same_installation_apart_from_staged_update)
 from .deployment_sources import read_package_source
-from .deployment_updates import checked_package, _candidate_source_selection, _same_toml
+from .deployment_updates import (FIRST_SETUP_UPDATE, ORDINARY_OWNER_BLOCKER, ORDINARY_REPLACEMENT_BLOCKER,
+    OWNER_RECONNECT_UPDATE, checked_package, inspect_transaction, _candidate_source_selection, _same_toml)
 from .forge_application_host import ForgeApplicationHost, application_setup_binding, owner_choices_match
 from .guide_store import GuideStore
 from .implementation import ImplementationService
@@ -65,10 +66,6 @@ def _set_up(directory):
 
 
 REDIRECTED = "The original installation cannot be redirected to another build or source owner."
-HELPERLESS_UPDATE = ("An application without a setup helper cannot take a staged update in place yet. "
-    "Its installed application is unchanged. Install the new build into a new empty folder.")
-FIRST_SETUP_UPDATE = ("This application has not finished its setup, so it cannot take a staged update in "
-    "place yet. Its installed application is unchanged. Finish its setup, then stage the accepted update again.")
 
 
 class LocalApplicationRegistry:
@@ -325,10 +322,12 @@ class LocalApplicationRegistry:
             return None, None
         build_id = _identity(receipt.get("build_id"))
         manual = self.manual_host if self.manual_host is not None and self.manual_host.applies(guide_id) else None
-        if _set_up(directory):
+        if _set_up(directory) or retained is not None and type(retained[0]) is OrdinaryApplicationHost:
             # Its retained setup host holds the installation's custody. Another
             # build's host never becomes its owner, even one built here; without
-            # a retained entry only a claimed recovery rebuilds that owner.
+            # a retained entry only a claimed recovery rebuilds that owner. The
+            # retained owner of an application without a setup helper keeps its
+            # installation through the installation's own completed updates.
             chosen = None
             host = retained[0] if retained is not None else manual
         else:
@@ -363,7 +362,8 @@ class LocalApplicationRegistry:
                 # The retained anchor moves only through this installation's
                 # own completed source updates.
                 require_owner_installation(directory, receipt, {name: value for name, value
-                    in retained[1].items() if name != "accepted_source_digest"}, REDIRECTED)
+                    in retained[1].items() if name != "accepted_source_digest"}, REDIRECTED,
+                    setup_entry=type(host) is not OrdinaryApplicationHost)
         current = read_receipt(directory)
         if (self.deployment._directory(guide_id) != directory
                 or _installation_binding(current, source) != binding):
@@ -621,7 +621,7 @@ class LocalApplicationRegistry:
 
     def _selected_replacement(self, guide_id, deployment_id, update_id):
         if self.replacement_selection is None:
-            return self._no_replacement(guide_id, deployment_id)
+            return self._no_replacement(guide_id, deployment_id, update_id)
         host = self.selected_host(guide_id, deployment_id, staged_update_allowed=False)
         if host is None:
             raise CustodyError("This installation has no trusted replacement source owner.")
@@ -633,19 +633,34 @@ class LocalApplicationRegistry:
             raise CustodyError("The original installed replacement owner changed.")
         return result
 
-    def _no_replacement(self, guide_id, deployment_id):
+    def _no_replacement(self, guide_id, deployment_id, update_id):
         """Without a launcher-selected supplier, no installation has a replacement owner.
 
         Apply then takes the ordinary update path, which checks the set-up
-        owner's completed Restore itself. The owner lookup still refuses a
-        redirect to another build or source owner. An application without a
-        setup helper, or one that has not entered its setup, has no update
-        worker that could start it, so Apply refuses before any worker.
+        owner's completed Restore itself, and whose worker leaves an
+        application without a setup helper stopped for its owner's Start. The
+        owner lookup still refuses a redirect to another build or source owner,
+        and that owner must accept the staged candidate's protected choices and
+        source. A product application that has not entered its setup has no
+        update worker that could start it, so Apply refuses before any worker.
+        After a Forge restart, an owner that only a claimed setup action can
+        reconnect is named as such before any lookup.
         """
+        if self._reconnect_status(self.deployment, guide_id, deployment_id) is not None:
+            raise CustodyError(OWNER_RECONNECT_UPDATE)
         host = self.selected_host(guide_id, deployment_id)
+        directory = self.deployment._directory(guide_id, deployment_id)
         if type(host) is OrdinaryApplicationHost:
-            raise CustodyError(HELPERLESS_UPDATE)
-        if host is not None and not _set_up(self.deployment._directory(guide_id, deployment_id)):
+            _, root, update = inspect_transaction(directory, update_id)
+            # An earlier Forge staged without these blockers; refuse what Stage now blocks.
+            if any(update.get(name) for name in ("native_definition_update", "host_instruction_update",
+                    "runtime_dependency_update", "maintained_host_update")):
+                raise CustodyError(ORDINARY_REPLACEMENT_BLOCKER)
+            _, files = checked_package(root, "candidate.zip", update["package_sha256"])
+            if (not owner_choices_match(host, files) or not self.continues_installed_source(
+                    guide_id, deployment_id, update["to_build_id"], update["source_digest"])):
+                raise CustodyError(ORDINARY_OWNER_BLOCKER)
+        elif host is not None and not _set_up(directory):
             raise CustodyError(FIRST_SETUP_UPDATE)
         if self.selected_host(guide_id, deployment_id) is not host:
             raise CustodyError("The original installed replacement owner changed.")

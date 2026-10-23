@@ -167,10 +167,6 @@ def startup(tmp_path, monkeypatch):
         # Receipt validation is real; these test payloads are never executed.
         return destination
 
-    def download_gateway(destination, **kwargs):
-        assert controller.lock_events[-1] == "acquired"
-        return official_mock_binary(destination, kwargs["binary_name"])
-
     monkeypatch.setitem(sys.modules, "meerkat_meta",
                         SimpleNamespace(Meta=SimpleNamespace(builder=builder),
                                         IdentityBootstrapMode=IdentityBootstrapMode))
@@ -188,9 +184,7 @@ def startup(tmp_path, monkeypatch):
         ExactFile(rpc_gateway, hashlib.sha256(rpc_gateway.read_bytes()).hexdigest()),
         guide_sdk.SELECTED_VERSION, guide_sdk.SELECTED_VERSION, "a" * 40, "b" * 40)
     monkeypatch.setattr(bootstrap, "_selected_guide_runtime", selected)
-    monkeypatch.setattr(module, "gateway_path", lambda: rpc_gateway)
     monkeypatch.setattr(module, "__file__", str(tmp_path / "owned-source/launchkit/architect.py"))
-    monkeypatch.setattr(bootstrap, "download_gateway", download_gateway)
     monkeypatch.setattr(storage_setup, "project_lock", project_lock)
     monkeypatch.setattr(storage_setup, "prepare_storage", prepare_storage)
     monkeypatch.delenv("MOBKIT_ARCHITECT_MODEL", raising=False)

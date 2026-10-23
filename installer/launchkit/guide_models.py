@@ -297,6 +297,10 @@ def validate_guide_publication(args: dict, context: dict, proposal: dict | None,
             if not any(positions[identity] > requested_at for identity in requirement.decision_message_ids):
                 raise ValueError("The feature request itself cannot authorize its deferral, cancellation or handoff. Ask for the user's choice.")
     selected = proposal if proposal is not None else current_blueprint
+    # The initial turn carries compiler scaffolding as current_blueprint. Only
+    # an actual proposal or an existing saved design can supply recipients.
+    if proposal is None and context.get("saved_plan_available") is False:
+        selected = None
     route_plan = None
     for source in value.brief.incoming_data:
         if any(identity not in evidence for identity in source.source_message_ids):
