@@ -2412,6 +2412,19 @@ async fn handle_unified_rpc_json_inner(
                     }
                 }
             }
+            // `meta/run_flow` accepts `role_targets`. A client checks for this
+            // before sending them: a server without it ignores the binding
+            // and runs the flow role-wide.
+            match crate::live_contracts::FeatureCapability::new(
+                crate::flow_role_targets::FLOW_ROLE_TARGETS_FEATURE,
+            ) {
+                Ok(capability) => feature_capabilities.push(capability),
+                Err(error) => tracing::error!(
+                    error,
+                    name = crate::flow_role_targets::FLOW_ROLE_TARGETS_FEATURE,
+                    "flow role targets feature capability refused"
+                ),
+            }
             let announcement_capabilities = crate::mob_announcements::rpc::capabilities_projection(
                 runtime.mob_announcements().as_ref(),
             )
@@ -2421,11 +2434,13 @@ async fn handle_unified_rpc_json_inner(
                 id: response_id,
                 result: Some(serde_json::json!({
                     "contract_version": META_CONTRACT_VERSION,
-                    // This projection revalidates upstream Gate0/operator/
-                    // realm/factory qualification and is non-empty only when
-                    // the same live registration carries open authority and
-                    // its mechanically derived bound-ready binder beside the
-                    // sealed WebRTC answer transport.
+                    // The live atoms in this projection revalidate upstream
+                    // Gate0/operator/realm/factory qualification: it carries
+                    // no live atom unless the same live registration carries
+                    // open authority and its mechanically derived bound-ready
+                    // binder beside the sealed WebRTC answer transport. It
+                    // also names the non-live features this gateway serves
+                    // (mob announcement sources, `flow_role_targets`).
                     "feature_capabilities": feature_capabilities,
                     // Mob announcement sources, as this gateway runs them;
                     // null when announcements are disabled.
@@ -3807,6 +3822,7 @@ async fn handle_unified_rpc_json_inner(
         "meta/run_flow" => {
             Box::pin(mob_methods::handle_run_flow(
                 runtime,
+                identity_ctx.map(|ctx| ctx.runtime.runtime()),
                 response_id,
                 &request.params,
             ))
