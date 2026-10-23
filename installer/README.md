@@ -171,11 +171,12 @@ A packaged standalone copy runs with Python 3.11+, including `venv` and
 It contains the prebuilt wizard, its assets and source examples, exact runtime
 dependency pins, and a checksum-bound compatible Python SDK wheel. Node.js and a
 source checkout are not required to open this wizard. New bundles carry the
-published MobKit 0.8.47 SDK, which pins Meerkat 0.8.51, for the packages they
-build. Packaging and startup verify the SDK's fixed PyPI checksum, package
-identity, release provenance and matching SDK/native version pins. The bundle
-downloads no native runtime of its own: each exported package installs its
-runtime and checks the release checksums itself.
+published MobKit 0.8.47 SDK, which pins Meerkat 0.8.51, for the application
+packages they build. Packaging and startup verify the SDK's fixed PyPI checksum, package
+identity, release provenance and matching SDK/native version pins. Agent team
+packages install the published Meta 0.9.4 release instead (see **Install agent
+team**). The bundle downloads no native runtime of its own: each exported
+package installs its runtime and checks the release checksums itself.
 
 This is a developer alpha bundle. Dependency verification establishes the
 selected artifact identities, not a complete application or animation acceptance
@@ -518,13 +519,19 @@ any computer-specific paths in the plan. This direct installation path currently
 supports the local computer. Native-team source updates are not yet supported;
 refining the guide does not change an existing installation.
 
-An installed Forge (the packaged product, as opposed to the developer source
-entry) does not offer the agent-team path: its applications run on Meta 0.9.4,
-and an agent team package installs the older MobKit 0.8 runtime. It shows no
-**Get your agent team** card and no agent team choice under **Install & Run**,
-and it refuses an agent team export or installation with that reason. Use
-**Build application** instead; it builds and installs your agents as an
-application. Agent teams already installed keep their own controls.
+The installed Forge (the packaged product) and the developer source entry both
+offer the agent-team path. An agent team package, downloaded or installed,
+installs the published Meta 0.9.4 release it pins: the `meerkat-meta` 0.9.4 SDK
+from PyPI by its fixed SHA-256, and the official `meta-rpc-gateway` and
+`meta-gateway` archives, each checked against the release's published SHA-256
+checksums. It does not use the runtime an installed Forge selected for its own
+applications. A model the pinned release does not list is refused before export
+or installation, and the message names models it does list. Such a package keeps
+the definition it was installed with; to change instructions, classes or flows,
+build the changed team and install it into a new folder. Agent teams installed
+earlier on MobKit 0.8 keep their own runtime and controls, and a Meta 0.9 package
+refuses to open MobKit 0.8 state. Use **Build application** when your agents need
+custom application behavior.
 
 Use the **Custom application** section when your requested outcomes need custom
 screens or additional application code. A team export does not implement remaining

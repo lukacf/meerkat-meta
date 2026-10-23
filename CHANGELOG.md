@@ -361,6 +361,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ordinary_runtime`, the Meta SDK version, target and gateway SHA-256 a
   trusted launcher selected for ordinary applications, or `null` without
   such a selection, as in the developer entry.
+- Meta Forge agent team packages, downloaded or installed, now install the
+  published Meta 0.9.4 release instead of MobKit 0.8.47: the `meerkat-meta`
+  0.9.4 SDK from PyPI by its fixed SHA-256, and the official
+  `meta-rpc-gateway` and `meta-gateway` archives, each checked against the
+  release's published SHA-256 checksums. The installed Forge offers agent
+  team packages again. A model the pinned release does not list is refused
+  before export or installation, and the message names models it does list.
+  A package keeps the definition it was installed with:
+  `bash start.sh --activate-revision` refuses, and changed instructions mean
+  building the changed team into a new folder. A Meta 0.9 package refuses to
+  open MobKit 0.8 state and names Meta's adoption tool. Agent teams installed
+  earlier on MobKit 0.8 keep their runtime and controls.
 
 ### Removed
 

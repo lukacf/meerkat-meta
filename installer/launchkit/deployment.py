@@ -40,8 +40,6 @@ OWNER_FILE = ".mobkit/launch-deployment-owner.json"
 PRIVATE_RUNTIME_UPDATE_ONLY = "This private runtime candidate is admitted only through the checked update of an existing stopped installation. Use that exact update or its forward recovery."
 
 PRODUCT_CONFIGURE_REQUIRED = "This selected Meta/Toolkit installation needs its original Configure startup inputs. Ordinary Start and background startup are unavailable."
-AGENT_TEAM_PRODUCT_UNAVAILABLE = ("Agent team packages are not available in this Forge: they install the older MobKit 0.8 "
-    "runtime. Use Build application to build and install your agents as an application on Meta 0.9.4.")
 LOG = logging.getLogger(__name__)
 
 
@@ -1118,28 +1116,20 @@ class DeploymentService:
     async def _guide(self, identity):
         return await (self.operations.read(self.guide, identity) if self.operations else self.guide.get(identity))
 
-    def _product_launched(self):
-        # Every trusted launcher selects its application owner's startup
-        # (``application_setup_selection``): the per-user application registry,
-        # which also selects ``application_host_selection``, and a selected
-        # application host. The developer source entry selects neither.
-        return self.application_setup_selection is not None or self.application_host_selection is not None
-
     def agent_team_availability(self):
         """Whether this Forge exports and installs agent team packages.
 
-        A product-launched Forge builds its applications on Meta 0.9.4. An
-        agent team package installs the MobKit 0.8 runtime, so such a Forge
-        refuses to export or install one; the developer source entry keeps
-        both.
+        Every entry does. A compiled agent team installs the public Meta
+        release it pins, checked against that release's checksums, so it does
+        not depend on the product a launcher selected for this Forge's own
+        applications.
         """
-        if self._product_launched():
-            return {"available": False, "reason": AGENT_TEAM_PRODUCT_UNAVAILABLE}
         return {"available": True}
 
     def require_agent_team_available(self):
-        if self._product_launched():
-            raise DraftConflict(AGENT_TEAM_PRODUCT_UNAVAILABLE)
+        availability = self.agent_team_availability()
+        if not availability["available"]:
+            raise DraftConflict(availability["reason"])
 
     def _directory(self, guide_id, deployment_id=None):
         for value in [guide_id, *([deployment_id] if deployment_id else [])]:
