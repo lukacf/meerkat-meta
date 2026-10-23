@@ -10097,6 +10097,7 @@ fn the_version_two_schema_is_pinned() {
              generation INTEGER notnull, held_at_ms INTEGER notnull, checked_at_ms INTEGER \
              notnull, record TEXT notnull"
                 .to_string(),
+            "index announcement_holds_by_check on announcement_holds: checked_at_ms".to_string(),
             "index announcement_holds_by_member on announcement_holds: member, checked_at_ms"
                 .to_string(),
             "table announcement_role_children: template_id TEXT notnull pk1, member TEXT \
@@ -15281,4 +15282,77 @@ async fn a_roster_read_error_defers_instead_of_holding() {
         1,
         "sealed once the roster reads: {batches:?}"
     );
+}
+
+/// One member's held items that cannot be checked (here a hold record that
+/// no longer decodes) do not stop the bounded check of another member's:
+/// each member is checked on its own, in the round that finds it due.
+#[tokio::test]
+async fn a_member_whose_hold_cannot_be_read_does_not_stop_another_members_release() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let both = serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]);
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            both.clone(),
+            serde_json::json!([{ "kind": "direct" }]),
+        ),
+    )
+    .await
+    .unwrap();
+    for (id, identity) in [("a-direct", "agent:a"), ("b-direct", "agent:b")] {
+        try_subscribe(service, id, identity, &["mail.received"])
+            .await
+            .unwrap();
+    }
+    baseline_inbox(service, 1).await;
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(advanced["items"][0]["captured"], serde_json::json!(2));
+    // Neither member passes now: each holds m-1 at its seal.
+    inbox_audience(
+        service,
+        "narrow",
+        1,
+        serde_json::json!([member_grant("agent:c")]),
+    )
+    .await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert!(batches_of_b(service).await.is_empty(), "b's item is held");
+    {
+        let db = rusqlite::Connection::open(harness._dir.path().join("mob_announcements.sqlite3"))
+            .unwrap();
+        let spoiled = db
+            .execute(
+                "UPDATE announcement_holds SET record = 'unreadable' WHERE member = ?1",
+                [member("agent:a").key()],
+            )
+            .unwrap();
+        assert_eq!(spoiled, 1, "a's hold");
+    }
+    inbox_audience(service, "widen", 2, both).await;
+    harness
+        .clock
+        .store(100_000 + HOLD_RECHECK_BOUND_MS + 1, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let batches = batches_of_b(service).await;
+    assert_eq!(
+        batches.len(),
+        1,
+        "b's hold is released in the round a's fails: {batches:?}"
+    );
+    let released = entries_for(service, agent_b(), "items_released").await;
+    assert_eq!(released.len(), 1, "{released:?}");
 }
