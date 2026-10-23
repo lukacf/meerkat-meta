@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `..`, adds the field. On the wire (`meta/on_error`, and the SDKs'
   `ErrorEvent.context`) the key is new beside the old ones, and an event
   recorded without it reads as an empty list.
+- `IdentityRuntimeError` gains `IdentityNameHeldByRawMember { identity, member,
+  session_id }`: the roster compile or wake that meets a member the host made
+  directly on the mob under the identity's member id. An exhaustive match on
+  `IdentityRuntimeError` adds the arm.
 
 ### Added
 
