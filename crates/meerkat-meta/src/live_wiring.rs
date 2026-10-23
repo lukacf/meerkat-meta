@@ -3671,6 +3671,10 @@ async fn handle_live_open<B: SessionAgentBuilder + 'static>(
         transport: transport.into(),
         capabilities: capabilities.into(),
         continuity: continuity.into(),
+        // This open delivers no staged create-time prompt (its config is
+        // built from the exported snapshot, see
+        // `live_open_config_for_session`), so it has no advisory to report.
+        advisories: Vec::new(),
     };
     match serde_json::to_value(result) {
         Ok(value) => live_success(rpc_id, value),
