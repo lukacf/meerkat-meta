@@ -1164,7 +1164,9 @@ class ConsoleFront:
     def _mount_mcp(self, login, attempt, redirect):
         parsed = urlsplit(redirect)
         path = parsed.path
-        if (parsed.scheme + "://" + parsed.netloc != self.origin or not path.startswith("/")
+        # The callback handler compares the raw ASGI path to ASCII bytes. Reject
+        # paths that browsers must encode before starting a native ceremony.
+        if (not path.isascii() or parsed.scheme + "://" + parsed.netloc != self.origin or not path.startswith("/")
                 or parsed.query or parsed.fragment or "%" in path or "//" in path
                 or any(part in (".", "..") for part in path.split("/"))
                 or path in ("/", "/login", "/logout", AVAILABILITY_PATH)

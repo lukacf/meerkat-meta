@@ -1741,6 +1741,11 @@ one retained attempt per Console login. Repeated requests reuse that attempt;
 they do not retry an uncertain start. A joined native attempt does not disclose
 another caller's authorization URL.
 
+The callback must have an ASCII path that the Console can match byte for byte.
+Paths with percent escapes, non-ASCII characters, dot segments or a reserved
+Console route are refused before native sign-in starts. Forge does not normalize
+or rewrite Core's registered redirect URI.
+
 Callback GET serves the SDK's fixed, uncached landing without inspecting a login
 or forwarding the query. Its bounded same-origin POST requires the original
 live Console login and binding. Callback receipt, credential observation,
@@ -1750,10 +1755,19 @@ retiring their enrollment on logout or shutdown. It never closes the runtime's
 shared private client. Provider callbacks and authorization URLs are excluded
 from logs and ordinary Console/model context.
 
+A failed or timed-out start can leave native admission uncertain. A later
+request reuses the retained attempt; it does not start a replacement. Logout
+revokes local Console access before waiting for cleanup. If cleanup cannot be
+confirmed, logout returns HTTP 503 instead of the normal redirect to `/login`.
+Native login retirement is still attempted, but its acknowledgment does not
+erase an earlier unconfirmed MCP cleanup outcome.
+
 The source tests exercise the actual SDK over anonymous test pipes and ASGI.
 They do not establish a real TLS route, provider login, native configuration
 resolution, installed persistence or cold restore. Those require the reviewed
 matching Core/Meta/Connect artifacts and the deployment owner's selected route.
+See [hosted MCP test setup and failure checks](tests/README.md) for the focused
+suite, required SDK selection and checks against misleading test passes.
 
 ### Explicit application tool selection
 
