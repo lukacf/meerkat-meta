@@ -32,6 +32,9 @@ if TYPE_CHECKING:
     from .deployment_worker import Supervisor
 
 
+_ABSENT = object()
+
+
 @dataclass(frozen=True)
 class ApplicationPreparationInputs:
     """Retained private inputs selected only by their original trusted host.
@@ -238,14 +241,26 @@ class ForgeApplicationHost:
         self._policy_bytes = pins_and_bytes["source_policy"][1]
         self._policy = application_tool_policy_selection(self._policy_bytes,
             selected_member_identities=tuple(row["identity"] for row in original["roster"]))
-        if (self._blueprint.get("acquisition") is None
-                or self._blueprint["acquisition"]["helper_identity"] != original["helper_identity"]
-                or self._blueprint["acquisition"]["helper_profile"] != "dedicated"
-                or self._blueprint["acquisition"]["helper_tools"] != "checked_installation"
-                or self._blueprint["project"]["slug"] != original["mob_id"]):
+        helper_selection = self._blueprint.get("acquisition")
+        if ((helper_selection is not None) != ("helper_identity" in original)
+                or self._blueprint["project"]["slug"] != original["mob_id"]
+                or (helper_selection is not None and (
+                    helper_selection["helper_identity"] != original["helper_identity"]
+                    or helper_selection["helper_profile"] != "dedicated"
+                    or helper_selection["helper_tools"] != "checked_installation"))):
             raise CustodyError("The selected blueprint and original helper roster differ.")
         from .compiler import application_inventory_input
-        if not _same_json_value(original, _inventory_input(application_inventory_input(self._blueprint))):
+        # Retain selected native class declarations without deriving their
+        # grants or callback catalog from Blueprint role text. An absent list
+        # stays absent in the original source; explicit empty is also valid
+        # for a fixed helperless inventory.
+        class_arguments = {}
+        if "member_classes" in original or helper_selection is None:
+            class_arguments["member_classes"] = original.get("member_classes", [])
+        regenerated = _inventory_input(application_inventory_input(self._blueprint, **class_arguments))
+        if "member_classes" not in original:
+            regenerated.pop("member_classes", None)
+        if not _same_json_value(original, regenerated):
             raise CustodyError("The selected blueprint changed the original complete fixed roster.")
         self._inventory = original
         self._inventory_pin = pins_and_bytes["original_inventory"][0]
@@ -256,11 +271,13 @@ class ForgeApplicationHost:
         self.require_current()
 
     def preparation_plan(self, inventory, *, deployment_root, owner, startup, authorities,
-            realm_storage, helper, acquisition, output, hold_timeout_ms, source_id):
+            realm_storage, output, hold_timeout_ms, source_id, helper=_ABSENT, acquisition=_ABSENT):
         """Join genuine inventory to explicit current public declarations.
 
-        The host supplies the existing public owner/helper/acquisition fields,
-        including qualified principal values and its retained issuance IDs.
+        The host supplies the existing public owner fields, including qualified
+        principal values and its retained issuance IDs. Helper and acquisition
+        declarations are supplied together only for a selected helper. Native
+        class declarations stay bound to the original inventory source.
         This method does not invent their encoding or turn declarations into
         authentication. The original installation transaction must retain and
         select the returned draft before the existing Fresh startup consumes it.
@@ -292,7 +309,8 @@ class ForgeApplicationHost:
         console_routes = [route for route in routes
             if isinstance(route, dict) and isinstance(route.get("origin"), dict)
             and route["origin"].get("kind") == "local_console"]
-        if (not _same_json_value(native.get("remote_operator"), human) or not console_routes
+        if (not _same_json_value(native.get("remote_operator"), human)
+                or (actual["members"] and not console_routes)
                 or any(not _same_json_value(route["origin"].get("requester"), human)
                     or not _same_json_value(route.get("represented_subject"), human)
                     for route in console_routes)):
@@ -304,26 +322,37 @@ class ForgeApplicationHost:
                 or any(not isinstance(member, dict) or not _same_json_value(member.get("member"), row["member"])
                     for member, row in zip(selected_members, actual["members"]))):
             raise CustodyError("The host member declarations differ from the actual same-order native inventory.")
-        helper_binding = next(row["member"] for row in actual["members"]
-            if row["identity"] == original["helper_identity"])
-        if (not isinstance(helper, dict) or not _same_json_value(helper.get("member"), helper_binding)
-                or not isinstance(realm_storage, dict) or "realm_id" in realm_storage):
-            raise CustodyError("Preparation changed its exact helper or selected storage declaration.")
+        has_helper = "helper_identity" in original
+        if not isinstance(realm_storage, dict) or "realm_id" in realm_storage:
+            raise CustodyError("Preparation changed its selected storage declaration.")
+        if has_helper:
+            helper_binding = next(row["member"] for row in actual["members"]
+                if row["identity"] == original["helper_identity"])
+            if (not isinstance(helper, dict) or not _same_json_value(helper.get("member"), helper_binding)
+                    or acquisition is _ABSENT):
+                raise CustodyError("Preparation changed its exact helper or acquisition selection.")
+        elif helper is not _ABSENT or acquisition is not _ABSENT:
+            raise CustodyError("Helperless preparation must omit helper and acquisition declarations.")
         policy = deepcopy(self._policy)
         mapping = {row["identity"]: row["member"]["member"] for row in actual["members"]}
         for row in policy["members"]:
             row["member_identity"] = mapping[row["member_identity"]]
         policy = _json(_compiler_input(policy, self._policy_bytes, source_id))
-        plan = {"schema": 1, "deployment_root": str(deployment_root), "owner": deepcopy(owner),
-            "startup": deepcopy(startup), "authorities": deepcopy(authorities),
-            "application": {"schema": 4,
+        application = {"schema": 4,
                 "realm": {"realm_id": actual["realm_id"], **deepcopy(realm_storage)},
                 "definition": {"format": "toml", "text": self._definition},
-                "roster": deepcopy(original["roster"]), "members": deepcopy(selected_members),
-                "helper": deepcopy(helper), "helper_tools": "checked_installation",
-                "helper_profile": "dedicated", "tool_policy": policy},
-            "acquisition": deepcopy(acquisition), "output": str(output),
-            "hold_timeout_ms": hold_timeout_ms}
+                "roster": deepcopy(original["roster"]), "members": deepcopy(selected_members)}
+        if has_helper:
+            application.update(helper=deepcopy(helper), helper_tools="checked_installation",
+                helper_profile="dedicated")
+        application["tool_policy"] = policy
+        if "member_classes" in original:
+            application["member_classes"] = deepcopy(original["member_classes"])
+        plan = {"schema": 1, "deployment_root": str(deployment_root), "owner": deepcopy(owner),
+            "startup": deepcopy(startup), "authorities": deepcopy(authorities), "application": application}
+        if has_helper:
+            plan["acquisition"] = deepcopy(acquisition)
+        plan.update(output=str(output), hold_timeout_ms=hold_timeout_ms)
         from .connect_application_plan import MAX_PLAN_BYTES, _assemble
         assembled = _assemble(plan)
         result = (json.dumps(assembled, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n").encode()
