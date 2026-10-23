@@ -162,3 +162,78 @@ def test_incoming_choices_survive_saved_setup_reopen_and_remain_in_agent_context
     assert reopened["brief"] == value
     assert compact_guidance_context({"brief": reopened["brief"]})["brief"] == value
     assert guided_document(plan, reopened["brief"])["brief"] == value
+
+
+@pytest.mark.parametrize("recipient_kind,recipient", [("identity", "lead:main"), ("class", "lead")])
+@pytest.mark.asyncio
+async def test_starter_scaffolding_cannot_supply_recipients_at_publication_tool(tmp_path, recipient_kind, recipient):
+    from launchkit.architect import ArchitectService
+
+    author = ArchitectService(tmp_path)
+    author.context = starter_blueprint().model_dump(mode="json")
+    author.guide_context = {"saved_plan_available": False, "brief": {},
+        "evidence_messages": [{"id": "request", "role": "user"}]}
+    value = brief()
+    value["facts"]["outcome"]["status"] = "proposed"
+    value["incoming_data"][0]["routes"] = [
+        {"recipient": recipient, "recipient_kind": recipient_kind, "delivery": "direct"}]
+    result = await author.publish_guide_step({"message": "Which changes should matter?", "brief": value,
+        "question": default_question("purpose"), "design_changed": False})
+    assert result["valid"] is False
+    assert "Propose the team" in result["issue"]
+    assert author.guide_result is None and author.proposal is None
+
+
+@pytest.mark.parametrize("plan_source", ["new_proposal", "saved_proposal", "manual_proposal"])
+def test_real_team_may_keep_starter_identity_names(plan_source):
+    plan = starter_blueprint().model_dump(mode="json")
+    value = brief()
+    proposed = plan_source != "saved_proposal"
+    result = validate_guide_publication({"message": "Which project sources should the team use?", "brief": value,
+        "question": default_question("connections"), "design_changed": proposed},
+        {"brief": {}, "saved_plan_available": not proposed,
+         "action": "manual" if plan_source == "manual_proposal" else "chat",
+         "manual_plan_submitted": plan_source == "manual_proposal",
+         "evidence_messages": [{"id": "request", "role": "user"}]},
+        plan if proposed else None, current_blueprint=plan)
+    assert result["brief"] == DesignBrief.model_validate(value).model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("routes", [[], [{"recipient": "lead:main", "delivery": "direct"}],
+    [{"recipient": "lead", "recipient_kind": "class", "delivery": "direct"}]])
+async def test_first_guide_turn_saves_only_unassigned_source_intent(tmp_path, monkeypatch, routes):
+    from launchkit.guide import GuideService
+    from launchkit.guide_store import GuideStore
+    from launchkit.server import GuideResponse
+
+    monkeypatch.setattr("launchkit.guide.planner_capability", lambda: {"available": True})
+
+    class Author:
+        async def message(self, prompt, blueprint, *, guide_context):
+            assert guide_context["saved_plan_available"] is False
+            assert guide_context["manual_plan_submitted"] is False
+            assert blueprint["agent_classes"][0]["id"] == "lead"
+            value = brief()
+            value["facts"]["outcome"]["status"] = "proposed"
+            value["incoming_data"][0]["routes"] = routes
+            for item in [*value["facts"].values(), *value["requirements"], *value["incoming_data"]]:
+                item["source_message_ids"] = [guide_context["current_user_message"]["id"]]
+            return {"guide": {"message": "Which changes should matter?", "brief": value,
+                "question": default_question("purpose"), "design_changed": False}, "proposal": None}
+
+    store = GuideStore(tmp_path)
+    service = GuideService(store, Author())
+    original = await service.create()
+    before = copy.deepcopy(store.get(original["id"]))
+    request = GuideResponse(version=original["version"], action="chat", text="Help me notice project changes.")
+    if routes:
+        with pytest.raises(ValueError, match="Propose the team"):
+            await service.respond(original["id"], request)
+        assert store.get(original["id"]) == before
+    else:
+        result = await service.respond(original["id"], request)
+        reopened = GuideStore(tmp_path).get(original["id"])
+        assert result["version"] == original["version"] + 1
+        assert reopened["brief"]["incoming_data"][0]["routes"] == []
+        assert reopened["proposal"] is None and reopened["blueprint"] is None
