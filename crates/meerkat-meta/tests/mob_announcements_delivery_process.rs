@@ -25,6 +25,10 @@
 //! it: inside the advance's transaction, which leaves neither its items nor
 //! its cursor, and after its commit, which delivers its items exactly once
 //! and answers the collector's retry with the original result.
+//!
+//! Two end the specialist's turn on a source item before it completes, by a
+//! shutdown and by a respawn: the item comes again in the member's next
+//! batch, under a notice naming the earlier batch.
 
 #![cfg(feature = "announcement-test-faults")]
 #![allow(
@@ -259,6 +263,8 @@ fn fault_line(point: &str) -> String {
 struct ModelLog {
     requests: Vec<Value>,
     held: bool,
+    /// Whether the first turn on the held source item has been held.
+    held_item: bool,
 }
 
 /// The text of the last message in a chat-completions request: the new
@@ -474,7 +480,12 @@ async fn chat_completions(
         if hold {
             log.held = true;
         }
-        hold
+        // The first turn on the held source item never finishes either.
+        let hold_item = last.contains(HELD_ITEM_MARKER) && !log.held_item;
+        if hold_item {
+            log.held_item = true;
+        }
+        hold || hold_item
     };
     if hold {
         // The first attempt at the original work never finishes: the
@@ -603,6 +614,8 @@ struct Gateway {
     roster: Vec<Value>,
     /// Every `callback/schedule_fire` the gateway sent, in order.
     fires: Vec<Value>,
+    /// The params of every `meta/on_error` notification, in order.
+    on_error: Vec<Value>,
 }
 
 impl Gateway {
@@ -662,6 +675,7 @@ impl Gateway {
             next_id: 0,
             roster: Vec::new(),
             fires: Vec::new(),
+            on_error: Vec::new(),
         }
     }
 
@@ -735,6 +749,10 @@ impl Gateway {
         let Some(method) = message.get("method").and_then(Value::as_str) else {
             return;
         };
+        if method == "meta/on_error" {
+            self.on_error
+                .push(message.get("params").cloned().unwrap_or(Value::Null));
+        }
         let Some(id) = message.get("id").cloned() else {
             return;
         };
@@ -756,6 +774,31 @@ impl Gateway {
                 self.label
             ),
             _ => {}
+        }
+    }
+
+    /// The first `meta/on_error` notification of `category` after the first
+    /// `skip` of them, answering callbacks while it waits.
+    fn wait_for_on_error(&mut self, category: &str, skip: usize, deadline: Duration) -> Value {
+        let start = Instant::now();
+        loop {
+            self.pump();
+            if let Some(event) = self
+                .on_error
+                .iter()
+                .filter(|event| event["category"] == json!(category))
+                .nth(skip)
+            {
+                return event.clone();
+            }
+            assert!(
+                start.elapsed() < deadline,
+                "[{}] no meta/on_error {category} within {deadline:?}: {:?}\n{}",
+                self.label,
+                self.on_error,
+                self.stderr_tail()
+            );
+            thread::sleep(Duration::from_millis(25));
         }
     }
 
@@ -1805,6 +1848,10 @@ fn a_retired_member_waits_until_its_destroyed_mob_ends_the_subscription() {
 
 const SOURCE_TOPIC: &str = "mail.received";
 const SOURCE_ITEM_MARKER: &str = "SOURCE-ITEM-INVOICE-7";
+/// A source item whose first turn the loopback model holds open.
+const HELD_ITEM_MARKER: &str = "SOURCE-ITEM-HELD-TURN";
+/// The opening of the notice a redelivery carries.
+const REDELIVERY_NOTICE: &str = "These redeliver announcements of batch";
 
 /// The verified account the source "inbox" reads.
 fn inbox_principal() -> Value {
@@ -2132,5 +2179,192 @@ fn a_source_runner_fires_the_hosts_runnable_with_its_source() {
         json!({ "mob_id": MOB_ID, "source_id": "inbox" }),
         "{fire}"
     );
+    gateway.shutdown_and_reap();
+}
+
+/// The collector's step that brings one item whose first turn the model
+/// holds open.
+fn held_item_step() -> Value {
+    let mut step = invoice_step();
+    step["operation_id"] = json!("schedule:collector:occurrence:2:v1");
+    step["items"][0]["item_id"] = json!("msg-8");
+    step["items"][0]["body"] = json!(format!("{HELD_ITEM_MARKER}: an invoice to check"));
+    step
+}
+
+/// How many model requests carried the held item as their new input, and
+/// how many of them under a redelivery notice.
+fn held_item_turns(log: &Arc<Mutex<ModelLog>>) -> (usize, usize) {
+    let log = log.lock().unwrap();
+    let turns = log
+        .requests
+        .iter()
+        .map(last_message_text)
+        .filter(|text| text.contains(HELD_ITEM_MARKER))
+        .collect::<Vec<_>>();
+    let redelivered = turns
+        .iter()
+        .filter(|text| text.contains(REDELIVERY_NOTICE))
+        .count();
+    (turns.len(), redelivered)
+}
+
+/// The specialist's batches once the held item came again: the first, whose
+/// turn ended unhandled, and the redelivery naming it.
+fn the_redelivery(gateway: &mut Gateway, log: &Arc<Mutex<ModelLog>>) -> (Value, Value) {
+    let start = Instant::now();
+    while held_item_turns(log).1 == 0 {
+        assert!(
+            start.elapsed() < SETTLE_TIMEOUT,
+            "the held item never came again with the notice: {:?}\n{}",
+            deliveries(gateway),
+            gateway.stderr_tail()
+        );
+        gateway.pump();
+        thread::sleep(Duration::from_millis(100));
+    }
+    let batches = deliveries(gateway);
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    let (first, again) = (batches[0].clone(), batches[1].clone());
+    let body = again["body"].as_str().unwrap_or_default();
+    assert!(
+        body.contains(&format!(
+            "{REDELIVERY_NOTICE} {}",
+            first["id"].as_str().unwrap_or_default()
+        )),
+        "{body}"
+    );
+    assert!(body.contains(HELD_ITEM_MARKER), "{body}");
+    (first, again)
+}
+
+#[test]
+fn a_shutdown_cancelled_turn_gets_its_items_again_after_restart() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    let mut first = boot_collecting("shutdown-1", state.path(), &host_config, None);
+    declare_live_inbox(&mut first);
+    first.call("meta/mob_announcements/sources/advance", held_item_step());
+    wait_until("the held turn to reach the model", SETTLE_TIMEOUT, || {
+        held_item_turns(&log).0 > 0
+    });
+    // The shutdown ends the held turn before it completes.
+    first.shutdown_and_reap();
+    drop(first);
+
+    let mut second = boot_collecting("shutdown-2", state.path(), &host_config, None);
+    let (earlier, _) = the_redelivery(&mut second, &log);
+    let observed = second.call(
+        "meta/mob_announcements/deliveries/observe",
+        json!({ "batch_id": earlier["id"] }),
+    );
+    assert_eq!(
+        observed["handling"]["state"],
+        json!("unhandled"),
+        "{observed}"
+    );
+    second.shutdown_and_reap();
+}
+
+#[test]
+fn a_member_respawned_mid_turn_gets_its_source_items_again_with_notice() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    let mut gateway = boot_collecting("respawn", state.path(), &host_config, None);
+    declare_live_inbox(&mut gateway);
+    gateway.call("meta/mob_announcements/sources/advance", held_item_step());
+    wait_until("the held turn to reach the model", SETTLE_TIMEOUT, || {
+        held_item_turns(&log).0 > 0
+    });
+    // The respawn retires the incarnation whose turn is held.
+    gateway.call("meta/respawn", json!({ "identity": IDENTITY }));
+    let (earlier, _) = the_redelivery(&mut gateway, &log);
+    let observed = gateway.call(
+        "meta/mob_announcements/deliveries/observe",
+        json!({ "batch_id": earlier["id"] }),
+    );
+    assert_eq!(
+        observed["handling"]["state"],
+        json!("unhandled"),
+        "{observed}"
+    );
+    gateway.shutdown_and_reap();
+}
+
+/// A source whose collections keep failing escalates: the host hears it as a
+/// `meta/on_error` notification carrying the escalation and its event
+/// cursor, and hears the same escalation id resolve once a collection
+/// succeeds.
+#[test]
+fn an_escalation_reaches_the_host_as_meta_on_error_and_resolves_with_the_same_id() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let mut gateway = boot_collecting("escalation", state.path(), &host_config, None);
+    declare_live_inbox(&mut gateway);
+    for attempt in 1..=3 {
+        gateway.call(
+            "meta/mob_announcements/sources/record_failure",
+            json!({
+                "operation_id": format!("failure-{attempt}"),
+                "source_id": "inbox",
+                "expected_revision": 1,
+                "expected_version": 1,
+                "principal": inbox_principal(),
+                "failure": { "class": "provider_unavailable" }
+            }),
+        );
+    }
+    let raised = gateway.wait_for_on_error("mob_announcement_escalated", 0, SETTLE_TIMEOUT);
+    assert_eq!(
+        raised["escalation"]["cause"],
+        json!("failure_streak"),
+        "{raised}"
+    );
+    assert_eq!(raised["event"], json!("raised"), "{raised}");
+    assert_eq!(
+        raised["escalation"]["subject"],
+        json!({ "kind": "source", "mob_id": MOB_ID, "source_id": "inbox" }),
+        "{raised}"
+    );
+    gateway.call(
+        "meta/mob_announcements/sources/advance",
+        json!({
+            "operation_id": "recovered",
+            "source_id": "inbox",
+            "expected_revision": 1,
+            "expected_version": 1,
+            "principal": inbox_principal(),
+            "next_cursor": "c2"
+        }),
+    );
+    let resolved =
+        gateway.wait_for_on_error("mob_announcement_escalation_resolved", 0, SETTLE_TIMEOUT);
+    assert_eq!(
+        resolved["escalation_id"], raised["escalation"]["escalation_id"],
+        "{resolved}"
+    );
+    assert!(
+        resolved["cursor"].as_u64() > raised["cursor"].as_u64(),
+        "{raised} then {resolved}"
+    );
+    let read = gateway.call(
+        "meta/mob_announcements/escalations/list",
+        json!({ "after": raised["cursor"].as_u64().unwrap() - 1 }),
+    );
+    assert_eq!(read["events"].as_array().map(Vec::len), Some(2), "{read}");
     gateway.shutdown_and_reap();
 }

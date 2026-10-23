@@ -10,15 +10,22 @@ use super::declarations::{
     RoleTemplate,
 };
 
+use super::availability::SuspendMarker;
+use super::escalations::{
+    Escalation, EscalationEvent, EscalationNotice, EscalationNoticePage, EscalationPass,
+    EscalationSubject, MemberRead, StatusCounts,
+};
+use super::handling::{BatchHandling, HandlingRead};
 use super::sources::{
     AdvanceSource, AnnouncementSource, AuditQuery, AuditRow, MemberFacts, PutSource,
     RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceQuery, SourceStream,
+    UnhandledPolicy,
 };
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
-    BatchId, BatchPosition, BatchQuery, BatchStateTag, ChildMemberLimits, ExpiryReport, Member,
-    MemberBacklog, MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport, PutSubscription,
-    Result, SealingPolicy, SourceId, SourceKey, Subscription, SubscriptionChange,
+    BatchId, BatchItem, BatchPosition, BatchQuery, BatchStateTag, ChildMemberLimits, ExpiryReport,
+    Member, MemberBacklog, MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport,
+    PutSubscription, Result, SealingPolicy, SourceId, SourceKey, Subscription, SubscriptionChange,
     SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, SubscriptionState, Topic,
 };
 
@@ -310,6 +317,103 @@ pub trait AnnouncementStore: Send + Sync {
         next_read_at_ms: Option<u64>,
     ) -> Result<Batch>;
 
+    /// The handling of batch `id` once it was admitted: what became of its
+    /// turn, and what was done about it.
+    async fn handling(&self, id: &BatchId) -> Result<Option<BatchHandling>> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// The handling of each of `ids` that was admitted.
+    async fn handlings(&self, ids: Vec<BatchId>) -> Result<BTreeMap<BatchId, BatchHandling>> {
+        let _ = ids;
+        Ok(BTreeMap::new())
+    }
+
+    /// Admitted batches whose next handling read is due at `now_ms`, the
+    /// longest due first. A batch enters this set when it is admitted, and
+    /// leaves it when [`Self::record_handling`] records a final read or
+    /// retention removes it.
+    async fn handling_reads_due(&self, now_ms: u64, limit: usize) -> Result<Vec<Batch>> {
+        let _ = (now_ms, limit);
+        Ok(Vec::new())
+    }
+
+    /// When the next handling read is due, if any is.
+    async fn next_handling_read(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Record one handling read of the admitted batch `id`. A final read
+    /// settles the handling, and one that finds the turn unhandled decides
+    /// in the same transaction what happens to each item the batch
+    /// delivered: a source item follows its source's
+    /// `delivery.on_unhandled`, a plain announcement `plain`. Redeliver owes
+    /// the item again for the member's next batch, first, under a notice;
+    /// past [`super::handling::MAX_REDELIVERIES`], with hold, or for a cause
+    /// a replay could mislead on, the item is held for an operator; report
+    /// changes nothing. A read of a final handling changes nothing.
+    async fn record_handling(
+        &self,
+        id: &BatchId,
+        read: HandlingRead,
+        plain: UnhandledPolicy,
+        now_ms: u64,
+    ) -> Result<BatchHandling> {
+        let _ = (id, read, plain, now_ms);
+        Err(no_handling())
+    }
+
+    /// The notice a successor carrying `items` on renders: a line for each
+    /// item the member is owed again after an unhandled turn.
+    async fn redelivery_notice(&self, member: &Member, items: &[BatchItem]) -> Result<String> {
+        let _ = (member, items);
+        Ok(String::new())
+    }
+
+    /// The answer an operator's redelivery of batch `id` recorded under
+    /// `operation`, if it was made: a retry answers it without reading
+    /// anything else. The same operation id with another request is
+    /// refused.
+    async fn redeliver_receipt(
+        &self,
+        operation: &OperationId,
+        id: &BatchId,
+    ) -> Result<Option<BatchHandling>> {
+        let _ = (operation, id);
+        Ok(None)
+    }
+
+    /// An operator's redelivery of what batch `id` holds after its turn
+    /// ended unhandled: each held item is checked afresh for coverage with
+    /// the member's roster `facts`, and what passes is owed again for the
+    /// member's next batch; what fails waits on coverage. Refused
+    /// [`AnnouncementStoreError::NotHeld`] for a batch whose handling is not
+    /// unhandled with items held.
+    async fn redeliver_held(
+        &self,
+        operation: &OperationId,
+        id: &BatchId,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<BatchHandling> {
+        let _ = (operation, id, facts, now_ms);
+        Err(no_handling())
+    }
+
+    /// An operator's dismissal of what batch `id` holds: each held item
+    /// settles as handled by an operator. Refused as
+    /// [`Self::redeliver_held`] is.
+    async fn dismiss_held(
+        &self,
+        operation: &OperationId,
+        id: &BatchId,
+        now_ms: u64,
+    ) -> Result<BatchHandling> {
+        let _ = (operation, id, now_ms);
+        Err(no_handling())
+    }
+
     /// Settle as expired what waited longer than the retention window with
     /// nothing native holding it, at most `limit` of each kind: owed
     /// announcements no batch holds (each once per member), and sealed
@@ -505,6 +609,116 @@ pub trait AnnouncementStore: Send + Sync {
         Err(no_sources())
     }
 
+    /// One escalation pass, in one transaction: every source and member
+    /// condition raised or resolved, open escalations notified again when
+    /// due, events past the retention window pruned, and each new raise or
+    /// notification announced on the health topic to its audience, with the
+    /// roster `facts` of the topic's subscribers. Answers the events it
+    /// wrote.
+    async fn escalation_pass(
+        &self,
+        pass: EscalationPass,
+        facts: &RosterFacts,
+        now_ms: u64,
+    ) -> Result<Vec<EscalationNotice>> {
+        let _ = (pass, facts, now_ms);
+        Err(no_escalations())
+    }
+
+    /// The escalation events after `after`, at most `limit`, and the cursor
+    /// to read on from.
+    async fn escalation_events(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<(Vec<EscalationEvent>, u64)> {
+        let _ = (after, limit);
+        Err(no_escalations())
+    }
+
+    /// The escalation events after `after`, each with its escalation as it
+    /// stands: what the owner pushes to the host.
+    async fn escalation_notices(&self, after: u64, limit: usize) -> Result<EscalationNoticePage> {
+        let _ = (after, limit);
+        Err(no_escalations())
+    }
+
+    /// The open escalations, of `subject` when one is named.
+    async fn open_escalations(
+        &self,
+        subject: Option<&EscalationSubject>,
+    ) -> Result<Vec<Escalation>> {
+        let _ = subject;
+        Err(no_escalations())
+    }
+
+    /// The cursor of the last escalation event; 0 before any.
+    async fn last_escalation_cursor(&self) -> Result<u64> {
+        Err(no_escalations())
+    }
+
+    /// The member's persisted suspend marker.
+    async fn member_marker(&self, member: &Member) -> Result<Option<SuspendMarker>> {
+        let _ = member;
+        Err(no_escalations())
+    }
+
+    /// Persist the member's suspend marker, or remove it with `None`.
+    async fn put_member_marker(
+        &self,
+        member: &Member,
+        marker: Option<SuspendMarker>,
+        now_ms: u64,
+    ) -> Result<()> {
+        let _ = (member, marker, now_ms);
+        Err(no_escalations())
+    }
+
+    /// Every persisted suspend marker.
+    async fn member_markers(&self) -> Result<Vec<(Member, SuspendMarker)>> {
+        Err(no_escalations())
+    }
+
+    /// What members/get reads about `member`.
+    async fn member_read(&self, member: &Member) -> Result<MemberRead> {
+        let _ = member;
+        Err(no_escalations())
+    }
+
+    /// What members/list reads: members after `after`, at most `limit`,
+    /// only those with an open escalation when `escalated`.
+    async fn member_reads(
+        &self,
+        after: Option<&Member>,
+        limit: usize,
+        escalated: bool,
+    ) -> Result<Vec<MemberRead>> {
+        let _ = (after, limit, escalated);
+        Err(no_escalations())
+    }
+
+    /// The members subscribed to the reserved health topic.
+    async fn health_subscribers(&self) -> Result<BTreeSet<Member>> {
+        Err(no_escalations())
+    }
+
+    /// The live subscriptions a source's audience and routes bind: those
+    /// that select one of its topics.
+    async fn source_bound_subscriptions(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<u32> {
+        let _ = (mob_id, source_id);
+        Err(no_sources())
+    }
+
+    /// meta/status's mob announcement counts at `now_ms`.
+    async fn status_counts(&self, now_ms: u64) -> Result<StatusCounts> {
+        let _ = now_ms;
+        Err(no_escalations())
+    }
+
     /// [`Self::announce_with_facts`] that first makes, in the same
     /// transaction, a child for each member `roles` admits to a live role
     /// template the announcement matches, and captures for no child whose
@@ -687,6 +901,14 @@ pub enum SubmissionCheck {
 
 fn no_sources() -> AnnouncementStoreError {
     AnnouncementStoreError::Storage("this announcement store keeps no sources".to_string())
+}
+
+fn no_handling() -> AnnouncementStoreError {
+    AnnouncementStoreError::Storage("this announcement store keeps no handling".to_string())
+}
+
+fn no_escalations() -> AnnouncementStoreError {
+    AnnouncementStoreError::Storage("this announcement store keeps no escalations".to_string())
 }
 
 fn no_templates() -> AnnouncementStoreError {

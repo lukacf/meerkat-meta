@@ -19,6 +19,11 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
 
 use super::availability::{EvidenceClass, SuspendCause, SuspendMarker};
+use super::escalations::{
+    Escalation, EscalationEvent, EscalationEventKind, EscalationNotice, EscalationPass,
+    EscalationSubject, MemberRead, StatusCounts,
+};
+use super::handling::{BatchHandling, Classified, HandlingRead, MAX_FOLLOW, classify};
 pub use super::native::AdmittedInput;
 use super::native::{
     MemberMobScan, MemberProblem, MemberRoute, MobOrigin, MobPresence, NativeDelivery,
@@ -28,7 +33,7 @@ use super::native::{
 use super::sources::{
     AdvanceSource, AnnouncementSource, AuditQuery, AuditRow, MemberFacts, PutSource,
     RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceQuery, SourceState,
-    SourceStream,
+    SourceStream, UnhandledPolicy,
 };
 use super::store::{AnnouncementStore, SubmissionCheck};
 use super::types::{
@@ -37,7 +42,8 @@ use super::types::{
     GapReason, LateOutcome, MAX_PAGE, Member, MemberRouteRecord, MobId, MobIncarnation, MobLineage,
     NativeReceipt, OperationId, PutSubscription, SealingPolicy, SourceId, SourceKey, Subscription,
     SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
-    SubscriptionState, SuccessorBatch, merge_gaps, render_item, successor_batch, wire_budget,
+    SubscriptionState, SuccessorBatch, merge_gaps, render_item, successor_batch_with_notice,
+    wire_budget,
 };
 
 #[path = "owner_declarations.rs"]
@@ -57,6 +63,13 @@ fn member_problem(member: &Member, problem: MemberProblem) -> AnnouncementError 
 
 /// Announcements and settled batches are kept this long after they settle.
 pub const DEFAULT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// The shortest wait before an open escalation is notified again.
+pub const MIN_RENOTIFY_AFTER_MS: u64 = 60 * 1_000;
+
+/// How long an open escalation waits before it is notified again by
+/// default: a day.
+pub const DEFAULT_RENOTIFY_AFTER_MS: u64 = 24 * 60 * 60 * 1_000;
 /// The shortest retention window: a retry of an announcement or a subscription
 /// change inside it still meets its original result.
 pub const MIN_RETENTION_MS: u64 = 60 * 60 * 1_000;
@@ -72,6 +85,8 @@ pub const HOLD_RECHECK_MS: u64 = 5 * 60 * 1_000;
 /// Batches that settled without their delivery being confirmed, read again
 /// per round.
 const ROUND_LATE_READS: usize = 16;
+/// Most handling reads in one round.
+const ROUND_HANDLING_READS: usize = 16;
 /// Longest the dispatcher sleeps without a signal, in ms.
 const MAX_IDLE_MS: u64 = 5 * 60 * 1_000;
 /// How often retention runs.
@@ -88,6 +103,41 @@ const RESTART_PAUSE_MAX: Duration = Duration::from_mins(1);
 /// One retention pass removes at most this many announcements, this many
 /// batches and this many receipts; passes repeat while one stops at a limit.
 const PRUNE_LIMIT: usize = 1_000;
+
+/// Where escalation events reach the host: the gateway's `meta/on_error`
+/// hook.
+pub type ErrorSink = Arc<dyn Fn(crate::unified_runtime::ErrorEvent) + Send + Sync>;
+
+/// The host notification for one escalation event.
+fn escalation_error_event(notice: EscalationNotice) -> crate::unified_runtime::ErrorEvent {
+    use crate::unified_runtime::ErrorEvent;
+    let EscalationNotice {
+        event,
+        mut escalation,
+    } = notice;
+    match event.event {
+        EscalationEventKind::Resolved => ErrorEvent::MobAnnouncementEscalationResolved {
+            escalation_id: event.escalation_id,
+            cause: event.cause,
+            subject: event.subject,
+            resolved_at_ms: event.at_ms,
+            cursor: event.cursor,
+        },
+        kind => {
+            // The record as it stood at this event: open, at the event's
+            // count, though a later notification or the resolution may
+            // already have changed the stored one.
+            escalation.renotify_count = event.renotify_count;
+            escalation.resolved_at_ms = None;
+            ErrorEvent::MobAnnouncementEscalated {
+                escalation,
+                event: kind,
+                renotify_count: event.renotify_count,
+                cursor: event.cursor,
+            }
+        }
+    }
+}
 
 /// Configurable announcement policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +170,16 @@ pub struct AnnouncementConfig {
     /// that names it is refused, and a member a lowered ceiling no longer
     /// covers is built without it.
     pub member_tools_in_child_mobs: bool,
+    /// What happens to a plain announcement whose admitted turn ended
+    /// unhandled: report (the default, as 0.9.4 plus the handling
+    /// observation), redeliver with notice, or hold for an operator. A
+    /// source item follows its own source's `delivery.on_unhandled`.
+    pub on_unhandled: UnhandledPolicy,
+    /// How long an open escalation waits before it is notified again.
+    pub renotify_after_ms: u64,
+    /// Who agents among a mob's members receive member escalations on the
+    /// health topic; empty, the default, leaves them to the host.
+    pub health_audience: Vec<super::sources::AudienceGrant>,
     /// The sources and subscriptions this gateway declares, as its options
     /// name them (inline, or a sidecar read at init): reconciled at compose,
     /// before the dispatcher starts.
@@ -151,6 +211,16 @@ impl AnnouncementConfig {
         self.child_limits
             .validate()
             .map_err(|error| Invalid(format!("child_member_limits: {error}")))?;
+        if self.renotify_after_ms < MIN_RENOTIFY_AFTER_MS {
+            return Err(Invalid(format!(
+                "renotify_after_ms must be at least {MIN_RENOTIFY_AFTER_MS}"
+            )));
+        }
+        for grant in &self.health_audience {
+            grant
+                .validate()
+                .map_err(|error| Invalid(format!("health_audience: {error}")))?;
+        }
         Ok(())
     }
 }
@@ -166,6 +236,9 @@ impl Default for AnnouncementConfig {
             peer_request_window_ms: crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS,
             child_limits: ChildMemberLimits::default(),
             member_tools_in_child_mobs: false,
+            on_unhandled: UnhandledPolicy::Report,
+            renotify_after_ms: DEFAULT_RENOTIFY_AFTER_MS,
+            health_audience: Vec::new(),
             declarations: None,
         }
     }
@@ -290,13 +363,15 @@ pub enum NativeObservation {
 
 /// Everything known about one delivery: the immutable batch with its owner
 /// state, the native owner's live status, once admitted the native input's
-/// own state, and why the member's deliveries wait, if they do.
+/// own state and what became of its turn (null until admitted), and why
+/// the member's deliveries wait, if they do.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DeliveryObservation {
     pub batch: Batch,
     pub native: NativeObservation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<Value>,
+    pub handling: Option<BatchHandling>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub marker: Option<SuspendMarker>,
 }
@@ -416,6 +491,15 @@ struct Inner {
     /// Runner reconciles pass one at a time, each reading the source's
     /// record as it stands then.
     runners_gate: tokio::sync::Mutex<()>,
+    /// Whether the persisted markers were read into `markers`.
+    markers_loaded: AtomicBool,
+    /// When each member's marker was last persisted.
+    marker_writes: std::sync::Mutex<BTreeMap<Member, u64>>,
+    /// Where escalation events reach the host.
+    error_sink: std::sync::Mutex<Option<ErrorSink>>,
+    /// The last escalation event pushed to the host; read from the store at
+    /// the first pass, so events from before a restart are not pushed again.
+    pushed_cursor: std::sync::Mutex<Option<u64>>,
     /// Applies and reconciles of declarations pass one at a time, each
     /// reading the applied declarations and marks as they stand then.
     declarations_gate: tokio::sync::Mutex<()>,
@@ -604,6 +688,10 @@ impl AnnouncementService {
                 stopped: AtomicBool::new(false),
                 runners: std::sync::Mutex::new(None),
                 runners_gate: tokio::sync::Mutex::new(()),
+                markers_loaded: AtomicBool::new(false),
+                marker_writes: std::sync::Mutex::new(BTreeMap::new()),
+                error_sink: std::sync::Mutex::new(None),
+                pushed_cursor: std::sync::Mutex::new(None),
                 declarations_gate: tokio::sync::Mutex::new(()),
                 options_conflict_warned: AtomicBool::new(false),
             }),
@@ -612,6 +700,15 @@ impl AnnouncementService {
 
     pub fn config(&self) -> &AnnouncementConfig {
         &self.inner.config
+    }
+
+    /// Send every escalation event to `sink` as it is written.
+    pub fn set_error_sink(&self, sink: ErrorSink) {
+        *self
+            .inner
+            .error_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
     }
 
     /// Apply declarations (contract 4.4): `Some` carries them (a gateway
@@ -698,41 +795,197 @@ impl AnnouncementService {
     }
 
     /// Record why the member's deliveries wait. The same wait on the same
-    /// evidence keeps the time it was first seen and shows its latest
-    /// detail. The marker is the latest attempt's: it can outlive the wait
-    /// it names (after a cancel, or once the batch settles) until the
-    /// member's next attempt or a restart.
-    fn mark(&self, member: &Member, cause: SuspendCause, evidence: EvidenceClass, now: u64) {
-        let mut markers = self
-            .inner
-            .markers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let since_ms = markers
-            .get(member)
-            .filter(|marker| marker.evidence == evidence && marker.cause.same_wait(&cause))
-            .map_or(now, |marker| marker.since_ms);
-        markers.insert(
-            member.clone(),
-            SuspendMarker {
+    /// evidence keeps the time it was first seen, across restarts too, and
+    /// shows its latest detail. The marker is the latest attempt's: it can
+    /// outlive the wait it names (after a cancel, or once the batch settles)
+    /// until the member's next attempt. It is persisted when its cause or
+    /// evidence changes, and at most once per failure report interval
+    /// otherwise; nothing reads it to decide a transition.
+    async fn mark(&self, member: &Member, cause: SuspendCause, evidence: EvidenceClass, now: u64) {
+        self.load_markers().await;
+        let (marker, changed) = {
+            let mut markers = self
+                .inner
+                .markers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let same = markers
+                .get(member)
+                .filter(|marker| marker.evidence == evidence && marker.cause.same_wait(&cause))
+                .map(|marker| marker.since_ms);
+            let marker = SuspendMarker {
                 cause,
                 evidence,
-                since_ms,
-            },
-        );
+                since_ms: same.unwrap_or(now),
+            };
+            markers.insert(member.clone(), marker.clone());
+            (marker, same.is_none())
+        };
+        let due = {
+            let mut writes = self
+                .inner
+                .marker_writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let due = changed
+                || writes
+                    .get(member)
+                    .is_none_or(|at| now.saturating_sub(*at) >= FAILURE_REPORT_INTERVAL_MS);
+            if due {
+                writes.insert(member.clone(), now);
+            }
+            due
+        };
+        if due
+            && let Err(error) = self
+                .inner
+                .store
+                .put_member_marker(member, Some(marker), now)
+                .await
+        {
+            tracing::warn!(member = %member, %error, "announcement member marker not persisted");
+        }
     }
 
     /// The member's deliveries move again.
-    fn unmark(&self, member: &Member) {
-        self.inner
+    async fn unmark(&self, member: &Member) {
+        self.load_markers().await;
+        let removed = self
+            .inner
             .markers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(member)
+            .is_some();
+        self.inner
+            .marker_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(member);
+        if removed
+            && let Err(error) = self
+                .inner
+                .store
+                .put_member_marker(member, None, self.now())
+                .await
+        {
+            tracing::warn!(member = %member, %error, "announcement member marker not removed");
+        }
+    }
+
+    /// Read the persisted markers once, so a wait seen before a restart
+    /// keeps its time.
+    async fn load_markers(&self) {
+        if self.inner.markers_loaded.load(Ordering::SeqCst) {
+            return;
+        }
+        match self.inner.store.member_markers().await {
+            Ok(persisted) => {
+                let mut markers = self
+                    .inner
+                    .markers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (member, marker) in persisted {
+                    markers.entry(member).or_insert(marker);
+                }
+                self.inner.markers_loaded.store(true, Ordering::SeqCst);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "announcement member markers not read");
+            }
+        }
     }
 
     fn now(&self) -> u64 {
         (self.inner.clock)()
+    }
+
+    /// The open escalations, of `subject` when one is named.
+    pub async fn open_escalations(
+        &self,
+        subject: Option<&EscalationSubject>,
+    ) -> Result<Vec<Escalation>, AnnouncementError> {
+        Ok(self.inner.store.open_escalations(subject).await?)
+    }
+
+    /// The escalation events after `after`, and the cursor to read on from.
+    pub async fn escalation_events(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<(Vec<EscalationEvent>, u64), AnnouncementError> {
+        Ok(self.inner.store.escalation_events(after, limit).await?)
+    }
+
+    /// The cursor of the last escalation event.
+    pub async fn last_escalation_cursor(&self) -> Result<u64, AnnouncementError> {
+        Ok(self.inner.store.last_escalation_cursor().await?)
+    }
+
+    /// What members/get reads about `member`.
+    pub async fn member_read(&self, member: &Member) -> Result<MemberRead, AnnouncementError> {
+        Ok(self.inner.store.member_read(member).await?)
+    }
+
+    /// What members/list reads.
+    pub async fn member_reads(
+        &self,
+        after: Option<&Member>,
+        limit: usize,
+        escalated: bool,
+    ) -> Result<Vec<MemberRead>, AnnouncementError> {
+        Ok(self
+            .inner
+            .store
+            .member_reads(after, limit, escalated)
+            .await?)
+    }
+
+    /// The live subscriptions a source's audience and routes bind.
+    pub async fn source_bound_subscriptions(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<u32, AnnouncementError> {
+        Ok(self
+            .inner
+            .store
+            .source_bound_subscriptions(mob_id, source_id)
+            .await?)
+    }
+
+    /// meta/status's mob announcement counts.
+    pub async fn status_counts(&self) -> Result<StatusCounts, AnnouncementError> {
+        Ok(self.inner.store.status_counts(self.now()).await?)
+    }
+
+    /// The one health status of `source` now: stale is computed at read.
+    pub fn health_status(
+        &self,
+        source: &super::sources::AnnouncementSource,
+    ) -> super::sources::SourceHealthStatus {
+        super::escalations::health_status(source, self.now())
+    }
+
+    /// Whether this gateway schedules sources' runners: a gateway with a
+    /// schedule service installed them.
+    pub fn runners_installed(&self) -> bool {
+        self.inner
+            .runners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Whether this gateway delivers to its own members: the fact the
+    /// subscription check reads.
+    pub fn local_delivery(&self) -> serde_json::Value {
+        match self.inner.native.governs_work_authority() {
+            Ok(false) => serde_json::json!({ "kind": "ready" }),
+            Ok(true) => serde_json::json!({ "kind": "refused", "cause": "governed_runtime" }),
+            Err(error) => serde_json::json!({ "kind": "unavailable", "detail": error.0 }),
+        }
     }
 
     /// Ask the dispatcher for a round.
@@ -790,6 +1043,18 @@ impl AnnouncementService {
         &self,
         request: AnnounceRequest,
     ) -> Result<AnnounceOutcome, AnnouncementError> {
+        if request
+            .topics
+            .iter()
+            .any(|topic| topic.as_str() == super::escalations::HEALTH_TOPIC)
+        {
+            return Err(AnnouncementError::Store(AnnouncementStoreError::Invalid(
+                format!(
+                    "the topic {} is reserved for health announcements",
+                    super::escalations::HEALTH_TOPIC
+                ),
+            )));
+        }
         self.ensure_hosted(&BTreeSet::from([request.mob_id.clone()]))
             .await?;
         // The roster facts of the members whose subscriptions take a topic a
@@ -1004,13 +1269,25 @@ impl AnnouncementService {
         let (roles, admitted) = self.expand_roles(&templates).await;
         subscribers.extend(admitted);
         let facts = self.roster_facts(subscribers).await;
+        let subject = EscalationSubject::Source {
+            mob_id: request.mob_id.clone(),
+            source_id: request.source_id.clone(),
+        };
         let advance = self
             .inner
             .store
             .advance_source_with_roles(operation, request, &facts, &roles, self.now())
             .await?;
         super::faults::after_source_advance();
-        if advance.captured {
+        // An advance can end what an open escalation of its source reports
+        // (a failure streak, a quiet window): the next round settles it
+        // rather than the dispatcher's longest idle.
+        let escalated = match self.inner.store.open_escalations(Some(&subject)).await {
+            Ok(open) => !open.is_empty(),
+            // Not read: the next round settles it all the same.
+            Err(_) => true,
+        };
+        if advance.captured || escalated {
             self.wake();
         }
         Ok(advance)
@@ -1023,11 +1300,13 @@ impl AnnouncementService {
         operation: &OperationId,
         request: RecordSourceFailure,
     ) -> Result<AnnouncementSource, AnnouncementError> {
-        Ok(self
+        let source = self
             .inner
             .store
             .record_source_failure(operation, request, self.now())
-            .await?)
+            .await?;
+        self.wake();
+        Ok(source)
     }
 
     /// Audited refusals and withholdings of sources' audiences and routes.
@@ -1456,7 +1735,7 @@ impl AnnouncementService {
 
     /// End every live subscription of a member that is gone for good.
     async fn end_member(&self, member: &Member, end: SubscriptionEnd, now: u64) {
-        self.unmark(member);
+        self.unmark(member).await;
         match self.inner.store.end_member(member, end.clone(), now).await {
             Ok(ended) if !ended.is_empty() => {
                 tracing::info!(
@@ -1507,6 +1786,75 @@ impl AnnouncementService {
 
     pub async fn deliveries(&self, query: &BatchQuery) -> Result<Vec<Batch>, AnnouncementError> {
         Ok(self.inner.store.batches(query).await?)
+    }
+
+    /// [`Self::deliveries`], each batch with its handling once it was
+    /// admitted.
+    pub async fn deliveries_with_handling(
+        &self,
+        query: &BatchQuery,
+    ) -> Result<Vec<(Batch, Option<BatchHandling>)>, AnnouncementError> {
+        let batches = self.inner.store.batches(query).await?;
+        let mut handlings = self
+            .inner
+            .store
+            .handlings(batches.iter().map(|batch| batch.id.clone()).collect())
+            .await?;
+        Ok(batches
+            .into_iter()
+            .map(|batch| {
+                let handling = handlings.remove(&batch.id);
+                (batch, handling)
+            })
+            .collect())
+    }
+
+    /// An operator's remedy for a delivered batch whose turn ended
+    /// unhandled and whose items are held: each held item is checked afresh
+    /// against its member's coverage, and what passes is owed again, under
+    /// a notice, for the member's next batch. A roster that cannot be read
+    /// decides nothing: the remedy is refused, to be asked again. A retry
+    /// answers what the first call recorded, whatever the roster says now.
+    pub async fn redeliver_held(
+        &self,
+        operation: &OperationId,
+        id: &BatchId,
+    ) -> Result<BatchHandling, AnnouncementError> {
+        if let Some(recorded) = self.inner.store.redeliver_receipt(operation, id).await? {
+            return Ok(recorded);
+        }
+        let batch = self
+            .inner
+            .store
+            .batch(id)
+            .await?
+            .ok_or(AnnouncementStoreError::UnknownBatch)?;
+        let facts = self
+            .member_facts_read(&batch.member)
+            .await
+            .map_err(|error| AnnouncementError::NativeUnavailable(error.0))?;
+        let handling = self
+            .inner
+            .store
+            .redeliver_held(operation, id, facts, self.now())
+            .await?;
+        self.wake();
+        Ok(handling)
+    }
+
+    /// An operator's dismissal of what a delivered batch holds after its
+    /// turn ended unhandled: each held item settles as handled by an
+    /// operator and is never delivered again.
+    pub async fn dismiss_held(
+        &self,
+        operation: &OperationId,
+        id: &BatchId,
+    ) -> Result<BatchHandling, AnnouncementError> {
+        Ok(self
+            .inner
+            .store
+            .dismiss_held(operation, id, self.now())
+            .await?)
     }
 
     /// The delivery's immutable batch, its owner state, and the native
@@ -1576,11 +1924,13 @@ impl AnnouncementService {
 
     async fn observe(&self, batch: Batch) -> Result<DeliveryObservation, AnnouncementError> {
         let marker = self.suspend_marker(&batch.member);
+        let handling = self.inner.store.handling(&batch.id).await?;
         if batch.state.tag() == BatchStateTag::Sealed {
             return Ok(DeliveryObservation {
                 batch,
                 native: NativeObservation::NotSubmitted,
                 input: None,
+                handling,
                 marker,
             });
         }
@@ -1593,6 +1943,7 @@ impl AnnouncementService {
                     detail: refusal.to_string(),
                 },
                 input: None,
+                handling,
                 marker,
             });
         }
@@ -1617,6 +1968,7 @@ impl AnnouncementService {
             batch,
             native,
             input,
+            handling,
             marker,
         })
     }
@@ -1711,6 +2063,18 @@ impl AnnouncementService {
         if let Err(error) = self.read_late(now).await {
             tracing::warn!(%error, "announcement late reads failed this round");
         }
+        // What became of each admitted batch's turn is read at the settle
+        // pace until a final read; a failing read waits for the next round,
+        // and the round after it comes no sooner than the shortest pause.
+        match self.read_handling(now).await {
+            Ok(next) => {
+                let next = next.map(|at| at.max(now.saturating_add(config.settle_check_min_ms)));
+                report.next_due_ms = min_due(report.next_due_ms, next);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "announcement handling reads failed this round");
+            }
+        }
         // Held items are checked afresh before the backlogs are read, so
         // what a check releases seals in this round.
         if let Err(error) = self.recheck_holds(now).await {
@@ -1768,7 +2132,122 @@ impl AnnouncementService {
                 None => {}
             }
         }
+        self.escalation_pass(now).await;
         Ok(report)
+    }
+
+    /// One escalation pass: raise and resolve every source and member
+    /// condition from the records as they stand, notify open escalations
+    /// again when due, and push the events it wrote to the host. A failure
+    /// leaves the next round to try again.
+    async fn escalation_pass(&self, now: u64) {
+        self.load_markers().await;
+        if self
+            .inner
+            .pushed_cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+        {
+            match self.inner.store.last_escalation_cursor().await {
+                Ok(cursor) => {
+                    *self
+                        .inner
+                        .pushed_cursor
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cursor);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "announcement escalation cursor not read");
+                    return;
+                }
+            }
+        }
+        let facts = match self.inner.store.health_subscribers().await {
+            Ok(members) => self.roster_facts(members).await,
+            Err(error) => {
+                tracing::warn!(%error, "announcement health subscribers not read");
+                RosterFacts::default()
+            }
+        };
+        // Health is announced only into the mobs hosted here: this gateway's
+        // own and the others it hosts.
+        let hosted = match self.inner.native.hosted_mob_ids().await {
+            Ok(mut hosted) => {
+                hosted.extend(self.inner.native.own_mob());
+                hosted
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error.0,
+                    "hosted mobs not read; no health is announced this round"
+                );
+                BTreeSet::new()
+            }
+        };
+        let pass = EscalationPass {
+            renotify_after_ms: self.inner.config.renotify_after_ms,
+            health_audience: self.inner.config.health_audience.clone(),
+            retention_ms: self.inner.config.retention_ms,
+            hosted,
+        };
+        if let Err(error) = self.inner.store.escalation_pass(pass, &facts, now).await {
+            tracing::warn!(%error, "announcement escalation pass failed; the next round retries");
+        }
+        self.push_escalations().await;
+    }
+
+    /// Push every escalation event after the last one pushed to the host's
+    /// error sink, in cursor order.
+    async fn push_escalations(&self) {
+        let sink = self
+            .inner
+            .error_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        loop {
+            let Some(after) = *self
+                .inner
+                .pushed_cursor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            else {
+                return;
+            };
+            let page = match self
+                .inner
+                .store
+                .escalation_notices(after, super::types::MAX_PAGE)
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::warn!(%error, "announcement escalation events not read");
+                    return;
+                }
+            };
+            for notice in page.notices {
+                let cursor = notice.event.cursor;
+                if let Some(sink) = &sink {
+                    sink(escalation_error_event(notice));
+                }
+                *self
+                    .inner
+                    .pushed_cursor
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cursor);
+            }
+            // Past every event read: one whose escalation is gone included.
+            *self
+                .inner
+                .pushed_cursor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(page.next);
+            if !page.full {
+                return;
+            }
+        }
     }
 
     /// Seal a member's due backlog into one batch on its kept route. The
@@ -2237,10 +2716,18 @@ impl AnnouncementService {
                 }),
             }
         }
-        Ok(Some(successor_batch(
+        // What the stranded batch redelivered after an unhandled turn keeps
+        // its notice.
+        let notice = self
+            .inner
+            .store
+            .redelivery_notice(&batch.member, &batch.items)
+            .await?;
+        Ok(Some(successor_batch_with_notice(
             id,
             &batch.id,
             merge_gaps(&batch.gaps, &not_retained),
+            &notice,
             &items,
             wire_budget(batch.route),
         )))
@@ -2425,6 +2912,91 @@ impl AnnouncementService {
             .record_late_read(&batch.id, late, next)
             .await?;
         Ok(())
+    }
+
+    /// Read what became of the turn of each admitted batch due a read.
+    /// Returns when the next read is due.
+    async fn read_handling(&self, now: u64) -> Result<Option<u64>, AnnouncementError> {
+        for batch in self
+            .inner
+            .store
+            .handling_reads_due(now, ROUND_HANDLING_READS)
+            .await?
+        {
+            if let Err(error) = self.read_handling_one(&batch, now).await {
+                tracing::warn!(batch = %batch.id, %error, "a batch's handling was not read");
+            }
+        }
+        Ok(self.inner.store.next_handling_read().await?)
+    }
+
+    async fn read_handling_one(&self, batch: &Batch, now: u64) -> Result<(), AnnouncementError> {
+        let BatchState::Delivered {
+            session_id,
+            input_id,
+            ..
+        } = &batch.state
+        else {
+            return Ok(());
+        };
+        // A route that contradicts its member is never read.
+        let read = if self.route_refusal(batch).is_some() {
+            HandlingRead::Unknown
+        } else {
+            self.handling_read(batch, session_id, input_id, now).await
+        };
+        self.inner
+            .store
+            .record_handling(&batch.id, read, self.inner.config.on_unhandled, now)
+            .await?;
+        Ok(())
+    }
+
+    /// What the admitted input's turn came to: its receipt first, its
+    /// terminal outcome and abandon reason without one, followed through a
+    /// superseding or coalescing input to the one that absorbed it. Read
+    /// again at the settle pace while it is not final or not readable;
+    /// unknown once the retention window has passed since the admission.
+    async fn handling_read(
+        &self,
+        batch: &Batch,
+        session_id: &str,
+        input_id: &str,
+        now: u64,
+    ) -> HandlingRead {
+        let expired = now.saturating_sub(batch.updated_at_ms) > self.inner.config.retention_ms;
+        let again = if expired {
+            HandlingRead::Unknown
+        } else {
+            HandlingRead::Again {
+                next_read_at_ms: now.saturating_add(self.settle_pause_ms(batch, now)),
+            }
+        };
+        let mut input_id = input_id.to_string();
+        for _ in 0..=MAX_FOLLOW {
+            let reading = match self.inner.native.input(batch, session_id, &input_id).await {
+                Ok(Some(reading)) => reading,
+                Ok(None) | Err(_) => return again,
+            };
+            match classify(&reading) {
+                Classified::Pending | Classified::Unreadable => return again,
+                Classified::Handled => return HandlingRead::Handled,
+                Classified::HandledUnverified => return HandlingRead::HandledUnverified,
+                Classified::Unhandled { cause, held } => {
+                    return HandlingRead::Unhandled { cause, held };
+                }
+                Classified::Unknown => return HandlingRead::Unknown,
+                Classified::Follow { input_id: next } => {
+                    // A peer answers for the batch's own input only: the
+                    // input that absorbed it is not readable there.
+                    if batch.route == MemberRoute::Peer {
+                        return HandlingRead::Unknown;
+                    }
+                    input_id = next;
+                }
+            }
+        }
+        HandlingRead::Unknown
     }
 
     fn settle_pause_ms(&self, batch: &Batch, now: u64) -> u64 {
@@ -2813,7 +3385,7 @@ impl AnnouncementService {
             // An answered read ends the wait it marked; what it says decides
             // the batch.
             Ok(status) => {
-                self.unmark(&batch.member);
+                self.unmark(&batch.member).await;
                 Ok(StatusStep::Status(status))
             }
             Err(NativeStatusError::Unavailable {
@@ -2828,7 +3400,7 @@ impl AnnouncementService {
                     detail = %detail,
                     "announcement native status unavailable"
                 );
-                self.mark(&batch.member, cause, evidence, now);
+                self.mark(&batch.member, cause, evidence, now).await;
                 Ok(StatusStep::Wait)
             }
             Err(NativeStatusError::Blocked { cause, detail }) => Ok(StatusStep::Moved(Box::new(
@@ -2878,7 +3450,7 @@ impl AnnouncementService {
                     cause = %cause,
                     "announcement member cannot take a delivery now; the batch waits"
                 );
-                self.mark(&batch.member, cause, evidence, now);
+                self.mark(&batch.member, cause, evidence, now).await;
                 Err(PrepareStep::Waits)
             }
             Err(PrepareError::Unavailable(error)) => {
@@ -2937,7 +3509,7 @@ impl AnnouncementService {
     async fn submit(&self, batch: &Batch, now: u64) -> Result<SubmitStep, AnnouncementError> {
         let event = match self.inner.native.submit(batch, now).await {
             Ok(receipt) => {
-                self.unmark(&batch.member);
+                self.unmark(&batch.member).await;
                 BatchEvent::NativeCommitted { receipt }
             }
             Err(NativeSubmitError::NotCommitted { cause, evidence }) => {
@@ -2948,7 +3520,7 @@ impl AnnouncementService {
                     evidence = evidence.as_str(),
                     "announcement submission committed nothing; the batch is owed again"
                 );
-                self.mark(&batch.member, cause, evidence, now);
+                self.mark(&batch.member, cause, evidence, now).await;
                 self.apply(batch, BatchEvent::SubmitRefused, now).await?;
                 return Ok(SubmitStep::Owed);
             }
@@ -2964,7 +3536,7 @@ impl AnnouncementService {
                     detail = %detail,
                     "announcement submission outcome unknown; the native status will settle it"
                 );
-                self.mark(&batch.member, cause, evidence, now);
+                self.mark(&batch.member, cause, evidence, now).await;
                 return Ok(SubmitStep::ReadStatus);
             }
             Err(NativeSubmitError::Blocked { cause, detail }) => BatchEvent::Block {

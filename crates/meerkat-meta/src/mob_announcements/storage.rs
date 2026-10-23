@@ -15,7 +15,8 @@ fn initialize_schema_v1(
     tx.execute_batch(SCHEMA)
 }
 
-/// Version 2 adds the source tables and changes no version 1 object.
+/// Version 2 adds the source, audit, hold and handling tables and changes no
+/// version 1 object.
 fn migrate_to_v2(tx: &rusqlite::Transaction<'_>) -> std::result::Result<(), rusqlite::Error> {
     tx.execute_batch(SCHEMA_V2)
 }
@@ -318,6 +319,54 @@ pub(crate) const ANNOUNCEMENT_SCHEMA_DOMAIN: meerkat_sqlite::SchemaDomain =
             meerkat_sqlite::SchemaObject {
                 kind: meerkat_sqlite::SchemaObjectKind::Index,
                 name: "announcement_holds_by_check",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Index,
+                name: "announcement_holds_by_batch",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "announcement_handling",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Index,
+                name: "announcement_handling_reads",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "announcement_redeliveries",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "announcement_source_items",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "announcement_escalations",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Index,
+                name: "announcement_escalations_open",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Index,
+                name: "announcement_escalations_by_subject",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "announcement_escalation_events",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "announcement_member_markers",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "announcement_escalation_passes",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Index,
+                name: "announcement_batches_reporting_gaps",
             },
             meerkat_sqlite::SchemaObject {
                 kind: meerkat_sqlite::SchemaObjectKind::Table,

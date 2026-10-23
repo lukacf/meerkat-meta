@@ -142,8 +142,9 @@ impl DeclarationsSource {
     }
 }
 
-/// A record a declaration manages, by its kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// A record a declaration manages, by its kind: the kind a declaration
+/// escalation names too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum DeclarationRecordKind {
@@ -154,6 +155,7 @@ pub enum DeclarationRecordKind {
 }
 
 impl DeclarationRecordKind {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Source => "source",

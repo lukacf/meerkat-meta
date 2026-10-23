@@ -23,8 +23,10 @@
 //! For each delivery, `meta/mob_announcements/deliveries/observe` reports
 //! separately: the announcements it carries, the sealed batch (what the
 //! member is owed), the native commit receipt, native admission as an input,
-//! and that input's own runtime state. There is no single "processed" flag:
-//! admission says nothing about what the agent did.
+//! that input's own runtime state, and its handling: what became of the
+//! turn, read from the input's own receipt (see [`handling`]). There is no
+//! single "processed" flag: admission says nothing about what the agent
+//! did, and a turn that ended before completing is reported as such.
 //!
 //! # Attention policy
 //!
@@ -37,8 +39,9 @@
 
 pub mod availability;
 pub mod declarations;
-mod escalations_stub;
+pub mod escalations;
 mod faults;
+pub mod handling;
 pub mod native;
 pub mod owner;
 pub mod remote;
@@ -50,6 +53,8 @@ pub mod store;
 pub mod tools;
 pub mod types;
 
+#[cfg(test)]
+mod escalations_tests;
 #[cfg(test)]
 mod remote_tests;
 #[cfg(test)]
@@ -69,6 +74,11 @@ pub use declarations::{
     DeclaredSource, DeclaredSubscription, DeclaredSubscriptionDelivery, PutRoleTemplate,
     ROLE_TEMPLATE_LIMIT, RoleSelector, RoleTemplate,
 };
+pub use escalations::{
+    Escalation, EscalationCause, EscalationEvent, EscalationEventKind, EscalationSubject,
+    HEALTH_TOPIC, MemberBacklogRead, MemberRead, QuietEvidence,
+};
+pub use handling::{BatchHandling, HandlingRead, HandlingState, MAX_REDELIVERIES};
 pub use native::{
     ANNOUNCEMENT_CONTINUATION_NAMESPACE, AnnouncementNativeDelivery, IdentityService, MemberMobEnd,
     MemberMobScan, MemberProblem, MemberRoute, MobNativeDelivery, MobPresence, NativeDelivery,
@@ -77,8 +87,8 @@ pub use native::{
 };
 pub use owner::{
     AdmittedInput, AnnouncementConfig, AnnouncementError, AnnouncementService,
-    DEFAULT_RETENTION_MS, DeliveryObservation, MIN_RETENTION_MS, NativeObservation, RoundReport,
-    SourceRunners,
+    DEFAULT_RENOTIFY_AFTER_MS, DEFAULT_RETENTION_MS, DeliveryObservation, ErrorSink,
+    MIN_RETENTION_MS, NativeObservation, RoundReport, SourceRunners,
 };
 pub use remote::{KeyedInjectServer, RemoteMemberDelivery};
 pub use sources::{
@@ -124,6 +134,12 @@ struct AnnouncementOptions {
     member_tools_in_child_mobs: bool,
     #[serde(default)]
     child_member_limits: Option<ChildMemberLimitOptions>,
+    #[serde(default)]
+    on_unhandled: Option<UnhandledPolicy>,
+    #[serde(default)]
+    renotify_after_ms: Option<u64>,
+    #[serde(default)]
+    health_audience: Option<Vec<sources::AudienceGrant>>,
     /// The sources and subscriptions this gateway declares, inline.
     #[serde(default)]
     declarations: Option<declarations::Declarations>,
@@ -201,12 +217,13 @@ pub(crate) fn parse_runtime_options(
 
 /// Parse a mob announcement options object (`{enabled, batch?,
 /// retention_ms?, member_limits?, member_tools_in_child_mobs?,
-/// child_member_limits?, declarations?, declarations_path?}`), as every
-/// gateway takes it; `path` is where the surface takes it, for the
-/// messages. `Ok(None)` when it is disabled. The result has passed
-/// [`AnnouncementConfig::validate`]. A sidecar of declarations is read
-/// here, once; [`AnnouncementComposition::compose`] checks the
-/// declarations against the gateway's mob.
+/// child_member_limits?, on_unhandled?, renotify_after_ms?, health_audience?,
+/// declarations?, declarations_path?}`), as every gateway takes it; `path`
+/// is where the surface takes it, for the messages. `Ok(None)` when it is
+/// disabled. The result has passed [`AnnouncementConfig::validate`]. A
+/// sidecar of declarations is read here, once;
+/// [`AnnouncementComposition::compose`] checks the declarations against
+/// the gateway's mob.
 pub fn parse_options(
     value: &serde_json::Value,
     path: &str,
@@ -220,6 +237,9 @@ pub fn parse_options(
         member_tools_in_child_mobs: options.member_tools_in_child_mobs,
         ..AnnouncementConfig::default()
     };
+    if let Some(policy) = options.on_unhandled {
+        config.on_unhandled = policy;
+    }
     if let Some(batch) = options.batch {
         let policy = &mut config.policy;
         policy.max_count = batch.max_count.unwrap_or(policy.max_count);
@@ -249,6 +269,12 @@ pub fn parse_options(
         let current = &mut config.child_limits;
         current.subscriptions = limits.subscriptions.unwrap_or(current.subscriptions);
         current.per_mob = limits.per_mob.unwrap_or(current.per_mob);
+    }
+    if let Some(renotify_after_ms) = options.renotify_after_ms {
+        config.renotify_after_ms = renotify_after_ms;
+    }
+    if let Some(health_audience) = options.health_audience {
+        config.health_audience = health_audience;
     }
     // One source of declarations per gateway: inline, or a sidecar read now.
     config.declarations = match (options.declarations, options.declarations_path) {
@@ -398,8 +424,11 @@ impl AnnouncementComposition {
             .member_tools_in_child_mobs
             .then(|| Arc::clone(&local));
         let native = AnnouncementNativeDelivery::new(local, remote);
-        let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config.clone())
+        let member_limits = config.member_limits;
+        let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config)
             .map_err(|error| error.to_string())?;
+        // Escalation events reach the host through the gateway's error hook.
+        service.set_error_sink(runtime.error_sink());
         if !runtime.attach_mob_announcements(service.clone()) {
             return Err("mob announcements are already attached to this runtime".to_string());
         }
@@ -414,7 +443,7 @@ impl AnnouncementComposition {
             .set(tools::ToolBackend {
                 service: service.clone(),
                 callers: Arc::new(callers),
-                limits: config.member_limits,
+                limits: member_limits,
             })
             .is_ok();
         if !bound {
