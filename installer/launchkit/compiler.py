@@ -195,17 +195,22 @@ def _fixed_agents(spec, *, identities=None):
             for row in rows]
 
 
-def application_inventory_input(value):
+def application_inventory_input(value, *, member_classes=None):
     """Return exact schema1 roster bytes for the native inventory command.
 
     This is the generated host's fixed DurableAgentSpec wire input, before any
     helper profile projection. The native command supplies realm/member names;
     these bytes select neither original routes nor native authority. The caller
     retains and pins this original roster for the later schema4 compilation.
+    A helperless caller explicitly supplies its native class declaration list;
+    the same declarations must reach compilation. No class creates an identity.
     """
     spec = _spec(value)
-    if spec.acquisition is None:
+    if spec.acquisition is None and member_classes is None:
         raise ValueError("Application inventory requires an explicit acquisition helper identity.")
+    if member_classes is not None and (type(member_classes) is not list
+            or any(type(item) is not dict for item in member_classes)):
+        raise ValueError("Application inventory requires an explicit native member-class list.")
     classes = {item.id: item for item in spec.agent_classes}
     roster = [{"identity": item["identity"], "profile": item["profile"],
         "addressability": "addressable", "display_name": item["name"],
@@ -213,10 +218,15 @@ def application_inventory_input(value):
                    "console_group": classes[item["classId"]].name},
         "additional_instructions": [], "runtime_mode_override": "turn_driven"}
         for item in _fixed_agents(spec)]
-    if spec.acquisition.helper_identity not in {row["identity"] for row in roster}:
+    if spec.acquisition is not None and spec.acquisition.helper_identity not in {row["identity"] for row in roster}:
         raise ValueError("Application inventory requires its explicit helper in the fixed roster.")
-    content = (json.dumps({"schema": 1, "mob_id": spec.project.slug,
-        "helper_identity": spec.acquisition.helper_identity, "roster": roster},
+    source = {"schema": 1, "mob_id": spec.project.slug}
+    if spec.acquisition is not None:
+        source["helper_identity"] = spec.acquisition.helper_identity
+    source["roster"] = roster
+    if member_classes is not None:
+        source["member_classes"] = member_classes
+    content = (json.dumps(source,
         ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
     from .connect_installer_caller import MAX_INVENTORY_BYTES
     if len(content) > MAX_INVENTORY_BYTES:

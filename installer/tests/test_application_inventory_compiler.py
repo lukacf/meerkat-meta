@@ -168,3 +168,46 @@ def test_inventory_rejects_valid_blueprint_that_exceeds_native_byte_limit():
     spec = Blueprint.model_validate(data)
     with pytest.raises(ValueError, match="256 KiB"):
         compiler.application_inventory_input(spec)
+
+
+def test_helperless_inventory_preserves_classes_without_creating_initial_members():
+    data = starter_blueprint().model_dump(mode="json")
+    data["flows"] = []
+    project = copy.deepcopy(data["agent_classes"][1])
+    project.update(id="project", instances=0)
+    data["agent_classes"].append(project)
+    spec = Blueprint.model_validate(data)
+    declarations = [{"id": "project", "profile": "application__project",
+        "factory": "application:project", "callbacks": [], "grants": []}]
+    original = copy.deepcopy(declarations)
+    payload = compiler.application_inventory_input(spec, member_classes=declarations)
+    value = _inventory_input(payload)
+    assert set(value) == {"schema", "mob_id", "roster", "member_classes"}
+    assert value["member_classes"] == original and declarations == original
+    assert [row["identity"] for row in value["roster"]] == [
+        "lead:main", "research:1", "research:2", "review:main"]
+    assert not any(row["identity"].startswith("project:") for row in value["roster"])
+    declarations[0]["grants"].append({"changed": "after serialization"})
+    assert json.loads(payload)["member_classes"] == original
+
+
+def test_legacy_inventory_bytes_keep_helper_field_order_and_no_class_default():
+    spec = selected_blueprint()
+    payload = compiler.application_inventory_input(spec)
+    source = json.loads(payload)
+    expected = {"schema": 1, "mob_id": spec.project.slug,
+        "helper_identity": spec.acquisition.helper_identity, "roster": source["roster"]}
+    assert payload == (json.dumps(expected, ensure_ascii=True,
+        separators=(",", ":")) + "\n").encode()
+
+
+@pytest.mark.parametrize("declarations", [{}, [None], ["project"], True])
+def test_compiler_refuses_nonobject_native_class_selection(declarations):
+    with pytest.raises(ValueError, match="native member-class list"):
+        compiler.application_inventory_input(starter_blueprint(), member_classes=declarations)
+
+
+def test_selected_class_bytes_count_toward_native_inventory_limit():
+    with pytest.raises(ValueError, match="256 KiB"):
+        compiler.application_inventory_input(starter_blueprint(), member_classes=[
+            {"id": "project", "opaque_native_input": "x" * MAX_INVENTORY_BYTES}])
