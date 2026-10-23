@@ -26,6 +26,16 @@ from test_meta_toolkit_runtime_update import catalog_target
 from test_guide import guide_client, start, answer
 
 
+@pytest.fixture(autouse=True)
+def inert_isolation_probe(monkeypatch):
+    """A guide turn reads the host's isolation probe, which starts a process.
+
+    This file forbids processes, so the probe passed only after an earlier
+    file had cached it. Select an inert sandbox path here, as other fixtures do.
+    """
+    monkeypatch.setattr("launchkit.implementation_workspace._sandbox_executable", lambda: "/inert/sandbox")
+
+
 def setup_spec():
     value = starter_blueprint().model_dump(mode="json")
     value["model"] = "gpt-6-astra"
