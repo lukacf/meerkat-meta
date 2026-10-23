@@ -2901,12 +2901,18 @@ fn live_open_instruction_overlay(instructions: Vec<String>) -> Option<String> {
     (!joined.is_empty()).then_some(joined)
 }
 
-/// Project the member session into a [`RealtimeSessionOpenConfig`].
+/// Project the member session into a [`RealtimeSessionOpenConfig`], together
+/// with whether a run-start hook refused the session's staged create-time
+/// prompt at this open (`true`: the open result reports the
+/// `staged_prompt_refused` advisory).
 ///
 /// meta mirror of the facade `LiveOrchestrator::live_open_config_for_session`
 /// (which is pinned to `FactoryAgentBuilder` + the staged-session registry,
 /// so a generic-`B` gateway cannot borrow it): the same three published
-/// service seams feed the same three pub projection free functions. No
+/// service seams feed the same three pub projection free functions, and the
+/// staged prompt is delivered at the same point, once the open-projection
+/// admission is held and before the seed is read
+/// ([`deliver_staged_prompt_for_live_open`]). No
 /// staged/archived recovery - meta member sessions are held live by the
 /// bridge, and an archived target surfaces as `NotFound`. Only the
 /// non-`openai-live` open uses it; refresh never projects through open.
@@ -2916,7 +2922,7 @@ async fn live_open_config_for_session<B: SessionAgentBuilder + 'static>(
     session_id: &SessionId,
     turning_mode: RealtimeTurningMode,
     seed_max_chars: Option<usize>,
-) -> Result<RealtimeSessionOpenConfig, meerkat_core::SessionError> {
+) -> Result<(RealtimeSessionOpenConfig, bool), meerkat_core::SessionError> {
     // Mirror of the facade orchestrator: process-wide open-projection custody
     // is acquired BEFORE the persistent service can hydrate blob-backed image
     // history; the take-once slot on the returned config carries this same
@@ -2928,6 +2934,9 @@ async fn live_open_config_for_session<B: SessionAgentBuilder + 'static>(
                 error.to_string(),
             ))
         })?;
+    // A staged create-time prompt is committed as the session's newest user
+    // row before the snapshot below is exported, so the seed carries it.
+    let staged_prompt_refused = deliver_staged_prompt_for_live_open(service, session_id).await?;
     let (session, canonical_user_image_decoded_bytes) = service
         .export_realtime_open_session_snapshot_with_image_usage(session_id)
         .await?;
@@ -2993,12 +3002,47 @@ async fn live_open_config_for_session<B: SessionAgentBuilder + 'static>(
             err.to_string(),
         ))
     })?;
-    Ok(open_config
-        .with_open_projection_lease(open_projection_lease)
-        .with_user_content_identities(session.realtime_user_content_identities())
-        .with_user_content_tombstones(session.realtime_user_content_tombstones())
-        .with_canonical_user_image_decoded_bytes(canonical_user_image_decoded_bytes)
-        .with_transcript_rewrite_generation(transcript_rewrite_generation))
+    Ok((
+        open_config
+            .with_open_projection_lease(open_projection_lease)
+            .with_user_content_identities(session.realtime_user_content_identities())
+            .with_user_content_tombstones(session.realtime_user_content_tombstones())
+            .with_canonical_user_image_decoded_bytes(canonical_user_image_decoded_bytes)
+            .with_transcript_rewrite_generation(transcript_rewrite_generation),
+        staged_prompt_refused,
+    ))
+}
+
+/// Deliver the session's staged create-time prompt for a live open, as
+/// Meerkat's own opens do: a deferred session whose first interaction is this
+/// open hands the prompt to the realtime model once, through the `RunStarted`
+/// hooks a turn carrying it would run. Like Meerkat's mirrored-channel and
+/// concurrent summary opens, the delivery only tries the session's turn
+/// boundary and never waits behind a running turn: a held boundary delivers
+/// nothing (a turn in flight has consumed the prompt already; any other holder
+/// leaves it staged for the next open or the first text turn). A session with
+/// nothing staged answers at once, with no guard, actor command or store read.
+/// A hook that refuses the prompt keeps it staged for the first text turn and
+/// the open goes ahead without it: the answer is `true`, reported as the
+/// `staged_prompt_refused` advisory.
+#[cfg(not(feature = "openai-live"))]
+async fn deliver_staged_prompt_for_live_open<B: SessionAgentBuilder + 'static>(
+    service: &PersistentSessionService<B>,
+    session_id: &SessionId,
+) -> Result<bool, meerkat_core::SessionError> {
+    let delivery = service
+        .try_deliver_staged_prompt_for_live_open(session_id)
+        .await?;
+    if let meerkat_session::StagedPromptLiveOpenDelivery::Refused(refusal) = delivery {
+        tracing::warn!(
+            target: "meerkat_meta::live_wiring",
+            %session_id,
+            %refusal,
+            "a run-start hook refused the staged create-time prompt at live open; it stays staged for the first text turn"
+        );
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// The realtime identity that `channel_id`'s open bound on `session_id`, read
@@ -3410,10 +3454,10 @@ async fn handle_live_open<B: SessionAgentBuilder + 'static>(
     // `runtime_options.live.seed_max_chars`; windowing is upstream-owned
     // (0.7.28, ask 30 SHIPPED).
     let seed_max_chars = parsed.seed_max_chars.or(ctx.seed_max_chars);
-    let mut open_config =
+    let (mut open_config, staged_prompt_refused) =
         match live_open_config_for_session(service, session_id, turning_mode, seed_max_chars).await
         {
-            Ok(config) => config,
+            Ok(projection) => projection,
             Err(meerkat_core::SessionError::NotFound { .. }) => {
                 return live_error(
                     rpc_id,
@@ -3671,10 +3715,13 @@ async fn handle_live_open<B: SessionAgentBuilder + 'static>(
         transport: transport.into(),
         capabilities: capabilities.into(),
         continuity: continuity.into(),
-        // This open delivers no staged create-time prompt (its config is
-        // built from the exported snapshot, see
-        // `live_open_config_for_session`), so it has no advisory to report.
-        advisories: Vec::new(),
+        // The open went ahead without a staged create-time prompt that a
+        // run-start hook refused: an advisory, not a failure.
+        advisories: if staged_prompt_refused {
+            vec![meerkat_contracts::WireLiveOpenAdvisory::StagedPromptRefused]
+        } else {
+            Vec::new()
+        },
     };
     match serde_json::to_value(result) {
         Ok(value) => live_success(rpc_id, value),
@@ -5406,6 +5453,107 @@ mod tests {
                 .feature_capabilities()
                 .is_empty()
         );
+    }
+
+    /// The ordinary open's staged-prompt delivery only tries the session's
+    /// turn boundary and never waits behind it: while another holder has the
+    /// boundary, the delivery answers at once and commits nothing, so the
+    /// prompt stays staged for the next open or the first text turn; once the
+    /// boundary is free the same delivery commits it once.
+    #[cfg(not(feature = "openai-live"))]
+    #[tokio::test]
+    async fn the_ordinary_open_delivery_never_waits_behind_a_held_turn_boundary() {
+        use meerkat_core::service::SessionService as _;
+
+        const STAGED: &str = "Remember the codeword ORBIT-7 for later.";
+        let persistence = meerkat::PersistenceBundle::new(
+            Arc::new(meerkat::MemoryStore::new()),
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        )
+        .expect("staged-prompt fixture persistence");
+        let temp = tempfile::tempdir().expect("staged-prompt fixture state");
+        let mut builder = meerkat::FactoryAgentBuilder::new(
+            AgentFactory::new(temp.path()).builtins(false),
+            Config::default(),
+        );
+        builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
+        let (service, machine) =
+            meerkat::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
+        let session = meerkat_core::Session::new();
+        let session_id = session.id().clone();
+        let bindings = machine
+            .prepare_bindings(session_id.clone())
+            .await
+            .expect("prepare runtime bindings");
+        service
+            .create_session(meerkat_core::service::CreateSessionRequest {
+                model: "claude-sonnet-4-5".to_string(),
+                prompt: meerkat_core::ContentInput::Text(STAGED.to_string()),
+                injected_context: Vec::new(),
+                system_prompt: meerkat_core::config::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Stage,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(session),
+                    runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
+                    ..meerkat_core::service::SessionBuildOptions::default()
+                }),
+                labels: None,
+            })
+            .await
+            .expect("create the deferred session with its prompt staged");
+
+        let boundary = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        let while_held = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            deliver_staged_prompt_for_live_open(&service, &session_id),
+        )
+        .await
+        .expect("the delivery never waits for the held turn boundary")
+        .expect("the delivery answers");
+        let rows_while_held = committed_user_rows(&service, &session_id).await;
+        drop(boundary);
+        let once_free = deliver_staged_prompt_for_live_open(&service, &session_id)
+            .await
+            .expect("the delivery answers");
+        let rows = committed_user_rows(&service, &session_id).await;
+        service.shutdown().await;
+
+        assert!(
+            !while_held && rows_while_held.is_empty() && !once_free && rows == [STAGED.to_string()],
+            "a held boundary must leave the prompt staged without waiting, and a free one \
+             must deliver it once: while_held={while_held} \
+             rows_while_held={rows_while_held:?} once_free={once_free} rows={rows:?}"
+        );
+    }
+
+    /// The text of every committed user row of `session_id`'s transcript.
+    #[cfg(not(feature = "openai-live"))]
+    async fn committed_user_rows<B: SessionAgentBuilder + 'static>(
+        service: &PersistentSessionService<B>,
+        session_id: &SessionId,
+    ) -> Vec<String> {
+        service
+            .load_authoritative_session(session_id)
+            .await
+            .expect("load the committed session")
+            .map(|session| {
+                session
+                    .messages()
+                    .iter()
+                    .filter_map(|message| match message {
+                        meerkat_core::Message::User(user) => Some(user.text_content()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[cfg(feature = "openai-live")]

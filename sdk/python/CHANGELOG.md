@@ -4,6 +4,13 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+- `LiveChannelHandle` and `PendingLiveChannelHandle` carry `advisories`, a
+  tuple of what the live open went ahead without, empty when the gateway
+  reported nothing. `"staged_prompt_refused"` means a run-start hook refused
+  the member's staged create-time prompt, which stays staged for its first
+  text turn. An advisory this SDK does not know is kept as the string the
+  gateway sent; a field that is not a list of non-empty strings raises
+  `ValueError`. `to_dict` writes the key only when it is not empty.
 - `MobHandle.schedule_tools()` returns `ScheduleToolsResult`, the definitions
   of Meerkat's durable schedule tools from `meta/schedule/tools`: one
   `ScheduleToolDefinition` (`name`, `description`, `input_schema`) per tool.

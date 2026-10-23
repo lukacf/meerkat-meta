@@ -22,6 +22,7 @@ import {
   parseLiveChannelHandle,
   parseLivePlaybackCompleteResult,
   parseLiveReplacementRequired,
+  pendingLiveChannelHandleToWire,
   supportsLiveExecutionIdentityV1,
   supportsLiveExecutionMode,
 } from "../src/live.js";
@@ -341,6 +342,52 @@ describe("LiveChannelHandle", () => {
     assert.equal(handle.continuity.mode, "transcript_only");
     assert.equal(handle.capabilities.imageIn, true);
     assert.deepEqual(liveChannelHandleToWire(handle), fixture.channel_handle);
+  });
+});
+
+describe("live open advisories", () => {
+  it("carries the open advisories on both handles and omits them when empty", () => {
+    // What a live open went ahead without (a refused staged create-time
+    // prompt); an advisory this SDK does not know is kept as the server sent it.
+    const expected = ["staged_prompt_refused", "a_future_advisory"];
+    const handle = parseLiveChannelHandle(fixture.channel_handle_with_advisories);
+    assert.deepEqual(handle.advisories, expected);
+    assert.deepEqual(
+      liveChannelHandleToWire(handle),
+      fixture.channel_handle_with_advisories,
+    );
+    const pending = parsePendingLiveChannelHandle(
+      fixture.pending_channel_handle_with_advisories,
+    );
+    assert.deepEqual(pending.advisories, expected);
+    assert.deepEqual(
+      pendingLiveChannelHandleToWire(pending),
+      fixture.pending_channel_handle_with_advisories,
+    );
+
+    assert.equal("advisories" in parseLiveChannelHandle(fixture.channel_handle), false);
+    assert.equal(
+      "advisories" in
+        parsePendingLiveChannelHandle({
+          ...(fixture.pending_channel_handle as object),
+          advisories: [],
+        }),
+      false,
+    );
+    for (const malformed of ["staged_prompt_refused", [1], [""], null]) {
+      assert.throws(() =>
+        parseLiveChannelHandle({
+          ...(fixture.channel_handle as object),
+          advisories: malformed,
+        }),
+      );
+      assert.throws(() =>
+        parsePendingLiveChannelHandle({
+          ...(fixture.pending_channel_handle as object),
+          advisories: malformed,
+        }),
+      );
+    }
   });
 });
 

@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   session_id }`: the roster compile or wake that meets a member the host made
   directly on the mob under the identity's member id. An exhaustive match on
   `IdentityRuntimeError` adds the arm.
+- `LiveChannelHandle` and `PendingLiveChannelHandle` gain `advisories:
+  Vec<WireLiveOpenAdvisory>`, what the open went ahead without (see Fixed).
+  Rust code that builds either handle as a struct literal adds the field
+  (`Vec::new()` for none); `from_open_result` and `new` carry it from
+  Meerkat's `LiveOpenResult`. On the wire the key is left out when empty.
 
 ### Added
 
@@ -1026,6 +1031,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   for it. A live member the identity runtime spawned (its spawn carries the
   `agent_identity` label) without its record is still refused, and so is a
   member an export entry names.
+- A voice-first member's staged create-time prompt reaches the realtime model.
+  A member created with its first turn deferred and its prompt staged
+  (`InitialTurnPolicy::Defer` with `DeferredPromptPolicy::Stage`) and then
+  opened with `meta/live/open` had its prompt held back until its first text
+  turn. The open now delivers it once, through the
+  `RunStarted` hooks a turn carrying it would run, as the member's newest user
+  row before the seed is read. The delivery only tries the member's turn
+  boundary and never waits behind a running turn, and a member with nothing
+  staged costs the open nothing. On an `openai-live` gateway Meerkat's own open
+  projections deliver it. A hook that refuses the prompt keeps it staged for
+  the first text turn and the open goes ahead without it: the `meta/live/open`
+  result, the pending handle (also from `meta/console/voice/open`) and a
+  replacement handle carry `advisories: ["staged_prompt_refused"]`, a key left
+  out when there are none. The Python and TypeScript SDK handles carry
+  `advisories` too, keeping an advisory they do not know as the string the
+  server sent and failing closed only on a malformed field.
 
 ### Known limitations
 
