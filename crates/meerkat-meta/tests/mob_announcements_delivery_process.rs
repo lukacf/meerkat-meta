@@ -614,6 +614,8 @@ struct Gateway {
     roster: Vec<Value>,
     /// Every `callback/schedule_fire` the gateway sent, in order.
     fires: Vec<Value>,
+    /// The params of every `meta/on_error` notification, in order.
+    on_error: Vec<Value>,
 }
 
 impl Gateway {
@@ -673,6 +675,7 @@ impl Gateway {
             next_id: 0,
             roster: Vec::new(),
             fires: Vec::new(),
+            on_error: Vec::new(),
         }
     }
 
@@ -746,6 +749,10 @@ impl Gateway {
         let Some(method) = message.get("method").and_then(Value::as_str) else {
             return;
         };
+        if method == "meta/on_error" {
+            self.on_error
+                .push(message.get("params").cloned().unwrap_or(Value::Null));
+        }
         let Some(id) = message.get("id").cloned() else {
             return;
         };
@@ -767,6 +774,31 @@ impl Gateway {
                 self.label
             ),
             _ => {}
+        }
+    }
+
+    /// The first `meta/on_error` notification of `category` after the first
+    /// `skip` of them, answering callbacks while it waits.
+    fn wait_for_on_error(&mut self, category: &str, skip: usize, deadline: Duration) -> Value {
+        let start = Instant::now();
+        loop {
+            self.pump();
+            if let Some(event) = self
+                .on_error
+                .iter()
+                .filter(|event| event["category"] == json!(category))
+                .nth(skip)
+            {
+                return event.clone();
+            }
+            assert!(
+                start.elapsed() < deadline,
+                "[{}] no meta/on_error {category} within {deadline:?}: {:?}\n{}",
+                self.label,
+                self.on_error,
+                self.stderr_tail()
+            );
+            thread::sleep(Duration::from_millis(25));
         }
     }
 
@@ -2266,5 +2298,73 @@ fn a_member_respawned_mid_turn_gets_its_source_items_again_with_notice() {
         json!("unhandled"),
         "{observed}"
     );
+    gateway.shutdown_and_reap();
+}
+
+/// A source whose collections keep failing escalates: the host hears it as a
+/// `meta/on_error` notification carrying the escalation and its event
+/// cursor, and hears the same escalation id resolve once a collection
+/// succeeds.
+#[test]
+fn an_escalation_reaches_the_host_as_meta_on_error_and_resolves_with_the_same_id() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let mut gateway = boot_collecting("escalation", state.path(), &host_config, None);
+    declare_live_inbox(&mut gateway);
+    for attempt in 1..=3 {
+        gateway.call(
+            "meta/mob_announcements/sources/record_failure",
+            json!({
+                "operation_id": format!("failure-{attempt}"),
+                "source_id": "inbox",
+                "expected_revision": 1,
+                "expected_version": 1,
+                "principal": inbox_principal(),
+                "failure": { "class": "provider_unavailable" }
+            }),
+        );
+    }
+    let raised = gateway.wait_for_on_error("mob_announcement_escalated", 0, SETTLE_TIMEOUT);
+    assert_eq!(
+        raised["escalation"]["cause"],
+        json!("failure_streak"),
+        "{raised}"
+    );
+    assert_eq!(raised["event"], json!("raised"), "{raised}");
+    assert_eq!(
+        raised["escalation"]["subject"],
+        json!({ "kind": "source", "mob_id": MOB_ID, "source_id": "inbox" }),
+        "{raised}"
+    );
+    gateway.call(
+        "meta/mob_announcements/sources/advance",
+        json!({
+            "operation_id": "recovered",
+            "source_id": "inbox",
+            "expected_revision": 1,
+            "expected_version": 1,
+            "principal": inbox_principal(),
+            "next_cursor": "c2"
+        }),
+    );
+    let resolved =
+        gateway.wait_for_on_error("mob_announcement_escalation_resolved", 0, SETTLE_TIMEOUT);
+    assert_eq!(
+        resolved["escalation_id"], raised["escalation"]["escalation_id"],
+        "{resolved}"
+    );
+    assert!(
+        resolved["cursor"].as_u64() > raised["cursor"].as_u64(),
+        "{raised} then {resolved}"
+    );
+    let read = gateway.call(
+        "meta/mob_announcements/escalations/list",
+        json!({ "after": raised["cursor"].as_u64().unwrap() - 1 }),
+    );
+    assert_eq!(read["events"].as_array().map(Vec::len), Some(2), "{read}");
     gateway.shutdown_and_reap();
 }

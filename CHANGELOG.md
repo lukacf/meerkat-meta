@@ -166,6 +166,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     actions `redelivered` and `dismissed`, and items held this way, with
     the reason `unhandled`; an entry for a plain announcement names no
     source.
+- Mob announcement sources and members report their health as escalations.
+  A condition a host should act on is a durable escalation, one open per
+  cause and subject, with an event at its raise, a re-notification every
+  `renotify_after_ms` (a new option, default 24 h) under the same id and a
+  higher count, and its resolution. Source causes, with the defaults of
+  the source's `health_policy`: `failure_streak` (3 failed collections in
+  a row, or failures and no success for 6 h), `stale` (no successful
+  advance for a day), `quiet` and `empty_coverage` (opt-in), `conflicts`
+  and `source_gap`; member causes: `suspended` (a delivery wait older than
+  an hour), `member_gap` and `audience_hold`. The dispatcher evaluates them
+  every round. A condition that happens rather than holds (a conflict, a
+  source gap, a batch that reported gaps, a capture withheld because
+  coverage changed) keeps its escalation open for a day after it last
+  happened, and one that happened while no round ran is raised by the next
+  round.
+  - Every event reaches the host as a `meta/on_error` notification,
+    `mob_announcement_escalated` or `mob_announcement_escalation_resolved`,
+    with the escalation id and the event cursor. After a reconnect,
+    `meta/mob_announcements/escalations/list` reads every event after the
+    host's last cursor, or the open escalations.
+  - The agents a source's audience covers, and for member escalations the
+    grants of the new `health_audience` option (default none), receive each
+    raise and re-notification on the reserved topic
+    `mob_announcements.health`, with a typed body. A host or member
+    announcement on that topic is refused.
+  - A member's suspend marker is persisted, and keeps the time it was
+    first seen across restarts. `meta/mob_announcements/members/get` and
+    `members/list` read a member's backlog, held and withheld counts,
+    marker and escalations.
+  - A source's health reads whether quiet and empty coverage detection are
+    configured, its open escalations, and whether this gateway schedules
+    its runner (`runner_scheduled_here`); `sources/list` takes `escalated`.
+    `sources/put` answers `affected_subscriptions` and
+    `delivery_readiness`.
+  - `meta/status` gains a `mob_announcements` object, and
+    `meta/capabilities` a `mob_announcements` object and the feature
+    capability `mob_announcements.sources.v1`, on the console too.
 
 ### Changed
 

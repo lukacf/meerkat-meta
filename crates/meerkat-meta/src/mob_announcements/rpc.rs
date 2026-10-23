@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use super::escalations::EscalationSubject;
 use super::owner::{AnnouncementError, AnnouncementService};
 use super::sources::{
     AdvanceSource, AnnouncementSource, AudienceGrant, AuditAction, AuditQuery, Coverage,
@@ -63,7 +64,101 @@ pub const ANNOUNCEMENT_METHODS: &[&str] = &[
     "meta/mob_announcements/sources/advance",
     "meta/mob_announcements/sources/record_failure",
     "meta/mob_announcements/audit/list",
+    "meta/mob_announcements/members/get",
+    "meta/mob_announcements/members/list",
+    "meta/mob_announcements/escalations/list",
 ];
+
+/// The feature capability a gateway with announcement sources advertises.
+pub const SOURCES_FEATURE_CAPABILITY: &str = "mob_announcements.sources.v1";
+
+/// The feature capabilities a gateway with mob announcements advertises.
+pub fn announcement_feature_capabilities() -> Vec<&'static str> {
+    vec![SOURCES_FEATURE_CAPABILITY]
+}
+
+/// meta/status's `mob_announcements` object: sources by state, members
+/// suspended, and open escalations with the last event cursor. A store that
+/// cannot be read answers null.
+pub async fn status_projection(service: &AnnouncementService) -> Value {
+    match service.status_counts().await {
+        Ok(counts) => json!({
+            "sources": {
+                "active": counts.sources_active,
+                "paused": counts.sources_paused,
+                "failing": counts.sources_failing,
+                "stale": counts.sources_stale,
+            },
+            "members": { "suspended": counts.members_suspended, "unhandled_held": 0 },
+            "escalations": {
+                "open": counts.open_escalations,
+                "last_event_cursor": counts.last_event_cursor,
+            },
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "mob announcement status not read");
+            Value::Null
+        }
+    }
+}
+
+/// meta/capabilities's `mob_announcements` object; null when disabled.
+pub async fn capabilities_projection(service: Option<&AnnouncementService>) -> Value {
+    let Some(service) = service else {
+        return Value::Null;
+    };
+    json!({
+        "sources": "v1",
+        "local_delivery": service.local_delivery(),
+        "governed_admission": false,
+    })
+}
+
+/// A source as an answer carries it, with what its health reads at read
+/// time: whether quiet and empty coverage detection are configured, its
+/// open escalations, and whether this gateway schedules its runner.
+async fn with_health(
+    service: &AnnouncementService,
+    source: &AnnouncementSource,
+    mut value: Value,
+) -> Result<Value, JsonRpcError> {
+    let escalations = service
+        .open_escalations(Some(&EscalationSubject::Source {
+            mob_id: source.mob_id.clone(),
+            source_id: source.source_id.clone(),
+        }))
+        .await
+        .map_err(rpc_error)?;
+    let policy = &source.health_policy;
+    let health = &source.health;
+    if let Some(projection) = value.get_mut("health").and_then(Value::as_object_mut) {
+        projection.insert(
+            "quiet_monitoring".to_string(),
+            json!({
+                "configured": policy.quiet_after_ms.is_some(),
+                "quiet_after_ms": policy.quiet_after_ms,
+                "last_new_item_at_ms": health.last_new_item_at_ms,
+            }),
+        );
+        projection.insert(
+            "empty_coverage_monitoring".to_string(),
+            json!({
+                "configured": policy.empty_after_ms.is_some(),
+                "empty_after_ms": policy.empty_after_ms,
+                "empty_snapshot_since_ms": health.empty_snapshot_since_ms,
+            }),
+        );
+        projection.insert("escalations".to_string(), to_value(escalations)?);
+        projection.insert(
+            "runner_scheduled_here".to_string(),
+            source
+                .runner
+                .as_ref()
+                .map_or(Value::Null, |_| Value::Bool(service.runners_installed())),
+        );
+    }
+    Ok(value)
+}
 
 pub fn is_announcement_method(method: &str) -> bool {
     ANNOUNCEMENT_METHODS.contains(&method)
@@ -665,6 +760,42 @@ struct ListSourcesParams {
     state: Option<SourceState>,
     #[serde(default)]
     limit: Option<usize>,
+    /// Only sources with an open escalation.
+    #[serde(default)]
+    escalated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemberGetParams {
+    member: Member,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembersListParams {
+    /// Start after this member, in member key order.
+    #[serde(default)]
+    after: Option<Member>,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Only members with an open escalation.
+    #[serde(default)]
+    escalated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EscalationsListParams {
+    /// Read the events after this cursor; 0, the default, reads from the
+    /// first one kept.
+    #[serde(default)]
+    after: u64,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Answer the open escalations instead of events.
+    #[serde(default)]
+    open: bool,
 }
 
 /// A source as a list shows it: its principal as its kind and digest only,
@@ -908,7 +1039,16 @@ pub async fn handle_announcement_method(
                 )
                 .await
                 .map_err(rpc_error)?;
-            Ok(json!({ "source": to_value(source)? }))
+            let affected_subscriptions = service
+                .source_bound_subscriptions(&source.mob_id, &source.source_id)
+                .await
+                .map_err(rpc_error)?;
+            let value = to_value(&source)?;
+            Ok(json!({
+                "source": with_health(service, &source, value).await?,
+                "affected_subscriptions": affected_subscriptions,
+                "delivery_readiness": service.local_delivery(),
+            }))
         }
         "meta/mob_announcements/sources/pause"
         | "meta/mob_announcements/sources/resume"
@@ -943,7 +1083,12 @@ pub async fn handle_announcement_method(
                 .source(&mob_id, &request.source_id)
                 .await
                 .map_err(rpc_error)?;
-            let mut answer = json!({ "source": to_value(source)? });
+            let value = to_value(&source)?;
+            let value = match &source {
+                Some(found) => with_health(service, found, value).await?,
+                None => value,
+            };
+            let mut answer = json!({ "source": value });
             if request.include_streams {
                 let streams = service
                     .source_streams(&mob_id, &request.source_id)
@@ -1014,20 +1159,79 @@ pub async fn handle_announcement_method(
         "meta/mob_announcements/sources/list" => {
             let request: ListSourcesParams = params(raw)?;
             let mob_id = request.mob_id.unwrap_or_else(|| own_mob.clone());
-            let sources = service
-                .sources(&SourceQuery {
-                    after: request.after.map(|source_id| (mob_id.clone(), source_id)),
-                    mob_id: Some(mob_id),
-                    state: request.state,
-                    limit: request.limit.unwrap_or(DEFAULT_LIMIT),
-                })
+            let limit = request
+                .limit
+                .unwrap_or(DEFAULT_LIMIT)
+                .clamp(1, super::types::MAX_PAGE);
+            let mut after = request.after.map(|source_id| (mob_id.clone(), source_id));
+            let mut listed = Vec::new();
+            // Escalated sources are picked here, after the store's page: the
+            // read goes on until the page is full or the sources end, so an
+            // escalated source behind a page of others is still listed.
+            loop {
+                let sources = service
+                    .sources(&SourceQuery {
+                        after: after.clone(),
+                        mob_id: Some(mob_id.clone()),
+                        state: request.state,
+                        limit,
+                    })
+                    .await
+                    .map_err(rpc_error)?;
+                let ended = sources.len() < limit;
+                after = sources
+                    .last()
+                    .map(|source| (source.mob_id.clone(), source.source_id.clone()));
+                for source in &sources {
+                    let value = with_health(service, source, listed_source(source)?).await?;
+                    let escalated = value
+                        .pointer("/health/escalations")
+                        .and_then(Value::as_array)
+                        .is_some_and(|escalations| !escalations.is_empty());
+                    if (!request.escalated || escalated) && listed.len() < limit {
+                        listed.push(value);
+                    }
+                }
+                if ended || !request.escalated || listed.len() >= limit {
+                    break;
+                }
+            }
+            Ok(json!({ "sources": listed }))
+        }
+        "meta/mob_announcements/members/get" => {
+            let request: MemberGetParams = params(raw)?;
+            let read = service
+                .member_read(&request.member)
                 .await
                 .map_err(rpc_error)?;
-            let listed = sources
-                .iter()
-                .map(listed_source)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(json!({ "sources": listed }))
+            to_value(read)
+        }
+        "meta/mob_announcements/members/list" => {
+            let request: MembersListParams = params(raw)?;
+            let reads = service
+                .member_reads(
+                    request.after.as_ref(),
+                    request.limit.unwrap_or(DEFAULT_LIMIT),
+                    request.escalated,
+                )
+                .await
+                .map_err(rpc_error)?;
+            Ok(json!({ "members": to_value(reads)? }))
+        }
+        "meta/mob_announcements/escalations/list" => {
+            let request: EscalationsListParams = params(raw)?;
+            let limit = request.limit.unwrap_or(DEFAULT_LIMIT);
+            if request.open {
+                let next = service.last_escalation_cursor().await.map_err(rpc_error)?;
+                let open = service.open_escalations(None).await.map_err(rpc_error)?;
+                Ok(json!({ "escalations": to_value(open)?, "next": next }))
+            } else {
+                let (events, next) = service
+                    .escalation_events(request.after, limit)
+                    .await
+                    .map_err(rpc_error)?;
+                Ok(json!({ "events": to_value(events)?, "next": next }))
+            }
         }
         _ => Err(JsonRpcError::new(-32601, "Method not found")),
     }

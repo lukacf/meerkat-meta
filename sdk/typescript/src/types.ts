@@ -2321,6 +2321,8 @@ export const ErrorCategory = {
   EVENT_LOG_FLUSH_FAILURE: "event_log_flush_failure",
   IDENTITY_MATERIALIZATION_FAILURE: "identity_materialization_failure",
   MOB_STOP_PROCEEDED_WITHOUT_INTERRUPT: "mob_stop_proceeded_without_interrupt",
+  MOB_ANNOUNCEMENT_ESCALATED: "mob_announcement_escalated",
+  MOB_ANNOUNCEMENT_ESCALATION_RESOLVED: "mob_announcement_escalation_resolved",
 } as const;
 
 /** Categories that report a failure ENDING rather than starting. Mirrors the
@@ -2329,7 +2331,26 @@ export const ErrorCategory = {
  *  a second incident for a stall that already resolved. */
 export const RESOLUTION_ERROR_CATEGORIES: ReadonlySet<string> = new Set([
   ErrorCategory.ACTOR_LOOP_RECOVERED,
+  ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED,
 ]);
+
+/** A mob announcement escalation's subject as the runtime words it. */
+function escalationSubject(raw: unknown): string {
+  if (typeof raw !== "object" || raw === null) return String(raw ?? "");
+  const subject = raw as Record<string, unknown>;
+  switch (subject.kind) {
+    case "source":
+      return `source ${String(subject.source_id ?? "")} of mob ${String(subject.mob_id ?? "")}`;
+    case "member": {
+      const member = asRecord(subject.member);
+      return `member ${String(member.identity ?? "")} of mob ${String(member.mob_id ?? "")}`;
+    }
+    case "declaration":
+      return `declared ${String(subject.record_kind ?? "")} ${String(subject.id ?? "")}`;
+    default:
+      return JSON.stringify(subject);
+  }
+}
 
 /** True when the event reports a failure ENDING rather than starting, so a
  *  host can close an incident instead of opening a second one. */
@@ -2429,6 +2450,20 @@ export function parseErrorEvent(raw: unknown): ErrorEvent {
         `still be running: ${error}`;
       break;
     }
+    case ErrorCategory.MOB_ANNOUNCEMENT_ESCALATED: {
+      const escalation = asRecord(context.escalation);
+      message =
+        `${String(context.event ?? "")} ${String(escalation.escalation_id ?? "")} ` +
+        `${String(escalation.cause ?? "")} on ${escalationSubject(escalation.subject)} ` +
+        `(notified again ${Number(context.renotify_count ?? 0)} times, ` +
+        `cursor ${Number(context.cursor ?? 0)})`;
+      break;
+    }
+    case ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED:
+      message =
+        `${String(context.escalation_id ?? "")} ${String(context.cause ?? "")} on ` +
+        `${escalationSubject(context.subject)} (cursor ${Number(context.cursor ?? 0)})`;
+      break;
     default:
       message = JSON.stringify(d);
       break;

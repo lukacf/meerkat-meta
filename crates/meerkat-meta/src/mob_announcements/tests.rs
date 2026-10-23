@@ -34,7 +34,7 @@ fn sid(value: &str) -> SubscriptionId {
     SubscriptionId::new(value).unwrap()
 }
 
-fn op(value: &str) -> OperationId {
+pub(super) fn op(value: &str) -> OperationId {
     OperationId::new(value).unwrap()
 }
 
@@ -46,7 +46,7 @@ fn departed() -> SubscriptionEnd {
 }
 
 /// The mob of the gateway these tests run as: its members are local.
-const OWN_MOB: &str = "payments";
+pub(super) const OWN_MOB: &str = "payments";
 
 /// The kept route of a member of [`OWN_MOB`].
 fn local_route() -> MemberRouteRecord {
@@ -56,11 +56,11 @@ fn local_route() -> MemberRouteRecord {
     }
 }
 
-fn member(value: &str) -> Member {
+pub(super) fn member(value: &str) -> Member {
     Member::new(mob(OWN_MOB), MemberIdentity::new(value).unwrap())
 }
 
-fn mob(value: &str) -> MobId {
+pub(super) fn mob(value: &str) -> MobId {
     MobId::new(value).unwrap()
 }
 
@@ -71,7 +71,12 @@ fn topics(values: &[&str]) -> BTreeSet<Topic> {
         .collect()
 }
 
-fn announce_request(mob_id: &str, key: &str, topic: &[&str], body: &str) -> AnnounceRequest {
+pub(super) fn announce_request(
+    mob_id: &str,
+    key: &str,
+    topic: &[&str],
+    body: &str,
+) -> AnnounceRequest {
     AnnounceRequest {
         mob_id: mob(mob_id),
         announced_by: Announcer::Host,
@@ -89,7 +94,7 @@ const TEST_MOBS: &[&str] = &[
     "payments", "events", "builds", "refunds", "a-newer", "z-older", "a-mob", "b-mob",
 ];
 
-fn put(id: &str, to: &str, topic: &[&str], start: StartFrontier) -> PutSubscription {
+pub(super) fn put(id: &str, to: &str, topic: &[&str], start: StartFrontier) -> PutSubscription {
     PutSubscription {
         id: sid(id),
         member: member(to),
@@ -105,7 +110,7 @@ fn put(id: &str, to: &str, topic: &[&str], start: StartFrontier) -> PutSubscript
     }
 }
 
-fn policy() -> SealingPolicy {
+pub(super) fn policy() -> SealingPolicy {
     SealingPolicy {
         max_count: 256,
         max_bytes: 1_048_576,
@@ -114,7 +119,7 @@ fn policy() -> SealingPolicy {
     }
 }
 
-fn batch_id(value: &str) -> BatchId {
+pub(super) fn batch_id(value: &str) -> BatchId {
     BatchId::new(value).unwrap()
 }
 
@@ -2297,12 +2302,12 @@ struct Ledger {
     unanswered: bool,
 }
 
-struct ScriptedNative {
+pub(super) struct ScriptedNative {
     ledger: Mutex<Ledger>,
     /// The mob this gateway names as its own, if any.
     own: Option<MobId>,
-    governed: bool,
-    known: BTreeSet<String>,
+    pub(super) governed: bool,
+    pub(super) known: BTreeSet<String>,
     /// Registered identities this gateway's runtime does not serve.
     unusable: BTreeSet<String>,
     /// Peers this gateway can call authenticated.
@@ -2310,7 +2315,7 @@ struct ScriptedNative {
     /// Mobs the mob owner records as destroyed.
     destroyed: Mutex<BTreeSet<String>>,
     /// Members that cannot take a delivery now, and why.
-    waiting: Mutex<BTreeMap<String, SuspendCause>>,
+    pub(super) waiting: Mutex<BTreeMap<String, SuspendCause>>,
     /// Identities a member preparation was asked for, in order.
     prepared: Mutex<Vec<String>>,
     /// The next submission's final answer that its member departed.
@@ -2352,7 +2357,7 @@ struct ScriptedNative {
 type RosterRow = (String, BTreeMap<String, String>);
 
 impl ScriptedNative {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             ledger: Mutex::new(Ledger::default()),
             own: Some(mob(OWN_MOB)),
@@ -2825,15 +2830,15 @@ impl NativeDelivery for ScriptedNative {
     }
 }
 
-struct Harness {
+pub(super) struct Harness {
     _dir: tempfile::TempDir,
-    store: Arc<SqliteAnnouncementStore>,
-    native: Arc<ScriptedNative>,
-    clock: Arc<AtomicU64>,
-    service: AnnouncementService,
+    pub(super) store: Arc<SqliteAnnouncementStore>,
+    pub(super) native: Arc<ScriptedNative>,
+    pub(super) clock: Arc<AtomicU64>,
+    pub(super) service: AnnouncementService,
 }
 
-fn harness_with(native: ScriptedNative) -> Harness {
+pub(super) fn harness_with(native: ScriptedNative) -> Harness {
     let (dir, store) = temp_store();
     let store = Arc::new(store);
     let native = Arc::new(native);
@@ -2874,14 +2879,14 @@ impl Harness {
         self.service.run_round().await.unwrap()
     }
 
-    async fn subscribe(&self, id: &str) -> Subscription {
+    pub(super) async fn subscribe(&self, id: &str) -> Subscription {
         self.service
             .put_subscription(&op(id), put(id, "agent:a", &["ios"], StartFrontier::Now))
             .await
             .unwrap()
     }
 
-    async fn announce_burst(&self, count: usize) {
+    pub(super) async fn announce_burst(&self, count: usize) {
         for index in 0..count {
             self.service
                 .announce(announce_request(
@@ -4442,7 +4447,7 @@ async fn a_failing_batch_is_retried_at_the_slow_pace() {
     let service = AnnouncementService::with_clock(
         Arc::clone(&store) as Arc<dyn AnnouncementStore>,
         Arc::new(ScriptedNative::new()) as Arc<dyn NativeDelivery>,
-        config,
+        config.clone(),
         Arc::new(move || reader.load(Ordering::SeqCst)),
     )
     .unwrap();
@@ -7974,6 +7979,7 @@ fn the_walk_parses_every_declared_module_and_reexport() {
 fn every_public_announcement_enum_is_non_exhaustive() {
     let public_modules = [
         ("availability", include_str!("availability.rs")),
+        ("escalations", include_str!("escalations.rs")),
         ("handling", include_str!("handling.rs")),
         ("native", include_str!("native.rs")),
         ("owner", include_str!("owner.rs")),
@@ -8799,7 +8805,7 @@ impl crate::identity_first::contracts::RosterProvider for StatusRoster {
 /// agent:a on its roster, for tests of its own native seam. Each test
 /// names its own mob: the comms names a runtime registers are
 /// process-wide, so two runtimes of one mob in parallel tests collide.
-async fn identity_first_test_runtime(
+pub(super) async fn identity_first_test_runtime(
     state: &std::path::Path,
     mob_id: &str,
 ) -> crate::UnifiedRuntime {
@@ -8810,7 +8816,7 @@ async fn identity_first_test_runtime(
 
 /// The builder of [`identity_first_test_runtime`], before `build()`.
 /// `tools` adds lines to the member profile's tools table.
-async fn identity_first_test_builder(
+pub(super) async fn identity_first_test_builder(
     state: &std::path::Path,
     mob_id: &str,
     tools: &str,
@@ -9222,7 +9228,7 @@ fn every_constructor_takes_the_member_tools_ceiling_for_child_mobs() {
         member_tools_in_child_mobs: true,
         ..AnnouncementConfig::default()
     };
-    let (_, _, availability) = super::AnnouncementComposition::new(granted)
+    let (_, _, availability) = super::AnnouncementComposition::new(granted.clone())
         .expect("the ceiling composes")
         .member_tool_bundle();
     assert_eq!(
@@ -9365,14 +9371,14 @@ fn a_clock_skew_read_from_a_later_request_is_the_same_wait() {
 // topics it owns, through the one handler every gateway dispatches to.
 // ---------------------------------------------------------------------------
 
-const SOURCES_PUT: &str = "meta/mob_announcements/sources/put";
-const SOURCES_GET: &str = "meta/mob_announcements/sources/get";
-const SOURCES_LIST: &str = "meta/mob_announcements/sources/list";
+pub(super) const SOURCES_PUT: &str = "meta/mob_announcements/sources/put";
+pub(super) const SOURCES_GET: &str = "meta/mob_announcements/sources/get";
+pub(super) const SOURCES_LIST: &str = "meta/mob_announcements/sources/list";
 const SOURCES_END: &str = "meta/mob_announcements/sources/end";
 const ANNOUNCE: &str = "meta/mob_announcements/announce";
 
 /// One `meta/mob_announcements/*` call as this host, keeping a refusal.
-async fn try_host_call(
+pub(super) async fn try_host_call(
     service: &AnnouncementService,
     method: &str,
     params: serde_json::Value,
@@ -9392,7 +9398,7 @@ fn refusal_kind(error: &crate::rpc::JsonRpcError) -> Option<String> {
 
 /// `sources/put` params for a mailbox source of this gateway's mob, read
 /// through a Connect setup whose verified account has `subject`.
-fn source_params(
+pub(super) fn source_params(
     operation: &str,
     source_id: &str,
     subject: &str,
@@ -9420,7 +9426,11 @@ fn source_params(
     })
 }
 
-fn with(mut params: serde_json::Value, key: &str, value: serde_json::Value) -> serde_json::Value {
+pub(super) fn with(
+    mut params: serde_json::Value,
+    key: &str,
+    value: serde_json::Value,
+) -> serde_json::Value {
     params[key] = value;
     params
 }
@@ -10084,6 +10094,23 @@ fn the_version_two_schema_is_pinned() {
             "index announcement_audit_counted on announcement_audit: mob_id, source_id, \
              generation, member, action, reason"
                 .to_string(),
+            "index announcement_batches_reporting_gaps on announcement_batches: sealed_at_ms, \
+             member"
+                .to_string(),
+            "table announcement_escalation_events: cursor INTEGER pk1, escalation_id TEXT \
+             notnull, at_ms INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_escalation_passes: id INTEGER notnull pk1, evaluated_at_ms \
+             INTEGER notnull"
+                .to_string(),
+            "table announcement_escalations: escalation_id TEXT notnull pk1, cause TEXT \
+             notnull, subject TEXT notnull, mob_id TEXT, open INTEGER notnull, notified_at_ms \
+             INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "index announcement_escalations_by_subject on announcement_escalations: subject"
+                .to_string(),
+            "index announcement_escalations_open on announcement_escalations: cause, subject"
+                .to_string(),
             "table announcement_handling: batch_id TEXT notnull pk1, member TEXT notnull, \
              state TEXT notnull, next_read_at_ms INTEGER, updated_at_ms INTEGER notnull, \
              record TEXT notnull"
@@ -10099,6 +10126,9 @@ fn the_version_two_schema_is_pinned() {
             "index announcement_holds_by_batch on announcement_holds: batch_id".to_string(),
             "index announcement_holds_by_check on announcement_holds: checked_at_ms".to_string(),
             "index announcement_holds_by_member on announcement_holds: member, checked_at_ms"
+                .to_string(),
+            "table announcement_member_markers: member TEXT notnull pk1, written_at_ms INTEGER \
+             notnull, record TEXT notnull"
                 .to_string(),
             "table announcement_redeliveries: subscription_id TEXT notnull pk1, mob_id TEXT \
              notnull pk2, sequence INTEGER notnull pk3, count INTEGER notnull, record TEXT \
@@ -10220,12 +10250,15 @@ async fn a_version_one_store_migrates_to_version_two_in_place() {
              AND name IN ('announcement_sources', 'announcement_source_topics',
                           'announcement_source_streams', 'announcement_audit',
                           'announcement_holds', 'announcement_handling',
-                          'announcement_redeliveries', 'announcement_source_items')",
+                          'announcement_redeliveries', 'announcement_source_items',
+                          'announcement_escalations', 'announcement_escalation_events',
+                          'announcement_member_markers',
+                          'announcement_escalation_passes')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 8);
+    assert_eq!(tables, 12);
 }
 
 // ---------------------------------------------------------------------------
@@ -10610,14 +10643,14 @@ async fn a_mob_holds_a_bounded_number_of_live_sources() {
 // the one handler every gateway dispatches to.
 // ---------------------------------------------------------------------------
 
-const SOURCES_ADVANCE: &str = "meta/mob_announcements/sources/advance";
-const SOURCES_RECORD_FAILURE: &str = "meta/mob_announcements/sources/record_failure";
+pub(super) const SOURCES_ADVANCE: &str = "meta/mob_announcements/sources/advance";
+pub(super) const SOURCES_RECORD_FAILURE: &str = "meta/mob_announcements/sources/record_failure";
 const SOURCES_PAUSE: &str = "meta/mob_announcements/sources/pause";
 const SOURCES_RESUME: &str = "meta/mob_announcements/sources/resume";
-const SUBSCRIPTIONS_PUT: &str = "meta/mob_announcements/subscriptions/put";
+pub(super) const SUBSCRIPTIONS_PUT: &str = "meta/mob_announcements/subscriptions/put";
 
 /// The verified account `source_params` pins for `subject`.
-fn principal_of(subject: &str) -> serde_json::Value {
+pub(super) fn principal_of(subject: &str) -> serde_json::Value {
     serde_json::json!({
         "kind": "connector_verified_account",
         "issuer": "https://accounts.example",
@@ -10628,7 +10661,12 @@ fn principal_of(subject: &str) -> serde_json::Value {
 
 /// A `sources/advance` of source "inbox" as its collector reading for
 /// "subject-1", from `version` at `revision`, moving the cursor to `cursor`.
-fn advance_params(operation: &str, revision: u64, version: u64, cursor: &str) -> serde_json::Value {
+pub(super) fn advance_params(
+    operation: &str,
+    revision: u64,
+    version: u64,
+    cursor: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "operation_id": operation,
         "source_id": "inbox",
@@ -10640,7 +10678,10 @@ fn advance_params(operation: &str, revision: u64, version: u64, cursor: &str) ->
 }
 
 /// `params` carrying `items`.
-fn with_items(params: serde_json::Value, items: &[serde_json::Value]) -> serde_json::Value {
+pub(super) fn with_items(
+    params: serde_json::Value,
+    items: &[serde_json::Value],
+) -> serde_json::Value {
     with(params, "items", serde_json::Value::Array(items.to_vec()))
 }
 
@@ -10656,7 +10697,7 @@ fn change_of(item_id: &str, version: &str, change: &str, body: &str) -> serde_js
 }
 
 /// An upsert of `item_id` at `version`.
-fn upsert(item_id: &str, version: &str, body: &str) -> serde_json::Value {
+pub(super) fn upsert(item_id: &str, version: &str, body: &str) -> serde_json::Value {
     change_of(item_id, version, "upsert", body)
 }
 
@@ -10690,7 +10731,7 @@ async fn live_inbox(service: &AnnouncementService) {
 }
 
 /// Subscribe this mob's member `identity` to the source topic from now.
-async fn subscribe_to_inbox(service: &AnnouncementService, id: &str, identity: &str) {
+pub(super) async fn subscribe_to_inbox(service: &AnnouncementService, id: &str, identity: &str) {
     try_host_call(
         service,
         SUBSCRIPTIONS_PUT,
@@ -10736,7 +10777,7 @@ fn outcomes(advanced: &serde_json::Value) -> Vec<String> {
 }
 
 /// Owed announcements per member, as the backlog counts them.
-async fn owed(harness: &Harness) -> BTreeMap<String, u64> {
+pub(super) async fn owed(harness: &Harness) -> BTreeMap<String, u64> {
     harness
         .store
         .backlogs(16)
