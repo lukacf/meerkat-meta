@@ -665,14 +665,15 @@ for (const status of ["failed", "interrupted"]) test(`mounted ${status} host ref
 const candidateDigest = "c".repeat(64);
 const acceptedCandidateBuild = (changes = {}) => {
   const accepted = acceptedRuntimeBuild();
-  return { ...accepted, source_digest: candidateDigest,
+  return { ...accepted, source_snapshot_verified: true, source_digest: candidateDigest,
     acceptance: { ...accepted.acceptance, source_digest: candidateDigest },
     framework: { runtime_candidate: { format: "forge-meta-toolkit-runtime-selection-v1" } }, ...changes };
 };
 
-for (const current of [true, false]) {
-  test(`fresh build binds the incomplete source once and preserves the unsent note: current=${current}`, async () => {
-    const initial = acceptedCandidateBuild({ status: "interrupted", ready_to_package: false,
+for (const current of [true, false]) for (const sourceVerified of [true, false]) {
+  test(`fresh build binds the incomplete source once and preserves the unsent note: current=${current}, publication=${sourceVerified}`, async () => {
+    const initial = acceptedCandidateBuild({ status: sourceVerified ? "interrupted" : "failed", ready_to_package: false,
+      source_verified: sourceVerified,
       current, current_guide_version: current ? state.version : null,
       guide_version: current ? state.version : state.version - 1 });
     const bodies = [];
@@ -693,7 +694,7 @@ for (const current of [true, false]) {
   });
 }
 
-for (const changes of [{ source_verified: false }, { worker_stop_confirmed: false },
+for (const changes of [{ source_snapshot_verified: false }, { source_snapshot_verified: undefined }, { worker_stop_confirmed: false },
   { cleanup_pending: true }, { cleanup_in_progress: true }, { cleanup_custody_lost: true },
   { source_digest: "" }, { status: "completed" }, { guide_id: otherState.id }]) {
   test(`fresh build is absent for unavailable source or cleanup: ${JSON.stringify(changes)}`, async () => {

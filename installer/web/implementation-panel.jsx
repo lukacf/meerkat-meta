@@ -312,7 +312,7 @@ export function ImplementationPanel({ state, plan, designBusy, pendingManual, Ic
     ["failed", "interrupted"].includes(receipt.status) &&
     typeof receipt.build_id === "string" && !!receipt.build_id && receipt.worker_stop_confirmed === true &&
     receipt.cleanup_pending !== true && receipt.cleanup_in_progress !== true && receipt.cleanup_custody_lost !== true && !running &&
-    receipt.source_verified === true && /^[a-f0-9]{64}$/.test(receipt.source_digest || "");
+    receipt.source_snapshot_verified === true && /^[a-f0-9]{64}$/.test(receipt.source_digest || "");
   const canShowSavedBuild = !statusUnconfirmed && canRefreshFramework && !!pendingSubmission &&
     buildAdmissionPending.current.get(state.id) === pendingSubmission &&
     pendingSubmission.guideId === state.id && pendingSubmission.version === state.version &&
