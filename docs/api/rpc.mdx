@@ -2516,8 +2516,9 @@ Declarations are `{revision, sources?, subscriptions?}`:
   mobs?, start?, delivery?}`: `member` subscribes one member, and
   `members`, `{"mob_id", "role"}`, makes a [role template](#role-templates).
   `start` is `{"kind": "now"}`, the only start a declaration takes, and
-  `delivery` with `{"await_handling": true}` is refused until a later
-  release. A declared `subscription_id` is at most 200 bytes.
+  `delivery`, `{"await_handling"?}`, is taken as `subscriptions/put` takes
+  it: absent, or naming nothing, it is the default. A declared
+  `subscription_id` is at most 200 bytes.
 - `mob_id` and `mobs` default to this gateway's mob, as for `sources/put`
   and `subscriptions/put`.
 
@@ -2594,9 +2595,12 @@ once the member has the role again. A template has at most 256 children
 (`role_template_limit`). A subscription and a role template never share an
 id: either put refuses the id the other holds (`subscription_id_taken`).
 
-`subscriptions/put` with `members` answers the template as `subscription`:
-`{id, members, topics, mobs, state, revision, created_at_ms,
-updated_at_ms}`, `state` `active`, `paused` or `cancelled`, and
+A template's `delivery`, declared or given to `subscriptions/put` beside
+`members`, is every child's: a replaced template's children take the new
+one with the new selector. `subscriptions/put` with `members` answers the
+template as `subscription`: `{id, members, topics, mobs, state, revision,
+created_at_ms, updated_at_ms, delivery?}`, `state` `active`, `paused` or
+`cancelled`, and
 `subscriptions/get` with a template's id answers it as `template`, beside
 `"subscription": null`. A template's id is at most 200 bytes (`-32602`
 otherwise), so its children's ids stay within bounds. Replacing its

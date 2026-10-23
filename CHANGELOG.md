@@ -237,7 +237,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   at each apply), as `{revision, sources, subscriptions}`: each source as
   `sources/put` takes it, and each subscription of one member (`member`) or
   of every member of a mob with a role (`members: {mob_id, role}`),
-  starting now. Meta reconciles them at startup, before it starts
+  starting now, with the delivery `subscriptions/put` takes (a template's
+  is every child's). Meta reconciles them at startup, before it starts
   delivering, and, without a restart, on the new method
   `meta/mob_announcements/declarations/apply`.
   - A lower revision is refused (`declaration_rollback`, with the applied
@@ -252,10 +253,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     init: bounds and shapes, duplicate ids, a topic two declared sources
     own, two declared sources on one principal's scope
     (`source_identity_taken`), a triage member its source's audience leaves
-    out, a member whose
-    declared subscriptions would reach a declared source both directly and
-    through its forward, a conversation member subscribed to its own scope,
-    and a stream route selector.
+    out, a member whose declared subscriptions would reach a declared source
+    both directly and through its forward, a conversation member subscribed
+    to its own scope, and a stream route selector.
   - Meta creates, replaces and ends only the records a declaration made,
     each marked with the revision and the digest of its declared form;
     records made at runtime are never touched. A changed subscription is

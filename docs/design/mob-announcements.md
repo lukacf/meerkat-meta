@@ -592,7 +592,8 @@ the owner reads the live templates whose topics and mobs match, resolves
 the roster members with the role (the roster read the audience check makes)
 and checks each member as a put would; in the capture's transaction the
 store makes a child subscription `<template id>/<16 hex>` for each admitted
-member and captures for it. A child whose member left the role, or that
+member and captures for it. Every child carries the template's
+delivery. A child whose member left the role, or that
 failed its checks, is skipped at capture and keeps what it owes, which
 delivers through the seal-time check. A template's verbs cascade to its
 children in one transaction, and replacing its selector admits each child
