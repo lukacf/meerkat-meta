@@ -36,7 +36,7 @@
 //! per announcement.
 
 pub mod availability;
-mod faults;
+pub(crate) mod faults;
 pub mod native;
 pub mod owner;
 pub mod remote;

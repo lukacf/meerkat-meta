@@ -600,11 +600,18 @@ struct Gateway {
 
 impl Gateway {
     fn start(label: &str, fault: Option<&str>) -> Self {
+        Self::start_with(label, fault, None)
+    }
+
+    /// [`Self::start`], with the session-service decorator answering that
+    /// `unobserved_owner`'s durable source cannot be observed.
+    fn start_with(label: &str, fault: Option<&str>, unobserved_owner: Option<&str>) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rpc_gateway"));
         command
             .arg("--persistent")
             .env_remove("RUST_LOG")
             .env_remove("META_ANNOUNCEMENT_FAULT")
+            .env_remove("META_ANNOUNCEMENT_UNOBSERVED_OWNER")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -621,6 +628,9 @@ impl Gateway {
         }
         if let Some(point) = fault {
             command.env("META_ANNOUNCEMENT_FAULT", point);
+        }
+        if let Some(session) = unobserved_owner {
+            command.env("META_ANNOUNCEMENT_UNOBSERVED_OWNER", session);
         }
         let mut child = command.spawn().expect("spawn rpc_gateway --persistent");
         let stdin = child.stdin.take().expect("gateway stdin");
@@ -662,6 +672,15 @@ impl Gateway {
         writeln!(stdin, "{}", serde_json::to_string(value).expect("encode"))
             .expect("write request");
         stdin.flush().expect("flush request");
+    }
+
+    /// Whether one captured stderr line contains every one of `needles`.
+    fn stderr_has_line(&self, needles: &[&str]) -> bool {
+        let Ok(sink) = self.stderr.lock() else {
+            return false;
+        };
+        sink.iter()
+            .any(|line| needles.iter().all(|needle| line.contains(needle)))
     }
 
     fn stderr_tail(&self) -> String {
@@ -1328,7 +1347,19 @@ fn a_member_announces_from_its_own_turn_as_itself() {
 /// announcement at once, with or without the member tools in the mobs its
 /// members create.
 fn boot_lead(label: &str, state: &Path, host_config: &Path, child_tools: bool) -> Gateway {
-    let mut gateway = Gateway::start(label, None);
+    boot_lead_with(label, state, host_config, child_tools, None)
+}
+
+/// [`boot_lead`], with the durable source of `unobserved_owner` reported
+/// unobservable, so a child mob that session owns is restored held.
+fn boot_lead_with(
+    label: &str,
+    state: &Path,
+    host_config: &Path,
+    child_tools: bool,
+    unobserved_owner: Option<&str>,
+) -> Gateway {
+    let mut gateway = Gateway::start_with(label, None, unobserved_owner);
     gateway.roster = vec![lead_roster_spec()];
     let response = gateway.request(
         "meta/init",
@@ -1419,6 +1450,12 @@ fn child_turn_tools(log: &Arc<Mutex<ModelLog>>) -> Vec<String> {
 /// Announce into the lead's mob and wait until the child member's batch is
 /// delivered; returns its id.
 fn announce_and_deliver_to_child(gateway: &mut Gateway, key: &str) -> String {
+    announce_to_child(gateway, key);
+    delivered_to_child(gateway, key)
+}
+
+/// Announce `key` into the lead's mob.
+fn announce_to_child(gateway: &mut Gateway, key: &str) {
     gateway.call(
         "meta/mob_announcements/announce",
         json!({
@@ -1428,6 +1465,29 @@ fn announce_and_deliver_to_child(gateway: &mut Gateway, key: &str) -> String {
             "body": format!("{key}: the payment provider is degraded")
         }),
     );
+}
+
+/// The child member's batches that carry `key`.
+fn child_batches_with(gateway: &mut Gateway, key: &str) -> Vec<Value> {
+    gateway.call(
+        "meta/mob_announcements/deliveries/list",
+        json!({ "member": child_member() }),
+    )["deliveries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|batch| {
+            batch["body"]
+                .as_str()
+                .is_some_and(|body| body.contains(key))
+        })
+        .collect()
+}
+
+/// Wait until the child member's batch carrying `key` is delivered; returns
+/// its id.
+fn delivered_to_child(gateway: &mut Gateway, key: &str) -> String {
     let start = Instant::now();
     loop {
         assert!(
@@ -1646,6 +1706,86 @@ fn the_host_subscribes_a_member_of_a_mob_a_member_created_across_a_restart() {
     // The same state again: the child mob is restored, running.
     let mut gateway = boot_lead("child-host-2", state.path(), &host_config, false);
     announce_and_deliver_to_child(&mut gateway, "outage-2");
+    let current = child_subscription(&mut gateway, "child-from-root");
+    assert_eq!(current["state"], json!("active"), "{current}");
+    assert_eq!(current["revision"], subscription["revision"], "{current}");
+    gateway.shutdown_and_reap();
+}
+
+/// P4: a restart that cannot observe the session of the member that created
+/// a mob restores that child mob held, until its owner resolves. While it is
+/// held, what is announced for its member stays owed: no batch is sealed for
+/// a held mob, nothing is delivered, and the member's subscription stays
+/// active, unchanged. The next restart observes the owner and restores the
+/// child mob running, and what waited is delivered, once.
+#[test]
+fn a_held_child_mob_keeps_its_member_subscribed_and_delivers_once_it_runs() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let (mut gateway, subscription) =
+        host_subscribed_child("child-held-1", state.path(), &host_config, &log);
+    announce_and_deliver_to_child(&mut gateway, "outage-1");
+    // The child mob's owner: the lead's session, which created it.
+    let owner = gateway.call("meta/status_identity", json!({ "identity": LEAD }))["session_id"]
+        .as_str()
+        .expect("the lead's session")
+        .to_owned();
+    gateway.shutdown_and_reap();
+    drop(gateway);
+
+    // The owner cannot be observed, so the child mob is restored held, and
+    // outage-2 stays owed to its member. An owed announcement has no batch to
+    // read, so the witness is the owner's report that the member's backlog is
+    // not sealed because its mob is held; until then, and after, nothing
+    // reaches the member.
+    let mut gateway = boot_lead_with(
+        "child-held-2",
+        state.path(),
+        &host_config,
+        false,
+        Some(&owner),
+    );
+    announce_to_child(&mut gateway, "outage-2");
+    let start = Instant::now();
+    loop {
+        let batches = child_batches_with(&mut gateway, "outage-2");
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch["state"]["state"] != json!("delivered")),
+            "the member of a held child mob received outage-2: {batches:?}"
+        );
+        if gateway.stderr_has_line(&[
+            "announcement backlog not sealed this round",
+            CHILD_MEMBER,
+            "is held until its owner resolves",
+        ]) {
+            break;
+        }
+        assert!(
+            start.elapsed() < SETTLE_TIMEOUT,
+            "the restart never held the child mob with outage-2 owed\n{}",
+            gateway.stderr_tail()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let current = child_subscription(&mut gateway, "child-from-root");
+    assert_eq!(current["state"], json!("active"), "{current}");
+    assert_eq!(current["revision"], subscription["revision"], "{current}");
+    gateway.shutdown_and_reap();
+    drop(gateway);
+
+    // The owner is observed again: the child mob runs, and what waited is
+    // delivered, once.
+    let mut gateway = boot_lead("child-held-3", state.path(), &host_config, false);
+    let delivered = delivered_to_child(&mut gateway, "outage-2");
+    let batches = child_batches_with(&mut gateway, "outage-2");
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(batches[0]["id"], json!(delivered), "{batches:?}");
     let current = child_subscription(&mut gateway, "child-from-root");
     assert_eq!(current["state"], json!("active"), "{current}");
     assert_eq!(current["revision"], subscription["revision"], "{current}");

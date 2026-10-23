@@ -33,3 +33,23 @@ pub(crate) fn after_remote_commit() {
     #[cfg(feature = "announcement-test-faults")]
     hit("after_remote_commit");
 }
+
+/// Whether `META_ANNOUNCEMENT_UNOBSERVED_OWNER` names `session_id`: the
+/// session-service decorator then answers that the session's durable source
+/// cannot be observed, as for an owner a restart cannot observe yet, so
+/// Meerkat restores a child mob that session owns held until its owner
+/// resolves. Always `false` without the feature.
+pub(crate) fn owner_unobserved(session_id: &meerkat_core::SessionId) -> bool {
+    #[cfg(feature = "announcement-test-faults")]
+    {
+        std::env::var("META_ANNOUNCEMENT_UNOBSERVED_OWNER")
+            .ok()
+            .and_then(|value| meerkat_core::SessionId::parse(value.trim()).ok())
+            .is_some_and(|named| &named == session_id)
+    }
+    #[cfg(not(feature = "announcement-test-faults"))]
+    {
+        let _ = session_id;
+        false
+    }
+}
