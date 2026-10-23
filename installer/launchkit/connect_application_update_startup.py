@@ -15,7 +15,8 @@ from pathlib import Path
 from .connect_accepted_source import AcceptedApplicationSource
 from .connect_application_callbacks import SelectedApplicationCallbacks
 from .connect_application_finalizer import _Current
-from .connect_application_startup import _joined, _source_checks, member_mcp_runtime_options
+from .connect_application_startup import (_joined, _require_fixed_roster, _source_checks,
+    member_mcp_runtime_options)
 from .connect_installer_caller import (
     CustodyError, ExactFile, ProductGatewayFile, _application_update_selection, _json, _path,
     _private_directory, _same_json_value,
@@ -115,7 +116,8 @@ class ReplacementApplicationStartup:
                 raise CustodyError("The retained replacement inputs or private output custody changed.")
 
     def _unconnected(self, application):
-        if (application.context.root != self.root or application.dynamic
+        _require_fixed_roster(self, application)
+        if (application.context.root != self.root
                 or application.context.runtime is not None
                 or application._application_callbacks is not None):
             raise CustodyError("Replacement startup requires its unconnected fixed application.")
@@ -221,10 +223,11 @@ class ReplacementApplicationStartup:
 
     def _check_config(self, config, application, *, connected=False):
         from meerkat_meta.builder import MetaBuilderConfig
+        _require_fixed_roster(self, application)
         if (not isinstance(config, MetaBuilderConfig) or config is not self.config
                 or _config_stamp(vars(config)) != self._config_values
                 or application is not self.application or application.context.root != self.root
-                or application.dynamic or application._application_callbacks is not self.callbacks
+                or application._application_callbacks is not self.callbacks
                 or application.context.runtime is not (self.runtime if connected else None)):
             raise CustodyError("Replacement changed its same config, application or selected callbacks.")
 

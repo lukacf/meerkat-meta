@@ -240,8 +240,13 @@ async def test_fresh_selection_refuses_incompatible_host_or_plan_before_connect(
             str(tmp_path / 'other') if condition == 'plan-root' else 60_000)
         f.owner.plan = pin(f.plan.path, json.dumps(value).encode())
         f.owner._finalizer_inputs['preparation_plan'] = f.owner.plan
-    with pytest.raises(CustodyError):
+    with pytest.raises(CustodyError) as refused:
         await f.owner.prepare(f.app)
+    if condition == 'dynamic':
+        # A dynamic roster is named, not refused as a generic fixed-application change.
+        text = str(refused.value)
+        assert 'dynamic agent roster' in text and 'fixed roster' in text, text
+        assert text == module.DYNAMIC_ROSTER_UNSUPPORTED
     assert not f.events and f.owner.callbacks is None
     if condition != 'callbacks':
         assert f.app._application_callbacks is None

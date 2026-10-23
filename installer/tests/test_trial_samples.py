@@ -138,6 +138,13 @@ def test_requested_trial_contract_requires_shared_behavior_and_independent_sourc
     assert "do not require an application to fabricate unavailable live I/O" in ACCEPTANCE_PROMPT
 
 
+
+def test_builder_prompt_says_a_selected_toolkit_product_needs_a_fixed_roster():
+    """The desired_roster/desired_edges guidance names the selected-product limit before Build."""
+    text = " ".join(IMPLEMENTATION_PROMPT.split())
+    assert "A selected Meta Toolkit product needs a fixed roster" in text
+    assert text.index("desired_roster/desired_edges hooks") < text.index("needs a fixed roster")
+
 def test_correction_contract_records_an_outcome_without_a_feasible_choice():
     assert "Where findings recommend among options, they must be able to record" in IMPLEMENTATION_PROMPT
     assert "that no option is feasible or that the decision is\nunderdetermined" in IMPLEMENTATION_PROMPT

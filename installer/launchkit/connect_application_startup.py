@@ -26,6 +26,31 @@ from .connect_installer_caller import (
 )
 
 
+DYNAMIC_ROSTER_UNSUPPORTED = ("This application has a dynamic agent roster (desired_roster and desired_edges). "
+    "The selected Meta Toolkit product's application host needs a fixed roster, so it cannot start this "
+    "application. Rebuild it with a fixed roster.")
+
+
+def _host_composes_dynamic_roster(owner):
+    """Whether this selected startup owner can compose a dynamic application.
+
+    No selected owner can yet: Fresh, installed restart, replacement and
+    ordinary Meta startup each bind a fixed roster. A host that later composes
+    dynamic member classes answers here, and only here.
+    """
+    return False
+
+
+def _require_fixed_roster(owner, application):
+    """Refuse a dynamic roster by name, before a startup owner's other application checks.
+
+    Every selected startup owner calls this first; it is the only place that
+    decides whether a dynamic application may start under that owner.
+    """
+    if application.dynamic and not _host_composes_dynamic_roster(owner):
+        raise CustodyError(DYNAMIC_ROSTER_UNSUPPORTED)
+
+
 def member_mcp_runtime_options(application):
     """Older frozen applications have no participant; selected ones fail closed.
 
@@ -426,7 +451,8 @@ class FreshApplicationStartup:
             self._original_gateway.require_current()
 
     def _check_unconnected_application(self, application):
-        if (application.context.root != self.root or application.dynamic
+        _require_fixed_roster(self, application)
+        if (application.context.root != self.root
                 or application.context.runtime is not None
                 or application._application_callbacks is not None):
             raise CustodyError("Fresh startup requires its unconnected fixed application and project owner.")
@@ -502,9 +528,10 @@ class FreshApplicationStartup:
         from meerkat_meta.builder import MetaBuilderConfig
         if not isinstance(config, MetaBuilderConfig):
             raise CustodyError("Fresh preparation requires the genuine installed Meta builder configuration.")
+        _require_fixed_roster(self, application)
         _require_model_builder(self, config)
         if (application is not self.application or application.context.root != self.root
-                or application.dynamic or application.context.runtime is not None
+                or application.context.runtime is not None
                 or application._application_callbacks is not self.callbacks
                 or getattr(config, "roster_provider", None) is not application
                 or getattr(config, "topology_provider", None) is not application):
@@ -692,7 +719,8 @@ class RestoredApplicationStartup:
             raise CustodyError("This installed restart was already selected.")
         self._prepared = True
         self._require_current()
-        if (application.context.root != self.root or application.dynamic
+        _require_fixed_roster(self, application)
+        if (application.context.root != self.root
                 or application.context.runtime is not None
                 or application._application_callbacks is not None):
             raise CustodyError("Installed restart requires its unconnected fixed application and project owner.")
@@ -704,7 +732,8 @@ class RestoredApplicationStartup:
 
         observed, callbacks = await _joined(read_inputs)
         self._require_current()
-        if (application.context.root != self.root or application.dynamic
+        _require_fixed_roster(self, application)
+        if (application.context.root != self.root
                 or application.context.runtime is not None
                 or application._application_callbacks is not None):
             raise CustodyError("The selected fixed application changed during restart observation.")
@@ -735,9 +764,10 @@ class RestoredApplicationStartup:
         from meerkat_meta.builder import MetaBuilderConfig
         if not isinstance(config, MetaBuilderConfig):
             raise CustodyError("Installed restart requires the genuine installed Meta builder configuration.")
+        _require_fixed_roster(self, application)
         _require_model_builder(self, config)
         if (application is not self.application or application.context.root != self.root
-                or application.dynamic or application.context.runtime is not None
+                or application.context.runtime is not None
                 or application._application_callbacks is not self.callbacks
                 or getattr(config, "roster_provider", None) is not application
                 or getattr(config, "topology_provider", None) is not application):

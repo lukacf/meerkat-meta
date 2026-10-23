@@ -658,10 +658,13 @@ they do not establish that the live agent understands the person's request.
 If continuing contexts must be created by users or existing continuing identities
 need account-specific separation, use the seeded host's paired
 desired_roster/desired_edges hooks and context.reconcile_agents with its compiled
-applicationProfiles map. Preserve the desired registry across restart and enforce
-account/membership policy in the application. Register callbacks for the actual
-adopted identity on creation and resume. Test registry, class/grant boundaries,
-relevant edges, repeated reconciliation and restart through the real host seam
+applicationProfiles map. A selected Meta Toolkit product needs a fixed roster
+unless its application host supports dynamic member classes; without that
+support, keep the compiled roster. Preserve the desired registry across
+restart and enforce account/membership policy in the application. Register
+callbacks for the actual adopted identity on creation and resume. Test registry,
+class/grant boundaries, relevant edges, repeated reconciliation and restart
+through the real host seam
 with fake native I/O as appropriate. A saved row or SDK mock is not evidence of
 live native identity continuity. Keep unavailable frozen-host or offline-trial
 lifecycle explicit rather than dropping the user's requirement or simulating it.

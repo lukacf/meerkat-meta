@@ -188,6 +188,24 @@ async def test_exact_replacement_uses_original_config_callbacks_and_actual_outco
     assert runtime.closed and f.events[-1] == "shutdown"
 
 
+async def test_dynamic_roster_refuses_a_replacement_start_first_with_its_own_text(fixture):
+    """A dynamic agent roster cannot take a replacement start.
+
+    The refusal names it ahead of the generic fixed-application refusal, which
+    the callbacks set here would also raise. Nothing is constructed or bound.
+    """
+    f = fixture
+    f.app.dynamic = True
+    f.app._application_callbacks = object()
+    with pytest.raises(CustodyError) as refused:
+        await f.owner.prepare(f.app)
+    text = str(refused.value)
+    assert "dynamic agent roster" in text and "fixed roster" in text, text
+    from launchkit.connect_application_startup import DYNAMIC_ROSTER_UNSUPPORTED
+    assert text == DYNAMIC_ROSTER_UNSUPPORTED
+    assert not f.events and f.app.context.runtime is None and f.owner.callbacks is None
+
+
 @pytest.mark.parametrize("pin_name", ["selection", "prior", "plan", "compilation", "activation", "gateway"])
 async def test_retained_input_changes_refuse_before_sdk_construction(fixture, pin_name):
     f = fixture

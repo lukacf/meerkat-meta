@@ -644,6 +644,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   final event whose closing blank line never arrived before the stream
   ended. The SSE specification discards that pending data, and the Python
   reader already did.
+- A generated application whose agent roster is dynamic (its `desired_roster`
+  and `desired_edges` hooks) cannot start under a selected Meta Toolkit
+  product, with or without a setup helper: the product's application host
+  needs a fixed roster. Its start refused only after Build and Install, with
+  a generic custody error that did not say why. The start still refuses
+  before anything runs, but now says "This application has a dynamic agent
+  roster (desired_roster and desired_edges). The selected Meta Toolkit
+  product's application host needs a fixed roster..." The application
+  builder's instructions now say that a selected Meta Toolkit product needs
+  a fixed roster unless its application host supports dynamic member classes.
 
 ### Known limitations
 
