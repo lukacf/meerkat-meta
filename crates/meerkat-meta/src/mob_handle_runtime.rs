@@ -3483,6 +3483,18 @@ macro_rules! delegate_mob_session_service {
                     .reconcile_runtime_compaction_projections(id, intents)
                     .await
             }
+            // Forwarded: the trait default refuses, so an unforwarded
+            // acknowledgement leaves the live actor behind the store's
+            // compaction finalization and costs the member its next turn.
+            async fn acknowledge_runtime_compaction_finalization(
+                &self,
+                id: &meerkat_core::types::SessionId,
+                authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+            ) -> Result<(), SessionError> {
+                self.inner
+                    .acknowledge_runtime_compaction_finalization(id, authority)
+                    .await
+            }
             async fn abort_uncommitted_compaction_projections(
                 &self,
                 id: &meerkat_core::types::SessionId,
@@ -3683,6 +3695,16 @@ macro_rules! delegate_mob_session_service {
             ) -> Option<Arc<dyn meerkat_core::event_injector::SubscribableInjector>> {
                 self.inner.interaction_event_injector(id).await
             }
+
+            // Forwarded: the trait default sends on the raw comms runtime,
+            // not through the inner service's own send.
+            async fn send_comms(
+                &self,
+                id: &meerkat_core::types::SessionId,
+                command: meerkat_core::CommsCommand,
+            ) -> Option<Result<meerkat_core::SendReceipt, meerkat_core::SendError>> {
+                self.inner.send_comms(id, command).await
+            }
         }
 
         #[async_trait]
@@ -3696,6 +3718,26 @@ macro_rules! delegate_mob_session_service {
                 meerkat_core::service::SessionControlError,
             > {
                 self.inner.append_system_context(id, req).await
+            }
+            // Forwarded: the trait defaults refuse both as unavailable, so
+            // a governed append through the mob's service would fail.
+            async fn append_authenticated_system_context(
+                &self,
+                control: Arc<meerkat_core::service::SystemContextControlRequest>,
+            ) -> Result<
+                meerkat_core::service::AppendSystemContextResult,
+                meerkat_core::service::SessionControlError,
+            > {
+                self.inner.append_authenticated_system_context(control).await
+            }
+            async fn append_authorized_system_context(
+                &self,
+                prepared: meerkat_core::service::PreparedSystemContextAppend,
+            ) -> Result<
+                meerkat_core::service::AppendSystemContextResult,
+                meerkat_core::service::SessionControlError,
+            > {
+                self.inner.append_authorized_system_context(prepared).await
             }
             async fn stage_tool_results(
                 &self,
@@ -4792,6 +4834,17 @@ impl meerkat_core::service::SessionService for AfterCreateMobSessionService {
             .reconcile_runtime_compaction_projections(id, intents)
             .await
     }
+    // Forwarded, as in `delegate_mob_session_service!`: the trait default
+    // refuses the acknowledgement.
+    async fn acknowledge_runtime_compaction_finalization(
+        &self,
+        id: &meerkat_core::types::SessionId,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), SessionError> {
+        self.inner
+            .acknowledge_runtime_compaction_finalization(id, authority)
+            .await
+    }
     async fn abort_uncommitted_compaction_projections(
         &self,
         id: &meerkat_core::types::SessionId,
@@ -4977,6 +5030,15 @@ impl meerkat_core::service::SessionServiceCommsExt for AfterCreateMobSessionServ
     ) -> Option<Arc<dyn meerkat_core::event_injector::SubscribableInjector>> {
         self.inner.interaction_event_injector(id).await
     }
+
+    // Forwarded, as in `delegate_mob_session_service!`.
+    async fn send_comms(
+        &self,
+        id: &meerkat_core::types::SessionId,
+        command: meerkat_core::CommsCommand,
+    ) -> Option<Result<meerkat_core::SendReceipt, meerkat_core::SendError>> {
+        self.inner.send_comms(id, command).await
+    }
 }
 
 #[async_trait]
@@ -4990,6 +5052,27 @@ impl meerkat_core::service::SessionServiceControlExt for AfterCreateMobSessionSe
         meerkat_core::service::SessionControlError,
     > {
         self.inner.append_system_context(id, req).await
+    }
+    // Forwarded, as in `delegate_mob_session_service!`.
+    async fn append_authenticated_system_context(
+        &self,
+        control: Arc<meerkat_core::service::SystemContextControlRequest>,
+    ) -> Result<
+        meerkat_core::service::AppendSystemContextResult,
+        meerkat_core::service::SessionControlError,
+    > {
+        self.inner
+            .append_authenticated_system_context(control)
+            .await
+    }
+    async fn append_authorized_system_context(
+        &self,
+        prepared: meerkat_core::service::PreparedSystemContextAppend,
+    ) -> Result<
+        meerkat_core::service::AppendSystemContextResult,
+        meerkat_core::service::SessionControlError,
+    > {
+        self.inner.append_authorized_system_context(prepared).await
     }
     async fn stage_tool_results(
         &self,
@@ -15534,6 +15617,14 @@ comms = true
         controller_pin_answer: Mutex<Option<meerkat_core::ControllerModelClient>>,
         /// The archive authority's answer.
         archive_authority_answer: Mutex<ArchiveAuthorityAnswer>,
+        /// Every compaction-finalization acknowledgement the probe received,
+        /// with the authority it carried.
+        acknowledged_compaction_finalizations: Mutex<
+            Vec<(
+                meerkat_core::types::SessionId,
+                meerkat_core::CommittedSessionBoundaryAuthority,
+            )>,
+        >,
     }
 
     impl ForwardingProbe {
@@ -15602,6 +15693,19 @@ comms = true
             _intents: Vec<meerkat_core::CompactionProjectionIntent>,
         ) -> Result<(), SessionError> {
             self.record("reconcile_runtime_compaction_projections");
+            Ok(())
+        }
+
+        async fn acknowledge_runtime_compaction_finalization(
+            &self,
+            id: &meerkat_core::types::SessionId,
+            authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+        ) -> Result<(), SessionError> {
+            self.record("acknowledge_runtime_compaction_finalization");
+            self.acknowledged_compaction_finalizations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((id.clone(), authority.clone()));
             Ok(())
         }
 
@@ -16337,6 +16441,50 @@ comms = true
                 "{shape}: the inner service settles the tail, exactly once"
             );
             settled.expect("the wrapped service settled the tail");
+        }
+    }
+
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward the runtime's compaction-finalization acknowledgement,
+    /// with the exact committed boundary authority, to the service they wrap.
+    /// Without the forward the trait default refuses it: the live actor never
+    /// adopts the store's metadata-only head commit after a memory compaction,
+    /// and the member's next turn is lost.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_compaction_finalization_acknowledgement() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let authority = meerkat_core::CommittedSessionBoundaryAuthority::HeadCanonical {
+            session_id: session_id.clone(),
+            committed_head_token: "probe-head-token".to_string(),
+        };
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            probe
+                .acknowledged_compaction_finalizations
+                .lock()
+                .expect("probe acknowledgements")
+                .clear();
+            meerkat_core::service::SessionService::acknowledge_runtime_compaction_finalization(
+                wrapper.as_ref(),
+                &session_id,
+                &authority,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{shape}: the wrapped service acknowledges: {error}"));
+            assert_eq!(
+                probe.calls(),
+                vec!["acknowledge_runtime_compaction_finalization"],
+                "{shape}: the inner service acknowledges, exactly once"
+            );
+            assert_eq!(
+                *probe
+                    .acknowledged_compaction_finalizations
+                    .lock()
+                    .expect("probe acknowledgements"),
+                vec![(session_id.clone(), authority.clone())],
+                "{shape}: the exact authority reaches the inner service"
+            );
         }
     }
 
@@ -17424,6 +17572,16 @@ comms = true
         )
         .await
         .expect("runtime compaction reconciliation should forward to inner service");
+        meerkat_core::service::SessionService::acknowledge_runtime_compaction_finalization(
+            &wrapped,
+            &session_id,
+            &meerkat_core::CommittedSessionBoundaryAuthority::HeadCanonical {
+                session_id: session_id.clone(),
+                committed_head_token: "probe-head-token".to_string(),
+            },
+        )
+        .await
+        .expect("runtime compaction finalization acknowledgement should forward to inner service");
         meerkat_core::service::SessionService::abort_uncommitted_compaction_projections(
             &wrapped,
             &session_id,
@@ -17506,6 +17664,7 @@ comms = true
                 "cancel_after_boundary_with_machine_authority",
                 "archive_with_mob_lifecycle_authority",
                 "reconcile_runtime_compaction_projections",
+                "acknowledge_runtime_compaction_finalization",
                 "abort_uncommitted_compaction_projections",
                 "abort_rejected_runtime_run_projections",
                 "record_live_terminal_error",
