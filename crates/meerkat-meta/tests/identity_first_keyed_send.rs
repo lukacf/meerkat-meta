@@ -547,10 +547,65 @@ async fn keyed_meta_send_refuses_track_turn_expected_spec_digest_and_invalid_key
             .await;
         assert_eq!(refused["error"]["code"], -32602, "{key}: {refused}");
     }
-    let committed = boot.keyed_send("Ingest item 5.", "item-5").await;
+    // Nothing was committed under the key: other content than the refused
+    // calls carried is accepted under it, never answered as a conflict.
+    let committed = boot
+        .keyed_send("Ingest item 5, after the refusals.", "item-5")
+        .await;
     assert!(
         ["pending", "admitted"].contains(&state(&committed)),
         "nothing was committed under the key before: {committed}"
+    );
+    boot.shutdown().await;
+}
+
+/// X3b: a key outlives a reset of the identity, which starts it on a fresh
+/// session. The replay answers the first receipt and the pre-reset admitted
+/// pair, never a second admission; `meta/send_status` reads that pair from
+/// the pre-reset session, which Core's member history binds to the
+/// identity; and a new key reaches the new session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keyed_meta_send_survives_identity_reset_and_send_status_reads_the_pre_reset_session() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let client = RecordingClient::default();
+    let boot = Boot::start(&temp.path().join("state"), &unique_mob_id(), &client).await;
+
+    let admitted = boot.replay_until_admitted("Ingest item 7.", "item-7").await;
+    let pair = admitted["continuation"]["status"].clone();
+    // The admitted turn settles first, so the reset never races it.
+    boot.status_until_terminal(IDENTITY, &pair).await;
+    boot.rpc("meta/reset", json!({"identity": IDENTITY})).await;
+    let current = boot.session_of(IDENTITY).await;
+    assert_ne!(
+        pair["session_id"], current,
+        "the reset starts a fresh session"
+    );
+
+    let replay = boot.keyed_send("Ingest item 7.", "item-7").await;
+    assert_eq!(delivery(&replay), delivery(&admitted), "the first receipt");
+    assert_eq!(
+        replay["continuation"]["status"], pair,
+        "the pre-reset pair, never a second admission"
+    );
+    let read = boot
+        .rpc(
+            "meta/send_status",
+            json!({
+                "identity": IDENTITY,
+                "session_id": pair["session_id"],
+                "input_id": pair["input_id"],
+            }),
+        )
+        .await;
+    assert_eq!(read["state"]["input_id"], pair["input_id"], "{read}");
+    assert!(read["state"]["terminal_outcome"].is_string(), "{read}");
+
+    let next = boot
+        .replay_until_admitted("Ingest item 7b.", "item-7b")
+        .await;
+    assert_eq!(
+        next["continuation"]["status"]["session_id"], current,
+        "a new key reaches the new session: {next}"
     );
     boot.shutdown().await;
 }
