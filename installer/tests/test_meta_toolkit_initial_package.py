@@ -214,19 +214,19 @@ def test_connect_route_console_opens_the_toolkit_setup_panel(product):
     ordinary["acquisition"] = None
     del ordinary["agent_classes"][0]["tools"]["rust_bundles"]
     without = {item.path: item for item in compiler.generate_package(ordinary, runtime_target=target)}
-    assert {key: value for key, value in console.items() if key != "sidebar"} == tomllib.loads(
-        without["config/console.toml"].content)
+    assert console == tomllib.loads(without["config/console.toml"].content)
 
 
-@pytest.mark.parametrize("kind", ["product-without-connect", "public-package"])
-def test_console_without_the_connect_route_has_no_setup_panel(product, kind):
+@pytest.mark.parametrize("kind", ["helperless-product", "public-package"])
+def test_console_setup_panel_follows_selected_product_route(product, kind):
     spec = setup_spec()
     spec["acquisition"] = None
     del spec["agent_classes"][0]["tools"]["rust_bundles"]
-    options = {"runtime_target": catalog_target(product)} if kind == "product-without-connect" else {}
+    options = {"runtime_target": catalog_target(product)} if kind == "helperless-product" else {}
     files = {item.path: item for item in compiler.generate_package(spec, **options)}
     console = tomllib.loads(files["config/console.toml"].content)
-    assert "sidebar" not in console and "/host/toolkit/setup" not in files["config/console.toml"].content
+    assert ("sidebar" in console) == (kind == "helperless-product")
+    assert ("/host/toolkit/setup" in files["config/console.toml"].content) == (kind == "helperless-product")
 
 
 @pytest.mark.parametrize("defect", ["bundle", "no-caller-bundle", "helper-mode", "helper-profile", "reusable-class", "cloud"])

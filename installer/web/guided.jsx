@@ -36,7 +36,7 @@ import { nativeTeamPackagePlan, setupNeedsApplicationBuild, setupProgress, setup
 import { RehearsalPanel } from "./rehearsal-panel.jsx";
 import { ProviderSetup } from "./provider-setup.jsx";
 import { hasForgeOpeningContext, isForgeOpening, ForgeWelcomeIntro, ForgeWelcomeNext, ForgeWelcomeOrientation, ForgeIllustrationMotionProvider, useForgeProposalNotice } from "./first-experience.jsx";
-import { ForgeOrganizationStart } from "./forge-organization-start.jsx";
+import { ForgeOrganizationStart, ForgeOrganizationContext } from "./forge-organization-start.jsx";
 import { ForgeStartingHelp, ForgeStartingContext, ForgeStartingExample } from "./forge-starting-help.jsx";
 import { startingContextDetails } from "./forge-starting-context.mjs";
 import { ToolkitSavedSetup } from "./toolkit-saved-setup.jsx";
@@ -1453,7 +1453,7 @@ export function GuidedSetup({
             .map((o) => o.label)
         : [];
     setPendingMessage(
-      action === "back"
+      ["back", "organization"].includes(action)
         ? null
         : { text: `${combined ? "More than one fits: " : ""}${[...labels, text].filter(Boolean).join("; ")}`, role: "user", created_at: new Date().toISOString(),
             ...(submittedAttachments.length ? { attachments: submittedAttachments } : {}) },
@@ -1479,7 +1479,8 @@ export function GuidedSetup({
       if (!loadGate.current.current(navigationToken) || loadGate.current.pending() ||
           latestState.current?.id !== current.id || expected && (current.id !== expected.id || current.version !== expected.version ||
             latestState.current.version !== expected.version || latestInput.current.key !== inputKey(current))) return;
-      if (options.preserveInput && !captureGuideResumeInput(guideStorage, current, latestInput.current, text)) {
+      if (options.preserveInput && !captureGuideResumeInput(guideStorage, current, latestInput.current, text,
+          action === "organization" ? { action, organization_fingerprint: extra.organization_fingerprint } : undefined)) {
         throw new Error("Your pending answer could not be saved. Keep it in the composer and try again after local storage is available.");
       }
       const submittedRequest = {
@@ -2481,6 +2482,9 @@ export function GuidedSetup({
             }}
           >
             <div className="setup-conversation-start">LET'S MAKE IT YOURS</div>
+            {state.id && <ForgeOrganizationContext update={state.organization_update} disabled={blocked}
+              onAdopt={organization_fingerprint => respond("organization", { organization_fingerprint },
+                { preserveInput: true, expectedGuide: { id: state.id, version: state.version } })} />}
             {providerOpen && <ProviderSetup
               firstRun={welcome} idea={draft} startingContext={inputStartingHelp(input)} guideReady={runtime?.status === "ready"}
               onRuntime={publishRuntime} onClose={() => {

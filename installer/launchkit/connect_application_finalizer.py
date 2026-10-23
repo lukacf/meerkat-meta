@@ -265,14 +265,15 @@ class ApplicationPolicyFinalizer:
     def _publication_snapshot(self, bundle, preparation, selection_file, selected, staged_pointer):
         _, outputs = _selection(json.dumps(selected, allow_nan=False).encode())
         pins = tuple(dict.fromkeys((self.plan, *self.sources, bundle.manifest,
-            bundle.setup, bundle.application_tool_policy, bundle.resource_handoff,
+            bundle.setup, bundle.application_tool_policy,
+            *((bundle.resource_handoff,) if bundle.resource_handoff is not None else ()),
             *bundle.source_files, *(pin for pair in bundle.member_surfaces for pin in pair),
             selection_file, *preparation.artifacts, preparation.activation_template, *outputs,
             *(ExactFile(preparation.bundle_path / pin.path.name, pin.sha256)
                 for pin in preparation.artifacts),
             *((self.original.activation,) if self.original.activation is not None else ()))))
         directories = tuple(dict.fromkeys((self.root[0], self.workspace[0],
-            bundle.directory[0], bundle.resources_directory[0], preparation.artifacts_directory[0],
+            bundle.directory[0], bundle.artifact_directory[0], preparation.artifacts_directory[0],
             preparation.bundle_path, *(pin.path.parent for pin in pins))))
         return _Publication(selected,
             tuple((pin.path, _identity(_path(pin.path).lstat())) for pin in pins),

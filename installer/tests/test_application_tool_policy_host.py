@@ -82,6 +82,36 @@ async def test_missing_ordinary_source_remains_optional(tmp_path, monkeypatch, c
     await loaded.stop()
 
 
+@pytest.mark.parametrize("fault", [None, "missing", "changed", "redirected"])
+async def test_helperless_source_uses_exact_seed_policy_without_baseline_fallback(tmp_path, monkeypatch, fault):
+    from launchkit.connect_policy_input import APPLICATION_INVENTORY_PATH, APPLICATION_NATIVE_POLICY_PATH
+    host, spec = generated_host(tmp_path, monkeypatch)
+    baseline = write_selection(tmp_path, selection(spec))
+    original = selection(spec, {spec["entrypoint"]: ["custom_read"]})
+    selected = json.dumps(original, indent=3).encode() + b"\n"
+    path = tmp_path / APPLICATION_NATIVE_POLICY_PATH
+    if fault != "missing":
+        path.write_bytes(selected)
+    spec["applicationInventory"] = APPLICATION_INVENTORY_PATH
+    if fault == "redirected":
+        spec["applicationInventory"] = "../foreign.json"
+    loaded = application(host, spec)
+    if fault in {"missing", "redirected"}:
+        with pytest.raises(ValueError):
+            await loaded.load_tool_policy(required=True)
+    else:
+        await loaded.load_tool_policy(required=True)
+        assert loaded.tool_policy_source_bytes == selected
+        assert loaded.tool_policy_selection == original
+        if fault == "changed":
+            path.write_bytes(baseline)
+            with pytest.raises(ValueError, match="changed after loading"):
+                await loaded.require_tool_policy_current()
+        else:
+            await loaded.require_tool_policy_current()
+    assert (tmp_path / "application/tool-policy.json").read_bytes() == baseline
+
+
 async def test_original_intent_preserves_empty_grants_and_pending_native_names(
         tmp_path, monkeypatch, capsys):
     host, spec = generated_host(tmp_path, monkeypatch)

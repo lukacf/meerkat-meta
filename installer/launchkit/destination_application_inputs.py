@@ -41,13 +41,17 @@ def _source_contents(files, runtime_target):
     from .templates_v2.application_configuration import validate_application_fields
     from .templates_v2.console_configuration import console_authentication
     spec = Blueprint.model_validate(_json(files["blueprint.json"][0]))
-    if not compiler._product_acquisition_supported(spec, runtime_target=runtime_target):
+    if not compiler._product_application_supported(spec, runtime_target=runtime_target):
         raise CustodyError(_missing_source_input(spec))
     definition = files["config/mob.toml"][0]
     _source_definition({"format": "toml", "text": definition.decode("utf-8")})
-    inventory_bytes = compiler.application_inventory_input(spec)
+    from .application_inventory_source import application_inventory_source, POLICY_PATH
+    inventory_bytes = application_inventory_source({name: entry[0] for name, entry in files.items()})
+    policy_path = POLICY_PATH if inventory_bytes is not None else "application/tool-policy.json"
+    if inventory_bytes is None:
+        inventory_bytes = compiler.application_inventory_input(spec)
     inventory = _inventory_input(inventory_bytes)
-    policy = files["application/tool-policy.json"][0]
+    policy = files[policy_path][0]
     application_tool_policy_selection(policy,
         selected_member_identities=tuple(row["identity"] for row in inventory["roster"]))
     configuration = _json(files["application/configuration.json"][0])
@@ -252,8 +256,11 @@ async def _select(source, deployment, require_current, *, recover, model_configu
         return pin
 
     pins = {name: retain(name, content) for name, content in contents.items()}
-    acquisition = retain("source-selection.json", _json_bytes(_application_acquisition_selection(
-        pins, [item[0] for item in compiler_sources])))
+    acquisition_value = _application_acquisition_selection(pins, [item[0] for item in compiler_sources])
+    from .application_inventory_source import selects_application_inventory, POLICY_PATH
+    if selects_application_inventory({name: entry[0] for name, entry in package.items()}):
+        acquisition_value["source_policy_path"] = POLICY_PATH
+    acquisition = retain("source-selection.json", _json_bytes(acquisition_value))
     viewer = retain("APPLICATION-SELECTION.json", _json_bytes(_application_viewer_selection(
         pins, acquisition, operator)))
     current()

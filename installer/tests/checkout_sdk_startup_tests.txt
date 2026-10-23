@@ -44,6 +44,7 @@ test_managed_model_factory_selection.py
 test_managed_model_preflight.py
 test_managed_model_preparation.py
 test_managed_model_startup.py
+test_member_class_serialization_custody.py
 test_member_mcp_application.py
 test_meta_toolkit_application_models.py
 test_meta_toolkit_initial_install.py
@@ -71,6 +72,7 @@ test_trusted_product_shipping.py
 test_update_after_setup.py
 test_update_after_setup_registry.py
 # Extras.
+test_helperless_application_source.py  # accepted native inventory, explicit seed policy and original Build owner recovery
 test_implementation_fresh_build.py  # fresh admission shares the selected-runtime registry and retained-installation fixtures
 test_native_callback_member_contract.py  # the application's Meta callback dispatcher with selected member labels
 test_native_console_login.py  # templates_v2 native_console_login and console_auth, imported by the application at startup

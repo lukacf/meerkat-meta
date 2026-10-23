@@ -13,6 +13,23 @@ from collections.abc import Sequence
 
 
 MAX_POLICY_SELECTION_BYTES = 16 * 1024 * 1024
+APPLICATION_INVENTORY_PATH = "application/native-inventory.json"
+APPLICATION_NATIVE_POLICY_PATH = "application/native-tool-policy.json"
+
+
+def application_tool_policy_path(deployment):
+    """Select the policy source named by the compiler's existing route.
+
+    Application-authored filenames and file presence cannot select a route.
+    Older accepted packages continue reading their original policy source.
+    """
+    if not isinstance(deployment, dict):
+        raise ValueError("Application policy selection needs its compiled deployment source.")
+    if "applicationInventory" not in deployment:
+        return "application/tool-policy.json"
+    if deployment["applicationInventory"] != APPLICATION_INVENTORY_PATH:
+        raise ValueError("Preserve the compiled application inventory source path.")
+    return APPLICATION_NATIVE_POLICY_PATH
 
 
 def _object(pairs):

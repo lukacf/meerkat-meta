@@ -246,6 +246,27 @@ async def test_candidate_callback_plan_must_join_exact_selected_compilation(fixt
     assert f.app._application_callbacks is None and not f.events
 
 
+@pytest.mark.parametrize("revision", [7, None])
+async def test_helperless_replacement_refuses_before_binding_callbacks_or_constructing_sdk(fixture, revision):
+    from launchkit.connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+    f = fixture
+    plan = deepcopy(f.plan_value)
+    for key in ("helper", "helper_tools", "helper_profile"):
+        plan["application"].pop(key, None)
+    f.plan = write(f.plan.path, content(plan))
+    f.compilation = write(f.compilation.path, content(plan["application"]))
+    f.selected["compilation_input"] = f.compilation.pin()
+    f.selection = write(f.selection.path, content(f.selected))
+    before = f.plan.read(), f.selection.read(), f.activation.read()
+    f.owner = f.make_owner(expected_revision=revision)
+    with pytest.raises(CustodyError) as refused:
+        await f.owner.prepare(f.app)
+    assert str(refused.value) == HELPERLESS_UPDATE_UNAVAILABLE
+    assert not f.events and f.app.context.runtime is None
+    assert f.app._application_callbacks is None and f.owner.callbacks is None
+    assert (f.plan.read(), f.selection.read(), f.activation.read()) == before
+
+
 @pytest.mark.parametrize("target", ["private", "installed", "admission"])
 async def test_full_accepted_source_is_fenced_with_unchanged_native_inputs(fixture, target):
     f = fixture

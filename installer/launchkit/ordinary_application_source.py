@@ -63,6 +63,9 @@ def ordinary_installation(receipt, files):
             or "application/runtime-selection.json" not in files or "blueprint.json" not in files):
         return False
     try:
+        from .application_inventory_source import selects_application_inventory
+        if selects_application_inventory({name: row[0] for name, row in files.items()}):
+            return False
         return (type(parse_candidate_selection(selection)) is MetaToolkitRuntimeTarget
             and ordinary_application(json.loads(files["blueprint.json"][0])))
     except (TypeError, ValueError):
@@ -315,6 +318,9 @@ def recover_ordinary_application_source(registry, guide_id, build_id, *, install
         observed.append((root, observation))
         if selected_files is None:
             selected_files = {file.path: file.as_bytes() for file in files}
+            from .application_inventory_source import selects_application_inventory
+            if selects_application_inventory(selected_files):
+                return None
             if item != frozen:
                 raise CustodyError("The original ordinary Build input changed during recovery.")
             if installed is not None:

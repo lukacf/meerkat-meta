@@ -102,7 +102,7 @@ def test_actual_callback_surface_must_equal_declared_class(tmp_path):
         f.callbacks.require_member_callbacks({**agent, "classId": "helper"}, [tool])
 
 
-def startup_fixture(tmp_path, monkeypatch, mode, *, declarations=None):
+def startup_fixture(tmp_path, monkeypatch, mode, *, declarations=None, helperless=False):
     from test_application_startup import Fixture as Fresh, pin
     from test_application_restart import RestartFixture
     from launchkit.connect_application_startup import FreshApplicationStartup
@@ -112,8 +112,22 @@ def startup_fixture(tmp_path, monkeypatch, mode, *, declarations=None):
         "model": "selected-model", "tools": {"comms": True}}
     value["application"]["member_classes"] = declarations if declarations is not None else [{"id": "reader", "profile": "reusable-reader",
         "factory": "application:reader", "callbacks": [], "grants": []}]
+    if helperless:
+        del value["application"]["helper"]
+        del value["application"]["helper_profile"]
     f.plan = pin(f.plan.path, json.dumps(value).encode())
     if mode == "restored":
+        setup = json.loads(f.setup.read())
+        setup["native_owner"] = {"native_host": {
+            "member_classes": deepcopy(value["application"]["member_classes"])}}
+        f.setup = pin(f.setup.path, json.dumps(setup).encode())
+        manifest = json.loads(f.manifest.read())
+        for artifact in manifest["artifacts"]:
+            if artifact["path"] == f.setup.path.name:
+                artifact["sha256"] = f.setup.sha256
+        f.manifest = pin(f.manifest.path, json.dumps(manifest).encode())
+        f.selection["policy_manifest"] = f.manifest.pin()
+        f.selection_file = pin(f.selection_file.path, json.dumps(f.selection).encode())
         f.owner = f.make_owner()
     else:
         f.owner = FreshApplicationStartup(project_lease=f.lease, accepted_source=f.source,
@@ -173,7 +187,7 @@ async def test_selected_startup_refuses_foreign_application_class_profile(tmp_pa
     assert f.events == []
 
 
-async def generated_dynamic(tmp_path, monkeypatch, *, durable=False):
+async def generated_dynamic(tmp_path, monkeypatch, *, durable=False, helperless=False):
     pytest.importorskip("meerkat_meta.agent_builder")
     from test_profile_only_classes import application, profile_plan
     from launchkit.blueprint import Blueprint
@@ -203,6 +217,9 @@ async def generated_dynamic(tmp_path, monkeypatch, *, durable=False):
     value = {"application": {"schema": 4, "definition": source,
         "roster": [seed.to_dict()], "members": [{"member": binding}],
         "helper": {"member": binding}, "helper_profile": "dedicated", "member_classes": [declaration]}}
+    if helperless:
+        del value["application"]["helper"]
+        del value["application"]["helper_profile"]
     path = tmp_path / "selected-plan.json"
     path.write_bytes(json.dumps(value).encode()); path.chmod(0o600)
     selected = SelectedApplicationCallbacks(ExactFile(path, hashlib.sha256(path.read_bytes()).hexdigest()))
@@ -210,7 +227,8 @@ async def generated_dynamic(tmp_path, monkeypatch, *, durable=False):
     projected = deepcopy(definition["profiles"][seed.profile])
     projected["tools"].setdefault("mcp_servers", []).append({"name": "toolkit-setup", "command": "inert"})
     projected["tools"].setdefault("rust_bundles", []).append("meerkat_toolkit.setup_results")
-    observed["profiles"]["observed-native-helper"] = projected
+    if not helperless:
+        observed["profiles"]["observed-native-helper"] = projected
     context = SimpleNamespace(mob_definition=observed)
     app._application_callbacks = selected
     app._native_identity_models = True
@@ -222,10 +240,11 @@ async def generated_dynamic(tmp_path, monkeypatch, *, durable=False):
     return host, app, context
 
 
+@pytest.mark.parametrize("helperless", [False, True])
 @pytest.mark.asyncio
-async def test_generated_zero_class_builds_only_exact_admitting_identity_with_declared_callback(tmp_path, monkeypatch):
+async def test_generated_zero_class_builds_only_exact_admitting_identity_with_declared_callback(tmp_path, monkeypatch, helperless):
     CallbackDispatcher = pytest.importorskip("meerkat_meta.agent_builder").CallbackDispatcher
-    _, app, context = await generated_dynamic(tmp_path, monkeypatch)
+    _, app, context = await generated_dynamic(tmp_path, monkeypatch, helperless=helperless)
     assert set(app._tool_catalog["resident"]) == {"read_resident"}
     assert [row.identity for row in await app.roster(context)] == ["lead:main"]
     app.integration.pending.append({"identity": "resident:alice", "classId": "resident", "context": {"owner": "alice"}})

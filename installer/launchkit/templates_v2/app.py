@@ -135,7 +135,7 @@ async def await_value(value):
     return await value if inspect.isawaitable(value) else value
 
 
-def _read_tool_policy_source(root):
+def _read_tool_policy_source(root, *, deployment=None):
     """Read optional public intent without following links or opening a FIFO."""
     directory = root / "application"
     try:
@@ -144,7 +144,8 @@ def _read_tool_policy_source(root):
         return None
     if not stat.S_ISDIR(directory_status.st_mode):
         raise ValueError("Application tool policy needs an ordinary application directory.")
-    path = directory / "tool-policy.json"
+    from launchkit.connect_policy_input import application_tool_policy_path
+    path = root / application_tool_policy_path({} if deployment is None else deployment)
     try:
         before = path.lstat()
     except FileNotFoundError:
@@ -412,10 +413,11 @@ class Application:
         """Pin fixed-roster intent before adapters, connectors or stores start."""
         required = required or self._tool_policy_required
         def read():
-            source = _read_tool_policy_source(self.context.root)
+            from launchkit.connect_policy_input import application_tool_policy_path
+            source = _read_tool_policy_source(self.context.root, deployment=self.deployment)
             if source is None:
                 if required:
-                    raise ValueError("Selected application startup requires application/tool-policy.json.")
+                    raise ValueError("Selected application startup requires " + application_tool_policy_path(self.deployment) + ".")
                 return None, None
             identities = tuple(agent["identity"] for agent in self.deployment["agents"])
             from launchkit.connect_policy_input import application_tool_policy_selection
@@ -450,7 +452,7 @@ class Application:
         """Check the same retained intent after awaited application/owner work."""
         if not self._tool_policy_loaded:
             raise ValueError("Application tool policy source has not been loaded.")
-        source = await _tool_policy_read(lambda: _read_tool_policy_source(self.context.root))
+        source = await _tool_policy_read(lambda: _read_tool_policy_source(self.context.root, deployment=self.deployment))
         if source != self._tool_policy_source:
             raise ValueError("Application tool policy source changed after loading.")
 

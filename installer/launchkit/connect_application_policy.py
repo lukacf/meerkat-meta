@@ -59,10 +59,16 @@ def _completed_application_policy_inputs(bundle, source_policy, *, owner_fences)
     plan, setup = read_json(plan_bytes), read_json(setup_bytes)
     parameters = plan.get("acquisition")
     required = {"backend_generation", "proposal_ceiling", "output_audience", "limits"}
-    if (not isinstance(parameters, dict) or not required <= parameters.keys()
-            or parameters.keys() - required - {"console_setup", "standing_policy"}):
-        raise CustodyError("Finalization requires the original acquisition parameters unchanged.")
-    _selected_standing_policy(parameters.get("standing_policy"), helper_tools=setup.get("helper_tools"))
+    if "helper" in setup:
+        if (not isinstance(parameters, dict) or not required <= parameters.keys()
+                or parameters.keys() - required - {"console_setup", "standing_policy"}):
+            raise CustodyError("Finalization requires the original acquisition parameters unchanged.")
+        _selected_standing_policy(parameters.get("standing_policy"), helper_tools=setup.get("helper_tools"))
+        acquisition = {"schema": 1, **parameters}
+    else:
+        if "acquisition" in plan:
+            raise CustodyError("Helperless finalization must omit acquisition parameters.")
+        acquisition = {"schema": 2}
     acquisition_name = "native-setup.json"
     original_artifacts = (source_policy, bundle.setup, bundle.application_tool_policy,
         *(output for _, output in bundle.member_surfaces))
@@ -72,8 +78,8 @@ def _completed_application_policy_inputs(bundle, source_policy, *, owner_fences)
     if (len(set(artifact_names)) != len(original_artifacts)
             or acquisition_name in set(artifact_names)):
         raise CustodyError("Final policy artifacts require distinct selected names.")
-    acquisition = {"schema": 1, **parameters, "prepared_application_setup": {
-        "name": bundle.setup.path.name, "sha256": bundle.setup.sha256}}
+    acquisition["prepared_application_setup"] = {
+        "name": bundle.setup.path.name, "sha256": bundle.setup.sha256}
     acquisition_bytes = (_json(acquisition) + "\n").encode()
     owner = setup["native_owner"]
     native = owner["native_host"]

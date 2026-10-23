@@ -129,6 +129,20 @@ def previous_build_diagnostics(receipt, source_digest, check, directory):
 
 
 APPLICATION_CONTRACT = """Application extension protocol for this generated package:
+When deployment.json selects applicationInventory, the application uses the
+helperless Connect route. Copy native-inventory.example.json to
+application/native-inventory.json and supply exact native member_classes,
+preserving schema, mob_id and the compiled roster. Use each class's actual
+applicationProfiles role, registered factory, callbacks and grants. Declare
+zero-instance roles without inventing an identity or calling tools_for_agent
+on a placeholder. Copy protected application/tool-policy.json to
+application/native-tool-policy.json and declare explicit fixed-seed grants in
+that existing native input format. Preserve provider_id, policy_id, revision
+and the member set. Class templates do not grant tools to initial seeds. Read
+the generated README and actual selected native contract for exact fields.
+Both files are accepted application source, not native admission or authority.
+Give organizational descriptions and skills intact to the application agent
+and existing Connect flow; do not invent an organization catalog or parser.
 Write application/__init__.py with build(context), sync or async, returning your
 integration object. It is ordinary Python code, not a layout or application schema.
 Use relative imports inside application/, such as from .adapters import Integration;
@@ -624,6 +638,11 @@ admission is not proof of successful handling or a connected useful result.
 If organization is present, it is the exact visible organization context saved with
 this guide, not the currently installed plugin or authorization. Carry its relevant
 identity, deployment and integration constraints into the application and tests.
+Its guide_context can be an ordinary document or skill describing available tools,
+data and access instructions. Give that original text intact to the application
+agent and, when it needs a connection, the existing find_and_install user_context
+array. Let Connect's agent resolve and install the tool through its existing flow.
+Do not turn this document into a catalog, parser or separate setup mechanism.
 Starting examples remain optional; the actual brief and user corrections decide
 which outcome is being built. References to private packages, authentication or
 installation contracts do not supply those files or grant access. Use only source
@@ -1405,6 +1424,12 @@ class ImplementationService:
                         raise DraftConflict("Replacing the selected candidate needs a separately bound runtime transition.")
             if not refresh_framework and runtime_target is None:
                 runtime_candidate = previous_candidate
+            legacy_ordinary = False
+            if automatic_product and previous and not start_fresh:
+                from .ordinary_application_source import ordinary_application
+                if ordinary_application(proposal):
+                    legacy_ordinary = await asyncio.to_thread(
+                        registry.legacy_ordinary_continuation, guide_id, previous.name)
             same_refresh = bool(previous_input and previous_input.get("refresh_framework", False) == refresh_framework
                 and previous_input.get("preserve_design", False) == preserve_design
                 and fingerprint(previous_candidate) == fingerprint(runtime_candidate))
@@ -1559,6 +1584,8 @@ class ImplementationService:
                             seed_options["runtime_target"] = runtime_target
                         if previous_candidate is not None and not preserve_design and framework is None and not automatic_product:
                             raise DraftConflict("The selected candidate needs its unchanged protected framework for continuation.")
+                        if framework is None and legacy_ordinary:
+                            seed_options["legacy_ordinary"] = True
                         workspace.seed(framework, **seed_options)
                         for item in files:
                             if item.path in changed:
@@ -2087,6 +2114,8 @@ class ImplementationService:
         workspace = ImplementationWorkspace(directory / "workspace", frozen["blueprint"],
             read_lock_timeout=WORKSPACE_READ_LOCK_TIMEOUT)
         files = await asyncio.to_thread(workspace.export_files, require_verified=True)
+        from .application_inventory_source import application_inventory_source
+        application_inventory_source({item.path: item.as_bytes() for item in files})
         if status.get("acceptance_current"):
             from .acceptance import SemanticAcceptance
             independent_files = await asyncio.to_thread(

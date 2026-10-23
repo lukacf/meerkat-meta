@@ -1,8 +1,8 @@
-"""Join fixed host callbacks to one native-observed setup helper projection.
+"""Join selected host callbacks to the native-observed application definition.
 
 The trusted runtime supplies its original roster callback context. This reader
 does not derive native profile names, change a roster, attach setup tools, or
-grant authority. Dynamic application callback catalogs are outside this seam.
+grant authority. Reusable callbacks retain their selected native declarations.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from copy import deepcopy
 import json
 import tomllib
 
-from .connect_installer_caller import CustodyError, ExactFile, _json
+from .connect_installer_caller import CustodyError, ExactFile, _json, _same_member_classes
 
 
 _SETUP_RESULTS_BUNDLE = "meerkat_toolkit.setup_results"
@@ -124,12 +124,13 @@ class SelectedApplicationCallbacks:
             raise CustodyError("Callbacks require the selected schema4 application plan.")
         self._source = _source_definition(application.get("definition"))
         self._strategy = application.get("helper_profile")
-        if self._strategy not in {"dedicated", "exclusive_application_role"}:
+        has_helper = bool({"helper", "helper_profile", "helper_tools"} & application.keys())
+        if has_helper and self._strategy not in {"dedicated", "exclusive_application_role"}:
             raise CustodyError("Callbacks require the explicit helper profile strategy.")
         roster, members = application.get("roster"), application.get("members")
         helper = _field(application.get("helper"), "member")
-        if (not isinstance(roster, list) or not isinstance(members, list) or not roster
-                or len(roster) != len(members) or not isinstance(helper, dict)):
+        if (not isinstance(roster, list) or not isinstance(members, list)
+                or len(roster) != len(members) or has_helper and not isinstance(helper, dict)):
             raise CustodyError("Callbacks require the same finite roster and native member selection.")
         self._fixed = {}
         self._member_bindings = {}
@@ -154,14 +155,16 @@ class SelectedApplicationCallbacks:
             native_members.add(binding["member"])
             if _signature(binding) == _signature(helper):
                 selected.append(row)
-        if len(selected) != 1:
-            raise CustodyError("Callback helper selection must identify one exact original roster row.")
-        self.helper_identity, self.source_profile = selected[0]["identity"], selected[0]["profile"]
-        if self.source_profile not in self._source["profiles"]:
-            raise CustodyError("The selected helper has no original inline source profile.")
-        source = self._source["profiles"][self.source_profile]
-        if not isinstance(source, dict) or "realm_profile" in source:
-            raise CustodyError("The selected helper requires its original inline source profile.")
+        self.helper_identity = self.source_profile = None
+        if has_helper:
+            if len(selected) != 1:
+                raise CustodyError("Callback helper selection must identify one exact original roster row.")
+            self.helper_identity, self.source_profile = selected[0]["identity"], selected[0]["profile"]
+            if self.source_profile not in self._source["profiles"]:
+                raise CustodyError("The selected helper has no original inline source profile.")
+            source = self._source["profiles"][self.source_profile]
+            if not isinstance(source, dict) or "realm_profile" in source:
+                raise CustodyError("The selected helper requires its original inline source profile.")
         self._member_classes = {}
         declarations = application.get("member_classes", [])
         if not isinstance(declarations, list):
@@ -191,6 +194,8 @@ class SelectedApplicationCallbacks:
             _signature(item)
             self._member_classes[item["id"]] = deepcopy(item)
             profiles.add(item["profile"])
+        if not roster and not self._member_classes:
+            raise CustodyError("An empty callback roster requires selected native member classes.")
         self._definition = None
         self._profile = None
         self._invalidated = False
@@ -204,6 +209,25 @@ class SelectedApplicationCallbacks:
         """Selected native declaration data, never an admission or runtime fact."""
         self._current()
         return deepcopy(self._member_classes)
+
+    def require_completed_classes(self, setup_bytes):
+        """Bind selected callbacks to the retained native owner's class list.
+
+        Restore supplies its exact completed bytes before constructing a runtime.
+        Fresh completion uses the same comparison in the existing finalizer join.
+        """
+        self._current()
+        setup = _json(setup_bytes)
+        owner = setup.get("native_owner") if isinstance(setup, dict) else None
+        native = owner.get("native_host") if isinstance(owner, dict) else None
+        if native is None and not self._member_classes:
+            # Class-free legacy carriers have no callback class join. Native
+            # still validates their complete owner and installed policy.
+            return
+        if (not isinstance(native, dict)
+                or not _same_member_classes(list(self._member_classes.values()), native.get("member_classes", []))):
+            raise CustodyError("The completed native owner differs from the selected callback classes.")
+        self._current()
 
     def dynamic_catalog(self, deployment):
         """Bind compiled class callbacks without creating a template identity."""
@@ -276,6 +300,8 @@ class SelectedApplicationCallbacks:
     @property
     def helper_profile(self):
         self._current()
+        if self.helper_identity is None:
+            return None
         if self._profile is None:
             raise CustodyError("The native roster context has not supplied its helper profile.")
         return self._profile
@@ -303,6 +329,11 @@ class SelectedApplicationCallbacks:
         source_profiles = self._source["profiles"]
         if not source_profiles.keys() <= profiles.keys():
             raise CustodyError("The native definition lost an original callback profile.")
+        if self.helper_identity is None:
+            if profiles.keys() != source_profiles.keys() or not _contains(self._source, definition):
+                raise CustodyError("The native callback definition changed explicit original configuration.")
+            self._definition = deepcopy(definition)
+            return
         if self._strategy == "dedicated":
             source = profiles[self.source_profile]
             candidates = [name for name, profile in profiles.items()
@@ -345,10 +376,12 @@ class SelectedApplicationCallbacks:
         self._current()
         if not isinstance(by_profile, Mapping):
             raise TypeError("Callbacks require the original fixed profile map.")
-        source = by_profile.get(self.source_profile)
-        if (not isinstance(source, dict) or source.get("identity") != self.helper_identity
-                or source.get("profile") != self.source_profile):
-            raise CustodyError("The original fixed helper callback row changed.")
+        source = None
+        if self.helper_identity is not None:
+            source = by_profile.get(self.source_profile)
+            if (not isinstance(source, dict) or source.get("identity") != self.helper_identity
+                    or source.get("profile") != self.source_profile):
+                raise CustodyError("The original fixed helper callback row changed.")
         profile, labels = _field(draft, "profile_name"), _field(draft, "labels")
         # Core's reserved labels identify the native member, not the logical
         # identity in the application roster. Keep the selected opaque binding;
@@ -360,8 +393,9 @@ class SelectedApplicationCallbacks:
                 or ("profile_name" in labels and labels["profile_name"] != profile)
                 or ("meerkat_id" in labels and labels["meerkat_id"] != member)):
             raise CustodyError("The callback changed its selected native member labels.")
-        helper_member = self._member_bindings[self.helper_identity]["member"]
-        if member == helper_member or profile == self._profile:
+        helper_member = (None if self.helper_identity is None else
+            self._member_bindings[self.helper_identity]["member"])
+        if self.helper_identity is not None and (member == helper_member or profile == self._profile):
             if (self._profile is None or member != helper_member
                     or profile != self._profile):
                 raise CustodyError("The callback does not match the native-observed selected helper.")

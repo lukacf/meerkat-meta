@@ -238,11 +238,53 @@ class LocalApplicationRegistry:
             if self.runtime_target is None:
                 return {}
             plan = self._current_plan(guide_id, guide_version)
-            if ordinary_application(plan) and self.ordinary_meta_gateway is None:
-                # This missing launcher input cannot be repaired by seeding a
-                # workspace. Refuse before reserving or copying build source.
+            from .compiler import _product_application_supported
+            from .blueprint import Blueprint
+            if (ordinary_application(plan) and self.ordinary_meta_gateway is None
+                    and not _product_application_supported(Blueprint.model_validate(plan),
+                        runtime_target=self._runtime_target_for_blueprint(plan))):
                 raise CustodyError(ORDINARY_SOURCE_UNAVAILABLE)
             return {"runtime_target": self._runtime_target_for_blueprint(plan)}
+
+    def legacy_ordinary_continuation(self, guide_id, build_id):
+        """Read the predecessor's signed route and retain its launcher gateway.
+
+        A changed guide may need newly compiled source, but it does not migrate
+        an ordinary installation to Connect. Authored file presence alone never
+        selects this route: the source must be in the host-signed baseline.
+        """
+        from .local_application_recovery import _pin
+        from .ordinary_application_source import _source_files
+        from .application_inventory_source import selects_application_inventory
+        import json
+        with self._lock:
+            self._require_registry()
+            guide_id, build_id = _identity(guide_id), _identity(build_id)
+            directory = self.implementation._directory(guide_id, build_id)
+            frozen = json.loads(_pin(directory / "input.json").read())
+            if frozen.get("guide_id") != guide_id:
+                raise CustodyError("Continue only this guide's original Build source.")
+            old = ImplementationWorkspace(directory / "workspace", frozen["blueprint"])
+            with old._locked():
+                state = old._state()
+                files = old._files(state)
+                selected = {item.path: item.as_bytes() for item in files}
+                candidate = old._runtime_candidate(state, files)
+                target = parse_candidate_selection(candidate) if candidate is not None else None
+                if (type(target) is not MetaToolkitRuntimeTarget
+                        or not ordinary_application(frozen["blueprint"])
+                        or selects_application_inventory(selected)):
+                    return False
+                if self.ordinary_meta_gateway is None:
+                    raise CustodyError(ORDINARY_SOURCE_UNAVAILABLE)
+                expected = _source_files(guide_id, self.ordinary_meta_gateway)
+                if (candidate != frozen.get("runtime_candidate")
+                        or not expected.keys() <= set(old._protected_application_paths(state))
+                        or any(selected.get(name) != data for name, data in expected.items())):
+                    raise CustodyError("Continue with the original ordinary gateway and protected Console source.")
+                self.ordinary_meta_gateway.read()
+            self._require_registry()
+            return True
 
     def _retained_ordinary_application(self, guide_id, deployment_id):
         self._require_registry()
@@ -311,9 +353,13 @@ class LocalApplicationRegistry:
             # Retain this attempt before the first possible source publication.
             self._attempts.add(key)
             factory = None
+            from .application_inventory_source import selects_application_inventory
+            authored_inventory = selects_application_inventory(
+                {"deployment.json": workspace.read_file("deployment.json").encode("utf-8")})
             if manual is not None:
                 host = manual
-            elif ordinary_application(plan) and self.ordinary_meta_gateway is not None:
+            elif (not authored_inventory and ordinary_application(plan)
+                    and self.ordinary_meta_gateway is not None):
                 if previous is not None:
                     if type(previous.host) is not OrdinaryApplicationHost:
                         raise CustodyError("Continue the original ordinary application source owner.")
@@ -551,6 +597,8 @@ class LocalApplicationRegistry:
         host = self.host_for_build(guide_id, build_id)
         if host is None:
             return
+        from .local_application_recovery import bind_accepted_build_inventory
+        bind_accepted_build_inventory(self, host, guide_id, build_id, publish=True)
         # Start would refuse host-managed models without this launcher's
         # application model configuration; Install says so before any worker.
         from .connect_application_startup import _managed_model_classes
@@ -779,6 +827,9 @@ class LocalApplicationRegistry:
         if self._reconnect_status(self.deployment, guide_id, deployment_id) is not None:
             raise CustodyError(OWNER_RECONNECT_UPDATE)
         host = self.selected_host(guide_id, deployment_id)
+        if type(host) is ForgeApplicationHost and "helper_identity" not in host._inventory:
+            from .connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+            raise CustodyError(HELPERLESS_UPDATE_UNAVAILABLE)
         directory = self.deployment._directory(guide_id, deployment_id)
         if type(host) is OrdinaryApplicationHost:
             _, root, update = inspect_transaction(directory, update_id)

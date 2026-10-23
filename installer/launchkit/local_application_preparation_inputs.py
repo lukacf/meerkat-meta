@@ -119,17 +119,21 @@ class LocalApplicationPreparationOwner:
 
     def _initial_choices(self, guide_id, deployment_id, console, console_pin):
         """The original concrete local source defaults, without publication."""
+        helper_identity = self.host._inventory.get("helper_identity")
         choices = {"deployment_id": deployment_id, "guide_id": guide_id,
             "console_operator": self.host.console_operator_declaration(),
             "principal_domain": "meta-forge-installation:" + deployment_id,
             "initial_setup_identities": [row["identity"] for row in self.host._inventory["roster"]
-                if row["identity"] != self.host._inventory["helper_identity"]],
+                if row["identity"] != helper_identity],
             "console_setup": console, "console_setup_source": None if console_pin is None else console_pin.pin(),
             "namespace": deployment_id, "generation": 1,
             "backend_generation": "forge-workgraph:" + deployment_id,
             "output_audience": "forge-console:" + deployment_id,
             "limits": {"setup_timeout_ms": _LOCAL_SETUP_TIMEOUT_MS, "max_workers": 4,
                 "max_effect_attempts": 4, "admission_timeout_ms": 10000}}
+        if helper_identity is None:
+            for name in ("initial_setup_identities", "backend_generation", "output_audience", "limits"):
+                del choices[name]
         model = self.factory._selected_model_configuration()
         if model is not None:
             choices["model_configuration"] = model
@@ -223,14 +227,15 @@ class LocalApplicationPreparationOwner:
         choices = self._initial_choices(admission.guide_id, admission.deployment_id, console, console_pin)
         choice_pin, template = _pin(home / "local-application-policy.json"), _pin(home / "activation-template.json")
         retained = _json(choice_pin.read())
-        limits = retained.get("limits") if isinstance(retained, dict) else None
-        timeout_ms = limits.get("setup_timeout_ms") if isinstance(limits, dict) else None
-        if (type(timeout_ms) is not int
-                or timeout_ms not in {_LEGACY_LOCAL_SETUP_TIMEOUT_MS, _LOCAL_SETUP_TIMEOUT_MS}):
-            raise CustodyError("The original local setup policy or activation source changed.")
-        # Recognize the exact older default without upgrading its retained
-        # choice, prepared plan or any already admitted operation's deadline.
-        choices["limits"]["setup_timeout_ms"] = timeout_ms
+        if "limits" in choices:
+            limits = retained.get("limits") if isinstance(retained, dict) else None
+            timeout_ms = limits.get("setup_timeout_ms") if isinstance(limits, dict) else None
+            if (type(timeout_ms) is not int
+                    or timeout_ms not in {_LEGACY_LOCAL_SETUP_TIMEOUT_MS, _LOCAL_SETUP_TIMEOUT_MS}):
+                raise CustodyError("The original local setup policy or activation source changed.")
+            # Recognize the exact older default without upgrading its retained
+            # choice, prepared plan or any already admitted operation's deadline.
+            choices["limits"]["setup_timeout_ms"] = timeout_ms
         if (choice_pin.read() != _encode(choices)
                 or template.read() != _encode({"activation_id": admission.deployment_id})):
             raise CustodyError("The original local setup policy or activation source changed.")
@@ -329,7 +334,7 @@ class LocalApplicationPreparationOwner:
         attempt = _pin(inputs.inventory_attempt_path)
         completion = _pin(Path(str(inputs.inventory_attempt_path) + ".outcome.json"))
         record = _json(attempt.read())
-        names = ("config/mob.toml", "application/tool-policy.json", "application/configuration.json",
+        names = ("config/mob.toml", self.host._policy_source_path, "application/configuration.json",
             "application/console.json", "config/access.toml")
         if (not isinstance(record, dict) or not isinstance(record.get("input_files"), list)
                 or len(record["input_files"]) != 2 + len(names)
@@ -447,21 +452,24 @@ class LocalApplicationPreparationOwner:
         human = choices["console_operator"]
         administrator = _principal("runtime_host", "installation-administrator", domain)
         ingress = _principal("runtime_host", "console-ingress", domain)
-        members, routes, controllers, setup_requests = [], [], [{"target": {"kind": "helper"},
-            "issuance_id": "forge:" + deployment + ":helper-controller"}], []
+        has_helper = "helper_identity" in original
+        members, routes, controllers, setup_requests = [], [], [], []
+        if has_helper:
+            controllers.append({"target": {"kind": "helper"},
+                "issuance_id": "forge:" + deployment + ":helper-controller"})
         helper = None
         for index, row in enumerate(actual["members"]):
             logical = _principal("shared_agent", row["identity"], domain)
             binding = deepcopy(row["member"])
             members.append({"member": binding, "logical_owner": logical,
                 "context_generation": 1, "audience": {"audience": "principal", "principal": deepcopy(human)}})
-            if row["identity"] == original["helper_identity"]:
+            if has_helper and row["identity"] == original["helper_identity"]:
                 helper = {"member": binding, "ingress_actor": deepcopy(ingress),
                     "logical_executor": logical, "represented_subject": deepcopy(human),
                     "controller_parent": [], "operation_basis": {
                         "kind": "targeted_grant_lineages", "base": None, "targets": []}}
             else:
-                if row["identity"] not in choices["initial_setup_identities"]:
+                if has_helper and row["identity"] not in choices["initial_setup_identities"]:
                     raise CustodyError("Local defaults lost their explicit initial setup member selection.")
                 route = "forge-console-" + str(index)
                 routes.append({"id": route, "origin": {"kind": "local_console", "member": binding,
@@ -473,11 +481,11 @@ class LocalApplicationPreparationOwner:
                     "event_domain": {"authority": deepcopy(ingress), "namespace": "console-events"}})
                 controllers.append({"target": {"kind": "original_route", "route": route},
                     "issuance_id": "forge:" + deployment + ":controller:" + str(index)})
-                setup_requests.append({"member": binding, "route": route,
-                    "issuance_id": "forge:" + deployment + ":setup:" + str(index)})
-        if helper is None or not routes:
+                if has_helper:
+                    setup_requests.append({"member": binding, "route": route,
+                        "issuance_id": "forge:" + deployment + ":setup:" + str(index)})
+        if has_helper and (helper is None or not routes):
             raise CustodyError("Local setup needs its dedicated helper and explicit Console application route.")
-        audience = choices["output_audience"]
         result = {"deployment_root": self._inputs.supervisor.destination,
             "owner": {"deployment": deployment, "components": [], "channels": [], "native_host": {
                 "realm": actual["realm_id"], "grant_administrator": administrator,
@@ -485,21 +493,29 @@ class LocalApplicationPreparationOwner:
                 "ingress_domain": {"authority": deepcopy(ingress), "namespace": "console-ingress"},
                 "members": members, "routes": routes}},
             "startup": {"kind": "initialize", "namespace": choices["namespace"], "generation": choices["generation"]},
-            "authorities": {"controllers": controllers, "agent_setup": setup_requests,
+            "authorities": {"controllers": controllers},
+            "realm_storage": {"context_root": str(self._inputs.supervisor.destination),
+                "state_root": str(self._inputs.supervisor.destination / ".mobkit/state")},
+            "output": str(self._inputs.startup_selection_path.parent / "prepared-application"),
+            "hold_timeout_ms": 180000, "source_id": "forge-local-installation:" + deployment}
+        if not has_helper:
+            # The same recovered-plan join checks these deterministic original
+            # declarations. There are no optional helper choices to recover.
+            inventory.authenticate()
+            self._require(self._guide_id, self._deployment_id)
+            return result
+        audience = choices["output_audience"]
+        result["authorities"].update({"agent_setup": setup_requests,
                 "helper_report": {"member": deepcopy(helper["member"]),
                     "issuance_id": "forge:" + deployment + ":helper-report",
                     "public_issuance_id": "forge:" + deployment + ":helper-public-service"},
                 "helper_mcp": {"issuance_id": "forge:" + deployment + ":helper-mcp"},
-                "helper_catalog": {"issuance_id": "forge:" + deployment + ":helper-catalog"}},
-            "realm_storage": {"context_root": str(self._inputs.supervisor.destination),
-                "state_root": str(self._inputs.supervisor.destination / ".mobkit/state")},
-            "helper": helper, "acquisition": {"console_setup": deepcopy(choices["console_setup"]),
+                "helper_catalog": {"issuance_id": "forge:" + deployment + ":helper-catalog"}})
+        result.update({"helper": helper, "acquisition": {"console_setup": deepcopy(choices["console_setup"]),
                 "backend_generation": choices["backend_generation"],
                 "proposal_ceiling": {"actions": [], "services": [], "frontends": [],
                     "output_audiences": [audience]}, "output_audience": [audience],
-                "limits": deepcopy(choices["limits"])},
-            "output": str(self._inputs.startup_selection_path.parent / "prepared-application"),
-            "hold_timeout_ms": 180000, "source_id": "forge-local-installation:" + deployment}
+                "limits": deepcopy(choices["limits"])}})
         # Recovery preserves the optional choice from the authenticated original
         # Fresh plan. An older custom policy may allow the account tool without
         # having selected its parent. All other declarations use the same

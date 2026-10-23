@@ -321,8 +321,8 @@ async def prepare_application(service, guide_id, deployment_id, *, application_h
             project_lease=lease, require_owner_current=owner_current,
             custody_directory=directory / ("application-preparation-source-" + str(uuid.uuid4())))
         source = custody.source
-        policy = dict(application_host._protected)["application/tool-policy.json"]
-        if policy.read() != package["application/tool-policy.json"][0]:
+        policy = dict(application_host._protected)[application_host._policy_source_path]
+        if policy.read() != package[application_host._policy_source_path][0]:
             raise CustodyError("Preparation lost the exact accepted original source policy.")
 
         def files_current():
@@ -346,7 +346,7 @@ async def prepare_application(service, guide_id, deployment_id, *, application_h
             require_current=owner_current, require_filesystem_current=files_current,
             provision_attempt_path=paths["provision_attempt_path"])
         source_files = tuple(source.exact_file(name) for name in (
-            "config/mob.toml", "application/tool-policy.json", "application/configuration.json",
+            "config/mob.toml", application_host._policy_source_path, "application/configuration.json",
             "application/console.json", "config/access.toml"))
         outcome = await caller.lower_application_inventory(application_host._inventory_pin,
             attempt_path=extra["inventory"], source_files=source_files)
