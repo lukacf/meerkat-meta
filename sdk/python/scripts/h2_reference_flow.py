@@ -195,19 +195,41 @@ def main() -> int:
             _require_client(), "POST", "/rpc/status", {"request_id": "h2-status"}
         )
         envelope = body.get("jsonrpc_envelope")
+        if not isinstance(envelope, dict):
+            raise AssertionError(f"status envelope should be object: {envelope}")
+        _assert_eq(envelope.get("jsonrpc"), "2.0", "status jsonrpc mismatch")
+        _assert_eq(envelope.get("id"), "h2-status", "status id mismatch")
+        result = envelope.get("result")
+        if not isinstance(result, dict):
+            raise AssertionError(f"status result should be object: {result}")
         _assert_eq(
-            envelope,
+            {key: result.get(key) for key in ("contract_version", "running", "loaded_modules")},
             {
-                "jsonrpc": "2.0",
-                "id": "h2-status",
-                "result": {
-                    "contract_version": EXPECTED_CONTRACT_VERSION,
-                    "running": True,
-                    "loaded_modules": ["routing"],
-                },
+                "contract_version": EXPECTED_CONTRACT_VERSION,
+                "running": True,
+                "loaded_modules": ["routing"],
             },
             "status envelope mismatch",
         )
+        # meta/status also carries the gateway's storage census. The reference
+        # app boots an ephemeral gateway, so its blob store is declared
+        # ephemeral and every composed slot is listed.
+        storage = result.get("storage")
+        if not isinstance(storage, dict):
+            raise AssertionError(f"status storage should be the storage census: {storage}")
+        _assert_eq(
+            storage.get("blob_durability"),
+            "declared_ephemeral",
+            "status storage blob_durability mismatch",
+        )
+        _assert_eq(
+            storage.get("blob_store_persistent"),
+            False,
+            "status storage blob_store_persistent mismatch",
+        )
+        slots = storage.get("slots")
+        if not isinstance(slots, list) or not slots:
+            raise AssertionError(f"status storage should list its slots: {storage}")
         if body.get("typed_error") is not None:
             raise AssertionError(f"status typed call should not fail: {body['typed_error']}")
         _assert_eq(
