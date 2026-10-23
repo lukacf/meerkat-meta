@@ -64,6 +64,12 @@ const SHAPE_TEST: &str = "a_host_can_neither_add_nor_drop_the_agent_customizer";
 const REQUIRE_TEST: &str = "a_host_that_needs_a_customizer_names_what_to_configure";
 const AFTER_CREATE_TEST: &str = "each_customized_build_tells_after_create_once";
 const AFTER_CREATE_FAILS_TEST: &str = "a_failing_after_create_leaves_the_build_standing";
+const SELF_SEND_TEST: &str =
+    "an_after_create_that_sends_to_its_own_identity_does_not_wait_out_the_callback_window";
+/// How long the send made inside an `after_create` may take to answer. The
+/// gateway waits up to 130 seconds for a callback, so a send that waits for
+/// that callback's own identity lock answers only after this.
+const SELF_SEND_WINDOW: Duration = Duration::from_mins(1);
 /// What the runtime logs when a customizer's `after_create` fails.
 const AFTER_CREATE_WARNING: &str = "the agent customizer's after_create failed";
 
@@ -368,6 +374,10 @@ struct Run {
     reset: Option<Value>,
     /// The gateway host process's stderr.
     stderr: String,
+    /// The response to the send made inside an `after_create`, and how long
+    /// it took.
+    self_send: Option<Value>,
+    self_send_elapsed: Option<Duration>,
 }
 
 impl Run {
@@ -463,23 +473,40 @@ fn answer_callback(method: &str, params: &Value, fail_after_create: bool) -> Res
     }
 }
 
+/// What the driver does once the init settles ready with an identity roster.
+#[derive(Default)]
+struct Script<'a> {
+    /// Member operations, run in order.
+    ops: &'a [&'a str],
+    /// Refuse the SDK customizer's `after_create`.
+    fail_after_create: bool,
+    /// The SDK `after_create` calls to wait for before the run ends. The
+    /// runtime may tell the customizer after the operation has answered.
+    after_creates: usize,
+    /// At the first `after_create` after Ready, send to the identity, and
+    /// answer the `after_create` only once that send has answered.
+    send_inside_after_create: bool,
+}
+
 /// Drive the `mode` host as a child process of `test`, with an identity roster
 /// (`roster`) and an SDK customizer (`customizer`) registered at init, and
 /// reset the member once the init settles ready.
 fn drive(test: &str, mode: &str, roster: bool, customizer: bool) -> Run {
-    drive_ops(test, mode, roster, customizer, &["meta/reset"], false)
+    let ops = ["meta/reset"];
+    let script = Script {
+        ops: &ops,
+        ..Script::default()
+    };
+    drive_script(test, mode, roster, customizer, &script)
 }
 
-/// [`drive`] with the member operations `ops` run in order once the init
-/// settles ready, and the SDK's `after_create` failed when
-/// `fail_after_create`.
-fn drive_ops(
+/// [`drive`] running `script` once the init settles ready.
+fn drive_script(
     test: &str,
     mode: &str,
     roster: bool,
     customizer: bool,
-    ops: &[&str],
-    fail_after_create: bool,
+    script: &Script<'_>,
 ) -> Run {
     let dir = tempfile::tempdir().unwrap();
     let record = dir.path().join("record");
@@ -511,6 +538,14 @@ fn drive_ops(
         writeln!(stdin, "{value}").expect("write");
         stdin.flush().expect("flush");
     };
+    let op = |method: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": method,
+            "method": method,
+            "params": { "identity": IDENTITY },
+        })
+    };
     let mut params = json!({
         "init_protocol": "accepted_then_settled",
         "init_id": format!("agent-customizer-{mode}"),
@@ -533,17 +568,48 @@ fn drive_ops(
     let mut later_builds = 0;
     let mut sdk_after_create = Vec::new();
     let mut responses: Vec<(String, Value)> = Vec::new();
-    let mut pending = ops.iter();
+    let mut pending = script.ops.iter();
     let mut current: Option<&str> = None;
+    let mut ops_done = false;
+    // The id of the `after_create` held until the send made inside it
+    // answers, and that send's start, response and duration.
+    let mut held_after_create: Option<Value> = None;
+    let mut self_send_sent: Option<Instant> = None;
+    let mut self_send = None;
+    let mut self_send_elapsed = None;
     loop {
-        let remaining = BACKSTOP.saturating_sub(started.elapsed());
-        let line = match lines.recv_timeout(remaining) {
+        if ops_done
+            && sdk_after_create.len() >= script.after_creates
+            && held_after_create.is_none()
+            && (self_send_sent.is_none() || self_send.is_some())
+        {
+            break;
+        }
+        let mut wait = BACKSTOP.saturating_sub(started.elapsed());
+        if let Some(sent) = self_send_sent
+            && self_send.is_none()
+        {
+            wait = wait.min(SELF_SEND_WINDOW.saturating_sub(sent.elapsed()));
+        }
+        let line = match lines.recv_timeout(wait) {
             Ok(line) => line,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("{mode}: the gateway ended before the run did; seen {seen:?}")
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                panic!("{mode}: the run did not finish; seen {seen:?}")
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprint!(
+                    "{}",
+                    std::fs::read_to_string(&stderr_path).unwrap_or_default()
+                );
+                if matches!(error, mpsc::RecvTimeoutError::Timeout)
+                    && self_send_sent.is_some()
+                    && self_send.is_none()
+                {
+                    panic!(
+                        "{mode}: the send made inside after_create did not answer within \
+                         {SELF_SEND_WINDOW:?}; seen {seen:?}"
+                    )
+                }
+                panic!("{mode}: the run did not finish ({error:?}); seen {seen:?}")
             }
         };
         // The test harness of the host process may print before the first
@@ -572,8 +638,21 @@ fn drive_ops(
                         .unwrap_or_default()
                         .to_string(),
                 );
+                if script.send_inside_after_create && settled && self_send_sent.is_none() {
+                    held_after_create = Some(id);
+                    self_send_sent = Some(Instant::now());
+                    send(json!({
+                        "jsonrpc": "2.0",
+                        "id": "self-send",
+                        "method": "meta/send",
+                        "params": { "identity": IDENTITY, "content": "seed the session" },
+                    }));
+                    seen.push(message);
+                    continue;
+                }
             }
-            let reply = match answer_callback(method, &message["params"], fail_after_create) {
+            let reply = match answer_callback(method, &message["params"], script.fail_after_create)
+            {
                 Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
                 Err(error) => json!({ "jsonrpc": "2.0", "id": id,
                     "error": { "code": -32601, "message": error } }),
@@ -584,21 +663,28 @@ fn drive_ops(
             settled = true;
             let ready = message["params"]["outcome"] == "ready";
             seen.push(message);
-            if ready && roster {
-                append(&record, SETTLED);
-                current = pending.next().copied();
-                if let Some(method) = current {
-                    append(&record, &format!("driver op {method}"));
-                    send(json!({
-                        "jsonrpc": "2.0",
-                        "id": method,
-                        "method": method,
-                        "params": { "identity": IDENTITY },
-                    }));
-                    continue;
-                }
+            if !(ready && roster) {
+                break;
             }
-            break;
+            append(&record, SETTLED);
+            current = pending.next().copied();
+            match current {
+                Some(method) => {
+                    append(&record, &format!("driver op {method}"));
+                    send(op(method));
+                }
+                None => ops_done = true,
+            }
+            continue;
+        }
+        if message.get("method").is_none() && message["id"] == "self-send" {
+            self_send_elapsed = self_send_sent.map(|sent| sent.elapsed());
+            self_send = Some(message.clone());
+            if let Some(id) = held_after_create.take() {
+                send(json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null }));
+            }
+            seen.push(message);
+            continue;
         }
         if let Some(method) = current
             && message.get("method").is_none()
@@ -607,17 +693,14 @@ fn drive_ops(
             responses.push((method.to_string(), message.clone()));
             seen.push(message);
             current = pending.next().copied();
-            if let Some(method) = current {
-                append(&record, &format!("driver op {method}"));
-                send(json!({
-                    "jsonrpc": "2.0",
-                    "id": method,
-                    "method": method,
-                    "params": { "identity": IDENTITY },
-                }));
-                continue;
+            match current {
+                Some(method) => {
+                    append(&record, &format!("driver op {method}"));
+                    send(op(method));
+                }
+                None => ops_done = true,
             }
-            break;
+            continue;
         }
         seen.push(message);
     }
@@ -649,6 +732,8 @@ fn drive_ops(
         responses,
         reset,
         stderr,
+        self_send,
+        self_send_elapsed,
     }
 }
 
@@ -854,7 +939,12 @@ fn a_host_that_needs_a_customizer_names_what_to_configure() {
 fn each_customized_build_tells_after_create_once() {
     serve_if_host_process();
     let ops = ["meta/respawn", "meta/reset"];
-    let run = drive_ops(AFTER_CREATE_TEST, "wrap", true, true, &ops, false);
+    let script = Script {
+        ops: &ops,
+        after_creates: 3,
+        ..Script::default()
+    };
+    let run = drive_script(AFTER_CREATE_TEST, "wrap", true, true, &script);
     assert_eq!(run.outcome(), "ready", "{:?}", run.seen);
     let respawned = run.response("meta/respawn")["result"]["session_id"]
         .as_str()
@@ -864,37 +954,43 @@ fn each_customized_build_tells_after_create_once() {
         .as_str()
         .unwrap_or_else(|| panic!("the reset succeeds: {:?}", run.responses))
         .to_string();
-    let told = run.after_creates();
-    let sessions: Vec<&str> = told
-        .iter()
-        .map(|(_, session, _)| session.as_str())
-        .collect();
-    assert_eq!(
-        sessions,
-        [respawned.as_str(), respawned.as_str(), succeeded.as_str()],
-        "the bootstrap's session, the same session at the respawn, the reset's \
-         successor: {:?}",
-        run.lines
-    );
     assert_ne!(respawned, succeeded, "the reset starts a fresh session");
+    let told = run.after_creates();
+    assert_eq!(told.len(), 3, "one after_create per build: {:?}", run.lines);
     assert!(
         told.iter().all(|(_, _, inner)| inner == "ok"),
         "{:?}",
         run.lines
     );
-    let (settled, respawn, reset) = (
-        run.at(SETTLED),
-        run.at("driver op meta/respawn"),
-        run.at("driver op meta/reset"),
-    );
-    let positions: Vec<usize> = told.iter().map(|(at, _, _)| *at).collect();
+    // The bootstrap's build is told before the init settles. The respawn's
+    // and the reset's may be told after their operation answered.
+    let (bootstrap_at, bootstrap_session, _) = &told[0];
     assert!(
-        positions[0] < settled && (respawn..reset).contains(&positions[1]) && positions[2] > reset,
-        "one after_create per build, in its own phase: {:?}",
+        *bootstrap_at < run.at(SETTLED) && bootstrap_session == &respawned,
+        "the bootstrap's build is told of the session the respawn resumes: {:?}",
         run.lines
     );
+    let mut later: Vec<&str> = told[1..]
+        .iter()
+        .map(|(_, session, _)| session.as_str())
+        .collect();
+    later.sort_unstable();
+    let mut expected = [respawned.as_str(), succeeded.as_str()];
+    expected.sort_unstable();
     assert_eq!(
-        run.sdk_after_create, sessions,
+        later, expected,
+        "the respawn's build is told of the same session, the reset's of its successor: {:?}",
+        run.lines
+    );
+    let mut wrapper_sessions: Vec<&str> = told
+        .iter()
+        .map(|(_, session, _)| session.as_str())
+        .collect();
+    let mut sdk_sessions: Vec<&str> = run.sdk_after_create.iter().map(String::as_str).collect();
+    wrapper_sessions.sort_unstable();
+    sdk_sessions.sort_unstable();
+    assert_eq!(
+        sdk_sessions, wrapper_sessions,
         "the wrapped SDK customizer is told of each session"
     );
 }
@@ -905,14 +1001,14 @@ fn each_customized_build_tells_after_create_once() {
 #[test]
 fn a_failing_after_create_leaves_the_build_standing() {
     serve_if_host_process();
-    let run = drive_ops(
-        AFTER_CREATE_FAILS_TEST,
-        "wrap",
-        true,
-        true,
-        &["meta/respawn"],
-        true,
-    );
+    let ops = ["meta/respawn"];
+    let script = Script {
+        ops: &ops,
+        fail_after_create: true,
+        after_creates: 2,
+        ..Script::default()
+    };
+    let run = drive_script(AFTER_CREATE_FAILS_TEST, "wrap", true, true, &script);
     assert_eq!(run.outcome(), "ready", "{:?}", run.seen);
     let respawned = run.response("meta/respawn")["result"]["session_id"]
         .as_str()
@@ -931,5 +1027,48 @@ fn a_failing_after_create_leaves_the_build_standing() {
         run.stderr.matches(AFTER_CREATE_WARNING).count(),
         2,
         "one warning per refused after_create"
+    );
+}
+
+/// The runtime tells the customizer `after_create` with the identity's
+/// lifecycle lock released, so an `after_create` that sends to its own
+/// identity is answered at once. The driver answers the respawn's
+/// `after_create` only after its own `meta/send` to the identity returned.
+#[test]
+fn an_after_create_that_sends_to_its_own_identity_does_not_wait_out_the_callback_window() {
+    serve_if_host_process();
+    let ops = ["meta/respawn"];
+    let script = Script {
+        ops: &ops,
+        after_creates: 2,
+        send_inside_after_create: true,
+        ..Script::default()
+    };
+    let run = drive_script(SELF_SEND_TEST, "wrap", true, true, &script);
+    assert_eq!(run.outcome(), "ready", "{:?}", run.seen);
+    let sent = run
+        .self_send
+        .as_ref()
+        .unwrap_or_else(|| panic!("the driver sent inside after_create: {:?}", run.seen));
+    assert!(
+        sent["result"].is_object(),
+        "the send to the identity is admitted: {sent}"
+    );
+    let elapsed = run.self_send_elapsed.expect("the send was timed");
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the send answered in {elapsed:?}, inside the callback window"
+    );
+    assert!(
+        run.response("meta/respawn")["result"]["session_id"].is_string(),
+        "the respawn succeeds: {:?}",
+        run.responses
+    );
+    let told = run.after_creates();
+    assert_eq!(told.len(), 2, "{:?}", run.lines);
+    assert!(
+        told.iter().all(|(_, _, inner)| inner == "ok"),
+        "{:?}",
+        run.lines
     );
 }
