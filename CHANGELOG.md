@@ -63,6 +63,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Durable worker profiles (meerkat 0.9.5): a profile's `durable = true`
+  reaches Meerkat unchanged from `mob.toml`, and the mobpack editor document
+  carries it as the member key `durable`, present only when true. The export
+  writes it back, `update_member` accepts a boolean `durable` patch, and
+  validation refuses a member whose `durable` disagrees with `mob.toml`
+  (`editor_profile_durable_mismatch`) or is not a boolean
+  (`invalid_durable`). Meerkat's refusal of a durable profile on a mob whose
+  session service keeps no persistent sessions
+  (`MobError::NonDurableService`) is read typed, as the new
+  `BridgeError::NonDurableService`: an identity wake answers it as
+  `HostRejectedBuild` with a reason that names the remedy and never retries
+  it, and the worker-plane `meta/ensure_member` answers Meerkat's own code
+  (`CAPABILITY_UNAVAILABLE`, `-32020`) and data
+  (`kind = "mob_non_durable_service"`) instead of `-32602`.
+- A mob runtime composed with a WorkGraph service answers Meerkat's resume
+  check for durable workers from that WorkGraph. Meerkat asks it before it
+  continues an interrupted run of any member spawned with a durable
+  identity: the members of a `durable = true` profile, and every
+  identity-first member. Meta checks that the worker still holds its work.
+  A run dispatched for an item is superseded when the item lives outside the
+  mob's realm, ended or is gone, when another owner claimed it, when the
+  worker's lease on it lapsed, or when its attention binding stopped or now
+  targets another owner. A run that named no item is superseded when a claim
+  the worker holds lapsed. A lapsed lease is committed first, so the item can
+  be claimed again, and every later attempt of the same resume answers
+  superseded too. A WorkGraph read fault, or an attention projection that
+  does not decode, answers unavailable: Meerkat asks again, up to three
+  attempts, before it settles the run the same way.
 - The stdio `meta/status` names why a mob's actor stopped: `mob_failure`,
   present only once the actor has stopped, beside `mob_state`, which stays
   the last phase the actor published. A fail-stopped actor keeps its last

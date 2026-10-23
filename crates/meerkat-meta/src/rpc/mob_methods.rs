@@ -1012,16 +1012,26 @@ pub(super) async fn handle_ensure_member(
                         error: None,
                     }
                 }
-                Err(err) => JsonRpcResponse {
-                    jsonrpc: JSONRPC_VERSION.to_string(),
-                    id: response_id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32602,
-                        message: format!("ensure_member failed: {err}"),
-                        data: None,
-                    }),
-                },
+                Err(err) => {
+                    match crate::identity_first::bridge::non_durable_service_refusal(&err) {
+                        // A durable profile on a mob whose session service keeps
+                        // no persistent sessions: meerkat's closed refusal keeps
+                        // its own code and data (`CAPABILITY_UNAVAILABLE`,
+                        // `data.kind = "mob_non_durable_service"`), so a caller
+                        // can tell it from a retryable failure.
+                        Some((refusal, _)) => mob_declaration_error(response_id, refusal),
+                        None => JsonRpcResponse {
+                            jsonrpc: JSONRPC_VERSION.to_string(),
+                            id: response_id,
+                            result: None,
+                            error: Some(JsonRpcError {
+                                code: -32602,
+                                message: format!("ensure_member failed: {err}"),
+                                data: None,
+                            }),
+                        },
+                    }
+                }
             }
         }
         _ => JsonRpcResponse {
@@ -3879,6 +3889,93 @@ mod member_declaration_error_parity_tests {
             code, -32602,
             "an unclassified MobError must not borrow a classified code"
         );
+    }
+
+    /// A durable profile on a mob whose session service keeps no persistent
+    /// sessions keeps meerkat's closed refusal: its capability code and the
+    /// member and profile it names.
+    #[test]
+    fn a_durable_profile_refusal_keeps_its_code_and_typed_data() {
+        let (code, data) = error_for(&meerkat_mob::MobError::NonDurableService {
+            member_id: meerkat_mob::AgentIdentity::from("worker"),
+            profile: meerkat_mob::ProfileName::from("durable-worker"),
+        });
+        assert_eq!(
+            code,
+            i64::from(ErrorCode::CapabilityUnavailable.jsonrpc_code())
+        );
+        let data = data.expect("the refusal names the member and the profile");
+        assert_eq!(data["kind"], serde_json::json!("mob_non_durable_service"));
+        assert_eq!(data["member_id"], serde_json::json!("worker"));
+        assert_eq!(data["profile"], serde_json::json!("durable-worker"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod durable_profile_refusal_tests {
+    //! A profile that declares `durable = true` on a mob whose session
+    //! service keeps no persistent sessions: the worker-plane ensure answers
+    //! meerkat's typed refusal, not the generic invalid-params text.
+
+    use std::sync::Arc;
+
+    use meerkat_contracts::ErrorCode;
+
+    #[tokio::test]
+    async fn ensure_member_answers_meerkats_durable_profile_refusal() {
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "durable-profile-refusal"
+
+[profiles.worker]
+model = "gpt-5.5"
+durable = true
+"#,
+        )
+        .expect("definition parses");
+        // The default composition runs ephemeral sessions, which a durable
+        // profile cannot use.
+        let runtime = crate::unified_runtime::UnifiedRuntime::builder()
+            .definition(definition)
+            .default_llm_client(Arc::new(meerkat_client::TestClient::for_provider(
+                meerkat_core::Provider::OpenAI,
+            )))
+            .build()
+            .await
+            .expect("runtime builds");
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "durable-profile",
+            "method": "meta/ensure_member",
+            "params": { "role": "worker", "agent_identity": "worker-1" },
+        })
+        .to_string();
+        let raw = crate::rpc::handle_unified_rpc_json(
+            &runtime,
+            &request,
+            std::time::Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
+        let response: serde_json::Value =
+            serde_json::from_str(&raw).expect("router must answer with JSON");
+        let error = response
+            .get("error")
+            .expect("the spawn of a durable profile is refused");
+        assert_eq!(
+            error["code"],
+            serde_json::json!(ErrorCode::CapabilityUnavailable.jsonrpc_code()),
+            "{response}"
+        );
+        assert_eq!(
+            error["data"]["kind"],
+            serde_json::json!("mob_non_durable_service"),
+            "{response}"
+        );
+        assert_eq!(error["data"]["profile"], serde_json::json!("worker"));
     }
 }
 

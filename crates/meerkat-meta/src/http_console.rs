@@ -10891,7 +10891,22 @@ async fn handle_console_runtime_rpc_with_visibility(
                     };
                     response_value(response_id, Some(body), None)
                 }
-                Err(err) => internal_error(response_id, format!("ensure_member failed: {err}")),
+                // A durable profile on a mob whose session service keeps no
+                // persistent sessions keeps meerkat's typed refusal, the same
+                // rendering the unified RPC path uses.
+                Err(err) => match crate::identity_first::bridge::non_durable_service_refusal(&err)
+                {
+                    Some((refusal, _)) => serde_json::to_value(
+                        crate::rpc::mob_methods::mob_declaration_error(
+                            response_id.clone(),
+                            refusal,
+                        ),
+                    )
+                    .unwrap_or_else(|error| {
+                        internal_error(response_id, format!("ensure_member failed: {error}"))
+                    }),
+                    None => internal_error(response_id, format!("ensure_member failed: {err}")),
+                },
             }
         })
         .await,
