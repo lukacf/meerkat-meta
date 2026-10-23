@@ -1,8 +1,14 @@
 //! The mob announcement store contract.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+use super::declarations::{
+    DeclarationRecordKind, DeclarationRefusal, DeclarationStatus, Declarations, PutRoleTemplate,
+    RoleTemplate,
+};
 
 use super::sources::{
     AdvanceSource, AnnouncementSource, AuditQuery, AuditRow, MemberFacts, PutSource,
@@ -10,10 +16,10 @@ use super::sources::{
 };
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
-    BatchId, BatchPosition, BatchQuery, BatchStateTag, ExpiryReport, Member, MemberBacklog,
-    MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport, PutSubscription, Result,
-    SealingPolicy, SourceId, SourceKey, Subscription, SubscriptionChange,
-    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, Topic,
+    BatchId, BatchPosition, BatchQuery, BatchStateTag, ChildMemberLimits, ExpiryReport, Member,
+    MemberBacklog, MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport, PutSubscription,
+    Result, SealingPolicy, SourceId, SourceKey, Subscription, SubscriptionChange,
+    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, SubscriptionState, Topic,
 };
 
 /// Durable mob announcements, member subscriptions and delivery batches.
@@ -498,6 +504,130 @@ pub trait AnnouncementStore: Send + Sync {
         let _ = query;
         Err(no_sources())
     }
+
+    /// [`Self::announce_with_facts`] that first makes, in the same
+    /// transaction, a child for each member `roles` admits to a live role
+    /// template the announcement matches, and captures for no child whose
+    /// member left the role. A store that keeps no templates has no
+    /// children, so its default is the plain capture.
+    async fn announce_with_roles(
+        &self,
+        request: AnnounceRequest,
+        facts: &RosterFacts,
+        roles: &RoleExpansions,
+        now_ms: u64,
+    ) -> Result<AnnounceOutcome> {
+        let _ = roles;
+        self.announce_with_facts(request, facts, now_ms).await
+    }
+
+    /// [`Self::advance_source_with_facts`] with role templates, as for
+    /// [`Self::announce_with_roles`], for each item the step announces.
+    async fn advance_source_with_roles(
+        &self,
+        operation: &OperationId,
+        request: AdvanceSource,
+        facts: &RosterFacts,
+        roles: &RoleExpansions,
+        now_ms: u64,
+    ) -> Result<SourceAdvance> {
+        let _ = roles;
+        self.advance_source_with_facts(operation, request, facts, now_ms)
+            .await
+    }
+
+    /// The live role templates, each with its children and their
+    /// subscriptions' states: those whose selector names `mob_id`, or every
+    /// one.
+    async fn role_templates(&self, mob_id: Option<&MobId>) -> Result<Vec<TemplateChildren>> {
+        let _ = mob_id;
+        Ok(Vec::new())
+    }
+
+    async fn role_template(&self, id: &SubscriptionId) -> Result<Option<RoleTemplate>> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// Create a role template, or replace its selector at its revision: its
+    /// live children take the new selector in place, keeping what they owe,
+    /// and the operator's cancel of a child no longer holds.
+    async fn put_role_template(
+        &self,
+        operation: &OperationId,
+        request: PutRoleTemplate,
+        now_ms: u64,
+    ) -> Result<RoleTemplate> {
+        let _ = (operation, request, now_ms);
+        Err(no_templates())
+    }
+
+    /// Cancel a role template at its revision, and every child it made.
+    async fn cancel_role_template(
+        &self,
+        operation: &OperationId,
+        id: &SubscriptionId,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> Result<RoleTemplate> {
+        let _ = (operation, id, expected_revision, now_ms);
+        Err(no_templates())
+    }
+
+    /// Reconcile role children against the members `roles` resolved now: a
+    /// member without a live child gets one (or its refusal); a child whose
+    /// member left the role is marked left, and captures nothing more; a
+    /// child an operator cancelled, or that ended, is held.
+    async fn reconcile_role_children(
+        &self,
+        roles: &RoleExpansions,
+        facts: &RosterFacts,
+        now_ms: u64,
+    ) -> Result<()> {
+        let _ = (roles, facts, now_ms);
+        Ok(())
+    }
+
+    /// Every role child, in template and member order.
+    async fn role_children(&self) -> Result<Vec<RoleChild>> {
+        Ok(Vec::new())
+    }
+
+    /// The declarations last applied, if any.
+    async fn applied_declarations(&self) -> Result<Option<AppliedDeclarations>> {
+        Ok(None)
+    }
+
+    /// Record `applied` as the declarations the reconciler follows.
+    async fn record_declarations(&self, applied: AppliedDeclarations) -> Result<()> {
+        let _ = applied;
+        Err(no_templates())
+    }
+
+    /// The marks of the records the declarations manage or refer to, in
+    /// kind and id order.
+    async fn declaration_marks(&self) -> Result<Vec<DeclarationMark>> {
+        Ok(Vec::new())
+    }
+
+    /// Write a record's mark. A pending mark raises its
+    /// `declaration_pending` escalation; any other resolves it.
+    async fn put_declaration_mark(&self, mark: DeclarationMark, now_ms: u64) -> Result<()> {
+        let _ = (mark, now_ms);
+        Err(no_templates())
+    }
+
+    /// Remove a record's mark: the declarations no longer name it, and the
+    /// reconciler ended or cancelled what it managed.
+    async fn remove_declaration_mark(
+        &self,
+        kind: DeclarationRecordKind,
+        id: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        let _ = (kind, id, now_ms);
+        Err(no_templates())
+    }
 }
 
 /// What the last check before a submission found.
@@ -514,4 +644,134 @@ pub enum SubmissionCheck {
 
 fn no_sources() -> AnnouncementStoreError {
     AnnouncementStoreError::Storage("this announcement store keeps no sources".to_string())
+}
+
+fn no_templates() -> AnnouncementStoreError {
+    AnnouncementStoreError::Storage(
+        "this announcement store keeps no declarations or role templates".to_string(),
+    )
+}
+
+/// The declarations the reconciler follows: the last applied, at its
+/// revision and with its digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedDeclarations {
+    pub revision: u64,
+    pub digest: String,
+    pub applied_at_ms: u64,
+    pub declarations: Declarations,
+}
+
+/// A record the declarations manage, or name and could not make: its
+/// declared digest, where it stands and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclarationMark {
+    /// A source or a subscription (a role template is a subscription).
+    pub kind: DeclarationRecordKind,
+    pub id: String,
+    /// The mob of a declared source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mob_id: Option<MobId>,
+    /// Whether the declared subscription is a role template.
+    #[serde(default)]
+    pub template: bool,
+    /// The revision of the declarations that last changed the mark.
+    pub revision: u64,
+    /// The digest of the declared form the mark was reconciled at.
+    pub digest: String,
+    pub status: DeclarationStatus,
+    /// When the record took this status.
+    pub since_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<DeclarationRefusal>,
+    /// Whether the reconciler made the runtime record of this id: only such
+    /// a record is ever replaced, ended or cancelled.
+    pub managed: bool,
+}
+
+/// Where a role child stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RoleChildStatus {
+    /// Made for a member with the role: it captures.
+    Applied,
+    /// A check refused its member: it captures nothing, and is tried again
+    /// at each capture and reconcile.
+    Pending,
+    /// Its member left the role: it stays active, captures nothing more and
+    /// delivers what it owes. A member that regains the role captures again
+    /// under the same child.
+    Left,
+    /// An operator cancelled it, or its member's end ended it: held until
+    /// the template changes.
+    Suppressed,
+}
+
+impl RoleChildStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Pending => "pending",
+            Self::Left => "left",
+            Self::Suppressed => "suppressed",
+        }
+    }
+}
+
+/// The child a role template made, or tried to make, for one member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleChild {
+    pub template_id: SubscriptionId,
+    pub member: Member,
+    /// `{template id}/{member digest, 16 hex}`.
+    pub subscription_id: SubscriptionId,
+    pub status: RoleChildStatus,
+    pub since_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<DeclarationRefusal>,
+}
+
+/// A live role template with its children, each with its subscription's
+/// state now (`None`: no subscription has its id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateChildren {
+    pub template: RoleTemplate,
+    pub children: Vec<(RoleChild, Option<SubscriptionState>)>,
+}
+
+/// What the owner found for one member that has a template's role now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RoleMember {
+    /// It has a child already, live or held: nothing to check. A child
+    /// marked left captures again.
+    Kept,
+    /// It passed the owner's checks: a child may be made for it on this
+    /// route (a member of a mob a member created, at that mob's event
+    /// cursor).
+    Admitted {
+        route: MemberRouteRecord,
+        member_mob_cursor: Option<u64>,
+    },
+    /// An owner check refused it: its child is pending with the refusal.
+    Refused(DeclarationRefusal),
+}
+
+/// The members of one role template, as the owner resolved them against
+/// the template's revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleExpansion {
+    pub revision: u64,
+    pub members: BTreeMap<Member, RoleMember>,
+}
+
+/// The role templates the owner resolved, by id. A template whose roster
+/// could not be read now is absent: its children stay as they are, and
+/// none is made.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleExpansions {
+    pub templates: BTreeMap<SubscriptionId, RoleExpansion>,
+    /// The bounds on subscriptions of members of mobs members created.
+    pub child_limits: ChildMemberLimits,
 }

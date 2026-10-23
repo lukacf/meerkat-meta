@@ -462,14 +462,9 @@ async fn an_operators_pause_and_cancel_of_a_declared_record_hold() {
     let service = &harness.service;
     let first_inbox = declared_inbox(serde_json::json!([member_grant("agent:a")]));
     let first = serde_json::json!([declared_subscription("declared-a", "agent:a", &["ops.one"])]);
-    try_apply(
-        service,
-        1,
-        serde_json::json!([first_inbox.clone()]),
-        first.clone(),
-    )
-    .await
-    .unwrap();
+    try_apply(service, 1, serde_json::json!([first_inbox]), first.clone())
+        .await
+        .unwrap();
 
     // A pause holds across the same declarations applied again and a
     // reconcile.

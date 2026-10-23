@@ -113,6 +113,17 @@ pub fn announcements_unavailable_error() -> JsonRpcError {
     )
 }
 
+/// The typed kind `error` carries on the wire: what a declared record or a
+/// role child is pending with when the same refusal meets it there.
+pub(super) fn refusal_kind(error: &AnnouncementError) -> String {
+    let refused = rpc_error(error.clone());
+    match refused.data.as_ref().and_then(|data| data.get("kind")) {
+        Some(Value::String(kind)) => kind.clone(),
+        _ if refused.code == -32602 => "invalid".to_string(),
+        _ => "failed".to_string(),
+    }
+}
+
 fn rpc_error(error: AnnouncementError) -> JsonRpcError {
     let message = error.to_string();
     match error {
