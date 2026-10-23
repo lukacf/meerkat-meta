@@ -59,6 +59,7 @@ class FakeManager:
         change = {"service_supervisor_pid": pid, "service_instance_id": instance,
                   "service_cleanup_confirmed": False, "startup_attempt_id": attempt,
                   "startup_console_health": {"attempt_id": attempt, "status": "pass"},
+                  "admission_health": None,
                   "runtime_pid": 9000 + len(self.starts), "bootstrap": bootstrap,
                   "status": "running", "phase": "run",
                   "logs": [{"at": now(), "phase": "runtime", "text": "fake fresh supervisor output"}]}
@@ -83,6 +84,13 @@ class FakeManager:
         elif behavior == "ack-only":
             change.update(status="starting", startup_attempt_id=None, startup_console_health=None,
                           bootstrap=None, runtime_pid=None)
+        elif behavior == "pending":
+            from test_admission_health import pending_payload
+            payload = pending_payload()
+            change.update(status="starting", health="pending", process_live=True,
+                          console_url=None, health_checked_at=now(), startup_console_health=None,
+                          bootstrap=payload["bootstrap"],
+                          admission_health={"attempt_id": attempt, **payload["admission"]})
         update_receipt(self.directory, **change)
         self.attempts.append({key: change[key] for key in ("service_instance_id", "startup_attempt_id")})
         if behavior == "failed":
@@ -109,9 +117,10 @@ class FakeManager:
 
 @pytest.fixture
 def unit_from_earlier_forge(monkeypatch):
-    """The background fixture's unit carries the 397-second budget an earlier Forge wrote."""
+    """An earlier systemd unit, independent of the test runner's operating system."""
     plan = services.service_plan
     def earlier(*args, **kwargs):
+        kwargs["platform"] = "linux"
         return {**plan(*args, **kwargs), "stop_timeout_seconds": 397}
     monkeypatch.setattr(services, "service_plan", earlier)
 
@@ -195,6 +204,173 @@ async def test_apply_and_explicit_rollback_use_fresh_service_health_without_repl
     assert (target / ".env").read_bytes() == private
     assert Path(definition["unit_path"]).read_bytes() == unit
     assert services.verify_service(directory, result)["host_files"] == manifest
+
+
+async def test_pending_update_waits_past_both_budgets_then_commits_only_fresh_ready(background, monkeypatch):
+    service, directory, target, old, private, identity, manager, _ = background
+    monkeypatch.setattr(services, "SERVICE_START_TIMEOUT", 1)
+    monkeypatch.setattr(services, "SERVICE_UPDATE_TIMEOUT", 1.5)
+    manager.behaviors = ["pending"]
+    task = asyncio.create_task(services.update_background(directory, manager, "update", update_id=identity))
+    try:
+        await asyncio.wait_for(manager.started.wait(), 5)
+        pending = read_receipt(directory)
+        await asyncio.sleep(1.65)
+        assert not task.done(), "A recoverable native admission is not an update timeout"
+        waiting = read_receipt(directory)
+        assert waiting["status"] == "starting" and waiting["health"] == "pending"
+        assert waiting["bootstrap"] == pending["bootstrap"]
+        assert waiting["health_checked_at"] == pending["health_checked_at"]
+        assert not waiting.get("update_service_verification") and waiting["console_url"] is None
+        assert manager.stops == [] and len(manager.starts) == 1
+        (target / "data/ledger.db").write_bytes(b"records retained during admission recovery")
+        attempt = waiting["startup_attempt_id"]
+        update_receipt(directory, status="running", admission_health=None,
+            bootstrap={"complete": True, "ready": True, "counts": {"broken": 0},
+                       "identities": {"lead:main": {"state": "active"}}},
+            startup_console_health={"attempt_id": attempt, "status": "pass"})
+        await asyncio.wait_for(task, 5)
+        result = read_receipt(directory)
+        assert result["update"]["status"] == "completed"
+        assert result["update_service_verification"]["startup_attempt_id"] == attempt
+        assert result["build_id"] == service.implementation.identity and result["health"] == "ready"
+        assert (target / "data/ledger.db").read_bytes() == b"records retained during admission recovery"
+        assert (target / ".env").read_bytes() == private
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("fault", ["reused-instance", "reused-attempt", "malformed", "failed-manager", "foreign-pid"])
+async def test_invalid_pending_update_cannot_suspend_timeout(background, monkeypatch, fault):
+    service, directory, _, old, _, identity, manager, _ = background
+    monkeypatch.setattr(services, "SERVICE_START_TIMEOUT", .15)
+    manager.behaviors = ["pending", "ready"]
+    original_start = manager.start
+
+    async def altered_start(definition):
+        observed = await original_start(definition)
+        if len(manager.starts) == 1:
+            receipt = read_receipt(directory)
+            if fault == "reused-instance":
+                update_receipt(directory, service_instance_id="previous-instance")
+            elif fault == "reused-attempt":
+                receipt["admission_health"]["attempt_id"] = "previous-startup"
+                update_receipt(directory, startup_attempt_id="previous-startup",
+                               admission_health=receipt["admission_health"])
+            elif fault == "malformed":
+                receipt["bootstrap"]["identities"]["project:one"]["restore"]["kind"] = "ordinary-failure"
+                update_receipt(directory, bootstrap=receipt["bootstrap"])
+            elif fault == "failed-manager":
+                manager.observation["state"] = "failed"
+            else:
+                manager.observation["pid"] += 999
+        return observed
+
+    monkeypatch.setattr(manager, "start", altered_start)
+    await asyncio.wait_for(services.update_background(directory, manager, "update", update_id=identity), 5)
+    result = read_receipt(directory)
+    assert result["update"]["status"] == "rolled-back" and result["build_id"] == old["build_id"]
+    assert manager.starts == [service.implementation.identity, old["build_id"]]
+    assert manager.stops == [service.implementation.identity]
+
+
+@pytest.mark.parametrize("condition", ["stale", "silent", "never-ready"])
+async def test_pending_update_is_bounded_and_rolls_back(background, monkeypatch, condition):
+    service, directory, target, old, private, identity, manager, _ = background
+    monkeypatch.setattr(services, "SERVICE_START_TIMEOUT", .2)
+    monkeypatch.setattr(services, "SERVICE_UPDATE_TIMEOUT", 3)
+    monkeypatch.setattr(services, "SERVICE_PENDING_MAX_WAIT", 2 if condition == "silent" else .3)
+    manager.behaviors = ["pending", "ready"]
+    original_observe = manager.observe
+    entered_at = None
+    records = (target / "data/ledger.db").read_bytes()
+
+    async def observe(definition):
+        nonlocal entered_at
+        if len(manager.starts) == 1:
+            elapsed = asyncio.get_running_loop().time()
+            if entered_at is None:
+                entered_at = elapsed
+            fresh = condition == "never-ready" or condition == "silent" and elapsed - entered_at < .3
+            update_receipt(directory, health_checked_at=(now() if fresh
+                else "2000-01-01T00:00:00+00:00"))
+        return await original_observe(definition)
+
+    monkeypatch.setattr(manager, "observe", observe)
+    task = asyncio.create_task(services.update_background(directory, manager, "update", update_id=identity))
+    try:
+        try:
+            await asyncio.wait_for(asyncio.shield(task), 2)
+        except TimeoutError:
+            pytest.fail("Pending evidence must not hold the transaction open until external cancellation")
+        result = read_receipt(directory)
+        assert result["update"]["status"] == "rolled-back" and result["build_id"] == old["build_id"]
+        assert manager.starts == [service.implementation.identity, old["build_id"]]
+        assert manager.stops == [service.implementation.identity]
+        assert (target / ".env").read_bytes() == private
+        assert (target / "data/ledger.db").read_bytes() == records
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 3)
+
+
+@pytest.mark.parametrize("after_pending", ["unknown", "cancel", "failed-then-stalled-fallback", "stalled-observation"])
+async def test_leaving_pending_restores_bounds_and_exact_cleanup(background, monkeypatch, after_pending):
+    service, directory, target, old, private, identity, manager, _ = background
+    monkeypatch.setattr(services, "SERVICE_START_TIMEOUT", .25)
+    monkeypatch.setattr(services, "SERVICE_UPDATE_TIMEOUT", 1)
+    manager.behaviors = ["pending", "block" if after_pending == "failed-then-stalled-fallback" else "ready"]
+    task = asyncio.create_task(services.update_background(directory, manager, "update", update_id=identity))
+    try:
+        await asyncio.wait_for(manager.started.wait(), 5)
+        await asyncio.sleep(.4)
+        assert not task.done() and manager.stops == []
+        if after_pending == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert len(manager.starts) == 1
+            assert read_receipt(directory)["update"]["status"] == "restored-stopped"
+        elif after_pending == "unknown":
+            update_receipt(directory, admission_health=None, bootstrap=None, health="unknown")
+            await asyncio.wait_for(task, 5)
+            result = read_receipt(directory)
+            assert result["update"]["status"] == "rolled-back"
+            assert result["build_id"] == old["build_id"]
+        elif after_pending == "stalled-observation":
+            original_observe = manager.observe
+            stalled_once = False
+
+            async def stalled_observe(definition):
+                nonlocal stalled_once
+                if not stalled_once:
+                    stalled_once = True
+                    await asyncio.Event().wait()
+                return await original_observe(definition)
+
+            monkeypatch.setattr(manager, "observe", stalled_observe)
+            await asyncio.wait_for(task, 4)
+            result = read_receipt(directory)
+            assert result["update"]["status"] == "rolled-back"
+            assert result["build_id"] == old["build_id"]
+        else:
+            update_receipt(directory, status="failed", health="unavailable")
+            # Shield distinguishes the update's own restored deadline from
+            # this test's safety timeout; it cannot pass by cancelling it.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task), 4)
+            assert task.done(), "The transaction's own deadline must bound fallback after pending"
+            assert manager.starts == [service.implementation.identity, old["build_id"]]
+            assert manager.stops == [service.implementation.identity, old["build_id"]]
+        assert (target / ".env").read_bytes() == private
+        assert manager.stops and manager.stops[0] == service.implementation.identity
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.parametrize("behavior", ["ack-only", "reused-instance", "reused-attempt", "stale-health", "failed"])
