@@ -1280,7 +1280,8 @@ impl MobNativeDelivery {
 
     /// A member of a mob a member created can be subscribed while that mob
     /// runs and has not completed, and the member is on its roster now. Its
-    /// absence later ends nothing: a respawn takes it off for a while.
+    /// absence later ends nothing: a respawn takes it off for a while. A mob
+    /// whose actor has stopped admits nothing until a restart recovers it.
     async fn check_child_member(&self, member: &Member) -> Result<(), MemberProblem> {
         let Some(handle) = self
             .running_child(&member.mob_id)
@@ -1292,12 +1293,19 @@ impl MobNativeDelivery {
                 member.mob_id
             )));
         };
+        let observation = handle.lifecycle_observation();
         if matches!(
-            handle.status_observation_snapshot(),
+            observation.phase,
             meerkat_mob::MobState::Completed | meerkat_mob::MobState::Destroyed
         ) {
             return Err(MemberProblem::Unusable(format!(
                 "{} has completed",
+                member.mob_id
+            )));
+        }
+        if observation.failure.is_some() {
+            return Err(MemberProblem::Unusable(format!(
+                "{} has stopped",
                 member.mob_id
             )));
         }

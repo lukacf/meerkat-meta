@@ -218,6 +218,18 @@ pub(crate) fn member_status_state_string(status: meerkat_mob::MobMemberStatus) -
     }
 }
 
+/// Whether a mob runs as its handles observe it without asking its actor:
+/// the last phase its actor published is live (creating or running) and the
+/// actor has not stopped. An actor that fail-stopped keeps the live phase it
+/// last published, so its phase alone reads it as running.
+pub(crate) fn mob_observed_running(observation: &meerkat_mob::MobLifecycleObservation) -> bool {
+    observation.failure.is_none()
+        && matches!(
+            observation.phase,
+            meerkat_mob::MobState::Creating | meerkat_mob::MobState::Running
+        )
+}
+
 /// Options for bootstrapping a mob runtime.
 #[derive(Clone, Default)]
 pub struct MobBootstrapOptions {
