@@ -151,18 +151,24 @@ def selected_ordinary_gateway():
     return _selected_ordinary_gateway
 
 
-def create_app():
+def create_app(*, retained_ordinary_applications=()):
     """Shipping Uvicorn factory entry: select before importing the server.
 
     A package that includes the selected Meta release's RPC gateway also
     builds ordinary applications, those without a connection setup helper.
     Application model custody, when a native owner selected it with
     configure_application_model_custody, reaches the local applications.
+    A trusted launcher can separately retain exact runtimes for its existing
+    ordinary installations. They are not inferred from package or receipt data.
     """
+    if type(retained_ordinary_applications) is not tuple:
+        raise TypeError("Select the original retained ordinary applications as a tuple.")
     selected = open_selection()
     gateway = selected_ordinary_gateway()
     custody = _application_model_custody
     options = {} if gateway is None else {"ordinary_meta_gateway": gateway}
+    if retained_ordinary_applications:
+        options["retained_ordinary_applications"] = retained_ordinary_applications
     if custody is not None:
         custody.require_environment()
         custody.require_filesystem_current()

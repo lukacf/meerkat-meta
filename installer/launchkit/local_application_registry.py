@@ -13,6 +13,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 from threading import RLock
 import uuid
 
@@ -31,7 +32,8 @@ from .local_application_factory import LocalApplicationFactory, _replacement_sup
 from .local_application_source import create_local_application_source, _guide, _store_identity
 from .projects import DraftConflict
 from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
-from .ordinary_application_source import OrdinaryApplicationHost, create_ordinary_application_source, ordinary_application
+from .ordinary_application_source import (OrdinaryApplicationHost, RetainedOrdinaryApplication,
+    create_ordinary_application_source, ordinary_application)
 
 
 @dataclass(frozen=True)
@@ -82,7 +84,8 @@ class LocalApplicationRegistry:
 
     def __init__(self, *, guide_store, implementation, deployment,
             runtime_target=None, manual_host=None, remote_control_selection=None,
-            model_configuration=None, ordinary_meta_gateway=None, replacement_selection=None):
+            model_configuration=None, ordinary_meta_gateway=None, replacement_selection=None,
+            retained_ordinary_applications=()):
         _replacement_supplier(replacement_selection)
         if replacement_selection is not None and (manual_host is not None or remote_control_selection is not None):
             raise CustodyError("Select replacement inputs through their original local automatic application owner.")
@@ -100,6 +103,30 @@ class LocalApplicationRegistry:
         self._ordinary_gateway_selection = ordinary_meta_gateway
         self._ordinary_gateway_identity = (None if ordinary_meta_gateway is None else
             _file_identity(ordinary_meta_gateway.path))
+        if (type(retained_ordinary_applications) is not tuple
+                or retained_ordinary_applications and (manual_host is not None or remote_control_selection is not None
+                    or type(runtime_target) is not MetaToolkitRuntimeTarget)):
+            raise CustodyError("Select retained ordinary applications through their original local launcher.")
+        from .connect_installer_caller import ExactFile, _private_parent
+        retained, seen = [], set()
+        for entry in retained_ordinary_applications:
+            if (type(entry) is not RetainedOrdinaryApplication
+                    or type(entry.runtime_target) is not MetaToolkitRuntimeTarget
+                    or type(entry.gateway) is not ExactFile):
+                raise CustodyError("Select each retained application's exact native runtime and ordinary gateway.")
+            key = (_identity(entry.guide_id), _identity(entry.deployment_id))
+            _identity(entry.build_id)
+            if type(entry.package_sha256) is not str or not re.fullmatch("[0-9a-f]{64}", entry.package_sha256):
+                raise CustodyError("Select the retained installation's exact accepted package digest.")
+            if key in seen:
+                raise CustodyError("Select one retained runtime per original installation.")
+            seen.add(key)
+            _private_parent(entry.gateway.path)
+            entry.gateway.verify(executable=True)
+            retained.append((entry, *key, entry.build_id, entry.package_sha256, entry.runtime_target, entry.gateway,
+                entry.gateway.path, entry.gateway.sha256, _file_identity(entry.gateway.path)))
+        self.retained_ordinary_applications = retained_ordinary_applications
+        self._retained_ordinary_inputs = tuple(retained)
         if remote_control_selection is not None:
             from .remote_product_control import ProductControlSelection
             if (type(remote_control_selection) is not ProductControlSelection
@@ -126,7 +153,7 @@ class LocalApplicationRegistry:
         self.remote_control_selection = remote_control_selection
         self.remote_runtime_target = remote_control_selection.runtime_target if remote_control_selection is not None else None
         self._configured = (guide_store, implementation, deployment, runtime_target, manual_host,
-            remote_control_selection, self.remote_runtime_target, replacement_selection)
+            remote_control_selection, self.remote_runtime_target, replacement_selection, retained_ordinary_applications)
         self._roots = (guide_store.root, implementation.root, deployment.root)
         self._storage = None
         self._lock = RLock()
@@ -154,9 +181,17 @@ class LocalApplicationRegistry:
                 or self.ordinary_meta_gateway is not None and
                     _file_identity(self.ordinary_meta_gateway.path) != self._ordinary_gateway_identity):
             raise CustodyError("Preserve the original separately selected ordinary Meta gateway.")
+        for entry, guide_id, deployment_id, build_id, package_sha256, target, gateway, path, sha256, identity in self._retained_ordinary_inputs:
+            if (entry.guide_id != guide_id or entry.deployment_id != deployment_id
+                    or entry.build_id != build_id or entry.package_sha256 != package_sha256
+                    or entry.runtime_target is not target or entry.gateway is not gateway
+                    or (gateway.path, gateway.sha256) != (path, sha256)
+                    or _file_identity(path) != identity):
+                raise CustodyError("Preserve each retained installation's original runtime and gateway selection.")
         if (any(current is not original for current, original in zip(
                 (self.guide_store, self.implementation, self.deployment, self.runtime_target, self.manual_host,
-                    self.remote_control_selection, self.remote_runtime_target, self.replacement_selection),
+                    self.remote_control_selection, self.remote_runtime_target, self.replacement_selection,
+                    self.retained_ordinary_applications),
                 self._configured))
                 or self.remote_control_selection is not None
                     and self.remote_control_selection.runtime_target is not self.remote_runtime_target
@@ -203,6 +238,30 @@ class LocalApplicationRegistry:
                 return {}
             plan = self._current_plan(guide_id, guide_version)
             return {"runtime_target": self._runtime_target_for_blueprint(plan)}
+
+    def _retained_ordinary_application(self, guide_id, deployment_id):
+        self._require_registry()
+        return next((entry for entry in self.retained_ordinary_applications
+            if entry.guide_id == guide_id and entry.deployment_id == deployment_id), None)
+
+    def _has_ordinary_runtime(self, guide_id, deployment_id):
+        self._require_registry()
+        return self.ordinary_meta_gateway is not None or self._retained_ordinary_application(
+            guide_id, deployment_id) is not None
+
+    def _ordinary_runtime_selection(self, guide_id, blueprint, *, installation=None):
+        """Use a held installation choice, never promote a receipt into authority."""
+        self._require_registry()
+        if installation is not None and ordinary_application(blueprint):
+            if installation.get("guide_id") != guide_id:
+                raise CustodyError("The retained runtime belongs to its original installation.")
+            entry = self._retained_ordinary_application(guide_id, installation.get("deployment_id"))
+            if entry is not None:
+                if (installation.get("build_id") != entry.build_id
+                        or installation.get("package_sha256") != entry.package_sha256):
+                    raise CustodyError("Recover only the retained installation's explicitly selected accepted source.")
+                return entry.runtime_target, entry.gateway
+        return self._runtime_target_for_blueprint(blueprint), self.ordinary_meta_gateway
 
     def prepare_workspace(self, guide_id, build_id, workspace, *, guide_version,
             source_build_id=None):
@@ -632,7 +691,7 @@ class LocalApplicationRegistry:
                 return False
         if not deployment.lock.locked():
             raise CustodyError("Reconnect setup through the original claimed installation action.")
-        if self.ordinary_meta_gateway is not None:
+        if self._has_ordinary_runtime(guide_id, deployment_id):
             from .ordinary_application_source import recover_ordinary_application_source
             directory, receipt, stopped = deployment._stopped_application_owner(guide_id, deployment_id)
             _, files = checked_package(directory, "package.zip", receipt["package_sha256"])
@@ -647,7 +706,10 @@ class LocalApplicationRegistry:
                     host.retain_installation_inputs(deployment, guide_id, deployment_id)
                     source = read_package_source(files, receipt)
                     stopped()
-                    self._builds[build_key] = _BuildOwner(guide_id, build_id, version, deepcopy(blueprint), factory, host)
+                    # An explicit retained runtime belongs only to this installed
+                    # owner. Do not promote it into a reusable Build/Install host.
+                    if self._retained_ordinary_application(guide_id, deployment_id) is None:
+                        self._builds[build_key] = _BuildOwner(guide_id, build_id, version, deepcopy(blueprint), factory, host)
                     self._installations[key] = (host, _installation_binding(receipt, source))
                     return True
         from .local_application_recovery import RecoveredLocalApplication, recover_local_application
@@ -781,13 +843,15 @@ class LocalApplicationRegistry:
                 return None
             source = read_package_source(files, receipt)
             blueprint = _json(files["blueprint.json"][0])
-            if parse_candidate_selection(selection) != self._runtime_target_for_blueprint(blueprint):
+            ordinary_target, ordinary_gateway = self._ordinary_runtime_selection(guide_id, blueprint,
+                installation=receipt)
+            if parse_candidate_selection(selection) != ordinary_target:
                 return None
             report = _json(files["implementation-report.json"][0])
             if (not _same_toml(_candidate_source_selection(files), selection)
                     or not _same_toml(report.get("framework", {}).get("runtime_candidate"), selection)):
                 raise CustodyError("The canonical package changed its original runtime selection.")
-            if self.ordinary_meta_gateway is not None and ordinary_application(blueprint):
+            if ordinary_gateway is not None and ordinary_application(blueprint):
                 self._require_registry()
                 return {**application_setup_binding(receipt, guide_id, deployment_id),
                     "available": False, "reason": "owner_reconnect", "action": "prepare-setup",
