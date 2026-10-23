@@ -140,5 +140,3 @@ async def test_live_project_lease_prevents_download_rebind_and_builder(startup, 
     assert controller.builders == controller.builds == 0
     assert not (root / "deployment.json").exists()
     assert not (root / ".bin/mobkit_gateway").is_symlink()
-
-
