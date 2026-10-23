@@ -184,6 +184,17 @@ describe("parseSseStream", () => {
     );
   });
 
+  it("does not dispatch a final event without its closing blank line", async () => {
+    // The SSE spec discards pending data at the end of the stream.
+    const events = await collectEvents(
+      toChunks("data: first\n\n", "event: last\ndata: pending\n"),
+    );
+    assert.deepEqual(
+      events.map((event) => event.data),
+      ["first"],
+    );
+  });
+
   it("parses a full event with all fields", async () => {
     const raw = "id: evt-99\nevent: agent_event\ndata: {\"type\":\"text_delta\",\"delta\":\"hi\"}\n\n";
     const events = await collectEvents(toChunks(raw));
