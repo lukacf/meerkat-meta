@@ -220,6 +220,42 @@ Operational list projections retain `active`, `retiring`, and `broken` rows as
 applicable. They filter terminal `completed` and `unknown` rows, even though
 those values remain part of the status vocabulary.
 
+## Durable workers
+
+A profile can declare `durable = true` (meerkat 0.9.5):
+
+```toml
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+durable = true
+```
+
+The flag belongs to the profile alone. `DurableAgentSpec`, `meta/ensure_member`
+and the SDKs take no durable argument, and an omitted key means an ordinary
+profile.
+
+- Meerkat spawns the profile's members with a durable identity, keyed by the
+  member's identity, so a host can list and re-attach them after a restart.
+  Every identity-first member is already spawned that way, so for an identity
+  the flag changes nothing in how Meta creates, wakes or resets it.
+- A durable profile needs a mob whose session service keeps persistent
+  sessions. On any other mob Meerkat refuses the spawn before anything is
+  created: `MobError::NonDurableService`, code `CAPABILITY_UNAVAILABLE`
+  (`-32020`), `data.kind = "mob_non_durable_service"` with the `member_id` and
+  the `profile`.
+  - On the identity plane the refusal is a deterministic build refusal. The
+    wake answers `HostRejectedBuild` with a reason that names the remedy: run
+    the mob on a persistent realm, or drop `durable` from the profile. Nothing
+    retries it and nothing is recorded; every wake answers it again.
+  - On the worker plane, `meta/ensure_member` answers Meerkat's own code and
+    `data` instead of the generic `-32602`.
+- The mobpack editor document carries the flag as the member key `durable`,
+  present only when true. The export writes `durable = true` back into the
+  profile, and `update_member` accepts a boolean `durable` patch. Validation
+  refuses a member whose `durable` disagrees with `mob.toml`
+  (`editor_profile_durable_mismatch`) or is not a boolean (`invalid_durable`).
+
 ## Deep member status
 
 `meta/member_status` serializes Meerkat's `MobMemberSnapshot`. It is a deep

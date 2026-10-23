@@ -1117,10 +1117,11 @@ pub enum IdentityRuntimeError {
     /// The build of the identity's member was refused DETERMINISTICALLY: the
     /// host answered the app-side `callback/build_agent` round trip with an
     /// error (the candidate-mode effect gate class), provider authentication
-    /// refused it with a credential kind no unattended retry can change, or
+    /// refused it with a credential kind no unattended retry can change,
     /// the placement host's realm backend is not persistent while the
-    /// identity needs durable sessions. Returned on each attempt; nothing is
-    /// parked or recorded.
+    /// identity needs durable sessions, or its profile declares
+    /// `durable = true` on a mob whose session service keeps no persistent
+    /// sessions. Returned on each attempt; nothing is parked or recorded.
     HostRejectedBuild {
         identity: AgentIdentity,
         reason: String,
@@ -1529,12 +1530,14 @@ pub(crate) const fn is_deterministic_provider_auth_kind(kind: meerkat_core::Auth
 
 /// The refusal reason for a build the bridge refused DETERMINISTICALLY, or
 /// `None` when the failure may resolve on its own (the next wake retries it).
-/// Three walls are recognised: the typed provider-auth refusal
+/// Four walls are recognised: the typed provider-auth refusal
 /// ([`BridgeError::ProviderAuthRejected`] with a kind
 /// [`is_deterministic_provider_auth_kind`] accepts), the placement host's
 /// typed refusal for a realm backend that is not persistent
 /// ([`BridgeError::RealmBackendUnavailable`]; the reason names the remedy),
-/// and the host's own `callback/build_agent` answer
+/// meerkat's typed refusal of a durable profile on a mob without persistent
+/// sessions ([`BridgeError::NonDurableService`]; the reason names the
+/// remedy), and the host's own `callback/build_agent` answer
 /// ([`is_host_rejected_build_error`], the one place a string probe remains
 /// because `rpc_gateway` mints that text).
 pub(crate) fn deterministic_build_rejection_reason(error: &BridgeError) -> Option<String> {
@@ -1547,6 +1550,11 @@ pub(crate) fn deterministic_build_rejection_reason(error: &BridgeError) -> Optio
             "{detail}; a durable identity needs durable sessions on the host it is placed \
              on: run that host with a persistent realm backend, or remove the identity's \
              placement"
+        )),
+        BridgeError::NonDurableService { profile, detail } => Some(format!(
+            "{detail}; profile '{profile}' declares durable = true, which needs a mob whose \
+             session service keeps persistent sessions: run the mob on a persistent realm, or \
+             drop durable from the profile"
         )),
         other => {
             let detail = other.to_string();
@@ -16276,6 +16284,20 @@ mod reset_reprofile_tests {
             ),
             "the reason names the remedy: {realm}"
         );
+        let durable = deterministic_build_rejection_reason(&BridgeError::NonDurableService {
+            profile: meerkat_mob::ProfileName::from("durable-worker"),
+            detail: "create_session: no persistent sessions".to_string(),
+        })
+        .ok_or("a durable profile on a mob without persistent sessions is a deterministic wall")?;
+        assert!(
+            durable.starts_with("create_session: no persistent sessions; "),
+            "{durable}"
+        );
+        assert!(
+            durable.contains("run the mob on a persistent realm, or drop durable from the profile"),
+            "the reason names the remedy: {durable}"
+        );
+        assert!(durable.contains("'durable-worker'"), "{durable}");
         let host_gate = BridgeError::Mob(
             "spawn_member: callback/build_agent failed: callback error: gate refused".to_string(),
         );
@@ -20534,10 +20556,13 @@ mod wake_per_reason_tests {
 
     /// A bridge over a Core that holds nothing for the identity, whose
     /// placement host refuses every spawn because its realm backend is not
-    /// persistent. It counts create calls.
+    /// persistent, or, with `durable_profile`, whose mob refuses every spawn
+    /// of a durable profile because its session service keeps no persistent
+    /// sessions. It counts create calls.
     #[derive(Default)]
     struct NonPersistentHostBridge {
         creates: AtomicUsize,
+        durable_profile: bool,
     }
 
     #[async_trait::async_trait]
@@ -20569,6 +20594,15 @@ mod wake_per_reason_tests {
             _draft: &AgentBuildDraft,
         ) -> Result<MemberRuntimeBinding, BridgeError> {
             self.creates.fetch_add(1, Ordering::SeqCst);
+            if self.durable_profile {
+                return Err(BridgeError::NonDurableService {
+                    profile: meerkat_mob::ProfileName::from("durable-worker"),
+                    detail: "create_session: member durable uses durable profile \
+                             'durable-worker', but the mob's session service keeps no \
+                             persistent sessions"
+                        .to_string(),
+                });
+            }
             Err(BridgeError::RealmBackendUnavailable {
                 detail: "create_session: materialize rejected: durable sessions required but \
                          the realm backend is not persistent"
@@ -21113,6 +21147,67 @@ mod wake_per_reason_tests {
             bridge.creates.load(Ordering::SeqCst),
             3,
             "the backoff holds the next pass inside its window"
+        );
+        Ok(())
+    }
+
+    /// The typed remedy for a durable profile on a mob whose session service
+    /// keeps no persistent sessions: the wake answers `HostRejectedBuild`
+    /// naming the remedy, on every attempt (one spawn each, no retry loop),
+    /// and records nothing.
+    #[tokio::test]
+    async fn a_durable_profile_without_persistent_sessions_refuses_the_wake_typed_with_its_remedy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let identity = AgentIdentity::parse("durable")?;
+        let bridge = Arc::new(NonPersistentHostBridge {
+            durable_profile: true,
+            ..NonPersistentHostBridge::default()
+        });
+        let runtime = IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "non-durable-service".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: Some(bridge.clone() as Arc<dyn SessionBridge>),
+            default_timeout: None,
+        });
+        runtime.register(spec(&identity)).await;
+
+        for attempt in 1..=2 {
+            let Err(error) = runtime.materialize(&identity).await else {
+                return Err(format!("attempt {attempt}: the wake must refuse").into());
+            };
+            let IdentityRuntimeError::HostRejectedBuild {
+                identity: refused,
+                reason,
+            } = &error
+            else {
+                return Err(
+                    format!("attempt {attempt}: the typed build refusal, got {error:?}").into(),
+                );
+            };
+            assert_eq!(refused, &identity, "attempt {attempt}");
+            assert!(
+                reason.contains("keeps no persistent sessions"),
+                "attempt {attempt}: Core's refusal is kept: {reason}"
+            );
+            assert!(
+                error.to_string().contains(
+                    "run the mob on a persistent realm, or drop durable from the profile"
+                ),
+                "attempt {attempt}: the answer names the remedy: {error}"
+            );
+            assert_eq!(
+                bridge.creates.load(Ordering::SeqCst),
+                attempt,
+                "attempt {attempt}: one spawn per wake, no retry loop"
+            );
+        }
+        let status = runtime.status(&identity).await?;
+        assert_eq!(
+            status.wake_refusal, None,
+            "the build refusal is answered on every attempt, never recorded"
         );
         Ok(())
     }

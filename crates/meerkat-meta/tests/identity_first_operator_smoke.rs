@@ -117,6 +117,7 @@ fn operator_definition(model: &str, test: &str) -> MobDefinition {
             max_inline_peer_notifications: None,
             output_schema: None,
             provider_params: None,
+            durable: false,
         })),
     );
 
@@ -142,6 +143,7 @@ fn operator_definition(model: &str, test: &str) -> MobDefinition {
             max_inline_peer_notifications: None,
             output_schema: None,
             provider_params: None,
+            durable: false,
         })),
     );
 

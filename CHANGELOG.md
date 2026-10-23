@@ -36,6 +36,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Durable worker profiles (meerkat 0.9.5): a profile's `durable = true`
+  reaches Meerkat unchanged from `mob.toml`, and the mobpack editor document
+  carries it as the member key `durable`, present only when true. The export
+  writes it back, `update_member` accepts a boolean `durable` patch, and
+  validation refuses a member whose `durable` disagrees with `mob.toml`
+  (`editor_profile_durable_mismatch`) or is not a boolean
+  (`invalid_durable`). Meerkat's refusal of a durable profile on a mob whose
+  session service keeps no persistent sessions
+  (`MobError::NonDurableService`) is read typed, as the new
+  `BridgeError::NonDurableService`: an identity wake answers it as
+  `HostRejectedBuild` with a reason that names the remedy and never retries
+  it, and the worker-plane `meta/ensure_member` answers Meerkat's own code
+  (`CAPABILITY_UNAVAILABLE`, `-32020`) and data
+  (`kind = "mob_non_durable_service"`) instead of `-32602`.
 - The stdio `meta/status` names why a mob's actor stopped: `mob_failure`,
   present only once the actor has stopped, beside `mob_state`, which stays
   the last phase the actor published. A fail-stopped actor keeps its last
