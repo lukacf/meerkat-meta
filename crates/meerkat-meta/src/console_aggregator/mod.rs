@@ -1299,13 +1299,13 @@ impl MetaConsoleAggregator {
         let identity_namespace = identity_namespace.into();
         let entry = RuntimeEntry {
             registration_id: uuid::Uuid::new_v4(),
-            runtime_key: runtime_key.clone(),
+            runtime_key,
             identity_namespace,
             runtime,
             identity_runtime,
             identity_owner: None,
             memory_panel: None,
-            console_events: console_events.clone(),
+            console_events,
             visibility_policy,
         };
         self.register_entry(entry);

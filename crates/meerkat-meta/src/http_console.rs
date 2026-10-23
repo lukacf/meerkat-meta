@@ -1106,7 +1106,7 @@ pub async fn console_json_handler(
         .console_aggregator
         .as_ref()
         .filter(|_| state.runtime.is_none())
-        .map(|aggregator| aggregator.panel_runtimes())
+        .map(super::console_aggregator::MetaConsoleAggregator::panel_runtimes)
         .transpose()
     {
         Ok(runtimes) => runtimes,
@@ -15827,7 +15827,7 @@ comms = true
                 identity_namespace: key.into(),
                 runtime,
                 visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
-            })
+            });
         };
         register("repo-a", runtime_a.clone());
         let call = |method: &str, params: Value| {
