@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- `GatewayHostError` is `#[non_exhaustive]` and has a new unit variant,
+  `AgentCustomizerRequired`. A host whose members need an agent customizer
+  answers it when `GatewayHostComposition::compose_agent_customizer` is
+  offered `None`: init fails closed with `-32603` before the identity
+  bootstrap, and the failure's message is the variant's text, "the native
+  host composition requires an agent customizer: configure the SDK agent
+  customizer (a pass-through is enough)". A host that matches
+  `GatewayHostError` needs a wildcard arm; later variants are additive.
+
 ### Added
 
 - `meta/schedule/tools` lists the definitions of Meerkat's durable schedule
