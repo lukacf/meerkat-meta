@@ -374,7 +374,7 @@ async def test_leaving_pending_restores_bounds_and_exact_cleanup(background, mon
         if after_pending == "cancel":
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await asyncio.wait_for(task, 30)
             assert len(manager.starts) == 1
             assert read_receipt(directory)["update"]["status"] == "restored-stopped"
         elif after_pending == "unknown":
