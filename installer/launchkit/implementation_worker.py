@@ -384,18 +384,20 @@ class BuildTools:
                 source_files[path] = digest
                 origins = [(path, i + 1, digest) for i in range(len(source.splitlines()))]
             if snapshot is not None and product and selected in ("runtime", "messaging", "flows", "schedule", "roster"):
-                for path in ("meerkat_toolkit/host_control.py", "meerkat_toolkit/application_runtime.py"):
+                # Keep request types, aliases and clients with their runtime wrappers.
+                # Older selected wheels may predate the member-class module.
+                paths = ["meerkat_toolkit/host_control.py", "meerkat_toolkit/application_runtime.py"]
+                if "meerkat_toolkit/member_classes.py" in snapshot["sources"]:
+                    paths.append("meerkat_toolkit/member_classes.py")
+                for path in paths:
                     raw = snapshot["sources"][path]
                     code, digest = raw.decode("utf-8"), hashlib.sha256(raw).hexdigest()
                     lines = code.splitlines()
-                    for node in ast.parse(code).body:
-                        if isinstance(node, ast.ClassDef) and node.name in ("ToolkitMobKitRuntime", "ToolkitApplicationRuntime"):
-                            start = min([node.lineno, *(item.lineno for item in node.decorator_list)])
-                            separator = ("\n" if source.endswith("\n") else "\n\n") if source else ""
-                            source += separator + "# " + path + ": " + node.name + "\n" + "\n".join(lines[start - 1:node.end_lineno])
-                            origins.extend(([None, None] if separator else [None])
-                                + [(path, i + 1, digest) for i in range(start - 1, node.end_lineno)])
-                            source_files[path] = digest
+                    separator = ("\n" if source.endswith("\n") else "\n\n") if source else ""
+                    source += separator + "# " + path + "\n" + "\n".join(lines)
+                    origins.extend(([None, None] if separator else [None])
+                        + [(path, i + 1, digest) for i in range(len(lines))])
+                    source_files[path] = digest
             reference_metadata["source_files"] = [{"path": path, "sha256": digest}
                 for path, digest in source_files.items()]
             return source, origins, reference_metadata
@@ -496,7 +498,7 @@ class BuildTools:
                                 "new_text": {"type": "string"}}, ["old_text", "new_text"])}},
                         ["kind", "path", "expected_sha256", "edits"])]}}}, ["operations"]))
         draft.register_tool("check_implementation", self.check, description="Run host-owned syntax checks, authored unittest tests/test_*.py and offline tests/test_*.dom.cjs checks when the reviewed DOM runtime is available, in an isolated snapshot without network, user files or credentials. DOM files export a registration function receiving test, createDOM, assert, sourceRoot and scratchRoot. Inspect failures and repair.", input_schema=_schema())
-        draft.register_tool("read_runtime_reference", self.reference, description="Find or read exact installed public SDK source and the application contract. Start with query='MemberSnapshot' or query='list_members' instead of guessing pages. Query is literal and case-insensitive, searches all advertised references unless name is supplied, and returns at most 40 attributed matches; offset pages matches. Read a match using its name and offset without query (offset then means source lines, at most 250). Types provides public result models from types.py; runtime, builder and identity provide full source. Roster, messaging and flows provide focused contracts. Selected runtime pages read its exact protected SDK wheel source without importing it. Schedule includes pinned Meta/Core 0.9.4 authoring schemas only when the selected Meta SDK (or, without a selection, the installed Meta SDK) matches; other versions receive recurrence guidance and an explicit missing-schema notice. SDK callback wiring and documentation are not observed execution. Application describes seeded host hooks. No arbitrary paths or private SDK modules are accepted.", input_schema=_schema({"name": {"type": "string", "enum": ["application", "messaging", "flows", "schedule", "roster", "runtime", "builder", "identity", "types"]}, "query": {"type": "string", "minLength": 1, "maxLength": 160}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 250}}))
+        draft.register_tool("read_runtime_reference", self.reference, description="Find or read exact installed public SDK source and the application contract. Start with query='MemberSnapshot' or query='list_members' instead of guessing pages. Query is literal and case-insensitive, searches all advertised references unless name is supplied, and returns at most 40 attributed matches; offset pages matches. Read a match using its name and offset without query (offset then means source lines, at most 250). Types provides public result models from types.py; runtime, builder and identity provide full source. Roster, messaging and flows provide focused contracts. Selected runtime pages read its exact protected SDK wheel source without importing it, including complete Toolkit runtime, private-host and member-class modules when present. Schedule includes pinned Meta/Core 0.9.4 authoring schemas only when the selected Meta SDK (or, without a selection, the installed Meta SDK) matches; other versions receive recurrence guidance and an explicit missing-schema notice. SDK callback wiring and documentation are not observed execution. Application describes seeded host hooks. No arbitrary paths or private SDK modules are accepted.", input_schema=_schema({"name": {"type": "string", "enum": ["application", "messaging", "flows", "schedule", "roster", "runtime", "builder", "identity", "types"]}, "query": {"type": "string", "minLength": 1, "maxLength": 160}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 250}}))
         draft.register_tool("publish_implementation", self.publish, description="Publish implemented source only after current host-issued passing checks. Explicitly retain unresolved external contracts and live verification needs.", input_schema=_schema({"summary": {"type": "string"}, "unresolved": {"type": "array", "items": {"type": "string"}}}, ["summary", "unresolved"]))
 
 
