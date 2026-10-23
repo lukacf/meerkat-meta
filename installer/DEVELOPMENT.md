@@ -74,17 +74,27 @@ isolation. Use the same test commands as the Forge workflow:
 
 ```bash
 NODE_OPTIONS=--max-old-space-size=3072 node --test --test-concurrency=2 installer/web/*.test.mjs
-installer/.venv/bin/python -m pytest -vv installer/tests --maxfail=10 --tb=short --durations=20 --junitxml=installer/.artifacts/pytest.xml
+installer/.venv/bin/python -m pytest -vv installer/tests --tb=short --durations=20 --junitxml=installer/.artifacts/pytest.xml
 ```
 
-Allow substantial time for the full backend suite. One hosted run reached its
-ten-failure limit after 41 minutes; a separate local run of the affected and
-remaining cases took another 48 minutes. Those are partial runs on different
-machines, not a measured duration for the full suite. The hosted backend job has
-a 120-minute limit and reports its 20 slowest tests. `--maxfail=10` stops after
-ten failures; it does not sample passing cases. A run stopped by that limit or a
-job timeout is incomplete even when its earlier cases passed. Preserve the
-failure output and XML before making a correction.
+Allow substantial time for the full backend suite: in one process it took about
+two hours on a busy development host. The Forge workflow splits it into twelve
+shards balanced on collected test items, each with a 120-minute limit and its
+own 20 slowest tests, and the `backend` job passes only once every shard has.
+No failure limit stops a run early, so every failure is reported. A run
+stopped by a job timeout is incomplete even when its earlier cases passed.
+Preserve the failure output and XML before making a correction. To run one
+shard's files as the workflow does:
+
+```bash
+installer/.venv/bin/python installer/tests/forge_shards.py 3 12 shard-files.txt shard-startup.txt
+installer/.venv/bin/python -m pytest -vv --tb=short $(cat shard-files.txt)
+```
+
+Each shard then reruns its files listed in
+`installer/tests/checkout_sdk_startup_tests.txt` with
+`PYTHONPATH=sdk/python:installer`, so the startup code imports this checkout's
+Meta SDK rather than the Guide SDK.
 
 Generated-host wiring checks use the installed Guide SDK, without a private
 source intake. Toolkit-specific doctor checks additionally require the selected
