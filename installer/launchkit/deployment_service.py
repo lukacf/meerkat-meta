@@ -130,9 +130,9 @@ OTHER_VOLUME_REFUSAL = ("macOS does not let a background login item read externa
     "or choose 'While Forge is open'.")
 
 
-def launchd_python_paths():
-    """The Python a new launchd unit runs, as its definition names it, and its installation."""
-    return Path(sys.executable).absolute(), Path(sys.base_prefix)
+def launchd_interpreter():
+    """The Python a new launchd unit runs, as its definition names it."""
+    return Path(sys.executable).absolute()
 
 
 def _folded(path):

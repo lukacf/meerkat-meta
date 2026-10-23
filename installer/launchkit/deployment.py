@@ -1139,8 +1139,8 @@ class DeploymentService:
         """
         if capability.get("manager") != "launchd":
             return None
-        from .deployment_service import launchd_folder_refusal, launchd_python_paths
-        return launchd_folder_refusal([*launchd_python_paths(), self.root,
+        from .deployment_service import launchd_folder_refusal, launchd_interpreter
+        return launchd_folder_refusal([launchd_interpreter(), self.root,
                                        *([destination] if destination is not None else [])])
 
     @staticmethod
