@@ -105,6 +105,10 @@ All notable changes to the Python SDK are documented here.
   it. `MobAnnouncementsStatus.handling` counts admitted batches by handling,
   and is empty from such a gateway. The escalation causes `unhandled` and
   `handled_unverified` read as sent.
+- `announcement_role_template_put` takes `delivery`
+  (`{"await_handling": bool}`), sent only when set: every child's delivery.
+  `AnnouncementRoleTemplate` gains `delivery` and `await_handling`, `None`
+  when the template did not set them.
 
 ## 0.9.4
 

@@ -1026,7 +1026,7 @@ only when set.
 | `announce(source_key, topics, body, *, mob_id=None, correlation_id=None, causes=None)` | `announce` | `AnnounceResult` (`announcement`, `replayed`, `captured`) |
 | `announcement_get(mob_id, source_key)` | `get` | `Announcement` or `None` |
 | `announcement_subscription_put(operation_id, subscription_id, member, topics, *, mobs=None, start=None, expected_revision=None, delivery=None)` | `subscriptions/put` | `AnnouncementSubscription` (`delivery` and `await_handling` when set) |
-| `announcement_role_template_put(operation_id, template_id, members, topics, *, mobs=None, expected_revision=None)` | `subscriptions/put` with `members` | `AnnouncementRoleTemplate` |
+| `announcement_role_template_put(operation_id, template_id, members, topics, *, mobs=None, expected_revision=None, delivery=None)` | `subscriptions/put` with `members` | `AnnouncementRoleTemplate` (`delivery` and `await_handling` when set) |
 | `announcement_subscription_pause` / `_resume` / `_cancel(operation_id, subscription_id, expected_revision)` | `subscriptions/{pause,resume,cancel}` | `AnnouncementSubscriptionChange` (`subscription`, `unresolved_batches`; for a role template `template` and `children`) |
 | `announcement_subscription_get(subscription_id)` | `subscriptions/get` | `AnnouncementSubscriptionView` (`subscription`, `marker`, `backlog`, and `template` for a role template's id) |
 | `announcement_subscription_list(*, member=None, after=None, limit=None)` | `subscriptions/list` | `list[AnnouncementSubscription]` |
