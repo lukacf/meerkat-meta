@@ -871,6 +871,11 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const explicitPanelRuntime = panelRuntimeSelection?.scope === persistentSendScope
     ? panelRuntimeSelection.key : savedPanelRuntimeSelection;
   const panelRuntimeKey = selectedPanelRuntime(explicitPanelRuntime, experience?.panel_runtimes);
+  // An explicitly empty shared registry is a setup state, not an access grant.
+  // Missing experience or a denied configured service must keep its normal gate.
+  const emptyPanelRegistry = experience?.panel_runtimes?.length === 0
+    && experience.memory?.available === false
+    && experience.workgraph?.available === false;
   React.useEffect(() => {
     if (!panelRuntimeKey) return;
     setPanelRuntimeSelection(current => current?.scope === persistentSendScope && current.key === panelRuntimeKey
@@ -1220,6 +1225,11 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   }
 
   function runtimeScopedPanel(kind: "memory" | "workgraph", content: React.ReactNode) {
+    if (emptyPanelRegistry) return <div className="console-panel runtime-panel-empty">
+      <h2>{kind === "memory" ? "Memory" : "WorkGraph"}</h2>
+      <p role="status">No teams are running.</p>
+      <p>Finish setting up a team to inspect its memory and work graph.</p>
+    </div>;
     const runtimes = experience?.panel_runtimes;
     if (!runtimes) return content;
     const loaded = (kind === "memory" ? memoryDataRuntimeKey : workGraphDataRuntimeKey) === panelRuntimeKey;
@@ -2710,11 +2720,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     if (configuredVisible.length > 0) {
       const extra: NavKind[] = [];
       if (experience?.access?.can_administer === true) extra.push("access");
-      // The Memory panel is gated server-side per principal, never by view
-      // config: `can_read` alone decides whether the nav entry appears.
-      if (experience?.memory?.can_read === true) extra.push("memory");
-      // WorkGraph is likewise server-gated: configured service + view grant.
-      if (experience?.workgraph?.available === true && experience?.workgraph?.can_view === true) {
+      // An empty shared registry offers a setup explanation only. Configured
+      // services still require the server-projected read/view grants.
+      if (emptyPanelRegistry || experience?.memory?.can_read === true) extra.push("memory");
+      if (emptyPanelRegistry || (experience?.workgraph?.available === true && experience?.workgraph?.can_view === true)) {
         extra.push("workgraph");
       }
       return extra.length > 0 ? [...configuredVisible, ...extra] : configuredVisible;
@@ -2728,10 +2737,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     // The Access admin surface is gated server-side per principal, never by
     // view config: administrators always get it, nobody else ever does.
     if (experience?.access?.can_administer === true) controls.push("access");
-    // Same for the Memory panel: server-side `can_read` gates the entry.
-    if (experience?.memory?.can_read === true) controls.push("memory");
-    // Same for WorkGraph: configured service + per-caller view grant.
-    if (experience?.workgraph?.available === true && experience?.workgraph?.can_view === true) {
+    // Empty shared registries keep these destinations discoverable without
+    // making store requests or replacing configured-service access checks.
+    if (emptyPanelRegistry || experience?.memory?.can_read === true) controls.push("memory");
+    if (emptyPanelRegistry || (experience?.workgraph?.available === true && experience?.workgraph?.can_view === true)) {
       controls.push("workgraph");
     }
     return controls;
@@ -2741,6 +2750,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     experience?.memory?.can_read,
     experience?.workgraph?.available,
     experience?.workgraph?.can_view,
+    emptyPanelRegistry,
     hasMobControlSurface,
   ]);
 
@@ -2898,6 +2908,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   }, [panelRefreshFlight, baseUrl, accessScope]);
 
   const refreshMemoryData = React.useCallback(() => panelRefreshFlight(`memory:${panelRuntimeKey}`, async () => {
+    if (emptyPanelRegistry) return;
     const memoryTarget = controlWorkbenchTarget("memory");
     try {
       let records: MemoryPanelRecord[] = [];
@@ -3077,13 +3088,14 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       setMemoryData((current) => ({ ...current, error: errorMessage(err) }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [panelRefreshFlight, baseUrl, panelRuntimeKey, experience?.memory?.can_review_quarantine]);
+  }), [panelRefreshFlight, baseUrl, panelRuntimeKey, emptyPanelRegistry, experience?.memory?.can_review_quarantine]);
 
   // Overlapping refreshes (debounced live signals, manual refresh, post-
   // mutation re-reads) can resolve out of order — sequence them so a stale
   // snapshot never overwrites a fresher one.
   const workGraphRefreshSequencerRef = React.useRef(createWorkGraphRefreshSequencer());
   const refreshWorkGraphData = React.useCallback(() => panelRefreshFlight(`workgraph:${panelRuntimeKey}`, async () => {
+    if (emptyPanelRegistry) return;
     const workGraphTarget = controlWorkbenchTarget("workgraph");
     const isCurrent = workGraphRefreshSequencerRef.current.begin();
     try {
@@ -3149,7 +3161,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       setWorkGraphData((current) => ({ ...current, error: errorMessage(err) }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [panelRefreshFlight, baseUrl, panelRuntimeKey]);
+  }), [panelRefreshFlight, baseUrl, panelRuntimeKey, emptyPanelRegistry]);
 
   /// Filtered/paged panel/records query for the Records filter bar, the
   /// keyset load-more, and the lattice page-walk. Resolves null STRICTLY on
@@ -3392,7 +3404,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const visiblePanelKey = JSON.stringify(visiblePanelTargets);
   React.useEffect(() => {
     void refreshPanelDataRef.current().catch(() => {});
-  }, [visiblePanelKey, accessScope, panelRuntimeKey, experience?.access?.can_administer]);
+  }, [visiblePanelKey, accessScope, panelRuntimeKey, emptyPanelRegistry, experience?.access?.can_administer]);
 
   const scheduleExperienceRefresh = React.useCallback(() => {
     if (experienceTimerRef.current !== null) return;

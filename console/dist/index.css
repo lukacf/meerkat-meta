@@ -13646,6 +13646,16 @@ svg[data-svg=fit],
   height: 100%;
   min-height: 0;
 }
+.runtime-panel-empty {
+  gap: 12px;
+}
+.runtime-panel-empty h2,
+.runtime-panel-empty p {
+  margin: 0;
+}
+.runtime-panel-empty p {
+  color: var(--ink-muted);
+}
 .runtime-scoped-panel > :last-child {
   flex: 1;
   min-height: 0;
