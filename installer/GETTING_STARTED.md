@@ -313,6 +313,15 @@ files. Review the new package, then use the saved installation's update controls
 when available. This action does not select the pending Meta/Toolkit composition
 or remove a displayed package-preparation limitation.
 
+After a failed or interrupted build, **Start a fresh build** may also appear
+under **Runtime and host updates** once Forge has verified the saved source and
+confirmed cleanup. It starts again from your accepted setup with the current
+runtime, leaving the unfinished application code and its checks in the previous
+build. The old source and history stay saved, and your unsent builder note stays
+in the note box. Use **Resume saved build** to continue that saved application
+work instead. A fresh build still needs the displayed package and app-check
+prerequisites; it leaves your installed application unchanged.
+
 If **Stopping builder...** or **Closing build runtime...** appears, wait for the
 existing build runtime to finish closing. If offered, **Retry cleanup** retries
 that cleanup. **Cleanup unavailable** means Forge cannot confirm cleanup yet;
