@@ -1710,3 +1710,176 @@ async fn a_declared_record_on_an_id_a_runtime_record_of_the_other_kind_holds_is_
         "the runtime subscription is never touched"
     );
 }
+
+/// A declared record pending with a runtime refusal raises one
+/// `declaration_pending` escalation about it, and applying the record
+/// resolves it.
+#[tokio::test]
+async fn a_pending_declared_record_raises_declaration_pending_until_it_applies() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let audience = serde_json::json!([{ "kind": "role", "mob_id": OWN_MOB, "role": "triager" }]);
+    try_apply(
+        service,
+        1,
+        serde_json::json!([declared_inbox(audience)]),
+        serde_json::json!([declared_subscription(
+            "b-mail",
+            "agent:b",
+            &["mail.received"]
+        )]),
+    )
+    .await
+    .unwrap();
+    let subject = serde_json::json!({
+        "kind": "declaration",
+        "record_kind": "subscription",
+        "id": "b-mail",
+    });
+    let open = |escalations: &serde_json::Value| -> Vec<serde_json::Value> {
+        escalations["escalations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|escalation| {
+                escalation["cause"] == "declaration_pending" && escalation["subject"] == subject
+            })
+            .collect()
+    };
+    let escalations = try_host_call(
+        service,
+        "meta/mob_announcements/escalations/list",
+        serde_json::json!({ "open": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(open(&escalations).len(), 1, "{escalations}");
+    // The member registers on the roster with the role, and the record applies.
+    harness.native.set_roster_facts("agent:b", "triager", &[]);
+    service.reconcile_mobs().await.unwrap();
+    let escalations = try_host_call(
+        service,
+        "meta/mob_announcements/escalations/list",
+        serde_json::json!({ "open": true }),
+    )
+    .await
+    .unwrap();
+    assert!(open(&escalations).is_empty(), "{escalations}");
+}
+
+/// A declared source naming the reserved health topic, as a topic or as a
+/// triage route's forward topic, is refused whole, and nothing applies.
+#[tokio::test]
+async fn a_declared_source_naming_the_health_topic_is_refused_whole() {
+    let harness = harness_with(native_serving(&[]));
+    let service = &harness.service;
+    let mut on_health = declared_inbox(serde_json::json!([member_grant("agent:a")]));
+    on_health["topics"] = serde_json::json!(["mob_announcements.health"]);
+    let refused = try_apply(
+        service,
+        1,
+        serde_json::json!([on_health]),
+        serde_json::json!([]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, -32602, "{refused:?}");
+    let mut forwarding = with(
+        declared_inbox(serde_json::json!([
+            member_grant("agent:a"),
+            member_grant("agent:t")
+        ])),
+        "routes",
+        serde_json::json!([
+            { "kind": "direct" },
+            triage_by("agent:t", serde_json::json!([member_grant("agent:a")])),
+        ]),
+    );
+    forwarding["routes"][1]["forward_topics"] = serde_json::json!(["mob_announcements.health"]);
+    let refused = try_apply(
+        service,
+        1,
+        serde_json::json!([forwarding]),
+        serde_json::json!([]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, -32602, "{refused:?}");
+    assert_eq!(declared(service).await["revision"], 0);
+}
+
+/// A pending declared record is retried at the health pass every round
+/// runs: once its member registers with the role, the next round makes it.
+#[tokio::test]
+async fn a_pending_declared_record_is_retried_at_the_health_pass() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let audience = serde_json::json!([{ "kind": "role", "mob_id": OWN_MOB, "role": "triager" }]);
+    try_apply(
+        service,
+        1,
+        serde_json::json!([declared_inbox(audience)]),
+        serde_json::json!([declared_subscription(
+            "b-mail",
+            "agent:b",
+            &["mail.received"]
+        )]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(subscription_state(service, "b-mail").await, None);
+    harness.native.set_roster_facts("agent:b", "triager", &[]);
+    service.run_round().await.unwrap();
+    let view = declared(service).await;
+    assert_eq!(
+        record(&view, "subscription", "b-mail").map(|record| &record["status"]),
+        Some(&serde_json::json!("applied")),
+        "{view}"
+    );
+    assert_eq!(
+        subscription_state(service, "b-mail").await.as_deref(),
+        Some("active")
+    );
+}
+
+/// A declared source's collection reads its health as it stands at the
+/// read: a live source no step has advanced for longer than its stale
+/// window is stale.
+#[tokio::test]
+async fn a_declared_source_past_its_stale_window_reads_stale() {
+    let harness = harness_with(native_serving(&[]));
+    let service = &harness.service;
+    try_apply(
+        service,
+        1,
+        serde_json::json!([declared_inbox(serde_json::json!([member_grant("agent:a")]))]),
+        serde_json::json!([]),
+    )
+    .await
+    .unwrap();
+    let baseline = with(
+        advance_params("baseline", 1, 0, "cursor-1"),
+        "coverage",
+        serde_json::json!("complete"),
+    );
+    try_host_call(service, SOURCES_ADVANCE, baseline)
+        .await
+        .unwrap();
+    let view = declared(service).await;
+    assert_eq!(
+        record(&view, "source", "inbox").map(|record| &record["collection"]),
+        Some(&serde_json::json!("live")),
+        "{view}"
+    );
+    // Two days on, past the default one-day stale window.
+    harness
+        .clock
+        .fetch_add(2 * 24 * 60 * 60 * 1000, Ordering::SeqCst);
+    let view = declared(service).await;
+    assert_eq!(
+        record(&view, "source", "inbox").map(|record| &record["collection"]),
+        Some(&serde_json::json!("stale")),
+        "{view}"
+    );
+}

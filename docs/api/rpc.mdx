@@ -2622,8 +2622,9 @@ A record the runtime refuses for now does not refuse the apply: it is
 `pending` with the refusal its put met (such as `unknown_member`,
 `audience_not_covered` or `route_overlap`), or `unmanaged_record` when a
 record made at runtime holds its id, and the rest of the declarations
-apply. A pending record is retried at startup, at each apply and whenever
-the gateway's set of mobs changes. At startup the options' declarations
+apply. A pending record raises a `declaration_pending` escalation until it
+applies, and is retried at startup, at each apply, whenever the gateway's
+set of mobs changes and at every health pass. At startup the options' declarations
 take effect when nothing is applied yet or they name a higher revision than
 the applied one, so an apply made at runtime stands across a restart until
 the options move past it; options at the applied revision with other

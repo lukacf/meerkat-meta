@@ -2185,6 +2185,9 @@ impl AnnouncementService {
                 BTreeSet::new()
             }
         };
+        // A pending declared record is retried at every health pass, and
+        // what it raised or resolved is pushed with the rest.
+        self.retry_pending_declared().await;
         let pass = EscalationPass {
             renotify_after_ms: self.inner.config.renotify_after_ms,
             health_audience: self.inner.config.health_audience.clone(),

@@ -248,10 +248,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - A declared record the runtime refuses for now (a member not yet
     registered, an audience that does not cover it yet, an id a
     subscription or template made at runtime holds: `unmanaged_record`) is
-    pending with its refusal, and
-    the rest of the declarations apply. A pending record is retried at
-    startup, at each apply and whenever the gateway's set of mobs changes;
-    a role child is retried at each announcement its template matches.
+    pending with its refusal and raises a `declaration_pending` escalation
+    until it applies, and the rest of the declarations apply. A pending
+    record is retried at startup, at each apply, whenever the gateway's set
+    of mobs changes and at every health pass; a role child is retried at
+    each announcement its template matches.
   - A role-selected subscription is a template that never delivers by
     itself: at each announcement it captures for every member the mob's
     roster gives the role, through a child subscription named for the
