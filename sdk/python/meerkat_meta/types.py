@@ -1,6 +1,7 @@
 """Typed return models for Meta SDK RPC methods."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -2157,6 +2158,8 @@ class ErrorCategory(str, Enum):
     EVENT_LOG_FLUSH_FAILURE = "event_log_flush_failure"
     IDENTITY_MATERIALIZATION_FAILURE = "identity_materialization_failure"
     MOB_STOP_PROCEEDED_WITHOUT_INTERRUPT = "mob_stop_proceeded_without_interrupt"
+    MOB_ANNOUNCEMENT_ESCALATED = "mob_announcement_escalated"
+    MOB_ANNOUNCEMENT_ESCALATION_RESOLVED = "mob_announcement_escalation_resolved"
 
 
 #: Categories that report a failure ENDING rather than starting. Mirrors the
@@ -2166,7 +2169,27 @@ class ErrorCategory(str, Enum):
 #:
 #: Holds wire strings, not enum members: ``ErrorEvent.category`` carries the
 #: raw wire value, so membership must not depend on ``Enum`` hash semantics.
-RESOLUTION_ERROR_CATEGORIES = frozenset({ErrorCategory.ACTOR_LOOP_RECOVERED.value})
+RESOLUTION_ERROR_CATEGORIES = frozenset(
+    {
+        ErrorCategory.ACTOR_LOOP_RECOVERED.value,
+        ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED.value,
+    }
+)
+
+
+def _escalation_subject(subject: Any) -> str:
+    """A mob announcement escalation's subject as the runtime words it."""
+    if not isinstance(subject, dict):
+        return str(subject or "")
+    kind = subject.get("kind")
+    if kind == "source":
+        return f"source {subject.get('source_id', '')} of mob {subject.get('mob_id', '')}"
+    if kind == "member":
+        member = subject.get("member") if isinstance(subject.get("member"), dict) else {}
+        return f"member {member.get('identity', '')} of mob {member.get('mob_id', '')}"
+    if kind == "declaration":
+        return f"declared {subject.get('record_kind', '')} {subject.get('id', '')}"
+    return json.dumps(subject, sort_keys=True)
 
 
 @dataclass(frozen=True)
@@ -2243,6 +2266,20 @@ class ErrorEvent:
                 f"teardown proceeded after {waited_ms}ms WITHOUT a successful "
                 f"interrupt{subject}; a turn may have been admitted and may "
                 f"still be running: {error}"
+            )
+        elif category == ErrorCategory.MOB_ANNOUNCEMENT_ESCALATED:
+            escalation = context.get("escalation")
+            escalation = escalation if isinstance(escalation, dict) else {}
+            message = (
+                f"{context.get('event', '')} {escalation.get('escalation_id', '')} "
+                f"{escalation.get('cause', '')} on "
+                f"{_escalation_subject(escalation.get('subject'))} (notified again "
+                f"{context.get('renotify_count', 0)} times, cursor {context.get('cursor', 0)})"
+            )
+        elif category == ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED:
+            message = (
+                f"{context.get('escalation_id', '')} {context.get('cause', '')} on "
+                f"{_escalation_subject(context.get('subject'))} (cursor {context.get('cursor', 0)})"
             )
         else:
             message = str(data)
