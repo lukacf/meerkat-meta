@@ -10852,6 +10852,7 @@ shell = true
             "meta/reset",
             "meta/delete_identity",
             "meta/send",
+            "meta/send_status",
             "meta/interact",
             "meta/dispatch",
             "meta/recover_delivery",
