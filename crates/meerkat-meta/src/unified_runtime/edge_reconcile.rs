@@ -870,9 +870,11 @@ mod reconcile_incomplete_alert_tests {
         assert_eq!(wire["category"], "reconcile_incomplete", "{wire}");
         assert_eq!(wire["failures"], 7, "{wire}");
         assert_eq!(wire["skipped"], 1, "{wire}");
-        let failed = wire["failed"]
-            .as_array()
-            .unwrap_or_else(|| panic!("the alert names the failed operations: {wire}"));
+        assert!(
+            wire["failed"].is_array(),
+            "the alert names the failed operations: {wire}"
+        );
+        let failed = wire["failed"].as_array().expect("the failed operations");
         assert_eq!(failed.len(), 5, "the first five: {wire}");
         for (index, failure) in failed.iter().enumerate() {
             assert_eq!(
