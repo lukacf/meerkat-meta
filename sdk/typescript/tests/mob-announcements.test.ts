@@ -1373,3 +1373,31 @@ describe("MobHandle handling reads and awaiting handling", () => {
     assert.equal(typeof api.parseAnnouncementMemberHandling, "function");
   });
 });
+
+// -- Template deliveries -------------------------------------------------------
+
+describe("MobHandle template deliveries", () => {
+  it("announcementRoleTemplatePut sends delivery only when set", async () => {
+    let { handle, calls } = mockHandle(() => ({}));
+    await (handle as any).announcementRoleTemplatePut("op-t", "reviewers", ROLE, ["ops.alert"], {
+      delivery: { await_handling: false },
+    });
+    assert.deepEqual((calls[0].params as any).delivery, { await_handling: false });
+    ({ handle, calls } = mockHandle(() => ({})));
+    await (handle as any).announcementRoleTemplatePut("op-t", "reviewers", ROLE, ["ops.alert"]);
+    assert.equal("delivery" in (calls[0].params as any), false);
+  });
+
+  it("a role template reads its delivery", async () => {
+    let { handle } = mockHandle(() => ({
+      subscription: null,
+      marker: null,
+      template: { ...TEMPLATE, delivery: { await_handling: true } },
+    }));
+    let template: any = ((await handle.announcementSubscriptionGet("reviewers")) as any).template;
+    assert.deepEqual([template.delivery, template.awaitHandling], [{ await_handling: true }, true]);
+    ({ handle } = mockHandle(() => ({ subscription: TEMPLATE })));
+    template = await (handle as any).announcementRoleTemplatePut("op-t", "reviewers", ROLE, ["ops.alert"]);
+    assert.deepEqual([template.delivery, template.awaitHandling], [null, null]);
+  });
+});

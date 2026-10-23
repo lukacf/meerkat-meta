@@ -1138,3 +1138,27 @@ def test_a_handling_cause_reads_as_sent(cause):
 def test_the_member_handling_name_is_exported():
     import meerkat_meta
     assert "AnnouncementMemberHandling" in meerkat_meta.__all__
+
+
+# -- Template deliveries -------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_role_template_put_sends_delivery_only_when_set():
+    handle, calls = make_mock_mob_handle()
+    await handle.announcement_role_template_put(
+        "op-t", "reviewers", ROLE, ["ops.alert"], delivery={"await_handling": False})
+    assert calls[0][1]["delivery"] == {"await_handling": False}
+    handle, calls = make_mock_mob_handle()
+    await handle.announcement_role_template_put("op-t", "reviewers", ROLE, ["ops.alert"])
+    assert "delivery" not in calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_a_role_template_reads_its_delivery():
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/subscriptions/get": {
+        "subscription": None, "marker": None, "template": {**TEMPLATE, "delivery": {"await_handling": True}}}})
+    template = (await handle.announcement_subscription_get("reviewers")).template
+    assert template.delivery == {"await_handling": True} and template.await_handling is True
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/subscriptions/put": {"subscription": TEMPLATE}})
+    template = await handle.announcement_role_template_put("op-t", "reviewers", ROLE, ["ops.alert"])
+    assert template.delivery is None and template.await_handling is None
