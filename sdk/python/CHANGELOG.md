@@ -44,6 +44,75 @@ All notable changes to the Python SDK are documented here.
   it, and `supports_announcement_sources(capabilities)`, true when
   `feature_capabilities` lists `mob_announcements.sources.v1`
   (`MOB_ANNOUNCEMENT_SOURCES_V1`).
+- Delivery handling on `MobHandle`: `announcement_delivery_redeliver` and
+  `announcement_delivery_dismiss(operation_id, batch_id)`, for
+  `deliveries/redeliver` and `deliveries/dismiss`, return the batch's
+  `AnnouncementBatchHandling` (`state`, `cause`, `redelivered`, `held`,
+  `dismissed`, `read_at_ms`). A batch that holds nothing for an operator
+  raises `AnnouncementRefusedError` with the kind `not_held`.
+- `AnnouncementBatch.handling` is an `AnnouncementBatchHandling` instead of
+  a dict, and `AnnouncementDeliveryObservation` gains `handling`. Both are
+  `None` until the batch is admitted, and the state stays a plain string.
+  The types are new in this release, so no earlier code relies on the
+  dict.
+- `AnnouncementAuditEntry.source_id` and `generation` are `None` for an
+  entry of a plain announcement. The audit now also counts holds,
+  redeliveries (`redelivered`) and dismissals (`dismissed`) of items
+  whose turn ended unhandled (the reason `unhandled`), with or without a
+  source.
+- Mob announcement health on `MobHandle`: `announcement_member_get`,
+  `announcement_member_list` and `announcement_escalations_list`, for
+  `members/get`, `members/list` and `escalations/list`, and `escalated` on
+  `announcement_source_list`. They return `AnnouncementMemberView`
+  (`member`, `backlog` as `AnnouncementMemberBacklog`, `marker`,
+  `escalations`) and `AnnouncementEscalationsPage` (`next`, and `events` of
+  `AnnouncementEscalationEvent` or, with `open=True`, `escalations` of
+  `AnnouncementEscalation`). Causes, events, evidence and subject kinds stay
+  plain strings, and a subject is kept as sent.
+- `AnnouncementSourceHealth` gains `escalations`, `quiet_monitoring`,
+  `empty_coverage_monitoring` and `runner_scheduled_here`.
+  `runner_scheduled_here` is `None` for a source without a runner, or from a
+  gateway that does not report it.
+- `StatusResult.mob_announcements` (`MobAnnouncementsStatus`: `sources`,
+  `members`, `open_escalations`, `last_event_cursor`) is `None` in three
+  cases: mob announcements are disabled, their database could not be read,
+  or the gateway does not report it.
+- `ErrorCategory.MOB_ANNOUNCEMENT_ESCALATED` and
+  `ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED`, with their messages.
+  The resolution is in `RESOLUTION_ERROR_CATEGORIES`, so
+  `ErrorEvent.is_resolution` is true for it.
+- Declarations and role templates on `MobHandle`:
+  - `announcement_declarations_apply(declarations=None, *, revision=None)`
+    and `announcement_declarations_get()`, for `declarations/apply` and
+    `declarations/get`, return `AnnouncementDeclarationsView` (`revision`,
+    `digest`, and `records` of `AnnouncementDeclarationRecord`).
+  - `announcement_role_template_put(operation_id, template_id, members,
+    topics, *, mobs=None, expected_revision=None)` sends
+    `subscriptions/put` with `members` (`{"mob_id", "role"}` or an
+    `AnnouncementRoleSelector`) and returns `AnnouncementRoleTemplate`.
+  - The refusals `declaration_rollback`, `declaration_digest_conflict`,
+    `role_template_limit` and `subscription_id_taken` keep
+    `AnnouncementRefusedError`.
+- `AnnouncementSubscriptionChange.subscription` is
+  `AnnouncementSubscription | None`: the subscription verbs on a role
+  template's id answer `template` and `children` instead.
+  `AnnouncementSubscriptionView` gains `template`. The type is new in
+  this release, so no earlier code relies on `subscription` being set.
+- `announcement_subscription_put` takes `delivery`
+  (`{"await_handling": bool}`), sent only when set: whether the member's
+  next batch waits until the turn of its previous one has ended.
+  `AnnouncementSubscription` gains `delivery` and `await_handling`, `None`
+  when the subscription did not set them.
+- `AnnouncementMemberView.handling` (`AnnouncementMemberHandling`:
+  `pending`, `handled`, `handled_unverified`, `unhandled`, `held`,
+  `oldest_unhandled_at_ms`) is `None` from a gateway that does not report
+  it. `MobAnnouncementsStatus.handling` counts admitted batches by handling,
+  and is empty from such a gateway. The escalation causes `unhandled` and
+  `handled_unverified` read as sent.
+- `announcement_role_template_put` takes `delivery`
+  (`{"await_handling": bool}`), sent only when set: every child's delivery.
+  `AnnouncementRoleTemplate` gains `delivery` and `await_handling`, `None`
+  when the template did not set them.
 
 ## 0.9.4
 

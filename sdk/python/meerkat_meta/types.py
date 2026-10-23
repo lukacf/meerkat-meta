@@ -127,14 +127,21 @@ class StatusResult:
     running: bool
     loaded_modules: list[str]
     storage: StorageSummary | None = None
+    # ``None`` when mob announcements are disabled, their store could not be
+    # read, or the gateway predates the object.
+    mob_announcements: MobAnnouncementsStatus | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> StatusResult:
+        announcements = data.get("mob_announcements")
         return cls(
             contract_version=data["contract_version"],
             running=data["running"],
             loaded_modules=list(data.get("loaded_modules", [])),
             storage=_storage_summary_from(data),
+            mob_announcements=MobAnnouncementsStatus.from_dict(announcements)
+            if isinstance(announcements, dict)
+            else None,
         )
 
 
@@ -2807,7 +2814,10 @@ class AnnouncementSubscription:
     ``state`` is ``"active"``, ``"paused"``, ``"cancelled"``, ``"ended"`` or a
     newer state. ``frontier`` maps each mob to the sequence after which the
     selector in force captures; ``ended`` says why an ended subscription
-    ended.
+    ended. ``delivery`` is how its member takes what it captures, as set on
+    the subscription (``{"await_handling"}``), and ``await_handling`` reads
+    it; both are ``None`` when it was not set, which leaves the gateway's
+    default.
     """
 
     id: str
@@ -2823,12 +2833,16 @@ class AnnouncementSubscription:
     ended_mobs: tuple[str, ...] = ()
     ended: dict[str, Any] | None = None
     member_mob_cursor: int | None = None
+    delivery: dict[str, Any] | None = None
+    await_handling: bool | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> AnnouncementSubscription:
         d = _wire_dict(data)
         selector = _wire_dict(d.get("selector"))
         frontier = _wire_dict(d.get("frontier"))
+        delivery = _wire_dict_or_none(d.get("delivery"))
+        await_handling = delivery.get("await_handling") if delivery else None
         return cls(
             id=str(d.get("id", "")),
             member=AnnouncementMember.from_dict(d.get("member")),
@@ -2843,6 +2857,67 @@ class AnnouncementSubscription:
             ended_mobs=_wire_strs(d.get("ended_mobs")),
             ended=_wire_dict_or_none(d.get("ended")),
             member_mob_cursor=_wire_int_or_none(d.get("member_mob_cursor")),
+            delivery=delivery,
+            await_handling=await_handling if isinstance(await_handling, bool) else None,
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementRoleSelector:
+    """The members a role template takes: every member of ``mob_id`` its
+    roster records with ``role`` (the profile it was spawned from)."""
+
+    mob_id: str
+    role: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementRoleSelector:
+        d = _wire_dict(data)
+        return cls(mob_id=str(d.get("mob_id", "")), role=str(d.get("role", "")))
+
+    def to_dict(self) -> dict[str, str]:
+        return {"mob_id": self.mob_id, "role": self.role}
+
+
+@dataclass(frozen=True)
+class AnnouncementRoleTemplate:
+    """A role template: a subscription for every member of a mob with a
+    role. It never delivers by itself: each member it takes captures through
+    a child subscription with the id ``"<template id>/<16 hex digits>"``.
+
+    ``state`` is ``"active"``, ``"paused"``, ``"cancelled"`` or a newer
+    state. ``delivery`` is every child's delivery, as set on the template
+    (``{"await_handling"}``), and ``await_handling`` reads it; both are
+    ``None`` when it was not set.
+    """
+
+    id: str
+    members: AnnouncementRoleSelector
+    topics: tuple[str, ...]
+    mobs: tuple[str, ...]
+    state: str
+    revision: int
+    created_at_ms: int
+    updated_at_ms: int
+    delivery: dict[str, Any] | None = None
+    await_handling: bool | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementRoleTemplate:
+        d = _wire_dict(data)
+        delivery = _wire_dict_or_none(d.get("delivery"))
+        await_handling = delivery.get("await_handling") if delivery else None
+        return cls(
+            id=str(d.get("id", "")),
+            members=AnnouncementRoleSelector.from_dict(d.get("members")),
+            topics=_wire_strs(d.get("topics")),
+            mobs=_wire_strs(d.get("mobs")),
+            state=str(d.get("state", "")),
+            revision=_coerce_int(d.get("revision")),
+            created_at_ms=_coerce_int(d.get("created_at_ms")),
+            updated_at_ms=_coerce_int(d.get("updated_at_ms")),
+            delivery=delivery,
+            await_handling=await_handling if isinstance(await_handling, bool) else None,
         )
 
 
@@ -2850,14 +2925,32 @@ class AnnouncementSubscription:
 class AnnouncementSubscriptionChange:
     """A subscription pause, resume or cancel: the subscription as it is
     now, and the batches that still hold its announcements and have not
-    settled (a change never rewrites a sealed batch)."""
+    settled (a change never rewrites a sealed batch).
 
-    subscription: AnnouncementSubscription
+    The same verbs on a role template's id change the template and its
+    children in one step: then ``template`` and ``children`` are set and
+    ``subscription`` is ``None``.
+    """
+
+    subscription: AnnouncementSubscription | None
     unresolved_batches: tuple[str, ...]
+    template: AnnouncementRoleTemplate | None = None
+    children: tuple[AnnouncementSubscription, ...] = ()
 
     @classmethod
     def from_dict(cls, data: Any) -> AnnouncementSubscriptionChange:
         d = _wire_dict(data)
+        template = d.get("template")
+        if isinstance(template, dict):
+            children = d.get("children")
+            return cls(
+                subscription=None,
+                unresolved_batches=_wire_strs(d.get("unresolved_batches")),
+                template=AnnouncementRoleTemplate.from_dict(template),
+                children=tuple(AnnouncementSubscription.from_dict(child) for child in children)
+                if isinstance(children, list)
+                else (),
+            )
         return cls(
             subscription=AnnouncementSubscription.from_dict(d.get("subscription")),
             unresolved_batches=_wire_strs(d.get("unresolved_batches")),
@@ -2894,23 +2987,27 @@ class AnnouncementSuspendMarker:
 class AnnouncementSubscriptionView:
     """``subscriptions/get``: the subscription (``None`` when unknown), why
     its member's deliveries wait if they do, and its backlog when the
-    gateway reports one."""
+    gateway reports one. A role template's id reads the template as
+    ``template``, beside no subscription."""
 
     subscription: AnnouncementSubscription | None
     marker: AnnouncementSuspendMarker | None = None
     backlog: dict[str, Any] | None = None
+    template: AnnouncementRoleTemplate | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> AnnouncementSubscriptionView:
         d = _wire_dict(data)
         subscription = d.get("subscription")
         marker = d.get("marker")
+        template = d.get("template")
         return cls(
             subscription=AnnouncementSubscription.from_dict(subscription)
             if isinstance(subscription, dict)
             else None,
             marker=AnnouncementSuspendMarker.from_dict(marker) if isinstance(marker, dict) else None,
             backlog=_wire_dict_or_none(d.get("backlog")),
+            template=AnnouncementRoleTemplate.from_dict(template) if isinstance(template, dict) else None,
         )
 
 
@@ -2938,6 +3035,39 @@ class AnnouncementBatchItem:
 
 
 @dataclass(frozen=True)
+class AnnouncementBatchHandling:
+    """What became of a delivered batch's turn, as Meta read it, and what it
+    did about it.
+
+    ``state`` is ``"pending"``, ``"handled"``, ``"handled_unverified"``,
+    ``"unhandled"``, ``"unknown"`` or newer. ``cause`` is why the turn did not
+    complete (the receipt's completion type, or the abandon reason when there
+    is none). ``redelivered`` counts the items owed again with a notice,
+    ``held`` the items held for an operator, and ``dismissed`` the held items
+    an operator settled.
+    """
+
+    state: str
+    read_at_ms: int
+    cause: str | None = None
+    redelivered: int = 0
+    held: int = 0
+    dismissed: int = 0
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementBatchHandling:
+        d = _wire_dict(data)
+        return cls(
+            state=str(d.get("state", "")),
+            read_at_ms=_coerce_int(d.get("read_at_ms")),
+            cause=_wire_str_or_none(d.get("cause")),
+            redelivered=_coerce_int(d.get("redelivered")),
+            held=_coerce_int(d.get("held")),
+            dismissed=_coerce_int(d.get("dismissed")),
+        )
+
+
+@dataclass(frozen=True)
 class AnnouncementBatch:
     """An immutable delivery batch for one member.
 
@@ -2946,8 +3076,8 @@ class AnnouncementBatch:
     through) and ``state_detail`` the full state object. ``gaps`` are the
     announcements owed to the member that this batch reports as not
     delivered (``{"mob_id", "count", "reason"}``). ``route`` is ``"local"``,
-    ``"child"``, ``"peer"`` or newer. ``handling`` is ``None`` from a gateway
-    that does not report it.
+    ``"child"``, ``"peer"`` or newer. ``handling`` is ``None`` until the batch
+    is admitted, and from a gateway that does not report it.
     """
 
     id: str
@@ -2963,13 +3093,14 @@ class AnnouncementBatch:
     gaps: tuple[dict[str, Any], ...] = ()
     predecessor: str | None = None
     successor: str | None = None
-    handling: dict[str, Any] | None = None
+    handling: AnnouncementBatchHandling | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> AnnouncementBatch:
         d = _wire_dict(data)
         state = _wire_dict(d.get("state"))
         items = d.get("items")
+        handling = d.get("handling")
         return cls(
             id=str(d.get("id", "")),
             member=AnnouncementMember.from_dict(d.get("member")),
@@ -2986,7 +3117,7 @@ class AnnouncementBatch:
             gaps=_wire_dicts(d.get("gaps")),
             predecessor=_wire_str_or_none(d.get("predecessor")),
             successor=_wire_str_or_none(d.get("successor")),
-            handling=_wire_dict_or_none(d.get("handling")),
+            handling=AnnouncementBatchHandling.from_dict(handling) if isinstance(handling, dict) else None,
         )
 
 
@@ -3002,18 +3133,21 @@ class AnnouncementDeliveryObservation:
     native_status: str
     input: dict[str, Any] | None = None
     marker: AnnouncementSuspendMarker | None = None
+    handling: AnnouncementBatchHandling | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> AnnouncementDeliveryObservation:
         d = _wire_dict(data)
         native = _wire_dict(d.get("native"))
         marker = d.get("marker")
+        handling = d.get("handling")
         return cls(
             batch=AnnouncementBatch.from_dict(d.get("batch")),
             native=native,
             native_status=str(native.get("status", "")),
             input=_wire_dict_or_none(d.get("input")),
             marker=AnnouncementSuspendMarker.from_dict(marker) if isinstance(marker, dict) else None,
+            handling=AnnouncementBatchHandling.from_dict(handling) if isinstance(handling, dict) else None,
         )
 
 
@@ -3091,7 +3225,12 @@ class AnnouncementSourceHealth:
     ``status`` is ``"baselining"``, ``"backfilling"``, ``"ok"``,
     ``"failing"``, ``"stale"``, ``"paused"``, ``"ended"`` or newer.
     ``totals`` counts what its collections did (``announced``, ``replayed``,
-    ``conflicts``, ``own_writes``, ``refusals``, ``gaps``).
+    ``conflicts``, ``own_writes``, ``refusals``, ``gaps``). ``escalations``
+    are its open escalations. ``runner_scheduled_here`` says whether this
+    gateway schedules its runner (``None`` without a runner, or from a gateway
+    that does not report it); a runner on a gateway that schedules none never
+    fires there. ``quiet_monitoring`` and ``empty_coverage_monitoring`` say
+    whether quiet and empty coverage detection are configured.
     """
 
     status: str
@@ -3104,11 +3243,17 @@ class AnnouncementSourceHealth:
     empty_snapshot_since_ms: int | None = None
     last_failure: dict[str, Any] | None = None
     last_conflict: dict[str, Any] | None = None
+    escalations: tuple[AnnouncementEscalation, ...] = ()
+    quiet_monitoring: dict[str, Any] | None = None
+    empty_coverage_monitoring: dict[str, Any] | None = None
+    runner_scheduled_here: bool | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> AnnouncementSourceHealth:
         d = _wire_dict(data)
         totals = _wire_dict(d.get("totals"))
+        escalations = d.get("escalations")
+        scheduled = d.get("runner_scheduled_here")
         return cls(
             status=str(d.get("status", "")),
             consecutive_failures=_coerce_int(d.get("consecutive_failures")),
@@ -3120,6 +3265,12 @@ class AnnouncementSourceHealth:
             empty_snapshot_since_ms=_wire_int_or_none(d.get("empty_snapshot_since_ms")),
             last_failure=_wire_dict_or_none(d.get("last_failure")),
             last_conflict=_wire_dict_or_none(d.get("last_conflict")),
+            escalations=tuple(AnnouncementEscalation.from_dict(item) for item in escalations)
+            if isinstance(escalations, list)
+            else (),
+            quiet_monitoring=_wire_dict_or_none(d.get("quiet_monitoring")),
+            empty_coverage_monitoring=_wire_dict_or_none(d.get("empty_coverage_monitoring")),
+            runner_scheduled_here=scheduled if isinstance(scheduled, bool) else None,
         )
 
 
@@ -3339,21 +3490,23 @@ class SourceAdvanceResult:
 @dataclass(frozen=True)
 class AnnouncementAuditEntry:
     """One counted audit entry: every refusal or withholding of one member
-    by one generation of one source, for one reason.
+    by one generation of one source, for one reason, and every hold,
+    redelivery or dismissal of an item whose turn ended unhandled.
 
     ``action`` is ``"subscription_refused"``, ``"capture_withheld"``,
     ``"items_held"``, ``"items_released"``, ``"expired_while_held"``,
-    ``"delivered_across_revocation"`` or newer; ``reason`` is
-    ``"audience_not_covered"``, ``"no_direct_route"``, ``"route_overlap"``,
-    ``"route_conflict"`` or newer.
+    ``"delivered_across_revocation"``, ``"redelivered"``, ``"dismissed"`` or
+    newer; ``reason`` is ``"audience_not_covered"``, ``"no_direct_route"``,
+    ``"route_overlap"``, ``"route_conflict"``, ``"unhandled"`` or newer.
+    ``source_id`` and ``generation`` are ``None`` for a plain announcement.
     """
 
     id: int
     at_ms: int
     action: str
     mob_id: str
-    source_id: str
-    generation: int
+    source_id: str | None
+    generation: int | None
     member: AnnouncementMember
     reason: str
     count: int
@@ -3368,13 +3521,296 @@ class AnnouncementAuditEntry:
             at_ms=_coerce_int(d.get("at_ms")),
             action=str(d.get("action", "")),
             mob_id=str(d.get("mob_id", "")),
-            source_id=str(d.get("source_id", "")),
-            generation=_coerce_int(d.get("generation")),
+            source_id=_wire_str_or_none(d.get("source_id")),
+            generation=_wire_int_or_none(d.get("generation")),
             member=AnnouncementMember.from_dict(d.get("member")),
             reason=str(d.get("reason", "")),
             count=_coerce_int(d.get("count")),
             first_at_ms=_coerce_int(d.get("first_at_ms")),
             last_at_ms=_coerce_int(d.get("last_at_ms")),
+        )
+
+
+def _escalation_subject_kind(subject: dict[str, Any]) -> str:
+    return str(subject.get("kind", ""))
+
+
+@dataclass(frozen=True)
+class AnnouncementEscalation:
+    """A durable mob announcement escalation.
+
+    ``cause`` is ``"failure_streak"``, ``"stale"``, ``"quiet"``,
+    ``"empty_coverage"``, ``"source_gap"``, ``"conflicts"``, ``"suspended"``,
+    ``"member_gap"``, ``"audience_hold"``, ``"unhandled"``,
+    ``"handled_unverified"``, ``"declaration_pending"`` or newer.
+    ``subject`` is ``{"kind": "source", "mob_id", "source_id"}``,
+    ``{"kind": "member", "member"}``, ``{"kind": "declaration", "record_kind",
+    "id"}`` or newer, as sent; ``subject_kind`` is its kind.
+    ``resolved_at_ms`` is ``None`` while it is open.
+    """
+
+    escalation_id: str
+    cause: str
+    subject: dict[str, Any]
+    subject_kind: str
+    since_ms: int
+    raised_at_ms: int
+    renotify_count: int
+    resolved_at_ms: int | None = None
+    evidence: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementEscalation:
+        d = _wire_dict(data)
+        subject = _wire_dict(d.get("subject"))
+        return cls(
+            escalation_id=str(d.get("escalation_id", "")),
+            cause=str(d.get("cause", "")),
+            subject=subject,
+            subject_kind=_escalation_subject_kind(subject),
+            since_ms=_coerce_int(d.get("since_ms")),
+            raised_at_ms=_coerce_int(d.get("raised_at_ms")),
+            renotify_count=_coerce_int(d.get("renotify_count")),
+            resolved_at_ms=_wire_int_or_none(d.get("resolved_at_ms")),
+            evidence=_wire_str_or_none(d.get("evidence")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementEscalationEvent:
+    """One raise, notification or resolution of an escalation, at its event
+    cursor. ``event`` is ``"raised"``, ``"renotified"``, ``"resolved"`` or
+    newer."""
+
+    cursor: int
+    escalation_id: str
+    event: str
+    cause: str
+    subject: dict[str, Any]
+    subject_kind: str
+    since_ms: int
+    at_ms: int
+    renotify_count: int
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementEscalationEvent:
+        d = _wire_dict(data)
+        subject = _wire_dict(d.get("subject"))
+        return cls(
+            cursor=_coerce_int(d.get("cursor")),
+            escalation_id=str(d.get("escalation_id", "")),
+            event=str(d.get("event", "")),
+            cause=str(d.get("cause", "")),
+            subject=subject,
+            subject_kind=_escalation_subject_kind(subject),
+            since_ms=_coerce_int(d.get("since_ms")),
+            at_ms=_coerce_int(d.get("at_ms")),
+            renotify_count=_coerce_int(d.get("renotify_count")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementEscalationsPage:
+    """``escalations/list``: the events after a cursor (``events``), or with
+    ``open=True`` the open escalations (``escalations``); the other is
+    ``None``. ``next`` is the cursor to read on from."""
+
+    next: int
+    events: tuple[AnnouncementEscalationEvent, ...] | None = None
+    escalations: tuple[AnnouncementEscalation, ...] | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementEscalationsPage:
+        d = _wire_dict(data)
+        events = d.get("events")
+        escalations = d.get("escalations")
+        return cls(
+            next=_coerce_int(d.get("next")),
+            events=tuple(AnnouncementEscalationEvent.from_dict(item) for item in events)
+            if isinstance(events, list)
+            else None,
+            escalations=tuple(AnnouncementEscalation.from_dict(item) for item in escalations)
+            if isinstance(escalations, list)
+            else None,
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementMemberBacklog:
+    """What a member is owed: deliverable items, held and withheld counts."""
+
+    eligible_count: int
+    eligible_bytes: int
+    outstanding: bool
+    held_audience: int
+    held_unhandled: int
+    held_refused: int
+    withheld_audience: int
+    oldest_captured_at_ms: int | None = None
+    last_sealed_at_ms: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementMemberBacklog:
+        d = _wire_dict(data)
+        return cls(
+            eligible_count=_coerce_int(d.get("eligible_count")),
+            eligible_bytes=_coerce_int(d.get("eligible_bytes")),
+            outstanding=bool(d.get("outstanding", False)),
+            held_audience=_coerce_int(d.get("held_audience")),
+            held_unhandled=_coerce_int(d.get("held_unhandled")),
+            held_refused=_coerce_int(d.get("held_refused")),
+            withheld_audience=_coerce_int(d.get("withheld_audience")),
+            oldest_captured_at_ms=_wire_int_or_none(d.get("oldest_captured_at_ms")),
+            last_sealed_at_ms=_wire_int_or_none(d.get("last_sealed_at_ms")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementMemberHandling:
+    """What became of a member's admitted batches' turns: batches by handling
+    (``handled_unverified`` is never folded into ``handled``), the items it
+    holds for an operator now (``held``), and when its oldest unhandled turn
+    was read."""
+
+    pending: int
+    handled: int
+    handled_unverified: int
+    unhandled: int
+    held: int
+    oldest_unhandled_at_ms: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementMemberHandling:
+        d = _wire_dict(data)
+        return cls(
+            pending=_coerce_int(d.get("pending")),
+            handled=_coerce_int(d.get("handled")),
+            handled_unverified=_coerce_int(d.get("handled_unverified")),
+            unhandled=_coerce_int(d.get("unhandled")),
+            held=_coerce_int(d.get("held")),
+            oldest_unhandled_at_ms=_wire_int_or_none(d.get("oldest_unhandled_at_ms")),
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementMemberView:
+    """``members/get`` and each ``members/list`` entry: a member's backlog,
+    why its deliveries wait (``marker``, persisted), its open escalations,
+    and what became of its turns (``handling``, ``None`` from a gateway that
+    does not report it)."""
+
+    member: AnnouncementMember
+    backlog: AnnouncementMemberBacklog
+    marker: AnnouncementSuspendMarker | None = None
+    escalations: tuple[AnnouncementEscalation, ...] = ()
+    handling: AnnouncementMemberHandling | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementMemberView:
+        d = _wire_dict(data)
+        marker = d.get("marker")
+        escalations = d.get("escalations")
+        handling = d.get("handling")
+        return cls(
+            member=AnnouncementMember.from_dict(d.get("member")),
+            backlog=AnnouncementMemberBacklog.from_dict(d.get("backlog")),
+            marker=AnnouncementSuspendMarker.from_dict(marker) if isinstance(marker, dict) else None,
+            escalations=tuple(AnnouncementEscalation.from_dict(item) for item in escalations)
+            if isinstance(escalations, list)
+            else (),
+            handling=AnnouncementMemberHandling.from_dict(handling) if isinstance(handling, dict) else None,
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementDeclarationRecord:
+    """One record the applied declarations manage.
+
+    ``kind`` is ``"source"``, ``"subscription"``, ``"role_child"`` or newer;
+    ``status`` is ``"applied"``, ``"pending"``, ``"left"`` (a role child whose
+    member left the role), ``"suppressed"`` (ended or cancelled by an
+    operator) or newer. ``refusal`` is ``{"kind", "message"}``, the refusal a
+    pending record's put met, and ``refusal_kind`` its kind. An applied
+    source carries ``collection`` (``"baselining"``, ``"backfilling"``,
+    ``"live"``, ``"failing"``, ``"stale"`` or newer); an applied subscription
+    or role child carries ``delivery`` (``{"kind": "ready"}`` or ``{"kind":
+    "refused", "cause"}``), and ``delivery_kind`` its kind.
+    """
+
+    kind: str
+    id: str
+    status: str
+    refusal: dict[str, Any] | None = None
+    refusal_kind: str | None = None
+    collection: str | None = None
+    delivery: dict[str, Any] | None = None
+    delivery_kind: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementDeclarationRecord:
+        d = _wire_dict(data)
+        refusal = _wire_dict_or_none(d.get("refusal"))
+        delivery = _wire_dict_or_none(d.get("delivery"))
+        return cls(
+            kind=str(d.get("kind", "")),
+            id=str(d.get("id", "")),
+            status=str(d.get("status", "")),
+            refusal=refusal,
+            refusal_kind=_wire_str_or_none(refusal.get("kind")) if refusal else None,
+            collection=_wire_str_or_none(d.get("collection")),
+            delivery=delivery,
+            delivery_kind=_wire_str_or_none(delivery.get("kind")) if delivery else None,
+        )
+
+
+@dataclass(frozen=True)
+class AnnouncementDeclarationsView:
+    """``declarations/get`` and ``declarations/apply``: the applied
+    ``revision`` (0 before any), its ``digest``, and one record per declared
+    source and subscription and per child of a declared role template."""
+
+    revision: int
+    digest: str
+    records: tuple[AnnouncementDeclarationRecord, ...]
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementDeclarationsView:
+        d = _wire_dict(data)
+        records = d.get("records")
+        return cls(
+            revision=_coerce_int(d.get("revision")),
+            digest=str(d.get("digest", "")),
+            records=tuple(AnnouncementDeclarationRecord.from_dict(record) for record in records)
+            if isinstance(records, list)
+            else (),
+        )
+
+
+@dataclass(frozen=True)
+class MobAnnouncementsStatus:
+    """``meta/status.mob_announcements``: sources by state (``active``,
+    ``paused``, ``failing``, ``stale``), members (``suspended``,
+    ``unhandled_held``), admitted batches by handling (``pending``,
+    ``handled``, ``handled_unverified``, ``unhandled``; empty from a gateway
+    that does not report them), and the open escalations with the last event
+    cursor."""
+
+    sources: dict[str, int]
+    members: dict[str, int]
+    open_escalations: int
+    last_event_cursor: int | None = None
+    handling: dict[str, int] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Any) -> MobAnnouncementsStatus:
+        d = _wire_dict(data)
+        escalations = _wire_dict(d.get("escalations"))
+        return cls(
+            sources={str(key): _coerce_int(value) for key, value in _wire_dict(d.get("sources")).items()},
+            members={str(key): _coerce_int(value) for key, value in _wire_dict(d.get("members")).items()},
+            open_escalations=_coerce_int(escalations.get("open")),
+            last_event_cursor=_wire_int_or_none(escalations.get("last_event_cursor")),
+            handling={str(key): _coerce_int(value) for key, value in _wire_dict(d.get("handling")).items()},
         )
 
 

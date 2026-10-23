@@ -283,7 +283,7 @@ async def test_deliveries_read_batch_state_handling_and_gaps():
     [batch] = await handle.announcement_delivery_list()
     assert batch.id == "batch-1" and batch.state == "delivered"
     assert batch.state_detail == {"state": "delivered", "receipt": {"delivery_id": "d-1"}}
-    assert batch.handling == {"state": "handled"} and batch.route == "local"
+    assert batch.handling.state == "handled" and batch.route == "local"
     assert batch.items[0].sequence == 7 and batch.gaps[0]["reason"] == "expired"
 
 
@@ -361,6 +361,17 @@ async def test_audit_list_reads_counted_entries():
     first, second = await handle.announcement_audit_list()
     assert (first.id, first.action, first.reason, first.count) == (1, "capture_withheld", "no_direct_route", 3)
     assert first.member.identity == "research:1" and second.action == "a_future_action"
+
+
+@pytest.mark.asyncio
+async def test_an_audit_entry_for_a_plain_announcement_names_no_source():
+    plain = {key: value for key, value in AUDIT_ENTRY.items() if key not in ("source_id", "generation")}
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/audit/list": {"entries": [
+        {**plain, "action": "redelivered", "reason": "unhandled"}, AUDIT_ENTRY]}})
+    first, second = await handle.announcement_audit_list()
+    assert (first.action, first.reason, first.source_id, first.generation) == (
+        "redelivered", "unhandled", None, None)
+    assert (second.source_id, second.generation) == ("mail", 1)
 
 
 def _error(code, kind=None, **data):
@@ -595,8 +606,8 @@ def _gateway_present() -> bool:
 @pytest.mark.asyncio
 @pytest.mark.skipif(not _gateway_present(), reason="no built rpc_gateway (make test-python builds it)")
 async def test_announcement_sources_round_trip(tmp_path):
-    from meerkat_meta import (AnnouncementNotFoundError, AnnouncementRefusedError, SourceStaleRevisionError,
-                              SourceVersionConflictError)
+    from meerkat_meta import (AnnouncementNotFoundError, AnnouncementRefusedError, RpcError,
+                              SourceStaleRevisionError, SourceVersionConflictError)
     from meerkat_meta.builder import Meta
 
     mob_toml = tmp_path / "mob.toml"
@@ -706,8 +717,448 @@ async def test_announcement_sources_round_trip(tmp_path):
         with pytest.raises(AnnouncementNotFoundError) as missing:
             await handle.announcement_source_pause("op-pause-missing", "no-such-source", 1)
         assert missing.value.kind == "unknown_source"
+        for held_remedy, operation_id in ((handle.announcement_delivery_redeliver, "op-redeliver-missing"),
+                                          (handle.announcement_delivery_dismiss, "op-dismiss-missing")):
+            with pytest.raises(AnnouncementNotFoundError) as unknown_batch:
+                await held_remedy(operation_id, "no-such-batch")
+            assert unknown_batch.value.kind == "unknown_delivery"
+
+        nothing_declared = await handle.announcement_declarations_get()
+        assert (nothing_declared.revision, nothing_declared.records) == (0, ())
+        with pytest.raises(RpcError) as no_sidecar:
+            await handle.announcement_declarations_apply()
+        assert no_sidecar.value.code == -32602
+        declared = await handle.announcement_declarations_apply({"revision": 1, "subscriptions": [
+            {"subscription_id": "declared-1", "member": member, "topics": ["ops.alert"]}]})
+        assert declared.revision == 1 and declared.digest.startswith("sha256:")
+        [record] = declared.records
+        assert (record.kind, record.id, record.status) == ("subscription", "declared-1", "applied")
+        assert (await handle.announcement_declarations_get()).digest == declared.digest
+        with pytest.raises(AnnouncementRefusedError) as rollback:
+            await handle.announcement_declarations_apply({"revision": 0})
+        assert rollback.value.kind == "declaration_rollback" and rollback.value.data["applied"] == 1
+
+        readers = {"mob_id": _ROUND_TRIP_MOB_ID, "role": "reader"}
+        template = await handle.announcement_role_template_put("op-template", "readers", readers, ["ops.alert"])
+        assert (template.id, template.state, template.members.role) == ("readers", "active", "reader")
+        assert template.topics == ("ops.alert",) and template.mobs == (_ROUND_TRIP_MOB_ID,)
+        viewed = await handle.announcement_subscription_get("readers")
+        assert viewed.subscription is None and viewed.template.revision == template.revision
+        with pytest.raises(AnnouncementRefusedError) as taken:
+            await handle.announcement_subscription_put("op-taken", "readers", member, ["ops.alert"])
+        assert taken.value.kind == "subscription_id_taken"
+        await handle.announce("ops/2", ["ops.alert"], "Disk full on db-3")
+        paused_template = await handle.announcement_subscription_pause(
+            "op-template-pause", "readers", template.revision)
+        assert paused_template.subscription is None and paused_template.template.state == "paused"
+        [child] = paused_template.children
+        assert child.id.startswith("readers/") and child.member.identity == "reader:1"
+        cancelled_template = await handle.announcement_subscription_cancel(
+            "op-template-cancel", "readers", paused_template.template.revision)
+        assert cancelled_template.template.state == "cancelled"
+        assert [c.state for c in cancelled_template.children] == ["cancelled"]
         cancelled = await handle.announcement_subscription_cancel(
             "op-cancel", "sub-1", listed_subscription.revision)
         assert cancelled.subscription.state == "cancelled"
     finally:
         await runtime.shutdown()
+
+
+# -- Handling, redelivery and dismissal ---------------------------------------
+
+HANDLING = {"state": "unhandled", "cause": "abandoned_with_error", "redelivered": 0, "held": 2,
+            "dismissed": 0, "read_at_ms": 50}
+
+HANDLING_SERVED = [
+    ("announcement_delivery_redeliver", lambda h: h.announcement_delivery_redeliver("op-r", "batch-1"),
+     "meta/mob_announcements/deliveries/redeliver", {"operation_id": "op-r", "batch_id": "batch-1"}),
+    ("announcement_delivery_dismiss", lambda h: h.announcement_delivery_dismiss("op-d", "batch-1"),
+     "meta/mob_announcements/deliveries/dismiss", {"operation_id": "op-d", "batch_id": "batch-1"}),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,call,method,params", HANDLING_SERVED, ids=[row[0] for row in HANDLING_SERVED])
+async def test_every_handling_method_sends_its_wire_name_and_params(name, call, method, params):
+    handle, calls = make_mock_mob_handle()
+    await call(handle)
+    assert calls == [(method, params)]
+
+
+@pytest.mark.asyncio
+async def test_redeliver_and_dismiss_read_the_handling():
+    handle, _ = make_mock_mob_handle({
+        "meta/mob_announcements/deliveries/redeliver": {"handling": {**HANDLING, "held": 0, "redelivered": 2}},
+        "meta/mob_announcements/deliveries/dismiss": {"handling": {**HANDLING, "held": 0, "dismissed": 2}}})
+    redelivered = await handle.announcement_delivery_redeliver("op-r", "batch-1")
+    assert (redelivered.state, redelivered.cause, redelivered.redelivered, redelivered.held) == (
+        "unhandled", "abandoned_with_error", 2, 0)
+    dismissed = await handle.announcement_delivery_dismiss("op-d", "batch-1")
+    assert (dismissed.dismissed, dismissed.read_at_ms) == (2, 50)
+
+
+@pytest.mark.asyncio
+async def test_a_batch_and_its_observation_read_the_handling():
+    handle, _ = make_mock_mob_handle({
+        "meta/mob_announcements/deliveries/list": {"deliveries": [
+            {**BATCH, "handling": HANDLING}, {**BATCH, "handling": None},
+            {**BATCH, "handling": {**HANDLING, "state": "a_future_state", "cause": None}}]},
+        "meta/mob_announcements/deliveries/observe": {"batch": BATCH, "native": {"status": "applied"},
+                                                      "handling": {**HANDLING, "state": "pending"}}})
+    handled, unread, future = await handle.announcement_delivery_list()
+    assert (handled.handling.state, handled.handling.held) == ("unhandled", 2)
+    assert unread.handling is None
+    assert future.handling.state == "a_future_state" and future.handling.cause is None
+    observation = await handle.announcement_delivery_observe("batch-1")
+    assert observation.handling.state == "pending"
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/deliveries/observe": {
+        "batch": BATCH, "native": {"status": "not_submitted"}}})
+    assert (await handle.announcement_delivery_observe("batch-1")).handling is None
+
+
+def test_the_handling_name_is_exported():
+    import meerkat_meta
+    assert "AnnouncementBatchHandling" in meerkat_meta.__all__
+
+
+# -- Members, escalations and status ----------------------------------------
+
+ESCALATION = {
+    "escalation_id": "esc-1", "cause": "failure_streak",
+    "subject": {"kind": "source", "mob_id": "mob-a", "source_id": "mail"},
+    "since_ms": 10, "raised_at_ms": 20, "renotify_count": 1,
+}
+
+MEMBER_READ = {
+    "member": MEMBER,
+    "backlog": {"eligible_count": 3, "eligible_bytes": 120, "oldest_captured_at_ms": 5,
+                "last_sealed_at_ms": None, "outstanding": True, "held_audience": 1,
+                "held_unhandled": 0, "held_refused": 0, "withheld_audience": 2},
+    "marker": {"cause": {"kind": "member_not_live"}, "evidence": "local", "since_ms": 7},
+    "escalations": [{**ESCALATION, "escalation_id": "esc-2", "cause": "suspended",
+                     "subject": {"kind": "member", "member": MEMBER}}],
+}
+
+ESCALATION_EVENT = {
+    "cursor": 4, "escalation_id": "esc-1", "event": "raised", "cause": "failure_streak",
+    "subject": ESCALATION["subject"], "since_ms": 10, "at_ms": 20, "renotify_count": 0,
+}
+
+HEALTH_SERVED = [
+    ("announcement_member_get", lambda h: h.announcement_member_get(MEMBER),
+     "meta/mob_announcements/members/get", {"member": MEMBER}),
+    ("announcement_member_list", lambda h: h.announcement_member_list(after=MEMBER, limit=5, escalated=True),
+     "meta/mob_announcements/members/list", {"after": MEMBER, "limit": 5, "escalated": True}),
+    ("announcement_escalations_list", lambda h: h.announcement_escalations_list(after=3, limit=10),
+     "meta/mob_announcements/escalations/list", {"after": 3, "limit": 10}),
+    ("announcement_escalations_list[open]", lambda h: h.announcement_escalations_list(open=True),
+     "meta/mob_announcements/escalations/list", {"open": True}),
+    ("announcement_source_list[escalated]", lambda h: h.announcement_source_list(escalated=True),
+     "meta/mob_announcements/sources/list", {"escalated": True}),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,call,method,params", HEALTH_SERVED, ids=[row[0] for row in HEALTH_SERVED])
+async def test_every_health_method_sends_its_wire_name_and_params(name, call, method, params):
+    handle, calls = make_mock_mob_handle()
+    await call(handle)
+    assert calls == [(method, params)]
+
+
+@pytest.mark.asyncio
+async def test_member_get_reads_backlog_marker_and_escalations():
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/members/get": MEMBER_READ})
+    view = await handle.announcement_member_get(MEMBER)
+    assert view.member.identity == "lead:main" and view.marker.cause_kind == "member_not_live"
+    assert (view.backlog.eligible_count, view.backlog.eligible_bytes, view.backlog.outstanding) == (3, 120, True)
+    assert (view.backlog.held_audience, view.backlog.withheld_audience) == (1, 2)
+    assert view.backlog.last_sealed_at_ms is None and view.backlog.oldest_captured_at_ms == 5
+    [escalation] = view.escalations
+    assert (escalation.escalation_id, escalation.cause, escalation.subject_kind) == ("esc-2", "suspended", "member")
+
+
+@pytest.mark.asyncio
+async def test_member_list_reads_member_views():
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/members/list": {"members": [
+        MEMBER_READ, {**MEMBER_READ, "marker": None, "escalations": []}]}})
+    first, second = await handle.announcement_member_list()
+    assert first.escalations[0].cause == "suspended" and second.marker is None and second.escalations == ()
+
+
+@pytest.mark.asyncio
+async def test_escalations_list_reads_events_or_the_open_escalations():
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/escalations/list": {
+        "events": [ESCALATION_EVENT, {**ESCALATION_EVENT, "cursor": 5, "event": "a_future_event"}], "next": 5}})
+    page = await handle.announcement_escalations_list(after=3)
+    assert page.next == 5 and page.escalations is None
+    assert [(event.cursor, event.event) for event in page.events] == [(4, "raised"), (5, "a_future_event")]
+    assert page.events[0].subject_kind == "source" and page.events[0].subject["source_id"] == "mail"
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/escalations/list": {
+        "escalations": [ESCALATION, {**ESCALATION, "cause": "a_future_cause", "resolved_at_ms": 30}], "next": 9}})
+    page = await handle.announcement_escalations_list(open=True)
+    assert page.next == 9 and page.events is None
+    first, second = page.escalations
+    assert (first.cause, first.renotify_count, first.resolved_at_ms) == ("failure_streak", 1, None)
+    assert (second.cause, second.resolved_at_ms) == ("a_future_cause", 30)
+
+
+@pytest.mark.asyncio
+async def test_a_source_health_reads_its_escalations_and_monitoring():
+    health = {**SOURCE["health"], "escalations": [ESCALATION], "runner_scheduled_here": False,
+              "quiet_monitoring": {"configured": True, "quiet_after_ms": 3600000, "last_new_item_at_ms": 40},
+              "empty_coverage_monitoring": {"configured": False, "empty_after_ms": None,
+                                            "empty_snapshot_since_ms": None}}
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/sources/list": {"sources": [
+        {**SOURCE, "health": health}, SOURCE]}})
+    escalated, plain = await handle.announcement_source_list()
+    assert escalated.health.escalations[0].cause == "failure_streak"
+    assert escalated.health.runner_scheduled_here is False
+    assert escalated.health.quiet_monitoring["configured"] is True
+    assert escalated.health.empty_coverage_monitoring["configured"] is False
+    assert plain.health.escalations == () and plain.health.runner_scheduled_here is None
+    assert plain.health.quiet_monitoring is None
+
+
+def test_status_reads_the_mob_announcement_counts():
+    from meerkat_meta import StatusResult
+    data = {"contract_version": "0.5.0", "running": True, "loaded_modules": [],
+            "mob_announcements": {"sources": {"active": 2, "paused": 1, "failing": 1, "stale": 0},
+                                  "members": {"suspended": 1, "unhandled_held": 0},
+                                  "escalations": {"open": 3, "last_event_cursor": 12}}}
+    counts = StatusResult.from_dict(data).mob_announcements
+    assert counts.sources == {"active": 2, "paused": 1, "failing": 1, "stale": 0}
+    assert counts.members == {"suspended": 1, "unhandled_held": 0}
+    assert (counts.open_escalations, counts.last_event_cursor) == (3, 12)
+    assert StatusResult.from_dict({**data, "mob_announcements": None}).mob_announcements is None
+    absent = {key: value for key, value in data.items() if key != "mob_announcements"}
+    assert StatusResult.from_dict(absent).mob_announcements is None
+
+
+@pytest.mark.parametrize("name", [
+    "AnnouncementEscalation", "AnnouncementEscalationEvent", "AnnouncementEscalationsPage",
+    "AnnouncementMemberBacklog", "AnnouncementMemberView", "MobAnnouncementsStatus",
+])
+def test_health_names_are_exported(name):
+    import meerkat_meta
+    assert hasattr(meerkat_meta, name) and name in meerkat_meta.__all__
+
+
+# -- Declarations and role templates ------------------------------------------
+
+ROLE = {"mob_id": "mob-a", "role": "reviewer"}
+
+TEMPLATE = {"id": "reviewers", "members": ROLE, "topics": ["ops.alert"], "mobs": ["mob-a"], "state": "active",
+            "revision": 1, "created_at_ms": 10, "updated_at_ms": 10}
+
+DECLARATIONS = {"revision": 3, "subscriptions": [
+    {"subscription_id": "reviewers", "members": ROLE, "topics": ["ops.alert"]}]}
+
+DECLARATIONS_VIEW = {"revision": 3, "digest": "sha256:abc", "records": [
+    {"kind": "source", "id": "mail", "status": "applied", "collection": "live"},
+    {"kind": "subscription", "id": "sub-1", "status": "pending",
+     "refusal": {"kind": "unknown_member", "message": "no such member"}},
+    {"kind": "role_child", "id": "reviewers/0123456789abcdef", "status": "applied",
+     "delivery": {"kind": "refused", "cause": "governed_runtime"}},
+    {"kind": "a_future_kind", "id": "x", "status": "a_future_status"}]}
+
+DECLARATION_SERVED = [
+    ("role_template_put", lambda h: h.announcement_role_template_put("op-t", "reviewers", ROLE, ["ops.alert"]),
+     "meta/mob_announcements/subscriptions/put",
+     {"operation_id": "op-t", "subscription_id": "reviewers", "members": ROLE, "topics": ["ops.alert"]}),
+    ("role_template_put_with_options", lambda h: h.announcement_role_template_put(
+        "op-t", "reviewers", ROLE, ["ops.alert"], mobs=["mob-a"], expected_revision=2),
+     "meta/mob_announcements/subscriptions/put",
+     {"operation_id": "op-t", "subscription_id": "reviewers", "members": ROLE, "topics": ["ops.alert"],
+      "mobs": ["mob-a"], "expected_revision": 2}),
+    ("declarations_apply", lambda h: h.announcement_declarations_apply(DECLARATIONS),
+     "meta/mob_announcements/declarations/apply", {"declarations": DECLARATIONS, "revision": 3}),
+    ("declarations_apply_from_a_sidecar", lambda h: h.announcement_declarations_apply(),
+     "meta/mob_announcements/declarations/apply", {}),
+    ("declarations_get", lambda h: h.announcement_declarations_get(),
+     "meta/mob_announcements/declarations/get", {}),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,call,method,params", DECLARATION_SERVED, ids=[row[0] for row in DECLARATION_SERVED])
+async def test_every_declaration_method_sends_its_wire_name_and_params(name, call, method, params):
+    handle, calls = make_mock_mob_handle()
+    await call(handle)
+    assert calls == [(method, params)]
+
+
+@pytest.mark.asyncio
+async def test_a_role_template_put_reads_the_template():
+    from meerkat_meta import AnnouncementRoleSelector
+    handle, calls = make_mock_mob_handle({"meta/mob_announcements/subscriptions/put": {"subscription": TEMPLATE}})
+    template = await handle.announcement_role_template_put(
+        "op-t", "reviewers", AnnouncementRoleSelector(mob_id="mob-a", role="reviewer"), ("ops.alert",))
+    assert calls[0][1]["members"] == ROLE
+    assert (template.id, template.members.mob_id, template.members.role) == ("reviewers", "mob-a", "reviewer")
+    assert template.topics == ("ops.alert",) and template.mobs == ("mob-a",)
+    assert (template.state, template.revision, template.created_at_ms, template.updated_at_ms) == ("active", 1, 10, 10)
+
+
+@pytest.mark.asyncio
+async def test_a_template_verb_reads_the_template_and_its_children():
+    child = {**SUBSCRIPTION, "id": "reviewers/0123456789abcdef", "state": "paused"}
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/subscriptions/pause": {
+        "template": {**TEMPLATE, "state": "paused", "revision": 2}, "children": [child],
+        "unresolved_batches": ["batch-1"]}})
+    change = await handle.announcement_subscription_pause("op-p", "reviewers", 1)
+    assert change.subscription is None
+    assert (change.template.state, change.template.revision) == ("paused", 2)
+    assert [(c.id, c.state) for c in change.children] == [("reviewers/0123456789abcdef", "paused")]
+    assert change.unresolved_batches == ("batch-1",)
+
+
+@pytest.mark.asyncio
+async def test_a_subscription_verb_names_no_template():
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/subscriptions/cancel": {
+        "subscription": {**SUBSCRIPTION, "state": "cancelled"}, "unresolved_batches": []}})
+    change = await handle.announcement_subscription_cancel("op-c", "sub-1", 2)
+    assert change.subscription.state == "cancelled"
+    assert change.template is None and change.children == ()
+
+
+@pytest.mark.asyncio
+async def test_subscription_get_reads_a_role_template():
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/subscriptions/get": {
+        "subscription": None, "marker": None, "template": TEMPLATE}})
+    view = await handle.announcement_subscription_get("reviewers")
+    assert view.subscription is None and view.marker is None
+    assert (view.template.id, view.template.members.role) == ("reviewers", "reviewer")
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/subscriptions/get": {
+        "subscription": SUBSCRIPTION, "marker": None}})
+    assert (await handle.announcement_subscription_get("sub-1")).template is None
+
+
+@pytest.mark.asyncio
+async def test_declarations_read_their_records():
+    handle, _ = make_mock_mob_handle({
+        "meta/mob_announcements/declarations/get": DECLARATIONS_VIEW,
+        "meta/mob_announcements/declarations/apply": {**DECLARATIONS_VIEW, "revision": 4}})
+    view = await handle.announcement_declarations_get()
+    assert (view.revision, view.digest) == (3, "sha256:abc")
+    source, pending, child, future = view.records
+    assert (source.kind, source.id, source.status, source.collection) == ("source", "mail", "applied", "live")
+    assert (pending.status, pending.refusal_kind) == ("pending", "unknown_member")
+    assert pending.refusal == {"kind": "unknown_member", "message": "no such member"}
+    assert (child.kind, child.delivery_kind, child.delivery["cause"]) == ("role_child", "refused", "governed_runtime")
+    assert (future.kind, future.status, future.refusal, future.collection, future.delivery) == (
+        "a_future_kind", "a_future_status", None, None, None)
+    assert (await handle.announcement_declarations_apply(DECLARATIONS)).revision == 4
+
+
+@pytest.mark.parametrize("kind,data", [
+    ("declaration_rollback", {"applied": 4}),
+    ("declaration_digest_conflict", {"revision": 3}),
+    ("role_template_limit", {"limit": 256}),
+    ("subscription_id_taken", {"subscription_id": "reviewers"}),
+])
+def test_declaration_refusals_keep_the_refused_class(kind, data):
+    from meerkat_meta import AnnouncementRefusedError
+    error = _error(-32047, kind, **data)
+    assert isinstance(error, AnnouncementRefusedError) and error.kind == kind
+    assert all(error.data[key] == value for key, value in data.items())
+
+
+def test_the_declaration_names_are_exported():
+    import meerkat_meta
+    for name in ("AnnouncementRoleSelector", "AnnouncementRoleTemplate", "AnnouncementDeclarationRecord",
+                 "AnnouncementDeclarationsView"):
+        assert name in meerkat_meta.__all__
+
+
+# -- Handling reads and awaiting handling ------------------------------------
+
+HANDLING_READ = {"pending": 1, "handled": 4, "handled_unverified": 2, "unhandled": 1, "held": 3,
+                 "oldest_unhandled_at_ms": 70}
+
+
+@pytest.mark.asyncio
+async def test_subscription_put_sends_delivery_only_when_set():
+    handle, calls = make_mock_mob_handle()
+    await handle.announcement_subscription_put(
+        "op-s", "sub-1", MEMBER, ["ops.alert"], delivery={"await_handling": True})
+    assert calls[0][1]["delivery"] == {"await_handling": True}
+    handle, calls = make_mock_mob_handle()
+    await handle.announcement_subscription_put("op-s", "sub-1", MEMBER, ["ops.alert"])
+    assert "delivery" not in calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_a_subscription_reads_its_delivery():
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/subscriptions/get": {
+        "subscription": {**SUBSCRIPTION, "delivery": {"await_handling": False}}, "marker": None}})
+    subscription = (await handle.announcement_subscription_get("sub-1")).subscription
+    assert subscription.delivery == {"await_handling": False} and subscription.await_handling is False
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/subscriptions/get": {
+        "subscription": SUBSCRIPTION, "marker": None}})
+    subscription = (await handle.announcement_subscription_get("sub-1")).subscription
+    assert subscription.delivery is None and subscription.await_handling is None
+
+
+@pytest.mark.asyncio
+async def test_member_get_reads_its_handling():
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/members/get": {**MEMBER_READ, "handling": HANDLING_READ}})
+    handling = (await handle.announcement_member_get(MEMBER)).handling
+    assert (handling.pending, handling.handled, handling.handled_unverified) == (1, 4, 2)
+    assert (handling.unhandled, handling.held, handling.oldest_unhandled_at_ms) == (1, 3, 70)
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/members/get": {
+        **MEMBER_READ, "handling": {**HANDLING_READ, "oldest_unhandled_at_ms": None}}})
+    assert (await handle.announcement_member_get(MEMBER)).handling.oldest_unhandled_at_ms is None
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/members/get": MEMBER_READ})
+    assert (await handle.announcement_member_get(MEMBER)).handling is None
+
+
+def test_status_reads_the_handling_counts():
+    from meerkat_meta import StatusResult
+    announcements = {"sources": {"active": 1, "paused": 0, "failing": 0, "stale": 0},
+                     "members": {"suspended": 0, "unhandled_held": 5},
+                     "handling": {"pending": 2, "handled": 9, "handled_unverified": 1, "unhandled": 3},
+                     "escalations": {"open": 1, "last_event_cursor": 4}}
+    data = {"contract_version": "0.5.0", "running": True, "loaded_modules": [], "mob_announcements": announcements}
+    counts = StatusResult.from_dict(data).mob_announcements
+    assert counts.members["unhandled_held"] == 5
+    assert counts.handling == {"pending": 2, "handled": 9, "handled_unverified": 1, "unhandled": 3}
+    older = {key: value for key, value in announcements.items() if key != "handling"}
+    assert StatusResult.from_dict({**data, "mob_announcements": older}).mob_announcements.handling == {}
+
+
+@pytest.mark.parametrize("cause", ["unhandled", "handled_unverified"])
+def test_a_handling_cause_reads_as_sent(cause):
+    from meerkat_meta import AnnouncementEscalation
+    escalation = AnnouncementEscalation.from_dict(
+        {**ESCALATION, "cause": cause, "subject": {"kind": "member", "member": MEMBER}})
+    assert (escalation.cause, escalation.subject_kind) == (cause, "member")
+
+
+def test_the_member_handling_name_is_exported():
+    import meerkat_meta
+    assert "AnnouncementMemberHandling" in meerkat_meta.__all__
+
+
+# -- Template deliveries -------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_role_template_put_sends_delivery_only_when_set():
+    handle, calls = make_mock_mob_handle()
+    await handle.announcement_role_template_put(
+        "op-t", "reviewers", ROLE, ["ops.alert"], delivery={"await_handling": False})
+    assert calls[0][1]["delivery"] == {"await_handling": False}
+    handle, calls = make_mock_mob_handle()
+    await handle.announcement_role_template_put("op-t", "reviewers", ROLE, ["ops.alert"])
+    assert "delivery" not in calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_a_role_template_reads_its_delivery():
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/subscriptions/get": {
+        "subscription": None, "marker": None, "template": {**TEMPLATE, "delivery": {"await_handling": True}}}})
+    template = (await handle.announcement_subscription_get("reviewers")).template
+    assert template.delivery == {"await_handling": True} and template.await_handling is True
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/subscriptions/put": {"subscription": TEMPLATE}})
+    template = await handle.announcement_role_template_put("op-t", "reviewers", ROLE, ["ops.alert"])
+    assert template.delivery is None and template.await_handling is None

@@ -45,6 +45,79 @@
   it, and `supportsAnnouncementSources(capabilities)`, true when
   `featureCapabilities` lists `mob_announcements.sources.v1`
   (`MOB_ANNOUNCEMENT_SOURCES_V1`).
+- Delivery handling on `MobHandle`: `announcementDeliveryRedeliver` and
+  `announcementDeliveryDismiss(operationId, batchId)`, for
+  `deliveries/redeliver` and `deliveries/dismiss`, resolve the batch's
+  `AnnouncementBatchHandling` (`state`, `cause`, `redelivered`, `held`,
+  `dismissed`, `readAtMs`; `parseAnnouncementBatchHandling`). A batch that
+  holds nothing for an operator rejects with `AnnouncementRefusedError`
+  and the kind `not_held`.
+- `AnnouncementBatch.handling` is an `AnnouncementBatchHandling` instead of
+  a raw object, and `AnnouncementDeliveryObservation` gains `handling`.
+  Both are `null` until the batch is admitted, and the state is an open
+  union. The types are new in this release, so nothing earlier narrows
+  on the raw object.
+- `AnnouncementAuditEntry.sourceId` and `generation` are `null` for an
+  entry of a plain announcement. The audit now also counts holds,
+  redeliveries (`redelivered`) and dismissals (`dismissed`) of items
+  whose turn ended unhandled (the reason `unhandled`), with or without a
+  source.
+- Mob announcement health on `MobHandle`: `announcementMemberGet`,
+  `announcementMemberList` and `announcementEscalationsList`, for
+  `members/get`, `members/list` and `escalations/list`, and `escalated` on
+  `announcementSourceList`. They resolve `AnnouncementMemberView` (`member`,
+  `backlog` as `AnnouncementMemberBacklog`, `marker`, `escalations`) and
+  `AnnouncementEscalationsPage` (`next`, and `events` of
+  `AnnouncementEscalationEvent` or, with `open: true`, `escalations` of
+  `AnnouncementEscalation`). Causes, events and subject kinds are open
+  unions, and a subject is kept as sent.
+- A source's `health` gains `escalations`, `quietMonitoring`,
+  `emptyCoverageMonitoring` and `runnerScheduledHere`. `runnerScheduledHere`
+  is `null` for a source without a runner, or from a gateway that does not
+  report it.
+- `StatusResult.mobAnnouncements` (`MobAnnouncementsStatus`: `sources`,
+  `members`, `openEscalations`, `lastEventCursor`) is absent when mob
+  announcements are disabled or the gateway does not report it, and `null`
+  when their database could not be read.
+- `ErrorCategory.MOB_ANNOUNCEMENT_ESCALATED` and
+  `ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED`, with their messages.
+  The resolution is in `RESOLUTION_ERROR_CATEGORIES`, so
+  `isResolutionErrorEvent` is true for it.
+- Declarations and role templates on `MobHandle`:
+  - `announcementDeclarationsApply(declarations?, { revision? })` and
+    `announcementDeclarationsGet()`, for `declarations/apply` and
+    `declarations/get`, resolve `AnnouncementDeclarationsView`
+    (`revision`, `digest`, and `records` of
+    `AnnouncementDeclarationRecord`).
+  - `announcementRoleTemplatePut(operationId, templateId, members, topics,
+    { mobs?, expectedRevision? })` sends `subscriptions/put` with
+    `members` (`{ mob_id, role }` or an `AnnouncementRoleSelector`) and
+    resolves `AnnouncementRoleTemplate`.
+  - The parsers are `parseAnnouncementRoleSelector`,
+    `parseAnnouncementRoleTemplate`, `parseAnnouncementDeclarationRecord`
+    and `parseAnnouncementDeclarationsView`.
+  - The refusals `declaration_rollback`, `declaration_digest_conflict`,
+    `role_template_limit` and `subscription_id_taken` keep
+    `AnnouncementRefusedError`.
+- `AnnouncementSubscriptionChange.subscription` is
+  `AnnouncementSubscription | null`, and the type gains `template` and
+  `children`: the subscription verbs on a role template's id answer the
+  template and its children instead. `AnnouncementSubscriptionView` gains
+  `template`. The type is new in this release, so nothing earlier narrows
+  on `subscription`.
+- `announcementSubscriptionPut` takes `delivery` (`{ await_handling }`),
+  sent only when set: whether the member's next batch waits until the turn
+  of its previous one has ended. `AnnouncementSubscription` gains `delivery`
+  and `awaitHandling`, `null` when the subscription did not set them.
+- `AnnouncementMemberView.handling` (`AnnouncementMemberHandling`:
+  `pending`, `handled`, `handledUnverified`, `unhandled`, `held`,
+  `oldestUnhandledAtMs`; `parseAnnouncementMemberHandling`) is `null` from a
+  gateway that does not report it. `MobAnnouncementsStatus.handling` counts
+  admitted batches by handling, and is empty from such a gateway. The
+  escalation causes `unhandled` and `handled_unverified` read as sent.
+- `announcementRoleTemplatePut` takes `delivery` (`{ await_handling }`), sent
+  only when set: every child's delivery. `AnnouncementRoleTemplate` gains
+  `delivery` and `awaitHandling`, `null` when the template did not set them.
 
 ## 0.9.4
 

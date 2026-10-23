@@ -81,6 +81,15 @@ within per-member limits.
 - Reading a batch shows the native status and the admitted input's runtime
   state. Admission is not processing: the input's state says what the
   runtime did with it.
+- Meta also reads what became of each admitted batch's turn: `handled`,
+  `handled_unverified` (consumed, with no receipt that says how),
+  `unhandled` with its cause, or `unknown`.
+- A policy decides what happens to the items of an unhandled turn. They
+  can be redelivered first in the member's next batch, under a notice
+  that says what happened. They can be held for an operator. Or the
+  outcome is only reported. Source items are redelivered by default, at
+  most twice, and plain announcements are reported, as before.
+- An operator redelivers or dismisses what a batch holds.
 
 ## When a subscription ends
 
@@ -216,6 +225,41 @@ subscription at the first announcement the template matches, so members
 spawned later are covered, and a member that loses the role stops
 capturing at once and still receives what it was owed.
 
+## Health and escalations
+
+A source or member that needs a person's attention raises an escalation. An
+escalation is a durable record, and only one is open per cause and subject.
+
+- A source escalates when its collections keep failing, when it stops
+  advancing because its collector is not running, and when it reports a gap
+  or a conflict. If its health policy opts in, it also escalates when it
+  stays quiet or its snapshots stay empty.
+- A member escalates when its deliveries have waited for an hour, when its
+  batches report gaps, and when items are held because its coverage changed.
+  It also escalates when it holds items for an operator after an unhandled
+  turn, and when its turns keep ending with no receipt that says how.
+- A declared record that stays pending escalates as well.
+
+An escalation stays open while its condition holds. While it is open, it is
+notified again every day by default, and it resolves when the condition
+ends.
+
+The host hears of every raise, notification and resolution through its
+`meta/on_error` hook. After a reconnect, `escalations/list` reads the events
+it missed, from its last cursor. Agents hear of escalations on the reserved
+topic `mob_announcements.health`. A member that subscribes to it receives:
+
+- the escalations of the sources whose audience covers it;
+- the member escalations, when the host's `health_audience` covers it.
+
+Several reads show the same state:
+
+- `members/get` and `members/list` read a member's backlog, holds, suspend
+  marker and open escalations.
+- A source's health reads its open escalations and whether this gateway
+  schedules its runner.
+- `meta/status` counts them.
+
 ## See also
 
 - [Mob announcement methods](/api/rpc#mob-announcements-optional) - methods,
@@ -224,6 +268,8 @@ capturing at once and still receives what it was owed.
   methods, the item key rule, onboarding and the audit
 - [Mob announcement declarations](/api/rpc#mob-announcement-declarations) -
   declarations, role templates and their statuses
+- [Mob announcement health](/api/rpc#mob-announcement-health) - escalations,
+  their causes and events, member reads and the status object
 - [Configuration](/reference/configuration) - `runtime_options.mob_announcements`,
   `control_request_window_ms` and `serve_keyed_inject`
 - [Access control](/concepts/access-control#keyed-inject) - keyed inject grants

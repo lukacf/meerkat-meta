@@ -172,6 +172,12 @@ from .types import (
     AnnouncementSubscriptionChange,
     AnnouncementSubscriptionView,
     SourceAdvanceResult,
+    AnnouncementEscalationsPage,
+    AnnouncementMemberView,
+    AnnouncementBatchHandling,
+    AnnouncementDeclarationsView,
+    AnnouncementRoleSelector,
+    AnnouncementRoleTemplate,
 )
 
 from ._client import _build_request as _rpc_request
@@ -4188,13 +4194,18 @@ class MobHandle:
         mobs: list[str] | tuple[str, ...] | None = None,
         start: Any | None = None,
         expected_revision: int | None = None,
+        delivery: dict[str, Any] | None = None,
     ) -> AnnouncementSubscription:
         """Create a subscription, or replace its selector at
         ``expected_revision``.
 
         ``mobs`` are the mobs hosted here whose announcements it takes (this
         gateway's own when absent); ``start`` is its start frontier (now by
-        default). ``operation_id`` makes a retry safe: the same operation
+        default). ``delivery`` is ``{"await_handling": bool}``: whether the
+        member's next batch waits until the turn of its previous one has
+        ended, for at most 15 minutes. Left out, the gateway decides: on for
+        the triage member of a triage route that takes a selected topic, off
+        otherwise. ``operation_id`` makes a retry safe: the same operation
         replays its answer.
         """
         raw = await self._announcement_rpc(
@@ -4209,9 +4220,50 @@ class MobHandle:
                 "mobs": list(mobs) if mobs is not None else None,
                 "start": start,
                 "expected_revision": expected_revision,
+                "delivery": dict(delivery) if delivery is not None else None,
             },
         )
         return AnnouncementSubscription.from_dict(raw.get("subscription"))
+
+    async def announcement_role_template_put(
+        self,
+        operation_id: str,
+        template_id: str,
+        members: AnnouncementRoleSelector | dict[str, str],
+        topics: list[str] | tuple[str, ...],
+        *,
+        mobs: list[str] | tuple[str, ...] | None = None,
+        expected_revision: int | None = None,
+        delivery: dict[str, Any] | None = None,
+    ) -> AnnouncementRoleTemplate:
+        """Create a role template, or replace its selector at
+        ``expected_revision``: ``subscriptions/put`` with ``members``
+        (``{"mob_id", "role"}``) instead of one member.
+
+        Each member of the mob with the role captures through a child
+        subscription, made at the first announcement it matches. A template
+        starts now. Its id is at most 200 bytes, and a subscription and a
+        role template never share an id (``subscription_id_taken``). The
+        subscription verbs and ``announcement_subscription_get`` take its id.
+        ``delivery`` (``{"await_handling": bool}``) is every child's, as for
+        ``announcement_subscription_put``; it is sent only when set.
+        """
+        selector = members.to_dict() if isinstance(members, AnnouncementRoleSelector) else dict(members)
+        raw = await self._announcement_rpc(
+            "subscriptions/put",
+            {
+                "operation_id": operation_id,
+                "subscription_id": template_id,
+                "members": selector,
+                "topics": list(topics),
+            },
+            {
+                "mobs": list(mobs) if mobs is not None else None,
+                "expected_revision": expected_revision,
+                "delivery": dict(delivery) if delivery is not None else None,
+            },
+        )
+        return AnnouncementRoleTemplate.from_dict(raw.get("subscription"))
 
     async def _announcement_subscription_change(
         self, change: str, operation_id: str, subscription_id: str, expected_revision: int
@@ -4312,6 +4364,24 @@ class MobHandle:
         that evidence."""
         raw = await self._announcement_rpc("deliveries/reconcile", {"batch_id": batch_id})
         return AnnouncementDeliveryObservation.from_dict(raw)
+
+    async def announcement_delivery_redeliver(self, operation_id: str, batch_id: str) -> AnnouncementBatchHandling:
+        """Owe a batch's held items again, for the member's next batch, after
+        a fresh coverage check; only a batch whose handling is ``unhandled``
+        with held items (``not_held`` otherwise)."""
+        raw = await self._announcement_rpc(
+            "deliveries/redeliver", {"operation_id": operation_id, "batch_id": batch_id}
+        )
+        return AnnouncementBatchHandling.from_dict(raw.get("handling"))
+
+    async def announcement_delivery_dismiss(self, operation_id: str, batch_id: str) -> AnnouncementBatchHandling:
+        """Settle a batch's held items as handled by an operator; only a batch
+        whose handling is ``unhandled`` with held items (``not_held``
+        otherwise)."""
+        raw = await self._announcement_rpc(
+            "deliveries/dismiss", {"operation_id": operation_id, "batch_id": batch_id}
+        )
+        return AnnouncementBatchHandling.from_dict(raw.get("handling"))
 
     async def announcement_source_put(
         self,
@@ -4434,11 +4504,15 @@ class MobHandle:
         after: str | None = None,
         state: str | None = None,
         limit: int | None = None,
+        escalated: bool | None = None,
     ) -> list[AnnouncementSource]:
-        """A page of a mob's sources. A list shows each principal as its kind
-        and digest only, and neither cursor tokens nor failure details."""
+        """A page of a mob's sources, or with ``escalated=True`` only those
+        with an open escalation. A list shows each principal as its kind and
+        digest only, and neither cursor tokens nor failure details."""
         raw = await self._announcement_rpc(
-            "sources/list", {}, {"mob_id": mob_id, "after": after, "state": state, "limit": limit}
+            "sources/list",
+            {},
+            {"mob_id": mob_id, "after": after, "state": state, "limit": limit, "escalated": escalated},
         )
         rows = raw.get("sources")
         return [AnnouncementSource.from_dict(row) for row in rows] if isinstance(rows, list) else []
@@ -4519,6 +4593,86 @@ class MobHandle:
             {"mob_id": mob_id},
         )
         return AnnouncementSource.from_dict(raw.get("source"))
+
+    async def announcement_member_get(
+        self, member: AnnouncementMember | dict[str, str]
+    ) -> AnnouncementMemberView:
+        """A member's backlog, why its deliveries wait, and its open
+        escalations."""
+        raw = await self._announcement_rpc("members/get", {"member": _announcement_member(member)})
+        return AnnouncementMemberView.from_dict(raw)
+
+    async def announcement_member_list(
+        self,
+        *,
+        after: AnnouncementMember | dict[str, str] | None = None,
+        limit: int | None = None,
+        escalated: bool | None = None,
+    ) -> list[AnnouncementMemberView]:
+        """A page of the members with an active or paused subscription, a
+        suspend marker or an open escalation, in member order after
+        ``after``, or with ``escalated=True`` only those with an open
+        escalation."""
+        raw = await self._announcement_rpc(
+            "members/list",
+            {},
+            {
+                "after": _announcement_member(after) if after is not None else None,
+                "limit": limit,
+                "escalated": escalated,
+            },
+        )
+        rows = raw.get("members")
+        return [AnnouncementMemberView.from_dict(row) for row in rows] if isinstance(rows, list) else []
+
+    async def announcement_escalations_list(
+        self,
+        *,
+        after: int | None = None,
+        limit: int | None = None,
+        open: bool | None = None,
+    ) -> AnnouncementEscalationsPage:
+        """The escalation events after the event cursor ``after`` (from the
+        first one kept by default), or with ``open=True`` the open
+        escalations. After a reconnect, read on from the last cursor a
+        ``meta/on_error`` escalation event or this page's ``next`` named."""
+        raw = await self._announcement_rpc(
+            "escalations/list", {}, {"after": after, "limit": limit, "open": open}
+        )
+        return AnnouncementEscalationsPage.from_dict(raw)
+
+    async def announcement_declarations_apply(
+        self,
+        declarations: dict[str, Any] | None = None,
+        *,
+        revision: int | None = None,
+    ) -> AnnouncementDeclarationsView:
+        """Apply declared sources and subscriptions now, and answer what is
+        applied.
+
+        ``declarations`` is ``{"revision", "sources"?, "subscriptions"?}`` in
+        wire form, for a gateway that declares none or declares them inline;
+        ``revision`` defaults to its own. Called with neither, a gateway whose
+        declarations come from a sidecar file reads the file again. Any other
+        combination is ``-32602``. A lower revision than the applied one
+        raises ``AnnouncementRefusedError`` with ``declaration_rollback``, and
+        the applied revision with other declarations
+        ``declaration_digest_conflict``.
+        """
+        params: dict[str, Any] = {}
+        if declarations is not None:
+            params["declarations"] = dict(declarations)
+            params["revision"] = revision if revision is not None else declarations.get("revision")
+        elif revision is not None:
+            params["revision"] = revision
+        raw = await self._announcement_rpc("declarations/apply", params)
+        return AnnouncementDeclarationsView.from_dict(raw)
+
+    async def announcement_declarations_get(self) -> AnnouncementDeclarationsView:
+        """The applied declarations' revision (0 before any) and digest, and
+        where each record they manage stands."""
+        raw = await self._announcement_rpc("declarations/get", {})
+        return AnnouncementDeclarationsView.from_dict(raw)
 
     async def announcement_audit_list(
         self,
