@@ -40,6 +40,19 @@ def test_ordinary_runtime_is_the_trusted_launchers_selected_meta_and_gateway(mon
     assert value["ordinary_runtime"] == {"sdk": "meerkat-meta", "version": "0.9.4", "target": "linux-x86_64",
                                          "gateway_sha256": "c" * 64}
     assert value["agent_team_runtime"]["version"] == public_meta_runtime.VERSION
+    # The same selection with the real owner types the launcher selects, so a
+    # renamed field fails here rather than in every capabilities read.
+    from launchkit.connect_installer_caller import ExactFile
+    from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
+    from launchkit.sdk_wheel_integrity import WheelByteExpectation
+    target = object.__new__(MetaToolkitRuntimeTarget)
+    object.__setattr__(target, "target", "macos-arm64")
+    object.__setattr__(target, "meta", WheelByteExpectation(distribution="meerkat-meta", version="0.9.5",
+        sha256="a" * 64, size=1, source_payload=(), metadata=()))
+    host.runtime_target = target
+    host.ordinary_meta_gateway = ExactFile(path=Path("/nonexistent/rpc_gateway"), sha256="b" * 64)
+    assert capabilities(monkeypatch, host)["ordinary_runtime"] == {"sdk": "meerkat-meta", "version": "0.9.5",
+        "target": "macos-arm64", "gateway_sha256": "b" * 64}
     # A Toolkit-only selection has no ordinary gateway, and a foreign host type is not a selection.
     host.ordinary_meta_gateway = None
     assert capabilities(monkeypatch, host)["ordinary_runtime"] is None
