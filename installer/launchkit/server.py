@@ -692,7 +692,8 @@ class ManualIntent(BaseModel):
 class GuideResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     version: int = Field(ge=1, strict=True)
-    action: str = Field(default="answer", pattern="^(answer|chat|back|manual)$")
+    action: str = Field(default="answer", pattern="^(answer|chat|back|manual|organization)$")
+    organization_fingerprint: str | None = Field(default=None, strict=True, pattern=r"^[0-9a-f]{64}$")
     selected: list[str] = Field(default_factory=list, max_length=6)
     text: str = Field(default="", max_length=6000)
     attachments: list[AttachmentReference] = Field(default_factory=list, max_length=MAX_FILES)
@@ -703,6 +704,13 @@ class GuideResponse(BaseModel):
 
     @model_validator(mode="after")
     def combined_answer(self):
+        if self.action == "organization":
+            if (self.organization_fingerprint is None or self.selected or self.text or self.attachments
+                    or self.stage is not None or self.blueprint is not None
+                    or self.manual_intent is not None or self.combine_options):
+                raise ValueError("Select only the displayed workplace guidance for this setup.")
+        elif self.organization_fingerprint is not None:
+            raise ValueError("Select workplace guidance with its dedicated action.")
         if self.manual_intent is not None and (self.action != "manual" or self.blueprint is not None):
             raise ValueError("Review manual intent without replacing the current blueprint.")
         if self.attachments and self.action not in {"answer", "chat"}:
@@ -721,6 +729,8 @@ class GuideResponse(BaseModel):
             body.pop("attachments", None)
         if self.manual_intent is None:
             body.pop("manual_intent", None)
+        if self.organization_fingerprint is None:
+            body.pop("organization_fingerprint", None)
         return body
 
 

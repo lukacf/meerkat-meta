@@ -179,6 +179,25 @@ async def helperless_build(f, *, empty_class=True):
     return saved, result
 
 
+async def test_adopted_plain_document_reaches_next_build_without_rewriting_original_request(registry):
+    from types import SimpleNamespace
+    from launchkit.projects import fingerprint
+    f = registry
+    saved = ordinary_guide(f)
+    original_messages = deepcopy(saved["messages"])
+    document = "  Workplace tools and how to reach them.\nGive this text to Connect unchanged.\n"
+    f.guide.organization = {"schema_version": 1, "id": "workplace", "version": "2.0",
+        "label": "Workplace", "description": "", "guide_context": document, "starting_examples": []}
+    selected = await f.guide.respond(saved["id"], SimpleNamespace(version=saved["version"],
+        action="organization", organization_fingerprint=fingerprint(f.guide.organization)))
+    result = await build(f, selected)
+    frozen = json.loads((f.implementation._directory(saved["id"], result["build_id"]) / "input.json").read_text())
+    assert frozen["organization"]["guide_context"] == document
+    assert frozen["organization"] == f.guide.organization
+    assert f.store.get(saved["id"])["messages"][:-1] == original_messages
+    assert frozen["blueprint"] == saved["proposal"]
+
+
 @pytest.mark.parametrize("empty_class", [False, True])
 async def test_default_build_and_install_bind_exact_authored_source_without_ordinary_gateway(registry, empty_class):
     f = registry

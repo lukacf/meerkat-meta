@@ -638,6 +638,11 @@ admission is not proof of successful handling or a connected useful result.
 If organization is present, it is the exact visible organization context saved with
 this guide, not the currently installed plugin or authorization. Carry its relevant
 identity, deployment and integration constraints into the application and tests.
+Its guide_context can be an ordinary document or skill describing available tools,
+data and access instructions. Give that original text intact to the application
+agent and, when it needs a connection, the existing find_and_install user_context
+array. Let Connect's agent resolve and install the tool through its existing flow.
+Do not turn this document into a catalog, parser or separate setup mechanism.
 Starting examples remain optional; the actual brief and user corrections decide
 which outcome is being built. References to private packages, authentication or
 installation contracts do not supply those files or grant access. Use only source

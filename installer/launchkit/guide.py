@@ -1034,6 +1034,7 @@ class GuideService:
         saved.pop("deployment_evidence", None)
         saved.pop("remote_deployment_evidence", None)
         saved.pop("package_availability", None)
+        saved.pop("organization_update", None)
         saved = await asyncio.to_thread(self.store.save, saved, version)
         return await self._with_implementation_evidence(saved)
 
@@ -1050,6 +1051,12 @@ class GuideService:
         state.setdefault("fact_history", [])
         state["readiness"] = review_readiness(state["brief"])
         state["capabilities"] = planner_capability()
+        state.pop("organization_update", None)
+        if self.organization is not None and self.organization != state.get("organization"):
+            from .organization import organization_snapshot
+            from .projects import fingerprint
+            context = organization_snapshot(self.organization)
+            state["organization_update"] = {"context": context, "fingerprint": fingerprint(context)}
         if not state.get("answers") and not state.get("proposal") and not state.get("blueprint") and not any(message["role"] == "user" for message in state["messages"]):
             state["question"] = default_question("purpose")
         if state.get("status") in {"review", "ready"} and (
@@ -1077,6 +1084,17 @@ class GuideService:
             if state["version"] != value.version:
                 raise DraftConflict("This setup changed in another tab. Reload before continuing.")
             action = value.action
+            if action == "organization":
+                from .organization import organization_snapshot
+                from .projects import fingerprint
+                selected = organization_snapshot(self.organization) if self.organization is not None else None
+                if selected is None or getattr(value, "organization_fingerprint", None) != fingerprint(selected):
+                    raise DraftConflict("The workplace guidance changed. Reload and review the available document.")
+                state["organization"] = selected
+                state["messages"].append(conversation_message("assistant",
+                    f"Workplace guidance from {selected['label']} is now included for this setup and future Builds.",
+                    stage=state["stage"], action="organization"))
+                return await self._save(state, value.version)
             references = await asyncio.to_thread(self.attachments.resolve, identity, getattr(value, "attachments", []))
             if references and action not in {"answer", "chat"}:
                 raise ValueError("Attach evidence to an answer or chat message.")
