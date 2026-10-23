@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         runtime
             .reconcile(vec![meerkat_mob::SpawnMemberSpec::new("guide", "guide")])
             .await?;
-        let store = Arc::new(SqliteAgentMemoryStore::open(&state.path().join(name))?);
+        let store = Arc::new(SqliteAgentMemoryStore::open(state.path().join(name))?);
         store
             .remember_authored(
                 &MemoryScope::Identity {
