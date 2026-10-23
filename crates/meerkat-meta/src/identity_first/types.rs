@@ -1596,6 +1596,74 @@ impl IdentityLifecycleState {
     }
 }
 
+/// Why one incarnation of a durable identity's member was retired, as a
+/// gateway host's retirement hook reads it
+/// (`GatewayHostComposition::identity_member_retired`).
+///
+/// Every cause ends exactly that incarnation. Only [`Self::Unlisted`] ends
+/// the identity's place in the roster: after [`Self::Retire`] or
+/// [`Self::Scoped`] the identity stays registered and dormant, Core keeps its
+/// session, and while the roster lists the identity the next roster pass,
+/// boot or wake resumes it at the next generation on the same session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RetiredIdentityCause {
+    /// A roster pass retired the member because the roster no longer lists
+    /// the identity (an identity this runtime registered, or a live member
+    /// Meta spawned for an identity it never registered).
+    Unlisted,
+    /// An explicit retire of the identity.
+    Retire,
+    /// A retire at a captured delivery scope that named the live member.
+    Scoped,
+}
+
+impl RetiredIdentityCause {
+    /// The cause's wire name: `unlisted`, `retire` or `scoped`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unlisted => "unlisted",
+            Self::Retire => "retire",
+            Self::Scoped => "scoped",
+        }
+    }
+}
+
+/// One retired incarnation of a durable identity's member, read from Core
+/// before the retire: the binding the incarnation ran under. Handed to a
+/// gateway host's retirement hook once, after Core's retire returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RetiredIdentityMember {
+    /// The durable identity.
+    pub identity: AgentIdentity,
+    /// Core's member id of the incarnation: the member a host's registration
+    /// hook saw.
+    pub member: String,
+    /// The profile Core ran the incarnation under.
+    pub role: meerkat_mob::ProfileName,
+    /// The incarnation's runtime id (`rt:{identity}:{generation}`).
+    pub agent_runtime_id: AgentRuntimeId,
+    /// Core's member generation of the incarnation.
+    pub generation: u64,
+    /// The incarnation's session document; `None` for a peer-only member.
+    pub session_id: Option<meerkat_core::types::SessionId>,
+    /// The exact Core registration the incarnation held when the retire
+    /// began: the one a host's registration hook was given for its build
+    /// (`MemberRuntimeBuildIdentity::registration`), and never a later
+    /// registration, even one that resumes the same session. `None` names
+    /// no registration: this gateway observed none for the incarnation (no
+    /// local registration, as for a peer-only or placed member, or a bridge
+    /// without a runtime machine), or the registration was still current
+    /// after Core's retire answered, so the retire did not end it. Compare
+    /// registrations with `==` only: a successor that resumes the same
+    /// session can carry the same session id and epoch (all its `Debug`
+    /// output shows), and only `==` tells the two apart.
+    pub registration: Option<meerkat_runtime::RuntimeSessionRegistrationWitness>,
+    /// Why it was retired.
+    pub cause: RetiredIdentityCause,
+}
+
 /// Durability policy declared by the continuity store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]

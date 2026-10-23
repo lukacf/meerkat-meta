@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createSimulation, simulationSourceKey, trialActivityStatus } from './simulation-state.mjs';
-import { createSimulationScene, simulationViewport } from './simulation-scene.mjs';
+import { createSimulationScene, simulationViewport, smallTeamPreview } from './simulation-scene.mjs';
 import { MobSim } from './mob-sim-renderer.mjs';
 import { IDENTITY_PAGE_SIZE, populationInspection } from './population-inspection.mjs';
 import { proposalClassChanges } from './proposal-changes.mjs';
@@ -1042,7 +1042,7 @@ export function ProposalSimulation({plan,interfaceFact,designBrief,visualization
     <div className="ps-scenario"><div><select aria-label="View to simulate" value={model.selectedFlowId || '__overview__'} onChange={e=>{invalidateVisualReview();setFlowId(e.target.value);}}><option value="__overview__">Team & responsibilities</option>{model.flows.map(f=><option key={f.id} value={f.id}>Workflow: {f.name}</option>)}</select><span>{updating?'Previous preview: ':''}{agents.length} identities · {(authored?generated.plan:plan).agent_classes.length} classes{updating?' · updating...':''}</span></div><button aria-pressed={showPeers} onClick={()=>{invalidateVisualReview();setShowPeers(!showPeers);}}>Tool access</button></div>
     <div className="ps-instrument">
       <div className="ps-instrument-key"><span>PROPOSAL SIMULATION</span>{!authored && <div><span><i className="agent"/>agent</span><span><i className="source"/>connection</span><span><i className="memory"/>memory</span></div>}</div>
-      <div className={`ps-stage${!model.selectedFlowId && model.nodes.filter(node=>node.kind==='agent').length<=8 ? ' ps-stage--small' : ''}`}>
+      <div className={`ps-stage${smallTeamPreview(model.nodes.filter(node=>node.kind==='agent').length,model.selectedFlowId) ? ' ps-stage--small' : ''}`}>
         <div className="ps-authored-host" ref={authoredHostRef} style={{visibility:authored?'visible':'hidden'}}/>
         {!authored && <><canvas ref={canvasRef} aria-label={`Network overview of ${agents.length} configured identities`} role="img"/>
         <div className="ps-hit-layer">{hits.map(n=><button key={n.id} className="ps-hit" style={{left:ox+n.x*sx,top:oy+n.y*sy}} aria-label={`Inspect ${n.name || n.label}`} title={n.name || n.label} onClick={e=>inspect(n.id,e)}/>)}

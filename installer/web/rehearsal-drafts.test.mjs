@@ -702,7 +702,7 @@ test("ordinary HTTP errors and mismatched negative responses preserve the pendin
     const saved = storage(), { body, draft } = initialRequest(fresh(saved));
     await mountedInitialTrial({ saved, onPost: () => response }, async (ui) => {
       await ui.click("Recover trial");
-      assert.equal(ui.button("Keep rejected start and correct trial"), undefined);
+      assert.equal(ui.button("Keep rejected start and correct trial") === undefined, true);
       assert.equal(ui.button("Try application request").disabled, true);
       assert.equal(ui.text().value, draft.sample);
       assert.deepEqual(fresh(saved).initial(guide.id).body, body);
@@ -721,12 +721,12 @@ test("a mounted waiting callback failure ends first and exposes repair only afte
     return { ...failed, status: "completed", worker_stop_confirmed: false, application_stop_confirmed: false };
   } }, async (ui) => {
     assert.match(ui.dom.window.document.body.textContent, /Once the host confirms cleanup/);
-    assert.equal(ui.button("Fix this trial"), undefined);
+    assert.equal(ui.button("Fix this trial") === undefined, true);
     assert.equal(posts, 0);
     ui.setLatest({ ...failed, status: "completed", worker_stop_confirmed: false, application_stop_confirmed: false });
     await ui.click("End trial");
     assert.equal(posts, 1);
-    assert.equal(ui.button("Fix this trial"), undefined);
+    assert.equal(ui.button("Fix this trial") === undefined, true);
     const stopped = { ...failed, status: "completed", worker_stop_confirmed: true, application_stop_confirmed: true };
     ui.setLatest(stopped);
     // A fresh panel reads the same actual host receipt rather than inventing cleanup locally.
@@ -791,7 +791,7 @@ test("failed trial investigation remains available without feedback while a succ
   } }, async (ui) => {
     assert.ok(ui.button("Improve from this trial"), ui.dom.window.document.body.textContent);
     assert.equal(ui.button("Improve from this trial").disabled, true);
-    assert.equal(ui.button("Fix this trial"), undefined);
+    assert.equal(ui.button("Fix this trial") === undefined, true);
     await ui.editField(ui.dom.window.document.querySelector('[aria-label="What should work better after this trial?"]'), correction);
     assert.equal(ui.button("Improve from this trial").disabled, false);
     await ui.click("Improve from this trial");
@@ -807,9 +807,9 @@ test("failed trial correction stays unavailable until terminal current source an
     { application_source: { build_id: build.build_id, source_digest: "b".repeat(64) } }]) {
     await mountedInitialTrial({ initialLatest: { ...failed, ...changes }, onRepairReceipt() {},
       onPost() { assert.fail("An ineligible trial cannot admit a correction"); } }, async (ui) => {
-      assert.equal(ui.dom.window.document.querySelector('[aria-label="What should work better after this trial?"]'), null);
-      assert.equal(ui.button("Fix this trial"), undefined);
-      assert.equal(ui.button("Improve from this trial"), undefined);
+      assert.equal(ui.dom.window.document.querySelector('[aria-label="What should work better after this trial?"]') === null, true);
+      assert.equal(ui.button("Fix this trial") === undefined, true);
+      assert.equal(ui.button("Improve from this trial") === undefined, true);
       assert.equal(ui.requests.filter((call) => call.method === "POST").length, 0);
     });
   }
@@ -846,7 +846,7 @@ test("the production panel retains a lost start, refuses latest-GET clearing, an
     assert.deepEqual(replayed, frozenBody);
     assert.equal(ui.text().value, initial);
     assert.equal(fresh(saved).initial(guide.id), null);
-    assert.equal(ui.button("Recover trial"), undefined);
+    assert.equal(ui.button("Recover trial") === undefined, true);
     assert.equal(ui.button("Try application request").disabled, false);
   });
 });
@@ -887,7 +887,7 @@ test("a partial host reservation cannot clear or unlock a fresh Try, and another
     assert.equal(ui.button("Try application request").disabled, true);
     assert.equal(fresh(saved).initial(guide.id).body.start_request_id, actionId);
     await ui.mount({ id: "other", version: 1 }, null);
-    assert.equal(ui.button("Recover trial"), undefined);
+    assert.equal(ui.button("Recover trial") === undefined, true);
     assert.equal(ui.requests.filter((call) => call.method === "POST").length, 1);
     assert.deepEqual(fresh(saved).initial(guide.id).body, action.body);
   });
@@ -903,7 +903,7 @@ test("the production partial-start escape archives only on explicit click, keeps
     assert.notEqual(body.start_request_id, actionId);
     return initialReceipt({ owner: setup(), body });
   } }, async (ui) => {
-    assert.equal(ui.button("Keep failed start and prepare a new trial"), undefined);
+    assert.equal(ui.button("Keep failed start and prepare a new trial") === undefined, true);
     await ui.click("Recover trial");
     assert.equal(ui.button("Try application request").disabled, true);
     assert.equal(calls, 1);
@@ -942,7 +942,7 @@ test("partial escape stays scoped and is unavailable during another pending POST
     assert.ok(fresh(saved).initial(guide.id));
     assert.equal(calls, 1);
     await ui.mount({ id: "another-guide", version: 7 }, null);
-    assert.equal(ui.button("Keep failed start and prepare a new trial"), undefined);
+    assert.equal(ui.button("Keep failed start and prepare a new trial") === undefined, true);
     await act(async () => oldButton.click());
     assert.ok(fresh(saved).initial(guide.id));
     await ui.settle(() => delayed.resolve(initialReceipt(action, { start_request_complete: false, status: "unavailable" })));
@@ -1116,7 +1116,7 @@ test("a delayed original start cannot clear or publish after a guide switch and 
       await ui.mount(nextGuide, null);
       await ui.settle(() => delayed.resolve(initialReceipt(action)));
       assert.equal(ui.text().value, "");
-      assert.equal(ui.dom.window.document.querySelector('[role="alert"]'), null);
+      assert.equal(ui.dom.window.document.querySelector('[role="alert"]') === null, true);
       assert.equal(fresh(saved).read(owner).sample, original);
       assert.equal(fresh(saved).initial(guide.id).body.start_request_id, actionId);
       await ui.mount(guide, null);

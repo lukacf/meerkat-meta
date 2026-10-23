@@ -130,7 +130,7 @@ test('removing one rejected file leaves an explicit retry for the remaining atta
     assert.equal(document.querySelectorAll('.setup-attachments li').length, 2);
     assert.equal(document.querySelector('#setup-send').disabled, true);
     await act(async () => { document.querySelector('[aria-label="Remove attachment bad.md"]').click(); await pause(); });
-    assert.equal(document.querySelector('.setup-attachments [role="alert"]'), null, 'Removing the rejected file keeps existing error-clearing semantics.');
+    assert.equal(document.querySelector('.setup-attachments [role="alert"]') === null, true, 'Removing the rejected file keeps existing error-clearing semantics.');
     assert.equal(document.querySelectorAll('.setup-attachments li').length, 1);
     assert.equal(document.querySelector('.setup-attachments li span').textContent, 'keep.md');
     assert.equal(document.querySelector('#setup-send').disabled, true, 'Unuploaded remaining evidence still cannot be silently omitted.');
@@ -144,13 +144,13 @@ test('removing one rejected file leaves an explicit retry for the remaining atta
     // The inert transport reads File bytes asynchronously before its response hook.
     for (let step = 0; sent.length < 2 && step < 40; step++) await act(pause);
     assert.equal(sent.length, 2);
-    assert.equal(retry(), undefined, 'An active upload cannot start another Retry.');
+    assert.equal(retry() === undefined, true, 'An active upload cannot start another Retry.');
     assert.equal(document.querySelector('[aria-label="Remove attachment keep.md"]').disabled, true);
     assert.equal(document.querySelector('#setup-send').disabled, true);
     await act(async () => { finishRetry(); await pause(); });
     assert.equal(document.querySelector('.setup-attachments a').textContent, 'keep.md');
-    assert.equal(document.querySelector('.setup-attachments li span'), null, 'Only checked refs replace the remaining pending File.');
-    assert.equal(retry(), undefined);
+    assert.equal(document.querySelector('.setup-attachments li span') === null, true, 'Only checked refs replace the remaining pending File.');
+    assert.equal(retry() === undefined, true);
     assert.equal(document.querySelector('#setup-send').disabled, false);
     assert.equal(document.querySelector('#setup-message').value, input.draft);
     assert.equal(local.get(input.key), retained);

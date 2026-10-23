@@ -211,7 +211,7 @@ focused('private prompt only, exact offered recovery choice, More only when offe
   const body = { kind: 'forge_recovery', choices: [{ choice_id: 'offered:one', application_id: 'Reading', change_id: 'saved-change', origin: 'http://127.0.0.1:4510' }], more: false, skipped_entries: 0 };
   f.emit({ type: 'prompt', id: 'p:one', scope: f.host.scope, prompt: body }, false);
   assert.equal(f.container.querySelector('.forge-setup__protected').hidden, true);
-  f.prompt(body); assert.ok(f.button('Reading')); assert.equal(f.button('More saved setups'), undefined);
+  f.prompt(body); assert.ok(f.button('Reading')); assert.equal(f.button('More saved setups') === undefined, true);
   f.button('Reading').click(); await flush();
   assert.deepEqual(f.requests.find(call => call.path === '/answer').body, { prompt_id: 'p:one', answer: { kind: 'forge_recovery', choice: { kind: 'existing', choice_id: 'offered:one' } } });
   assert.match(f.container.textContent, /no effect is confirmed yet/);
@@ -223,8 +223,8 @@ focused('offered origin is inert and forwarded exactly, not an editable or navig
   const f = fixture(), view = f.mount(); await flush();
   const origin = '<img src=x onerror=alert(1)>\u202Eaddress';
   f.prompt({ kind: 'forge_origin', permitted_origin: origin });
-  assert.equal(f.container.querySelector('img'), null); assert.equal(f.container.querySelector('a'), null);
-  assert.match(f.container.textContent, /\[U\+202E\]/); assert.equal(f.container.querySelector('.forge-setup__protected input'), null);
+  assert.equal(f.container.querySelector('img') === null, true); assert.equal(f.container.querySelector('a') === null, true);
+  assert.match(f.container.textContent, /\[U\+202E\]/); assert.equal(f.container.querySelector('.forge-setup__protected input') === null, true);
   f.button('Continue with this Forge').click(); await flush();
   assert.deepEqual(f.requests.find(call => call.path === '/answer').body, { prompt_id: 'p:one', answer: { kind: 'forge_origin', origin } });
   view.dispose(); f.dom.window.close();
@@ -253,8 +253,8 @@ focused('complete proposal and warnings remain selectable and inert with visible
   const proposal = f.container.querySelector('pre');
   assert.equal(proposal.textContent, visibleText(JSON.stringify(body, null, 2)));
   assert.match(proposal.textContent, /LAST COMPLETE WARNING/); assert.match(proposal.textContent, /\[U\+202E\]\[U\+007F\]/);
-  assert.equal(proposal.tabIndex, 0); assert.equal(f.container.querySelector('script'), null);
-  assert.equal(f.button('Approve this exact change'), undefined);
+  assert.equal(proposal.tabIndex, 0); assert.equal(f.container.querySelector('script') === null, true);
+  assert.equal(f.button('Approve this exact change') === undefined, true);
   f.button('Do not approve').click(); await flush();
   assert.deepEqual(f.requests.find(call => call.path === '/answer').body, { prompt_id: 'p:one', answer: { kind: 'approval', decision: 'deny' } });
   view.dispose(); f.dom.window.close();
@@ -294,7 +294,7 @@ focused('logout failure response clears all private controls and refuses late ca
   const oldStream = f.sources.findLast(source => source.url.endsWith('/private'));
   f.overrides.set('/state', () => response({ error: { code: 'invalid_binding' } }, 401));
   await f.port.refresh(); await flush();
-  assert.equal(input.value, ''); assert.equal(f.container.querySelector('input'), null);
+  assert.equal(input.value, ''); assert.equal(f.container.querySelector('input') === null, true);
   assert.match(f.container.textContent, /Sign in to the Console again/);
   oldStream.emit({ type: 'prompt', id: 'p:late', scope: f.host.scope, prompt: { kind: 'forge_origin', permitted_origin: 'OLD-PRIVATE' } });
   assert.doesNotMatch(f.container.textContent, /OLD-PRIVATE/);
@@ -315,7 +315,7 @@ focused('new login scope replaces view and clears pending private controls rathe
   f.prompt({ kind: 'forge_password', origin: 'http://127.0.0.1:4510', mode: 'initial', min_chars: 12, max_chars: 4096 });
   const input = f.container.querySelector('input'); input.value = 'old-login-private-draft';
   f.host.scope = 'replacement-host-scope'; f.state(idle()); await flush();
-  assert.equal(input.value, ''); assert.equal(f.container.querySelector('input'), null);
+  assert.equal(input.value, ''); assert.equal(f.container.querySelector('input') === null, true);
   assert.equal(f.port.scope, 'replacement-host-scope');
   f.emit({ type: 'prompt', id: 'p:old', scope: 'private-host-scope', prompt: { kind: 'forge_origin', permitted_origin: 'WRONG' } }, true);
   assert.doesNotMatch(f.container.textContent, /WRONG/);
@@ -345,7 +345,7 @@ focused('expired or undisplayable proposal cannot be approved and Escape closes 
   assert.equal(f.button('Approve this exact change').disabled, true); assert.equal(f.button('Do not approve').disabled, true);
   f.button('Close').focus();
   f.button('Close').dispatchEvent(new f.dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-  assert.equal(f.container.children.length, 0); assert.equal(f.dom.window.document.activeElement, trigger);
+  assert.equal(f.container.children.length, 0); assert.equal(f.dom.window.document.activeElement === trigger, true);
   assert.equal(f.requests.some(call => ['/cancel', '/answer'].includes(call.path)), false);
   view.dispose(); f.dom.window.close();
 });
@@ -602,9 +602,9 @@ focused('v3 initialization offers only exact protected provider targets before a
     f.provider({ kind: 'provider_target', choices: [{ choice_id: 'native-choice', target: providerTarget(), status: 'Native configured target' }] });
     assert.ok(f.button('model-example'), 'Pre-session private provider choice must be reachable');
     assert.equal(f.port.scope, ''); assert.equal(f.port.available, false); assert.equal(f.port.canSend, false);
-    assert.equal(f.container.querySelector('.toolkit-conversation'), null);
+    assert.equal(f.container.querySelector('.toolkit-conversation') === null, true);
     assert.match(f.container.querySelector('.forge-setup__status-text').textContent, /private provider setup/i);
-    assert.equal(f.button('Cancel this setup interaction'), undefined);
+    assert.equal(f.button('Cancel this setup interaction') === undefined, true);
     f.button('model-example').click(); await flush();
     assert.deepEqual(f.requests.find(call => call.path === '/answer').body, { prompt_id: 'p:provider', answer: { kind: 'provider_target', choice_id: 'native-choice' } });
     assert.equal(f.requests.some(call => call.path === '/send'), false);
@@ -651,7 +651,7 @@ focused('v3 provider actions and answers cannot inject unoffered targets or auth
   try {
     await flush(); f.provider({ kind: 'provider_action', target: providerTarget(), actions: ['use', 'back'] });
     assert.ok(f.button('Use this connection')); assert.ok(f.button('Choose another connection'));
-    assert.equal(f.button('Enter an API key privately'), undefined); assert.equal(f.button('Sign in to this provider'), undefined);
+    assert.equal(f.button('Enter an API key privately') === undefined, true); assert.equal(f.button('Sign in to this provider') === undefined, true);
     for (const answer of [{ kind: 'provider_action', action: 'sign_in' }, { kind: 'provider_action', action: 'use', realm: 'injected' }, { kind: 'cancel' }]) {
       assert.equal(await f.port.answer('p:provider', answer), false);
     }
@@ -674,9 +674,9 @@ focused('v3 browser and device sign-in show exact inert information and only aut
       const exact = prompt.authorization_url ?? prompt.verification_uri;
       assert.ok([...f.container.querySelectorAll('code')].some(node => node.textContent === visibleText(exact)));
       if (prompt.user_code) assert.ok([...f.container.querySelectorAll('code')].some(node => node.textContent === visibleText(prompt.user_code)));
-      assert.equal(f.container.querySelector('a'), null);
-      assert.equal(f.container.querySelector('tag'), null);
-      assert.equal(f.button('I have signed in'), undefined);
+      assert.equal(f.container.querySelector('a') === null, true);
+      assert.equal(f.container.querySelector('tag') === null, true);
+      assert.equal(f.button('I have signed in') === undefined, true);
       assert.equal(await f.port.answer('p:provider', { kind: prompt.kind, success: true }), false);
       f.button('Cancel provider sign-in').click(); await flush();
       assert.deepEqual(f.requests.find(call => call.path === '/answer').body, { prompt_id: 'p:provider', answer: { kind: 'cancel' } });
@@ -751,8 +751,8 @@ focused('v3 approval is complete inert data and forwards no approval or target i
     await flush();
     f.provider({ kind: 'approval', approval_id: 'owner-approval', summary: 'Exact <change>\u202E', body: { proposed: '<script>bad</script>', warnings: ['All retained warnings'] }, allowed_decisions: ['approve', 'deny'], expires_at: null });
     assert.match(f.container.querySelector('pre').textContent, /All retained warnings/);
-    assert.equal(f.container.querySelector('script'), null);
-    assert.equal(f.button('Cancel this setup interaction'), undefined);
+    assert.equal(f.container.querySelector('script') === null, true);
+    assert.equal(f.button('Cancel this setup interaction') === undefined, true);
     assert.equal(await f.port.answer('p:provider', { kind: 'approval', decision: 'approve', approval_id: 'owner-approval' }), false);
     f.button('Do not approve').click(); await flush();
     assert.deepEqual(f.requests.find(call => call.path === '/answer').body, { prompt_id: 'p:provider', answer: { kind: 'approval', decision: 'deny' } });
@@ -763,7 +763,7 @@ focused('v1 defaults refuse unnegotiated provider prompts without changing the l
   const f = fixture(), view = f.mount();
   try {
     await flush(); f.prompt({ kind: 'provider_api_key', target: providerTarget(), max_bytes: 8192 });
-    assert.equal(f.container.querySelector('input'), null);
+    assert.equal(f.container.querySelector('input') === null, true);
     assert.equal(f.port.available, true); assert.equal(f.port.scope, f.host.scope);
     assert.ok(f.container.querySelector('.toolkit-conversation'));
     assert.equal(f.requests.some(call => call.path === '/answer'), false);
@@ -788,7 +788,7 @@ focused('v3 target events retain strict pre-session state and close the exact na
     f.provider({ kind: 'provider_api_key', target: providerTarget(), max_bytes: 8192 }, 'p:key');
     f.container.querySelector('input').value = 'unsent fixture secret';
     f.emit({ type: 'event', event: { target: copy(f.serviceTarget), kind: 'unavailable', reason: 'failed' } });
-    assert.equal(f.port.protectedPrompt, null); assert.equal(f.container.querySelector('input'), null);
+    assert.equal(f.port.protectedPrompt, null); assert.equal(f.container.querySelector('input') === null, true);
     f.provider(prompt, 'p:late'); assert.equal(f.port.protectedPrompt, null);
     assert.equal(f.requests.some(call => ['/answer', '/send', '/cancel'].includes(call.path)), false);
     assert.equal(f.requests.filter(call => call.path === '/initialize').length, 1);

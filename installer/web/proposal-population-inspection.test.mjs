@@ -115,7 +115,7 @@ test('the mounted inspector browses all 611 identities, announces exact ranges a
       if (page < 10) {
         const container = ui.dom.window.document.querySelector('.ps-member-results'); container.scrollTop = 200;
         await ui.click('Next identities');
-        assert.equal(ui.dom.window.document.activeElement, ui.results()[0], 'Paging moves keyboard focus to the new result page');
+        assert.equal(ui.dom.window.document.activeElement === ui.results()[0], true, 'Paging moves keyboard focus to the new result page');
         assert.equal(container.scrollTop, 0);
       }
     }
@@ -131,9 +131,9 @@ test('the mounted inspector browses all 611 identities, announces exact ranges a
     assert.equal(inspector.querySelector('h4').textContent, 'old beta case 305');
     assert.equal(inspector.querySelector('details code').textContent, 'beta:case_305');
     assert.equal(inspector.querySelectorAll('.ps-relationships li').length, 2, 'Final member retains its exact peer and notes grant');
-    assert.equal(ui.dom.window.document.activeElement, inspector);
+    assert.equal(ui.dom.window.document.activeElement === inspector, true);
     await ui.click('Close inspector');
-    assert.equal(ui.dom.window.document.activeElement, ui.button('Explore identities'), 'A removed result button has a visible close-focus fallback');
+    assert.equal(ui.dom.window.document.activeElement === ui.button('Explore identities'), true, 'A removed result button has a visible close-focus fallback');
   });
 });
 
@@ -151,7 +151,7 @@ test('search and population switches reset pages, expose exact counts and keep n
     await ui.search('No matching context');
     assert.match(ui.text(), /No matching identities\./);
     assert.equal(ui.results().length, 0);
-    assert.equal(ui.dom.window.document.querySelector('nav[aria-label="Identity result pages"]'), null);
+    assert.equal(ui.dom.window.document.querySelector('nav[aria-label="Identity result pages"]') === null, true);
     assert.equal(ui.dom.window.document.activeElement.getAttribute('aria-label'), 'Find an identity');
     await ui.search('beta case');
     assert.match(ui.text(), /Showing 1-60 of 305 matching identities/, 'Returning to a prior search must not restore its old final page');
@@ -182,7 +182,7 @@ test('equivalent parent rerenders preserve paging while actual source, view and 
     assert.match(ui.text(), /Showing 121-180 of 611 matching identities/);
     assert.equal(ui.results()[0].querySelector('code').textContent, first);
     await ui.mount(populationPlan('replacement', 32));
-    assert.equal(ui.dom.window.document.querySelector('.ps-inspector'), null);
+    assert.equal(ui.dom.window.document.querySelector('.ps-inspector') === null, true);
     await ui.click('Explore identities');
     assert.match(ui.text(), /Showing 1-60 of 65 matching identities/);
     await ui.click('Next identities');
@@ -191,12 +191,12 @@ test('equivalent parent rerenders preserve paging while actual source, view and 
       const select = ui.dom.window.document.querySelector('select[aria-label="View to simulate"]');
       select.value = 'summary'; select.dispatchEvent(new ui.dom.window.Event('change', {bubbles: true}));
     });
-    assert.equal(ui.dom.window.document.querySelector('.ps-inspector'), null);
+    assert.equal(ui.dom.window.document.querySelector('.ps-inspector') === null, true);
     await ui.click('Explore identities');
     assert.match(ui.text(), /Showing 1-60 of 65 matching identities/);
     await ui.click('Next identities');
     await ui.mount(undefined, 'another-guide');
-    assert.equal(ui.dom.window.document.querySelector('.ps-inspector'), null);
+    assert.equal(ui.dom.window.document.querySelector('.ps-inspector') === null, true);
     await ui.click('Explore identities');
     assert.match(ui.text(), /Showing 1-60 of 65 matching identities/);
   });
@@ -222,6 +222,6 @@ test('updating a custom scene keeps inspection on its displayed historical model
     assert.match(ui.text(), /Showing 1-60 of 65 matching identities/);
     assert.equal(ui.results()[0].querySelector('strong').textContent, 'new coordinator');
     assert.ok(ui.results().every(item => !item.querySelector('strong').textContent.startsWith('old ')));
-    assert.equal(ui.dom.window.document.activeElement, ui.results()[0], 'Replacing a removed historical result preserves a usable keyboard target');
+    assert.equal(ui.dom.window.document.activeElement === ui.results()[0], true, 'Replacing a removed historical result preserves a usable keyboard target');
   });
 });

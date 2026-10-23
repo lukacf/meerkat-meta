@@ -2371,6 +2371,7 @@ export const ErrorCategory = {
   EVENT_LOG_FLUSH_FAILURE: "event_log_flush_failure",
   IDENTITY_MATERIALIZATION_FAILURE: "identity_materialization_failure",
   MOB_STOP_PROCEEDED_WITHOUT_INTERRUPT: "mob_stop_proceeded_without_interrupt",
+  RETIRED_MEMBER_RELEASE_FAILED: "retired_member_release_failed",
 } as const;
 
 /** Categories that report a failure ENDING rather than starting. Mirrors the
@@ -2477,6 +2478,15 @@ export function parseErrorEvent(raw: unknown): ErrorEvent {
         `teardown proceeded after ${waitedMs}ms WITHOUT a successful ` +
         `interrupt${subject}; a turn may have been admitted and may ` +
         `still be running: ${error}`;
+      break;
+    }
+    case ErrorCategory.RETIRED_MEMBER_RELEASE_FAILED: {
+      const identity = String(context.identity ?? "");
+      const runtimeId = String(context.agent_runtime_id ?? "");
+      const cause = String(context.cause ?? "");
+      message =
+        `${identity} (${runtimeId}) was retired (${cause}), and the host's ` +
+        `release failed: ${error}`;
       break;
     }
     default:

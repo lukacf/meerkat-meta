@@ -57,6 +57,8 @@ binding covers:
 - the trees of `installer`, `console`, `packages/console-core`,
   `packages/console-components` and `sdk/python`;
 - `forge.yml`, the lockfiles, the installer requirements and the vendored wheels;
+- `crates/meerkat-meta/src/rpc_gateway.rs`, whose advertised shutdown horizon a
+  Forge test pins;
 - a recorded toolchain that fits `forge.yml`'s declared Python and Node versions.
 
 Evidence and packages are matched to one run attempt. A rerun of only the

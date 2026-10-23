@@ -920,6 +920,28 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual([line for line in code if "CARGO_BUILD_JOBS" in line], [])
         self.assertEqual([line for line in code if re.search(r"repo-cargo .*(\s-j\s*\d|--jobs)", line)], [])
 
+    def test_live_lanes_print_cargo_output_without_color_codes(self):
+        """A run that holds a model provider's key is read by grep: its pass
+        counts and its summary lines. dtolnay/rust-toolchain sets
+        CARGO_TERM_COLOR=always when nothing set it, so Cargo and nextest put
+        color codes inside those lines, and a check for a passing summary
+        failed a run whose rows had all passed. Each such workflow sets the
+        variable to never for all its jobs, and nothing sets color back."""
+        live = []
+        for path in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
+            source = path.read_text()
+            if not re.search(r"secrets\.(ANTHROPIC|OPENAI|GEMINI|GOOGLE)_API_KEY\b", source):
+                continue
+            live.append(path.name)
+            workflow = yaml.safe_load(source) or {}
+            self.assertEqual((workflow.get("env") or {}).get("CARGO_TERM_COLOR"), "never", path.name)
+            self.assertIsNone(re.search(r"--color[ =]+(always|auto)", source), path.name)
+            for name, job in (workflow.get("jobs") or {}).items():
+                self.assertNotIn("CARGO_TERM_COLOR", job.get("env") or {}, f"{path.name} job {name}")
+                for step in job.get("steps") or []:
+                    self.assertNotIn("CARGO_TERM_COLOR", step.get("env") or {}, f"{path.name} job {name}")
+        self.assertIn("e2e-live.yml", live)
+
     def test_voice_feature_runs_real_host_tests_and_strict_lint(self):
         block = job_block("test-voice")
         self.assertIn("--locked --features openai-live", block)

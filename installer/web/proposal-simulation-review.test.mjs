@@ -221,7 +221,7 @@ test('long authored step captions show a clamped verbatim preview and native dis
     const caption=document.querySelector('.ps-caption');
     assert.equal(caption.querySelector('strong').textContent,'Evidence before a device handoff');
     const preview=caption.querySelector('.ps-caption-preview');assert.ok(preview);assert.equal(preview.textContent,full);
-    assert.equal(preview.nextElementSibling,caption.querySelector('details'),'Read the preview before its disclosure');
+    assert.equal(preview.nextElementSibling === caption.querySelector('details'), true,'Read the preview before its disclosure');
     const previewStyle=getComputedStyle(preview);
     assert.equal(previewStyle.display,'-webkit-box');assert.equal(previewStyle.getPropertyValue('-webkit-line-clamp'),'3');
     assert.equal(previewStyle.maxHeight,'4.65em');assert.equal(previewStyle.overflow,'hidden');assert.equal(previewStyle.whiteSpace,'pre-wrap');
@@ -230,7 +230,7 @@ test('long authored step captions show a clamped verbatim preview and native dis
     assert.equal(details.querySelector('p').textContent,full);
     assert.equal(caption.getAttribute('aria-live'),'polite');
     assert.equal(scene.reducedMotion,true);assert.equal(scene.paused,true);
-    details.querySelector('summary').focus();assert.equal(document.activeElement,details.querySelector('summary'));
+    details.querySelector('summary').focus();assert.equal(document.activeElement === details.querySelector('summary'), true);
     await ui.settle(()=>{details.open=true;});assert.equal(details.open,true);assert.equal(details.querySelector('p').textContent,full);
     assert.equal(getComputedStyle(preview).display,'none','Expanded native disclosure hides the duplicate preview');
     await ui.click('Expand');assert.ok(document.querySelector('.ps-expanded'));
@@ -243,17 +243,17 @@ test('long authored step captions show a clamped verbatim preview and native dis
     await ui.click('Pause simulation');assert.equal(caption.getAttribute('aria-live'),'polite');
     const short='The coordinator asks the weather specialist for fresh evidence.';
     await ui.settle(()=>scene.options.onCaption({title:'Ask for current conditions',description:short}));
-    assert.equal(caption.querySelector('details'),null);assert.equal(caption.querySelector('p').textContent,short);
+    assert.equal(caption.querySelector('details') === null,true);assert.equal(caption.querySelector('p').textContent,short);
     assert.equal(caption.querySelector('strong').textContent,'Ask for current conditions');
     const selected='The selected owner keeps its own responsibilities and source context.\n'+full;
     await ui.inspect(scene,'lead:main');
     assert.equal(caption.querySelector('.ps-caption-context').textContent,'Playback chapter');
     await ui.settle(()=>scene.options.onCaption({title:'Selected owner context',description:selected}));
-    assert.equal(caption.querySelector('strong').textContent,'Selected owner context');assert.equal(caption.querySelector('.ps-caption-context'),null);
+    assert.equal(caption.querySelector('strong').textContent,'Selected owner context');assert.equal(caption.querySelector('.ps-caption-context') === null,true);
     assert.equal(caption.querySelector('.ps-caption-preview').textContent,selected);assert.equal(caption.querySelector('details p').textContent,selected);
     await ui.click('Close inspector');
     assert.equal(caption.querySelector('strong').textContent,'Ask for current conditions');assert.equal(caption.querySelector('p').textContent,short);
-    assert.equal(caption.querySelector('details'),null);assert.equal(caption.querySelector('.ps-caption-context'),null);
+    assert.equal(caption.querySelector('details') === null,true);assert.equal(caption.querySelector('.ps-caption-context') === null,true);
     assert.deepEqual(ui.visible(),[scene]);assert.equal(ui.posts.length,1);assert.deepEqual(scene.seekCalls,[]);
   });
 });

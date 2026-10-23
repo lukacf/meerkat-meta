@@ -356,12 +356,12 @@ function assertUnchecked(document, draft) {
   assert.equal(view.querySelector('h3')?.textContent, 'Use your application');
   assert.match(view.textContent, /first-use details could not be checked/);
   assertDrafts(document, draft);
-  assert.equal(view.querySelector('a'), null, 'Unchecked metadata cannot publish application, native or task links');
-  assert.equal(view.querySelector('.deployment-use-ideas'), null);
-  assert.equal(view.querySelector('.deployment-use-walkthrough'), null);
-  assert.equal(view.querySelector('.deployment-use-success'), null);
+  assert.equal(view.querySelector('a') === null, true, 'Unchecked metadata cannot publish application, native or task links');
+  assert.equal(view.querySelector('.deployment-use-ideas') === null, true);
+  assert.equal(view.querySelector('.deployment-use-walkthrough') === null, true);
+  assert.equal(view.querySelector('.deployment-use-success') === null, true);
   assert.equal(view.querySelector('.deployment-use-feedback')?.tagName, 'FORM', 'The report editor keeps its original guarded container');
-  assert.equal(view.querySelector('button[type="submit"]'), null);
+  assert.equal(view.querySelector('button[type="submit"]') === null, true);
   assert.equal([...view.querySelectorAll('button')].some(button =>
     ['It worked', 'Improve this behavior'].includes(button.textContent.trim())), false);
   assert.doesNotMatch(view.textContent, /UNCHECKED NAME|UNCHECKED IDEA/);
@@ -375,7 +375,7 @@ function assertLinks(document, id, task = taskFor(id), handoffAllowed = true) {
   if (!handoffAllowed) {
     assert.equal(link?.getAttribute('aria-disabled'), 'true');
     assert.equal(link?.tabIndex, -1);
-    assert.equal(handoff, undefined, 'Fresh entrypoint observation cannot release uncertain command custody');
+    assert.equal(handoff === undefined, true, 'Fresh entrypoint observation cannot release uncertain command custody');
     return;
   }
   assert.ok(handoff, 'Only the exact checked authored entry receives the human task');
@@ -465,7 +465,7 @@ test('local first-use draft recovery keeps denied-storage drafts editable and ma
     assert.deepEqual(copied, [edited.task], 'Clipboard refusal still receives the exact current human task');
     await click(button(document, 'Select task to copy'));
     const field = taskField(document);
-    assert.equal(document.activeElement, field);
+    assert.equal(document.activeElement === field, true);
     assert.equal(field.selectionStart, 0); assert.equal(field.selectionEnd, edited.task.length);
     assert.match(useView(document).textContent, /Select it and copy manually/);
     assertUnchecked(document, edited);
@@ -542,7 +542,7 @@ for (const condition of ['denied', 'unreadable']) {
       assert.equal(button(document, 'Stop application').disabled, true);
       assert.equal(button(document, 'Improve this behavior').disabled, true);
       assert.equal(button(document, 'It worked').disabled, true, 'Success admission also requires readable command custody');
-      assert.equal(taskLink(document), undefined, 'An uncertain command cannot publish an application task handoff');
+      assert.equal(taskLink(document) === undefined, true, 'An uncertain command cannot publish an application task handoff');
       await click(button(document, 'Stop application')); await click(button(document, 'Improve this behavior'));
       await click(button(document, 'It worked')); await click(button(document, 'Copy task'));
       assert.deepEqual(copied, [draftFor(A).task]);
@@ -582,7 +582,7 @@ test('parent receipt storage recovery a newly unreadable command fences the late
     assert.equal(useView(document).querySelector('[aria-label="Task awaiting success confirmation"]')?.textContent, originalBody.task);
     assert.doesNotMatch(useView(document).querySelector('.deployment-use-success').textContent, /Your success report is saved/);
     assert.equal(button(document, 'Retry success confirmation').disabled, true);
-    assert.equal(taskLink(document), undefined);
+    assert.equal(taskLink(document) === undefined, true);
     assert.equal(fixture.calls.filter(call => call.method === 'POST').length, 1);
   }, { permitsSuccess: true, storageAdapter: storage => ({
     getItem(key) { if (denyActionRead && key.startsWith('meta-forge-deployment-action-v1:')) throw Error('PRIVATE_BROWSER_STORAGE'); return storage.getItem(key); },
@@ -606,7 +606,7 @@ test('parent receipt storage recovery failed exact command retirement preserves 
     assert.equal(button(document, 'Stop application').disabled, true);
     assert.equal(button(document, 'It worked').disabled, true);
     assert.equal(button(document, 'Improve this behavior').disabled, true);
-    assert.equal(taskLink(document), undefined);
+    assert.equal(taskLink(document) === undefined, true);
     await click(button(document, 'Copy task'));
     assert.deepEqual(copied, [draftFor(A).task]);
     await tick(1600);
@@ -631,7 +631,7 @@ test('parent receipt storage recovery denied Window getter never borrows a globa
     assert.equal(button(document, 'Stop application').disabled, true);
     assert.equal(button(document, 'It worked').disabled, true);
     assert.equal(button(document, 'Improve this behavior').disabled, true);
-    assert.equal(taskLink(document), undefined);
+    assert.equal(taskLink(document) === undefined, true);
     await click(button(document, 'Copy task'));
     assert.deepEqual(copied, [draftFor(A).task]);
     await tick(1600);
@@ -660,9 +660,9 @@ function assertCachedEntriesPaused(document, originalLabels) {
     assert.equal(link.getAttribute('aria-disabled'), 'true');
     assert.equal(link.tabIndex, -1, 'A paused live entry is removed from sequential keyboard navigation');
   }
-  assert.equal(document.querySelector(`a[href="${entryUrl(A)}"]`), null);
-  assert.equal(document.querySelector(`a[href="${receiptFor(A).console_url}"]`), null);
-  assert.equal(taskLink(document), undefined, 'Unknown command custody cannot publish a task handoff');
+  assert.equal(document.querySelector(`a[href="${entryUrl(A)}"]`) === null, true);
+  assert.equal(document.querySelector(`a[href="${receiptFor(A).console_url}"]`) === null, true);
+  assert.equal(taskLink(document) === undefined, true, 'Unknown command custody cannot publish a task handoff');
 }
 function assertCachedEntriesLive(document, expectedUrls) {
   const links = cachedEntryLinks(document);
@@ -711,11 +711,11 @@ for (const variant of ['application UI', 'application Console', 'native team']) 
       assert.deepEqual(JSON.parse(window.sessionStorage.getItem(storedKey)), enteredCommand);
       assertCachedEntriesPaused(document, originalLabels);
       assert.match(useView(document).textContent, /installation status.*(check|unconfirmed)|check installation status/i);
-      assert.equal(taskField(document), originalEditors.task);
+      assert.equal(taskField(document) === originalEditors.task, true);
       assert.equal(taskField(document).value, taskFor(A));
       assert.equal(taskField(document).disabled, false);
       if (!nativeTeam) { assertDrafts(document, draftFor(A)); assertStored(window, A);
-        assert.equal(reportField(document), originalEditors.report); }
+        assert.equal(reportField(document) === originalEditors.report, true); }
       assert.equal(button(document, 'Copy task').disabled, false);
       await click(button(document, 'Copy task'));
       assert.deepEqual(copied, [taskFor(A)]);
@@ -733,7 +733,7 @@ for (const variant of ['application UI', 'application Console', 'native team']) 
       assertCachedEntriesPaused(document, originalLabels);
       assert.equal(fixture.count(A, '/use'), originalReads.use);
       assert.equal(fixture.count(A, '/experiences'), originalReads.experiences);
-      assert.equal(taskField(document), originalEditors.task);
+      assert.equal(taskField(document) === originalEditors.task, true);
       assert.equal(taskField(document).value, taskFor(A));
       if (!nativeTeam) assertDrafts(document, draftFor(A));
       assert.deepEqual(JSON.parse(window.sessionStorage.getItem(storedKey)), enteredCommand);
@@ -763,9 +763,9 @@ for (const variant of ['application UI', 'application Console', 'native team']) 
       assert.equal(window.sessionStorage.getItem(storedKey), null);
       assert.equal(document.querySelector('.deployment-panel').dataset.deploymentStatus, 'stopped');
       assert.equal(receipts.filter(Boolean).at(-1)?.deployment_id, enteredCommand.deployment_id);
-      assert.equal(document.querySelector(`a[href="${entryUrl(A)}"]`), null);
-      assert.equal(document.querySelector(`a[href="${receiptFor(A).console_url}"]`), null);
-      assert.equal(taskField(document), originalEditors.task);
+      assert.equal(document.querySelector(`a[href="${entryUrl(A)}"]`) === null, true);
+      assert.equal(document.querySelector(`a[href="${receiptFor(A).console_url}"]`) === null, true);
+      assert.equal(taskField(document) === originalEditors.task, true);
       assert.equal(taskField(document).value, taskFor(A));
       if (!nativeTeam) assertDrafts(document, draftFor(A));
       const exactReads = fixture.calls.slice(beforeRecovery).filter(call => call.url.includes('/action/') || call.url === deploymentUrl(A));
@@ -779,7 +779,7 @@ for (const variant of ['application UI', 'application Console', 'native team']) 
       await tick(1600);
       assert.equal(document.querySelector('.deployment-panel').dataset.deploymentStatus, 'running');
       assertCachedEntriesLive(document, originalUrls);
-      assert.equal(taskField(document), originalEditors.task);
+      assert.equal(taskField(document) === originalEditors.task, true);
       assert.equal(taskField(document).value, taskFor(A));
       if (!nativeTeam) { assertDrafts(document, draftFor(A)); assertStored(window, A); }
       assert.equal(button(document, 'Copy task').disabled, false);

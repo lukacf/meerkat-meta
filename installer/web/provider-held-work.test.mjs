@@ -148,7 +148,7 @@ test("held configured work explains blocked startup and rechecks until the exist
     await click("Check saved settings");
     assert.equal(document.querySelector(".setup-provider").dataset.providerStep, "start");
     assert.equal(document.querySelector("h2").textContent, "Start your setup guide");
-    assert.equal(document.querySelector(".setup-provider-work"), null);
+    assert.equal(document.querySelector(".setup-provider-work") === null, true);
     assert.equal(button("Start guide").disabled, false);
     assert.equal(outsideClosedDetails(button("Start guide")), true);
     assert.equal(document.querySelector('input[type="password"]').disabled, false);
@@ -156,7 +156,7 @@ test("held configured work explains blocked startup and rechecks until the exist
     assert.equal(closes(), 0);
     assert.equal(calls.length, 5);
     assert.ok(calls.every(call => call.method === "GET"));
-    assert.equal(document.querySelector(".setup-provider-return"), null,
+    assert.equal(document.querySelector(".setup-provider-return") === null, true,
       "Clearing a hold is not evidence that the guide started or provider access works.");
   });
 });
@@ -169,14 +169,14 @@ test("held work without an effective provider explains the locked key and offers
     return { status: "stopped", available: false, startup_retry_required: false };
   } }, async ({ document, calls, button, click, closes }) => {
     heldOnboarding({ document, button });
-    assert.equal(document.querySelector(".setup-provider-configured"), null);
+    assert.equal(document.querySelector(".setup-provider-configured") === null, true);
     assert.equal(button("Start guide").disabled, true);
     await click("Save locally");
     assert.equal(calls.length, 1);
     await click("Check saved settings");
     heldOnboarding({ document, button });
-    assert.equal(document.querySelector(".setup-provider-configured"), null);
-    assert.equal(document.querySelector(".setup-provider-return"), null);
+    assert.equal(document.querySelector(".setup-provider-configured") === null, true);
+    assert.equal(document.querySelector(".setup-provider-return") === null, true);
     assert.equal(closes(), 0);
     assert.deepEqual(calls.map(call => [call.method, call.url]), [
       ["GET", "/api/provider-settings"],

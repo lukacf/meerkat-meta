@@ -199,11 +199,11 @@ test("cold exact pending support intent is read-only until an explicit resume", 
 test("pending ordinary commands and missing exact support observation keep support actions closed", async () => {
   const ordinary = deploymentActionIntent(guide.id, { deployment_id: receiptFor().deployment_id, action: "restart" }, requestId);
   await mount(async ({ calls, button }) => {
-    assert.equal(button("Review update"), undefined);
+    assert.equal(button("Review update") === undefined, true);
     assert.equal(calls.some((call) => call.method === "POST"), false);
   }, { storage: (storage) => storeDeploymentActionIntent(storage, ordinary) });
   await mount(async ({ calls, button }) => {
-    assert.equal(button("Resume this update"), undefined);
+    assert.equal(button("Resume this update") === undefined, true);
     assert.equal(button("Start installed application").disabled, true);
     assert.equal(calls.some((call) => call.method === "POST"), false);
   }, { receipt: prepared(receiptFor()), storage: (storage) => storeDeploymentSupportIntent(storage, applyIntent()) });
@@ -225,7 +225,7 @@ test("a late support response cannot select another guide or retire its saved co
 
 test("unreadable command storage and unavailable status never enable support resume", async () => {
   await mount(async ({ calls, button, document }) => {
-    assert.equal(button("Review update"), undefined);
+    assert.equal(button("Review update") === undefined, true);
     assert.ok(document.body.textContent.includes("browser storage"));
     assert.equal(calls.some((call) => call.method === "POST"), false);
   }, { storage: (storage) => storage.setItem("meta-forge-deployment-support-v1:" + guide.id, "broken") });
@@ -233,7 +233,7 @@ test("unreadable command storage and unavailable status never enable support res
   await mount(async ({ calls, button, unavailableStatus, poll }) => {
     assert.ok(button("Resume this update"));
     unavailableStatus(); await poll();
-    assert.equal(button("Resume this update"), undefined);
+    assert.equal(button("Resume this update") === undefined, true);
     assert.equal(button("Start installed application").disabled, true);
     assert.equal(calls.some((call) => call.method === "POST"), false);
   }, { receipt, observation: { action_request: { ...intent, phase: "pending", outcome: null } },
@@ -248,15 +248,15 @@ test("minimal command metadata cannot release controls before delayed or failed 
       const sent = calls.find((call) => call.method === "POST").body;
       const retained = loadDeploymentSupportIntent(storage, guide.id);
       assert.equal(retained.action_request_id, sent.action_request_id);
-      assert.equal(button("Resume this update"), undefined);
+      assert.equal(button("Resume this update") === undefined, true);
       assert.equal(button("Start installed application").disabled, true);
       assert.equal(receipts.at(-1).support_request.phase, "prepared");
       await releaseStatus();
       assert.ok(button("Resume this update"));
       setObservation({ action_request: { ...retained, phase: "settled", outcome } });
       unavailableStatus(); await poll();
-      assert.equal(button("Resume this update"), undefined);
-      assert.equal(button("Apply support update"), undefined);
+      assert.equal(button("Resume this update") === undefined, true);
+      assert.equal(button("Apply support update") === undefined, true);
       assert.equal(button("Start installed application").disabled, true);
       assert.equal(loadDeploymentSupportIntent(storage, guide.id).action_request_id, sent.action_request_id,
         "Metadata settlement does not bypass the failed status check or retire its intent.");
@@ -285,8 +285,8 @@ test("pending metadata cannot authorize changed receipt ownership, stopped state
     await mount(async ({ calls, button, setReceipt, poll, storage }) => {
       assert.ok(button("Resume this update"));
       const changed = structuredClone(receipt); change(changed); setReceipt(changed); await poll();
-      assert.equal(button("Resume this update"), undefined);
-      assert.equal(button("Apply support update"), undefined);
+      assert.equal(button("Resume this update") === undefined, true);
+      assert.equal(button("Apply support update") === undefined, true);
       assert.equal(loadDeploymentSupportIntent(storage, guide.id).action_request_id, intent.action_request_id);
       assert.equal(calls.some((call) => call.method === "POST"), false);
     }, { receipt, observation: { action_request: { ...intent, phase: "pending", outcome: null } },
@@ -301,7 +301,7 @@ test("conflicting nested command identity cannot settle or resume the retained s
     setObservation({ action_request: { ...intent, descriptor_sha256: "f".repeat(64),
       phase: "settled", outcome: "returned" } });
     await poll();
-    assert.equal(button("Resume this update"), undefined);
+    assert.equal(button("Resume this update") === undefined, true);
     assert.equal(button("Start installed application").disabled, true);
     assert.equal(loadDeploymentSupportIntent(storage, guide.id).descriptor_sha256, intent.descriptor_sha256);
     assert.equal(calls.some((call) => call.method === "POST"), false);
@@ -313,12 +313,12 @@ test("an uncertain ordinary command immediately closes the support action while 
   await mount(async ({ calls, button, click, releaseObservation }) => {
     assert.equal(button("Review update").disabled, false);
     await click("Start installed application");
-    assert.equal(button("Review update"), undefined);
+    assert.equal(button("Review update") === undefined, true);
     assert.equal(button("Start installed application").disabled, true);
     assert.ok(button("Check support status"));
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
     await releaseObservation();
-    assert.equal(button("Review update"), undefined);
+    assert.equal(button("Review update") === undefined, true);
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
   }, { ordinaryUncertain: true });
 });
@@ -345,7 +345,7 @@ test("a settled raw Stop reply preserves the checked projection until a fresh st
     assert.deepEqual(retained.support_request, running.support_request);
     assert.ok(button("Check support status"), "The retained support card stays visible while checking.");
     assert.equal(button("Stop application").disabled, true);
-    assert.equal(button("Review update"), undefined);
+    assert.equal(button("Review update") === undefined, true);
     assert.equal(document.body.textContent.includes("belongs to an earlier proposal or build"), false);
     assert.ok(calls.filter((call) => call.url === `/api/guide/${guide.id}/deployment`).length >= 2,
       "Settlement immediately begins a fresh status read.");
@@ -393,7 +393,7 @@ test("a late raw command reply rechecks status even after a passive poll confirm
     assert.equal(document.querySelector('[aria-label="Installation support"]').dataset.supportState, "eligible",
       "The passive read confirmed exact settlement and fresh status, while the POST reply remains pending.");
     holdNextStatus(); await releaseReply();
-    assert.equal(button("Review update"), undefined, "The late raw reply cannot keep the old support confirmation.");
+    assert.equal(button("Review update") === undefined, true, "The late raw reply cannot keep the old support confirmation.");
     assert.ok(button("Check support status"));
     assert.equal(button("Start installed application").disabled, true);
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
@@ -436,8 +436,8 @@ test("failed background cleanup sends one Stop and waits for fresh stopped proof
     holdNextStatus, releaseStatus, storage }) => {
     assert.ok(button("Stop and verify cleanup"));
     assert.equal(button("Stop and verify cleanup").disabled, false);
-    assert.equal(button("Change private settings"), undefined);
-    assert.equal(button("Stop application"), undefined);
+    assert.equal(button("Change private settings") === undefined, true);
+    assert.equal(button("Stop application") === undefined, true);
     holdNextStatus(); await click("Stop and verify cleanup");
     const posts = calls.filter((call) => call.method === "POST");
     assert.equal(posts.length, 1);
@@ -448,10 +448,10 @@ test("failed background cleanup sends one Stop and waits for fresh stopped proof
     assert.equal(receipts.at(-1).status, status, "Raw Stop cannot replace the checked failed projection.");
     assert.equal(button("Stop and verify cleanup").disabled, true);
     assert.equal(button("Retry saved installation").disabled, true);
-    assert.equal(button("Change private settings"), undefined);
+    assert.equal(button("Change private settings") === undefined, true);
     await releaseStatus();
     assert.equal(receipts.at(-1).status, "stopped");
-    assert.equal(button("Stop and verify cleanup"), undefined);
+    assert.equal(button("Stop and verify cleanup") === undefined, true);
     assert.equal(button("Change private settings").disabled, false);
     assert.equal(button("Start installed application").disabled, false);
     assert.equal(calls.filter((call) => call.method === "POST").length, 1,
@@ -464,7 +464,7 @@ test("failed background cleanup keeps mutations closed after a status error and 
     unavailableStatus(); await click("Stop and verify cleanup");
     assert.equal(button("Stop and verify cleanup").disabled, true);
     assert.equal(button("Retry saved installation").disabled, true);
-    assert.equal(button("Change private settings"), undefined);
+    assert.equal(button("Change private settings") === undefined, true);
     assert.equal(loadDeploymentActionIntent(storage, guide.id), null, "Only the exact settled command is retired.");
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
     setReceipt(stoppedBackground()); availableStatus(); await poll();
@@ -481,7 +481,7 @@ test("failed background cleanup does not unlock private settings from unconfirme
   ];
   for (const change of changes) await mount(async ({ calls, button, click }) => {
     await click("Stop and verify cleanup");
-    assert.equal(button("Change private settings"), undefined);
+    assert.equal(button("Change private settings") === undefined, true);
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
   }, { receipt: failedBackground(), ordinaryRawReply: true,
     ordinaryStoppedReceipt: { ...stoppedBackground(), ...change } });
@@ -498,8 +498,8 @@ test("failed background cleanup has no Stop control for unknown or foreign servi
     { guide_id: "foreign-guide" },
   ];
   for (const change of changes) await mount(async ({ calls, button }) => {
-    assert.equal(button("Stop and verify cleanup"), undefined);
-    assert.equal(button("Change private settings"), undefined);
+    assert.equal(button("Stop and verify cleanup") === undefined, true);
+    assert.equal(button("Change private settings") === undefined, true);
     assert.equal(calls.some((call) => call.method === "POST"), false);
   }, { receipt: { ...receipt, ...change } });
 });
@@ -511,7 +511,7 @@ test("failed background cleanup cannot send a second command while ordinary or s
     const intent = support ? applyIntent() : ordinary;
     await mount(async ({ calls, button, document }) => {
       assert.equal(button("Stop and verify cleanup").disabled, true);
-      assert.equal(button("Change private settings"), undefined);
+      assert.equal(button("Change private settings") === undefined, true);
       await act(async () => button("Stop and verify cleanup").click());
       assert.equal(calls.some((call) => call.method === "POST"), false);
       assert.ok(document.body.textContent.includes("checking") || document.body.textContent.includes("Checking"));
@@ -527,16 +527,16 @@ test("failed background cleanup ignores old Stop replies and checked status afte
     await switchGuide("synthetic-second-guide"); await releaseReply();
     assert.equal(loadDeploymentActionIntent(storage, guide.id).action_request_id, sent.action_request_id);
     assert.equal(receipts.at(-1).guide_id, "synthetic-second-guide");
-    assert.equal(button("Stop and verify cleanup"), undefined);
-    assert.equal(button("Change private settings"), undefined);
+    assert.equal(button("Stop and verify cleanup") === undefined, true);
+    assert.equal(button("Change private settings") === undefined, true);
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
   }, { receipt: failedBackground(), ordinaryRawReply: true, ordinaryStoppedReceipt: stoppedBackground() });
   await mount(async ({ calls, button, click, holdNextStatus, switchGuide, releaseStatus, receipts }) => {
     holdNextStatus(); await click("Stop and verify cleanup");
     await switchGuide("synthetic-second-guide"); await releaseStatus();
     assert.equal(receipts.at(-1).guide_id, "synthetic-second-guide");
-    assert.equal(button("Stop and verify cleanup"), undefined);
-    assert.equal(button("Change private settings"), undefined);
+    assert.equal(button("Stop and verify cleanup") === undefined, true);
+    assert.equal(button("Change private settings") === undefined, true);
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
   }, { receipt: failedBackground(), ordinaryRawReply: true, ordinaryStoppedReceipt: stoppedBackground() });
 });
@@ -565,7 +565,7 @@ test("failed background cleanup remains available with retained update history a
     const receipt = { ...failedBackground(), update,
       update_capabilities: { background_activation_supported: false } };
     await mount(async ({ calls, button, click }) => {
-      assert.equal(button("Stop and confirm cleanup"), undefined, "The update adapter supplies no alternate Stop.");
+      assert.equal(button("Stop and confirm cleanup") === undefined, true, "The update adapter supplies no alternate Stop.");
       assert.ok(button("Stop and verify cleanup"));
       await click("Stop and verify cleanup");
       assert.equal(button("Change private settings").disabled, false);
@@ -583,7 +583,7 @@ test("failed background cleanup preserves the single existing Stop when its upda
     deployment_id: receipt.deployment_id, build_id: receipt.build_id, package_sha256: receipt.package_sha256,
     manager: receipt.service.manager, unit_sha256: receipt.service.unit_sha256, host_manifest_sha256: "c".repeat(64) };
   await mount(async ({ calls, button, click, document }) => {
-    assert.equal(button("Stop and verify cleanup"), undefined);
+    assert.equal(button("Stop and verify cleanup") === undefined, true);
     assert.equal(button("Stop and confirm cleanup").disabled, false);
     assert.equal([...document.querySelectorAll("button")].filter((node) => node.textContent.startsWith("Stop")).length, 1);
     await click("Stop and confirm cleanup");

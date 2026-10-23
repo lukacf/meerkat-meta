@@ -124,12 +124,12 @@ test("a stalled build receipt body releases status recovery and preserves the un
     assert.equal(firstSignal?.aborted, true);
     assert.equal(receiptReads, 2, "the existing mount refresh runs once without dispatching a build");
     assert.equal(button("Refresh build status").disabled, false);
-    assert.equal(button("Build application"), undefined, "new build remains blocked until a known observation");
+    assert.equal(button("Build application") === undefined, true, "new build remains blocked until a known observation");
     assert.equal(textarea.value, note);
     assert.equal(dom.window.localStorage.getItem(noteKey), note);
     await act(async () => button("Refresh build status").click());
     assert.equal(receiptReads, 3);
-    assert.equal(button("Refresh build status"), undefined);
+    assert.equal(button("Refresh build status") === undefined, true);
     assert.equal(button("Build application").disabled, false);
     assert.equal(textarea.value, note);
     assert.equal(dom.window.localStorage.getItem(noteKey), note);

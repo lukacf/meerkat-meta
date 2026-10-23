@@ -654,6 +654,7 @@ let runtime = UnifiedRuntime::builder()
 | `event_log_flush_failure` | `error` | the operational event log could not flush |
 | `identity_materialization_failure` | `identity`, `initiator?`, `operation`, `error` | identity-first hydration skipped a member |
 | `mob_stop_proceeded_without_interrupt` | `waited_ms`, `member?`, `error` | not produced since MobKit 0.8.46 (meerkat 0.8.51's Stop no longer refuses on runtime-attach readiness); kept for wire compatibility |
+| `retired_member_release_failed` | `identity`, `agent_runtime_id`, `session_id?`, `cause`, `error` | a gateway host's retirement hook (`GatewayHostComposition::identity_member_retired`) answered an error for a retired incarnation. The retirement stands and is not retried; `cause` is `unlisted`, `retire` or `scoped` |
 
 `actor_loop_terminated` is terminal, not an `actor_loop_recovered` event.
 It can occur without a prior stall (`stall_id` is then absent). The probe

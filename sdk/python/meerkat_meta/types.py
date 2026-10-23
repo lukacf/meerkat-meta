@@ -2207,6 +2207,7 @@ class ErrorCategory(str, Enum):
     EVENT_LOG_FLUSH_FAILURE = "event_log_flush_failure"
     IDENTITY_MATERIALIZATION_FAILURE = "identity_materialization_failure"
     MOB_STOP_PROCEEDED_WITHOUT_INTERRUPT = "mob_stop_proceeded_without_interrupt"
+    RETIRED_MEMBER_RELEASE_FAILED = "retired_member_release_failed"
 
 
 #: Categories that report a failure ENDING rather than starting. Mirrors the
@@ -2293,6 +2294,14 @@ class ErrorEvent:
                 f"teardown proceeded after {waited_ms}ms WITHOUT a successful "
                 f"interrupt{subject}; a turn may have been admitted and may "
                 f"still be running: {error}"
+            )
+        elif category == ErrorCategory.RETIRED_MEMBER_RELEASE_FAILED:
+            identity = context.get("identity", "")
+            runtime_id = context.get("agent_runtime_id", "")
+            cause = context.get("cause", "")
+            message = (
+                f"{identity} ({runtime_id}) was retired ({cause}), and the host's "
+                f"release failed: {error}"
             )
         else:
             message = str(data)

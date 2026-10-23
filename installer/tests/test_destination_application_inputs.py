@@ -19,11 +19,13 @@ from uuid import uuid4
 import pytest
 
 from launchkit import deployment, deployment_worker, remote_product_destination_owner
+from launchkit import compiler, local_application_source
 from launchkit import deployment_application_bootstrap as bootstrap
+from launchkit.blueprint import Blueprint
 from launchkit.connect_installer_caller import CustodyError, ExactFile
 from launchkit.destination_application_inputs import (
     SOURCE_DIRECTORY, DestinationApplicationInputs, create_destination_application_inputs,
-    recover_destination_application_inputs,
+    recover_destination_application_inputs, _source_contents,
 )
 from launchkit.forge_application_host import ApplicationPreparationInputs, ForgeApplicationHost
 from launchkit.local_application_preparation_inputs import LocalApplicationPreparationOwner
@@ -37,6 +39,8 @@ from test_product_destination_install import installation, destination_source, a
 from test_product_destination_owner import no_destination_execution
 from test_meta_toolkit_runtime_selection import no_product_execution
 from test_local_application_restore import completed_specimen
+from test_local_application_source import cloud_plan
+from test_meta_toolkit_initial_package import setup_spec
 import test_application_finalizer as finalizer_fixture
 from test_application_finalizer import FinalizerFixture
 
@@ -377,6 +381,28 @@ async def test_original_ambiguous_or_nonshipping_operator_choice_refuses_before_
         await create(f)
     assert not (f.root / SOURCE_DIRECTORY).exists() and not f.directory.exists()
     assert not (f.root / ".env").exists() and f.service.application_host_selection is None
+
+
+@pytest.mark.parametrize("case", ["local", "cloud", "native-bundle", "helper"])
+def test_destination_source_names_the_actual_missing_input_of_an_unsupported_plan(case):
+    # Only a plan that selects the helper is pending connection setup support. A
+    # plan without one names the input it lacks, as its local Build does.
+    value = setup_spec()
+    if case != "helper":
+        value["acquisition"] = None
+        for index, row in enumerate(value["agent_classes"]):
+            row["tools"]["rust_bundles"] = ["foreign.native"] if case == "native-bundle" and index == 0 else []
+    if case in {"cloud", "helper"}:
+        # The helper plan targets the cloud without a selected Linux product.
+        value = cloud_plan(value)
+    files = {"blueprint.json": (json.dumps(Blueprint.model_validate(value).model_dump(mode="json")).encode(),)}
+    expected = {"local": local_application_source.ORDINARY_SOURCE_UNAVAILABLE,
+        "cloud": local_application_source.ORDINARY_TARGET_UNSUPPORTED,
+        "native-bundle": compiler.NATIVE_BUNDLE_PENDING, "helper": compiler.CONNECTION_SETUP_PENDING}[case]
+    with pytest.raises(CustodyError) as refused:
+        _source_contents(files, None)
+    assert str(refused.value) == expected
+    assert (case == "helper") == ("selects a connection setup helper" in str(refused.value))
 
 
 async def test_destination_input_cancel_joins_original_file_read_with_lease_held(inputs_destination, monkeypatch):

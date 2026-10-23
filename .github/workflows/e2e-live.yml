@@ -12,6 +12,12 @@ on:
 permissions:
   contents: read
 
+# The lane's log is read by grep, so Cargo prints it without color codes:
+# dtolnay/rust-toolchain sets CARGO_TERM_COLOR=always only when it is unset,
+# and the codes then sit inside the summary lines a check looks for.
+env:
+  CARGO_TERM_COLOR: never
+
 concurrency:
   group: e2e-live
   cancel-in-progress: false

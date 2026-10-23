@@ -588,7 +588,15 @@ export const createScene = createSimulationScene;
 /** Shared drawing and hit-target projection for the automatic preview only. */
 export function simulationViewport(scene, width, height) {
   const sc = Math.min(width / scene.W, height / scene.H);
-  const small = scene.population?.count > 0 && scene.population.count <= 8 && !scene.selectedFlowId;
+  const small = smallTeamPreview(scene.population?.count, scene.selectedFlowId);
   return small ? {sc, sx: width / scene.W, sy: height / scene.H, ox: 0, oy: 0}
     : {sc, sx: sc, sy: sc, ox: (width - scene.W * sc) / 2, oy: (height - scene.H * sc) / 2};
+}
+
+export const SMALL_TEAM_LIMIT = 8;
+
+/** The one rule for a small-team preview: one to eight agents outside a
+ *  selected native flow. The stage, layout, projection and renderer all ask it. */
+export function smallTeamPreview(agentCount, selectedFlowId) {
+  return Number.isSafeInteger(agentCount) && agentCount > 0 && agentCount <= SMALL_TEAM_LIMIT && !selectedFlowId;
 }

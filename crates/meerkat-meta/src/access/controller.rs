@@ -1273,6 +1273,12 @@ impl LiveAccessView {
         Some(&self.view).filter(|view| view.enforced())
     }
 
+    /// The owner's latest committed access revision. After a
+    /// [`Self::refresh`] the view is rebuilt for at least this revision.
+    pub(crate) fn revision(&self) -> u64 {
+        *self.revision.borrow()
+    }
+
     /// Wait until the owner commits a change, then rebuild the view, for a
     /// stream that must act on a change while it has nothing to send.
     /// Cancellation-safe: dropped before the change, it leaves the change

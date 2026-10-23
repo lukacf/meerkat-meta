@@ -314,7 +314,7 @@ for (const kind of ['local', 'remote']) {
         await selectBuild(finishedImprovement); observeBuild(finishedImprovement);
         await click('Check Build status');
         assertDrafts(document);
-        assert.equal(document.querySelector('.installed-improvement-handoff'), null, 'A newer unrelated Build is not admission of this report');
+        assert.equal(document.querySelector('.installed-improvement-handoff') === null, true, 'A newer unrelated Build is not admission of this report');
         assert.match(document.body.textContent, /does not confirm whether your earlier report was admitted/);
         assert.equal(button('Prepare another report')?.disabled, false);
         assert.equal(document.querySelector('.deployment-use-feedback button[type="submit"]').disabled, true);
@@ -333,7 +333,7 @@ for (const kind of ['local', 'remote']) {
         });
         await idle();
         assertDrafts(document, newerDraft);
-        assert.equal(document.querySelector('.installed-improvement-handoff'), null);
+        assert.equal(document.querySelector('.installed-improvement-handoff') === null, true);
         assert.deepEqual(publications, beforeLate);
         assert.equal(calls.filter(call => call.method === 'GET').length, beforeReads);
         assert.equal(postsFor(calls, kind, 'feedback').length, 1);
@@ -363,7 +363,7 @@ for (const kind of ['local', 'remote']) {
           await idle(); assertDrafts(document);
           assert.deepEqual([...storage.values], bytes, 'A late reply cannot overwrite or remove newer retained tracking');
           assert.deepEqual(publications, before);
-          assert.equal(document.querySelector('.installed-improvement-handoff'), null);
+          assert.equal(document.querySelector('.installed-improvement-handoff') === null, true);
           assert.doesNotMatch(document.body.textContent, /The builder did not receive this report/);
           assert.equal(postsFor(calls, kind, 'feedback').length, 1);
         }, { storage });
@@ -377,19 +377,19 @@ for (const kind of ['local', 'remote']) {
         await edit(); await click(improvementLabel(kind));
         assert.equal(button('Check Build status').disabled, false);
         await click('Check Build status');
-        assert.equal(button('Prepare another report'), undefined, 'The original continuation Build cannot release the report');
+        assert.equal(button('Prepare another report') === undefined, true, 'The original continuation Build cannot release the report');
         observeBuild(() => { throw Error('PRIVATE_REFUSAL_DETAIL'); });
         await click('Check Build status');
         assert.match(document.body.textContent, /Build status could not be checked/);
-        assert.equal(button('Prepare another report'), undefined);
+        assert.equal(button('Prepare another report') === undefined, true);
         assert.equal(button('Check Build status').disabled, false);
         observeBuild({ ...finishedImprovement, guide_id: 'foreign-guide' });
         await click('Check Build status');
-        assert.equal(button('Prepare another report'), undefined);
+        assert.equal(button('Prepare another report') === undefined, true);
         await selectBuild(finishedImprovement);
         for (const patch of [{ cleanup_pending: true }, { source_verified: false }, { status: 'running' }, { build_id: 'unselected-new-build' }]) {
           observeBuild({ ...finishedImprovement, ...patch }); await click('Check Build status');
-          assert.equal(button('Prepare another report'), undefined, 'Only the exact selected, terminal, checked and cleaned source can prepare a new report');
+          assert.equal(button('Prepare another report') === undefined, true, 'Only the exact selected, terminal, checked and cleaned source can prepare a new report');
         }
         const before = structuredClone(publications), finalRead = heldJson();
         observeBuild(() => finalRead.response); await click('Check Build status');
@@ -397,7 +397,7 @@ for (const kind of ['local', 'remote']) {
         await act(async () => { original.reject(Error('PRIVATE_REFUSAL_DETAIL')); await settle(); });
         await idle(); assertDrafts(document);
         assert.deepEqual(publications, before);
-        assert.equal(document.querySelector('.installed-improvement-handoff'), null);
+        assert.equal(document.querySelector('.installed-improvement-handoff') === null, true);
         assert.equal(postsFor(calls, kind, 'feedback').length, 1);
         assert.equal(button('Checking Build status...').disabled, true, 'The original POST finally cannot release the entered GET');
         await act(async () => { finalRead.resolve(finishedImprovement); await settle(); });
@@ -422,7 +422,7 @@ for (const kind of ['local', 'remote']) {
         await act(async () => { reading.resolve(finishedImprovement); await settle(); });
         await idle();
         assert.deepEqual(publications, []);
-        assert.equal(button('Prepare another report'), undefined);
+        assert.equal(button('Prepare another report') === undefined, true);
         current = true;
         observeBuild(checked);
         await select('B'); await edit(otherDraft);
@@ -432,7 +432,7 @@ for (const kind of ['local', 'remote']) {
         await act(async () => { original.resolve({ ...finishedImprovement, build_id: 'late-remounted-build', request: 'Late original report.' }); await settle(); });
         await idle(); assertDrafts(document, newerDraft);
         assert.deepEqual(publications, before, 'Retired original publication cannot replace the remounted owner');
-        assert.equal(document.querySelector('.installed-improvement-handoff'), null);
+        assert.equal(document.querySelector('.installed-improvement-handoff') === null, true);
         assert.equal(button(improvementLabel(kind)).disabled, true);
         assert.equal(postsFor(calls, kind, 'feedback').length, 1);
         await select('B'); assertDrafts(document, otherDraft);
@@ -455,7 +455,7 @@ for (const kind of ['local', 'remote']) {
       assertDrafts(document);
       assert.match(document.body.textContent, /did not receive this report/);
       assert.match(document.body.textContent, /Browser draft storage is unavailable/);
-      assert.equal(button('Retry clearing report tracking'), undefined);
+      assert.equal(button('Retry clearing report tracking') === undefined, true);
       assert.equal(button(improvementLabel(kind)).disabled, false);
       assert.equal(postsFor(calls, kind, 'feedback').length, 1);
       await idle(); assert.equal(postsFor(calls, kind, 'feedback').length, 1, 'A host refusal never automatically resends');
@@ -479,8 +479,8 @@ for (const kind of ['local', 'remote']) {
       await edit(); assert.equal(button('It worked').disabled, false);
       await click('It worked'); assertDrafts(document);
       assert.match(document.querySelector('.deployment-use-success').textContent, /earlier success report was not saved/);
-      assert.equal(button('Clear unsaved confirmation'), undefined);
-      assert.equal(button('Retry success confirmation'), undefined);
+      assert.equal(button('Clear unsaved confirmation') === undefined, true);
+      assert.equal(button('Retry success confirmation') === undefined, true);
       assert.equal(button('It worked').disabled, false);
       await idle(); assert.equal(postsFor(calls, kind, 'success').length, 1);
       await click('It worked');
@@ -503,14 +503,14 @@ for (const kind of ['local', 'remote']) {
     }, async ({ document, button, click, edit, calls, idle }) => {
       await edit(); await click(improvementLabel(kind));
       assertDrafts(document); assert.equal(button(improvementLabel(kind)).disabled, true);
-      assert.equal(button('Retry clearing report tracking'), undefined);
+      assert.equal(button('Retry clearing report tracking') === undefined, true);
       await click('Check Build status');
       assert.equal(button(improvementLabel(kind)).disabled, true, 'Unchanged old Build cannot release an unknown report');
       await click(improvementLabel(kind));
       assert.equal(postsFor(calls, kind, 'feedback').length, 1);
       await click('It worked');
       assert.equal(button('Retry success confirmation').disabled, false);
-      assert.equal(button('Clear unsaved confirmation'), undefined);
+      assert.equal(button('Clear unsaved confirmation') === undefined, true);
       assert.equal(document.querySelector('[aria-label="Task awaiting success confirmation"]')?.textContent, draft.task.trim());
       const original = postsFor(calls, kind, 'success')[0].body;
       await click('Recheck success reports'); await idle();
@@ -628,9 +628,9 @@ for (const kind of ['local', 'remote']) {
       assert.equal(button(improvementLabel(kind)).disabled, true);
       observeBuild(admitted);
       await select('B');
-      assert.equal(document.querySelector('.installed-improvement-handoff'), null,
+      assert.equal(document.querySelector('.installed-improvement-handoff') === null, true,
         'A different installed source or exact remote destination cannot inherit the confirmed link');
-      assert.equal(document.querySelector('.deployment-use-submitted'), null);
+      assert.equal(document.querySelector('.deployment-use-submitted') === null, true);
       assert.equal(document.querySelector('.deployment-use-field textarea').value, '');
       await edit(otherDraft);
       const readsBeforeReturn = calls.filter(call => call.method === 'GET' && call.target === `/api/guide/${state.id}/implementation`).length;
@@ -646,7 +646,7 @@ for (const kind of ['local', 'remote']) {
       assert.equal(postsFor(calls, kind, 'success').length, 0);
       assert.match(document.body.textContent, /open page only/);
       await select('B'); assertDrafts(document, otherDraft);
-      assert.equal(document.querySelector('.installed-improvement-handoff'), null);
+      assert.equal(document.querySelector('.installed-improvement-handoff') === null, true);
       await select('A'); assertDrafts(document);
       assert.equal(document.querySelector('.installed-improvement-handoff')?.dataset.buildId, admitted.build_id);
       assert.equal(postsFor(calls, kind, 'feedback').length, 1);
@@ -682,7 +682,7 @@ for (const kind of ['local', 'remote']) {
         const originalSuccess = postsFor(calls, kind, 'success')[0].body;
         await select('B');
         assert.equal(button(improvementLabel(kind)).disabled, true, 'An empty separate draft is not a report');
-        assert.equal(document.querySelector('[aria-label="Task awaiting success confirmation"]'), null);
+        assert.equal(document.querySelector('[aria-label="Task awaiting success confirmation"]') === null, true);
         await select('A');
         assert.equal(document.querySelector('[aria-label="Task awaiting success confirmation"]')?.textContent, draft.task.trim(),
           'The exact entered success report remains pending after its first owner unmounted');
@@ -717,7 +717,7 @@ for (const kind of ['local', 'remote']) {
     await mounted(kind, t, () => { throw Error('No new report was requested.'); }, async ({ document, calls }) => {
       assert.equal(document.querySelector('.deployment-use-field textarea').value, '');
       assert.equal(document.querySelector('.deployment-use-feedback textarea').value, '');
-      assert.equal(document.querySelector('[aria-label="Task awaiting success confirmation"]'), null);
+      assert.equal(document.querySelector('[aria-label="Task awaiting success confirmation"]') === null, true);
       assert.equal(document.querySelector('.deployment-use-walkthrough')?.getAttribute('aria-label'), 'Prepare your own first job');
       assert.equal(calls.filter(call => call.method === 'POST').length, 0);
     });

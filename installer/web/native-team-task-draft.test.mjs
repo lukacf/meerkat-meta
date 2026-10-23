@@ -140,7 +140,7 @@ test("actual stopped team keeps an editable draft and copying never starts or su
     await click("Copy task");
     assert.deepEqual(copies, ["Inspect the actual saved result.\nThen ask me what is missing."]);
     assert.match(document.body.textContent, /Task copied.*before sending/);
-    assert.equal(document.querySelector("a[href]"), null);
+    assert.equal(document.querySelector("a[href]") === null, true);
     assert.match(document.body.textContent, /Start this installed team using its installation controls/);
   }, { current: { ...receipt, status: "stopped", console_url: null, health: "unknown", process_live: false } });
 });
@@ -148,7 +148,7 @@ test("actual stopped team keeps an editable draft and copying never starts or su
 test("failed metadata leaves draft editable and source changes restore each source's own writing", async () => {
   await mounted(async ({ document, edit, click, rerender, copies }) => {
     await edit("Original installed source task");
-    assert.equal(document.querySelector("a[href]"), null);
+    assert.equal(document.querySelector("a[href]") === null, true);
     assert.match(document.body.textContent, /conversation owner could not be checked/);
     await click("Copy task");
     await rerender({ receipt: { ...receipt, source_digest: "d".repeat(64) } });
@@ -167,7 +167,7 @@ test("failed clipboard exposes manual selection of the exact retained task", asy
     assert.match(document.body.textContent, /could not be copied/);
     await click("Select task to copy");
     const field = document.querySelector("textarea");
-    assert.equal(document.activeElement, field);
+    assert.equal(document.activeElement === field, true);
     assert.equal(field.value.slice(field.selectionStart, field.selectionEnd), task);
     assert.ok(document.querySelector('a[href="http://127.0.0.1:18880/console"]'));
   }, { clipboard: { writeText: async () => { throw Error("Clipboard permission refused"); } } });
@@ -207,7 +207,7 @@ test("invalidated guide selection refuses edits, copy and Console navigation", a
     available = false; await rerender({});
     assert.equal(document.querySelector("textarea").disabled, true);
     assert.equal(button(document, "Copy task").disabled, true);
-    assert.equal(document.querySelector("a[href]"), null);
+    assert.equal(document.querySelector("a[href]") === null, true);
     await click("Copy task"); assert.deepEqual(copies, []);
     available = true; await rerender({});
     assert.equal(document.querySelector("textarea").value, "Original task");

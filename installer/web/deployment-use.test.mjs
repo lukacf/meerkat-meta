@@ -647,7 +647,7 @@ test("production idea selection only fills the local draft and keeps the exact a
     help.open = true;
     assert.match(help.textContent, /Get ready|Your own first job/);
     help.open = false;
-    assert.equal(document.querySelector(".deployment-use-task-field textarea"), task);
+    assert.equal(document.querySelector(".deployment-use-task-field textarea") === task, true);
     assert.equal(task.value, edited, "Opening job help preserves the exact edited draft.");
     assert.equal(calls.filter((call) => call.method !== "GET").length, 0, "Choosing and editing never sends the task.");
     assert.deepEqual(admissions, []);
@@ -805,16 +805,16 @@ test("first-use availability recovery rechecks valid unavailable application det
     const disclosure = document.querySelector(".deployment-use-feedback-disclosure");
     const verifyDrafts = () => {
       assertInstalledReportDraft(ui);
-      assert.equal(document.querySelector(".deployment-use-field textarea"), taskField);
-      assert.equal(document.querySelector(".deployment-use-feedback textarea"), reportField);
-      assert.equal(document.querySelector(".deployment-use-feedback-disclosure"), disclosure);
+      assert.equal(document.querySelector(".deployment-use-field textarea") === taskField, true);
+      assert.equal(document.querySelector(".deployment-use-feedback textarea") === reportField, true);
+      assert.equal(document.querySelector(".deployment-use-feedback-disclosure") === disclosure, true);
       assert.equal(disclosure.open, true);
       assert.equal(calls.filter(call => call.method !== "GET").length, 0);
       assert.deepEqual(admissions, []);
     };
     assert.match(document.body.textContent, /saved installation status is running/);
     assert.doesNotMatch(document.body.textContent, /Start the installed application|Paste your copied task/);
-    assert.equal(document.querySelector('a[href]'), null);
+    assert.equal(document.querySelector('a[href]') === null, true);
     assert.ok(check(), "Verified metadata without Console availability still has a scoped recheck");
     assert.equal(check().disabled, false, "Command custody pauses mutations, not the existing metadata read");
     assert.equal(reportSubmit(document).disabled, true);
@@ -829,7 +829,7 @@ test("first-use availability recovery rechecks valid unavailable application det
       json: async () => ({ detail: "Synthetic first-use metadata temporarily unavailable." }) }));
     assert.match(document.body.textContent, /first-use details could not be checked/);
     assert.ok(check());
-    assert.equal(document.querySelector('a[href]'), null);
+    assert.equal(document.querySelector('a[href]') === null, true);
     verifyDrafts();
 
     await act(async () => check().click());
@@ -841,7 +841,7 @@ test("first-use availability recovery rechecks valid unavailable application det
     assert.equal(consoleLink.getAttribute("href"), null, "Unconfirmed command custody keeps access disabled");
     assert.equal(consoleLink.getAttribute("aria-disabled"), "true");
     assert.match(document.body.textContent, /For jobs handled through native chat/);
-    assert.equal(check(), undefined);
+    assert.equal(check() === undefined, true);
     assert.equal(reportSubmit(document).disabled, true);
     assert.equal(namedButton(document, "It worked").disabled, true);
     verifyDrafts();
@@ -864,7 +864,7 @@ test("first-use availability recovery rechecks the verified native owner through
     assert.match(document.body.textContent, /checked installed conversation owner is Observing-program owner/);
     assert.match(document.body.textContent, /saved installation status is running/);
     assert.doesNotMatch(document.body.textContent, /Start this installed team|Open the Console and select/);
-    assert.equal(document.querySelector('a[href]'), null);
+    assert.equal(document.querySelector('a[href]') === null, true);
     assert.ok(check(), "A verified owner with unavailable Console must remain recheckable");
     assert.equal(check().disabled, false);
 
@@ -872,19 +872,19 @@ test("first-use availability recovery rechecks the verified native owner through
     response = () => new Promise(resolve => { finishRead = resolve; });
     await act(async () => check().click());
     assert.match(document.body.textContent, /Checking this installed team's conversation owner/);
-    assert.equal(check(), undefined);
+    assert.equal(check() === undefined, true);
     await act(async () => finishRead({ ok: false, status: 503,
       json: async () => ({ detail: "Synthetic native first-use metadata temporarily unavailable." }) }));
     assert.match(document.body.textContent, /conversation owner could not be checked/);
     assert.ok(check());
-    assert.equal(document.querySelector('a[href]'), null);
+    assert.equal(document.querySelector('a[href]') === null, true);
 
     await act(async () => check().click());
     assert.match(document.body.textContent, /Checking this installed team's conversation owner/);
     await act(async () => finishRead({ ok: true, json: async () => structuredClone(native) }));
     assert.equal(document.querySelector('a[href]').href, installed.console_url);
     assert.match(document.body.textContent, /Open the Console and select Observing-program owner/);
-    assert.equal(check(), undefined);
+    assert.equal(check() === undefined, true);
     assert.equal(calls.length, 3);
     for (const [status, instruction] of [["stopped", /Start this installed team using its installation controls/],
       ["starting", /wait for the installation step to finish/],
@@ -893,7 +893,7 @@ test("first-use availability recovery rechecks the verified native owner through
       await rerender(null, { receipt: { ...receipt, status } });
       assert.match(document.body.textContent, instruction);
       assert.ok(check());
-      assert.equal(document.querySelector('a[href]'), null);
+      assert.equal(document.querySelector('a[href]') === null, true);
       if (status === "stopped") assert.match(document.body.textContent, /Your agent team is stopped/);
       else assert.doesNotMatch(document.body.textContent, /Start this installed team/);
     }
@@ -991,7 +991,7 @@ test("an explicitly rejected local report keeps its draft, refreshes setup and r
       assert.equal(ui.calls.filter(call => call.method === "POST").length, 1);
       assert.equal(ui.calls.filter(call => call.target === installedUseUrl(guide.id) && call.method === "GET").length, 2);
       assert.equal(reportSubmit(ui.document).disabled, false);
-      assert.equal(namedButton(ui.document, "Check Build status"), undefined);
+      assert.equal(namedButton(ui.document, "Check Build status") === undefined, true);
     }, metadata, (target, options) => options.method === "POST"
       ? rejectedFeedbackResponse(status, "installed_feedback_not_admitted") : undefined, { storage });
     await mountedInstalledReport(noUi, async ui => {
@@ -1010,7 +1010,7 @@ test("an uncoded local409 or422 remains uncertain and cannot resend against its 
     assert.match(ui.document.body.textContent, /Admission.*unconfirmed/); assertInstalledReportDraft(ui);
     await act(async () => namedButton(ui.document, "Check Build status").click());
     assert.equal(reportSubmit(ui.document).disabled, true);
-    assert.equal(namedButton(ui.document, "Prepare another report"), undefined);
+    assert.equal(namedButton(ui.document, "Prepare another report") === undefined, true);
     await act(async () => ui.document.querySelector(".deployment-use-feedback").dispatchEvent(
       new ui.window.Event("submit", { bubbles: true, cancelable: true })));
     assert.equal(ui.calls.filter(call => call.method === "POST").length, 1);
@@ -1034,7 +1034,7 @@ test("the exact local improvement completes visibly without a manual Build check
     assertInstalledReportDraft(ui);
     await ui.rerender(noUi, { build: { ...improvedBuild, build_id: "unrelated-candidate" } });
     assert.doesNotMatch(handoff().textContent, /ready to review/);
-    assert.equal(handoff().querySelector("a"), null);
+    assert.equal(handoff().querySelector("a") === null, true);
   });
 });
 
@@ -1102,7 +1102,7 @@ test("local reload hints cannot borrow a replacement build, different host repor
     { guide_version: guide.version + 1 }, { guide_id: "foreign" }, null]) {
     const candidate = { ...improvedBuild, request: admitted.request, ...change };
     await mountedInstalledReport(noUi, async ui => {
-      assert.equal(ui.document.querySelector(".installed-improvement-handoff"), null);
+      assert.equal(ui.document.querySelector(".installed-improvement-handoff") === null, true);
       assert.doesNotMatch(ui.document.body.textContent, /ready to review|request for proposal \d+ was admitted/);
       assert.equal(reportSubmit(ui.document).disabled, true); assertInstalledReportDraft(ui);
       await act(async () => ui.document.querySelector("form").dispatchEvent(new ui.window.Event("submit", { bubbles: true, cancelable: true })));
@@ -1125,7 +1125,7 @@ test("local reload waits for checked installed metadata when its receipt omits t
   const { source_digest, ...ordinaryReceipt } = installed;
   assert.equal(source_digest, source);
   await mountedInstalledReport(noUi, async ui => {
-    assert.equal(ui.document.querySelector(".installed-improvement-handoff"), null);
+    assert.equal(ui.document.querySelector(".installed-improvement-handoff") === null, true);
     assert.doesNotMatch(ui.document.body.textContent, /ready to review/);
     await act(async () => finishSource(feedbackResponse({ ...metadata, continuation: {
       build_id: candidate.build_id, source_digest: candidate.source_digest, available: true, requires_acknowledgement: true } })));
@@ -1167,7 +1167,7 @@ test("a stale automatic local recovery read cannot overwrite a new proposal revi
     version++;
     await ui.rerender(noUi, { state: { ...guide, version }, build: { ...candidate, current_guide_version: version } });
     await act(async () => finish(feedbackResponse(candidate)));
-    assert.equal(ui.document.querySelector(".installed-improvement-handoff"), null);
+    assert.equal(ui.document.querySelector(".installed-improvement-handoff") === null, true);
     assert.equal(reportSubmit(ui.document).disabled, true);
     assert.equal(ui.admissions.length, 0);
     assert.equal(ui.calls.filter(call => call.method === "POST").length, 0);
@@ -1208,7 +1208,7 @@ test("a lost local feedback response stays uncertain through reload and cannot r
   await mountedInstalledReport(noUi, async ui => {
     assert.match(ui.document.body.textContent, /Admission.*unconfirmed/);
     assert.equal(reportSubmit(ui.document).disabled, true); assertInstalledReportDraft(ui);
-    assert.equal(namedButton(ui.document, "Prepare another report"), undefined);
+    assert.equal(namedButton(ui.document, "Prepare another report") === undefined, true);
     candidate = { ...improvedBuild, build_id: "later-observed-build" };
     await ui.rerender(noUi, { build: candidate });
     await act(async () => namedButton(ui.document, "Check Build status").click());
@@ -1249,13 +1249,13 @@ test("lost installed feedback requires actual Build reads and a separate deliber
     await act(async () => namedButton(ui.document, "Check Build status").click());
     assert.equal(ui.calls.filter((call) => call.target === buildStatusUrl && call.method === "GET").length, 1);
     assert.match(ui.document.body.textContent, /current candidate with status completed.*does not confirm whether your earlier report was admitted/s);
-    assert.equal(namedButton(ui.document, "Prepare another report"), undefined, "The old terminal candidate cannot resolve a lost admission.");
+    assert.equal(namedButton(ui.document, "Prepare another report") === undefined, true, "The old terminal candidate cannot resolve a lost admission.");
     candidate = { ...checked, build_id: "observed-current-repair", source_digest: nextSource, status: "running" };
     await ui.rerender(noUi, { build: candidate });
     await act(async () => namedButton(ui.document, "Check Build status").click());
     assert.equal(ui.admissions.at(-1).build_id, candidate.build_id, "Only the actual status receipt reaches Build.");
     assert.match(ui.document.body.textContent, /status running.*does not confirm whether your earlier report was admitted/s);
-    assert.equal(namedButton(ui.document, "Prepare another report"), undefined);
+    assert.equal(namedButton(ui.document, "Prepare another report") === undefined, true);
     candidate = { ...candidate, status: "completed", cleanup_pending: false };
     await ui.rerender(noUi, { build: candidate });
     await act(async () => namedButton(ui.document, "Check Build status").click());
@@ -1323,7 +1323,7 @@ test("a stale or unavailable Build read never clears an unconfirmed installed re
     await ui.rerender(noUi, { state: { ...guide, version }, build: { ...checked, current_guide_version: version } });
     await act(async () => finish(feedbackResponse({ ...checked, build_id: "stale-status", source_digest: nextSource })));
     assert.doesNotMatch(ui.document.body.textContent, /Build reports a/);
-    assert.equal(namedButton(ui.document, "Prepare another report"), undefined);
+    assert.equal(namedButton(ui.document, "Prepare another report") === undefined, true);
     assert.equal(reportSubmit(ui.document).disabled, true);
     await act(async () => namedButton(ui.document, "Check Build status").click());
     assert.match(ui.document.body.textContent, /Build status could not be checked/);
@@ -1349,7 +1349,7 @@ test("foreign admission and Build replies cannot confirm installed feedback or u
     await act(async () => namedButton(ui.document, "Check Build status").click());
     assert.match(ui.document.body.textContent, /Build status could not be checked/);
     assert.doesNotMatch(ui.document.body.textContent, /Build reports a|is with the builder/);
-    assert.equal(namedButton(ui.document, "Prepare another report"), undefined);
+    assert.equal(namedButton(ui.document, "Prepare another report") === undefined, true);
     assert.equal(reportSubmit(ui.document).disabled, true);
     assertInstalledReportDraft(ui);
     assert.equal(ui.admissions.length, 0);
@@ -1596,14 +1596,14 @@ test("mounted UI discovery retry preserves task and report drafts across unresol
     assert.equal(handoff.querySelector(".deployment-use-contact strong").textContent, metadata.entrypoint.name);
     assert.equal(handoff.querySelector(".deployment-use-contact code").textContent, metadata.entrypoint.identity);
     assert.equal(handoff.querySelectorAll(".deployment-use-console-send li").length, 3);
-    assert.equal(document.querySelector(".deployment-use-admin a"), null);
+    assert.equal(document.querySelector(".deployment-use-admin a") === null, true);
     assert.match(document.body.textContent, /Open application conversation|Paste your copied task/);
     assert.doesNotMatch(document.body.textContent, /Retry UI links/);
     await rerender(declaredUi);
     verifyDrafts();
     assert.match(document.body.textContent, /Open Project workspace/);
     assert.equal(document.querySelector(".deployment-use-entry a").href, declaredUi.entries[0].url);
-    assert.equal(document.querySelector(".deployment-use-console-handoff"), null);
+    assert.equal(document.querySelector(".deployment-use-console-handoff") === null, true);
     assert.equal(document.querySelector(".deployment-use-admin a").href, installed.console_url);
     assert.doesNotMatch(document.body.textContent, /Open application conversation|Paste your copied task/);
   });
@@ -1638,7 +1638,7 @@ test("mounted oversized first-job edits show the limit and retain the exact prev
     assert.equal(field.value, "\u{1f9ed}".repeat(3000));
     assert.equal(field.value.length, 6000);
     assert.equal(field.getAttribute("aria-invalid"), "false");
-    assert.equal(document.querySelector('[role="alert"]'), null);
+    assert.equal(document.querySelector('[role="alert"]') === null, true);
     await edit(field, "\u{1f9ed}".repeat(3001));
     assert.equal(field.value, "\u{1f9ed}".repeat(3000));
     assert.equal(document.querySelector('[role="alert"]').textContent, INSTALLED_USE_TASK_LIMIT_MESSAGE);
@@ -1647,7 +1647,7 @@ test("mounted oversized first-job edits show the limit and retain the exact prev
     assert.equal(document.querySelector('[role="alert"]').textContent, INSTALLED_USE_TASK_LIMIT_MESSAGE);
     await act(async () => [...document.querySelectorAll("button")].find((button) => button.textContent === "Use this idea").click());
     assert.equal(field.value, catalogue.tasks[0].request);
-    assert.equal(document.querySelector('[role="alert"]'), null);
+    assert.equal(document.querySelector('[role="alert"]') === null, true);
     assert.equal(reportField.value, improvement);
     assert.equal(document.querySelector('input[value="blocked"]').checked, true);
     assert.equal(calls.filter((call) => call.method === "POST").length, 0);
@@ -1681,14 +1681,14 @@ test("local handoff requires the exact authored entry and checked installed sour
 test("mounted local task handoff uses the current edit, retains manual copy and sends no task or authorization", async () => {
   await mountedInstalledReport(declaredUi, async ({ document, window, calls, admissions, rerender }) => {
     const handoff = () => [...document.querySelectorAll("a")].find((link) => link.textContent === "Continue with this task");
-    assert.equal(handoff(), undefined);
+    assert.equal(handoff() === undefined, true);
     await act(async () => document.querySelector(".deployment-use-ideas button").click());
     assert.equal(taskFromLink(handoff()), catalogue.tasks[0].request);
     const copy = () => [...document.querySelectorAll("button")].find((button) => button.textContent === "Copy task");
     const assertEditableHandoffPrimary = () => {
       assert.equal(handoff().className, "setup-action primary");
       assert.equal(copy().className, "setup-action");
-      assert.equal(handoff().parentElement.firstElementChild, handoff(), "The declared editable handoff leads its action row");
+      assert.equal(handoff().parentElement.firstElementChild === handoff(), true, "The declared editable handoff leads its action row");
       assert.equal(document.querySelector(".deployment-use-entry a").href, handoff().href,
         "The ready editable draft leads the application entry actions");
       assert.ok([...document.querySelectorAll(".deployment-use-entry a")]
@@ -1713,16 +1713,16 @@ test("mounted local task handoff uses the current edit, retains manual copy and 
     assert.deepEqual(copied, [task]);
     assertEditableHandoffPrimary();
     await rerender(declaredUi, { blocked: true });
-    assert.equal(handoff(), undefined);
+    assert.equal(handoff() === undefined, true);
     assert.equal(copy().className, "setup-action", "The ordinary application entry remains primary when the optional draft handoff is gated");
     assert.equal(field.value, task);
     await rerender(declaredUi);
     assert.equal(taskFromLink(handoff()), task);
     await rerender(null, { experienceLoading: true });
-    assert.equal(handoff(), undefined);
+    assert.equal(handoff() === undefined, true);
     assert.equal(field.value, task);
     await rerender(declaredUi, { receipt: { ...installed, process_live: false } });
-    assert.equal(handoff(), undefined);
+    assert.equal(handoff() === undefined, true);
     assert.equal(field.value, task);
     assert.equal(calls.filter((call) => call.method === "POST").length, 0);
     assert.deepEqual(admissions, []);
@@ -1749,7 +1749,7 @@ test("mounted local pending clipboard copy offers selection of the current task 
     assert.equal(field.disabled, false);
     await edit(current);
     await act(async () => namedButton(document, "Select task to copy").click());
-    assert.equal(document.activeElement, field);
+    assert.equal(document.activeElement === field, true);
     assert.equal(field.value, current);
     assert.equal(field.selectionStart, 0); assert.equal(field.selectionEnd, current.length);
     assert.equal(completed, false, "Manual selection leaves the original clipboard write pending");
@@ -1760,8 +1760,8 @@ test("mounted local pending clipboard copy offers selection of the current task 
     assert.equal(completed, true);
     assert.equal(field.value, current);
     assert.equal(namedButton(document, "Copy task").disabled, false);
-    assert.equal(namedButton(document, "Copying task..."), undefined);
-    assert.equal(namedButton(document, "Select task to copy"), undefined);
+    assert.equal(namedButton(document, "Copying task...") === undefined, true);
+    assert.equal(namedButton(document, "Select task to copy") === undefined, true);
     assert.doesNotMatch(document.body.textContent, /Task copied|Clipboard copy is still pending|could not be copied/);
     assert.deepEqual(copied, [original]);
   });
@@ -1796,7 +1796,7 @@ test("accepted first-job success survives draft qualifications and remains bound
       assert.equal(success().querySelector(".deployment-use-reported-job p").textContent, taskA.trim());
       assert.equal(document.querySelector(".deployment-use-feedback textarea").value, qualification);
       assert.equal(partly.checked, true);
-      assert.equal(namedButton(document, "It worked"), undefined);
+      assert.equal(namedButton(document, "It worked") === undefined, true);
     };
     assertHistorical();
     assert.equal(field.value, taskA);

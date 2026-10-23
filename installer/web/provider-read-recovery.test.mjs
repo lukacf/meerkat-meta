@@ -341,7 +341,7 @@ test("pending start recovery checks fresh settings and status without replacing 
     assert.equal(deadlines.size, 0, "A pending mutation body has no read timeout");
     await pollStart();
     assert.equal(runtimes.at(-1).status, "ready");
-    assert.equal(document.querySelector(".setup-provider-return"), null, "A poll alone does not refresh the settings or release Start");
+    assert.equal(document.querySelector(".setup-provider-return") === null, true, "A poll alone does not refresh the settings or release Start");
     assert.equal(button("Back to my idea").disabled, true);
     await pollStart();
     active = true;
@@ -385,13 +385,13 @@ for (const mismatch of ["active-starting", "inactive-ready", "status-starting"])
       await click("Start guide");
       checked = true;
       await click("Check guide status");
-      assert.equal(document.querySelector(".setup-provider-return"), null);
+      assert.equal(document.querySelector(".setup-provider-return") === null, true);
       assert.equal(button("Back to my idea").disabled, true);
       assert.equal(button("Check guide status").disabled, false, "A non-ready observation remains deliberately recheckable");
       assert.equal(calls.filter(call => call.method !== "GET").length, 1);
       await act(async () => startBody.resolve({ status: "ready" }));
       await settle();
-      assert.equal(document.querySelector(".setup-provider-return"), null, "A stale original Start cannot upgrade the explicit observation");
+      assert.equal(document.querySelector(".setup-provider-return") === null, true, "A stale original Start cannot upgrade the explicit observation");
       assert.equal(document.querySelector(".setup-provider-idea p").textContent, idea);
     }, { ready: true });
   });

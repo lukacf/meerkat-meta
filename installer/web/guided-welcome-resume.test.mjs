@@ -166,7 +166,7 @@ for (const change of ['none', 'new edit', 'focus elsewhere']) test(`restored wel
     await click(choice('A team'));
     editor.setSelectionRange(0, 0);
     await click(choice('Repetitive work'));
-    assert.equal(document.activeElement, editor, 'The choice retains immediate composer focus.');
+    assert.equal(document.activeElement === editor, true, 'The choice retains immediate composer focus.');
     assert.equal(editor.value, draft, 'Selecting the same restored context does not change any draft byte.');
     assert.equal(JSON.parse(values.get(inputKey(a))).draft, draft);
     if (change === 'new edit') {
@@ -185,7 +185,7 @@ for (const change of ['none', 'new edit', 'focus elsewhere']) test(`restored wel
       for (const callback of pending) callback(0);
       await settle();
     });
-    assert.equal(document.activeElement, focus, 'A deferred caret handoff never takes focus back.');
+    assert.equal(document.activeElement === focus, true, 'A deferred caret handoff never takes focus back.');
     assert.equal(editor.selectionStart, change === 'none' ? draft.length : change === 'new edit' ? 4 : 0);
     assert.equal(editor.selectionEnd, editor.selectionStart);
     assert.equal(editor.value, change === 'new edit' ? `${draft}\nKeep this newer thought.` : draft);
@@ -217,7 +217,7 @@ for (const narrow of [true, false]) test(`${narrow ? 'phone Return keeps the ide
       assert.equal(JSON.parse(values.get(inputKey(a))).draft, draft);
     }
     if (narrow) {
-      assert.equal(document.querySelector('.forge-welcome-shortcuts'), null, 'Phone offers explicit Send without a misleading desktop shortcut.');
+      assert.equal(document.querySelector('.forge-welcome-shortcuts') === null, true, 'Phone offers explicit Send without a misleading desktop shortcut.');
       assert.equal((await enter({})).defaultPrevented, false, 'Phone Return remains a native textarea newline.');
       assert.deepEqual(posts(), [], 'Phone Return never submits the unfinished idea.');
       assert.equal(textarea.value, draft);
@@ -258,7 +258,7 @@ test('a stalled saved-setup list enables retry and ignores its late body without
       await settle();
     });
     assert.match(document.querySelector('.setup-history-menu').textContent, /Saved setups could not be read/);
-    assert.equal(document.querySelector('.forge-welcome-resume'), null);
+    assert.equal(document.querySelector('.forge-welcome-resume') === null, true);
     await click(button(document, 'Retry saved setups'));
     assert.equal(document.querySelector('.forge-welcome-resume strong').textContent, 'Existing observing setup');
     assert.equal(values.get(GUIDE_KEY), a.id);
@@ -278,7 +278,7 @@ test('welcome resumes only an explicitly selected checked saved setup and preser
   for (const scenario of ['empty', 'only-current', 'failed', 'ready', 'review', 'question']) {
     await mounted(scenario, async ({ document, a, b, calls, values, list, selection, finish }) => {
       assert.ok(document.querySelector('.setup-welcome'));
-      assert.equal(document.querySelector('.forge-welcome-resume'), null, 'A pending list must not pretend a resume is available.');
+      assert.equal(document.querySelector('.forge-welcome-resume') === null, true, 'A pending list must not pretend a resume is available.');
       const rows = scenario === 'empty' ? [] : scenario === 'only-current' ? [{ id: a.id, name: 'Blank saved start', status: 'question' }]
         : [{ id: a.id, name: 'Blank saved start', status: 'question' },
           { id: b.id, name: 'Existing observing setup', status: scenario },
@@ -288,7 +288,7 @@ test('welcome resumes only an explicitly selected checked saved setup and preser
       assert.equal(calls.some(call => call.url === `/api/guide/${b.id}`), false, 'Reading the list never selects its first row.');
       const card = document.querySelector('.forge-welcome-resume');
       if (['empty', 'only-current', 'failed'].includes(scenario)) {
-        assert.equal(card, null, 'Empty, current-only or failed reads offer no resume.'); return;
+        assert.equal(card === null, true, 'Empty, current-only or failed reads offer no resume.'); return;
       }
       assert.ok(card, 'A checked existing setup has an explicit welcome resume affordance.');
       assert.equal(card.querySelector('strong').textContent, 'Existing observing setup', 'Use the first actual server-ordered other row.');
@@ -304,18 +304,18 @@ test('welcome resumes only an explicitly selected checked saved setup and preser
       });
       assert.equal(JSON.parse(values.get(inputKey(a))).draft, raw);
       await click(button(document, 'Guide settings'));
-      assert.equal(document.querySelector('.forge-welcome-resume'), null, 'Model settings have their own first-minute action.');
+      assert.equal(document.querySelector('.forge-welcome-resume') === null, true, 'Model settings have their own first-minute action.');
       await click(button(document, 'Back to my idea'));
       assert.equal(document.querySelector('#setup-message').value, raw);
       await click(document.querySelector('.forge-welcome-resume button'));
       assert.equal(calls.filter(call => call.url === `/api/guide/${b.id}`).length, 1);
       assert.equal(document.querySelector('#setup-send').disabled, true, 'Existing navigation owns pending submission admission.');
-      assert.equal(document.querySelector('.forge-welcome-resume'), null, 'Pending selection cannot offer another resume.');
+      assert.equal(document.querySelector('.forge-welcome-resume') === null, true, 'Pending selection cannot offer another resume.');
       assert.equal(JSON.parse(values.get(inputKey(a))).draft, raw, 'Navigation retains the exact unsent draft through its existing key.');
       await finish(selection, response(structuredClone(b)));
       assert.equal(values.get(GUIDE_KEY), b.id);
       assert.equal(document.querySelector('#setup-message').value, '', 'The saved setup never receives the other idea.');
-      assert.equal(document.querySelector('.forge-welcome-resume'), null);
+      assert.equal(document.querySelector('.forge-welcome-resume') === null, true);
       await click(button(document, 'Your setups'));
       const original = [...document.querySelectorAll('.setup-history-menu button')]
         .find(item => item.querySelector('span')?.textContent === 'Blank saved start');

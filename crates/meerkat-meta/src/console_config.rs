@@ -999,6 +999,74 @@ mod tests {
         Ok(())
     }
 
+    /// The Console configuration Meta Forge compiles for an application on
+    /// the Meta Toolkit Connect route ends with a "Connect setup" sidebar
+    /// button that opens the host's Toolkit setup page as a docked operator
+    /// panel. Read from disk as a gateway loads its Console configuration,
+    /// with or without a realm, the button keeps its panel path through
+    /// normalization and reaches the Console as written.
+    #[test]
+    fn connect_setup_panel_button_survives_normalization() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // The file as the compiler writes it, the button table last.
+        let compiled = r#"title = "Research desk"
+[brand]
+label = "Research desk"
+
+[appearance]
+default_theme = "dark"
+default_variant = "graphite"
+
+[environment]
+label = "local"
+[layout]
+initial_preset = "two_columns"
+initial_agent = "lead"
+
+[agent_list]
+group_by = ["labels.console_group"]
+default_pinned_agent_ids = ["lead"]
+
+[actions]
+show_reset = false
+
+[[sidebar.buttons]]
+id = "connect-setup"
+label = "Connect setup"
+panel = "/host/toolkit/setup"
+"#;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("console.toml");
+        std::fs::write(&path, compiled)?;
+        let connect_setup = ConsoleSidebarButtonConfig {
+            id: "connect-setup".to_string(),
+            label: "Connect setup".to_string(),
+            panel: Some("/host/toolkit/setup".to_string()),
+            ..ConsoleSidebarButtonConfig::default()
+        };
+        for realm in [None, Some("ops")] {
+            let config = load_console_ui_config_from_path_for_realm(&path, realm)?;
+            assert_eq!(
+                config.sidebar.buttons,
+                vec![connect_setup.clone()],
+                "{realm:?}"
+            );
+            assert_eq!(config.clone().normalized(), config, "{realm:?}");
+            assert_eq!(
+                serde_json::to_value(&config)?["sidebar"],
+                serde_json::json!({
+                    "buttons": [{
+                        "id": "connect-setup",
+                        "label": "Connect setup",
+                        "panel": "/host/toolkit/setup",
+                    }],
+                }),
+                "{realm:?}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn mcp_apps_sandbox_rejects_invalid_urls_before_capability_bootstrap()
     -> Result<(), Box<dyn std::error::Error>> {

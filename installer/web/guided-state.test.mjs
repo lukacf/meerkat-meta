@@ -141,7 +141,7 @@ test("Guide console is removed when the confirmed owner explicitly has no Consol
       await act(async () => intervals.find(interval => interval.delay === 4000).callback());
       assert.equal(link()?.href, new URL(oldRuntimeOwner.browser_console_url, "http://localhost/").href);
       await render({ ...currentRuntimeOwner, browser_console_url: null });
-      assert.equal(link(), null, "The old local and historical URLs cannot survive an owner-null update");
+      assert.equal(link() === null, true, "The old local and historical URLs cannot survive an owner-null update");
     });
 });
 
@@ -150,7 +150,7 @@ test("Guide console respects an explicit null URL from the current runtime statu
     status: () => ({ available: true, status: "stopped", console_url: null, browser_console_url: null }) }, async ({ link, intervals }) => {
       assert.equal(link()?.href, new URL(oldRuntimeOwner.browser_console_url, "http://localhost/").href);
       await act(async () => intervals.find(interval => interval.delay === 4000).callback());
-      assert.equal(link(), null, "A confirmed null status must not fall back to an older config URL");
+      assert.equal(link() === null, true, "A confirmed null status must not fall back to an older config URL");
     });
 });
 
@@ -262,7 +262,7 @@ test("optional examples seed an empty message for editing and never send guide w
     await act(async () => document.querySelector(".setup-starting-points > button").click());
     assert.equal(choices.length, 1);
     assert.match(choices[0], /which information it needs/);
-    assert.equal(document.querySelector("details"), null);
+    assert.equal(document.querySelector("details") === null, true);
     await render("", true);
     await act(async () => document.querySelector(".setup-starting-points > button").click());
     assert.equal(choices.length, 1);

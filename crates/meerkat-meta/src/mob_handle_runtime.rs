@@ -3753,11 +3753,18 @@ macro_rules! delegate_mob_session_service {
             // source from authority, catalog and lifecycle rows without a
             // body read. Required since meerkat 0.8.47; a wrapper that
             // answered it itself would make every voice readiness poll a
-            // whole-transcript read.
+            // whole-transcript read. It is also how a restored child mob's
+            // owner resolves; an announcement test-fault build can answer
+            // unobservable for one session (`mob_announcements::faults`).
             async fn observe_live_durable_source(
                 &self,
                 session_id: &meerkat_core::SessionId,
             ) -> Result<meerkat_mob::LiveDurableSourceObservation, SessionError> {
+                if crate::mob_announcements::faults::owner_unobserved(session_id) {
+                    return Err(SessionError::Store(Box::new(std::io::Error::other(
+                        "announcement test fault: this session's durable source is not observed",
+                    ))));
+                }
                 self.inner.observe_live_durable_source(session_id).await
             }
 
@@ -5015,8 +5022,9 @@ impl MobSessionService for AfterCreateMobSessionService {
             .await
     }
 
-    // Forwarded exactly, as in `delegate_mob_session_service!`: the body-free
-    // durable-source observation behind voice readiness.
+    // Forwarded exactly: the body-free durable-source observation behind
+    // voice readiness. (`delegate_mob_session_service!` forwards it the same
+    // way, after the announcement test-fault check of a test-fault build.)
     async fn observe_live_durable_source(
         &self,
         session_id: &meerkat_core::SessionId,

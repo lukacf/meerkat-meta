@@ -1417,6 +1417,26 @@ class TestErrorEvent:
             "runtime attach not ready"
         )
 
+    def test_retired_member_release_failed_names_the_retired_incarnation(self):
+        r = ErrorEvent.from_dict(
+            {
+                "category": "retired_member_release_failed",
+                "identity": "keeper",
+                "agent_runtime_id": "rt:keeper:2",
+                "session_id": "s-1",
+                "cause": "retire",
+                "error": "native host composition is unavailable",
+            }
+        )
+        assert r.category == "retired_member_release_failed"
+        assert r.message == (
+            "keeper (rt:keeper:2) was retired (retire), and the host's "
+            "release failed: native host composition is unavailable"
+        )
+        assert r.context["cause"] == "retire"
+        assert r.context["session_id"] == "s-1"
+        assert r.is_resolution is False
+
     def test_only_recovery_is_a_resolution(self):
         for category in ErrorCategory:
             expected = category is ErrorCategory.ACTOR_LOOP_RECOVERED
@@ -1440,6 +1460,7 @@ class TestErrorEvent:
             "EVENT_LOG_FLUSH_FAILURE": "event_log_flush_failure",
             "IDENTITY_MATERIALIZATION_FAILURE": "identity_materialization_failure",
             "MOB_STOP_PROCEEDED_WITHOUT_INTERRUPT": "mob_stop_proceeded_without_interrupt",
+            "RETIRED_MEMBER_RELEASE_FAILED": "retired_member_release_failed",
         }
 
 

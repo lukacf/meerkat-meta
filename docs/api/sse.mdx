@@ -147,6 +147,7 @@ data: {"type":"snapshot_complete","cursor":"console:240"}
 | `frame_updated` | `{type: "frame_updated", frame}` **or** `{type: "console_frame", frame}` with `frame.kind = "frame_updated"`; handle as an update, not a new completed interaction | `frame.cursor` |
 | `snapshot_complete` | `{type: "snapshot_complete", cursor?}` ends replay; live continuation follows | `cursor` when present |
 | `replay_unavailable` | `{type: "replay_unavailable", requested_cursor, latest_cursor}`; `latest_cursor` may be `null`; refetch a recent page | none |
+| `access_changed` | `{type: "access_changed", revision}`: the committed revision of the Console access configuration, sent once when the live part of the stream starts and again after each committed change, only when Console access control is configured; read access-dependent views (Access, the roster) again when it is newer than the revision you hold | none |
 
 `after` and `cursor` are omitted on markers when absent. The SSE event name
 and `data.type` need not coincide for updates. Persist cursor-bearing IDs for

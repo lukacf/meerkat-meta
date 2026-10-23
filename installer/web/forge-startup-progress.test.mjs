@@ -180,14 +180,14 @@ test("a pending first Start exposes successive host phases without releasing its
       assert.equal(block.querySelector("p").textContent, projected.detail);
       labels.add(projected.title);
       assert.equal(button("Back to my idea").disabled, true);
-      assert.equal(document.querySelector(".setup-provider-return"), null);
+      assert.equal(document.querySelector(".setup-provider-return") === null, true);
       assertDraftAndAdmission(document, calls);
     }
     assert.equal(labels.size, phases.length, "Different observed preparation stages are distinguishable");
     observed = hostStatus("ready"); active = true;
     await act(async () => original.resolve(observed)); await settle();
     assert.equal(document.querySelector(".setup-provider").dataset.providerStep, "ready");
-    assert.equal(document.querySelector(".setup-provider-startup"), null, "Finished startup does not leave an obsolete phase block");
+    assert.equal(document.querySelector(".setup-provider-startup") === null, true, "Finished startup does not leave an obsolete phase block");
     assert.equal(button("Back to my draft").disabled, false);
     assert.equal(closes(), 0, "Readiness does not navigate or send the draft automatically");
     assertDraftAndAdmission(document, calls);
@@ -254,7 +254,7 @@ test("unknown and malformed startup diagnostics never become user text or readin
       assert.doesNotMatch(document.body.textContent, new RegExp(privateDiagnostic));
       assert.equal(document.querySelector(".setup-provider").dataset.providerStep, "starting");
       assert.equal(button("Back to my idea").disabled, true);
-      assert.equal(document.querySelector(".setup-provider-return"), null);
+      assert.equal(document.querySelector(".setup-provider-return") === null, true);
       assertDraftAndAdmission(document, calls);
     }
     assert.equal(detailFor({ status: "starting", startup_retry_required: "false", startup_phase: "identity_warmup" }), null,
@@ -277,10 +277,10 @@ test("a rejected Start clears an earlier working phase until status can be confi
     await click("Start guide"); await pollStart();
     assert.equal(progress(document).dataset.startupPhase, "identity_warmup");
     await act(async () => original.reject(new Error(privateDiagnostic))); await settle();
-    assert.equal(document.querySelector(".setup-provider-startup"), null,
+    assert.equal(document.querySelector(".setup-provider-startup") === null, true,
       "A past working observation is not current progress after Start becomes unconfirmed");
     assert.match(document.body.textContent, /Starting was not confirmed/);
-    assert.equal(document.querySelector(".setup-provider-return"), null);
+    assert.equal(document.querySelector(".setup-provider-return") === null, true);
     assert.equal(button("Check saved settings").disabled, false);
     assert.doesNotMatch(document.body.textContent, new RegExp(privateDiagnostic));
     assertDraftAndAdmission(document, calls);
@@ -300,17 +300,17 @@ test("a failed manual status read clears the older working phase at check admiss
     await click("Start guide"); await pollStart();
     assert.equal(progress(document).dataset.startupPhase, "identity_warmup");
     await click("Check guide status");
-    assert.equal(document.querySelector(".setup-provider-startup"), null,
+    assert.equal(document.querySelector(".setup-provider-startup") === null, true,
       "Checking current status removes the superseded working observation before the read settles");
     assert.equal(button("Checking guide status...").disabled, true);
     await act(async () => currentRead.reject(new Error(privateDiagnostic))); await settle();
-    assert.equal(document.querySelector(".setup-provider-startup"), null);
+    assert.equal(document.querySelector(".setup-provider-startup") === null, true);
     assert.match(document.body.textContent, /Guide status could not be confirmed/);
     assert.equal(button("Check guide status").disabled, false);
     assert.equal(button("Back to my idea").disabled, true, "The original Start is still entered");
     assertDraftAndAdmission(document, calls);
     await act(async () => original.resolve(hostStatus("starting", { startup_phase: "native_bootstrap" }))); await settle();
-    assert.equal(document.querySelector(".setup-provider-startup"), null,
+    assert.equal(document.querySelector(".setup-provider-startup") === null, true,
       "The late Start result cannot override the newer failed observation");
     assert.doesNotMatch(document.body.textContent, new RegExp(privateDiagnostic));
     assertDraftAndAdmission(document, calls);
@@ -332,7 +332,7 @@ test("manual ready observation owns startup presentation over a late background 
     await pollStart(); active = true;
     await click("Check guide status");
     assert.equal(document.querySelector(".setup-provider").dataset.providerStep, "ready");
-    assert.equal(document.querySelector(".setup-provider-startup"), null);
+    assert.equal(document.querySelector(".setup-provider-startup") === null, true);
     assert.equal(button("Stop setup team").disabled, true, "A readback does not replace the entered Start");
     const readCount = calls.length, runtimeCount = runtimes.length;
     await act(async () => oldPoll.resolve(hostStatus("failed", { startup_phase: "identity_warmup",
@@ -342,7 +342,7 @@ test("manual ready observation owns startup presentation over a late background 
     assert.equal(runtimes.length, runtimeCount, "An older phase observation is inert");
     await act(async () => original.reject(new Error(privateDiagnostic))); await settle();
     assert.equal(document.querySelector(".setup-provider").dataset.providerStep, "ready");
-    assert.equal(document.querySelector(".setup-provider-startup"), null);
+    assert.equal(document.querySelector(".setup-provider-startup") === null, true);
     assert.doesNotMatch(document.body.textContent, new RegExp(privateDiagnostic));
     assertDraftAndAdmission(document, calls);
     await click("Back to my draft"); assert.equal(closes(), 1);
@@ -365,7 +365,7 @@ test("an unmounted provider handoff cannot publish a delayed startup diagnosis",
       startup_error_kind: "storage_preparation", detail: privateDiagnostic }))); await settle();
     await act(async () => original.resolve(hostStatus("ready"))); await settle();
     assert.equal(runtimes.length, count);
-    assert.equal(document.querySelector(".setup-provider-startup"), null);
+    assert.equal(document.querySelector(".setup-provider-startup") === null, true);
     assert.equal(calls.filter(call => call.method === "POST").length, 1);
   });
 });

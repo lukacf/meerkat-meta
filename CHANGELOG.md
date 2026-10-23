@@ -45,6 +45,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   also name `IdentityRuntime::restore_flow` as a path outside the bootstrap
   controller, and say that a listed, owed member can be added again without
   unlisting it first.
+- `GatewayHostComposition::compose_agent_customizer` (defaulted to returning
+  the given customizer): on the identity-first path, a host-composed gateway
+  offers its host the agent customizer it composed (the SDK's customizer
+  callback, wrapped by agent memory when that is configured, or `None`),
+  once, after `bind_runtime` and before the identity context is installed.
+  The answer is installed as the one customizer, the same `Arc`, of the
+  identity runtime, the identity-first context and the RPC context, so a
+  host wrapper runs for the roster bootstrap's builds and for the builds
+  outside it, such as a reset's fresh life. `Err` refuses init before the
+  identity bootstrap, as does an answer that adds a customizer where the
+  gateway composed none or drops the composed one. A gateway without an
+  identity roster never asks.
+- `GatewayHostComposition::identity_member_retired` (defaulted to doing
+  nothing): a host-composed gateway tells its host once per retired incarnation
+  of a durable identity's member, after Core's retire returned and with no Meta
+  lock held, so the host can release what it keeps for that incarnation. The
+  new `RetiredIdentityMember` names the incarnation (member id, role, runtime
+  id, generation, session and `registration`, the exact Core registration it
+  held, all read from Core before the retire) and its `RetiredIdentityCause`:
+  `unlisted` (a roster pass retired it because the roster no longer lists the
+  identity, the one cause that ends the identity's place in the roster),
+  `retire` (an explicit retire) or `scoped` (a retire at a captured delivery
+  scope that named the live member). After `retire` or `scoped` the identity
+  stays registered and dormant, and a still listed identity resumes at the next
+  generation on the same session, under another registration: `registration` is
+  the one a host's registration hook was given for the retired incarnation and
+  never a successor's, and `None` (none observed, or still current after Core's
+  retire answered) names no registration. Hosts compare registrations with `==`
+  only, never by session id or epoch: a successor on the same session can carry
+  the same session id and epoch. A roster pass collects its retirements and the
+  host hears of them after the bootstrap controller is released, also when a
+  later step of the pass failed; the identity bootstrap's retirements reach the
+  host too. Reloads, reprofiles, compaction rebuilds, respawns, reset and
+  delete successors, held or refused spawns, shutdowns and restarts never call
+  it. A host error leaves the retirement standing and is reported once as the
+  new `ErrorEvent` category `retired_member_release_failed` (`identity`,
+  `agent_runtime_id`, `session_id?`, `cause`, `error`), which both SDKs'
+  `ErrorCategory` lists carry. With a host, a retire whose incarnation read
+  from Core fails is refused before Core is asked (fail closed). Without a
+  host, retires read nothing extra.
 
 ### Changed
 
@@ -108,6 +148,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   timeout rises from 337 to 377 seconds, and the advertised
   `stdio_shutdown_horizon_ms` from 392000 to 432000; hosts that honor the
   advertised value need no change.
+- The Console reads its Access view again only when the access
+  configuration changes. With Console access control configured,
+  `/console/timeline/stream` now sends an `access_changed` event naming the
+  configuration's committed revision when the live part of the stream
+  starts and after each committed change, and the Console reads Access
+  (when its panel is open) and the roster again on a newer revision. It
+  used to read Access again on 16 kinds of activity event, such as tool
+  calls and run starts, none of which can change it.
 
 ### Fixed
 
@@ -219,6 +267,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Meta Forge no longer leaves a partial remote installation behind when a
   connect is cancelled or refused partway, so removing the cloud computer
   afterwards no longer fails on it.
+- Console: the 10 s between the two member status polls that clear a stale
+  "working" chat is now measured on the page's monotonic clock instead of
+  the computer's clock. A clock set forward between the polls could clear
+  the chat after two polls a few seconds apart, and a clock set back could
+  keep a finished member's chat "working" until the clock caught up.
+- The Console no longer projects members that a `spawn_many_members` call
+  failed to create. It looked for the spawned members in a shape Core does
+  not emit and then fell back to the call's specs, so a failed row got a
+  kickoff frame and spawned-by registrations for a member that never
+  existed. It now reads Core's typed per-member results and projects only
+  the rows that spawned.
+- Meta Forge's "Check cloud access" step for a Google Cloud destination no
+  longer gives up after 30 s. Forge reads and checks the accepted package
+  before and after it lists the signed-in accounts, which can take longer
+  than 30 s on a small machine, and it bounds the whole check at 180 s. The
+  page stopped waiting after 30 s and said the server was taking too long,
+  and checking again was refused until the first check had finished. The
+  page now waits up to 240 s, so it shows the check's result, or Forge's own
+  refusal when the check runs out of time.
 
 ### Known limitations
 

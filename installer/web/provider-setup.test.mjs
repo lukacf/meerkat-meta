@@ -90,7 +90,7 @@ test('fresh provider form privately saves once, clears key and starts only on ex
 
 test('environment configuration exposes no input and cannot be replaced', async()=>{
   await mount(()=>({...saved(),providers:saved().providers.map(p=>p.provider==='openai'?{...p,source:'environment'}:p)}),
-    async({document,calls})=>{ assert.equal(document.querySelector('input'),null); assert.match(document.body.textContent,/server environment/);
+    async({document,calls})=>{ assert.equal(document.querySelector('input') === null,true); assert.match(document.body.textContent,/server environment/);
       assert.ok(calls.every(c=>c.method==='GET')); });
 });
 
@@ -173,7 +173,7 @@ test('failed initial settings read admits one captured retry and reaches explici
     await act(async () => { retry.click(); retry.click(); });
     await tick();
     assert.equal(reads, 2, 'captured retry clicks admit one settings read');
-    assert.equal(document.querySelector('[role="alert"]'), null);
+    assert.equal(document.querySelector('[role="alert"]') === null, true);
     assert.match(document.body.textContent, /Reading local settings/);
     assert.equal(buttonFor(document, 'Close').disabled, true);
 
@@ -226,7 +226,7 @@ for (const failure of [false, true]) {
       assert.match(document.body.textContent, /Saved privately on the computer running Forge/);
       assert.match(document.body.textContent, /OpenAI is currently used/);
       assert.equal(buttonFor(document, 'Start guide').disabled, false);
-      assert.equal(document.querySelector('[role="alert"]'), null);
+      assert.equal(document.querySelector('[role="alert"]') === null, true);
       assert.equal(document.querySelector('input').value, '');
       assert.doesNotMatch(document.body.textContent, /private-old-observation|synthetic-confirmed-key/);
       assert.equal(calls.filter(call => call.method === 'PUT').length, 1);
@@ -260,7 +260,7 @@ for (const failure of [false, true]) {
       await complete(first, failure ? new Error('private-superseded-failure') : fresh(), tick);
       assert.match(document.body.textContent, /OpenAI is currently used/);
       assert.equal(buttonFor(document, 'Start guide').disabled, false);
-      assert.equal(document.querySelector('[role="alert"]'), null);
+      assert.equal(document.querySelector('[role="alert"]') === null, true);
       assert.doesNotMatch(document.body.textContent, /private-superseded-failure|current-initial-failure/);
       assert.equal(runtime.length, 1);
       assert.ok(calls.every(call => call.method === 'GET'));
@@ -327,7 +327,7 @@ test('selected model host exposes its configured model without a key field or cr
       ? {...p,configured:true,source:'native_host_config',editable:false}:p) };
   await mount(c=>c.url==='/api/provider-settings'?host:{status:'stopped',available:true},
     async({document,calls})=>{
-      assert.equal(document.querySelector('input'),null);
+      assert.equal(document.querySelector('input') === null,true);
       assert.match(document.body.textContent,/claude-sonnet-5-5/);
       assert.match(document.body.textContent,/model configured by this Forge host/);
       assert.doesNotMatch(document.body.textContent,/authentication verified/i);

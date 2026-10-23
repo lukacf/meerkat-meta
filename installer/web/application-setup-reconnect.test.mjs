@@ -84,7 +84,7 @@ async function mounted(verify, fixture = {}) {
   const button = label => [...dom.window.document.querySelectorAll("button")].find(node => node.textContent === label);
   const assertReadOnly = () => {
     assert.ok(calls.every(call => call.method === "GET" && call.body === undefined));
-    assert.equal(dom.window.document.querySelector("input, textarea, form"), null,
+    assert.equal(dom.window.document.querySelector("input, textarea, form") === null, true,
       "The setup handoff never solicits private Configure values in the browser.");
   };
   try {
@@ -188,7 +188,7 @@ test("Continue setup delegates only one explicit prepare intent and never claims
   await mounted(async ({ document, calls, actions, settings, checks, click, button, refresh, invoke }) => {
     assert.equal(button("Continue setup").disabled, false);
     for (const label of ["Prepare application setup", "Set up and start application", "Start installed application", "Run in background"])
-      assert.equal(button(label), undefined, label);
+      assert.equal(button(label) === undefined, true, label);
     assert.match(document.body.textContent, /check this installation's saved setup/i);
     assert.match(document.body.textContent, /stays stopped|does not start the application/i);
     assert.doesNotMatch(document.body.textContent, /Ready to start|Ready to set up|Private settingsSaved|DO-NOT-DISPLAY|\/private\/synthetic/);
@@ -230,7 +230,7 @@ test("a retained pending reconnect intent survives remount without automatic sub
   const saved = [...values];
   await mounted(async ({ document, calls, actions, button }) => {
     assert.deepEqual(calls, []); assert.deepEqual(actions, []);
-    assert.equal(button("Continue setup"), undefined);
+    assert.equal(button("Continue setup") === undefined, true);
     assert.match(document.body.textContent, /not be sent again automatically/);
     assert.deepEqual(loadDeploymentActionIntent(storage, state.id), intent);
     assert.deepEqual([...values], saved);
@@ -240,7 +240,7 @@ test("a retained pending reconnect intent survives remount without automatic sub
 test("an explicit read-only recheck may expose reconnect but never performs recovery", async () => {
   const state = guide(), receipt = receiptFor(state);
   await mounted(async ({ document, calls, actions, settings, checks, click, button }) => {
-    assert.equal(button("Continue setup"), undefined);
+    assert.equal(button("Continue setup") === undefined, true);
     await click("Check setup status");
     assert.equal(calls.length, 2); assert.deepEqual(checks, ["check"]);
     assert.deepEqual(actions, []); assert.deepEqual(settings, []);
@@ -260,7 +260,7 @@ for (const [kind, label] of [["fresh", "Set up and start application"], ["restor
       assert.deepEqual(actions, []);
       await refresh({ disabled: false });
       assert.equal(calls.length, 2);
-      assert.equal(button("Continue setup"), undefined);
+      assert.equal(button("Continue setup") === undefined, true);
       assert.equal(button(label).disabled, false);
       assert.doesNotMatch(document.body.textContent, /Saved setup to check/);
       await invoke(stale);
@@ -299,7 +299,7 @@ test("changed guide or receipt identity refuses the old reconnect click even aft
       await invoke(stale);
       assert.deepEqual(actions, [], JSON.stringify(change));
       assert.equal(calls.length, 2);
-      assert.equal(button("Continue setup"), undefined);
+      assert.equal(button("Continue setup") === undefined, true);
       await release(1, reconnect(nextReceipt, nextState));
       assert.equal(button("Continue setup").disabled, false);
       await invoke(stale);
@@ -314,7 +314,7 @@ test("an old suspended reconnect observation cannot replace a current different 
   const nextState = { id: "synthetic-other-guide", version: 9 };
   const nextReceipt = receiptFor(nextState, { deployment_id: "synthetic-other-installation", package_sha256: "1".repeat(64) });
   await mounted(async ({ document, calls, actions, button, refresh, release, click }) => {
-    assert.equal(button("Continue setup"), undefined);
+    assert.equal(button("Continue setup") === undefined, true);
     await refresh({ state: nextState, receipt: nextReceipt });
     assert.equal(button("Continue setup").disabled, false);
     await release(0, reconnect(receiptFor(), guide(), { application_name: "OLD WRONG APPLICATION" }));
@@ -344,7 +344,7 @@ test("contradictory reconnect replies do not mount a Continue or native startup 
     { action: "finish-setup" }, { missing_fields: ["Runtime provider"] }]) {
     await mounted(async ({ document, calls, actions, settings, button, click }) => {
       for (const label of ["Continue setup", "Prepare application setup", "Set up and start application", "Start installed application", "Run in background"])
-        assert.equal(button(label), undefined, JSON.stringify(patch));
+        assert.equal(button(label) === undefined, true, JSON.stringify(patch));
       assert.doesNotMatch(document.body.textContent, /Ready to start|Ready to set up|Saved setup found/);
       assert.deepEqual(actions, []); assert.deepEqual(settings, []);
       await click("Check setup status");
@@ -357,7 +357,7 @@ test("contradictory reconnect replies do not mount a Continue or native startup 
 test("reconnect cannot borrow a background capability or leak raw private server details", async () => {
   await mounted(async ({ document, actions, settings, button }) => {
     assert.equal(button("Continue setup").disabled, false);
-    assert.equal(button("Run in background"), undefined);
+    assert.equal(button("Run in background") === undefined, true);
     assert.doesNotMatch(document.body.textContent, /DO-NOT-DISPLAY|\/private\/synthetic|Claims a native grant/);
     assert.deepEqual(actions, []); assert.deepEqual(settings, []);
   }, { responses: [reconnect(receiptFor(), guide(), { detail: "/private/synthetic/DO-NOT-DISPLAY.json",
@@ -367,7 +367,7 @@ test("reconnect cannot borrow a background capability or leak raw private server
 test("failed or foreign reads need an explicit fresh observation before reconnect is offered", async () => {
   for (const first of [new Error("Synthetic observation failed"), reconnect(receiptFor(), guide(), { guide_id: "foreign-guide" })]) {
     await mounted(async ({ calls, actions, settings, button, click }) => {
-      assert.equal(button("Continue setup"), undefined);
+      assert.equal(button("Continue setup") === undefined, true);
       assert.deepEqual(actions, []); assert.deepEqual(settings, []);
       await click("Check setup status");
       assert.equal(calls.length, 2); assert.equal(button("Continue setup").disabled, false);

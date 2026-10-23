@@ -177,7 +177,7 @@ for(const [status,narrow,mode] of [['failed',false,'answer'],['interrupted',true
       button.focus();
       await act(async()=>button.click());
       await flushReviewFrames(frames);
-      assert.equal(document.activeElement,editor,'The actual connected composer receives focus');
+      assert.equal(document.activeElement === editor, true,'The actual connected composer receives focus');
       assert.ok(focuses.includes(editor));
       assert.equal(editor.value,input.draft,'Saved request prose never replaces newer writing');
       assert.deepEqual(storageSnapshot(storage),before,'Text, choices, context, mode, combination and journals stay exact');
@@ -387,7 +387,7 @@ test('the current-question shortcut disappears in view and returns on history na
       scroll.scrollTop=860;
       scroll.dispatchEvent(new document.defaultView.Event('scroll',{bubbles:true}));
     });
-    assert.equal(document.querySelector('.setup-question-return'),null,'The visible heading and first choice do not need duplicate navigation');
+    assert.equal(document.querySelector('.setup-question-return') === null,true,'The visible heading and first choice do not need duplicate navigation');
     await act(async()=>{
       scroll.scrollTop=0;
       scroll.dispatchEvent(new document.defaultView.Event('scroll',{bubbles:true}));
@@ -454,7 +454,7 @@ test('busy following keeps current native activity visible above long saved setu
       document.querySelector('#setup-deployment'),'The actual saved Try/Build/Run panels remain below the conversation');
     assert.match(native.textContent,/Using tools/);
     assert.equal(scroll.scrollTop,416);
-    assert.equal(follow(),null,'Following the live transcript needs no redundant navigation');
+    assert.equal(follow() === null,true,'Following the live transcript needs no redundant navigation');
     assert.ok(movements.some(move=>move.behavior==='smooth' && move.top===416),'The initial busy reveal follows native activity');
     const advance=async(tail)=>{
       nativeTail=tail;
@@ -488,7 +488,7 @@ test('busy following keeps current native activity visible above long saved setu
     await advance(2100);
     await act(async()=>{while(navigationFrames.length)navigationFrames.shift()();await settle();});
     assert.equal(scroll.scrollTop,1616,'Explicit following survives asynchronous scroll events and follows the newly grown native tail');
-    assert.equal(follow(),null,'Following resumes without creating a false new-activity notice');
+    assert.equal(follow() === null,true,'Following resumes without creating a false new-activity notice');
     assert.ok(movements.some(move=>move.behavior==='instant' && move.top===1216),
       'The explicit return has no intermediate smooth-scroll positions');
     await act(async()=>{
@@ -588,12 +588,12 @@ test('an initial design question leads while optional build readiness stays in t
       const disclosure = document.querySelector('.setup-proposal-actions');
       if (!build) {
         assert.equal(disclosure.open, false);
-        assert.equal(progress.closest('details'), disclosure);
+        assert.equal(progress.closest('details') === disclosure, true);
         assert.equal(question.querySelector('h1')?.textContent, state.question.title);
         assert.equal(document.querySelector('.setup-chat-top small')?.textContent, 'One decision at a time');
         assert.deepEqual([...document.querySelectorAll('.setup-stage-shortcuts a')].map(link => link.textContent), ['Try, build and run']);
       } else {
-        assert.equal(progress.closest('details'), null, 'Actual owned work remains prominent');
+        assert.equal(progress.closest('details') === null, true, 'Actual owned work remains prominent');
         assert.match(progress.textContent, /being built and checked/);
         assert.equal(question.querySelector('h2')?.textContent, state.question.title);
         assert.ok(progress.compareDocumentPosition(question) & document.defaultView.Node.DOCUMENT_POSITION_FOLLOWING);
@@ -613,7 +613,7 @@ test('a saved design refinement without a question keeps an unstarted build opti
   await mountedGuide({ value: storage }, async (document, calls) => {
     const disclosure = document.querySelector('.setup-proposal-actions');
     assert.equal(disclosure.open, false);
-    assert.equal(document.querySelector('.setup-progress-card').closest('details'), disclosure);
+    assert.equal(document.querySelector('.setup-progress-card').closest('details') === disclosure, true);
     assert.equal(document.querySelector('#setup-message').value, input.draft);
     assert.equal(calls.some(call => call.method === 'POST'), false);
   }, packageReads(state, null));
@@ -700,8 +700,8 @@ test('a late compiled ZIP never downloads after the displayed guide, version, pl
       await act(async () => { finishBlob(new Blob(['late offline package'])); await settle(); });
       await waitPackage(() => teamDownload(document)?.disabled===false);
       assert.deepEqual(downloads, []);
-      assert.equal(document.querySelector('.setup-team-package [role="status"]'), null);
-      assert.equal(document.querySelector('.setup-error'),null,'the outgoing ZIP cannot report an error on the selected setup');
+      assert.equal(document.querySelector('.setup-team-package [role="status"]') === null, true);
+      assert.equal(document.querySelector('.setup-error') === null,true,'the outgoing ZIP cannot report an error on the selected setup');
       assert.equal(storage.getItem(GUIDE_KEY),next.id);
       assert.equal(document.querySelector('#setup-message').value,retained.draft);
       assert.deepEqual(JSON.parse(storage.getItem(retained.key)),retained);
@@ -733,14 +733,14 @@ test('a successful native package acknowledgment belongs only to its guide, vers
       [`/api/guide/${next.id}`]: () => structuredClone(switched ? next : state),
     });
     await mountedGuide({ value: packageStorage(state) }, async (document, calls) => {
-      assert.equal(document.querySelector('.setup-team-package [role="status"]'), null);
+      assert.equal(document.querySelector('.setup-team-package [role="status"]') === null, true);
       await act(async () => { teamDownload(document).click(); await settle(); });
       await waitPackage(() => downloads.length === 1 && document.querySelector('.setup-team-package [role="status"]'));
       await act(async () => { document.querySelector('.setup-history-control > button').click(); await settle(); });
       switched = true;
       const reload = [...document.querySelectorAll('.setup-history-menu button')].find(button => button.textContent.includes('Current setup'));
       await act(async () => { reload.click(); await settle(); });
-      assert.equal(document.querySelector('.setup-team-package [role="status"]'), null);
+      assert.equal(document.querySelector('.setup-team-package [role="status"]') === null, true);
       assert.equal(downloads.length, 1);
       assert.equal(calls.filter(call => call.method === 'POST').length, 2, 'Changing the displayed setup never automatically exports again');
     }, read, packageOptions(downloads));
@@ -838,8 +838,8 @@ test(`package ${route} delayed ${outcome} respects ${navigation} ownership`,asyn
     });
     await waitPackage(()=>composer()?.disabled===false);
     assert.deepEqual(downloads,[]);
-    assert.equal(document.querySelector('.setup-team-package [role="status"]'),null);
-    assert.equal(document.querySelector('.setup-file-modal'),null);
+    assert.equal(document.querySelector('.setup-team-package [role="status"]') === null,true);
+    assert.equal(document.querySelector('.setup-file-modal') === null,true);
     assert.doesNotMatch(document.body.textContent,/Outgoing package failed|The setup changed|Package download started/);
     assert.deepEqual(calls.filter(call=>call.method==='POST' || call.url.includes('/implementation/package')),captured,
       'late settlement never validates, fetches another package or resends a guide request');
@@ -854,7 +854,7 @@ test(`package ${route} delayed ${outcome} respects ${navigation} ownership`,asyn
       assert.equal(document.querySelector('.setup-guide-wait').dataset.requestId,second.operation.request_id);
       assert.match(document.querySelector('.setup-error').textContent,/Second saved request observation interrupted/);
     }else{
-      assert.equal(document.querySelector('.setup-error'),null);
+      assert.equal(document.querySelector('.setup-error') === null,true);
       assert.ok(packageAction(document,route) && !packageAction(document,route).disabled);
       await act(async()=>{packageAction(document,route).click();await settle();});
       await waitPackage(()=>route==='inspect'?!!document.querySelector('.setup-file-modal'):downloads.length===1);
@@ -901,8 +901,8 @@ for(const stage of [1,2,3,4,5,6,7])test(`native package fingerprint ${stage} can
     await act(async()=>{releaseDigest();await settle();});
     assert.deepEqual(calls.filter(call=>call.method==='POST'),before,'a digest cannot renew the captured navigation lifetime');
     assert.deepEqual(downloads,[]);
-    assert.equal(document.querySelector('.setup-error'),null);
-    assert.equal(document.querySelector('.setup-file-modal'),null);
+    assert.equal(document.querySelector('.setup-error') === null,true);
+    assert.equal(document.querySelector('.setup-file-modal') === null,true);
     if(stage%2!==0){
       pending=false;
       await act(async()=>{releaseSelection(structuredClone(second));await settle();});
@@ -938,7 +938,7 @@ test(`${route} package fetch ${failure?'refusal':'success'} does not start body 
     assert.equal(jsonReads,0);
     assert.equal(blobReads,0);
     assert.deepEqual(downloads,[]);
-    assert.equal(document.querySelector('.setup-error'),null);
+    assert.equal(document.querySelector('.setup-error') === null,true);
     await act(async()=>{releaseSelection(structuredClone(second));await settle();});
     await waitPackage(()=>document.querySelector('#setup-message').disabled===false);
     assert.equal(document.querySelector('#setup-message').value,inputs[1].draft);
@@ -968,7 +968,7 @@ test('a saved manual change selected during validation retains its own package b
     assert.equal(packageAction(document,'native').disabled,true);
     assert.equal(document.querySelector('#setup-send').disabled,true);
     assert.match(document.body.textContent,/Your adjustments.*Deployment settings/s);
-    assert.equal(document.querySelector('.setup-error'),null);
+    assert.equal(document.querySelector('.setup-error') === null,true);
     assert.equal(document.querySelector('#setup-message').value,inputs[0].draft);
     assert.deepEqual(JSON.parse(storage.getItem(manualKey(first.id))),manual);
     assert.deepEqual(JSON.parse(storage.getItem(inputs[0].key)),inputs[0]);
@@ -999,8 +999,8 @@ for(const changed of [
     await act(async()=>{release(new Blob(['previous checked source']));await settle();});
     await waitPackage(()=>document.querySelector('#setup-message').disabled===false);
     assert.deepEqual(downloads,[]);
-    assert.equal(document.querySelector('.setup-error'),null);
-    assert.equal(document.querySelector('.setup-manual-export .setup-download-success'),null);
+    assert.equal(document.querySelector('.setup-error') === null,true);
+    assert.equal(document.querySelector('.setup-manual-export .setup-download-success') === null,true);
     assert.equal(document.querySelector('#setup-message').value,inputs[0].draft);
     assert.deepEqual(JSON.parse(storage.getItem(inputs[0].key)),inputs[0]);
     assert.deepEqual(calls.filter(call=>call.url.includes('/implementation/package')).map(call=>call.url),[checkedPackageUrl(first)]);
@@ -1031,8 +1031,8 @@ test('checked package identity cannot change while its final fingerprint is pend
     await act(async()=>{release();await settle();});
     await waitPackage(()=>document.querySelector('#setup-message').disabled===false);
     assert.deepEqual(downloads,[]);
-    assert.equal(document.querySelector('.setup-error'),null);
-    assert.equal(document.querySelector('.setup-manual-export .setup-download-success'),null);
+    assert.equal(document.querySelector('.setup-error') === null,true);
+    assert.equal(document.querySelector('.setup-manual-export .setup-download-success') === null,true);
     assert.equal(document.querySelector('#setup-message').value,inputs[0].draft);
     assert.deepEqual(JSON.parse(storage.getItem(inputs[0].key)),inputs[0]);
     assert.deepEqual(calls.filter(call=>call.url.includes('/implementation/package')).map(call=>call.url),[checkedPackageUrl(first)]);
@@ -1059,7 +1059,7 @@ test(`retained selected export uses source-only fallback ${navigation?'without s
     const retainedClick=button[propsKey].onClick;
     build={...build,ready_to_package:false};
     await act(async()=>{for(const poll of polls.splice(0))await poll();await settle();});
-    assert.equal(packageAction(document,'checked'),undefined,
+    assert.equal(packageAction(document,'checked') === undefined, true,
       'this preserves an existing retained handler, not a newly visible legacy export control');
     await act(async()=>{retainedClick();await settle();});
     if(navigation){
@@ -1072,7 +1072,7 @@ test(`retained selected export uses source-only fallback ${navigation?'without s
       assert.equal(storage.getItem(GUIDE_KEY),second.id);
       assert.equal(document.querySelector('#setup-message').value,inputs[1].draft);
       assert.deepEqual(JSON.parse(storage.getItem(inputs[1].key)),inputs[1]);
-      assert.equal(document.querySelector('.setup-download-success'),null);
+      assert.equal(document.querySelector('.setup-download-success') === null,true);
     }else{
       await waitPackage(()=>downloads.length===1 && document.querySelector('#setup-message').disabled===false);
       assert.equal(downloads[0].name,'sample-team.zip');
@@ -1080,12 +1080,12 @@ test(`retained selected export uses source-only fallback ${navigation?'without s
       await act(async()=>{for(const poll of polls.splice(0))await poll();await settle();});
       await waitPackage(()=>!!document.querySelector('.setup-manual-export .setup-download-success'));
       assert.match(document.querySelector('.setup-manual-export .setup-download-success').textContent,/Package download started/);
-      assert.equal(document.querySelector('.setup-team-package [role="status"]'),null,
+      assert.equal(document.querySelector('.setup-team-package [role="status"]') === null,true,
         'the selected fallback must not acknowledge a native-scope export');
       assert.equal(document.querySelector('#setup-message').value,inputs[0].draft);
       assert.equal(storage.getItem(GUIDE_KEY),first.id);
     }
-    assert.equal(document.querySelector('.setup-error'),null);
+    assert.equal(document.querySelector('.setup-error') === null,true);
     assert.deepEqual(JSON.parse(storage.getItem(inputs[0].key)),inputs[0]);
     assert.deepEqual(calls.filter(call=>call.method==='POST'),['/api/blueprint/validate','/api/blueprint/package']
       .map(url=>({url,method:'POST',body:first.blueprint})));
@@ -1118,7 +1118,7 @@ for(const route of ['native','inspect','checked'])test(`current ${route} package
     assert.deepEqual(calls.filter(call=>call.method==='POST' || call.url.includes('/implementation/package')),admitted);
     await act(async()=>{packageAction(document,route).click();await settle();});
     await waitPackage(()=>route==='inspect'?!!document.querySelector('.setup-file-modal'):downloads.length===1);
-    assert.equal(document.querySelector('.setup-error'),null);
+    assert.equal(document.querySelector('.setup-error') === null,true);
     assert.equal(document.querySelector('#setup-message').value,inputs[0].draft);
     assert.equal(calls.filter(call=>call.method==='POST').length,route==='checked'?0:route==='inspect'?2:3);
     if(route==='checked')assert.equal(calls.filter(call=>call.url===checkedPackageUrl(first)).length,2);
@@ -1180,7 +1180,7 @@ test('a decision-blocked, questioned or running refinement cannot offer acceptan
   ]) {
     const state = { ...structuredClone(readyRefinement), ...changed };
     await mountedGuide({ value: packageStorage(state) }, async (document, calls) => {
-      assert.equal(usePlan(document), undefined);
+      assert.equal(usePlan(document) === undefined, true);
       assert.deepEqual(calls.filter(call => call.method === 'POST'), []);
     }, packageReads(state));
   }
@@ -1209,7 +1209,7 @@ test('a retained ready-refinement click cannot accept after the saved version be
     switched = true;
     const reload = [...document.querySelectorAll('.setup-history-menu button')].find(item => item.textContent.includes('Current refinement'));
     await act(async () => { reload.click(); await settle(); });
-    assert.equal(usePlan(document), undefined);
+    assert.equal(usePlan(document) === undefined, true);
     await act(async () => { retainedClick(); await settle(); });
     assert.deepEqual(calls.filter(call => call.method === 'POST'), []);
   }, packageReads(state, null, {

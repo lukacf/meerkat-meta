@@ -242,7 +242,7 @@ async function mounted({ saved = storage(), initialBuild = build, initialState =
 test("reloading a completed successor shows its result without automatically dispatching another replay", async () => {
   await mounted({ initialReceipt: completedReplay(), onPost() { assert.fail("Reload must not start another trial"); } }, async (ui) => {
     assert.match(ui.dom.window.document.body.textContent, /Saved job replay finished/);
-    assert.equal(ui.button("Try the same job again"), undefined);
+    assert.equal(ui.button("Try the same job again") === undefined, true);
     assert.equal(ui.button("Run the saved job again").className, "implementation-link");
     assert.equal(ui.button("Run the saved job again").disabled, false);
     assert.equal(ui.calls.length, 0);
@@ -330,12 +330,12 @@ test("a source change hides the offered action and another guide cannot recover 
   const saved = storage(); createTrialReplayStore(saved).begin(offer(), actionId);
   await mounted({ saved, initialState: { id: oldTrial, version: 9 }, initialBuild: null,
     onPost() { assert.fail("Another guide cannot replay this action"); } }, async (ui) => {
-    assert.equal(ui.button("Try the same job again"), undefined);
-    assert.equal(ui.button("Recover saved retry"), undefined); assert.equal(ui.calls.length, 0);
+    assert.equal(ui.button("Try the same job again") === undefined, true);
+    assert.equal(ui.button("Recover saved retry") === undefined, true); assert.equal(ui.calls.length, 0);
   });
   await mounted({ initialBuild: { ...build, source_digest: "f".repeat(64) },
     onPost() { assert.fail("Edited unchecked source cannot be offered"); } }, async (ui) => {
-    assert.equal(ui.button("Try the same job again"), undefined); assert.equal(ui.calls.length, 0);
+    assert.equal(ui.button("Try the same job again") === undefined, true); assert.equal(ui.calls.length, 0);
   });
 });
 
@@ -388,8 +388,8 @@ test("the mounted replay cannot offer manual continuation, can End, and keeps or
   } }, async (ui) => {
     uiRef = ui;
     await ui.click("Try the same job again");
-    assert.equal(ui.button("Continue this trial"), undefined);
-    assert.equal(ui.dom.window.document.querySelector('textarea[id^="trial-follow-up-"]'), null);
+    assert.equal(ui.button("Continue this trial") === undefined, true);
+    assert.equal(ui.dom.window.document.querySelector('textarea[id^="trial-follow-up-"]') === null, true);
     assert.match(ui.dom.window.document.body.textContent, /1 of 3 requests have settled/);
     assert.match(ui.dom.window.document.body.textContent, /next saved request is sent automatically/);
     assert.doesNotMatch(ui.dom.window.document.body.textContent, /Follow-up window/);

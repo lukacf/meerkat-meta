@@ -1692,6 +1692,26 @@ describe("parseErrorEvent", () => {
     );
   });
 
+  it("parses retired_member_release_failed naming the retired incarnation", () => {
+    const result = parseErrorEvent({
+      category: "retired_member_release_failed",
+      identity: "keeper",
+      agent_runtime_id: "rt:keeper:2",
+      session_id: "s-1",
+      cause: "retire",
+      error: "native host composition is unavailable",
+    });
+    assert.equal(result.category, "retired_member_release_failed");
+    assert.equal(
+      result.message,
+      "keeper (rt:keeper:2) was retired (retire), and the host's " +
+        "release failed: native host composition is unavailable",
+    );
+    assert.equal(result.context.cause, "retire");
+    assert.equal(result.context.session_id, "s-1");
+    assert.equal(isResolutionErrorEvent(result), false);
+  });
+
   it("only actor_loop_recovered is a resolution", () => {
     for (const category of Object.values(ErrorCategory)) {
       assert.equal(
@@ -1719,6 +1739,7 @@ describe("parseErrorEvent", () => {
       EVENT_LOG_FLUSH_FAILURE: "event_log_flush_failure",
       IDENTITY_MATERIALIZATION_FAILURE: "identity_materialization_failure",
       MOB_STOP_PROCEEDED_WITHOUT_INTERRUPT: "mob_stop_proceeded_without_interrupt",
+      RETIRED_MEMBER_RELEASE_FAILED: "retired_member_release_failed",
     });
   });
 });

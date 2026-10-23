@@ -188,7 +188,7 @@ focused('paused archive integration: native private wait keeps neutral copy and 
       f.emit({ type: 'event', event: { ...(service ? { target: copy(f.serviceTarget) } : { scope: f.host.scope }), kind: 'unavailable' } }); await flush();
       assert.equal(f.port.available, false);
       assert.equal(f.port.snapshot.state, null);
-      assert.equal(innerStatus(f), null);
+      assert.equal(innerStatus(f) === null, true);
       assert.equal(f.requests.filter(call => call.method === 'POST').length, initialPosts, 'Passive status, completion and retirement must not send, cancel, answer or initialize again');
       assert.equal(f.requests.some(call => ['/send', '/cancel', '/answer'].includes(call.path)), false);
     } finally { view.dispose(); f.dom.window.close(); }

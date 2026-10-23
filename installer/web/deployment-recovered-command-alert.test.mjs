@@ -299,7 +299,7 @@ test("recovered exact Start retires only its transient alert after successful se
       loseStartResponse, restoreStatusReads, actionReadback, failOptions, revise }) => {
       const alert = () => document.querySelector(".deployment-panel > .deployment-error");
       const installReads = () => calls.filter(call => call.target === installUrl && call.method === "GET").length;
-      assert.equal(button("Install on this computer"), undefined);
+      assert.equal(button("Install on this computer") === undefined, true);
       assert.equal(calls.some(call => call.target.includes("/options?")), false);
       assert.equal(button("Start installed application").disabled, false);
       loseStartResponse();
@@ -329,7 +329,7 @@ test("recovered exact Start retires only its transient alert after successful se
         : { ...healthyApplication, execution_mode: "background" });
       await act(async () => button("Check installation status").click());
       assert.equal(installReads(), readCount + 1, "Settlement must be paired with a new receipt read.");
-      assert.equal(button("Check installation status"), undefined);
+      assert.equal(button("Check installation status") === undefined, true);
       assert.equal(calls.filter(call => call.method === "POST").length, 1, "Observation never replays Start.");
       if (scenario === "returned") {
         assert.equal(document.querySelector(".deployment-panel").dataset.deploymentStatus, "running");

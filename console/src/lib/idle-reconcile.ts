@@ -19,8 +19,10 @@ export function agentReportsIdle(agent: Pick<ConsoleAgent, "response_phase" | "p
 /// milliseconds apart; the regular poll runs every 15 s.
 export const IDLE_SETTLE_MIN_GAP_MS = 10_000;
 
-/// The clock the settlement reads; tests replace `now`.
-export const idleSettleClock = { now: (): number => Date.now() };
+/// The clock the settlement reads: the page's monotonic clock, so setting
+/// the computer's clock neither settles a member early nor holds a settled
+/// one open. Tests replace `now`.
+export const idleSettleClock = { now: (): number => performance.now() };
 
 /// What one status poll does to one identity's fold:
 /// - "reset": the poll does not count toward settling (the server reports

@@ -3843,6 +3843,18 @@ pub trait SessionBridge: Send + Sync {
         None
     }
 
+    /// The exact Core registration occupying `session_id` now
+    /// (`MeerkatMachine::current_session_registration_witness`), or `None`
+    /// when the session holds none or this bridge cannot observe it. Core
+    /// hands out only a current registration, so a caller that needs an
+    /// incarnation's registration reads it before that incarnation ends.
+    async fn member_registration(
+        &self,
+        _session_id: &meerkat_core::types::SessionId,
+    ) -> Option<meerkat_runtime::RuntimeSessionRegistrationWitness> {
+        None
+    }
+
     /// Spawn a new mob member for a freshly-created identity.
     ///
     /// The caller names no runtime id and no session: MobMachine mints both,
@@ -7200,6 +7212,18 @@ impl SessionBridge for MobSessionBridge {
         member_durability_from_machine(machine.durability_reload_required(session_id).await)
     }
 
+    async fn member_registration(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Option<meerkat_runtime::RuntimeSessionRegistrationWitness> {
+        let machine = crate::mob_handle_runtime::observed_runtime_adapter(
+            self.session_service.as_ref()?.as_ref(),
+        )?;
+        machine
+            .current_session_registration_witness(session_id)
+            .await
+    }
+
     async fn raw_member_alias_exists(&self, alias: &str) -> Result<bool, BridgeError> {
         let members = self.handle.list_members_including_retiring().await;
         let authoritative_members = self.runtime_members.read().await;
@@ -8928,6 +8952,13 @@ impl SessionBridge for super::PublicSessionBridge {
         session_id: &meerkat_core::types::SessionId,
     ) -> Option<super::types::MemberDurability> {
         self.bridge.member_durability(session_id).await
+    }
+
+    async fn member_registration(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Option<meerkat_runtime::RuntimeSessionRegistrationWitness> {
+        self.bridge.member_registration(session_id).await
     }
 
     async fn create_session(

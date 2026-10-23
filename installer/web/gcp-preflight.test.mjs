@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import React, { act } from "react";
 import { createHash, webcrypto } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createGcpPreflightGate, gcpPreflightAvailable, gcpPreflightScope, gcpPreflightUrl, gcpBindingMatches,
   gcpOptionsValid, gcpProjectsValid, gcpCheckValid, gcpCheckFresh, GCP_PREFLIGHT_FRESH_MS,
   gcpProjectFeedbackCurrent, gcpProjectBlueprint, gcpProjectBlueprintMatches } from "./gcp-preflight.mjs";
@@ -120,7 +121,8 @@ async function mounted(verify, integrated = false) {
     localStorage: dom.window.localStorage,
     crypto: { randomUUID: () => "33333333-3333-4333-8333-333333333333", subtle: { digest: (...args) => digestHandler(...args) } },
     setTimeout(callback, delay, ...args) {
-      if (delay < 100000 && delay !== 1500 && delay !== 2000) return originalSetTimeout(callback, delay, ...args);
+      // Held: the polls, the ordinary 30 s read deadline and every timer of 100 s or more.
+      if (delay < 100000 && delay !== 1500 && delay !== 2000 && delay !== 30000) return originalSetTimeout(callback, delay, ...args);
       const token = { cloudFreshness: ++nextTimer }; timers.set(token, { callback: () => callback(...args), delay }); return token;
     },
     clearTimeout(token) { if (!timers.delete(token)) originalClearTimeout(token); },
@@ -214,8 +216,8 @@ test("unknown destination checks show useful blockers without a plan or download
       checks: [{ ...check, status: "unknown", detail: "Billing could not be observed.", action: "Ask the project owner to check billing." }] }));
     await chooseDestination(ui); await ui.click("Check destination");
     assert.match(ui.document.body.textContent, /Billing could not be observed/); assert.match(ui.document.body.textContent, /Not verified/);
-    assert.match(ui.document.body.textContent, /Ask the project owner/); assert.equal(ui.document.querySelector(".gcp-preflight-plan"), null);
-    assert.equal(ui.button("Download accepted GCP package"), undefined); assert.equal(ui.document.querySelector('[role="alert"]'), null);
+    assert.match(ui.document.body.textContent, /Ask the project owner/); assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true);
+    assert.equal(ui.button("Download accepted GCP package") === undefined, true); assert.equal(ui.document.querySelector('[role="alert"]') === null, true);
   });
 });
 
@@ -226,11 +228,58 @@ test("a CLI missing at Launch startup keeps the required restart step visible af
         action: "Install Google Cloud CLI on this computer and sign in, then restart Launch and reopen this saved setup before checking cloud access again." }] }));
     await ui.click("Check cloud access"); assert.match(ui.document.body.textContent, /Install Google Cloud CLI/);
     assert.match(ui.document.body.textContent, /restart Launch and reopen this saved setup/);
-    assert.equal(ui.button("First account"), undefined);
+    assert.equal(ui.button("First account") === undefined, true);
     await ui.click("Check cloud access again");
-    assert.equal(ui.button("First account"), undefined);
+    assert.equal(ui.button("First account") === undefined, true);
     assert.match(ui.document.body.textContent, /restart Launch and reopen this saved setup/);
     assert.equal(ui.calls.filter((call) => call.target.includes("gcp-preflight/options")).length, 2);
+  });
+});
+
+// The server bounds one whole cloud access observation at PROBE_TIMEOUT. It
+// reads and checks the accepted package before and after the signed-in account
+// reads, refuses another probe until this one ends, and past the bound answers
+// with its own refusal. The page's read must stay open beyond it, yet stay bounded.
+function serverCloudProbeMs() {
+  const source = readFileSync(new URL("../launchkit/gcp_preflight.py", import.meta.url), "utf8");
+  return 1000 * Number(source.match(/^PROBE_TIMEOUT = (\d+)$/m)?.[1]);
+}
+
+test("a slow cloud access check keeps its read open past the ordinary 30 s deadline until the server's bounded probe answers", async () => {
+  const bound = serverCloudProbeMs();
+  assert.equal(Number.isFinite(bound) && bound > 30000, true, `The server's cloud probe bound reads as ${bound} ms.`);
+  await mounted(async (ui) => {
+    let answer; ui.setHandler("options", () => new Promise((done) => { answer = done; }));
+    ui.pendingClick("Check cloud access");
+    try {
+      const deadlines = [...ui.timers.values()].map(({ delay }) => delay);
+      assert.equal(deadlines.length, 1, "The cloud access read holds one deadline.");
+      assert.equal(deadlines[0] > bound, true, `The cloud access read deadline (${deadlines[0]} ms) outlasts the server's ${bound} ms probe bound.`);
+      // The server's bound passes: every held deadline at or under it fires.
+      await act(async () => { for (const [token, timer] of [...ui.timers]) if (timer.delay <= bound) { ui.timers.delete(token); timer.callback(); } });
+      assert.equal(ui.document.querySelector('[role="alert"]') === null, true, "No read timeout is shown while the server's probe can still answer.");
+      assert.equal(ui.button("Checking cloud access...") !== undefined, true, "The cloud access check is still waiting.");
+    } finally { await act(async () => answer(options())); }
+    assert.equal(ui.button("First account") !== undefined, true, "The late answer shows its accounts.");
+    assert.equal(ui.document.querySelector('[role="alert"]') === null, true);
+    assert.equal(ui.timers.size, 0, "The answered read leaves no deadline behind.");
+  });
+});
+
+test("a cloud access read the server never answers still ends at its explicit deadline and can be checked again", async () => {
+  await mounted(async (ui) => {
+    let reads = 0; ui.setHandler("options", () => ++reads === 1 ? new Promise(() => {}) : options());
+    ui.pendingClick("Check cloud access");
+    const held = [...ui.timers];
+    try {
+      assert.equal(held.length, 1, "The cloud access read holds one deadline.");
+      assert.equal(Number.isFinite(held[0][1].delay), true);
+    } finally { await act(async () => { for (const [token, timer] of held) { ui.timers.delete(token); timer.callback(); } }); }
+    assert.match(ui.document.querySelector('[role="alert"]')?.textContent ?? "", /taking too long to respond/);
+    assert.equal(ui.button("Check cloud access")?.disabled, false, "The cloud access check can run again.");
+    await ui.click("Check cloud access");
+    assert.equal(reads, 2); assert.equal(ui.button("First account") !== undefined, true);
+    assert.equal(ui.document.querySelector('[role="alert"]') === null, true, "The new read clears the timeout message.");
   });
 });
 
@@ -254,9 +303,9 @@ test("changing project clears ready output synchronously and A-B-A cannot revive
     await chooseDestination(ui); ui.pendingClick("Check destination");
     await ui.click("Another project"); await ui.click("Observatory");
     await act(async () => resolve(result()));
-    assert.equal(ui.document.querySelector(".gcp-preflight-result"), null); assert.ok(ui.button("Check destination"));
+    assert.equal(ui.document.querySelector(".gcp-preflight-result") === null, true); assert.ok(ui.button("Check destination"));
     ui.setHandler("check", (body) => result(body.account, body.project)); await ui.click("Check destination"); assert.ok(ui.document.querySelector(".gcp-preflight-plan"));
-    ui.pendingClick("Another project"); assert.equal(ui.document.querySelector(".gcp-preflight-plan"), null);
+    ui.pendingClick("Another project"); assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true);
   });
 });
 
@@ -265,7 +314,7 @@ test("changing account twice rejects the first account's late project response",
     let resolve, reads = 0; ui.setHandler("projects", (body) => ++reads === 1 ? new Promise((done) => { resolve = done; }) : { ...projects(body.account), projects: [] });
     await ui.click("Check cloud access"); ui.pendingClick("First account"); await ui.click("Second account"); await ui.click("First account");
     await act(async () => resolve(projects()));
-    assert.equal(ui.button("Observatory"), undefined); assert.ok(ui.button("Use the proposed project"));
+    assert.equal(ui.button("Observatory") === undefined, true); assert.ok(ui.button("Use the proposed project"));
   });
 });
 
@@ -276,7 +325,7 @@ test("source or guide changes invalidate delayed cloud observations even after r
       let resolve; ui.setHandler("check", () => new Promise((done) => { resolve = done; }));
       await chooseDestination(ui); ui.pendingClick("Check destination"); await ui.change(nextState, nextBuild, blocked); await ui.change();
       await act(async () => resolve(result()));
-      assert.equal(ui.document.querySelector(".gcp-preflight-result"), null); assert.ok(ui.button("Check cloud access"));
+      assert.equal(ui.document.querySelector(".gcp-preflight-result") === null, true); assert.ok(ui.button("Check cloud access"));
     });
   }
 });
@@ -286,7 +335,7 @@ test("a delayed failed read cannot replace the current account choice with an er
     let reject; ui.setHandler("projects", (body) => body.account === accounts[0].id ? new Promise((_, fail) => { reject = fail; }) : projects(body.account));
     await ui.click("Check cloud access"); ui.pendingClick("First account"); await ui.click("Second account");
     await act(async () => reject(new Error("Old account request failed.")));
-    assert.equal(ui.document.querySelector('[role="alert"]'), null); assert.ok(ui.button("Observatory"));
+    assert.equal(ui.document.querySelector('[role="alert"]') === null, true); assert.ok(ui.button("Observatory"));
   });
 });
 
@@ -295,7 +344,7 @@ test("a response for another accepted package is rejected and no plan is shown",
     ui.setHandler("check", () => ({ ...result(), binding: { ...binding, package_sha256: "d".repeat(64) } }));
     await chooseDestination(ui); await ui.click("Check destination");
     assert.match(ui.document.querySelector('[role="alert"]').textContent, /do not match this accepted package/);
-    assert.equal(ui.document.querySelector(".gcp-preflight-plan"), null);
+    assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true);
   });
 });
 
@@ -306,9 +355,9 @@ test("expiry removes readiness while keeping the observed checks and their captu
     const [token, timer] = ui.timers.entries().next().value; ui.timers.delete(token);
     const originalNow = Date.now;
     try { Date.now = () => checkedAt + GCP_PREFLIGHT_FRESH_MS; await act(async () => timer.callback());
-      assert.equal(ui.document.querySelector(".gcp-preflight-plan"), null); assert.match(ui.document.body.textContent, /These checks need a refresh/);
+      assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true); assert.match(ui.document.body.textContent, /These checks need a refresh/);
       assert.match(ui.document.body.textContent, /Synthetic verified access/); assert.match(ui.document.body.textContent, /Checked/);
-      assert.equal(ui.button("Download accepted GCP package"), undefined);
+      assert.equal(ui.button("Download accepted GCP package") === undefined, true);
     } finally { Date.now = originalNow; }
   });
 });
@@ -319,10 +368,10 @@ test("the production deployment panel makes guided cloud setup primary and keeps
     assert.ok(manual); assert.equal(manual.open, false);
     assert.match(manual.querySelector("summary").textContent, /Manual Google Cloud.*advanced/);
     assert.ok(ui.button("Check cloud access"));
-    assert.equal(ui.document.querySelector(".gcp-preflight-next"), null);
+    assert.equal(ui.document.querySelector(".gcp-preflight-next") === null, true);
     await chooseDestination(ui); await ui.click("Check destination");
     const next = ui.document.querySelector(".gcp-preflight-next button");
-    assert.equal(next.textContent, "Create this cloud computer"); assert.equal(next.closest("details"), null); assert.equal(next.disabled, false);
+    assert.equal(next.textContent, "Create this cloud computer"); assert.equal(next.closest("details") === null, true); assert.equal(next.disabled, false);
     assert.ok(ui.calls.some(call => call.target.endsWith("/check-guided")));
     assert.ok([...ui.document.querySelectorAll(".gcp-guided button")].every(node => !node.textContent.includes("Download accepted GCP package")));
     assert.equal([...manual.querySelectorAll("button")].filter(node => node.textContent.includes("Download accepted GCP package")).length, 1);
@@ -358,8 +407,8 @@ test("rapid duplicate clicks share each explicit cloud read without retrying it"
 test("editing a project ID discards an old ready result before another project is submitted", async () => {
   await mounted(async (ui) => {
     await chooseDestination(ui); await ui.click("Check destination"); assert.ok(ui.document.querySelector(".gcp-preflight-plan"));
-    await ui.enter("other-project"); assert.equal(ui.document.querySelector(".gcp-preflight-plan"), null);
-    assert.equal(ui.button("Download accepted GCP package"), undefined); assert.equal(ui.button("Check destination"), undefined);
+    await ui.enter("other-project"); assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true);
+    assert.equal(ui.button("Download accepted GCP package") === undefined, true); assert.equal(ui.button("Check destination") === undefined, true);
     assert.equal(ui.calls.length, 3); await ui.click("Choose this project"); assert.ok(ui.button("Check destination")); assert.equal(ui.calls.length, 3);
   });
 });
@@ -401,7 +450,7 @@ test("account and project reversals retire the standalone checked callback even 
       const selected = ui.downloads[0]; assert.ok(selected); assert.equal(selected.isCurrent(), true);
       await change(ui);
       assert.equal(selected.isCurrent(), false); assert.deepEqual(selected.binding, binding);
-      assert.equal(ui.savedPackages.length, 0); assert.equal(ui.document.querySelector(".gcp-preflight-plan"), null);
+      assert.equal(ui.savedPackages.length, 0); assert.equal(ui.document.querySelector(".gcp-preflight-plan") === null, true);
     });
   }
 });

@@ -14613,6 +14613,38 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// On the identity-first path the identity view does not exist yet here;
     /// bind it in [`Self::bind_identity_runtime`].
     async fn bind_runtime(&self, runtime: &mut UnifiedRuntime) -> Result<(), GatewayHostError>;
+    /// Compose the agent customizer the gateway installs. Called once, on the
+    /// identity-first path only, after `bind_runtime` and before the identity
+    /// context is installed (so before [`Self::bind_identity_runtime`]), with
+    /// the customizer the gateway composed: the SDK's customizer callback when
+    /// the init registers one, wrapped by agent memory when that is
+    /// configured, or `None` when neither is. The answer is the one
+    /// customizer, the same `Arc`, that the identity runtime (members built
+    /// outside the roster bootstrap, such as a reset's fresh life), the
+    /// identity-first context (the roster bootstrap and reconcile) and the
+    /// RPC context hold, so it runs for every build the composed customizer
+    /// would have run for. The default returns the given customizer unchanged.
+    ///
+    /// A wrapper must delegate `after_create` as well as `customize_build`:
+    /// [`AgentCustomizer::after_create`](crate::identity_first::AgentCustomizer::after_create)
+    /// has a no-op default, so a wrapper that overrides only `customize_build`
+    /// still compiles and silently drops the wrapped `after_create`: the SDK's
+    /// `after_create` callback, and agent memory's when that is configured.
+    ///
+    /// - `Some` -> `Ok(Some)`: the returned customizer is installed; it may
+    ///   wrap the given one.
+    /// - `None` -> `Ok(None)`: no customizer, as without this hook.
+    /// - `Some` -> `Ok(None)`, `None` -> `Ok(Some)`, or any `Err`: init is
+    ///   refused before the identity bootstrap. Whether a customizer runs is
+    ///   settled before this call, because the registry that carries
+    ///   `customize_build` tools across member rebuilds follows it, so a host
+    ///   can neither add a customizer nor drop the composed one.
+    fn compose_agent_customizer(
+        &self,
+        customizer: Option<Arc<dyn crate::identity_first::AgentCustomizer>>,
+    ) -> Result<Option<Arc<dyn crate::identity_first::AgentCustomizer>>, GatewayHostError> {
+        Ok(customizer)
+    }
     /// Bind the same native owners to the installed identity runtime. Called
     /// once, on the identity-first path only, after `bind_runtime`: the
     /// identity context is installed, so `runtime.identity_runtime()` is the
@@ -14666,6 +14698,54 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     ) -> Result<(), GatewayHostError> {
         let _ = (members, completion);
         Err(GatewayHostError::Unavailable)
+    }
+    /// One incarnation of a durable identity's member was retired: Core's
+    /// retire returned, and the incarnation's runtime and session
+    /// registration were released. `retired` names that incarnation (its
+    /// member id, role, runtime id, generation and session, read from Core
+    /// before the retire) and why it was retired. Its `registration` is the
+    /// exact Core registration the incarnation held, the one a host's
+    /// registration hook was given for its build
+    /// (`MemberRuntimeBuildIdentity::registration`): a host that bound what
+    /// it decided there to that registration releases exactly that. It is
+    /// never a successor's, even when a still listed identity returns on the
+    /// same session before this call; `None` names no registration. Compare
+    /// registrations with `==` only, never by their session id or epoch: a
+    /// successor on the same session can carry the same session id and
+    /// epoch, and only `==` tells the two apart.
+    ///
+    /// What ended depends on [`crate::identity_first::RetiredIdentityCause`]:
+    /// every cause ends that one incarnation, so state the host keeps for it
+    /// alone may go. Only `Unlisted` ends the identity's place in the roster,
+    /// so only then may state the host keeps for the identity itself go.
+    /// After `Retire` or `Scoped` the identity stays registered and dormant,
+    /// and while the roster lists it the next roster pass, boot or wake
+    /// resumes it at the next generation on the same session.
+    ///
+    /// Called once per retired incarnation, after the retire, with no Meta
+    /// lock held (no identity lifecycle lock, no bootstrap controller), so it
+    /// may call back into the runtime. The gateway installs it right after
+    /// [`Self::bind_identity_runtime`], so the identity bootstrap's own
+    /// retirements of members the roster no longer lists reach it too (from
+    /// the init task); later ones run in the retiring operation's tracked
+    /// task, which a shutdown joins. Never called for a reload, a reprofile,
+    /// a compaction rebuild, a respawn, a reset or delete successor, a held
+    /// or refused spawn, or a shutdown or restart. The retirement stands
+    /// whatever this returns: an `Err` is reported to the error hook as
+    /// `retired_member_release_failed` and is not retried. The default does
+    /// nothing.
+    ///
+    /// Fail closed: because the gateway installs it for every host, each
+    /// retire this can announce first reads the retiring incarnation from
+    /// Core's member history, under the identity's lifecycle lock and before
+    /// Core is asked. If that read fails, that retire is refused rather than
+    /// retiring an incarnation the host would not hear of.
+    async fn identity_member_retired(
+        &self,
+        retired: &crate::identity_first::RetiredIdentityMember,
+    ) -> Result<(), GatewayHostError> {
+        let _ = retired;
+        Ok(())
     }
     /// Publish the exact SDK Ready response and start its HTTP surface while
     /// serialized against the native owner's actual close transition. The
@@ -14921,6 +15001,49 @@ async fn select_prepared_application(
         (Some(_), Ok(Some(prepared))) => Ok(Some(prepared)),
         (Some(_), Ok(None)) => Err(
             "the native host composition did not authenticate the prepared_application".to_string(),
+        ),
+    }
+}
+
+/// The identity runtime's retirement hook for a host-composed gateway: each
+/// retired incarnation goes to the host's
+/// [`GatewayHostComposition::identity_member_retired`].
+fn host_retired_member_observer(
+    host: Arc<dyn GatewayHostComposition>,
+) -> crate::identity_first::runtime::RetiredMemberObserver {
+    Arc::new(move |retired| {
+        let host = Arc::clone(&host);
+        Box::pin(async move {
+            host.identity_member_retired(&retired)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    })
+}
+
+/// The agent customizer the gateway installs: the one it composed, as its host
+/// composes it ([`GatewayHostComposition::compose_agent_customizer`]). Without
+/// a host it is the composed one unchanged. A host answer that adds or drops a
+/// customizer is refused, as a host error is.
+fn host_composed_agent_customizer(
+    host: Option<&Arc<dyn GatewayHostComposition>>,
+    composed: Option<Arc<dyn crate::identity_first::AgentCustomizer>>,
+) -> Result<Option<Arc<dyn crate::identity_first::AgentCustomizer>>, String> {
+    let Some(host) = host else {
+        return Ok(composed);
+    };
+    let had_customizer = composed.is_some();
+    match host.compose_agent_customizer(composed) {
+        Err(error) => Err(error.to_string()),
+        Ok(customizer) if customizer.is_some() == had_customizer => Ok(customizer),
+        Ok(Some(_)) => Err(
+            "the native host composition added an agent customizer where the gateway composed \
+             none; refusing it"
+                .to_string(),
+        ),
+        Ok(None) => Err(
+            "the native host composition dropped the gateway's agent customizer; refusing it"
+                .to_string(),
         ),
     }
 }
@@ -17962,6 +18085,11 @@ external_addressable = true
             } else {
                 base_customizer
             };
+        // The host composes the final customizer here, once. The same `Arc`
+        // is the identity runtime's, the identity context's and the RPC
+        // context's below.
+        let customizer = host_composed_agent_customizer(host, customizer)
+            .map_err(|error| fail_init(&request_id, -32603, error))?;
         let agent_memory_injector = if let (Some(agent_memory), Some(provider)) = (
             gateway_options.agent_memory.as_ref(),
             agent_memory_provider.clone(),
@@ -18048,6 +18176,9 @@ external_addressable = true
             host.bind_identity_runtime(runtime)
                 .await
                 .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?;
+            // Before the identity bootstrap, so a boot pass's retirements of
+            // members the roster no longer lists reach the host too.
+            irt.set_retired_member_observer(Some(host_retired_member_observer(Arc::clone(host))));
         }
         // A host that completes its application from the roster's finished
         // members holds their fresh creations until it has.

@@ -369,7 +369,7 @@ test("mounted unavailable check stays single-owner while pending and preserves s
     assert.equal(document.querySelector(".cc-conversation-transcript").textContent, history);
     assertPreserved();
     await release(2, { status: "ready", startup_retry_required: false, available: true });
-    assert.equal(document.querySelector(".setup-error"), null);
+    assert.equal(document.querySelector(".setup-error") === null, true);
     assert.equal(document.querySelector(".cc-conversation-transcript").textContent, history);
     assertPreserved();
   }, { heldChecks: true, savedMessages: [{ id: "saved-user", role: "user", text: "Retained original conversation" }] });
@@ -385,7 +385,7 @@ test("mounted old unavailable action and delayed result stay inert after switchi
     await invoke(check);
     assert.deepEqual(calls, before, "A callback from the disposed original guide cannot read status again.");
     await release(2, unavailable);
-    assert.equal(document.querySelector(".setup-error"), null, "A late old result cannot replace the returned guide's live observation.");
+    assert.equal(document.querySelector(".setup-error") === null, true, "A late old result cannot replace the returned guide's live observation.");
     assertPreserved();
   }, { heldChecks: true });
 });

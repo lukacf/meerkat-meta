@@ -639,12 +639,12 @@ test('the mounted guide retains saved choices beside a timed wait and editable d
     const strip=()=>document.querySelector('.setup-guide-wait');
     const question=()=>document.querySelector('.setup-current-question');
     const advance=async ms=>act(async()=>{t.mock.timers.tick(ms);await settle();});
-    assert.equal(strip(),null);
+    assert.equal(strip() === null,true);
     await act(async()=>document.querySelector('#setup-send').click());
     assert.equal(composer().value,'','only the admitted text is consumed');
     assert.equal(strip().dataset.requestId,pending.operation.request_id);
     assert.ok(strip().closest('.setup-composer-area'));
-    assert.equal(strip().closest('.setup-chat-scroll'),null,'the status remains outside transcript scrolling');
+    assert.equal(strip().closest('.setup-chat-scroll') === null,true,'the status remains outside transcript scrolling');
     assert.match(question().textContent,/SAVED QUESTION/);
     assert.match(question().textContent,/Your guide is responding\. Choices are paused/);
     assert.match(question().textContent,/Who should this help\?/);
@@ -693,7 +693,7 @@ test('the mounted guide retains saved choices beside a timed wait and editable d
         {id:'published-guide',role:'assistant',text:'Let us clarify the scale.',action:'answer',created_at:new Date(Date.now()).toISOString()}],
       operation:{...pending.operation,status:'completed'}};
     await advance(2500);
-    assert.equal(strip(),null);
+    assert.equal(strip() === null,true);
     assert.match(document.body.textContent,/How many people will use it/);
     assert.doesNotMatch(question().textContent,/SAVED QUESTION|Choices are paused|Workshop staff|Volunteer group/);
     assert.ok([...question().querySelectorAll('.setup-choice')].every(button=>!button.disabled));
@@ -747,7 +747,7 @@ test('mounted navigation hides the outgoing wait and rejects its late receipt an
     await act(async()=>{t.mock.timers.tick(2500);await settle();});
     await click('Your setups');
     await click('Second observatory');
-    assert.equal(strip(),null,'a pending selection does not display the old request as current');
+    assert.equal(strip() === null,true,'a pending selection does not display the old request as current');
     await act(async()=>{releaseSecond(structuredClone(second));await settle();});
     assert.equal(strip().dataset.guideId,second.id);
     assert.equal(strip().dataset.requestId,second.operation.request_id);
@@ -760,7 +760,7 @@ test('mounted navigation hides the outgoing wait and rejects its late receipt an
     returning=true;
     await click('Your setups');
     await click('First workshop');
-    assert.equal(strip(),null);
+    assert.equal(strip() === null,true);
     assert.equal(composer().value,firstDraft.draft);
     assert.equal(JSON.parse(values.get(secondDraft.key)).draft,secondDraft.draft);
     assert.ok(calls.every(call=>call.method==='GET'));
@@ -901,7 +901,7 @@ test(`delayed plan ${outcome} belongs to its original navigation (${selection})`
       assert.equal(posts()[1].body.version,6);
       assert.equal(posts()[1].body.text,input.draft);
     }else{
-      assert.equal(document.querySelector('.setup-error'),null);
+      assert.equal(document.querySelector('.setup-error') === null,true);
       const needsReadback=selection==='A-B-A' && outcome==='success';
       assert.ok(usePlanButton(document));
       assert.equal(usePlanButton(document).disabled,needsReadback);
@@ -961,15 +961,15 @@ for(const outcome of ['success','failure'])test(`same-owner plan ${outcome} rele
     assert.equal(send().disabled,false,'own cleanup must release busy even after successful version advancement');
     if(outcome==='success'){
       assert.match(document.body.textContent,/ACCEPTED PLAN/);
-      assert.equal(document.querySelector('.setup-error'),null);
-      assert.equal(usePlanButton(document),undefined);
+      assert.equal(document.querySelector('.setup-error') === null,true);
+      assert.equal(usePlanButton(document) === undefined, true);
     }else{
       assert.match(document.querySelector('.setup-error').textContent,/Current plan acceptance refused/);
       assert.ok(usePlanButton(document) && !usePlanButton(document).disabled);
       assert.equal(calls.filter(call=>call.method==='POST').length,1,'an error never retries acceptance automatically');
       await clickGuideButton(document,'Use this plan');
       assert.match(document.body.textContent,/ACCEPTED PLAN/);
-      assert.equal(document.querySelector('.setup-error'),null);
+      assert.equal(document.querySelector('.setup-error') === null,true);
       assert.equal(send().disabled,false);
     }
     assert.deepEqual(calls.filter(call=>call.method==='POST'),Array.from({length:outcome==='success'?1:2},()=>({
@@ -1021,7 +1021,7 @@ test(`plan acceptance response timeout preserves the draft and requires newer re
       composer().dispatchEvent(new document.defaultView.KeyboardEvent('keydown',{key:'Enter',bubbles:true}));await settle();});
     assert.deepEqual(posts(),[{url:applyUrl,method:'POST',body:{version:before.version}}]);
     await clickGuideButton(document,'Dismiss');
-    assert.equal(document.querySelector('.setup-error'),null);
+    assert.equal(document.querySelector('.setup-error') === null,true);
     assert.ok(status(),'Dismiss removes the error, not uncertainty about the saved plan');
     assert.equal(send().disabled,true);
     await clickGuideButton(document,'Check saved plan');
@@ -1041,7 +1041,7 @@ test(`plan acceptance response timeout preserves the draft and requires newer re
 
     readFails=false;server=acceptedGuide(before);
     await clickGuideButton(document,'Check saved plan');
-    assert.equal(status(),null,'a newer same-guide snapshot excludes the old version-CAS write');
+    assert.equal(status() === null,true,'a newer same-guide snapshot excludes the old version-CAS write');
     assert.match(document.body.textContent,/ACCEPTED PLAN/);
     assert.equal(send().disabled,false);
     assert.equal(composer().value,edited);
@@ -1092,7 +1092,7 @@ test(`plan acceptance response timeout cannot replace B or release B's later own
     assert.equal(composer().value,inputs[1].draft);
     assert.equal(send().disabled,false,'A uncertainty does not freeze a different selected guide');
     assert.equal(usePlanButton(document).disabled,false);
-    assert.equal(document.querySelector('[aria-label="Plan save status"]'),null,'A status is not displayed as B status');
+    assert.equal(document.querySelector('[aria-label="Plan save status"]') === null,true,'A status is not displayed as B status');
     await clickGuideButton(document,'Use this plan');
     assert.equal(send().disabled,true);
     assert.equal(composer().disabled,false);
@@ -1158,7 +1158,7 @@ test(`plan acceptance response timeout survives A-B-A and cannot release a later
     await clickGuideButton(document,'Check saved plan');
     assert.equal(send().disabled,false,'a newer same-guide reviewed plan excludes the original CAS');
     assert.equal(usePlanButton(document).disabled,false);
-    assert.equal(document.querySelector('[aria-label="Plan save status"]'),null);
+    assert.equal(document.querySelector('[aria-label="Plan save status"]') === null,true);
     assert.equal(posts().length,1,'observing a newer review does not apply it automatically');
     await clickGuideButton(document,'Use this plan');
     assert.equal(send().disabled,true);
@@ -1210,10 +1210,10 @@ test(`plan acceptance deliberate retry requires an exact saved check and retains
     const retry=()=>[...document.querySelectorAll('button')].find(button=>button.textContent==='Try saving this plan again');
     const status=()=>document.querySelector('[aria-label="Plan save status"]');
     await clickGuideButton(document,'Use this plan');
-    assert.equal(retry(),undefined,'admission alone does not authorize a duplicate acceptance');
+    assert.equal(retry() === undefined, true,'admission alone does not authorize a duplicate acceptance');
     await act(async()=>{t.mock.timers.tick(30000);await settle();});
     assert.ok(status());
-    assert.equal(retry(),undefined,'an elapsed response deadline does not prove the original plan remains current');
+    assert.equal(retry() === undefined, true,'an elapsed response deadline does not prove the original plan remains current');
     assert.equal(composer().value,inputs[0].draft);
     assert.equal(composer().disabled,false);
     assert.equal(send().disabled,true);
@@ -1222,14 +1222,14 @@ test(`plan acceptance deliberate retry requires an exact saved check and retains
 
     readFails=true;
     await clickGuideButton(document,'Check saved plan');
-    assert.equal(retry(),undefined,'a failed check cannot authorize the explicit retry');
+    assert.equal(retry() === undefined, true,'a failed check cannot authorize the explicit retry');
     assert.equal(send().disabled,true);
     assert.equal(posts().length,1);
     readFails=false;
     server={...structuredClone(before),proposal:{...structuredClone(before.proposal),
       project:{...before.proposal.project,name:'Different proposal at the same version'}}};
     await clickGuideButton(document,'Check saved plan');
-    assert.equal(retry(),undefined,'a same-version read must preserve the exact reviewed proposal');
+    assert.equal(retry() === undefined, true,'a same-version read must preserve the exact reviewed proposal');
     assert.equal(send().disabled,true);
     assert.equal(posts().length,1);
 
@@ -1245,7 +1245,7 @@ test(`plan acceptance deliberate retry requires an exact saved check and retains
     assert.deepEqual(posts(),Array.from({length:2},()=>({url:applyUrl,method:'POST',body:{version:before.version}})),
       'the deliberate retry repeats only the original version-CAS acceptance body');
     assert.equal(send().disabled,true);
-    assert.equal(retry(),undefined,'the fresh response owner requires its own check before any further retry');
+    assert.equal(retry() === undefined, true,'the fresh response owner requires its own check before any further retry');
     const published=structuredClone(blueprints);
     await act(async()=>{
       if(outcome==='success')releaseOriginal(acceptedGuide(before));
@@ -1263,7 +1263,7 @@ test(`plan acceptance deliberate retry requires an exact saved check and retains
     assert.equal(posts().length,2,'a captured retired retry control cannot submit a third acceptance');
 
     await act(async()=>{releaseRetry(acceptedGuide(before));await settle();});
-    assert.equal(status(),null);
+    assert.equal(status() === null,true);
     assert.match(document.body.textContent,/ACCEPTED PLAN/);
     assert.equal(send().disabled,false,'only the deliberate retry confirmation admits subsequent explicit work');
     assert.equal(composer().value,inputs[0].draft);
@@ -1421,7 +1421,7 @@ test(`manual import ${outcome} cannot publish across navigation (${selection})`,
         await clickGuideButton(document,'First workshop');
       }
     }
-    assert.equal(configModal(document),null,'navigation cannot retain the outgoing configuration editor');
+    assert.equal(configModal(document) === null,true,'navigation cannot retain the outgoing configuration editor');
     let currentEditorError;
     if(selection==='running B'){
       secondReadFails=true;
@@ -1447,7 +1447,7 @@ test(`manual import ${outcome} cannot publish across navigation (${selection})`,
     assert.doesNotMatch(document.body.textContent,/Outgoing configuration import refused|Outgoing imported plan/);
     if(selection==='pending B'){
       await act(async()=>{releaseSelection(structuredClone(second));await settle();});
-      assert.equal(configModal(document),null);
+      assert.equal(configModal(document) === null,true);
     }else if(currentEditorError){
       assert.equal(configText(document).value,'{','the selected editor draft survives old completion');
       assert.equal(configModal(document).querySelector('.setup-error').textContent,currentEditorError);
@@ -1470,7 +1470,7 @@ test(`manual import ${outcome} cannot publish across navigation (${selection})`,
       await typeConfig(document,JSON.stringify(nextCandidate,null,2));
       await sendConfig(document);
       await waitConfig(()=>calls.some(call=>call.url===`/api/guide/${current.id}/respond`));
-      assert.equal(configModal(document),null);
+      assert.equal(configModal(document) === null,true);
       assert.deepEqual(posts().map(call=>call.url),['/api/blueprint/import','/api/blueprint/import',`/api/guide/${current.id}/respond`]);
       const response=posts()[2];
       assert.equal(response.body.version,current.version);
@@ -1520,7 +1520,7 @@ test(`manual import ${outcome} cannot settle a newer editor (${replacement})`,as
         else [...configModal(document).querySelectorAll('footer button')].find(button=>button.textContent==='Cancel').click();
         await settle();
       });
-      assert.equal(configModal(document),null);
+      assert.equal(configModal(document) === null,true);
       await clickGuideButton(document,'Configuration');
       await typeConfig(document,originalText);
     }
@@ -1537,7 +1537,7 @@ test(`manual import ${outcome} cannot settle a newer editor (${replacement})`,as
     assert.deepEqual(blueprints,publicationsBefore);
     assert.equal(configText(document).value,retainedText);
     assert.equal(configSend(document).disabled,true,'old finally cannot unlock the newer pending request');
-    assert.equal(configModal(document).querySelector('.setup-error'),null);
+    assert.equal(configModal(document).querySelector('.setup-error') === null,true);
     assert.equal(values.get(manualKey(guide.id)),undefined);
     assert.equal(posts().length,2);
     await act(async()=>{releaseSecond({httpError:422,detail:'Current editor import refused'});await settle();});
@@ -1549,7 +1549,7 @@ test(`manual import ${outcome} cannot settle a newer editor (${replacement})`,as
     assert.equal(posts().length,2,'the current refusal is not automatically retried');
     await sendConfig(document);
     await waitConfig(()=>calls.some(call=>call.url===respond));
-    assert.equal(configModal(document),null);
+    assert.equal(configModal(document) === null,true);
     assert.deepEqual(posts().slice(0,3).map(call=>call.body),[originalCandidate,nextCandidate,nextCandidate]);
     assert.deepEqual(posts().map(call=>call.url),['/api/blueprint/import','/api/blueprint/import','/api/blueprint/import',respond]);
     assert.equal(posts()[3].body.version,guide.version);
@@ -1598,7 +1598,7 @@ test('current pending manual configuration remains the base through honest refus
     assert.equal(document.querySelector('#setup-message').value,inputs[0].draft);
     await sendConfig(document);
     await waitConfig(()=>calls.some(call=>call.url===respond));
-    assert.equal(configModal(document),null);
+    assert.equal(configModal(document) === null,true);
     const submitted=calls.find(call=>call.url===respond).body;
     assert.equal(submitted.version,guide.version);
     assert.equal(submitted.action,'manual');
@@ -1627,7 +1627,7 @@ test('manual configuration in an anonymous setup retains supported startup and e
     await typeConfig(document,JSON.stringify(candidate,null,2));
     await sendConfig(document);
     await waitConfig(()=>calls.some(call=>call.url===respond));
-    assert.equal(configModal(document),null);
+    assert.equal(configModal(document) === null,true);
     assert.deepEqual(calls.filter(call=>call.method==='POST').map(call=>call.url),['/api/blueprint/import','/api/guide/start',respond]);
     const creation=calls.find(call=>call.url==='/api/guide/start').body;
     assert.deepEqual(Object.keys(creation),['start_request_id']);
@@ -1674,7 +1674,7 @@ for(const outcome of ['success','failure'])test(`current saved manual import ${o
       await sendConfig(document);
     }
     await waitConfig(()=>calls.some(call=>call.url===respond));
-    assert.equal(configModal(document),null);
+    assert.equal(configModal(document) === null,true);
     const posts=calls.filter(call=>call.method==='POST');
     assert.deepEqual(posts.map(call=>call.url),[...Array(outcome==='success'?1:2).fill('/api/blueprint/import'),respond]);
     assert.ok(posts.filter(call=>call.url==='/api/blueprint/import').every(call=>JSON.stringify(call.body)===JSON.stringify(candidate)));
@@ -1842,7 +1842,7 @@ test(`count import ${outcome} cannot publish across navigation (${selection})`,a
     else assert.equal(values.get(manualKey(second.id)),undefined);
     assert.doesNotMatch(document.body.textContent,/Outgoing count import refused/);
     if(selection==='pending B'){
-      assert.equal(document.querySelector('.setup-guide-wait'),null,'a pending selection does not borrow an old operation');
+      assert.equal(document.querySelector('.setup-guide-wait') === null,true,'a pending selection does not borrow an old operation');
       // The old plan can remain visible while loading, but it cannot admit another count import.
       const pendingControl=moreCount(document);
       assert.ok(pendingControl,'The displayed count control still belongs to the outgoing plan during loading');
@@ -1868,7 +1868,7 @@ test(`count import ${outcome} cannot publish across navigation (${selection})`,a
       assert.match(document.querySelector('.setup-manual-note').textContent,/Deployment settings/);
       assert.deepEqual(blueprints.at(-1),pendingManual.blueprint);
     }else{
-      assert.equal(document.querySelector('.setup-error'),null);
+      assert.equal(document.querySelector('.setup-error') === null,true);
       assert.equal(moreCount(document).disabled,false,'the old count request releases only its package latch');
       assert.equal(document.querySelector('#setup-send').disabled,false);
       assert.deepEqual(blueprints.at(-1),current.proposal);
@@ -1931,7 +1931,7 @@ for(const outcome of ['success','failure'])test(`current count import ${outcome}
     assert.ok(retained.changes.includes('Update Context owner'));
     assert.equal(countValue(document),'2');
     assert.deepEqual(blueprints.at(-1),candidate);
-    assert.equal(document.querySelector('.setup-error'),null);
+    assert.equal(document.querySelector('.setup-error') === null,true);
     assert.equal(document.querySelector('.setup-guide-wait').dataset.requestId,'6'.repeat(64));
     assert.equal(moreCount(document).disabled,true,'the admitted guide operation owns the current busy state');
     assert.equal(document.querySelector('#setup-send').disabled,true);
@@ -1950,7 +1950,7 @@ test('an unchanged checked count releases its own latch without a manual request
     assert.equal(countValue(document),'1');
     assert.equal(moreCount(document).disabled,false);
     assert.equal(document.querySelector('#setup-send').disabled,false);
-    assert.equal(document.querySelector('.setup-error'),null);
+    assert.equal(document.querySelector('.setup-error') === null,true);
     assert.equal(document.querySelector('#setup-message').value,inputs[0].draft);
     assert.deepEqual(JSON.parse(values.get(inputs[0].key)),inputs[0]);
   },read,{allowedPosts:['/api/blueprint/import']});

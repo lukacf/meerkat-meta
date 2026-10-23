@@ -7,6 +7,7 @@ import {
   agentReportsIdle,
   decideIdleSettlement,
   framesAfterIdleWatermark,
+  idleSettleClock,
   idleWatermarkFor,
   isAfterIdleWatermark,
 } from "./idle-reconcile";
@@ -203,4 +204,36 @@ test("two idle polls a poll interval apart settle; every guard resets the count"
     "nothing to settle");
   assert.equal(decideIdleSettlement({ ...base, foldBusy: false, foldPhase: "waiting", armed }), "settle",
     "a stale phase alone is settled too");
+});
+
+test("the gap between the two idle polls is measured on the monotonic clock, not the wall clock", () => {
+  const ownPerformanceNow = Object.getOwnPropertyDescriptor(performance, "now");
+  const realDateNow = Date.now;
+  let wallMs = 1_700_000_000_000;
+  let monotonicMs = 50_000;
+  Date.now = () => wallMs;
+  Object.defineProperty(performance, "now", { configurable: true, writable: true, value: () => monotonicMs });
+  try {
+    const base = {
+      agent: idleAgent,
+      logVersionAtRequest: 7,
+      logVersionNow: 7,
+      sendInFlight: false,
+      foldBusy: true,
+      foldPhase: "waiting",
+    };
+    const armed = { version: 7, atMs: idleSettleClock.now() };
+    wallMs += 3_600_000;
+    monotonicMs += 2_000;
+    assert.equal(decideIdleSettlement({ ...base, armed, nowMs: idleSettleClock.now() }), "wait",
+      "the computer's clock set an hour ahead does not settle two polls 2 s apart");
+    wallMs -= 7_200_000;
+    monotonicMs += IDLE_SETTLE_MIN_GAP_MS;
+    assert.equal(decideIdleSettlement({ ...base, armed, nowMs: idleSettleClock.now() }), "settle",
+      "the computer's clock set back does not hold the member open past a poll interval");
+  } finally {
+    Date.now = realDateNow;
+    if (ownPerformanceNow) Object.defineProperty(performance, "now", ownPerformanceNow);
+    else delete (performance as { now?: unknown }).now;
+  }
 });

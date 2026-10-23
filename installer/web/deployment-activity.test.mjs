@@ -61,7 +61,7 @@ test("absent activity stays absent and progress text is rendered as text", () =>
   for (const value of [null, {}, receipt([]), receipt("unavailable")])
     assert.equal(renderToStaticMarkup(React.createElement(DeploymentActivity, { receipt: value })), "");
   inspect(receipt([{ message: '<script>alert("not executable")</script>' }]), document => {
-    assert.equal(document.querySelector("script"), null);
+    assert.equal(document.querySelector("script") === null, true);
     assert.equal(document.querySelector("li").textContent, '<script>alert("not executable")</script>');
   });
 });

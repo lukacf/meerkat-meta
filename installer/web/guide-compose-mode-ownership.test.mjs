@@ -156,7 +156,7 @@ test('a delayed original completed response preserves the newer chat draft throu
     assert.equal(document.querySelector('#setup-send').disabled, true);
     assert.equal(composer().value, nextText);
     await click(button('Check saved conversation'));
-    assert.equal(document.querySelector('[aria-label="Message delivery status"]'), null,
+    assert.equal(document.querySelector('[aria-label="Message delivery status"]') === null, true,
       'Only exact saved request readback releases the uncertain Send.');
     assert.equal(postCount, 1, 'Checking the saved guide does not repeat the admitted request.');
     assert.match(document.body.textContent, /What scale should this support/);

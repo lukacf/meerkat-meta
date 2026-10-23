@@ -135,7 +135,7 @@ test("ordinary provider checks retain the unsaved provider/key pair while recove
     mode = "ordinary";
     await click("Check saved settings");
     pair("anthropic", "fixture-anthropic-draft");
-    assert.equal(document.querySelector('[role="alert"]'), null);
+    assert.equal(document.querySelector('[role="alert"]') === null, true);
 
     await click("Save locally");
     assert.equal(writes, 1);

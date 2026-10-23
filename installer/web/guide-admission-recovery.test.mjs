@@ -237,7 +237,7 @@ test('guide admission recovery: direct new draft keeps current anonymous writing
     assert.equal(state.local.getItem(GUIDE_KEY), null);
     assert.equal(state.session.getItem(GUIDE_CREATION_KEY), null,
       'The old creation token is retired, not promised as still checkable here.');
-    assert.equal(delivery(document), null);
+    assert.equal(delivery(document) === null, true);
     assert.equal(document.querySelector('#setup-message').value, edited);
     const retained = JSON.parse(state.local.getItem(inputKey(state.initial)));
     assert.equal(retained.draft, edited);
@@ -430,7 +430,7 @@ test('guide admission recovery: exact completed readback preserves later writing
     assert.equal(state.posts().length, 1, 'Checking saved conversation does not send the task again.');
     assert.equal(document.querySelector('#setup-message').value, edited);
     assert.equal(JSON.parse(state.local.getItem(inputKey(state.guides.get(A)))).draft, edited);
-    assert.equal(delivery(document), null);
+    assert.equal(delivery(document) === null, true);
     assert.equal(document.querySelector('#setup-send').disabled, false);
     const second = state.holdNextPost();
     await click(document.querySelector('#setup-send'));
@@ -454,7 +454,7 @@ test('guide admission recovery: exact running readback resumes existing status p
     state.guides.set(A, { ...saved, version: state.initial.version,
       operation: { ...saved.operation, status: 'running' } });
     await click(named(document, 'Check saved conversation'));
-    assert.equal(delivery(document), null, 'Exact running admission is confirmed, not left uncertain.');
+    assert.equal(delivery(document) === null, true, 'Exact running admission is confirmed, not left uncertain.');
     assert.equal(document.querySelector('#setup-message').value, original,
       'Original writing remains until saved completion; running admission resumes status without resending.');
     assert.equal(document.querySelector('#setup-send').disabled, true);
@@ -489,7 +489,7 @@ test('guide admission recovery: unrelated same-version or failed readback keeps 
     state.getFailures.delete(`/api/guide/${A}`);
     state.guides.set(A, saved);
     await click(named(document, 'Check saved conversation'));
-    assert.equal(delivery(document), null);
+    assert.equal(delivery(document) === null, true);
     assert.equal(document.querySelector('#setup-message').value, '', 'Only an exact later check can consume the original task.');
     assert.equal(state.posts().length, 1);
   });
@@ -504,7 +504,7 @@ test('guide admission recovery: a later saved version excludes old CAS without c
     state.guides.set(A, { ...saved, operation: null,
       messages: [{ id: 'other-message', role: 'user', text: 'Independent saved progress.' }] });
     await click(named(document, 'Check saved conversation'));
-    assert.equal(delivery(document), null);
+    assert.equal(delivery(document) === null, true);
     assert.equal(document.querySelector('#setup-message').value, original,
       'Version exclusion is not proof that this submitted writing was admitted.');
     assert.equal(document.querySelector('#setup-send').disabled, false);
@@ -555,7 +555,7 @@ test('guide admission recovery: complete request matching preserves ordered choi
     }
     state.guides.set(A, exact);
     await click(named(document, 'Check saved conversation'));
-    assert.equal(delivery(document), null);
+    assert.equal(delivery(document) === null, true);
     assert.equal(document.querySelector('#setup-message').value, '');
     assert.deepEqual(JSON.parse(state.local.getItem(inputKey(state.initial))).selected, []);
     assert.equal(state.session.getItem(`mobkit-guide-attachments-v1:${A}`), null,
@@ -683,7 +683,7 @@ test('guide admission recovery: first-visit file selection creates once and uplo
     assert.equal(document.querySelector('#setup-message').value, original);
     assert.equal(JSON.parse(state.local.getItem(inputKey(state.guides.get(A)))).draft, original);
     assert.equal(state.session.getItem(GUIDE_CREATION_KEY), null);
-    assert.equal(delivery(document), null);
+    assert.equal(delivery(document) === null, true);
   });
 });
 
@@ -704,12 +704,12 @@ test('guide admission recovery: first-visit file creation timeout checks existin
     await click(named(document, 'Check saved conversation'));
     assert.equal(state.local.getItem(GUIDE_KEY), A);
     assert.equal(document.querySelector('#setup-message').value, edited);
-    assert.equal(delivery(document), null);
+    assert.equal(delivery(document) === null, true);
     assert.equal(state.posts().length, 1,
       'Creation recovery does not resume the old file upload or send the first answer.');
     await act(async () => { state.settleOriginal('success'); await settle(); });
     assert.equal(state.posts().length, 1, 'A late creation body cannot start the abandoned upload.');
-    assert.equal(document.querySelector('.setup-attachments a'), null);
+    assert.equal(document.querySelector('.setup-attachments a') === null, true);
     assert.equal(document.querySelector('#setup-message').value, edited);
     await choose();
     assert.equal(state.posts().length, 2, 'Only a fresh deliberate file selection uploads to the recovered saved guide.');

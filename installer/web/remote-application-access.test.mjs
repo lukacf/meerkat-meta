@@ -256,7 +256,7 @@ test("multiple entries mount and reload through GET only; explicit open publishe
     assert.equal(calls.length, entries.length); assert.ok(calls.every((call) => call.method === "GET"));
     assert.equal(document.querySelector("h4").textContent, "Open my app");
     assert.equal(document.querySelector("details").open, false);
-    for (const entry of entries) { assert.ok(button(entry.id, "Connect to " + entry.label)); assert.equal(link(entry.id), null); }
+    for (const entry of entries) { assert.ok(button(entry.id, "Connect to " + entry.label)); assert.equal(link(entry.id) === null, true); }
     await click("reports", "Connect to Reports");
     assert.equal(link("reports").getAttribute("href"), "http://127.0.0.1:12007/reports/daily");
     assert.equal(link("reports").target, "_blank"); assert.equal(link("reports").rel, "noopener noreferrer");
@@ -267,7 +267,7 @@ test("multiple entries mount and reload through GET only; explicit open publishe
     assert.match(document.body.textContent, /does not verify sign-in or a useful task result/);
     assert.match(document.body.textContent, /Keep Forge open while using the app/);
     assert.equal(window.localStorage.length, 0); assert.equal(window.sessionStorage.length, 0);
-    assert.equal(document.querySelector("input"), null);
+    assert.equal(document.querySelector("input") === null, true);
   });
   await mountedAccess({ reports: ready(entries[2]) }, async ({ calls, link }) => {
     assert.ok(link("reports")); assert.ok(calls.every((call) => call.method === "GET"));
@@ -297,7 +297,7 @@ test("older controllers and no-entry packages require no custom requests", async
     supported: false, status: "unavailable", metadata_sha256: null, entries: [] }, { ...receipt.application_experiences,
     status: "none", metadata_sha256: null, entries: [] }])
     await mountedAccess({}, async ({ document, calls }) => {
-      assert.equal(document.querySelector(".remote-application-access"), null); assert.equal(calls.length, 0);
+      assert.equal(document.querySelector(".remote-application-access") === null, true); assert.equal(calls.length, 0);
     }, { receipt: { ...receipt, application_experiences } });
 });
 
@@ -309,14 +309,14 @@ test("malformed metadata and unowned listeners never offer connection, including
     assert.match(document.body.textContent, /could not check this installation's application links/);
     for (const service of [1, {}, true, []]) {
       await rerender({ receipt: { ...receipt, service: { ...receipt.service, service } } });
-      assert.equal(document.querySelector(".remote-application-access"), null);
+      assert.equal(document.querySelector(".remote-application-access") === null, true);
     }
     assert.equal(calls.filter((call) => call.method === "POST").length, 0);
   });
   const entry = { ...entries[0], listener_owned: false, listener_token: null,
     reason: "The declared listener is not currently owned by this service." };
   await mountedAccess({ workshop: closed(entry) }, async ({ document, button, link, calls }) => {
-    assert.equal(button("workshop", "Connect to Workshop"), undefined); assert.equal(link("workshop"), null);
+    assert.equal(button("workshop", "Connect to Workshop") === undefined, true); assert.equal(link("workshop") === null, true);
     assert.match(document.body.textContent, /declared listener is not currently owned/);
     assert.equal(calls.filter((call) => call.method === "POST").length, 0);
   }, { receipt: { ...receipt, application_experiences: { ...receipt.application_experiences, entries: [entry] } } });
@@ -333,13 +333,13 @@ test("same-port close hides every alias immediately while unrelated port access 
         return pending.promise;
       });
       await click("workshop", "Close connection");
-      assert.equal(link("workshop"), null); assert.equal(link("admin"), null); assert.ok(link("reports"));
-      assert.equal(button("admin", "Connect to Workshop settings"), undefined);
+      assert.equal(link("workshop") === null, true); assert.equal(link("admin") === null, true); assert.ok(link("reports"));
+      assert.equal(button("admin", "Connect to Workshop settings") === undefined, true);
       assert.deepEqual(calls.find((call) => call.method === "POST").body,
         { deployment_id: receipt.deployment_id, access_id: ids[0] });
       await act(async () => pending.resolve(closed(entries[0], {
         access_id: ids[0], status: "cleanup-needed", cleanup_confirmed: false })));
-      assert.equal(link("admin"), null); assert.ok(button("admin", "Close connection"));
+      assert.equal(link("admin") === null, true); assert.ok(button("admin", "Close connection"));
       for (const entry of entries.slice(0, 2)) setAccess(entry.id, closed(entry, { access_id: ids[entries.indexOf(entry)] }));
       await poll();
       assert.ok(button("workshop", "Connect to Workshop")); assert.ok(button("admin", "Connect to Workshop settings"));
@@ -358,14 +358,14 @@ test("a delayed alias open admitted before shared close cannot restore any close
         return pendingClose.promise;
       });
       await click("workshop", "Close connection");
-      assert.equal(link("workshop"), null); assert.equal(link("admin"), null);
+      assert.equal(link("workshop") === null, true); assert.equal(link("admin") === null, true);
       await act(async () => pendingOpen.resolve(ready(entries[1])));
-      assert.equal(link("admin"), null); assert.equal(button("admin", "Connect to Workshop settings"), undefined);
+      assert.equal(link("admin") === null, true); assert.equal(button("admin", "Connect to Workshop settings") === undefined, true);
       assert.ok(link("reports"));
       setAccess("admin", closed(entries[1], { access_id: ids[1], status: "cleanup-needed", cleanup_confirmed: false }));
       await act(async () => pendingClose.resolve(closed(entries[0], { access_id: ids[0],
         status: "cleanup-needed", cleanup_confirmed: false })));
-      await poll(); assert.equal(link("admin"), null);
+      await poll(); assert.equal(link("admin") === null, true);
       assert.equal(calls.filter((call) => call.method === "POST").length, 2);
     });
 });
@@ -374,11 +374,11 @@ test("listener changes withdraw readiness while retaining exact admitted close c
   await mountedAccess({ workshop: ready(entries[0]) }, async ({ click, link, button, rerender, setClose, calls }) => {
     const changedEntries = entries.map((entry) => entry.destination_port === 8792 ? { ...entry, listener_token: "0".repeat(64) } : entry);
     await rerender({ receipt: { ...receipt, application_experiences: { ...receipt.application_experiences, entries: changedEntries } } });
-    assert.equal(link("workshop"), null); assert.ok(button("workshop", "Close connection"));
+    assert.equal(link("workshop") === null, true); assert.ok(button("workshop", "Close connection"));
     setClose(() => closed(entries[0], { access_id: ids[0], status: "cleanup-needed", cleanup_confirmed: false }));
     await click("workshop", "Close connection");
     assert.equal(calls.find((call) => call.method === "POST").body.access_id, ids[0]);
-    assert.equal(link("workshop"), null); assert.ok(button("workshop", "Close connection"));
+    assert.equal(link("workshop") === null, true); assert.ok(button("workshop", "Close connection"));
   });
 });
 
@@ -386,15 +386,15 @@ test("observation loss hides ready links without asserting the Linux application
   await mountedAccess({ reports: ready(entries[2]) }, async ({ document, link, button, setRead, click, calls }) => {
     setRead("reports", () => { throw new Error("Synthetic observation loss."); });
     await click("reports", "Recheck connection");
-    assert.equal(link("reports"), null); assert.ok(button("reports", "Close connection"));
-    assert.equal(button("reports", "Connect to Reports"), undefined);
+    assert.equal(link("reports") === null, true); assert.ok(button("reports", "Close connection"));
+    assert.equal(button("reports", "Connect to Reports") === undefined, true);
     assert.match(document.body.textContent, /Linux application may still be running/);
     setRead("reports", null); await click("reports", "Recheck connection"); assert.ok(link("reports"));
     assert.equal(calls.filter((call) => call.method === "POST").length, 0);
   });
   await mountedAccess({}, async ({ button, setRead, click, calls }) => {
     setRead("reports", () => { throw new Error("Synthetic closed observation loss."); });
-    await click("reports", "Recheck connection"); assert.equal(button("reports", "Connect to Reports"), undefined);
+    await click("reports", "Recheck connection"); assert.equal(button("reports", "Connect to Reports") === undefined, true);
     setRead("reports", null); await click("reports", "Recheck connection"); assert.ok(button("reports", "Connect to Reports"));
     assert.equal(calls.filter((call) => call.method === "POST").length, 0);
   });
@@ -405,9 +405,9 @@ test("freshness clocks hide links even when entry observations stall", async () 
     async ({ document, link, click, tick, setRead, calls }) => {
       const pending = deferred(); setRead("workshop", () => pending.promise);
       await click("workshop", "Recheck connection"); assert.ok(link("workshop"));
-      await tick(15_001); assert.equal(link("workshop"), null); assert.equal(link("reports"), null);
+      await tick(15_001); assert.equal(link("workshop") === null, true); assert.equal(link("reports") === null, true);
       assert.match(document.body.textContent, /readiness needs another check/);
-      await act(async () => pending.resolve(ready(entries[0]))); assert.equal(link("workshop"), null);
+      await act(async () => pending.resolve(ready(entries[0]))); assert.equal(link("workshop") === null, true);
       assert.equal(calls.filter((call) => call.method === "POST").length, 0);
     });
 });
@@ -432,7 +432,7 @@ test("foreign, credential-bearing and false verification replies withhold links 
       { local_url: "http://127.0.0.1:12007/reports/daily?token=synthetic-url-canary",
         detail: "synthetic-response-detail-canary" }]) {
       setAccess("reports", ready(entries[2], changed)); await click("reports", "Recheck connection");
-      assert.equal(link("reports"), null); assert.ok(button("reports", "Close connection"));
+      assert.equal(link("reports") === null, true); assert.ok(button("reports", "Close connection"));
       assert.doesNotMatch(document.body.innerHTML, /synthetic-url-canary|synthetic-response-detail-canary/);
     }
     setAccess("reports", ready(entries[2], { http_status: 401 })); await click("reports", "Recheck connection");
@@ -446,21 +446,21 @@ test("late open and GET replies cannot publish after source, guide or applicatio
     const pending = deferred(); setOpen(() => pending.promise);
     await click("reports", "Connect to Reports"); await rerender({ state: { ...guide, version: 5 } });
     await act(async () => pending.resolve(ready(entries[2])));
-    assert.equal(link("reports"), null); assert.equal(document.querySelector(".remote-application-access"), null);
+    assert.equal(link("reports") === null, true); assert.equal(document.querySelector(".remote-application-access") === null, true);
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
   });
   await mountedAccess({ reports: ready(entries[2]) }, async ({ document, click, link, setRead, rerender }) => {
     const pending = deferred(); setRead("reports", () => pending.promise);
     await click("reports", "Recheck connection"); await rerender({ receipt: { ...receipt, source_current: false } });
     await act(async () => pending.resolve(ready(entries[2])));
-    assert.equal(link("reports"), null); assert.equal(document.querySelector(".remote-application-access"), null);
+    assert.equal(link("reports") === null, true); assert.equal(document.querySelector(".remote-application-access") === null, true);
   });
   await mountedAccess({ reports: ready(entries[2]) }, async ({ click, link, setRead, rerender }) => {
     const pending = deferred(); setRead("reports", () => pending.promise); await click("reports", "Recheck connection");
     const changedEntries = entries.map((entry) => entry.id === "reports" ? { ...entry, path: "/other", destination_port: 12008 } : entry);
     await rerender({ receipt: { ...receipt, application_experiences: { ...receipt.application_experiences,
       metadata_sha256: "0".repeat(64), entries: changedEntries } } });
-    await act(async () => pending.resolve(ready(entries[2]))); assert.equal(link("reports"), null);
+    await act(async () => pending.resolve(ready(entries[2]))); assert.equal(link("reports") === null, true);
   });
 });
 
@@ -479,7 +479,7 @@ test("remote handoff appends the current editable draft only to the exact existi
       assert.ok(handoff);
       assert.equal(handoff.href.split("#")[0], link("workshop").href);
       assert.equal(linkedDraft(handoff), task);
-      assert.equal(handoffLink(document, "admin"), null);
+      assert.equal(handoffLink(document, "admin") === null, true);
       assert.equal(handoff.getAttribute("referrerpolicy"), "no-referrer");
       assert.equal(handoff.rel, "noopener noreferrer");
       assert.equal(new URL(handoff.href).search, "");
@@ -490,7 +490,7 @@ test("remote handoff appends the current editable draft only to the exact existi
       assert.equal(linkedDraft(handoffLink(document)), edited);
       for (const taskHandoff of [{ ...draftProjection(edited), readKey: "stale" },
         { ...draftProjection(edited), binding: "another source" }, draftProjection(edited, "missing"), draftProjection("bad\ud800"), null]) {
-        await rerender({ taskHandoff }); assert.equal(handoffLink(document), null);
+        await rerender({ taskHandoff }); assert.equal(handoffLink(document) === null, true);
         assert.ok(link("workshop"), "The ordinary checked app link remains independent.");
       }
       assert.equal(calls.filter((call) => call.method === "POST").length, 0);
@@ -500,14 +500,14 @@ test("remote handoff appends the current editable draft only to the exact existi
 test("remote draft handoff is absent until explicit owned tunnel readiness and expires with its displayed link", async () => {
   const taskHandoff = draftProjection("Human draft");
   await mountedAccess({}, async ({ document, calls, click, tick }) => {
-    assert.equal(handoffLink(document), null);
+    assert.equal(handoffLink(document) === null, true);
     assert.equal(calls.filter((call) => call.method === "POST").length, 0);
     await click("workshop", "Connect to Workshop");
     assert.equal(linkedDraft(handoffLink(document)), "Human draft");
     assert.equal(calls.filter((call) => call.method === "POST").length, 1);
     assert.deepEqual(calls.find((call) => call.method === "POST").body.entry_id, "application:workshop");
     await tick(15001);
-    assert.equal(handoffLink(document), null);
+    assert.equal(handoffLink(document) === null, true);
   }, { taskHandoff });
 });
 
@@ -516,16 +516,16 @@ test("remote handoff immediately withdraws for close, health observation loss an
   await mountedAccess({ workshop: ready(entries[0]) }, async ({ document, click, rerender }) => {
     assert.ok(handoffLink(document));
     await click("workshop", "Close connection");
-    assert.equal(handoffLink(document), null);
+    assert.equal(handoffLink(document) === null, true);
     await rerender({ observationUnavailable: true });
-    assert.equal(handoffLink(document), null);
+    assert.equal(handoffLink(document) === null, true);
   }, { taskHandoff });
   await mountedAccess({ workshop: ready(entries[0]) }, async ({ document, rerender }) => {
     await rerender({ receipt: { ...receipt, application_experiences: { ...receipt.application_experiences,
       entries: entries.map((entry) => entry.id === "workshop" ? { ...entry, listener_token: "0".repeat(64) } : entry) } } });
-    assert.equal(handoffLink(document), null);
+    assert.equal(handoffLink(document) === null, true);
     await rerender({ receipt, blocked: true });
-    assert.equal(handoffLink(document), null);
+    assert.equal(handoffLink(document) === null, true);
   }, { taskHandoff });
 });
 
@@ -547,7 +547,7 @@ function remoteTaskMetadata(r) {
 
 test("mounted RemoteDeployment joins its current draft to its sibling checked tunnel without an automatic send", async () => {
   await mountedAccess({ workshop: ready(entries[0]), admin: ready(entries[1]) }, async ({ document, window, calls, rerender }) => {
-    assert.equal(handoffLink(document), null);
+    assert.equal(handoffLink(document) === null, true);
     await act(async () => document.querySelector(".deployment-use-ideas button").click());
     assert.equal(linkedDraft(handoffLink(document)), "Suggested editable job");
     const task = "  The actual edited remote task \u{1f9ed}\nwith my limits.  ";
@@ -555,9 +555,9 @@ test("mounted RemoteDeployment joins its current draft to its sibling checked tu
     const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
     await act(async () => { setter.call(field, task); field.dispatchEvent(new window.Event("input", { bubbles: true })); });
     assert.equal(linkedDraft(handoffLink(document)), task);
-    assert.equal(handoffLink(document, "admin"), null);
+    assert.equal(handoffLink(document, "admin") === null, true);
     await rerender({ blocked: true });
-    assert.equal(handoffLink(document), null);
+    assert.equal(handoffLink(document) === null, true);
     assert.equal(field.value, task);
     await rerender({ blocked: false });
     assert.equal(linkedDraft(handoffLink(document)), task);
@@ -576,7 +576,7 @@ test("refreshed custom UI links survive harmless chat and retain exact listener 
     const currentReceipt = { ...receipt, current_guide_version: 5 };
     await rerender({ state: next, build: currentBuild, receipt: currentReceipt,
       options: { ...options, current_guide_version: 5 } });
-    assert.equal(link("reports"), null);
+    assert.equal(link("reports") === null, true);
     setAccess("reports", { ...ready(entry), current_guide_version: 5 }); await poll();
     assert.equal(link("reports").getAttribute("href"), "http://127.0.0.1:12007/reports/daily");
     for (const patch of [{ current_guide_version: undefined }, { current_guide_version: null },
@@ -585,7 +585,7 @@ test("refreshed custom UI links survive harmless chat and retain exact listener 
       assert.equal(remoteApplicationReplyCurrent({ ...ready(entry), current_guide_version: 5, ...patch },
         currentReceipt, next, currentBuild, experiences, entry), false);
     await rerender({ receipt: { ...currentReceipt, source_binding_current: false } });
-    assert.equal(link("reports"), null);
+    assert.equal(link("reports") === null, true);
     assert.equal(calls.some(call => call.method === "POST"), false);
   });
 });
