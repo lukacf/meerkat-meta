@@ -237,6 +237,8 @@ def new_installation_receipt(identity, guide_id, source, version, build_id, dige
                "detail": "Preparing your owned deployment folder.", "created_at": now(), "updated_at": now(),
                "checks": [], "progress": [], "logs": [], "console_url": None, "bootstrap": None,
                "runtime_pid": None, "unresolved": json.loads(files["implementation-report.json"][0]).get("unresolved", []) if source_kind == "application" else []}
+    if "organization_hash" in source:
+        receipt["organization_hash"] = source["organization_hash"]
     if runtime_selection is not None:
         receipt["runtime_candidate"] = deepcopy(runtime_selection)
     return receipt

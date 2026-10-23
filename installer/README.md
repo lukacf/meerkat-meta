@@ -528,6 +528,15 @@ any computer-specific paths in the plan. This direct installation path currently
 supports the local computer. Native-team source updates are not yet supported;
 refining the guide does not change an existing installation.
 
+An agent-team package also binds the guide's saved organization context. New
+installations retain that binding when reporting whether they match the current
+guide. Changing or removing the context does not rebind an installed team.
+Packages without organization context keep their original scope. Older Forge
+versions that cannot read organization-aware team manifests refuse those
+packages; use the Forge version that prepared the package for installation.
+See [native package compatibility](COMPATIBILITY.md) for affected versions and
+the behavior of retained packages and receipts.
+
 The installed Forge (the packaged product) and the developer source entry both
 offer the agent-team path. An agent team package, downloaded or installed,
 installs the published Meta 0.9.4 release it pins: the `meerkat-meta` 0.9.4 SDK
