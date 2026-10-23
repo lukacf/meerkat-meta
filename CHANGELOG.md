@@ -115,6 +115,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     callback runnables (`runtime_options.host_runnables`). Each fire hands
     the runnable Core's invocation unchanged, its delivery idempotency key
     included. A name taken twice, or the steward's, refuses init.
+- Mob announcement sources hold what a member may no longer receive. An
+  owed item whose member stopped passing its source's audience or routes
+  after the capture (a narrowed audience, a removed route, a role or label
+  changed by a respawn) is held at the member's next seal: not sealed and
+  not dropped. Immediately before every native submission of a batch (the
+  first, and each one after an answer that nothing was committed), every
+  item is checked again; a batch with an item that fails is cancelled
+  while nothing native holds it, its failing items are held and the rest
+  reopen for the member's next batch.
+  - A held item is released only by a fresh check at the member's next
+    seal, and only while the source generation that held it is current;
+    held items alone start no seal.
+  - A held item past the retention window expires, and no gap line
+    reports it to its member.
+  - `meta/mob_announcements/audit/list` counts the new actions
+    `items_held`, `items_released`, `expired_while_held` and
+    `delivered_across_revocation`: a batch committed while its member
+    passed and admitted after it stopped, which nothing Meta controls
+    stands between on a gateway without a governed binder.
 
 ### Changed
 
