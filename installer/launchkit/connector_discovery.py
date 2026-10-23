@@ -19,7 +19,7 @@ from .blueprint import HEADER_REFERENCE
 
 MAX_RESPONSE = 2_000_000
 ENV_REF = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
-VARIABLE = re.compile(r"(?<!\$)\{([A-Za-z_][A-Za-z0-9_]*)\}")
+VARIABLE = re.compile(r"(?<!\$)\{([A-Za-z_][A-Za-z0-9_-]*)\}")
 ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 
@@ -70,7 +70,10 @@ def _env_name(value: str, prefix: str = "MCP") -> str:
 def _url(value: str) -> str:
     value = _text(value, 4000)
     # Placeholder values are substituted only by the exported runtime.
-    parsed = urlsplit(ENV_REF.sub("placeholder", value))
+    resolved_shape = ENV_REF.sub("placeholder", value)
+    if "{" in resolved_shape or "}" in resolved_shape:
+        raise DiscoveryError("The MCP URL contains an unresolved placeholder. Provide a complete URL or an environment-backed configuration.")
+    parsed = urlsplit(resolved_shape)
     if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
         raise DiscoveryError("Use an HTTP MCP URL without embedded credentials or fragments.")
     if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
@@ -85,6 +88,7 @@ class _Inputs:
         self.prefix = _env_name(prefix)
         self.items: dict[str, dict] = {}
         self.optional_arguments: list[list[str]] = []
+        self.variable_sources: dict[str, str] = {}
 
     def ref(self, name: str, description: str = "", secret: bool = False, required: bool = True, default: str = "") -> str:
         name = _env_name(name, self.prefix)
@@ -112,7 +116,10 @@ class _Inputs:
             definition = variables.get(key, {})
             if not isinstance(definition, dict):
                 raise DiscoveryError("Invalid MCP input variable definition.")
-            return self.ref(f"{self.prefix}_{key}", definition.get("description", item.get("description", "")), bool(definition.get("isSecret", secret)), bool(definition.get("isRequired", required)), str(definition.get("default", "")))
+            name = _env_name(f"{self.prefix}_{key}")
+            if self.variable_sources.setdefault(name, key) != key:
+                raise DiscoveryError("Distinct MCP variables map to the same environment input. Provide an explicit custom configuration.")
+            return self.ref(name, definition.get("description", item.get("description", "")), bool(definition.get("isSecret", secret)), bool(definition.get("isRequired", required)), str(definition.get("default", "")))
         rendered = VARIABLE.sub(replace, value)
         if secret and rendered == value and not ENV_REF.search(value):
             return self.ref(fallback, item.get("description", ""), True, required)
