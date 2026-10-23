@@ -1292,3 +1292,84 @@ describe("MobHandle declarations and role templates", () => {
     }
   });
 });
+
+// -- Handling reads and awaiting handling ------------------------------------
+
+const HANDLING_READ = {
+  pending: 1,
+  handled: 4,
+  handled_unverified: 2,
+  unhandled: 1,
+  held: 3,
+  oldest_unhandled_at_ms: 70,
+};
+
+describe("MobHandle handling reads and awaiting handling", () => {
+  it("announcementSubscriptionPut sends delivery only when set", async () => {
+    let { handle, calls } = mockHandle(() => ({}));
+    await (handle as any).announcementSubscriptionPut("op-s", "sub-1", MEMBER, ["ops.alert"], {
+      delivery: { await_handling: true },
+    });
+    assert.deepEqual((calls[0].params as any).delivery, { await_handling: true });
+    ({ handle, calls } = mockHandle(() => ({})));
+    await handle.announcementSubscriptionPut("op-s", "sub-1", MEMBER, ["ops.alert"]);
+    assert.equal("delivery" in (calls[0].params as any), false);
+  });
+
+  it("a subscription reads its delivery", async () => {
+    let { handle } = mockHandle(() => ({
+      subscription: { ...SUBSCRIPTION, delivery: { await_handling: false } },
+      marker: null,
+    }));
+    let subscription: any = (await handle.announcementSubscriptionGet("sub-1")).subscription;
+    assert.deepEqual([subscription.delivery, subscription.awaitHandling], [{ await_handling: false }, false]);
+    ({ handle } = mockHandle(() => ({ subscription: SUBSCRIPTION, marker: null })));
+    subscription = (await handle.announcementSubscriptionGet("sub-1")).subscription;
+    assert.deepEqual([subscription.delivery, subscription.awaitHandling], [null, null]);
+  });
+
+  it("member get reads its handling", async () => {
+    let { handle } = mockHandle(() => ({ ...MEMBER_READ, handling: HANDLING_READ }));
+    let handling = ((await (handle as any).announcementMemberGet(MEMBER)) as any).handling;
+    assert.deepEqual(
+      [handling.pending, handling.handled, handling.handledUnverified, handling.unhandled, handling.held],
+      [1, 4, 2, 1, 3],
+    );
+    assert.equal(handling.oldestUnhandledAtMs, 70);
+    ({ handle } = mockHandle(() => ({ ...MEMBER_READ, handling: { ...HANDLING_READ, oldest_unhandled_at_ms: null } })));
+    handling = ((await (handle as any).announcementMemberGet(MEMBER)) as any).handling;
+    assert.equal(handling.oldestUnhandledAtMs, null);
+    ({ handle } = mockHandle(() => MEMBER_READ));
+    assert.equal(((await (handle as any).announcementMemberGet(MEMBER)) as any).handling, null);
+  });
+
+  it("status reads the handling counts", () => {
+    const announcements = {
+      sources: { active: 1, paused: 0, failing: 0, stale: 0 },
+      members: { suspended: 0, unhandled_held: 5 },
+      handling: { pending: 2, handled: 9, handled_unverified: 1, unhandled: 3 },
+      escalations: { open: 1, last_event_cursor: 4 },
+    };
+    const data = { contract_version: "0.5.0", running: true, loaded_modules: [], mob_announcements: announcements };
+    const counts = (api.parseStatusResult(data) as any).mobAnnouncements;
+    assert.equal(counts.members.unhandled_held, 5);
+    assert.deepEqual(counts.handling, { pending: 2, handled: 9, handled_unverified: 1, unhandled: 3 });
+    const { handling: _omitted, ...older } = announcements;
+    assert.deepEqual((api.parseStatusResult({ ...data, mob_announcements: older }) as any).mobAnnouncements.handling, {});
+  });
+
+  for (const cause of ["unhandled", "handled_unverified"]) {
+    it(`a ${cause} escalation reads as sent`, async () => {
+      const { handle } = mockHandle(() => ({
+        ...MEMBER_READ,
+        escalations: [{ ...ESCALATION, cause, subject: { kind: "member", member: MEMBER } }],
+      }));
+      const [escalation] = ((await (handle as any).announcementMemberGet(MEMBER)) as any).escalations;
+      assert.deepEqual([escalation.cause, escalation.subjectKind], [cause, "member"]);
+    });
+  }
+
+  it("exports parseAnnouncementMemberHandling", () => {
+    assert.equal(typeof api.parseAnnouncementMemberHandling, "function");
+  });
+});

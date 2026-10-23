@@ -1069,3 +1069,72 @@ def test_the_declaration_names_are_exported():
     for name in ("AnnouncementRoleSelector", "AnnouncementRoleTemplate", "AnnouncementDeclarationRecord",
                  "AnnouncementDeclarationsView"):
         assert name in meerkat_meta.__all__
+
+
+# -- Handling reads and awaiting handling ------------------------------------
+
+HANDLING_READ = {"pending": 1, "handled": 4, "handled_unverified": 2, "unhandled": 1, "held": 3,
+                 "oldest_unhandled_at_ms": 70}
+
+
+@pytest.mark.asyncio
+async def test_subscription_put_sends_delivery_only_when_set():
+    handle, calls = make_mock_mob_handle()
+    await handle.announcement_subscription_put(
+        "op-s", "sub-1", MEMBER, ["ops.alert"], delivery={"await_handling": True})
+    assert calls[0][1]["delivery"] == {"await_handling": True}
+    handle, calls = make_mock_mob_handle()
+    await handle.announcement_subscription_put("op-s", "sub-1", MEMBER, ["ops.alert"])
+    assert "delivery" not in calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_a_subscription_reads_its_delivery():
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/subscriptions/get": {
+        "subscription": {**SUBSCRIPTION, "delivery": {"await_handling": False}}, "marker": None}})
+    subscription = (await handle.announcement_subscription_get("sub-1")).subscription
+    assert subscription.delivery == {"await_handling": False} and subscription.await_handling is False
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/subscriptions/get": {
+        "subscription": SUBSCRIPTION, "marker": None}})
+    subscription = (await handle.announcement_subscription_get("sub-1")).subscription
+    assert subscription.delivery is None and subscription.await_handling is None
+
+
+@pytest.mark.asyncio
+async def test_member_get_reads_its_handling():
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/members/get": {**MEMBER_READ, "handling": HANDLING_READ}})
+    handling = (await handle.announcement_member_get(MEMBER)).handling
+    assert (handling.pending, handling.handled, handling.handled_unverified) == (1, 4, 2)
+    assert (handling.unhandled, handling.held, handling.oldest_unhandled_at_ms) == (1, 3, 70)
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/members/get": {
+        **MEMBER_READ, "handling": {**HANDLING_READ, "oldest_unhandled_at_ms": None}}})
+    assert (await handle.announcement_member_get(MEMBER)).handling.oldest_unhandled_at_ms is None
+    handle, _ = make_mock_mob_handle({"meta/mob_announcements/members/get": MEMBER_READ})
+    assert (await handle.announcement_member_get(MEMBER)).handling is None
+
+
+def test_status_reads_the_handling_counts():
+    from meerkat_meta import StatusResult
+    announcements = {"sources": {"active": 1, "paused": 0, "failing": 0, "stale": 0},
+                     "members": {"suspended": 0, "unhandled_held": 5},
+                     "handling": {"pending": 2, "handled": 9, "handled_unverified": 1, "unhandled": 3},
+                     "escalations": {"open": 1, "last_event_cursor": 4}}
+    data = {"contract_version": "0.5.0", "running": True, "loaded_modules": [], "mob_announcements": announcements}
+    counts = StatusResult.from_dict(data).mob_announcements
+    assert counts.members["unhandled_held"] == 5
+    assert counts.handling == {"pending": 2, "handled": 9, "handled_unverified": 1, "unhandled": 3}
+    older = {key: value for key, value in announcements.items() if key != "handling"}
+    assert StatusResult.from_dict({**data, "mob_announcements": older}).mob_announcements.handling == {}
+
+
+@pytest.mark.parametrize("cause", ["unhandled", "handled_unverified"])
+def test_a_handling_cause_reads_as_sent(cause):
+    from meerkat_meta import AnnouncementEscalation
+    escalation = AnnouncementEscalation.from_dict(
+        {**ESCALATION, "cause": cause, "subject": {"kind": "member", "member": MEMBER}})
+    assert (escalation.cause, escalation.subject_kind) == (cause, "member")
+
+
+def test_the_member_handling_name_is_exported():
+    import meerkat_meta
+    assert "AnnouncementMemberHandling" in meerkat_meta.__all__
