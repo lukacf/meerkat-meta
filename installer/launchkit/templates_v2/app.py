@@ -1114,10 +1114,15 @@ def public_meta_package(spec):
     """Whether this package installed the public Meta release (0.9 on).
 
     A shell-started 0.8 package keeps MobKit; a selected product never starts
-    from the shell, so its startup owner supplies its own Meta runtime.
+    from the shell, so its startup owner supplies its own Meta runtime. Every
+    compiled package carries the pin; a spec without one keeps MobKit, as
+    before the pin chose the runtime.
     """
+    version = spec.get("mobkitVersion")
+    if version is None:
+        return False
     try:
-        return tuple(int(part) for part in str(spec.get("mobkitVersion")).split(".")[:2]) >= (0, 9)
+        return tuple(int(part) for part in str(version).split(".")[:2]) >= (0, 9)
     except ValueError:
         raise ValueError("The package names an invalid runtime version.") from None
 
@@ -1353,8 +1358,9 @@ async def run(spec, args, *, application_startup=None):
         check(spec)
     # A shell-started package runs the release it installed: MobKit for 0.8,
     # the public Meta release from 0.9 on. A selected startup is always Meta.
-    meta = application_startup is not None or public_meta_package(spec)
-    if application_startup is None and meta and args.activate_revision is not None:
+    shell_meta = application_startup is None and public_meta_package(spec)
+    meta = application_startup is not None or shell_meta
+    if shell_meta and args.activate_revision is not None:
         raise ValueError(ACTIVATION_UNAVAILABLE)
     if application_startup is None:
         if meta:
@@ -1450,8 +1456,9 @@ async def run(spec, args, *, application_startup=None):
             path = ROOT / relative
             if path.is_file():
                 setattr(config, field, str(path))
-        return await connect_application_runtime(config, application, application_startup=application_startup,
-            meta=meta)
+        if shell_meta:
+            return await connect_application_runtime(config, application, meta=True)
+        return await connect_application_runtime(config, application, application_startup=application_startup)
 
     runtime = None
     try:
