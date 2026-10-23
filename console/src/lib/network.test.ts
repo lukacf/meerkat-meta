@@ -898,7 +898,7 @@ test("an unauthenticated console send is a typed rejection on the JSON and multi
         const failure = classifyConsoleSendFailure(error);
         assert.equal(failure.state, "definitely-rejected");
         assert.equal(failure.kind, "unauthenticated");
-        assert.match(failure.message, /^Not authorized from this network \(401\)\./);
+        assert.match(failure.message, /^Sign-in required \(401\)\./);
         return true;
       });
     }
