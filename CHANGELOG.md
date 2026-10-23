@@ -56,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Rust code that builds either handle as a struct literal adds the field
   (`Vec::new()` for none); `from_open_result` and `new` carry it from
   Meerkat's `LiveOpenResult`. On the wire the key is left out when empty.
+  Older Meta crates, older Python and TypeScript SDKs and an outdated
+  embedded console refuse a live channel handle that carries `advisories`,
+  which is only sent after a hook refuses a staged prompt; upgrade clients
+  together with the gateway.
 
 ### Added
 
