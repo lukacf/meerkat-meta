@@ -3960,9 +3960,9 @@ class DeploymentService:
                 require_available_console_port(installed_console_port(destination, json.loads(files["deployment.json"][0])["port"]))
                 journal(directory, "Restart admitted for this owned background service.", status="starting",
                         runtime_pid=None, console_url=None, bootstrap=None,
-                        # Preserve the old Restore lifetime's confirmed cleanup
-                        # until the actual manager worker publishes its successor.
-                        **({} if service_current is not None else {"service_cleanup_confirmed": False}),
+                        # Preserve the old lifetime's confirmed cleanup until
+                        # the actual manager worker publishes its successor;
+                        # a successor that never registers then stops at once.
                         startup_attempt_id=None, startup_console_health=None, startup_port_observation=None,
                         health="unknown", health_checked_at=None, process_live=False)
                 destination_current()

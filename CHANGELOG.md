@@ -664,6 +664,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   The reason now says so and suggests a folder such as `~/MetaForge`, or
   **While Forge is open**. Forge does not look inside those folders to decide
   this and changes no privacy setting.
+- A background service that ended before it started the application, such
+  as one whose Python stalled while starting, now stops at once and no
+  longer blocks a restart. Its Stop waited 60 seconds for a cleanup report
+  that only a started service sends, then reported the cleanup as
+  unconfirmed. After a restart whose new service never started, every later
+  Stop ended that way and every restart was refused. Forge settles such a
+  Stop only when the service manager reports the service gone, the service
+  never registered, and no process the manager reported for it remains. A
+  service that started still waits for its own cleanup report.
 
 ### Known limitations
 

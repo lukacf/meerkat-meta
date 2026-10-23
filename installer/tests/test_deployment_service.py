@@ -625,6 +625,147 @@ async def test_unconfirmed_cleanup_never_allows_replacement(owned, monkeypatch):
     assert read_receipt(directory)["status"] == "interrupted"
 
 
+NEVER_STARTED = ("The background service is stopped. It ended before it started this application, so there was "
+    "nothing to clean up. Installed files and saved records are preserved.")
+
+
+def ended_pid():
+    """The PID of a process that has exited and been reaped."""
+    import subprocess
+    process = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
+    process.wait()
+    return process.pid
+
+
+def admitted_unregistered(directory):
+    # The installer's handoff before the unit's own worker registers its lifetime.
+    update_receipt(directory, status="starting", phase="service", service_cleanup_confirmed=False)
+    stored = read_receipt(directory)
+    assert stored.get("service_supervisor_pid") is None and stored.get("service_instance_id") is None
+
+
+async def test_stop_settles_a_lifetime_that_ended_before_it_registered(owned, monkeypatch):
+    import launchkit.deployment_service as module
+    service, manager, directory, _ = owned
+    monkeypatch.setattr(module, "SERVICE_TIMEOUT", 2)
+    admitted_unregistered(directory)
+    # The unit's Python never got past start-up, then the stop removed it.
+    manager.observation = {"loaded": True, "pid": ended_pid(), "state": "running"}
+    stopped = await service.action(service.guide.identity, directory.name, "stop")
+    assert (stopped["status"], stopped["detail"]) == ("stopped", NEVER_STARTED)
+    stored = read_receipt(directory)
+    assert stored["status"] == "stopped" and stored["service_cleanup_confirmed"] is True
+    assert stored.get("service_supervisor_pid") is None and stored.get("service_instance_id") is None
+    assert stored["process_live"] is False and stored["runtime_pid"] is None
+
+
+async def test_stop_of_a_unit_that_reported_no_process_settles_as_before(owned, monkeypatch):
+    import launchkit.deployment_service as module
+    service, manager, directory, _ = owned
+    monkeypatch.setattr(module, "SERVICE_TIMEOUT", 2)
+    admitted_unregistered(directory)
+    manager.observation = {"loaded": True, "pid": None, "state": "waiting"}
+
+    def no_probe(pid):
+        pytest.fail("A stop without a reported process needs no process check")
+    monkeypatch.setattr(module, "service_process_absent", no_probe, raising=False)
+    stopped = await service.action(service.guide.identity, directory.name, "stop")
+    assert stopped["status"] == "stopped" and stopped["detail"] != NEVER_STARTED
+    assert read_receipt(directory)["service_cleanup_confirmed"] is False
+
+
+async def test_stop_after_a_restart_whose_successor_never_registered(owned, monkeypatch):
+    import launchkit.deployment_service as module
+    service, manager, directory, _ = owned
+    monkeypatch.setattr(module, "SERVICE_TIMEOUT", 2)
+    manager.observation = {"loaded": True, "pid": 4567, "state": "running"}
+    update_receipt(directory, status="running", service_supervisor_pid=4567, service_instance_id="generation-one",
+                   service_cleanup_confirmed=False)
+    manager.cleanup = directory
+    restarted = await service.action(service.guide.identity, directory.name, "restart")
+    assert restarted["status"] == "starting"
+    # The successor's Python stalls before it registers, so it never confirms.
+    manager.cleanup = None
+    manager.observation = {"loaded": True, "pid": ended_pid(), "state": "running"}
+    stopped = await service.action(service.guide.identity, directory.name, "stop")
+    assert stopped["status"] == "stopped"
+    stored = read_receipt(directory)
+    assert (stored["service_supervisor_pid"], stored["service_instance_id"]) == (4567, "generation-one")
+    assert stored["service_cleanup_confirmed"] is True
+    again = await service.action(service.guide.identity, directory.name, "restart")
+    assert again["status"] == "starting"
+
+
+async def test_stop_of_a_registered_lifetime_without_cleanup_stays_interrupted(owned, monkeypatch):
+    import launchkit.deployment_service as module
+    _, manager, directory, _ = owned
+    monkeypatch.setattr(module, "SERVICE_TIMEOUT", 0.5)
+    manager.observation = {"loaded": True, "pid": ended_pid(), "state": "running"}
+    update_receipt(directory, status="running", service_supervisor_pid=manager.observation["pid"],
+                   service_instance_id="generation-one", service_cleanup_confirmed=False)
+    stopped = await stop_background(directory, manager)
+    assert stopped["status"] == "interrupted" and stopped["service_cleanup_confirmed"] is False
+
+
+async def test_stop_keeps_custody_while_the_unit_is_still_loaded(owned, monkeypatch):
+    import launchkit.deployment_service as module
+    _, manager, directory, _ = owned
+    monkeypatch.setattr(module, "SERVICE_TIMEOUT", 0.5)
+    admitted_unregistered(directory)
+    manager.observation = {"loaded": True, "pid": ended_pid(), "state": "running"}
+
+    async def stop_without_effect(service):
+        manager.calls.append(("stop", service["label"]))
+        manager.observation = {"loaded": True, "pid": None, "state": "waiting"}
+        return deepcopy(manager.observation)
+    manager.stop = stop_without_effect
+    stopped = await stop_background(directory, manager)
+    assert stopped["status"] == "interrupted" and stopped["service_cleanup_confirmed"] is False
+
+
+async def test_stop_keeps_custody_when_a_registration_appears_during_stop(owned, monkeypatch):
+    import launchkit.deployment_service as module
+    _, manager, directory, _ = owned
+    monkeypatch.setattr(module, "SERVICE_TIMEOUT", 0.5)
+    admitted_unregistered(directory)
+    pid = ended_pid()
+    manager.observation = {"loaded": True, "pid": pid, "state": "running"}
+    stop = manager.stop
+
+    async def registered_then_stopped(service):
+        update_receipt(directory, service_supervisor_pid=pid, service_instance_id=str(uuid.uuid4()),
+                       service_cleanup_confirmed=False)
+        return await stop(service)
+    manager.stop = registered_then_stopped
+    stopped = await stop_background(directory, manager)
+    assert stopped["status"] == "interrupted" and stopped["service_cleanup_confirmed"] is False
+
+
+async def test_stop_keeps_custody_while_a_reported_pid_is_alive(owned, monkeypatch):
+    import launchkit.deployment_service as module
+    _, manager, directory, _ = owned
+    monkeypatch.setattr(module, "SERVICE_TIMEOUT", 0.5)
+    admitted_unregistered(directory)
+    # A live PID (this test process) may be the unit's or a reused one.
+    manager.observation = {"loaded": True, "pid": os.getpid(), "state": "running"}
+    stopped = await stop_background(directory, manager)
+    assert stopped["status"] == "interrupted" and stopped["service_cleanup_confirmed"] is False
+
+
+async def test_stop_keeps_custody_for_a_supervisor_without_its_frozen_lifetime_record(owned, monkeypatch):
+    import launchkit.deployment_service as module
+    _, manager, directory, _ = owned
+    monkeypatch.setattr(module, "SERVICE_TIMEOUT", 0.5)
+    admitted_unregistered(directory)
+    receipt = read_receipt(directory)
+    service = {key: value for key, value in receipt["service"].items() if key != "update_startup_protocol"}
+    update_receipt(directory, service=service)
+    monkeypatch.setattr(module, "verify_service", lambda directory, receipt: service)
+    manager.observation = {"loaded": True, "pid": ended_pid(), "state": "running"}
+    stopped = await stop_background(directory, manager)
+    assert stopped["status"] == "interrupted" and stopped["service_cleanup_confirmed"] is False
+
+
 async def test_options_are_read_only_and_background_selection_explicit(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     guide = Guide()

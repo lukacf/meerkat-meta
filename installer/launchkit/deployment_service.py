@@ -919,30 +919,80 @@ async def background_status(directory, manager):
         return {**observed, "process_live": False, "health": "unknown", "console_url": None}
 
 
+NEVER_STARTED_STOP = ("The background service is stopped. It ended before it started this application, so there was "
+    "nothing to clean up. Installed files and saved records are preserved.")
+
+
+def _unregistered_lifetime(service, receipt):
+    """No worker of this exact unit registered a lifetime.
+
+    A Forge supervisor registers its PID and instance (deployment_worker run)
+    before it creates a Supervisor or starts any native runtime. Without that
+    record, a unit that has ended never started one. A frozen supervisor
+    without the lifetime protocol record keeps today's custody.
+    """
+    current = receipt.get("service")
+    return (receipt.get("service_supervisor_pid") is None and receipt.get("service_instance_id") is None
+            and isinstance(current, dict) and service_binding(current) == service_binding(service)
+            and type(service.get("update_startup_protocol")) is int
+            and service.get("update_worker_sha256") == service.get("host_files", {}).get("launchkit/deployment_worker.py"))
+
+
+def service_process_absent(pid):
+    """True only when no process has this PID; a live, foreign or reused PID keeps custody."""
+    if type(pid) is not int or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 async def stop_background(directory, manager):
-    """Stop only the verified UUID unit and require its own native cleanup receipt."""
+    """Stop only the verified UUID unit and require its own native cleanup receipt.
+
+    A process the manager reported that never registered its lifetime cannot
+    send that receipt. Such a stop settles at once when the manager reports
+    the unit gone, the re-read receipt still has no registration and every PID
+    the manager reported during this stop is gone: it started no native runtime.
+    """
     from .deployment import journal, read_receipt
     directory = Path(directory)
     receipt = read_receipt(directory)
     service = verify_service(directory, receipt)
     observation = await manager.observe(service)
     instance = receipt.get("service_instance_id")
+    unregistered = _unregistered_lifetime(service, receipt)
+    reported = {observation["pid"]} if observation.get("pid") else set()
     had_supervisor = bool(observation.get("pid") or receipt.get("service_supervisor_pid"))
     journal(directory, "Stopping the owned operating-system service and its native runtime.", status="stopping",
             console_url=None)
     await manager.stop(service)
     deadline = asyncio.get_running_loop().time() + SERVICE_TIMEOUT
+    stopped_summary = {"manager": service["manager"], "state": "stopped", "pid": None, "definition_verified": True}
     while True:
         current = read_receipt(directory)
         observation = await manager.observe(service)
+        if observation.get("pid"):
+            reported.add(observation["pid"])
         cleaned = (not had_supervisor or current.get("service_cleanup_confirmed") is True
                    and current.get("service_instance_id") == instance)
         if manager_stopped(observation) and cleaned:
             return journal(directory, "The operating-system service is stopped. Installed files and native state are preserved.",
                            status="stopped", runtime_pid=None, console_url=None, process_live=False,
                            health="unknown",
-                           service_observation={**observation, "owned": True}, service={**service, "public_summary": {
-                               "manager": service["manager"], "state": "stopped", "pid": None, "definition_verified": True}})
+                           service_observation={**observation, "owned": True}, service={**service, "public_summary": stopped_summary})
+        # A reported process that never registered cannot report cleanup.
+        if (unregistered and manager_stopped(observation)
+                and _unregistered_lifetime(service, read_receipt(directory))
+                and all(service_process_absent(pid) for pid in reported)):
+            return journal(directory, NEVER_STARTED_STOP, status="stopped", runtime_pid=None, console_url=None,
+                           process_live=False, health="unknown", service_cleanup_confirmed=True,
+                           service_observation={**observation, "owned": True},
+                           service={**service, "public_summary": stopped_summary})
         if asyncio.get_running_loop().time() >= deadline:
             return journal(directory, "The service manager was stopped, but the previous native runtime did not confirm cleanup. No replacement will be started.",
                            status="interrupted", console_url=None, process_live=False, health="unknown")
