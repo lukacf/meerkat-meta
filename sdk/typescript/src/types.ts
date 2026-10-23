@@ -4861,6 +4861,38 @@ export interface AnnouncementGap {
 }
 
 /**
+ * What became of a delivered batch's turn, as Meta read it, and what it did
+ * about it. `cause` is why the turn did not complete (the receipt's
+ * completion type, or the abandon reason when there is none). `redelivered`
+ * counts the items owed again with a notice, `held` the items held for an
+ * operator, and `dismissed` the held items an operator settled.
+ */
+export interface AnnouncementBatchHandling {
+  readonly state: "pending" | "handled" | "handled_unverified" | "unhandled" | "unknown" | (string & {});
+  readonly cause: string | null;
+  readonly redelivered: number;
+  readonly held: number;
+  readonly dismissed: number;
+  readonly readAtMs: number;
+}
+
+export function parseAnnouncementBatchHandling(raw: unknown): AnnouncementBatchHandling {
+  const d = asRecord(raw);
+  return {
+    state: String(d.state ?? ""),
+    cause: optionalString(d.cause),
+    redelivered: Number(d.redelivered ?? 0),
+    held: Number(d.held ?? 0),
+    dismissed: Number(d.dismissed ?? 0),
+    readAtMs: Number(d.read_at_ms ?? 0),
+  };
+}
+
+function parseOptionalBatchHandling(raw: unknown): AnnouncementBatchHandling | null {
+  return wireRecordOrNull(raw) === null ? null : parseAnnouncementBatchHandling(raw);
+}
+
+/**
  * An immutable delivery batch for one member. `state` is the delivery
  * state's tag and `stateDetail` the full state object as sent. `route` is
  * `"local"`, `"child"`, `"peer"` or newer. `handling` is `null` from a
@@ -4890,7 +4922,8 @@ export interface AnnouncementBatch {
     | "committed_unconfirmed"
     | (string & {});
   readonly stateDetail: Readonly<Record<string, unknown>>;
-  readonly handling: Readonly<Record<string, unknown>> | null;
+  /** What became of its turn: `null` until the batch is admitted, and from a gateway that does not report it. */
+  readonly handling: AnnouncementBatchHandling | null;
   readonly sealedAtMs: number;
   readonly updatedAtMs: number;
 }
@@ -4920,7 +4953,7 @@ export function parseAnnouncementBatch(raw: unknown): AnnouncementBatch {
     successor: optionalString(d.successor),
     state: String(state.state ?? ""),
     stateDetail: state,
-    handling: wireRecordOrNull(d.handling),
+    handling: parseOptionalBatchHandling(d.handling),
     sealedAtMs: Number(d.sealed_at_ms ?? 0),
     updatedAtMs: Number(d.updated_at_ms ?? 0),
   };
@@ -4938,6 +4971,8 @@ export interface AnnouncementDeliveryObservation {
   readonly nativeStatus: string;
   readonly input: Readonly<Record<string, unknown>> | null;
   readonly marker: AnnouncementSuspendMarker | null;
+  /** What became of the batch's turn: `null` until it is admitted. */
+  readonly handling: AnnouncementBatchHandling | null;
 }
 
 export function parseAnnouncementDeliveryObservation(raw: unknown): AnnouncementDeliveryObservation {
@@ -4949,6 +4984,7 @@ export function parseAnnouncementDeliveryObservation(raw: unknown): Announcement
     nativeStatus: String(native.status ?? ""),
     input: wireRecordOrNull(d.input),
     marker: parseOptionalSuspendMarker(d.marker),
+    handling: parseOptionalBatchHandling(d.handling),
   };
 }
 
@@ -5189,7 +5225,9 @@ export function parseSourceAdvanceResult(raw: unknown): SourceAdvanceResult {
 
 /**
  * One counted audit entry: every refusal or withholding of one member by one
- * generation of one source, for one reason.
+ * generation of one source, for one reason, and every hold, redelivery or
+ * dismissal of an item whose turn ended unhandled. `sourceId` and
+ * `generation` are `null` for a plain announcement.
  */
 export interface AnnouncementAuditEntry {
   readonly id: number;
@@ -5201,16 +5239,19 @@ export interface AnnouncementAuditEntry {
     | "items_released"
     | "expired_while_held"
     | "delivered_across_revocation"
+    | "redelivered"
+    | "dismissed"
     | (string & {});
   readonly mobId: string;
-  readonly sourceId: string;
-  readonly generation: number;
+  readonly sourceId: string | null;
+  readonly generation: number | null;
   readonly member: AnnouncementMember;
   readonly reason:
     | "audience_not_covered"
     | "no_direct_route"
     | "route_overlap"
     | "route_conflict"
+    | "unhandled"
     | (string & {});
   readonly count: number;
   readonly firstAtMs: number;
@@ -5224,8 +5265,8 @@ export function parseAnnouncementAuditEntry(raw: unknown): AnnouncementAuditEntr
     atMs: Number(d.at_ms ?? 0),
     action: String(d.action ?? ""),
     mobId: String(d.mob_id ?? ""),
-    sourceId: String(d.source_id ?? ""),
-    generation: Number(d.generation ?? 0),
+    sourceId: optionalString(d.source_id),
+    generation: optionalNumber(d.generation),
     member: parseAnnouncementMember(d.member),
     reason: String(d.reason ?? ""),
     count: Number(d.count ?? 0),

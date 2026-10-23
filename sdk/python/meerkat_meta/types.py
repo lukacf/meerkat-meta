@@ -2842,6 +2842,39 @@ class AnnouncementBatchItem:
 
 
 @dataclass(frozen=True)
+class AnnouncementBatchHandling:
+    """What became of a delivered batch's turn, as Meta read it, and what it
+    did about it.
+
+    ``state`` is ``"pending"``, ``"handled"``, ``"handled_unverified"``,
+    ``"unhandled"``, ``"unknown"`` or newer. ``cause`` is why the turn did not
+    complete (the receipt's completion type, or the abandon reason when there
+    is none). ``redelivered`` counts the items owed again with a notice,
+    ``held`` the items held for an operator, and ``dismissed`` the held items
+    an operator settled.
+    """
+
+    state: str
+    read_at_ms: int
+    cause: str | None = None
+    redelivered: int = 0
+    held: int = 0
+    dismissed: int = 0
+
+    @classmethod
+    def from_dict(cls, data: Any) -> AnnouncementBatchHandling:
+        d = _wire_dict(data)
+        return cls(
+            state=str(d.get("state", "")),
+            read_at_ms=_coerce_int(d.get("read_at_ms")),
+            cause=_wire_str_or_none(d.get("cause")),
+            redelivered=_coerce_int(d.get("redelivered")),
+            held=_coerce_int(d.get("held")),
+            dismissed=_coerce_int(d.get("dismissed")),
+        )
+
+
+@dataclass(frozen=True)
 class AnnouncementBatch:
     """An immutable delivery batch for one member.
 
@@ -2850,8 +2883,8 @@ class AnnouncementBatch:
     through) and ``state_detail`` the full state object. ``gaps`` are the
     announcements owed to the member that this batch reports as not
     delivered (``{"mob_id", "count", "reason"}``). ``route`` is ``"local"``,
-    ``"child"``, ``"peer"`` or newer. ``handling`` is ``None`` from a gateway
-    that does not report it.
+    ``"child"``, ``"peer"`` or newer. ``handling`` is ``None`` until the batch
+    is admitted, and from a gateway that does not report it.
     """
 
     id: str
@@ -2867,13 +2900,14 @@ class AnnouncementBatch:
     gaps: tuple[dict[str, Any], ...] = ()
     predecessor: str | None = None
     successor: str | None = None
-    handling: dict[str, Any] | None = None
+    handling: AnnouncementBatchHandling | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> AnnouncementBatch:
         d = _wire_dict(data)
         state = _wire_dict(d.get("state"))
         items = d.get("items")
+        handling = d.get("handling")
         return cls(
             id=str(d.get("id", "")),
             member=AnnouncementMember.from_dict(d.get("member")),
@@ -2890,7 +2924,7 @@ class AnnouncementBatch:
             gaps=_wire_dicts(d.get("gaps")),
             predecessor=_wire_str_or_none(d.get("predecessor")),
             successor=_wire_str_or_none(d.get("successor")),
-            handling=_wire_dict_or_none(d.get("handling")),
+            handling=AnnouncementBatchHandling.from_dict(handling) if isinstance(handling, dict) else None,
         )
 
 
@@ -2906,18 +2940,21 @@ class AnnouncementDeliveryObservation:
     native_status: str
     input: dict[str, Any] | None = None
     marker: AnnouncementSuspendMarker | None = None
+    handling: AnnouncementBatchHandling | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> AnnouncementDeliveryObservation:
         d = _wire_dict(data)
         native = _wire_dict(d.get("native"))
         marker = d.get("marker")
+        handling = d.get("handling")
         return cls(
             batch=AnnouncementBatch.from_dict(d.get("batch")),
             native=native,
             native_status=str(native.get("status", "")),
             input=_wire_dict_or_none(d.get("input")),
             marker=AnnouncementSuspendMarker.from_dict(marker) if isinstance(marker, dict) else None,
+            handling=AnnouncementBatchHandling.from_dict(handling) if isinstance(handling, dict) else None,
         )
 
 
@@ -3243,21 +3280,23 @@ class SourceAdvanceResult:
 @dataclass(frozen=True)
 class AnnouncementAuditEntry:
     """One counted audit entry: every refusal or withholding of one member
-    by one generation of one source, for one reason.
+    by one generation of one source, for one reason, and every hold,
+    redelivery or dismissal of an item whose turn ended unhandled.
 
     ``action`` is ``"subscription_refused"``, ``"capture_withheld"``,
     ``"items_held"``, ``"items_released"``, ``"expired_while_held"``,
-    ``"delivered_across_revocation"`` or newer; ``reason`` is
-    ``"audience_not_covered"``, ``"no_direct_route"``, ``"route_overlap"``,
-    ``"route_conflict"`` or newer.
+    ``"delivered_across_revocation"``, ``"redelivered"``, ``"dismissed"`` or
+    newer; ``reason`` is ``"audience_not_covered"``, ``"no_direct_route"``,
+    ``"route_overlap"``, ``"route_conflict"``, ``"unhandled"`` or newer.
+    ``source_id`` and ``generation`` are ``None`` for a plain announcement.
     """
 
     id: int
     at_ms: int
     action: str
     mob_id: str
-    source_id: str
-    generation: int
+    source_id: str | None
+    generation: int | None
     member: AnnouncementMember
     reason: str
     count: int
@@ -3272,8 +3311,8 @@ class AnnouncementAuditEntry:
             at_ms=_coerce_int(d.get("at_ms")),
             action=str(d.get("action", "")),
             mob_id=str(d.get("mob_id", "")),
-            source_id=str(d.get("source_id", "")),
-            generation=_coerce_int(d.get("generation")),
+            source_id=_wire_str_or_none(d.get("source_id")),
+            generation=_wire_int_or_none(d.get("generation")),
             member=AnnouncementMember.from_dict(d.get("member")),
             reason=str(d.get("reason", "")),
             count=_coerce_int(d.get("count")),

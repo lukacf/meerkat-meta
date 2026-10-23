@@ -321,6 +321,8 @@ import {
   parseAnnouncementSourceView,
   parseSourceAdvanceResult,
   parseAnnouncementAuditEntry,
+  parseAnnouncementBatchHandling,
+  type AnnouncementBatchHandling,
   type AnnounceResult,
   type Announcement,
   type AnnouncementMember,
@@ -3984,6 +3986,25 @@ export class MobHandle {
     return parseAnnouncementDeliveryObservation(
       await this._announcementRpc("deliveries/reconcile", { batch_id: batchId }),
     );
+  }
+
+  /**
+   * Owe a batch's held items again, for the member's next batch, after a
+   * fresh coverage check; only a batch whose handling is `unhandled` with
+   * held items (`not_held` otherwise).
+   */
+  async announcementDeliveryRedeliver(operationId: string, batchId: string): Promise<AnnouncementBatchHandling> {
+    const raw = await this._announcementRpc("deliveries/redeliver", { operation_id: operationId, batch_id: batchId });
+    return parseAnnouncementBatchHandling(raw.handling);
+  }
+
+  /**
+   * Settle a batch's held items as handled by an operator; only a batch
+   * whose handling is `unhandled` with held items (`not_held` otherwise).
+   */
+  async announcementDeliveryDismiss(operationId: string, batchId: string): Promise<AnnouncementBatchHandling> {
+    const raw = await this._announcementRpc("deliveries/dismiss", { operation_id: operationId, batch_id: batchId });
+    return parseAnnouncementBatchHandling(raw.handling);
   }
 
   /**

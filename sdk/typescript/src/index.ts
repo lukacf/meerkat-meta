@@ -398,6 +398,7 @@ export {
   parseAnnouncementSourceView,
   parseSourceAdvanceResult,
   parseAnnouncementAuditEntry,
+  parseAnnouncementBatchHandling,
 } from "./types.js";
 
 export type {
@@ -418,6 +419,7 @@ export type {
   AnnouncementSuspendMarker,
   AnnouncementSubscriptionView,
   AnnouncementBatchItem,
+  AnnouncementBatchHandling,
   AnnouncementGap,
   AnnouncementBatch,
   AnnouncementDeliveryObservation,

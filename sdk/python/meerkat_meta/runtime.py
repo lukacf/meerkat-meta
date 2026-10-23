@@ -171,6 +171,7 @@ from .types import (
     AnnouncementSubscriptionChange,
     AnnouncementSubscriptionView,
     SourceAdvanceResult,
+    AnnouncementBatchHandling,
 )
 
 from ._client import _build_request as _rpc_request
@@ -4216,6 +4217,24 @@ class MobHandle:
         that evidence."""
         raw = await self._announcement_rpc("deliveries/reconcile", {"batch_id": batch_id})
         return AnnouncementDeliveryObservation.from_dict(raw)
+
+    async def announcement_delivery_redeliver(self, operation_id: str, batch_id: str) -> AnnouncementBatchHandling:
+        """Owe a batch's held items again, for the member's next batch, after
+        a fresh coverage check; only a batch whose handling is ``unhandled``
+        with held items (``not_held`` otherwise)."""
+        raw = await self._announcement_rpc(
+            "deliveries/redeliver", {"operation_id": operation_id, "batch_id": batch_id}
+        )
+        return AnnouncementBatchHandling.from_dict(raw.get("handling"))
+
+    async def announcement_delivery_dismiss(self, operation_id: str, batch_id: str) -> AnnouncementBatchHandling:
+        """Settle a batch's held items as handled by an operator; only a batch
+        whose handling is ``unhandled`` with held items (``not_held``
+        otherwise)."""
+        raw = await self._announcement_rpc(
+            "deliveries/dismiss", {"operation_id": operation_id, "batch_id": batch_id}
+        )
+        return AnnouncementBatchHandling.from_dict(raw.get("handling"))
 
     async def announcement_source_put(
         self,
