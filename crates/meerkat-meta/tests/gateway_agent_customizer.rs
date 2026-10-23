@@ -8,8 +8,9 @@
 //! answer that adds or drops a customizer, fails init before the identity
 //! bootstrap, and a gateway without an identity roster never asks. A host that
 //! needs a customizer refuses `None` with `AgentCustomizerRequired`, whose text
-//! names what to configure. Each case is a separate gateway process over real
-//! stdio, answering the SDK callbacks itself.
+//! names what to configure. Each build that ran the customizer tells it
+//! `after_create` once, best-effort. Each case is a separate gateway process
+//! over real stdio, answering the SDK callbacks itself.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -61,6 +62,10 @@ const DEFAULT_TEST: &str = "a_host_without_the_hook_keeps_the_composed_customize
 const REFUSE_TEST: &str = "a_refused_customizer_composition_fails_init_closed";
 const SHAPE_TEST: &str = "a_host_can_neither_add_nor_drop_the_agent_customizer";
 const REQUIRE_TEST: &str = "a_host_that_needs_a_customizer_names_what_to_configure";
+const AFTER_CREATE_TEST: &str = "each_customized_build_tells_after_create_once";
+const AFTER_CREATE_FAILS_TEST: &str = "a_failing_after_create_leaves_the_build_standing";
+/// What the runtime logs when a customizer's `after_create` fails.
+const AFTER_CREATE_WARNING: &str = "the agent customizer's after_create failed";
 
 fn append(record: &Path, line: &str) {
     let mut file = std::fs::OpenOptions::new()
@@ -116,7 +121,16 @@ impl AgentCustomizer for Wrapper {
         session_id: &meerkat_core::types::SessionId,
         context: &SessionCreatedContext,
     ) -> Result<(), CustomizerError> {
-        self.inner.after_create(identity, session_id, context).await
+        let told = self.inner.after_create(identity, session_id, context).await;
+        append(
+            &self.record,
+            &format!(
+                "after_create identity={identity} session={session_id} wrapper={:p} inner={}",
+                self,
+                if told.is_ok() { "ok" } else { "err" }
+            ),
+        );
+        told
     }
 }
 
@@ -335,9 +349,10 @@ fn serve_if_host_process() {
 }
 
 /// One gateway host process, driven through its init and, when that settles
-/// ready with an identity roster, a reset of the roster member.
+/// ready with an identity roster, member operations on the roster member.
 struct Run {
-    /// The record: the host's lines and the driver's [`SETTLED`] marker.
+    /// The record: the host's lines, the driver's [`SETTLED`] marker and a
+    /// `driver op <method>` line before each operation.
     lines: Vec<String>,
     /// Every message the gateway wrote.
     seen: Vec<Value>,
@@ -345,8 +360,14 @@ struct Run {
     /// settled, and after it.
     bootstrap_builds: usize,
     later_builds: usize,
+    /// The sessions the SDK customizer was told of (`after_create`), in order.
+    sdk_after_create: Vec<String>,
+    /// Each operation's response, by method.
+    responses: Vec<(String, Value)>,
     /// The reset's response.
     reset: Option<Value>,
+    /// The gateway host process's stderr.
+    stderr: String,
 }
 
 impl Run {
@@ -380,11 +401,47 @@ impl Run {
             .filter(|line| line.starts_with(prefix))
             .collect()
     }
+
+    fn response(&self, method: &str) -> &Value {
+        self.responses
+            .iter()
+            .find(|(sent, _)| sent == method)
+            .map(|(_, response)| response)
+            .unwrap_or_else(|| panic!("{method} answered: {:?}", self.responses))
+    }
+
+    /// The record position of a line.
+    fn at(&self, line: &str) -> usize {
+        self.lines
+            .iter()
+            .position(|recorded| recorded == line)
+            .unwrap_or_else(|| panic!("{line:?} recorded: {:?}", self.lines))
+    }
+
+    /// The wrapper's `after_create` calls: record position, session, and
+    /// whether the wrapped customizer accepted it.
+    fn after_creates(&self) -> Vec<(usize, String, String)> {
+        self.lines
+            .iter()
+            .enumerate()
+            .filter_map(|(at, line)| {
+                let rest = line.strip_prefix("after_create ")?;
+                let field = |name: &str| {
+                    rest.split(' ')
+                        .find_map(|part| part.strip_prefix(name))
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                Some((at, field("session="), field("inner=")))
+            })
+            .collect()
+    }
 }
 
 /// The SDK side of the gateway's callback bridge: the roster holds one
-/// member, and the customizer gives it one callback tool.
-fn answer_callback(method: &str, params: &Value) -> Result<Value, String> {
+/// member, the customizer gives it one callback tool, and its `after_create`
+/// succeeds unless `fail_after_create`.
+fn answer_callback(method: &str, params: &Value, fail_after_create: bool) -> Result<Value, String> {
     match method {
         "callback/roster_provider/roster" => {
             Ok(json!([{ "identity": IDENTITY, "profile": "worker" }]))
@@ -398,16 +455,35 @@ fn answer_callback(method: &str, params: &Value) -> Result<Value, String> {
             }]);
             Ok(draft)
         }
+        "callback/agent_customizer/after_create" if fail_after_create => {
+            Err("after_create refused by the test SDK".to_string())
+        }
         "callback/agent_customizer/after_create" => Ok(Value::Null),
         other => Err(format!("no handler for {other}")),
     }
 }
 
 /// Drive the `mode` host as a child process of `test`, with an identity roster
-/// (`roster`) and an SDK customizer (`customizer`) registered at init.
+/// (`roster`) and an SDK customizer (`customizer`) registered at init, and
+/// reset the member once the init settles ready.
 fn drive(test: &str, mode: &str, roster: bool, customizer: bool) -> Run {
+    drive_ops(test, mode, roster, customizer, &["meta/reset"], false)
+}
+
+/// [`drive`] with the member operations `ops` run in order once the init
+/// settles ready, and the SDK's `after_create` failed when
+/// `fail_after_create`.
+fn drive_ops(
+    test: &str,
+    mode: &str,
+    roster: bool,
+    customizer: bool,
+    ops: &[&str],
+    fail_after_create: bool,
+) -> Run {
     let dir = tempfile::tempdir().unwrap();
     let record = dir.path().join("record");
+    let stderr_path = dir.path().join("stderr");
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture"])
         .env(HOST_PROCESS, mode)
@@ -417,6 +493,7 @@ fn drive(test: &str, mode: &str, roster: bool, customizer: bool) -> Run {
         .current_dir(dir.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
+        .stderr(std::fs::File::create(&stderr_path).expect("stderr file"))
         .spawn()
         .expect("gateway host process");
     let stdout = child.stdout.take().expect("stdout");
@@ -454,7 +531,10 @@ fn drive(test: &str, mode: &str, roster: bool, customizer: bool) -> Run {
     let mut settled = false;
     let mut bootstrap_builds = 0;
     let mut later_builds = 0;
-    let mut reset = None;
+    let mut sdk_after_create = Vec::new();
+    let mut responses: Vec<(String, Value)> = Vec::new();
+    let mut pending = ops.iter();
+    let mut current: Option<&str> = None;
     loop {
         let remaining = BACKSTOP.saturating_sub(started.elapsed());
         let line = match lines.recv_timeout(remaining) {
@@ -485,11 +565,20 @@ fn drive(test: &str, mode: &str, roster: bool, customizer: bool) -> Run {
                     bootstrap_builds += 1;
                 }
             }
-            send(match answer_callback(method, &message["params"]) {
+            if method == "callback/agent_customizer/after_create" {
+                sdk_after_create.push(
+                    message["params"]["session_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+            let reply = match answer_callback(method, &message["params"], fail_after_create) {
                 Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
                 Err(error) => json!({ "jsonrpc": "2.0", "id": id,
                     "error": { "code": -32601, "message": error } }),
-            });
+            };
+            send(reply);
         }
         if message.get("method").and_then(Value::as_str) == Some("meta/init_settled") {
             settled = true;
@@ -497,19 +586,37 @@ fn drive(test: &str, mode: &str, roster: bool, customizer: bool) -> Run {
             seen.push(message);
             if ready && roster {
                 append(&record, SETTLED);
+                current = pending.next().copied();
+                if let Some(method) = current {
+                    append(&record, &format!("driver op {method}"));
+                    send(json!({
+                        "jsonrpc": "2.0",
+                        "id": method,
+                        "method": method,
+                        "params": { "identity": IDENTITY },
+                    }));
+                    continue;
+                }
+            }
+            break;
+        }
+        if let Some(method) = current
+            && message.get("method").is_none()
+            && message["id"] == method
+        {
+            responses.push((method.to_string(), message.clone()));
+            seen.push(message);
+            current = pending.next().copied();
+            if let Some(method) = current {
+                append(&record, &format!("driver op {method}"));
                 send(json!({
                     "jsonrpc": "2.0",
-                    "id": "reset",
-                    "method": "meta/reset",
+                    "id": method,
+                    "method": method,
                     "params": { "identity": IDENTITY },
                 }));
                 continue;
             }
-            break;
-        }
-        if message.get("method").is_none() && message["id"] == "reset" {
-            reset = Some(message.clone());
-            seen.push(message);
             break;
         }
         seen.push(message);
@@ -524,14 +631,24 @@ fn drive(test: &str, mode: &str, roster: bool, customizer: bool) -> Run {
         let _ = child.kill();
     }
     let _ = child.wait();
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    // The host process's log rides this test's own output.
+    eprint!("{stderr}");
     assert!(exited, "{mode}: the gateway ends after its run");
     let recorded = std::fs::read_to_string(&record).unwrap_or_default();
+    let reset = responses
+        .iter()
+        .find(|(method, _)| method == "meta/reset")
+        .map(|(_, response)| response.clone());
     Run {
         lines: recorded.lines().map(str::to_string).collect(),
         seen,
         bootstrap_builds,
         later_builds,
+        sdk_after_create,
+        responses,
         reset,
+        stderr,
     }
 }
 
@@ -726,4 +843,93 @@ fn a_host_that_needs_a_customizer_names_what_to_configure() {
     let run = drive(REQUIRE_TEST, "require", true, true);
     assert_eq!(run.outcome(), "ready", "{:?}", run.seen);
     assert_eq!(run.starting("compose "), ["compose given=some"]);
+}
+
+/// Each build that ran the customizer tells it `after_create` once, with the
+/// session it built: the roster bootstrap's creation, a respawn (retire, then
+/// a wake onto the same session) and a reset's successor (a fresh session).
+/// The host's wrapper delegates, so the SDK customizer it wraps is told each
+/// one too.
+#[test]
+fn each_customized_build_tells_after_create_once() {
+    serve_if_host_process();
+    let ops = ["meta/respawn", "meta/reset"];
+    let run = drive_ops(AFTER_CREATE_TEST, "wrap", true, true, &ops, false);
+    assert_eq!(run.outcome(), "ready", "{:?}", run.seen);
+    let respawned = run.response("meta/respawn")["result"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the respawn succeeds: {:?}", run.responses))
+        .to_string();
+    let succeeded = run.response("meta/reset")["result"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the reset succeeds: {:?}", run.responses))
+        .to_string();
+    let told = run.after_creates();
+    let sessions: Vec<&str> = told
+        .iter()
+        .map(|(_, session, _)| session.as_str())
+        .collect();
+    assert_eq!(
+        sessions,
+        [respawned.as_str(), respawned.as_str(), succeeded.as_str()],
+        "the bootstrap's session, the same session at the respawn, the reset's \
+         successor: {:?}",
+        run.lines
+    );
+    assert_ne!(respawned, succeeded, "the reset starts a fresh session");
+    assert!(
+        told.iter().all(|(_, _, inner)| inner == "ok"),
+        "{:?}",
+        run.lines
+    );
+    let (settled, respawn, reset) = (
+        run.at(SETTLED),
+        run.at("driver op meta/respawn"),
+        run.at("driver op meta/reset"),
+    );
+    let positions: Vec<usize> = told.iter().map(|(at, _, _)| *at).collect();
+    assert!(
+        positions[0] < settled && (respawn..reset).contains(&positions[1]) && positions[2] > reset,
+        "one after_create per build, in its own phase: {:?}",
+        run.lines
+    );
+    assert_eq!(
+        run.sdk_after_create, sessions,
+        "the wrapped SDK customizer is told of each session"
+    );
+}
+
+/// `after_create` is best-effort: when the SDK customizer refuses it, the
+/// runtime logs a warning and the build stands, at the roster bootstrap and at
+/// a respawn alike.
+#[test]
+fn a_failing_after_create_leaves_the_build_standing() {
+    serve_if_host_process();
+    let run = drive_ops(
+        AFTER_CREATE_FAILS_TEST,
+        "wrap",
+        true,
+        true,
+        &["meta/respawn"],
+        true,
+    );
+    assert_eq!(run.outcome(), "ready", "{:?}", run.seen);
+    let respawned = run.response("meta/respawn")["result"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the respawn succeeds: {:?}", run.responses))
+        .to_string();
+    let told = run.after_creates();
+    assert_eq!(
+        told.iter()
+            .map(|(_, session, inner)| (session.as_str(), inner.as_str()))
+            .collect::<Vec<_>>(),
+        [(respawned.as_str(), "err"), (respawned.as_str(), "err")],
+        "{:?}",
+        run.lines
+    );
+    assert_eq!(
+        run.stderr.matches(AFTER_CREATE_WARNING).count(),
+        2,
+        "one warning per refused after_create"
+    );
 }
