@@ -36,6 +36,7 @@ test_forge_application_setup_action.py
 test_forge_prepare_setup.py
 test_frontend_setup_source_sampler.py
 test_hosted_mcp_startup.py
+test_implementation_fresh_build.py
 test_local_application_dispatch.py
 test_local_application_recovery.py
 test_local_application_registry.py

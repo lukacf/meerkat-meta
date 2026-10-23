@@ -670,6 +670,34 @@ const acceptedCandidateBuild = (changes = {}) => {
     framework: { runtime_candidate: { format: "forge-meta-toolkit-runtime-selection-v1" } }, ...changes };
 };
 
+test("fresh build binds the incomplete source once and preserves the unsent note", async () => {
+  const initial = acceptedCandidateBuild({ status: "interrupted", ready_to_package: false });
+  const bodies = [];
+  await mounted({ initial, onPost({ body }) {
+    bodies.push(body);
+    return response(receipt("fresh-B", { status: "queued" }));
+  } }, async ui => {
+    const fresh = ui.button("Start a fresh build");
+    assert.ok(fresh && !fresh.disabled);
+    await ui.flush(() => { fresh.click(); fresh.click(); });
+    assert.equal(ui.current().build_id, "fresh-B");
+    assert.equal(ui.text(), initialDraft);
+    assert.equal(ui.savedDraft(), initialDraft);
+  });
+  assert.deepEqual(bodies, [{ version: state.version, request: "", previous_build_id: initial.build_id,
+    start_fresh: true, previous_source_digest: candidateDigest }]);
+});
+
+for (const changes of [{ source_verified: false }, { worker_stop_confirmed: false },
+  { cleanup_pending: true }, { source_digest: "" }, { status: "completed" }]) {
+  test(`fresh build is absent for unavailable source or cleanup: ${JSON.stringify(changes)}`, async () => {
+    await mounted({ initial: acceptedCandidateBuild({ status: "interrupted", ready_to_package: false, ...changes }) }, async ui => {
+      assert.equal(ui.button("Start a fresh build"), undefined);
+      assert.equal(ui.calls.filter(call => call.method === "POST").length, 0);
+    });
+  });
+}
+
 test("mounted candidate runtime refresh sends the host-owned preserve-design request and keeps the unsent draft", async () => {
   const initial = acceptedCandidateBuild(), bodies = [];
   await mounted({ initial, onPost({ target, body }) {

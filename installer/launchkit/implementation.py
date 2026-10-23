@@ -1255,11 +1255,25 @@ class ImplementationService:
                      expected_source_digest=None, expected_selected_build_id=_UNSET_SELECTED_BUILD,
                      refresh_framework=False, trial_replay_capsule=_UNSET_TRIAL_REPLAY,
                      expected_framework_build_id=None, expected_framework_source_digest=None,
-                     preserve_design=False, runtime_target=None):
+                     preserve_design=False, runtime_target=None, start_fresh=False,
+                     expected_fresh_source_digest=None):
         if type(refresh_framework) is not bool:
             raise ValueError("Choose whether to refresh the framework using a boolean value.")
         if type(preserve_design) is not bool:
             raise ValueError("Choose whether to preserve the accepted design using a boolean value.")
+        if type(start_fresh) is not bool:
+            raise ValueError("Choose a fresh build using a boolean value.")
+        if start_fresh:
+            if (refresh_framework or preserve_design or request.strip()
+                    or expected_selected_build_id is _UNSET_SELECTED_BUILD or expected_selected_build_id is None
+                    or not isinstance(expected_fresh_source_digest, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", expected_fresh_source_digest)
+                    or expected_previous_build_id is not None or expected_source_digest is not None
+                    or expected_framework_build_id is not None or expected_framework_source_digest is not None
+                    or trial_replay_capsule is not _UNSET_TRIAL_REPLAY):
+                raise ValueError("A fresh build needs its exact incomplete predecessor and no repair or refresh request.")
+        elif expected_fresh_source_digest is not None:
+            raise ValueError("A source digest is only selected for an explicit fresh build.")
         initial_product = False
         preparation = self.prepare_workspace
         registry = self._local_application_registry(preparation)
@@ -1283,6 +1297,8 @@ class ImplementationService:
                 or expected_previous_build_id is not None or expected_source_digest is not None):
             raise ValueError("Runtime refresh requires an exact selected accepted build, framework refresh, and no feedback or repair request.")
         framework_override = expected_framework_build_id is not None or expected_framework_source_digest is not None
+        if start_fresh and not automatic_product:
+            raise DraftConflict("A fresh build requires this host's current product runtime owner.")
         if framework_override and (refresh_framework or expected_framework_build_id is None
                 or not isinstance(expected_framework_source_digest, str)
                 or not re.fullmatch(r"[0-9a-f]{64}", expected_framework_source_digest)):
@@ -1312,6 +1328,16 @@ class ImplementationService:
                     and self.processes.get(previous.name) is None
                     and (previous_task is None or previous_task.done())):
                 raise DraftConflict("The previous builder's cleanup handle is no longer owned. Its source is preserved, but cleanup cannot be confirmed or another build admitted from saved process metadata.")
+            if start_fresh:
+                current = await self.status(guide_id, state=state)
+                if (not receipt or current.get("status") not in {"failed", "interrupted"}
+                        or current.get("current") is not True or current.get("source_verified") is not True
+                        or current.get("source_digest") != expected_fresh_source_digest
+                        or current.get("worker_stop_confirmed") is not True
+                        or current.get("cleanup_pending") or current.get("cleanup_in_progress")
+                        or current.get("cleanup_custody_lost")
+                        or previous.name in self.processes or previous_task is not None and not previous_task.done()):
+                    raise DraftConflict("A fresh build needs the exact current incomplete source and confirmed builder cleanup.")
             proposal = state.get("proposal") or state.get("blueprint")
             if not proposal:
                 raise ValueError("Describe a concrete job and get a proposed system before building.")
@@ -1357,7 +1383,7 @@ class ImplementationService:
             previous_input = json.loads((previous / "input.json").read_text()) if previous else None
             previous_candidate = (await asyncio.to_thread(self._retained_runtime_candidate, previous, previous_input)
                                   if previous else None)
-            if automatic_product and previous_candidate is not None:
+            if automatic_product and previous_candidate is not None and not start_fresh:
                 from .runtime_selection import parse_candidate_selection
                 old_target = parse_candidate_selection(previous_candidate)
                 if (type(old_target) is MetaToolkitRuntimeTarget
@@ -1396,7 +1422,7 @@ class ImplementationService:
                 "build_id": expected_framework_build_id, "source_digest": expected_framework_source_digest})
             # A retained candidate continuation uses its authenticated framework
             # bytes instead of current package generation. Keep that owner path.
-            retained_candidate = bool(same_specification and not refresh_framework and (
+            retained_candidate = bool(not start_fresh and same_specification and not refresh_framework and (
                 previous_candidate is not None or framework_baseline is not None
                 and framework_baseline.runtime_candidate is not None))
             if receipt and receipt["status"] in ("queued", "running", "checking") and previous.name not in self.tasks:
@@ -1406,7 +1432,7 @@ class ImplementationService:
                     detail="The previous build was interrupted. Continue to reuse its saved source.")
             if receipt and receipt.get("cleanup_pending") and previous.name not in self.tasks:
                 raise DraftConflict("The previous builder's cleanup custody is unavailable. Its source is preserved; cleanup must be confirmed before another build can start.")
-            if (not preserve_design and not request and receipt and receipt["status"] in {"failed", "interrupted", "queued", "running", "checking"}
+            if (not start_fresh and not preserve_design and not request and receipt and receipt["status"] in {"failed", "interrupted", "queued", "running", "checking"}
                     and same_specification):
                 # Browser retry clears its composer after admission. A blank
                 # retry resumes that request instead of silently dropping it.
@@ -1477,7 +1503,7 @@ class ImplementationService:
                 # An explicit refresh seeds current compiler bytes in a new build.
                 # Neither path transfers old checks or independent acceptance.
                 accepted_framework_digest = None
-                if previous and same_specification and not refresh_framework:
+                if previous and same_specification and not refresh_framework and not start_fresh:
                     prior_status = await self.status(guide_id, state=state)
                     if (prior_status.get("status") == "completed" and prior_status.get("current") is True
                             and prior_status.get("source_verified") is True
@@ -1490,12 +1516,12 @@ class ImplementationService:
                 previous_context = None
                 retained_tests = {}
                 copied_source_digest = None
-                requests = list(previous_input.get("implementation_requests", [])) if previous_input else []
-                if previous_input and previous_input.get("request") and not requests:
+                requests = list(previous_input.get("implementation_requests", [])) if previous_input and not start_fresh else []
+                if previous_input and not start_fresh and previous_input.get("request") and not requests:
                     requests.append(previous_input["request"])
                 if request and (not requests or requests[-1] != request):
                     requests.append(request)
-                if previous:
+                if previous and not start_fresh:
                     def continue_source():
                         old = ImplementationWorkspace(previous / "workspace", previous_input["blueprint"])
                         # Copy one bounded source snapshot, rather than inventory
@@ -1576,7 +1602,7 @@ class ImplementationService:
                             for name, content in retained_tests.items()]}
                 else:
                     await asyncio.to_thread(workspace.seed,
-                        fresh_reason="explicit-framework-refresh" if refresh_framework else None,
+                        fresh_reason="explicit-fresh-build" if start_fresh else "explicit-framework-refresh" if refresh_framework else None,
                         **({"runtime_target": runtime_target} if initial_product else {}))
                 if self.prepare_workspace != preparation:
                     raise DraftConflict("The original application preparation owner changed during Build.")
@@ -1586,7 +1612,7 @@ class ImplementationService:
                     from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
                     self._local_application_registry(preparation)
                     source_build_id = None
-                    if (previous and same_specification and not refresh_framework
+                    if (previous and not start_fresh and same_specification and not refresh_framework
                             and previous_candidate is not None
                             and type(parse_candidate_selection(previous_candidate)) is MetaToolkitRuntimeTarget
                             and fingerprint(previous_candidate) == fingerprint(runtime_candidate)):
@@ -1619,8 +1645,11 @@ class ImplementationService:
                     frozen["runtime_refresh_source_digest"] = await asyncio.to_thread(workspace.digest)
                     frozen["runtime_refresh_predecessor"] = {"build_id": framework_baseline.previous_build_id,
                         "source_digest": framework_baseline.previous_source_digest}
+                if start_fresh:
+                    frozen["fresh_build_predecessor"] = {"build_id": receipt["build_id"],
+                        "source_digest": expected_fresh_source_digest}
                 from .trial_replay import retained_trial_replay, save_trial_replay, trial_replay_ancestry, TrialReplayUnavailable
-                retain_job = trial_replay_capsule is _UNSET_TRIAL_REPLAY and previous and same_specification
+                retain_job = not start_fresh and trial_replay_capsule is _UNSET_TRIAL_REPLAY and previous and same_specification
                 capsule = None if trial_replay_capsule is _UNSET_TRIAL_REPLAY else trial_replay_capsule
                 if retain_job:
                     try:
@@ -1722,7 +1751,11 @@ class ImplementationService:
                         source = old._files(stored)
                         digest = old._digest(source)
                         verified = old._verification(stored, source)
-                        if (current_previous != previous or digest != copied_source_digest
+                        if (current_previous != previous or digest != (expected_fresh_source_digest if start_fresh else copied_source_digest)
+                                or start_fresh and (current_receipt.get("status") not in {"failed", "interrupted"}
+                                    or current_receipt.get("worker_stop_confirmed") is not True
+                                    or current_receipt.get("cleanup_pending") or current_receipt.get("cleanup_in_progress")
+                                    or current_receipt.get("cleanup_custody_lost"))
                                 or preserve_design and (current_receipt.get("status") != "completed"
                                     or current_receipt.get("cleanup_pending") or current_receipt.get("cleanup_in_progress")
                                     or digest != framework_baseline.previous_source_digest or not verified
