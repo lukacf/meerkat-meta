@@ -799,6 +799,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   saved. It was refused as if no team had been proposed, so the guide could not
   continue without proposing the team again. A reply is still refused when a
   route names a missing recipient or a source cites non-user evidence.
+- Every Meta member builder waits for a member's configured MCP servers before
+  its construction is prepared: the stdio and console gateways, the library
+  builder, and the plain ephemeral spec. A member's authoritative tool surface
+  is captured after its configured MCP servers connect or fail, so the first
+  turn waits for each profile-injected MCP server up to its connect timeout
+  plus at most 0.25 s (plus the TERM grace for a server that ignores SIGTERM).
+  Before, only a host with a document MCP binding waited, and any other
+  member's surface was captured while its servers were still connecting,
+  without their tools or their MCP provenance.
 
 ### Known limitations
 
