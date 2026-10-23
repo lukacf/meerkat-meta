@@ -133,6 +133,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `last_phase` `"prepare"` instead of `"roster"`, which now begins the
   roster bootstrap. A failed roster callback still fails init with `-32603`
   ("roster provider failed"), and a refused composition keeps its code.
+  Every roster read of one boot, the early refusal read included, is handed
+  the mob definition in the form the mob holds it.
 
 ### Fixed
 
@@ -148,7 +150,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   starts until the roster pass retires it, on the gateway and the library
   builder. The restart revived it like any other member and nothing published
   its customizer tools, so it could start a run without them before it was
-  retired.
+  retired. A host-adopted identity's member, which the roster pass never
+  retires, is not held.
 - Every Meta member builder waits for a member's configured MCP servers before
   its construction is prepared: the stdio and console gateways, the library
   builder, and the plain ephemeral spec. A member's authoritative tool surface

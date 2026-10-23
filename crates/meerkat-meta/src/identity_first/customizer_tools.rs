@@ -577,7 +577,8 @@ pub(crate) fn unpublished_before_mob_build(
 
 /// The identities of the live members `stored` names that `roster` does
 /// not list. `stored` is read from the mob store before the build
-/// (`MobBootstrapSpec::stored_durable_identity_members`): a resume of a log
+/// (`MobBootstrapSpec::stored_command_driven_identity_members`, which leaves
+/// out the identities the roster pass never retires): a resume of a log
 /// left Running revives those members like any other, but no publication
 /// covers them, so their run starts are held until the roster pass retires
 /// them. A member id that names no valid identity is left out; the roster
