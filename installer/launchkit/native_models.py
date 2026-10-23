@@ -154,8 +154,17 @@ def model_catalog_context(catalog=None, *, issue=None, native_version=VERSION, c
 
 
 def model_registry_lines(selections, *, native_version=VERSION, core_version=_CORE_FOR_RELEASE,
-                         runtime_target=None, verified_artifacts=None, guide_runtime=None):
+                         runtime_target=None, verified_artifacts=None, guide_runtime=None,
+                         public_runtime=False):
     """Declare missing selected models once; never duplicate native builtins."""
+    if public_runtime:
+        # The public Meta release's native registry owns these models. Use the
+        # same allowlist rule as a selected product, against its recorded catalog.
+        from .public_meta_runtime import models_unlisted_reason, unlisted_models
+        missing = unlisted_models(selections)
+        if missing:
+            raise ValueError(models_unlisted_reason(missing))
+        return []
     if runtime_target is not None:
         context = model_catalog_context(runtime_target=runtime_target, verified_artifacts=verified_artifacts)
         known = {(entry["provider"], entry["id"]) for entry in context["models"]}

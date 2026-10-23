@@ -200,8 +200,28 @@ def write_private(path: Path, value: dict):
     temporary.replace(path)
 
 
+def native_storage(root: Path) -> dict:
+    """The maintenance tool, product name and continuity ledger of this package.
+
+    A 0.9 package runs the public Meta release; a 0.8 package keeps MobKit.
+    """
+    version = json.loads((root / "deployment.json").read_text())["mobkitVersion"]
+    if isinstance(version, str) and version.split(".")[:2] == ["0", "9"]:
+        return {"tool": "meta_gateway", "name": "Meta", "version": version, "continuity": "meta-continuity"}
+    return {"tool": "mobkit_gateway", "name": "MobKit", "version": version, "continuity": "mobkit-continuity"}
+
+
+PREDECESSOR_STATE = (
+    "This project's .mobkit/state holds MobKit 0.8 state, which this Meta {version} package does not "
+    "open. No data was changed. Keep the state with its original MobKit package, or carry it over "
+    "once with Meta's own storage tools while the app is stopped and backed up, starting with "
+    ".bin/meta_gateway storage-adopt-predecessor --state-dir .mobkit/state as Meta's upgrade guide "
+    "describes.")
+
+
 def migration(root: Path, *, apply: bool, report_path: Path | None = None) -> dict:
-    binary = root / ".bin/mobkit_gateway"
+    native = native_storage(root)
+    binary = root / ".bin" / native["tool"]
     if not binary.is_file():
         raise RuntimeError("The storage setup tool is missing. Run bash install.sh first.")
     command = [str(binary), "storage-migrate", "--state-dir", str(root / ".mobkit/state"), "--json"]
@@ -211,20 +231,26 @@ def migration(root: Path, *, apply: bool, report_path: Path | None = None) -> di
         result = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
         report = json.loads(result.stdout)
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-        raise RuntimeError("MobKit could not prepare storage. No existing data was deleted. Retry startup.") from None
+        raise RuntimeError(f"{native['name']} could not prepare storage. No existing data was deleted. Retry startup.") from None
     if not isinstance(report, dict):
-        raise RuntimeError("MobKit returned an invalid storage report.")
+        raise RuntimeError(f"{native['name']} returned an invalid storage report.")
     destination = report_path or root / ".mobkit/storage-initialization.json"
     write_private(destination, report)
+    errors = report.get("errors")
+    # Meta refuses predecessor state before it reads any store; its error
+    # names the adoption verb that carries the state over.
+    if (native["tool"] == "meta_gateway" and isinstance(errors, list)
+            and any(isinstance(error, str) and "storage-adopt-predecessor" in error for error in errors)):
+        raise RuntimeError(PREDECESSOR_STATE.format(version=native["version"]))
     backfill = report.get("head_canonical_backfill") or {}
     if (not isinstance(backfill, dict) or result.returncode or report.get("errors")
             or backfill.get("failures") or backfill.get("skipped_unparseable") or backfill.get("vanished")):
-        raise RuntimeError(f"MobKit storage preparation needs attention. Inspect {destination.relative_to(root)}.")
+        raise RuntimeError(f"{native['name']} storage preparation needs attention. Inspect {destination.relative_to(root)}.")
     return report
 
 
-def current_storage(report: dict) -> bool:
-    return any(entry.get("domain") == "mobkit-continuity" and
+def current_storage(report: dict, continuity: str = "mobkit-continuity") -> bool:
+    return any(entry.get("domain") == continuity and
                (entry.get("after") or entry.get("before") or 0) >= 2
                for entry in report.get("ledger", []))
 
@@ -407,6 +433,7 @@ def upgrade_storage(root: Path, from_version: str, to_version: str, *,
 
 async def prepare_storage(root: Path, build_runtime):
     """Run once, before user interaction. Never write native database tables."""
+    native = native_storage(root)
     state = root / ".mobkit/state"
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     marker = root / ".mobkit/launch-storage.json"
@@ -429,10 +456,10 @@ async def prepare_storage(root: Path, build_runtime):
         # Always inspect through MobKit before trusting ready state. This also
         # covers restored backups without treating the marker as schema truth.
         report = await asyncio.to_thread(migration, root, apply=False)
-        if not current_storage(report):
+        if not current_storage(report, native["continuity"]):
             raise RuntimeError(
-                "Existing storage needs an explicit MobKit migration. Stop the app, back up .mobkit/state, "
-                "then run .bin/mobkit_gateway storage-migrate --state-dir .mobkit/state --apply. "
+                f"Existing storage needs an explicit {native['name']} migration. Stop the app, back up .mobkit/state, "
+                f"then run .bin/{native['tool']} storage-migrate --state-dir .mobkit/state --apply. "
                 "Start again after that command succeeds."
             )
         write_private(marker, {**binding, "phase": "ready"})
@@ -443,7 +470,7 @@ async def prepare_storage(root: Path, build_runtime):
     if nonempty:
         # Resume an interrupted initialization through the same native tool.
         report = await asyncio.to_thread(migration, root, apply=True)
-        if current_storage(report):
+        if current_storage(report, native["continuity"]):
             write_private(marker, {**binding, "phase": "ready"})
             return
     runtime = await build_runtime()
@@ -454,6 +481,6 @@ async def prepare_storage(root: Path, build_runtime):
     finally:
         await runtime.shutdown()
     report = await asyncio.to_thread(migration, root, apply=True)
-    if not current_storage(report):
-        raise RuntimeError("MobKit did not confirm current storage. Inspect .mobkit/storage-initialization.json.")
+    if not current_storage(report, native["continuity"]):
+        raise RuntimeError(f"{native['name']} did not confirm current storage. Inspect .mobkit/storage-initialization.json.")
     write_private(marker, {**binding, "phase": "ready"})
