@@ -219,6 +219,110 @@ def test_forged_toolkit_application_refuses_before_server_selection(supplier, tm
         launch.create_app()
 
 
+def configured_custody(monkeypatch, owner):
+    """A launcher configures application model custody in this process before serving."""
+    from launchkit import packaged_runtime
+    for name in ("_selected_target", "_application_model_custody"):
+        monkeypatch.setattr(packaged_runtime, name, None)
+    packaged_runtime.configure_application_model_custody(owner)
+    return owner
+
+
+def other_model_owner(tmp_path, owner):
+    """Another inert model source over the same credential root."""
+    config = tmp_path / "other-host.toml"
+    config.write_bytes(b'[model]\nselected = "another-inert-custody-specimen"\n')
+    config.chmod(0o600)
+    return startup._ModelConfiguration.observe({"host_config": {"path": str(config),
+        "sha256": hashlib.sha256(config.read_bytes()).hexdigest()},
+        "credential_config_root": owner.selection()["credential_config_root"]})
+
+
+def test_bare_toolkit_target_takes_the_application_model_custody_configured_for_this_forge(
+        supplier, tmp_path, monkeypatch):
+    from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
+    owner = configured_custody(monkeypatch, model_owner(tmp_path, monkeypatch))
+    supplier.modules["launchkit.runtime_selection"] = SimpleNamespace(MetaToolkitRuntimeTarget=MetaToolkitRuntimeTarget)
+    target = object.__new__(MetaToolkitRuntimeTarget)
+    supplier.modules["trusted_operator.selection"].make_host = lambda: target
+    calls = []
+    supplier.modules["launchkit.server"].select_local_application_runtime = (
+        lambda value, **options: calls.append((value, options)))
+    assert launch.create_app() is supplier.app
+    assert calls == [(target, {"model_configuration": owner})]
+    assert calls[0][0] is target and calls[0][1]["model_configuration"] is owner
+
+
+def test_ordinary_selection_without_an_owner_takes_the_configured_custody(supplier, tmp_path, monkeypatch):
+    from launchkit.connect_installer_caller import ExactFile
+    from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
+    owner = configured_custody(monkeypatch, model_owner(tmp_path, monkeypatch))
+    target = object.__new__(MetaToolkitRuntimeTarget)
+    gateway = ExactFile(tmp_path / "ordinary-rpc", "a" * 64)
+    supplier.modules["trusted_operator.selection"].make_host = (
+        lambda: launch.OrdinaryMetaApplicationSelection(target, gateway))
+    calls = []
+    supplier.modules["launchkit.server"].select_local_application_runtime = (
+        lambda value, **options: calls.append((value, options)))
+    assert launch.create_app() is supplier.app
+    assert calls == [(target, {"ordinary_meta_gateway": gateway, "model_configuration": owner})]
+    assert calls[0][1]["model_configuration"] is owner
+
+
+@pytest.mark.parametrize("same", ["same-owner", "same-selection"])
+def test_selection_with_the_configured_owner_keeps_its_own(supplier, tmp_path, monkeypatch, same):
+    from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
+    owner = configured_custody(monkeypatch, model_owner(tmp_path, monkeypatch))
+    own = owner if same == "same-owner" else startup._ModelConfiguration.observe(owner.selection())
+    target = object.__new__(MetaToolkitRuntimeTarget)
+    supplier.modules["trusted_operator.selection"].make_host = lambda: launch.ToolkitApplicationSelection(target, own)
+    calls = []
+    supplier.modules["launchkit.server"].select_local_application_runtime = (
+        lambda value, **options: calls.append((value, options)))
+    assert launch.create_app() is supplier.app
+    assert calls == [(target, {"model_configuration": own})] and calls[0][1]["model_configuration"] is own
+
+
+@pytest.mark.parametrize("kind", ["toolkit", "ordinary"])
+def test_selection_with_another_model_owner_refuses_the_configured_custody(supplier, tmp_path, monkeypatch, kind):
+    from launchkit.connect_installer_caller import CustodyError, ExactFile
+    from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
+    owner = configured_custody(monkeypatch, model_owner(tmp_path, monkeypatch))
+    other = other_model_owner(tmp_path, owner)
+    target = object.__new__(MetaToolkitRuntimeTarget)
+    chosen = (launch.ToolkitApplicationSelection(target, other) if kind == "toolkit" else
+        launch.OrdinaryMetaApplicationSelection(target, ExactFile(tmp_path / "ordinary-rpc", "a" * 64), other))
+    supplier.modules["trusted_operator.selection"].make_host = lambda: chosen
+    supplier.modules["launchkit.server"].select_local_application_runtime = (
+        lambda *args, **kwargs: pytest.fail("Two application model owners cannot reach server selection"))
+    with pytest.raises(CustodyError, match="differs from the model owner"):
+        launch.create_app()
+
+
+@pytest.mark.parametrize("kind", ["application-host", "application-host-with-matching-attribute",
+    "local-and-linux-control"])
+def test_selection_that_cannot_carry_the_configured_custody_refuses_it(supplier, tmp_path, monkeypatch, kind):
+    from launchkit.connect_installer_caller import CustodyError
+    from launchkit.remote_product_control import ProductControlSelection
+    from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
+    owner = configured_custody(monkeypatch, model_owner(tmp_path, monkeypatch))
+    if kind.startswith("application-host"):
+        chosen = supplier.selected
+        if kind == "application-host-with-matching-attribute":
+            # An ad hoc attribute is no checked model owner.
+            chosen.model_configuration = owner.selection()
+    else:
+        local = object.__new__(MetaToolkitRuntimeTarget)
+        object.__setattr__(local, "target", "linux-x86_64")
+        chosen = launch.ApplicationRuntimeSelection(local, object.__new__(ProductControlSelection))
+    supplier.modules["trusted_operator.selection"].make_host = lambda: chosen
+    server = supplier.modules["launchkit.server"]
+    server.select_application_host = server.select_product_application_runtime = (
+        lambda *args, **kwargs: pytest.fail("Configured custody cannot be dropped at server selection"))
+    with pytest.raises(CustodyError, match="cannot reach the selection"):
+        launch.create_app()
+
+
 @pytest.mark.parametrize("value", [None, "", "module", ":factory", "module:",
     " module:factory", "module:factory ", "module:factory:other", "../owner.py:factory",
     ".owner:factory", "owner..selection:factory", "owner:object.factory", "owner:class",

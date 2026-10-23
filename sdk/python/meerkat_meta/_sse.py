@@ -5,6 +5,8 @@ import asyncio
 import json
 from typing import Any, AsyncIterator
 
+from .errors import TransportError
+
 
 class SseEvent:
     __slots__ = ("id", "event", "data")
@@ -76,17 +78,25 @@ class SseEventStream:
 async def parse_sse_stream(
     response_body: AsyncIterator[bytes],
 ) -> AsyncIterator[SseEvent]:
-    """Parse an SSE byte stream into SseEvent objects."""
-    buffer = ""
+    """Parse an SSE byte stream into SseEvent objects.
+
+    Lines are split on bytes and each complete line is decoded as strict
+    UTF-8, so a multi-byte character that a chunk boundary splits arrives
+    whole. Bytes that are not UTF-8, in a complete line or in a stream that
+    ends inside a character, raise :class:`~meerkat_meta.errors.TransportError`
+    (caused by the ``UnicodeDecodeError``) instead of being repaired with
+    U+FFFD.
+    """
+    buffer = b""
     current_id: str | None = None
     current_event = "message"
     current_data: list[str] = []
 
     async for chunk in response_body:
-        buffer += chunk.decode("utf-8", errors="replace")
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            line = line.rstrip("\r")
+        buffer += chunk
+        while b"\n" in buffer:
+            raw_line, buffer = buffer.split(b"\n", 1)
+            line = _decode_sse_line(raw_line.rstrip(b"\r"))
 
             if not line:
                 if current_data:
@@ -108,3 +118,15 @@ async def parse_sse_stream(
                 current_data.append(line[6:])
             elif line.startswith("data:"):
                 current_data.append(line[5:])
+
+    # An unterminated last line is dropped, as before; one that ends inside a
+    # character means the stream was cut mid-character, which is refused too.
+    _decode_sse_line(buffer)
+
+
+def _decode_sse_line(raw: bytes) -> str:
+    """One SSE line as strict UTF-8; bytes that are not UTF-8 refuse the stream."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise TransportError("SSE stream is not valid UTF-8") from error

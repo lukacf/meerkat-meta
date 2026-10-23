@@ -196,7 +196,7 @@ export function classifyConsoleSendFailure(error: unknown): ConsoleSendFailure {
     : typeof typed.message === "string" && typed.message.trim() ? typed.message.trim() : undefined;
   if (rpcKind === "unauthenticated" || status === 401) {
     return { state: "definitely-rejected", kind: "unauthenticated",
-      message: "Not authorized from this network (401). The gateway refused the request before accepting it, so nothing was sent. Sign in or connect from a trusted network, then retry." };
+      message: "Sign-in required (401). Nothing was sent. Sign in again or check this connection's authentication, then review the saved message before resending." };
   }
   if (rpcKind === "access_denied" || rpc?.code === -32030 || status === 403) {
     return { state: "definitely-rejected", kind: "access_denied",
@@ -322,7 +322,7 @@ export function describeConsoleAcceptanceCheckFailure(error: unknown): ConsoleAc
   const unchanged = "The saved message is unchanged and was not resent.";
   switch (failure.kind) {
     case "unauthenticated":
-      return { kind: failure.kind, message: `Could not check acceptance: not authorized from this network (401). ${unchanged}` };
+      return { kind: failure.kind, message: `Could not check acceptance: authentication required (401). ${unchanged}` };
     case "access_denied":
       return { kind: failure.kind, message: `Could not check acceptance: not allowed to read this agent's timeline (403). ${unchanged}` };
     case "connection_failed":
@@ -385,7 +385,7 @@ export function describeConsolePendingRow(
   if (attempt.state === "definitely-rejected") {
     const detail = (() => {
       switch (attempt.failureKind) {
-        case "unauthenticated": return "You were signed out, or this network isn't allowed.";
+        case "unauthenticated": return "Sign in again or check this connection's authentication. Then review your saved message before choosing Send again.";
         case "access_denied": return `You don't have permission to message ${names.agent}.`;
         case "read_only": return "This console is read-only.";
         case "capability_unavailable": return "Sending isn't available here.";

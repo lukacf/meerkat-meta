@@ -596,7 +596,12 @@ class AcceptedImplementation:
 
 
 class SourceFramedTransport:
-    """Same pinned owner transport interface, without creating a connection."""
+    """Same pinned owner transport interface, without creating a connection.
+
+    A real destination runs in its own process; the host only awaits its
+    answer. The in-process destination therefore runs in a worker thread, so
+    its file reads and syncs are never measured as host event-loop work.
+    """
 
     def __init__(self, selected):
         self.selected = selected
@@ -616,16 +621,21 @@ class SourceFramedTransport:
 
     async def request(self, endpoint, program, request, timeout, *, expected_fingerprint, deadline):
         self.admitted(endpoint, program, request, timeout, expected_fingerprint, deadline)
-        parsed, stream = owner.read_request(io.BytesIO(json_bytes(request)))
-        result = owner.receive(parsed, stream, owner_source=self.selected.source)
+        def destination():
+            parsed, stream = owner.read_request(io.BytesIO(json_bytes(request)))
+            return owner.receive(parsed, stream, owner_source=self.selected.source)
+        result = await asyncio.to_thread(destination)
         return {**result, "_transport": {"host_key_fingerprint": expected_fingerprint}}
 
     async def transfer_file(self, endpoint, program, request, artifact, timeout, *,
             expected_fingerprint, deadline, require_current):
         self.admitted(endpoint, program, request, timeout, expected_fingerprint, deadline)
         require_current()
-        parsed, stream = owner.read_request(io.BytesIO(frame(request, artifact.path.read_bytes())))
-        result = owner.receive(parsed, stream, owner_source=self.selected.source)
+        def destination():
+            # The real transport also reads the artifact in a worker thread.
+            parsed, stream = owner.read_request(io.BytesIO(frame(request, artifact.path.read_bytes())))
+            return owner.receive(parsed, stream, owner_source=self.selected.source)
+        result = await asyncio.to_thread(destination)
         if self.on_package is not None:
             self.on_package()
         self.entered.set()
@@ -796,4 +806,22 @@ async def test_host_package_staging_leaves_the_event_loop_free(destination_sourc
     assert_stage_only(result)
     assert transport.calls == ["begin", "package", "finish"]
     assert (arguments["transaction_directory"] / "package.zip").read_bytes() == selected.package
+    assert gap < 0.5
+
+
+async def test_a_slow_destination_is_not_host_event_loop_work(destination_source, tmp_path, monkeypatch):
+    # A real destination runs in its own process over SSH, and the host only
+    # awaits its answer. The in-process stand-in keeps that work off the host's
+    # loop too; otherwise the loop-gap rows measure the destination's disk.
+    selected = destination_source
+    implementation, transport = AcceptedImplementation(selected), SourceFramedTransport(selected)
+    arguments = staging_arguments(selected, tmp_path, transport)
+    original_receive = owner.receive
+    def slow_receive(*args, **kwargs):
+        time.sleep(1.0)  # A slow destination disk, not host work.
+        return original_receive(*args, **kwargs)
+    monkeypatch.setattr(owner, "receive", slow_receive)
+    result, gap = await longest_loop_gap(owner.stage_product_destination_source(implementation, GUIDE, **arguments))
+    assert_stage_only(result)
+    assert transport.calls == ["begin", "package", "finish"]
     assert gap < 0.5

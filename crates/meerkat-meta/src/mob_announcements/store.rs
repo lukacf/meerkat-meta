@@ -4,11 +4,16 @@ use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 
+use super::sources::{
+    AdvanceSource, AnnouncementSource, AuditQuery, AuditRow, MemberFacts, PutSource,
+    RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceQuery, SourceStream,
+};
 use super::types::{
-    AnnounceOutcome, AnnounceRequest, Announcement, Batch, BatchEvent, BatchId, BatchPosition,
-    BatchQuery, BatchStateTag, ExpiryReport, Member, MemberBacklog, MemberRouteRecord, MobId,
-    MobLineage, OperationId, PruneReport, PutSubscription, Result, SealingPolicy, SourceKey,
-    Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
+    AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
+    BatchId, BatchPosition, BatchQuery, BatchStateTag, ExpiryReport, Member, MemberBacklog,
+    MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport, PutSubscription, Result,
+    SealingPolicy, SourceId, SourceKey, Subscription, SubscriptionChange,
+    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, Topic,
 };
 
 /// Durable mob announcements, member subscriptions and delivery batches.
@@ -28,10 +33,13 @@ use super::types::{
 ///   the state the caller observed, and settles or moves the batch's owed
 ///   announcements in the same transaction.
 ///
-/// Mutations of subscriptions carry an operation id: a replay with the same
-/// request returns the original result, and the same id with another request
-/// is refused. Implementations must keep those receipts at least as long as
-/// the retention window.
+/// Mutations of subscriptions and sources carry an operation id: a replay
+/// with the same request returns the original result, and the same id with
+/// another request is refused. Implementations must keep those receipts at
+/// least as long as the retention window.
+///
+/// The source methods have default bodies that refuse, so a store written
+/// before sources existed still compiles and says it keeps none.
 #[async_trait]
 pub trait AnnouncementStore: Send + Sync {
     async fn announce(&self, request: AnnounceRequest, now_ms: u64) -> Result<AnnounceOutcome>;
@@ -162,6 +170,10 @@ pub trait AnnouncementStore: Send + Sync {
     /// route also stops where its JSON-encoded body, counted with
     /// [`super::types::header_wire_bound`], would exceed one peer request
     /// ([`super::types::MAX_REMOTE_BODY_WIRE_BYTES`]).
+    ///
+    /// A store that keeps sources seals here with no roster facts, so a
+    /// member is covered by member grants alone: a caller whose sources
+    /// grant by role or label uses [`Self::seal_batch_with_facts`].
     async fn seal_batch(
         &self,
         member: &Member,
@@ -169,6 +181,86 @@ pub trait AnnouncementStore: Send + Sync {
         policy: &SealingPolicy,
         now_ms: u64,
     ) -> Result<Option<Batch>>;
+
+    /// [`Self::seal_batch`] with the member's roster facts as the owner read
+    /// them. A store that keeps sources checks every item it would seal, and
+    /// every item it holds, against the member's coverage and routes first:
+    /// an item that fails is held, not sealed and not dropped, and a held
+    /// item that passes this fresh check is released and sealed. A store
+    /// without sources owns no topic and seals as before.
+    async fn seal_batch_with_facts(
+        &self,
+        member: &Member,
+        batch_id: &BatchId,
+        policy: &SealingPolicy,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<Option<Batch>> {
+        let _ = facts;
+        self.seal_batch(member, batch_id, policy, now_ms).await
+    }
+
+    /// The last check before a native submission of batch `id`, which is in
+    /// state `expected`: sealed, or submitting after an answer that nothing
+    /// was committed. Every item is checked again against its member's
+    /// coverage and routes (`facts`). When all pass, the batch is left as it
+    /// is. When one fails and `may_cancel` (nothing native can hold the
+    /// batch any more), the batch is cancelled: its failing items are held,
+    /// the rest reopen for the member's next batch and its gap lines go to
+    /// that batch. Without `may_cancel` (an earlier request to a peer may
+    /// still commit) nothing changes and the failure comes back. A store
+    /// without sources owns no topic and passes every batch.
+    async fn check_before_submission(
+        &self,
+        id: &BatchId,
+        expected: BatchStateTag,
+        facts: Option<MemberFacts>,
+        may_cancel: bool,
+        now_ms: u64,
+    ) -> Result<SubmissionCheck> {
+        let _ = (id, expected, facts, may_cancel, now_ms);
+        Ok(SubmissionCheck::Passed)
+    }
+
+    /// Members whose held items are due a fresh check: a hold of the
+    /// source's current generation, on an active subscription, last checked
+    /// at or before `checked_before_ms`; at most `limit` members, the one
+    /// checked longest ago first.
+    async fn members_with_holds_due(
+        &self,
+        checked_before_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<Member>> {
+        let _ = (checked_before_ms, limit);
+        Ok(Vec::new())
+    }
+
+    /// Check `member`'s held items afresh, at most `limit`, the ones checked
+    /// longest ago first: one that passes is released and counted; one that
+    /// still fails is stamped checked, so the next check reaches the others.
+    async fn release_holds(
+        &self,
+        member: &Member,
+        facts: Option<MemberFacts>,
+        limit: u32,
+        now_ms: u64,
+    ) -> Result<()> {
+        let _ = (member, facts, limit, now_ms);
+        Ok(())
+    }
+
+    /// Count, for batch `id` just admitted into its member's session, each
+    /// item its member's coverage or routes (`facts`) no longer allow: it was
+    /// committed while they did, and reached the member after they stopped.
+    async fn audit_delivered_across_revocation(
+        &self,
+        id: &BatchId,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<()> {
+        let _ = (id, facts, now_ms);
+        Ok(())
+    }
 
     async fn batch(&self, id: &BatchId) -> Result<Option<Batch>>;
 
@@ -241,4 +333,185 @@ pub trait AnnouncementStore: Send + Sync {
     /// ended before the window and that no live record names as parent.
     /// [`PruneReport::more`] says whether another pass has work.
     async fn prune(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<PruneReport>;
+
+    /// Declare a source, replace its declaration at its revision, or start
+    /// its next generation, in one transaction with the claim of every topic
+    /// it owns. A source of another live source's principal and scope is
+    /// refused ([`AnnouncementStoreError::SourceIdentityTaken`]), and so is
+    /// a topic another source owns, live or ended
+    /// ([`AnnouncementStoreError::TopicOwned`]).
+    async fn put_source(
+        &self,
+        operation: &OperationId,
+        request: PutSource,
+        now_ms: u64,
+    ) -> Result<AnnouncementSource> {
+        let _ = (operation, request, now_ms);
+        Err(no_sources())
+    }
+
+    /// Pause, resume or end a source at its revision.
+    async fn change_source(
+        &self,
+        operation: &OperationId,
+        mob_id: &MobId,
+        source_id: &SourceId,
+        expected_revision: u64,
+        change: SourceChange,
+        now_ms: u64,
+    ) -> Result<AnnouncementSource> {
+        let _ = (
+            operation,
+            mob_id,
+            source_id,
+            expected_revision,
+            change,
+            now_ms,
+        );
+        Err(no_sources())
+    }
+
+    async fn source(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<Option<AnnouncementSource>> {
+        let _ = (mob_id, source_id);
+        Err(no_sources())
+    }
+
+    /// Sources in `(mob_id, source_id)` order.
+    async fn sources(&self, query: &SourceQuery) -> Result<Vec<AnnouncementSource>> {
+        let _ = query;
+        Err(no_sources())
+    }
+
+    /// One collector step, in one transaction: the step's receipt, the
+    /// fences (state, revision, principal, cursor version), onboarding, each
+    /// item announced as the source's (with its captures) or replayed or
+    /// recorded as a conflict, at most one gap notice, then the cursor, the
+    /// phases and the health. A refusal leaves all of it unchanged; an
+    /// onboarding refusal (baseline required, stream not baselined,
+    /// backfill bound exceeded) then counts toward the source's failure
+    /// streak on its own.
+    async fn advance_source(
+        &self,
+        operation: &OperationId,
+        request: AdvanceSource,
+        now_ms: u64,
+    ) -> Result<SourceAdvance> {
+        let _ = (operation, request, now_ms);
+        Err(no_sources())
+    }
+
+    /// Record a collector's failure, fenced like an advance; the cursor does
+    /// not move.
+    async fn record_source_failure(
+        &self,
+        operation: &OperationId,
+        request: RecordSourceFailure,
+        now_ms: u64,
+    ) -> Result<AnnouncementSource> {
+        let _ = (operation, request, now_ms);
+        Err(no_sources())
+    }
+
+    /// The streams the source's current generation onboarded, by name.
+    async fn source_streams(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<Vec<SourceStream>> {
+        let _ = (mob_id, source_id);
+        Err(no_sources())
+    }
+
+    /// [`Self::put_subscription`] with the member's roster facts as the owner
+    /// read them (`None`: it has none). A topic a source owns admits the
+    /// member only if the topic's audience covers it, the member owns no
+    /// live conversation on the source's scope, a direct route names the
+    /// topic (or the member triages it), and the member would not reach the
+    /// source both directly and through a forward. A store that keeps no
+    /// sources owns no topic, so its default is the plain put.
+    async fn put_subscription_with_facts(
+        &self,
+        operation: &OperationId,
+        request: PutSubscription,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<Subscription> {
+        let _ = facts;
+        self.put_subscription(operation, request, now_ms).await
+    }
+
+    /// [`Self::announce`] with the roster facts of the members whose
+    /// subscriptions take a topic a source owns: on such a topic only a
+    /// covered member captures, and each withheld capture is an audit row.
+    /// A member the facts do not name is covered by a member grant alone.
+    async fn announce_with_facts(
+        &self,
+        request: AnnounceRequest,
+        facts: &RosterFacts,
+        now_ms: u64,
+    ) -> Result<AnnounceOutcome> {
+        let _ = facts;
+        self.announce(request, now_ms).await
+    }
+
+    /// [`Self::advance_source`] with the roster facts of the source's
+    /// subscribers, as for [`Self::announce_with_facts`].
+    async fn advance_source_with_facts(
+        &self,
+        operation: &OperationId,
+        request: AdvanceSource,
+        facts: &RosterFacts,
+        now_ms: u64,
+    ) -> Result<SourceAdvance> {
+        let _ = facts;
+        self.advance_source(operation, request, now_ms).await
+    }
+
+    /// The members whose live subscriptions take any of `topics` that a
+    /// source owns in `mob_id`.
+    async fn owned_topic_subscribers(
+        &self,
+        mob_id: &MobId,
+        topics: &BTreeSet<Topic>,
+    ) -> Result<BTreeSet<Member>> {
+        let _ = (mob_id, topics);
+        Ok(BTreeSet::new())
+    }
+
+    /// The members whose live subscriptions take any topic `source_id` owns
+    /// in `mob_id`.
+    async fn source_subscribers(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<BTreeSet<Member>> {
+        let _ = (mob_id, source_id);
+        Ok(BTreeSet::new())
+    }
+
+    /// Audited refusals and withholdings, in id order.
+    async fn audit(&self, query: &AuditQuery) -> Result<Vec<AuditRow>> {
+        let _ = query;
+        Err(no_sources())
+    }
+}
+
+/// What the last check before a submission found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubmissionCheck {
+    /// Every item passes.
+    Passed,
+    /// An item fails, and the batch was left as it is.
+    Failed,
+    /// An item failed and the batch was cancelled.
+    Cancelled(Box<Batch>),
+}
+
+fn no_sources() -> AnnouncementStoreError {
+    AnnouncementStoreError::Storage("this announcement store keeps no sources".to_string())
 }

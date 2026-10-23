@@ -25,12 +25,17 @@ use super::native::{
     NativeStatus, NativeStatusError, NativeSubmitError, OwnerRefusal, PrepareError,
     route_contradiction,
 };
-use super::store::AnnouncementStore;
+use super::sources::{
+    AdvanceSource, AnnouncementSource, AuditQuery, AuditRow, MemberFacts, PutSource,
+    RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceQuery, SourceState,
+    SourceStream,
+};
+use super::store::{AnnouncementStore, SubmissionCheck};
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
     BatchGap, BatchId, BatchPosition, BatchQuery, BatchState, BatchStateTag, ChildMemberLimits,
-    GapReason, LateOutcome, Member, MemberRouteRecord, MobId, MobIncarnation, MobLineage,
-    NativeReceipt, OperationId, PutSubscription, SealingPolicy, SourceKey, Subscription,
+    GapReason, LateOutcome, MAX_PAGE, Member, MemberRouteRecord, MobId, MobIncarnation, MobLineage,
+    NativeReceipt, OperationId, PutSubscription, SealingPolicy, SourceId, SourceKey, Subscription,
     SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
     SubscriptionState, SuccessorBatch, merge_gaps, render_item, successor_batch, wire_budget,
 };
@@ -56,6 +61,11 @@ pub const MIN_RETENTION_MS: u64 = 60 * 60 * 1_000;
 pub(super) const ROUND_BATCHES: usize = 64;
 /// Members the dispatcher considers for sealing per round.
 pub(super) const ROUND_MEMBERS: usize = 64;
+
+/// How often, at least, a member's held items are checked afresh while it
+/// has nothing else to seal: a held item its member passes again is
+/// released within this bound and the dispatcher's longest idle.
+pub const HOLD_RECHECK_MS: u64 = 5 * 60 * 1_000;
 /// Batches that settled without their delivery being confirmed, read again
 /// per round.
 const ROUND_LATE_READS: usize = 16;
@@ -392,6 +402,38 @@ struct Inner {
     markers: std::sync::Mutex<BTreeMap<Member, SuspendMarker>>,
     clock: Clock,
     stopped: AtomicBool,
+    /// The schedule authority sources' runners are kept on, once the gateway
+    /// that owns one installs it.
+    runners: std::sync::Mutex<Option<Arc<dyn SourceRunners>>>,
+    /// Runner reconciles pass one at a time, each reading the source's
+    /// record as it stands then.
+    runners_gate: tokio::sync::Mutex<()>,
+}
+
+/// Keeps sources' runner schedules in line with their records: Meta's
+/// schedule authority, composed by the gateway that owns one. A source with
+/// a runner has one durable schedule firing its host runnable with the
+/// source it collects; a changed cadence updates it in place; no runner, or
+/// an ended source, ends it.
+#[async_trait::async_trait]
+pub trait SourceRunners: Send + Sync {
+    /// Bring `source`'s runner schedule in line with this record of it.
+    async fn reconcile(&self, source: &AnnouncementSource) -> Result<(), String>;
+
+    /// Bring every runner schedule in line with `live`, every source that is
+    /// not ended: theirs are kept, made or changed, and the schedule of a
+    /// source not among them (ended, or gone) ends.
+    async fn reconcile_all(&self, live: &[AnnouncementSource]) -> Result<(), String>;
+}
+
+/// What the last check before a submission decided.
+enum LastCheck {
+    Passed,
+    /// An item fails, and the batch may not be cancelled now.
+    Failed,
+    Cancelled(Box<Batch>),
+    /// The member's roster could not be read: decided at a later round.
+    Deferred,
 }
 
 /// What a submission left to do.
@@ -546,6 +588,8 @@ impl AnnouncementService {
                 markers: std::sync::Mutex::new(BTreeMap::new()),
                 clock,
                 stopped: AtomicBool::new(false),
+                runners: std::sync::Mutex::new(None),
+                runners_gate: tokio::sync::Mutex::new(()),
             }),
         })
     }
@@ -660,7 +704,19 @@ impl AnnouncementService {
     ) -> Result<AnnounceOutcome, AnnouncementError> {
         self.ensure_hosted(&BTreeSet::from([request.mob_id.clone()]))
             .await?;
-        let outcome = self.inner.store.announce(request, self.now()).await?;
+        // The roster facts of the members whose subscriptions take a topic a
+        // source owns: the store captures only covered members there.
+        let subscribers = self
+            .inner
+            .store
+            .owned_topic_subscribers(&request.mob_id, &request.topics)
+            .await?;
+        let facts = self.roster_facts(subscribers).await;
+        let outcome = self
+            .inner
+            .store
+            .announce_with_facts(request, &facts, self.now())
+            .await?;
         if !outcome.captured_for.is_empty() {
             self.wake();
         }
@@ -673,6 +729,239 @@ impl AnnouncementService {
         source_key: &SourceKey,
     ) -> Result<Option<Announcement>, AnnouncementError> {
         Ok(self.inner.store.announcement(mob_id, source_key).await?)
+    }
+
+    /// Declare a source of a mob hosted here, replace its declaration at its
+    /// revision, or start its next generation. The source verbs are public
+    /// so a collector in this process calls them directly, never through
+    /// its own gateway's RPC.
+    pub async fn put_source(
+        &self,
+        operation: &OperationId,
+        request: PutSource,
+    ) -> Result<AnnouncementSource, AnnouncementError> {
+        self.ensure_hosted(&BTreeSet::from([request.mob_id.clone()]))
+            .await?;
+        let source = self
+            .inner
+            .store
+            .put_source(operation, request, self.now())
+            .await?;
+        self.reconcile_runner(&source).await;
+        Ok(source)
+    }
+
+    /// Pause, resume or end a source at its revision.
+    pub async fn change_source(
+        &self,
+        operation: &OperationId,
+        mob_id: &MobId,
+        source_id: &SourceId,
+        expected_revision: u64,
+        change: SourceChange,
+    ) -> Result<AnnouncementSource, AnnouncementError> {
+        let source = self
+            .inner
+            .store
+            .change_source(
+                operation,
+                mob_id,
+                source_id,
+                expected_revision,
+                change,
+                self.now(),
+            )
+            .await?;
+        self.reconcile_runner(&source).await;
+        Ok(source)
+    }
+
+    /// Install the schedule authority sources' runners are kept on, and
+    /// bring every runner schedule in line with the sources: one declared
+    /// before the install, or while the gateway was down, gets its schedule
+    /// now, and one of a source ended meanwhile ends. A failure is logged;
+    /// the next install, or a source's next change, reconciles again.
+    pub async fn install_source_runners(&self, runners: Arc<dyn SourceRunners>) {
+        let _gate = self.inner.runners_gate.lock().await;
+        *self
+            .inner
+            .runners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&runners));
+        let mut live = Vec::new();
+        for state in [SourceState::Active, SourceState::Paused] {
+            let mut after = None;
+            loop {
+                let page = match self
+                    .inner
+                    .store
+                    .sources(&SourceQuery {
+                        mob_id: None,
+                        after,
+                        state: Some(state),
+                        limit: MAX_PAGE,
+                    })
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(error) => {
+                        // A partial read would end live sources' schedules.
+                        tracing::warn!(%error, "sources' runner schedules were not reconciled");
+                        return;
+                    }
+                };
+                let more = page.len() == MAX_PAGE;
+                after = page
+                    .last()
+                    .map(|source| (source.mob_id.clone(), source.source_id.clone()));
+                live.extend(page);
+                if !more {
+                    break;
+                }
+            }
+        }
+        if let Err(error) = runners.reconcile_all(&live).await {
+            tracing::warn!(%error, "sources' runner schedules were not reconciled");
+        }
+    }
+
+    /// Bring the runner schedule of the source `changed` names in line with
+    /// its record as it stands now, if a schedule authority is installed.
+    /// The record is read again under the gate, so the reconciles of racing
+    /// changes end on the last of them. A failure is logged: the change is
+    /// committed, and the next change or install reconciles again.
+    async fn reconcile_runner(&self, changed: &AnnouncementSource) {
+        let _gate = self.inner.runners_gate.lock().await;
+        let runners = self
+            .inner
+            .runners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(runners) = runners else {
+            return;
+        };
+        let outcome = match self
+            .inner
+            .store
+            .source(&changed.mob_id, &changed.source_id)
+            .await
+        {
+            Ok(Some(source)) => runners.reconcile(&source).await,
+            Ok(None) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = outcome {
+            tracing::warn!(
+                mob_id = %changed.mob_id,
+                source_id = %changed.source_id,
+                %error,
+                "a source's runner schedule was not reconciled"
+            );
+        }
+    }
+
+    /// A source whole, with its cursor's token: what a collector reads
+    /// before it collects.
+    pub async fn source(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<Option<AnnouncementSource>, AnnouncementError> {
+        Ok(self.inner.store.source(mob_id, source_id).await?)
+    }
+
+    /// Sources in `(mob_id, source_id)` order, with their cursor tokens
+    /// (the RPC list strips them).
+    pub async fn sources(
+        &self,
+        query: &SourceQuery,
+    ) -> Result<Vec<AnnouncementSource>, AnnouncementError> {
+        Ok(self.inner.store.sources(query).await?)
+    }
+
+    /// Advance a source of a mob hosted here by one collector step: its
+    /// items, their captures and its cursor commit together or not at all.
+    /// A retry of the step with its operation id answers the original,
+    /// marked replayed.
+    pub async fn advance_source(
+        &self,
+        operation: &OperationId,
+        request: AdvanceSource,
+    ) -> Result<SourceAdvance, AnnouncementError> {
+        self.ensure_hosted(&BTreeSet::from([request.mob_id.clone()]))
+            .await?;
+        let subscribers = self
+            .inner
+            .store
+            .source_subscribers(&request.mob_id, &request.source_id)
+            .await?;
+        let facts = self.roster_facts(subscribers).await;
+        let advance = self
+            .inner
+            .store
+            .advance_source_with_facts(operation, request, &facts, self.now())
+            .await?;
+        super::faults::after_source_advance();
+        if advance.captured {
+            self.wake();
+        }
+        Ok(advance)
+    }
+
+    /// Record a source collector's failure at the revision and cursor
+    /// version it read.
+    pub async fn record_source_failure(
+        &self,
+        operation: &OperationId,
+        request: RecordSourceFailure,
+    ) -> Result<AnnouncementSource, AnnouncementError> {
+        Ok(self
+            .inner
+            .store
+            .record_source_failure(operation, request, self.now())
+            .await?)
+    }
+
+    /// Audited refusals and withholdings of sources' audiences and routes.
+    pub async fn audit(&self, query: &AuditQuery) -> Result<Vec<AuditRow>, AnnouncementError> {
+        Ok(self.inner.store.audit(query).await?)
+    }
+
+    /// The member's roster facts, or none when its roster cannot be read
+    /// now: the store then covers it by member grants alone.
+    async fn member_facts(&self, member: &Member) -> Option<MemberFacts> {
+        match self.inner.native.member_facts(member).await {
+            Ok(facts) => facts,
+            Err(error) => {
+                tracing::warn!(
+                    %member,
+                    error = %error.0,
+                    "a member's roster facts could not be read; a member grant alone covers it"
+                );
+                None
+            }
+        }
+    }
+
+    /// The roster facts of `members`, as far as they can be read.
+    async fn roster_facts(&self, members: BTreeSet<Member>) -> RosterFacts {
+        let mut facts = RosterFacts::default();
+        for member in members {
+            if let Some(found) = self.member_facts(&member).await {
+                facts.insert(member, found);
+            }
+        }
+        facts
+    }
+
+    /// The streams a source's current generation onboarded.
+    pub async fn source_streams(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<Vec<SourceStream>, AnnouncementError> {
+        Ok(self.inner.store.source_streams(mob_id, source_id).await?)
     }
 
     pub async fn put_subscription(
@@ -711,10 +1000,13 @@ impl AnnouncementService {
         request.child_limits = self.inner.config.child_limits;
         let mobs = self.ensure_hosted(&request.selector.mobs).await?;
         let member_mob = request.member.mob_id.clone();
+        // A topic a source owns takes the member only if its audience
+        // covers it, as the member's roster facts say.
+        let facts = self.member_facts(&request.member).await;
         let subscription = self
             .inner
             .store
-            .put_subscription(operation, request, self.now())
+            .put_subscription_with_facts(operation, request, facts, self.now())
             .await
             .map_err(|error| match error {
                 // Another put kept the member on another route meanwhile.
@@ -1306,6 +1598,11 @@ impl AnnouncementService {
         if let Err(error) = self.read_late(now).await {
             tracing::warn!(%error, "announcement late reads failed this round");
         }
+        // Held items are checked afresh before the backlogs are read, so
+        // what a check releases seals in this round.
+        if let Err(error) = self.recheck_holds(now).await {
+            tracing::warn!(%error, "held announcements were not checked this round");
+        }
         let policy = config.policy;
         let backlogs = self.inner.store.backlogs(ROUND_MEMBERS).await?;
         walk.unsealed
@@ -1386,7 +1683,163 @@ impl AnnouncementService {
         if route == Some(MemberRoute::Child) {
             self.member_mob_ended(member, now).await?;
         }
-        Ok(self.inner.store.seal_batch(member, id, policy, now).await?)
+        // The store checks what it seals, and what it holds, against the
+        // member's coverage and routes as its roster says now. A roster
+        // that cannot be read decides nothing: the seal waits for a read.
+        let facts = match self.member_facts_read(member).await {
+            Ok(facts) => facts,
+            Err(error) => {
+                tracing::warn!(
+                    %member,
+                    error = %error.0,
+                    "a member's roster could not be read; its seal waits"
+                );
+                return Ok(None);
+            }
+        };
+        Ok(self
+            .inner
+            .store
+            .seal_batch_with_facts(member, id, policy, facts, now)
+            .await?)
+    }
+
+    /// A member's roster facts, or the error that kept them from being
+    /// read: a check that holds or releases items never takes an
+    /// unreadable roster for an uncovered member.
+    async fn member_facts_read(
+        &self,
+        member: &Member,
+    ) -> Result<Option<MemberFacts>, super::native::NativeUnavailable> {
+        self.inner.native.member_facts(member).await
+    }
+
+    /// Check afresh the held items of every member due a check: one whose
+    /// holds were last checked a bound ago, so a held item whose member
+    /// passes again is released though nothing new comes for it. Each
+    /// member is checked on its own: one whose roster cannot be read, or
+    /// whose check fails, is checked again at a later round, and the
+    /// members after it are still checked in this one.
+    async fn recheck_holds(&self, now: u64) -> Result<(), AnnouncementError> {
+        let members = self
+            .inner
+            .store
+            .members_with_holds_due(now.saturating_sub(HOLD_RECHECK_MS), ROUND_MEMBERS)
+            .await?;
+        for member in members {
+            match self.member_facts_read(&member).await {
+                Ok(facts) => {
+                    if let Err(error) = self
+                        .inner
+                        .store
+                        .release_holds(&member, facts, self.inner.config.policy.max_count, now)
+                        .await
+                    {
+                        tracing::warn!(
+                            %member,
+                            %error,
+                            "a member's held items could not be checked; they wait"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    %member,
+                    error = %error.0,
+                    "a member's roster could not be read; its held items wait"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// For a batch to a peer that nothing has settled (submitting, or
+    /// sealed): whether a request for it may still commit, inside the quiet
+    /// window after its last change. A sealed batch's record does not say
+    /// whether an earlier submission was answered that nothing was
+    /// committed, so every sealed peer batch waits that window out before a
+    /// failing check cancels it: a delay, never a leak. `None` for any
+    /// other batch.
+    fn peer_request_open(&self, batch: &Batch, now: u64) -> Option<bool> {
+        if batch.route != MemberRoute::Peer {
+            return None;
+        }
+        matches!(
+            batch.state,
+            BatchState::Submitting { .. } | BatchState::Sealed
+        )
+        .then(|| now <= self.peer_window_end(batch))
+    }
+
+    /// When the quiet window after a peer batch's last request ends.
+    fn peer_window_end(&self, batch: &Batch) -> u64 {
+        batch.updated_at_ms.saturating_add(self.quiet_ms())
+    }
+
+    /// The last check before a native submission: every item of `batch` is
+    /// checked again against its member's coverage and routes. With
+    /// `may_cancel`, a failing item cancels the batch (its failing items
+    /// are held and the rest reopen); without it, the failure comes back
+    /// and nothing changes. A roster that cannot be read defers it.
+    async fn last_check(
+        &self,
+        batch: &Batch,
+        may_cancel: bool,
+        now: u64,
+    ) -> Result<LastCheck, AnnouncementError> {
+        let facts = match self.member_facts_read(&batch.member).await {
+            Ok(facts) => facts,
+            Err(error) => {
+                tracing::warn!(
+                    batch_id = %batch.id,
+                    error = %error.0,
+                    "a member's roster could not be read; the batch's last check waits"
+                );
+                return Ok(LastCheck::Deferred);
+            }
+        };
+        Ok(
+            match self
+                .inner
+                .store
+                .check_before_submission(&batch.id, batch.state.tag(), facts, may_cancel, now)
+                .await?
+            {
+                SubmissionCheck::Passed => LastCheck::Passed,
+                SubmissionCheck::Cancelled(cancelled) => LastCheck::Cancelled(cancelled),
+                _ => LastCheck::Failed,
+            },
+        )
+    }
+
+    /// Count what an admitted batch delivered past a revocation: on a
+    /// gateway without a governed binder nothing Meta controls stands
+    /// between a commit and its admission, so an item its member stopped
+    /// passing between them still reached it. A failure to count is
+    /// logged; the delivery stands.
+    async fn audit_delivered_across_revocation(&self, batch: &Batch, now: u64) {
+        let facts = match self.member_facts_read(&batch.member).await {
+            Ok(facts) => facts,
+            Err(error) => {
+                tracing::warn!(
+                    batch_id = %batch.id,
+                    error = %error.0,
+                    "a member's roster could not be read; an admission went uncounted"
+                );
+                return;
+            }
+        };
+        if let Err(error) = self
+            .inner
+            .store
+            .audit_delivered_across_revocation(&batch.id, facts, now)
+            .await
+        {
+            tracing::warn!(
+                batch_id = %batch.id,
+                %error,
+                "a delivery across a revocation could not be audited"
+            );
+        }
     }
 
     /// Record when a batch the round just read is read again.
@@ -1869,11 +2322,16 @@ impl AnnouncementService {
         event: BatchEvent,
         now: u64,
     ) -> Result<Batch, AnnouncementError> {
-        Ok(self
+        let admitted = matches!(event, BatchEvent::NativeApplied { .. });
+        let next = self
             .inner
             .store
             .transition_batch(&batch.id, batch.state.tag(), event, now)
-            .await?)
+            .await?;
+        if admitted {
+            self.audit_delivered_across_revocation(&next, now).await;
+        }
+        Ok(next)
     }
 
     /// Advance one batch as far as native evidence allows now. Returns when
@@ -1940,6 +2398,47 @@ impl AnnouncementService {
                         }
                         Err(PrepareStep::Waits) => return Ok(owed_at),
                         Err(PrepareStep::NotYet) => return Ok(retry_at),
+                    }
+                    // The last point Meta controls: a member that stopped
+                    // passing since the seal gets nothing of it. A peer
+                    // batch submitted before is never cancelled while its
+                    // last request may still commit, and past that window
+                    // what the request did is read first.
+                    let peer = self.peer_request_open(&batch, now);
+                    match self.last_check(&batch, peer.is_none(), now).await? {
+                        LastCheck::Passed => {}
+                        LastCheck::Cancelled(cancelled) => {
+                            batch = *cancelled;
+                            continue;
+                        }
+                        LastCheck::Deferred => return Ok(retry_at),
+                        LastCheck::Failed if peer == Some(true) => {
+                            return Ok(Some(self.peer_window_end(&batch).saturating_add(1)));
+                        }
+                        LastCheck::Failed => match self.inner.native.status(&batch).await {
+                            Ok(NativeStatus::NotCommitted) => {
+                                match self.last_check(&batch, true, now).await? {
+                                    LastCheck::Cancelled(cancelled) => {
+                                        batch = *cancelled;
+                                        continue;
+                                    }
+                                    LastCheck::Passed => {}
+                                    LastCheck::Failed | LastCheck::Deferred => {
+                                        return Ok(retry_at);
+                                    }
+                                }
+                            }
+                            // An earlier request committed: the batch settles
+                            // from what the native owner holds.
+                            Ok(status) => {
+                                batch = self
+                                    .apply(&batch, BatchEvent::BeginSubmit, self.now())
+                                    .await?;
+                                batch = self.settle_from(&batch, status, now).await?;
+                                continue;
+                            }
+                            Err(_) => return Ok(retry_at),
+                        },
                     }
                     // Stamped when the request is issued, not when the
                     // round began: a peer's window runs from the issue.
@@ -2022,6 +2521,23 @@ impl AnnouncementService {
                                 }
                                 Err(PrepareStep::Waits) => return Ok(owed_at),
                                 Err(PrepareStep::NotYet) => return Ok(retry_at),
+                            }
+                            // Every resubmission is checked again first. A
+                            // peer's earlier request may still commit inside
+                            // the quiet window: then the batch waits.
+                            let open = self.peer_request_open(&batch, now) == Some(true);
+                            match self.last_check(&batch, !open, now).await? {
+                                LastCheck::Passed => {}
+                                LastCheck::Cancelled(cancelled) => {
+                                    batch = *cancelled;
+                                    continue;
+                                }
+                                LastCheck::Deferred => return Ok(retry_at),
+                                LastCheck::Failed => {
+                                    return Ok(Some(
+                                        self.peer_window_end(&batch).saturating_add(1),
+                                    ));
+                                }
                             }
                             batch = self
                                 .apply(&batch, BatchEvent::RetryNotCommitted, self.now())

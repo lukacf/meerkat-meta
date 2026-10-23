@@ -28,7 +28,7 @@ from .deployment_deadlines import (APPLICATION_STOP_TIMEOUT, LEGACY_USER_SERVICE
                                    reported_gateway_horizon, shutdown_budget)
 from .deployment_ports import require_available_console_port, LocalConsolePortUnavailable
 from .native_definition_continuity import valid_continuity_projection
-from .owned_worker import spawn_owned_worker
+from .owned_worker import end_after_owner_loss, serve_as_owned_worker, spawn_owned_worker
 
 INSTALL_TIMEOUT = 1200
 CHECK_TIMEOUT = 180
@@ -2367,15 +2367,19 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
 async def owner_input(supervisor):
     reader = asyncio.StreamReader()
     await asyncio.get_running_loop().connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer)
+    stopped = False
     while True:
         line = await reader.readline()
         if not line:
+            from .deployment import worker_stop_timeout
+            end_after_owner_loss(worker_stop_timeout(supervisor.directory))
             supervisor.stop.set()
-            return "owner_lost"
+            return "stopped" if stopped else "owner_lost"
         try:
             if json.loads(line).get("action") == "stop":
+                # Keep reading: the owner can still be lost during this stop.
                 supervisor.stop.set()
-                return "stopped"
+                stopped = True
         except (ValueError, AttributeError):
             continue
 
@@ -2682,4 +2686,5 @@ if __name__ == "__main__":
     selection = ({"path": sys.argv[3], "sha256": sys.argv[4]} if len(sys.argv) == 5 else None)
     if len(sys.argv) not in {3, 5}:
         raise ValueError("The fixed deployment worker arguments changed.")
+    serve_as_owned_worker()
     sys.exit(asyncio.run(run(Path(sys.argv[1]), sys.argv[2], update_selection=selection)) or 0)

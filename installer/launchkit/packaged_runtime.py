@@ -19,6 +19,51 @@ _private_model_custody = None
 _selected_target = None
 _selected_root = None
 _selected_ordinary_gateway = None
+_application_model_custody = None
+APPLICATION_MODEL_ROOT = ("Application model custody needs Linux and this Forge's one model credential root: its "
+    "credential root must be the XDG_CONFIG_HOME this Forge runs with, the same root the Guide's model route uses.")
+
+
+def configure_application_model_custody(custody):
+    """Select a native owner's application model configuration for local applications.
+
+    This is an explicit opt-in, separate from configure_private_model_route:
+    the Guide's model route never supplies application credentials. Call it
+    once, before the packaged runtime opens. custody is the application model
+    configuration owner that the launcher selections carry; create_app passes
+    it to the local application registry, which checks it again. It may be the
+    same owner the Guide's route uses, or another one over the same root: a
+    process has one supported model credential root, XDG_CONFIG_HOME. A Forge
+    started with an application host factory carries it too, or refuses to
+    start (application_host_launch).
+    """
+    global _application_model_custody
+    from .connect_application_startup import _ModelConfiguration
+    if _selected_target is not None:
+        raise ValueError("Select application model custody before opening the packaged runtime.")
+    if _application_model_custody is not None:
+        raise ValueError("The original application model custody cannot be replaced.")
+    if type(custody) is not _ModelConfiguration:
+        raise TypeError("Select the original application model configuration owner.")
+    from .connect_installer_caller import CustodyError
+    try:
+        custody.require_environment()
+    except CustodyError as error:
+        # One process has one supported model credential root. Refuse here,
+        # not at a later Start.
+        raise CustodyError(APPLICATION_MODEL_ROOT) from error
+    custody.require_filesystem_current()
+    _application_model_custody = custody
+
+
+def configured_application_model_custody():
+    """The owner configure_application_model_custody selected, or None.
+
+    A Forge started with an application host factory reads it too
+    (application_host_launch), so the owner reaches that entry's selection or
+    startup refuses; it is never dropped.
+    """
+    return _application_model_custody
 
 
 def configure_private_model_route(route, custody):
@@ -111,12 +156,20 @@ def create_app():
 
     A package that includes the selected Meta release's RPC gateway also
     builds ordinary applications, those without a connection setup helper.
+    Application model custody, when a native owner selected it with
+    configure_application_model_custody, reaches the local applications.
     """
     selected = open_selection()
     gateway = selected_ordinary_gateway()
+    custody = _application_model_custody
+    options = {} if gateway is None else {"ordinary_meta_gateway": gateway}
+    if custody is not None:
+        custody.require_environment()
+        custody.require_filesystem_current()
+        options["model_configuration"] = custody
     server = importlib.import_module("launchkit.server")
-    if gateway is None:
-        server.select_local_application_runtime(selected)
-    else:
-        server.select_local_application_runtime(selected, ordinary_meta_gateway=gateway)
+    server.select_local_application_runtime(selected, **options)
+    if custody is not None:
+        custody.require_environment()
+        custody.require_filesystem_current()
     return server.app

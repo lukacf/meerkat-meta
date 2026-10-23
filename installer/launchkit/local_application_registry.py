@@ -66,6 +66,9 @@ def _set_up(directory):
 
 
 REDIRECTED = "The original installation cannot be redirected to another build or source owner."
+MANAGED_MODELS_WITHOUT_CUSTODY = ("This plan's agents use host-managed models, and this Forge was started without "
+    "an application model configuration for them. Choose models that use your own provider key, or start Forge "
+    "with the application model configuration its product provides.")
 
 
 class LocalApplicationRegistry:
@@ -484,6 +487,12 @@ class LocalApplicationRegistry:
         host = self.host_for_build(guide_id, build_id)
         if host is None:
             return
+        # Start would refuse host-managed models without this launcher's
+        # application model configuration; Install says so before any worker.
+        from .connect_application_startup import _managed_model_classes
+        if (_managed_model_classes({"classes": host._blueprint["agent_classes"]})
+                and self._selected_model_configuration() is None):
+            raise DraftConflict(MANAGED_MODELS_WITHOUT_CUSTODY)
         host.validate_settings(guide_id, settings)
         if self.host_for_build(guide_id, build_id) is not host:
             raise CustodyError("The original Build host changed during settings validation.")
@@ -497,12 +506,64 @@ class LocalApplicationRegistry:
                 raise CustodyError("The original installed settings owner changed.")
 
     def retain_installation_inputs(self, deployment, guide_id, deployment_id):
+        if self._reconnects_saved_setup(deployment, guide_id, deployment_id):
+            # After a Forge restart, a retried Install's saved setup belongs to
+            # its claimed setup action: Continue setup rebuilds the original
+            # owner from the installed source. Completion retains nothing new.
+            return
+        self._recover_install_build(deployment, guide_id, deployment_id)
         host = self._require_selected(deployment, guide_id, deployment_id)
         if host is not None:
             result = host.retain_installation_inputs(deployment, guide_id, deployment_id)
             if self._require_selected(deployment, guide_id, deployment_id) is not host:
                 raise CustodyError("The original Install retainer changed during completion.")
             return result
+
+    def _reconnects_saved_setup(self, deployment, guide_id, deployment_id):
+        """Whether only Continue setup can reconnect this installation's owner.
+
+        The reconnect hint reads the installation's saved setup without
+        constructing a host. A product installation whose Install never saved
+        its setup has no such hint, and its Build owner is recovered instead.
+        """
+        try:
+            return self._reconnect_status(deployment, guide_id, deployment_id) is not None
+        except FileNotFoundError:
+            return False
+
+    def _recover_install_build(self, deployment, guide_id, deployment_id):
+        """Recover the installed Build's owner for a retried Install, as Install does.
+
+        After a Forge restart this process holds no Build owner. The same
+        signed-acceptance readers as a deliberate Install rebuild it; a set-up
+        installation or a retained one keeps its existing owner.
+        """
+        self._require_registry()
+        if deployment is not self.deployment:
+            raise CustodyError("Use the registry's original deployment service.")
+        if self.runtime_target is None or self.manual_host is not None:
+            return
+        guide_id, deployment_id = _identity(guide_id), _identity(deployment_id)
+        directory = deployment._directory(guide_id, deployment_id)
+        receipt = read_receipt(directory)
+        if receipt.get("source_kind", "application") != "application":
+            return
+        build_id = _identity(receipt.get("build_id"))
+        key, build_key = (guide_id, deployment_id), (guide_id, build_id)
+        with self._lock:
+            if key in self._installations or build_key in self._builds or _set_up(directory):
+                return
+        from .local_application_recovery import recover_local_build
+        from .ordinary_application_source import recover_ordinary_application_source
+        recovered = (recover_ordinary_application_source(self, guide_id, build_id)
+            if self.ordinary_meta_gateway is not None else None)
+        if recovered is None:
+            recovered = recover_local_build(self, guide_id, build_id)
+        if recovered is not None:
+            version, blueprint, factory, selected = recovered
+            with self._lock:
+                self._builds.setdefault(build_key, _BuildOwner(guide_id, build_id, version,
+                    deepcopy(blueprint), factory, selected))
 
     def _selected_startup(self, guide_id, deployment_id):
         host = self.selected_host(guide_id, deployment_id)
@@ -641,7 +702,9 @@ class LocalApplicationRegistry:
         application without a setup helper stopped for its owner's Start. The
         owner lookup still refuses a redirect to another build or source owner,
         and that owner must accept the staged candidate's protected choices and
-        source. A product application that has not entered its setup has no
+        source. A transaction an earlier Forge staged with a native definition,
+        instruction, runtime or maintained-host change is refused here, as Stage
+        now blocks it. A product application that has not entered its setup has no
         update worker that could start it, so Apply refuses before any worker.
         After a Forge restart, an owner that only a claimed setup action can
         reconnect is named as such before any lookup.

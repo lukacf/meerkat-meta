@@ -36,6 +36,12 @@ pub const MAX_CAUSES: usize = 16;
 pub const MAX_BACKFILL: usize = 10_000;
 /// Largest page any list query returns.
 pub const MAX_PAGE: usize = 256;
+/// Longest announcement source id, in bytes: a source's id is part of every
+/// key its items are announced under.
+pub const MAX_SOURCE_ID_BYTES: usize = 200;
+/// The prefix of every source item's key. The namespace belongs to sources:
+/// a host or member announcement under it is refused.
+pub const SOURCE_KEY_PREFIX: &str = "source:";
 /// Largest rendering of one announcement inside a batch body, JSON-encoded,
 /// in bytes. An announcement that renders larger is refused, so every
 /// announcement fits a batch for a member on a peer gateway on its own.
@@ -128,6 +134,119 @@ pub enum AnnouncementStoreError {
     RouteNotKept {
         member: Member,
     },
+    /// No source has this id in the mob.
+    UnknownSource,
+    /// The source's generation ended. Declaring the source again starts its
+    /// next generation; nothing else changes an ended one.
+    SourceEnded,
+    /// The source is paused: it takes no advance until it is resumed.
+    SourcePaused,
+    /// Another live source of the mob already reads the same principal's
+    /// scope: one scope is one source per mob.
+    SourceIdentityTaken {
+        source_id: SourceId,
+    },
+    /// A source's identity is fixed within a generation; changing it starts
+    /// a new generation.
+    IdentityImmutable,
+    /// The topic is owned by another source of the mob, live or ended.
+    TopicOwned {
+        topic: Topic,
+        source_id: SourceId,
+    },
+    /// A plain announcement named a topic a source owns. Only the source's
+    /// items reach its topics, and only a triage route's own member its
+    /// forward topics.
+    TopicOwnedBySource {
+        topic: Topic,
+        source_id: SourceId,
+    },
+    /// This kind of principal is not accepted with the source's connection.
+    PrincipalNotAllowed {
+        kind: String,
+    },
+    /// A route selects by something this release does not support.
+    RouteSelectorUnsupported {
+        selector: String,
+    },
+    /// The source moved past the caller's expected revision. Carries where
+    /// it stands; the cursor's token goes to the caller's data only, never
+    /// into a message.
+    SourceStaleRevision {
+        revision: u64,
+        generation: u64,
+        cursor: super::sources::SourceCursor,
+    },
+    /// The live-source bound of the mob (`mob_id`) or of the gateway (no
+    /// `mob_id`) is reached. An ended source frees its place.
+    SourceLimit {
+        limit: u32,
+        mob_id: Option<MobId>,
+    },
+    /// Another step advanced the source first: the caller read an older
+    /// cursor version. Carries where the cursor stands; its token goes to
+    /// the caller's data only.
+    SourceVersionConflict {
+        revision: u64,
+        state: super::sources::SourceState,
+        cursor: super::sources::SourceCursor,
+    },
+    /// The principal a collector used is not the one the source's
+    /// generation pins. Carries both digests, never a principal.
+    PrincipalChanged {
+        pinned_digest: String,
+        offered_digest: String,
+    },
+    /// The source is taking a baseline: its advances carry no items until
+    /// its final page.
+    BaselineRequired,
+    /// Items of streams whose baseline is not taken.
+    StreamNotBaselined {
+        streams: Vec<String>,
+    },
+    /// The page would announce more history than the backfill (the
+    /// source's, or a stream's when `stream` names it) takes.
+    BackfillBoundExceeded {
+        remaining: u32,
+        stream: Option<String>,
+    },
+    /// A deletion on a source whose provider has no observable deletions.
+    DeletionsUnobservable,
+    /// The source's audience (a forward topic's forward audience) does not
+    /// let the member receive the topic.
+    AudienceNotCovered {
+        source_id: SourceId,
+        topic: Topic,
+    },
+    /// No direct route of the source names the topic, and the member is not
+    /// the triage member that takes it.
+    NoDirectRoute {
+        source_id: SourceId,
+        topic: Topic,
+    },
+    /// The member would be reachable both directly and through a forward of
+    /// the same source.
+    RouteOverlap {
+        source_id: SourceId,
+        member: Member,
+    },
+    /// The member owns a live conversation on the source's scope.
+    ConversationMember {
+        source_id: SourceId,
+    },
+}
+
+impl AnnouncementStoreError {
+    /// The kind an onboarding refusal of an advance is counted under in the
+    /// source's failure streak, if this is one.
+    pub(crate) fn onboarding_refusal(&self) -> Option<&'static str> {
+        match self {
+            Self::BaselineRequired => Some("baseline_required"),
+            Self::StreamNotBaselined { .. } => Some("stream_not_baselined"),
+            Self::BackfillBoundExceeded { .. } => Some("backfill_bound_exceeded"),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for AnnouncementStoreError {
@@ -194,6 +313,93 @@ impl fmt::Display for AnnouncementStoreError {
                  resolves it"
             ),
             Self::RouteNotKept { member } => write!(f, "no route is kept for member {member}"),
+            Self::UnknownSource => f.write_str("no such source"),
+            Self::SourceEnded => {
+                f.write_str("the source ended; declare it again to start its next generation")
+            }
+            Self::SourcePaused => f.write_str("the source is paused"),
+            Self::SourceIdentityTaken { source_id } => write!(
+                f,
+                "source {source_id} already reads this principal's scope in this mob"
+            ),
+            Self::IdentityImmutable => f.write_str(
+                "a source's identity is fixed within a generation; ask for a new generation",
+            ),
+            Self::TopicOwned { topic, source_id } => {
+                write!(f, "topic {topic} is owned by source {source_id}")
+            }
+            Self::TopicOwnedBySource { topic, source_id } => write!(
+                f,
+                "topic {topic} is owned by source {source_id}: only its items reach it"
+            ),
+            Self::PrincipalNotAllowed { kind } => write!(
+                f,
+                "a {kind} principal is not accepted with this source's connection"
+            ),
+            Self::RouteSelectorUnsupported { selector } => write!(
+                f,
+                "routes select by topic; selecting by {selector} is not supported in this release"
+            ),
+            Self::SourceStaleRevision { revision, .. } => {
+                write!(f, "the source is at revision {revision}")
+            }
+            Self::SourceLimit {
+                limit,
+                mob_id: Some(mob_id),
+            } => write!(
+                f,
+                "limit reached: at most {limit} live sources in mob {mob_id}"
+            ),
+            Self::SourceLimit {
+                limit,
+                mob_id: None,
+            } => write!(
+                f,
+                "limit reached: at most {limit} live sources on this gateway"
+            ),
+            Self::SourceVersionConflict { cursor, .. } => write!(
+                f,
+                "the source's cursor is at version {}; read it again",
+                cursor.version
+            ),
+            Self::PrincipalChanged { .. } => f.write_str(
+                "the principal is not the one this source's generation pins; another principal \
+                 needs a new generation",
+            ),
+            Self::BaselineRequired => f.write_str(
+                "the source is taking a baseline: an advance carries no items until its final page",
+            ),
+            Self::StreamNotBaselined { streams } => write!(
+                f,
+                "items of {} streams whose baseline is not taken; onboard them first",
+                streams.len()
+            ),
+            Self::BackfillBoundExceeded { remaining, .. } => write!(
+                f,
+                "the page passes the backfill's bound: {remaining} items of history remain"
+            ),
+            Self::DeletionsUnobservable => {
+                f.write_str("the source declares no observable deletions, so it carries none")
+            }
+            Self::AudienceNotCovered { source_id, topic } => write!(
+                f,
+                "the audience of source {source_id} does not let this member receive topic \
+                 {topic}"
+            ),
+            Self::NoDirectRoute { source_id, topic } => write!(
+                f,
+                "no direct route of source {source_id} names topic {topic}; only its triage \
+                 member takes it"
+            ),
+            Self::RouteOverlap { source_id, member } => write!(
+                f,
+                "member {member} would be reachable both directly and through a forward of \
+                 source {source_id}"
+            ),
+            Self::ConversationMember { source_id } => write!(
+                f,
+                "the member owns a live conversation on the scope of source {source_id}"
+            ),
         }
     }
 }
@@ -295,6 +501,12 @@ bounded_id!(
     MAX_ID_BYTES,
     "a member identity"
 );
+bounded_id!(
+    /// A caller-chosen announcement source id, unique within its mob.
+    SourceId,
+    MAX_SOURCE_ID_BYTES,
+    "a source id"
+);
 
 /// Separates the mob from the identity in a member's store key. Neither
 /// part may contain a control character, so the key is unambiguous.
@@ -338,7 +550,7 @@ impl fmt::Display for Member {
     }
 }
 
-fn sha256_hex(parts: &[&[u8]]) -> String {
+pub(crate) fn sha256_hex(parts: &[&[u8]]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update((part.len() as u64).to_be_bytes());
@@ -362,13 +574,15 @@ pub struct AnnouncementRef {
     pub source_key: SourceKey,
 }
 
-/// Who made an announcement: the host, or a member of the mob.
+/// Who made an announcement: the host, a member of the mob, or one of the
+/// mob's announcement sources (an item its collector observed).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum Announcer {
     Host,
     Member { identity: MemberIdentity },
+    Source { source_id: SourceId },
 }
 
 impl fmt::Display for Announcer {
@@ -376,6 +590,7 @@ impl fmt::Display for Announcer {
         match self {
             Self::Host => f.write_str("the host"),
             Self::Member { identity } => write!(f, "member {identity}"),
+            Self::Source { source_id } => write!(f, "source {source_id}"),
         }
     }
 }
@@ -418,6 +633,20 @@ impl AnnounceRequest {
         Ok(())
     }
 
+    /// Refuse a new announcement under the key prefix reserved for source
+    /// items unless a source makes it. Checked once no announcement holds
+    /// the key: a retry of one 0.9.4 accepted still answers its original.
+    pub(crate) fn ensure_key_open(&self) -> Result<()> {
+        if !matches!(self.announced_by, Announcer::Source { .. })
+            && self.source_key.as_str().starts_with(SOURCE_KEY_PREFIX)
+        {
+            return Err(AnnouncementStoreError::Invalid(format!(
+                "the key prefix {SOURCE_KEY_PREFIX:?} is reserved for source items"
+            )));
+        }
+        Ok(())
+    }
+
     /// The digest of the content a source key binds. Equal content under the
     /// same key is a replay; other content is a conflict.
     pub fn digest(&self) -> String {
@@ -436,6 +665,7 @@ impl AnnounceRequest {
         let announcer = match &self.announced_by {
             Announcer::Host => "host".to_string(),
             Announcer::Member { identity } => format!("member\n{identity}"),
+            Announcer::Source { source_id } => format!("source\n{source_id}"),
         };
         sha256_hex(&[
             b"mob-announcement-v1",
@@ -1583,7 +1813,7 @@ pub struct PruneReport {
 /// A string as a JSON literal: quoted, with every quote and control
 /// character escaped, so a caller-chosen name cannot change the structure of
 /// the line it appears in.
-fn quoted(text: &str) -> String {
+pub(crate) fn quoted(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())
 }
 
@@ -1602,6 +1832,8 @@ pub fn render_item(announcement: &Announcement) -> String {
     let announcer = match &announcement.announced_by {
         Announcer::Host => "the host".to_string(),
         Announcer::Member { identity } => format!("member {}", quoted(identity.as_str())),
+        // The source by id only: never its connection, principal or cursor.
+        Announcer::Source { source_id } => format!("source {}", quoted(source_id.as_str())),
     };
     let mut out = format!(
         "- Announcement #{sequence} in mob {mob_id}, by {announcer}; topics [{topics}]; \

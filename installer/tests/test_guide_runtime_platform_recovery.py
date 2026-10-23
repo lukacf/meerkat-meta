@@ -12,6 +12,16 @@ from test_meta_toolkit_runtime_update import catalog_target
 import test_meta_toolkit_runtime_selection as product_fixtures
 
 
+@pytest.fixture(autouse=True)
+def inert_isolation_probe(monkeypatch):
+    """A guide turn reads the host's isolation probe, which starts a process.
+
+    This file forbids processes, so the probe passed only after an earlier
+    file had cached it. Select an inert sandbox path here, as other fixtures do.
+    """
+    monkeypatch.setattr("launchkit.implementation_workspace._sandbox_executable", lambda: "/inert/sandbox")
+
+
 @pytest.fixture
 def selected_runtime(request, monkeypatch):
     platform = request.param

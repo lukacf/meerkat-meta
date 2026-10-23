@@ -603,7 +603,7 @@ describe("stock durable queue integration", () => {
     const row = await screen.findByTestId(/^pending-item:/);
     await waitFor(() => expect(within(row).getByText("Not sent")).toBeVisible());
     expect(within(row).getByTestId(/^pending-explanation:/)).toHaveTextContent(
-      "You were signed out, or this network isn't allowed.",
+      "Sign in again or check this connection's authentication. Then review your saved message before choosing Send again.",
     );
     expect(screen.queryByText("Sending")).toBeNull();
     expect(screen.queryByText(/Waiting for confirmation/)).toBeNull();
@@ -812,7 +812,7 @@ describe("stock durable queue integration", () => {
     await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
     expect(send.mock.calls[0][0].attachments).toEqual([file]);
     expect(await screen.findByTestId("console-action-error")).toHaveTextContent(
-      "Not authorized from this network (401). The gateway refused the request before accepting it, so nothing was sent.",
+      "Sign-in required (401). Nothing was sent.",
     );
     expect(textarea.value).toBe("look at this from off the home network");
     expect(screen.getAllByRole("button", { name: "Remove attachment" })).toHaveLength(1);

@@ -25716,7 +25716,7 @@ function classifyConsoleSendFailure(error48) {
     return {
       state: "definitely-rejected",
       kind: "unauthenticated",
-      message: "Not authorized from this network (401). The gateway refused the request before accepting it, so nothing was sent. Sign in or connect from a trusted network, then retry."
+      message: "Sign-in required (401). Nothing was sent. Sign in again or check this connection's authentication, then review the saved message before resending."
     };
   }
   if (rpcKind === "access_denied" || rpc2?.code === -32030 || status === 403) {
@@ -25837,7 +25837,7 @@ function describeConsolePendingRow(attempt, names) {
     const detail2 = (() => {
       switch (attempt.failureKind) {
         case "unauthenticated":
-          return "You were signed out, or this network isn't allowed.";
+          return "Sign in again or check this connection's authentication. Then review your saved message before choosing Send again.";
         case "access_denied":
           return "You don't have permission to message ".concat(names.agent, ".");
         case "read_only":
@@ -48312,6 +48312,36 @@ function framesAfterIdleWatermark(frames, watermark) {
 // src/ConsoleApp.tsx
 var import_react49 = __toESM(require("react"));
 
+// src/lib/panel-runtime.ts
+function selectionStorageKey(scope) {
+  return "meta-console-panel-runtime:".concat(encodeURIComponent(scope));
+}
+function loadPanelRuntimeSelection(storage, scope) {
+  if (!scope) return "";
+  try {
+    return storage?.getItem(selectionStorageKey(scope)) || "";
+  } catch {
+    return "";
+  }
+}
+function savePanelRuntimeSelection(storage, scope, key) {
+  if (!scope || !key) return;
+  try {
+    storage?.setItem(selectionStorageKey(scope), key);
+  } catch {
+  }
+}
+function selectedPanelRuntime(selected, runtimes) {
+  return selected || runtimes?.[0]?.key || "";
+}
+function scopedPanelParams(kind, runtimeKey, params) {
+  if (!runtimeKey || kind !== "meta/memory" && kind !== "meta/workgraph") return params;
+  return { runtime_key: runtimeKey, ...params };
+}
+function framesForPanelRuntime(frames, runtimeKey) {
+  return runtimeKey === void 0 ? frames : frames.filter((frame) => frame.runtimeKey === runtimeKey);
+}
+
 // src/lib/agents.ts
 function buildConsoleIdentityAliasMap(agents) {
   const map4 = /* @__PURE__ */ new Map();
@@ -62892,6 +62922,49 @@ var ACTIVITY_SKIP_EVENTS = /* @__PURE__ */ new Set([
   "tool_execution_completed",
   "server_tool_content"
 ]);
+function emptyMemoryPanelData() {
+  return {
+    records: [],
+    realms: [],
+    quarantineRecords: [],
+    pendingPromotions: [],
+    dreams: [],
+    detail: null,
+    detailLoading: false,
+    unavailable: false,
+    error: null,
+    nextCursor: null,
+    recordsDenied: false,
+    dreamsDenied: false,
+    operatorScopeDenied: false,
+    mobScopeDenied: false,
+    overview: null,
+    overviewDenied: false,
+    proposals: [],
+    proposalsDenied: false,
+    injections: [],
+    injectionsDenied: false,
+    harvests: [],
+    harvestsDenied: false,
+    dreamRuns: [],
+    dreamRunsDenied: false,
+    auditVerdicts: [],
+    auditVerdictsDenied: false,
+    canDecideQuarantine: false
+  };
+}
+function emptyWorkGraphPanelData() {
+  return {
+    items: [],
+    edges: [],
+    attention: [],
+    events: [],
+    capturedAt: null,
+    unavailable: false,
+    denied: false,
+    error: null
+  };
+}
 function ConsoleApp(props) {
   const instanceKey = import_react49.default.useMemo(() => createConsoleId("console-instance"), [props.baseUrl, props.transport, props.storageNamespace, props.panelService, props.mcpAppsHost]);
   return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(ConsoleAppAuthority, { ...props }, instanceKey);
@@ -62992,6 +63065,24 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const [experience, setExperience] = import_react49.default.useState(
     null
   );
+  const persistentSendScope = storageNamespace?.trim() || (experience?.storage_scope?.trim() ? JSON.stringify([baseUrl, experience.storage_scope]) : null);
+  const savedPanelRuntimeSelection = import_react49.default.useMemo(
+    () => loadPanelRuntimeSelection(browserLocalStorage(), persistentSendScope),
+    [persistentSendScope]
+  );
+  const [panelRuntimeSelection, setPanelRuntimeSelection] = import_react49.default.useState(null);
+  const explicitPanelRuntime = panelRuntimeSelection?.scope === persistentSendScope ? panelRuntimeSelection.key : savedPanelRuntimeSelection;
+  const panelRuntimeKey = selectedPanelRuntime(explicitPanelRuntime, experience?.panel_runtimes);
+  const emptyPanelRegistry = experience?.panel_runtimes?.length === 0 && experience.memory?.available === false && experience.workgraph?.available === false;
+  import_react49.default.useEffect(() => {
+    if (!panelRuntimeKey) return;
+    setPanelRuntimeSelection((current) => current?.scope === persistentSendScope && current.key === panelRuntimeKey ? current : { scope: persistentSendScope, key: panelRuntimeKey });
+    savePanelRuntimeSelection(browserLocalStorage(), persistentSendScope, panelRuntimeKey);
+  }, [persistentSendScope, panelRuntimeKey]);
+  const panelRuntimeKeyRef = import_react49.default.useRef(panelRuntimeKey);
+  panelRuntimeKeyRef.current = panelRuntimeKey;
+  const [memoryDataRuntimeKey, setMemoryDataRuntimeKey] = import_react49.default.useState("");
+  const [workGraphDataRuntimeKey, setWorkGraphDataRuntimeKey] = import_react49.default.useState("");
   const [agents, setAgents] = import_react49.default.useState([]);
   const peerLabels = import_react49.default.useMemo(() => {
     const labels2 = /* @__PURE__ */ new Map();
@@ -63034,50 +63125,14 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     config: null,
     error: null
   });
-  const [memoryData, setMemoryData] = import_react49.default.useState({
-    records: [],
-    realms: [],
-    quarantineRecords: [],
-    pendingPromotions: [],
-    dreams: [],
-    detail: null,
-    detailLoading: false,
-    unavailable: false,
-    error: null,
-    nextCursor: null,
-    recordsDenied: false,
-    dreamsDenied: false,
-    operatorScopeDenied: false,
-    mobScopeDenied: false,
-    overview: null,
-    overviewDenied: false,
-    proposals: [],
-    proposalsDenied: false,
-    injections: [],
-    injectionsDenied: false,
-    harvests: [],
-    harvestsDenied: false,
-    dreamRuns: [],
-    dreamRunsDenied: false,
-    auditVerdicts: [],
-    auditVerdictsDenied: false,
-    canDecideQuarantine: false
-  });
-  const [workGraphData, setWorkGraphData] = import_react49.default.useState({
-    items: [],
-    edges: [],
-    attention: [],
-    events: [],
-    version: 0,
-    sorted: null,
-    busyLifecycle: new ConsoleActivityProjection(),
-    busyFoldedThroughMs: Number.NEGATIVE_INFINITY,
-    busyFoldValid: true,
-    capturedAt: null,
-    unavailable: false,
-    denied: false,
-    error: null
-  });
+  const [memoryData, setMemoryData] = import_react49.default.useState(emptyMemoryPanelData);
+  const [workGraphData, setWorkGraphData] = import_react49.default.useState(emptyWorkGraphPanelData);
+  import_react49.default.useEffect(() => {
+    setMemoryDataRuntimeKey("");
+    setWorkGraphDataRuntimeKey("");
+    setMemoryData(emptyMemoryPanelData());
+    setWorkGraphData(emptyWorkGraphPanelData());
+  }, [panelRuntimeKey]);
   const [topologyQueryResult, setTopologyQueryResult] = import_react49.default.useState(null);
   const [topologyCapabilities, setTopologyCapabilities] = import_react49.default.useState(null);
   const [topologyOperations, setTopologyOperations] = import_react49.default.useState([]);
@@ -63311,11 +63366,43 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   function controlWorkbenchTarget(kind) {
     return requireWorkbenchTarget(buildControlTarget2(kind));
   }
+  function runtimeScopedPanel(kind, content3) {
+    if (emptyPanelRegistry) return /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("div", { className: "console-panel runtime-panel-empty", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("h2", { children: kind === "memory" ? "Memory" : "WorkGraph" }),
+      /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("p", { role: "status", children: "No teams are running." }),
+      /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("p", { children: "Finish setting up a team to inspect its memory and work graph." })
+    ] });
+    const runtimes = experience?.panel_runtimes;
+    if (!runtimes) return content3;
+    const loaded = (kind === "memory" ? memoryDataRuntimeKey : workGraphDataRuntimeKey) === panelRuntimeKey;
+    return /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("div", { className: "runtime-scoped-panel", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("label", { className: "runtime-panel-selector", children: [
+        "Mob",
+        /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)(
+          "select",
+          {
+            "aria-label": "".concat(kind === "memory" ? "Memory" : "Work Graph", " mob"),
+            value: panelRuntimeKey,
+            onChange: (event) => setPanelRuntimeSelection({ scope: persistentSendScope, key: event.target.value }),
+            children: [
+              !runtimes.some((runtime) => runtime.key === panelRuntimeKey) && /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("option", { value: panelRuntimeKey, children: "Runtime unavailable" }),
+              runtimes.map((runtime) => /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("option", { value: runtime.key, children: runtime.label }, runtime.key))
+            ]
+          }
+        )
+      ] }),
+      loaded ? content3 : /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("div", { className: "console-panel", role: "status", children: [
+        "Loading ",
+        kind === "memory" ? "memory" : "work graph",
+        "..."
+      ] })
+    ] }, "".concat(kind, ":").concat(panelRuntimeKey));
+  }
   async function executeHeadlessCommand(command, target, params) {
     return (await consoleController.commands.execute({
       command,
       target,
-      params
+      params: scopedPanelParams(target.kind, panelRuntimeKey, params)
     })).result;
   }
   const identityLogRef = import_react49.default.useRef({});
@@ -63732,7 +63819,6 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const sendControllerRef = import_react49.default.useRef(consoleController);
   sendControllerRef.current = consoleController;
   const transientSendScope = import_react49.default.useMemo(() => "transient:".concat(createIdempotencyKey()), [consoleController]);
-  const persistentSendScope = storageNamespace?.trim() || (experience?.storage_scope?.trim() ? JSON.stringify([baseUrl, experience.storage_scope]) : null);
   const sendScope = persistentSendScope || "".concat(transientSendScope, ":").concat(baseUrl);
   const [composerTabId] = import_react49.default.useState(() => {
     try {
@@ -64389,8 +64475,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     if (configuredVisible.length > 0) {
       const extra = [];
       if (experience?.access?.can_administer === true) extra.push("access");
-      if (experience?.memory?.can_read === true) extra.push("memory");
-      if (experience?.workgraph?.available === true && experience?.workgraph?.can_view === true) {
+      if (emptyPanelRegistry || experience?.memory?.can_read === true) extra.push("memory");
+      if (emptyPanelRegistry || experience?.workgraph?.available === true && experience?.workgraph?.can_view === true) {
         extra.push("workgraph");
       }
       return extra.length > 0 ? [...configuredVisible, ...extra] : configuredVisible;
@@ -64400,8 +64486,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     );
     const controls = runtimeControls.filter((kind) => !hidden.has(kind));
     if (experience?.access?.can_administer === true) controls.push("access");
-    if (experience?.memory?.can_read === true) controls.push("memory");
-    if (experience?.workgraph?.available === true && experience?.workgraph?.can_view === true) {
+    if (emptyPanelRegistry || experience?.memory?.can_read === true) controls.push("memory");
+    if (emptyPanelRegistry || experience?.workgraph?.available === true && experience?.workgraph?.can_view === true) {
       controls.push("workgraph");
     }
     return controls;
@@ -64411,6 +64497,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     experience?.memory?.can_read,
     experience?.workgraph?.available,
     experience?.workgraph?.can_view,
+    emptyPanelRegistry,
     hasMobControlSurface
   ]);
   import_react49.default.useLayoutEffect(() => {
@@ -64534,7 +64621,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       }
     });
   }, [panelRefreshFlight, baseUrl, accessScope]);
-  const refreshMemoryData = import_react49.default.useCallback(() => panelRefreshFlight("memory", async () => {
+  const refreshMemoryData = import_react49.default.useCallback(() => panelRefreshFlight("memory:".concat(panelRuntimeKey), async () => {
+    if (emptyPanelRegistry) return;
     const memoryTarget = controlWorkbenchTarget("memory");
     try {
       let records = [];
@@ -64649,6 +64737,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           (result) => result?.verdicts || []
         )
       ]);
+      if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+      setMemoryDataRuntimeKey(panelRuntimeKey);
       setMemoryData((current) => ({
         ...current,
         records,
@@ -64678,15 +64768,18 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         error: null
       }));
     } catch (err) {
+      if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+      setMemoryDataRuntimeKey(panelRuntimeKey);
       if (jsonRpcErrorCode(err) === -32601) {
         setMemoryData((current) => ({ ...current, unavailable: true, error: null }));
         return;
       }
       setMemoryData((current) => ({ ...current, error: errorMessage(err) }));
     }
-  }), [panelRefreshFlight, baseUrl, experience?.memory?.can_review_quarantine]);
+  }), [panelRefreshFlight, baseUrl, panelRuntimeKey, emptyPanelRegistry, experience?.memory?.can_review_quarantine]);
   const workGraphRefreshSequencerRef = import_react49.default.useRef(createWorkGraphRefreshSequencer());
-  const refreshWorkGraphData = import_react49.default.useCallback(() => panelRefreshFlight("workgraph", async () => {
+  const refreshWorkGraphData = import_react49.default.useCallback(() => panelRefreshFlight("workgraph:".concat(panelRuntimeKey), async () => {
+    if (emptyPanelRegistry) return;
     const workGraphTarget = controlWorkbenchTarget("workgraph");
     const isCurrent = workGraphRefreshSequencerRef.current.begin();
     try {
@@ -64715,7 +64808,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           if (jsonRpcErrorCode(err) !== -32030) throw err;
         }
       }
-      if (!isCurrent()) return;
+      if (!isCurrent() || panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+      setWorkGraphDataRuntimeKey(panelRuntimeKey);
       setWorkGraphData({
         items: snapshot?.items || [],
         edges: snapshot?.edges || [],
@@ -64727,7 +64821,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         error: null
       });
     } catch (err) {
-      if (!isCurrent()) return;
+      if (!isCurrent() || panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+      setWorkGraphDataRuntimeKey(panelRuntimeKey);
       const code4 = jsonRpcErrorCode(err);
       const capabilityMissing = err instanceof Error && err.message.startsWith("Meta capability missing");
       if (code4 === -32601 || code4 === -32041 || capabilityMissing) {
@@ -64736,7 +64831,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       }
       setWorkGraphData((current) => ({ ...current, error: errorMessage(err) }));
     }
-  }), [panelRefreshFlight, baseUrl]);
+  }), [panelRefreshFlight, baseUrl, panelRuntimeKey, emptyPanelRegistry]);
   const queryMemoryRecords = import_react49.default.useCallback(
     async (params) => {
       try {
@@ -64747,19 +64842,21 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         );
       } catch (err) {
         if (memorySectionOutcome(err) === "denied") return null;
-        setMemoryData((current) => ({ ...current, error: errorMessage(err) }));
+        if (panelRuntimeKeyRef.current === panelRuntimeKey) setMemoryData((current) => ({ ...current, error: errorMessage(err) }));
         throw err;
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [baseUrl]
+    [baseUrl, panelRuntimeKey]
   );
   const loadMemoryEvidence = import_react49.default.useCallback(
     async (identity, evidence) => {
       if (!evidence.session_id) return null;
       try {
+        const namespace = experience?.panel_runtimes?.find((runtime) => runtime.key === panelRuntimeKey)?.namespace;
+        const scopedIdentity = identity && namespace && !identity.startsWith("".concat(namespace, "/")) ? "".concat(namespace, "/").concat(identity) : identity;
         const pageFact = await consoleController.timeline.query({
-          ...identity ? { identity } : {},
+          ...scopedIdentity ? { identity: scopedIdentity } : {},
           mode: "recent",
           limit: 1e3
         });
@@ -64776,7 +64873,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         return null;
       }
     },
-    [consoleController]
+    [consoleController, panelRuntimeKey, experience?.panel_runtimes]
   );
   const loadMemoryRecordDetail = import_react49.default.useCallback(
     async (realm, memoryId) => {
@@ -64793,8 +64890,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           chain: result.chain || [],
           injections: result.injections || []
         } : null;
+        if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
         setMemoryData((current) => ({ ...current, detail, detailLoading: false }));
       } catch (err) {
+        if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
         setMemoryData((current) => ({
           ...current,
           detail: null,
@@ -64804,7 +64903,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [baseUrl]
+    [baseUrl, panelRuntimeKey]
   );
   const decideMemoryQuarantine = import_react49.default.useCallback(
     async (realm, record8, verdict, rationale) => {
@@ -64912,7 +65011,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   import_react49.default.useEffect(() => {
     void refreshPanelDataRef.current().catch(() => {
     });
-  }, [visiblePanelKey, accessScope, experience?.access?.can_administer]);
+  }, [visiblePanelKey, accessScope, panelRuntimeKey, emptyPanelRegistry, experience?.access?.can_administer]);
   const scheduleExperienceRefresh = import_react49.default.useCallback(() => {
     if (experienceTimerRef.current !== null) return;
     experienceTimerRef.current = window.setTimeout(() => {
@@ -64966,7 +65065,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     try {
       const snapshot = await executeHeadlessCommand(
         CONSOLE_COMMAND_NAMES2.workgraphSnapshot,
-        controlWorkbenchTarget("workgraph")
+        controlWorkbenchTarget("workgraph"),
+        experience?.panel_runtimes ? {
+          runtime_key: experience.panel_runtimes.find((runtime) => identity.startsWith("".concat(runtime.namespace, "/")))?.key || ""
+        } : void 0
       );
       appendFrame(
         identity,
@@ -66403,7 +66505,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     if (target.kind === "identity-inspect") {
       return renderInspectPanel(target);
     }
-    if ((target.kind === "routing" || target.kind === "gating" || target.kind === "gates" || target.kind === "workgraph") && !hasMobControlSurface) {
+    if ((target.kind === "routing" || target.kind === "gating" || target.kind === "gates") && !hasMobControlSurface) {
       return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("div", { className: "console-panel", children: "This view requires a mob runtime control surface." });
     }
     if (target.kind === "routing") return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(RoutingPanel, { data: routingData });
@@ -66504,67 +66606,73 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         accessScope
       );
     if (target.kind === "memory")
-      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
-        MemoryPanel,
-        {
-          records: memoryData.records,
-          realms: memoryData.realms,
-          quarantineRecords: memoryData.quarantineRecords,
-          pendingPromotions: memoryData.pendingPromotions,
-          dreams: memoryData.dreams,
-          detail: memoryData.detail,
-          detailLoading: memoryData.detailLoading,
-          canReviewQuarantine: experience?.memory?.can_review_quarantine === true,
-          unavailable: memoryData.unavailable,
-          error: memoryData.error,
-          nextCursor: memoryData.nextCursor,
-          recordsDenied: memoryData.recordsDenied,
-          dreamsDenied: memoryData.dreamsDenied,
-          operatorScopeDenied: memoryData.operatorScopeDenied,
-          mobScopeDenied: memoryData.mobScopeDenied,
-          overview: memoryData.overview,
-          overviewDenied: memoryData.overviewDenied,
-          proposals: memoryData.proposals,
-          proposalsDenied: memoryData.proposalsDenied,
-          injections: memoryData.injections,
-          injectionsDenied: memoryData.injectionsDenied,
-          harvests: memoryData.harvests,
-          harvestsDenied: memoryData.harvestsDenied,
-          dreamRuns: memoryData.dreamRuns,
-          dreamRunsDenied: memoryData.dreamRunsDenied,
-          auditVerdicts: memoryData.auditVerdicts,
-          auditVerdictsDenied: memoryData.auditVerdictsDenied,
-          liveFrames: activityRef.current,
-          onRefresh: () => void refreshMemoryData(),
-          onSelectRecord: (realm, memoryId) => void loadMemoryRecordDetail(realm, memoryId),
-          onClearDetail: () => setMemoryData((current) => ({ ...current, detail: null, detailLoading: false })),
-          onQueryRecords: queryMemoryRecords,
-          onLoadEvidence: loadMemoryEvidence,
-          onDecideQuarantine: memoryData.canDecideQuarantine && !frontendReadOnly && experience?.console_policy?.read_only !== true ? decideMemoryQuarantine : void 0,
-          onOpenGating: (
-            // Only offered where the nav itself offers gating — on runtimes
-            // without a mob control surface (or with gating hidden) the
-            // target would land on a dead-end placeholder.
-            visibleControls.includes("gating") ? () => dock.openTarget(buildControlTarget2("gating"), "replace_focused") : void 0
-          )
-        }
+      return runtimeScopedPanel(
+        "memory",
+        /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
+          MemoryPanel,
+          {
+            records: memoryData.records,
+            realms: memoryData.realms,
+            quarantineRecords: memoryData.quarantineRecords,
+            pendingPromotions: memoryData.pendingPromotions,
+            dreams: memoryData.dreams,
+            detail: memoryData.detail,
+            detailLoading: memoryData.detailLoading,
+            canReviewQuarantine: experience?.memory?.can_review_quarantine === true,
+            unavailable: memoryData.unavailable,
+            error: memoryData.error,
+            nextCursor: memoryData.nextCursor,
+            recordsDenied: memoryData.recordsDenied,
+            dreamsDenied: memoryData.dreamsDenied,
+            operatorScopeDenied: memoryData.operatorScopeDenied,
+            mobScopeDenied: memoryData.mobScopeDenied,
+            overview: memoryData.overview,
+            overviewDenied: memoryData.overviewDenied,
+            proposals: memoryData.proposals,
+            proposalsDenied: memoryData.proposalsDenied,
+            injections: memoryData.injections,
+            injectionsDenied: memoryData.injectionsDenied,
+            harvests: memoryData.harvests,
+            harvestsDenied: memoryData.harvestsDenied,
+            dreamRuns: memoryData.dreamRuns,
+            dreamRunsDenied: memoryData.dreamRunsDenied,
+            auditVerdicts: memoryData.auditVerdicts,
+            auditVerdictsDenied: memoryData.auditVerdictsDenied,
+            liveFrames: framesForPanelRuntime(activityRef.current, experience?.panel_runtimes ? panelRuntimeKey : void 0),
+            onRefresh: () => void refreshMemoryData(),
+            onSelectRecord: (realm, memoryId) => void loadMemoryRecordDetail(realm, memoryId),
+            onClearDetail: () => setMemoryData((current) => ({ ...current, detail: null, detailLoading: false })),
+            onQueryRecords: queryMemoryRecords,
+            onLoadEvidence: loadMemoryEvidence,
+            onDecideQuarantine: memoryData.canDecideQuarantine && !frontendReadOnly && experience?.console_policy?.read_only !== true ? decideMemoryQuarantine : void 0,
+            onOpenGating: (
+              // Only offered where the nav itself offers gating — on runtimes
+              // without a mob control surface (or with gating hidden) the
+              // target would land on a dead-end placeholder.
+              visibleControls.includes("gating") ? () => dock.openTarget(buildControlTarget2("gating"), "replace_focused") : void 0
+            )
+          }
+        )
       );
     if (target.kind === "workgraph") {
       const workGraphPanelHandlers = makeWorkGraphOperatorHandlers();
-      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
-        WorkGraphPanel,
-        {
-          data: workGraphData,
-          canManage: canManageWorkGraph,
-          onRefresh: () => void refreshWorkGraphData(),
-          onClaim: workGraphPanelHandlers.onClaim,
-          onClose: workGraphPanelHandlers.onClose,
-          onGoalConfirm: workGraphPanelHandlers.onGoalConfirm,
-          onGoalRequestClose: workGraphPanelHandlers.onGoalRequestClose,
-          onAttentionPause: workGraphPanelHandlers.onAttentionPause,
-          onAttentionResume: workGraphPanelHandlers.onAttentionResume,
-          onAttentionReassign: workGraphPanelHandlers.onAttentionReassign
-        }
+      return runtimeScopedPanel(
+        "workgraph",
+        /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
+          WorkGraphPanel,
+          {
+            data: workGraphData,
+            canManage: canManageWorkGraph,
+            onRefresh: () => void refreshWorkGraphData(),
+            onClaim: workGraphPanelHandlers.onClaim,
+            onClose: workGraphPanelHandlers.onClose,
+            onGoalConfirm: workGraphPanelHandlers.onGoalConfirm,
+            onGoalRequestClose: workGraphPanelHandlers.onGoalRequestClose,
+            onAttentionPause: workGraphPanelHandlers.onAttentionPause,
+            onAttentionResume: workGraphPanelHandlers.onAttentionResume,
+            onAttentionReassign: workGraphPanelHandlers.onAttentionReassign
+          }
+        )
       );
     }
     return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("div", { className: "console-panel", children: "Unsupported panel" });

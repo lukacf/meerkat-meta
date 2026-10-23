@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- `GatewayHostError` is `#[non_exhaustive]` and has a new unit variant,
+  `AgentCustomizerRequired`. A host whose members need an agent customizer
+  answers it when `GatewayHostComposition::compose_agent_customizer` is
+  offered `None`: init fails closed with `-32603` before the identity
+  bootstrap, and the failure's message is the variant's text, "the native
+  host composition requires an agent customizer: configure the SDK agent
+  customizer (a pass-through is enough)". A host that matches
+  `GatewayHostError` needs a wildcard arm; later variants are additive.
+
 ### Added
 
 - Forge operators can select organization-provided starting examples and guide
@@ -56,7 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   outside it, such as a reset's fresh life. `Err` refuses init before the
   identity bootstrap, as does an answer that adds a customizer where the
   gateway composed none or drops the composed one. A gateway without an
-  identity roster never asks.
+  identity roster never asks. An application whose host gives members
+  build-time tools through the hook, such as one that declares member
+  classes, must configure the SDK's agent customizer (a pass-through is
+  enough): a host offered `None` can only start without a customizer or
+  refuse init, with `GatewayHostError::AgentCustomizerRequired` when it
+  needs one.
 - `GatewayHostComposition::identity_member_retired` (defaulted to doing
   nothing): a host-composed gateway tells its host once per retired incarnation
   of a durable identity's member, after Core's retire returned and with no Meta
@@ -85,6 +101,152 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ErrorCategory` lists carry. With a host, a retire whose incarnation read
   from Core fails is refused before Core is asked (fail closed). Without a
   host, retires read nothing extra.
+- Meta Forge's packaged entry, `launchkit.packaged_runtime`, has
+  `configure_application_model_custody(custody)`. A native owner that starts
+  Forge from a product package calls it once, before the packaged runtime
+  opens, to give the local applications their model configuration,
+  separately from the Guide's `configure_private_model_route`. The custody
+  may be the Guide's own owner or another one over the same credential root:
+  one Forge process has one model credential root, its `XDG_CONFIG_HOME`, and
+  a custody over another root is refused at that call. Applications whose
+  agents use host-managed models then install and start from the packaged
+  entry. A Forge started with an application host factory
+  (`META_FORGE_APPLICATION_HOST_FACTORY`) carries that custody too: a bare
+  product target, or an ordinary selection without its own model owner,
+  takes it, and a selection with another owner, or one that cannot carry it
+  such as an application host, stops startup instead of dropping it.
+- Mob announcement sources, first slice. A source is the durable record of
+  one feed a collector reads into a mob: its identity (the provider, the
+  principal whose account it reads, and the scope), the topics it owns, its
+  audience and routes, how its adapter observes, and its collection state.
+  New methods `meta/mob_announcements/sources/{put, pause, resume, end, get,
+  list}` declare it, change its operator state at its revision, and read
+  it. A list reads one mob's sources (the gateway's own unless `mob_id`
+  names another), shows each source's principal as its kind and digest,
+  and never returns the cursor token or a failure's detail; `sources/get`
+  returns both, and the source's streams with `"include_streams": true`.
+  A change at a stale revision is refused `stale_revision` with the
+  source's revision, generation and cursor.
+  - A mob keeps at most 256 live sources and a gateway 1024
+    (`source_limit`); an ended source frees its place.
+  - A mob keeps one live source per principal's scope
+    (`source_identity_taken`). A source's identity is fixed within a
+    generation (`identity_immutable`); `new_generation`, or a declaration
+    after an end, starts the next generation from a fresh baseline, and the
+    revision keeps rising across generations.
+  - A principal is a verified connector account (`issuer`, `strategy_id`,
+    `subject`) or, only with a host connection, a host-attested account
+    (`principal_not_allowed` otherwise). A credential slot or a label is
+    never one, and a source without a principal is refused.
+  - Every source declares its observation capability: how its adapter takes
+    a baseline (`delta` or `snapshot`) and whether deletions are
+    observable.
+  - Routes select by topic: a route that selects by stream is refused
+    (`route_selector_unsupported`).
+- Mob announcement sources collect. `meta/mob_announcements/sources/advance`
+  takes one collector step in one transaction: its items (each announced as
+  the source's, replayed when the same version comes back, or recorded as a
+  conflict with both content digests while the cursor still advances), their
+  captures, and the cursor. A step names the revision and the cursor
+  version it read and the principal it read with: another revision is
+  `stale_revision`, another version `source_version_conflict` (with the
+  current cursor in the error data, never in its message), another
+  principal `principal_changed`, and a paused or ended source refuses it. A
+  retry under the step's operation id answers the original result, marked
+  `"replayed": true`. `meta/mob_announcements/sources/record_failure` records
+  a collector's failure under the same fences and moves no cursor.
+  - Onboarding: a new source takes a baseline, or a bounded backfill, across
+    pages and announces none of what its baseline reads. Only a final page
+    settles a checkpoint (the source's last success) and turns an onboarding
+    live, and the final page of every onboarding says what it covered.
+    Items while a source baselines are refused (`baseline_required`) and
+    past a backfill's bound (`backfill_bound_exceeded`).
+  - Streams onboard on their own, by baseline or bounded backfill. An item
+    of a stream whose baseline is not taken refuses the whole step
+    (`stream_not_baselined`), and these refusals, like the other two
+    onboarding refusals, count toward the source's failure streak.
+  - A rebaseline, or a final page that cannot prove complete coverage,
+    announces one gap notice on the source's topics.
+  - Each version of an item, and each explicit deletion, is its own
+    announcement; a source that declares deletions unobservable takes none
+    (`deletions_unobservable`).
+  - An advance records what its adapter observed (a delta, or a snapshot
+    and its record count) and when a spell of empty snapshots began.
+  - Bounds: 100 items and 1 MiB of item bodies per step, an 8 KiB cursor
+    token (refused, never cut), 1024 streams per source, a 512 byte
+    failure detail.
+- Mob announcement sources decide who receives their items. A source's
+  audience is a list of grants (a member, a role, or a label of its mob)
+  that Meta's access engine evaluates over the member's roster facts,
+  denying by default; a member whose role or labels the roster does not
+  record is covered by a member grant alone. A triage route's forward
+  topics take its forward audience (the source's audience by default).
+  - A subscription to a topic a source owns is refused when the topic's
+    audience does not cover the member (`audience_not_covered`, through
+    the host RPC and the member tool alike), when no direct route names a
+    source topic and the member is not the triage member that takes it
+    (`no_direct_route`), when the member owns a live conversation on the
+    source's scope (`route_conflict`), or when the member would reach the
+    source both directly and through a forward (`route_overlap`, also
+    refused at `sources/put` for a route change that would do this to an
+    existing subscriber).
+  - Capture follows the same audience and routes: an uncovered
+    subscription, a conversation member's, or one to a source topic that no
+    direct route names, held by a member that does not triage it, does not
+    capture the item. Routes bind every subscriber: removing a direct route
+    stops capture for the subscriptions made before the change too.
+  - New method `meta/mob_announcements/audit/list` reads a mob's audit
+    entries, one counted entry per source, generation, member, action
+    (`subscription_refused`, `capture_withheld`) and reason, with its count
+    and its first and last times. It reads per source, per member, per
+    action, or any of them, pages after an entry id, and keeps an entry
+    for the retention window from its last count.
+  - A triage member of another mob, and a role or label grant naming
+    another mob, are refused at `sources/put`; a member grant may name a
+    member of another gateway's mob. A grant names exact values: "*" is
+    no member and no role.
+- Mob announcement sources run their collectors on schedule. A source
+  declared with a runner (`{host_runnable, every_seconds}`, one minute to
+  30 days) gets one durable schedule on the gateway's schedule host,
+  whether it was declared before a boot or at runtime: an interval of its
+  cadence from the declaration on, firing the host's runnable with params
+  `{mob_id, source_id}`, never while the previous fire runs and never late.
+  Sources sharing one runnable keep a schedule each. A changed cadence
+  updates the schedule in place, a changed runnable replaces it, and an end
+  or a declaration without a runner ends it; a paused source keeps its
+  schedule, and its collector reads the pause. A runner naming no runnable
+  (blank) or the memory steward's is refused.
+  - A Rust gateway host hands Meta its own runnables through the new
+    `GatewayHostComposition::host_runnables`, registered beside the SDK's
+    callback runnables (`runtime_options.host_runnables`). Each fire hands
+    the runnable Core's invocation unchanged, its delivery idempotency key
+    included. A name taken twice, or the steward's, refuses init.
+- Mob announcement sources hold what a member may no longer receive. An
+  owed item whose member stopped passing its source's audience or routes
+  after the capture (a narrowed audience, a removed route, a role or label
+  changed by a respawn) is held at the member's next seal: not sealed and
+  not dropped. Immediately before every native submission of a batch (the
+  first, and each one after an answer that nothing was committed), every
+  item is checked again; a batch with an item that fails is cancelled
+  while nothing native holds it, its failing items are held and the rest
+  reopen for the member's next batch.
+  - A held item is released only by a fresh check: at the member's next
+    seal, and at least every 5 minutes while the member has nothing else
+    to seal, so one whose member passes again goes out within minutes
+    though nothing new comes. Only the source generation that held it
+    releases it, and a roster that cannot be read decides nothing: the
+    check waits for a read.
+  - On a peer route a batch is never cancelled while a request for it may
+    still commit: a failing last check waits out the quiet window after the
+    batch's last change, and past it what a request did is read first.
+  - A held item past the retention window expires, and no gap line
+    reports it to its member.
+  - `meta/mob_announcements/audit/list` counts the new actions
+    `items_held`, `items_released`, `expired_while_held` and
+    `delivered_across_revocation`, counted when Meta observes an admission
+    of an item its member no longer passes: on a gateway without a
+    governed binder nothing Meta controls stands between a commit and its
+    admission.
 
 ### Changed
 
@@ -175,6 +337,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bundle ran them: its guide uses its selected Meta runtime, and each exported
   package installs and verifies its own runtime.
   `bash start.sh --prepare-only` now prepares only the Python environment.
+- A source owns its topics and its triage routes' forward topics in its
+  mob, and keeps them after it ends. Another source cannot claim them
+  (`topic_owned`), and a host or member announcement on one is refused
+  (`topic_owned_by_source`), except a triage route's own member announcing
+  on that route's forward topics. Topics no source owns are unchanged.
+- Announcements gain the announcer kind `{"kind": "source", "source_id"}`,
+  a new value raw readers of announcements may see once sources announce.
+  A batch names such an item's source by its id only.
+- The key prefix `source:` is reserved for source items: a new host
+  announcement under it is refused as invalid params. A retry of one made
+  before the upgrade still answers its original.
+- The mob announcement database moves to schema version 2, which only adds
+  the source tables. A version 1 database is migrated in place on first
+  open; an older binary refuses a version 2 database, so going back means
+  disabling mob announcements or keeping this binary.
+- Meta Forge's `/api/capabilities` reports Forge's own release as `version`:
+  the version in `installer/pyproject.toml` that a Forge release is tagged
+  with. It reported `0.8.47`, the MobKit version a developer-entry Build
+  compiles with. Two new fields name the runtimes Forge builds on:
+  `agent_team_runtime`, the public Meta release every compiled agent team
+  installs (`meerkat-meta` 0.9.4, with its release URL), and
+  `ordinary_runtime`, the Meta SDK version, target and gateway SHA-256 a
+  trusted launcher selected for ordinary applications, or `null` without
+  such a selection, as in the developer entry.
 
 ### Removed
 
@@ -368,6 +554,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   anything changes with every launcher; with a launcher that selects a Meta
   Forge application host directly, its update could stop as "recovery
   needed" before.
+- The shared Console, which shows several repositories' mobs in one console,
+  again shows each repository's native Memory and Work Graph panels, read-only
+  and scoped to the repository you pick. It keeps member names and peer links
+  across those mobs, and keeps the repository a panel shows across a reload.
+  When a send needs a new sign-in (401), the Console says that nothing was
+  sent and asks you to review the saved message before you choose Send again;
+  a refused send (403) keeps its access-denied wording.
+- The identity runtime calls `AgentCustomizer::after_create` once after each
+  member build that ran `customize_build`, with the session the build created
+  or resumed: a member's creation or wake (a respawn included), and the
+  successor of a live member's reset or `delete_identity`. It never called it
+  before, so the SDKs' `after_create` callbacks never ran on the identity
+  path. It calls it with no lock of the identity held, so once the init has
+  settled the callback may call back into the gateway for the same identity,
+  and the call can come after the operation answered; a graceful shutdown
+  abandons the calls still waiting. It is best-effort: an error is logged at
+  WARN and the build stands. A member Core rebuilds on its own (its restore
+  at a restart, a delivery-time repair) gets the identity's customizer tools
+  attached without either call.
+- The Python SDK gives an identity customizer's `after_create` the context the
+  gateway sends: the model, labels and system prompt beside the identity and
+  the session. It read a nested `context` object, which the gateway does not
+  send, and passed an empty context; a nested object is still read when one
+  is present.
+- A Meta Toolkit product application's first setup now works when an
+  accepted update was staged after its Install. Preparing or finishing
+  that setup refused with "Preparation inputs differ from the original
+  stopped product owner." (or "Preparation cannot substitute a Supervisor
+  from another installation."): the staged update counted as a change to the
+  installed application, though it changes nothing until it is applied. The
+  update stays staged; to apply it after the setup, stage it again. "Apply
+  and verify update" now says so for such an update, instead of asking you
+  to reconcile the Fresh bootstrap attempt of a setup that completed.
+- After Forge restarts, a retried Install of a Meta Toolkit product
+  application no longer ends with "Trusted setup inputs were not retained".
+  The application's setup owner lived only in the Forge process that built
+  it. When the original Install saved the application's setup, the retried
+  Install now leaves it to "Continue setup", which reconnects it as before;
+  when it never saved one, the retried Install saves it, as a first Install
+  does.
+- Installing an application whose agents use host-managed models, in a Forge
+  started without an application model configuration, is refused before any
+  worker runs, with guidance: choose models that use your own provider key,
+  or start Forge with the application model configuration its product
+  provides. The Install used to run and then fail its input retention
+  ("Trusted setup inputs were not retained"), or, for an application without
+  a setup helper, Start refused later without guidance. Start of such an
+  application installed earlier now gives the same guidance.
+- Checking a remote Linux destination for a Meta Toolkit product names the
+  CPython the product's control tools need when the destination's Python
+  differs, as a failed check before anything is transferred: for example
+  "need CPython 3.12 on Linux x86_64 with glibc 2.31 or newer; this
+  destination runs CPython 3.11". The check reported only "The destination
+  could not complete this request."
+- Stopping Meta Forge (Ctrl+C, or the SIGTERM an installer host sends) no
+  longer waits without bound for each owner of native work in turn. Each
+  owner gets 10 s to stop, in order, and its stop is logged; an owner past
+  its deadline no longer holds the owners after it. Forge no longer kills a
+  deployment, build or trial worker when its stop runs past that deadline,
+  or when Forge exits. It closes the worker's input, which the worker stops
+  itself on, and the worker finishes its application's or native runtime's
+  own shutdown even after Forge has exited. A worker still running once the
+  stop budget its owner waits has passed (467 s for an unreported shutdown
+  horizon) ends its own process group with SIGKILL, after a SIGTERM while
+  it can still absorb one. The next start confirms a deployment's cleanup
+  from the record its worker wrote.
+- The Python SDK's SSE reader (`parse_sse_stream`, behind the agent and mob
+  event streams) decodes each complete line as UTF-8 instead of decoding each
+  network chunk with replacement: a multi-byte character that a chunk
+  boundary split arrived as U+FFFD. The TypeScript SDK's reader already
+  reassembled split characters. In both SDKs, bytes that are not UTF-8, and
+  a stream that ends inside a character, now raise the SDK's
+  `TransportError` (caused by the decode error) instead of being replaced
+  with U+FFFD.
+- The TypeScript SDK's SSE reader (`parseSseStream`) no longer dispatches a
+  final event whose closing blank line never arrived before the stream
+  ended. The SSE specification discards that pending data, and the Python
+  reader already did.
 
 ### Known limitations
 
@@ -376,10 +640,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   protected settings or runtime, including a "Rebuild with updated runtime"
   package. "Stage accepted update" blocks such an update and says why;
   install that build into a new empty folder. A set-up application that runs
-  as a background service still refuses "Stage accepted update". On the
-  Meta Toolkit Connect route, an update staged before the application's
-  first setup can still make that setup refuse. After Forge restarts, use
-  "Continue setup" once before you stage or apply an update.
+  as a background service still refuses "Stage accepted update". After
+  Forge restarts, use "Continue setup" once before you stage or apply an
+  update.
 - A Meta Toolkit product application that has not finished its setup cannot
   take a staged update in place yet. "Apply and verify update" refuses such
   an update before anything changes. Finish its setup, then stage the

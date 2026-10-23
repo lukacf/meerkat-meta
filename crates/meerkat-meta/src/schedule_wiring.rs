@@ -51,6 +51,7 @@ use serde_json::{Map, Value};
 
 use crate::identity_first::gateway_bridges::CallbackBridge;
 use crate::memory::steward::StewardEngine;
+use crate::mob_announcements::{AnnouncementSource, SourceRunners, SourceState};
 
 /// File name for the durable schedule store, kept beside the runtime DB so a
 /// gateway and a library-mode runtime pointed at the same dir share state.
@@ -194,11 +195,29 @@ impl HostRunnable for CallbackHostRunnable {
 /// serves session/mob targets only). `Err` on a duplicate runnable name —
 /// including a callback runnable colliding with the reserved
 /// [`STEWARD_DREAM_RUNNABLE`] name.
-// The steward runnable name is a non-empty const, so its parse is infallible.
-#[allow(clippy::expect_used)]
 pub fn gateway_runnable_host(
     steward: Option<Arc<StewardEngine>>,
     callback_runnables: Option<(Arc<dyn CallbackBridge>, Vec<HostRunnableName>)>,
+) -> Result<Option<Arc<dyn ScheduleRunnableHost>>, String> {
+    gateway_runnable_host_with(steward, callback_runnables, Vec::new())
+}
+
+/// A Rust host's own schedule runnables, each under the name a
+/// host-runnable target calls it by.
+pub type HostRunnables = Vec<(HostRunnableName, Arc<dyn HostRunnable>)>;
+
+/// [`gateway_runnable_host`], with the Rust host's own runnables
+/// (`GatewayHostComposition::host_runnables`) registered beside the
+/// steward's and the SDK's callback runnables. Core hands each fire's
+/// [`HostRunnableInvocation`] to such a runnable unchanged, its delivery
+/// idempotency key included. `Err` on a duplicate name, as for the others,
+/// and on the steward's reserved name.
+// The steward runnable name is a non-empty const, so its parse is infallible.
+#[allow(clippy::expect_used)]
+pub fn gateway_runnable_host_with(
+    steward: Option<Arc<StewardEngine>>,
+    callback_runnables: Option<(Arc<dyn CallbackBridge>, Vec<HostRunnableName>)>,
+    host_runnables: HostRunnables,
 ) -> Result<Option<Arc<dyn ScheduleRunnableHost>>, String> {
     let mut registry = HostRunnableRegistry::new();
     let mut registered = false;
@@ -223,7 +242,234 @@ pub fn gateway_runnable_host(
             registered = true;
         }
     }
+    for (name, runnable) in host_runnables {
+        // The steward's name is Meta's, with or without a steward here.
+        if name.as_str() == STEWARD_DREAM_RUNNABLE {
+            return Err(format!(
+                "host runnable name '{name}' is reserved for the memory steward"
+            ));
+        }
+        registry
+            .register(name, runnable)
+            .map_err(|error| error.to_string())?;
+        registered = true;
+    }
     Ok(registered.then(|| Arc::new(registry) as Arc<dyn ScheduleRunnableHost>))
+}
+
+/// The label every source runner schedule Meta makes carries. A schedule
+/// without it is never Meta's to change or end, whatever it targets: a
+/// host's own schedule of its collector stays the host's.
+pub const SOURCE_RUNNER_LABEL: &str = "mob_announcements.source_runner";
+
+/// The params a source runner's schedule carries: the source its collector
+/// reads.
+fn source_runner_params(source: &AnnouncementSource) -> Value {
+    serde_json::json!({
+        "mob_id": source.mob_id.as_str(),
+        "source_id": source.source_id.as_str(),
+    })
+}
+
+/// A host-runnable target's runnable and parsed params, if it is one.
+fn host_runnable_target(target: &TargetBinding) -> Option<(HostRunnableName, Value)> {
+    let TargetBinding::HostRunnable(binding) = target else {
+        return None;
+    };
+    let params = serde_json::from_str::<Value>(binding.params.as_ref()?.get()).ok()?;
+    Some((binding.runnable.clone(), params))
+}
+
+/// A source runner schedule Meta made, with its runnable and the params
+/// naming its source.
+type RunnerSchedule = (Schedule, HostRunnableName, Value);
+
+/// Every source runner schedule Meta made on `service`.
+async fn runner_schedules(service: &ScheduleService) -> Result<Vec<RunnerSchedule>, String> {
+    Ok(service
+        .list()
+        .await
+        .map_err(|error| format!("list schedules: {error}"))?
+        .into_iter()
+        .filter(|schedule| schedule.config.labels.contains_key(SOURCE_RUNNER_LABEL))
+        .filter_map(|schedule| {
+            let (runnable, params) = host_runnable_target(&schedule.target)?;
+            Some((schedule, runnable, params))
+        })
+        .collect())
+}
+
+/// Bring `source`'s runner schedule in line with its record, given the
+/// runner schedules Meta made for it (`theirs`). A source with a runner has
+/// exactly one, keyed on the runner's host runnable AND the params naming
+/// the source (never the runnable alone, so sources sharing one collector
+/// keep separate schedules), firing every `every_seconds` from `now_utc` on
+/// (a source starts collecting when it is declared, not one interval
+/// later), under Core's default overlap (skip while the previous fire runs)
+/// and misfire (skip a late fire: the next one reads from the cursor anyway)
+/// policies. A changed cadence updates that schedule in place, from
+/// `now_utc`; a changed runnable replaces it; no runner, or an ended source,
+/// ends it. A paused source keeps its schedule: the collector reads the
+/// pause and does nothing.
+async fn apply_source_runner(
+    service: &ScheduleService,
+    source: &AnnouncementSource,
+    theirs: Vec<RunnerSchedule>,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    let wanted = source
+        .runner
+        .as_ref()
+        .filter(|_| source.state != SourceState::Ended);
+    let runnable = wanted
+        .map(|runner| HostRunnableName::parse(runner.host_runnable.as_str()))
+        .transpose()
+        .map_err(|error| format!("source runner host runnable: {error}"))?;
+    let mut kept: Option<Schedule> = None;
+    for (schedule, target_runnable, _) in theirs {
+        if kept.is_none() && runnable.as_ref() == Some(&target_runnable) {
+            kept = Some(schedule);
+            continue;
+        }
+        service
+            .delete(&schedule.schedule_id)
+            .await
+            .map_err(|error| format!("end a source runner schedule: {error}"))?;
+    }
+    let (Some(runner), Some(runnable)) = (wanted, runnable) else {
+        return Ok(());
+    };
+    let every_seconds = runner.every_seconds;
+    let trigger = TriggerSpec::Interval(IntervalTriggerSpec {
+        start_at_utc: now_utc,
+        every_seconds,
+        end_at_utc: None,
+    });
+    match kept {
+        Some(schedule) => {
+            if matches!(
+                &schedule.trigger,
+                TriggerSpec::Interval(spec) if spec.every_seconds == every_seconds
+            ) {
+                return Ok(());
+            }
+            service
+                .update(
+                    &schedule.schedule_id,
+                    UpdateScheduleRequest {
+                        trigger: Some(trigger),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| format!("update a source runner schedule: {error}"))?;
+        }
+        None => {
+            let params = meerkat::HostRunnableParams::try_from(source_runner_params(source))
+                .map_err(|error| format!("source runner params: {error}"))?;
+            service
+                .create(CreateScheduleRequest {
+                    name: Some(format!(
+                        "mob announcement source {} {}",
+                        source.mob_id, source.source_id
+                    )),
+                    description: Some(
+                        "Runs a mob announcement source's collector (host-runnable target)"
+                            .to_string(),
+                    ),
+                    trigger,
+                    target: TargetBinding::host_runnable(HostRunnableTargetBinding {
+                        runnable,
+                        params: Some(params),
+                    }),
+                    misfire_policy: meerkat::MisfirePolicy::default(),
+                    overlap_policy: meerkat::OverlapPolicy::default(),
+                    missing_target_policy: meerkat::MissingTargetPolicy::default(),
+                    labels: BTreeMap::from([(SOURCE_RUNNER_LABEL.to_string(), "1".to_string())]),
+                    planning_horizon_days: None,
+                    planning_horizon_occurrences: None,
+                })
+                .await
+                .map_err(|error| format!("create a source runner schedule: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Bring the durable schedule of `source`'s runner in line with its record
+/// (see [`apply_source_runner`] for the rules). Only schedules carrying
+/// [`SOURCE_RUNNER_LABEL`] are read, changed or ended.
+pub async fn reconcile_source_runner(
+    service: &ScheduleService,
+    source: &AnnouncementSource,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    let params = source_runner_params(source);
+    let theirs = runner_schedules(service)
+        .await?
+        .into_iter()
+        .filter(|(_, _, target_params)| *target_params == params)
+        .collect();
+    apply_source_runner(service, source, theirs, now_utc).await
+}
+
+/// Bring every source runner schedule on `service` in line with `live`, the
+/// sources that are not ended, from one read of the schedules: each live
+/// source's is kept, made or changed as [`reconcile_source_runner`] would,
+/// and a runner schedule naming no live source (its source ended, or is
+/// gone) ends. Every source is tried; the failures come back together.
+pub async fn reconcile_source_runners(
+    service: &ScheduleService,
+    live: &[AnnouncementSource],
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    let mut left = runner_schedules(service).await?;
+    let mut failures = Vec::new();
+    for source in live {
+        let params = source_runner_params(source);
+        let (theirs, others): (Vec<RunnerSchedule>, Vec<RunnerSchedule>) = left
+            .into_iter()
+            .partition(|(_, _, target_params)| *target_params == params);
+        left = others;
+        if let Err(error) = apply_source_runner(service, source, theirs, now_utc).await {
+            failures.push(format!("{} {}: {error}", source.mob_id, source.source_id));
+        }
+    }
+    for (schedule, _, _) in left {
+        if let Err(error) = service.delete(&schedule.schedule_id).await {
+            failures.push(format!(
+                "end runner schedule {}: {error}",
+                schedule.schedule_id
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Sources' runners kept on this gateway's schedule service.
+pub struct ScheduleSourceRunners {
+    service: ScheduleService,
+}
+
+impl ScheduleSourceRunners {
+    pub fn new(service: ScheduleService) -> Self {
+        Self { service }
+    }
+}
+
+#[async_trait]
+impl SourceRunners for ScheduleSourceRunners {
+    async fn reconcile(&self, source: &AnnouncementSource) -> Result<(), String> {
+        reconcile_source_runner(&self.service, source, chrono::Utc::now()).await
+    }
+
+    async fn reconcile_all(&self, live: &[AnnouncementSource]) -> Result<(), String> {
+        reconcile_source_runners(&self.service, live, chrono::Utc::now()).await
+    }
 }
 
 /// Find-or-create the durable schedule that drives the steward dream runnable
@@ -5595,6 +5841,15 @@ schedule = true
 
     impl HostedScheduleFixture {
         async fn new(governed: bool) -> Self {
+            Self::with_runnables(governed, None).await
+        }
+
+        /// [`HostedScheduleFixture::new`], its schedule host serving
+        /// `runnables` too.
+        async fn with_runnables(
+            governed: bool,
+            runnables: Option<Arc<dyn meerkat::ScheduleRunnableHost>>,
+        ) -> Self {
             use std::sync::atomic::AtomicUsize;
 
             let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -5711,7 +5966,7 @@ schedule = true
                 runtime.mob_runtime().agent_mob_mcp_state(),
                 handle,
                 None,
-                None,
+                runnables,
                 None,
                 "schedule-hosted",
             )
@@ -6644,5 +6899,226 @@ schedule = true
                 "refused before the host's ingress check is asked"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // A Rust host's runnables, and mob announcement sources' runners
+    // -----------------------------------------------------------------------
+
+    /// A runnable that keeps every invocation it is handed.
+    #[derive(Default)]
+    struct RecordingRunnable {
+        invocations: std::sync::Mutex<Vec<HostRunnableInvocation>>,
+    }
+
+    impl RecordingRunnable {
+        fn handed(&self) -> Vec<HostRunnableInvocation> {
+            self.invocations.lock().expect("invocations lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl HostRunnable for RecordingRunnable {
+        async fn run(
+            &self,
+            invocation: HostRunnableInvocation,
+        ) -> Result<HostRunnableOutcome, HostRunnableError> {
+            self.invocations
+                .lock()
+                .expect("invocations lock")
+                .push(invocation);
+            Ok(HostRunnableOutcome::completed())
+        }
+    }
+
+    /// A Rust host's runnables (what `GatewayHostComposition::host_runnables`
+    /// hands init) register beside the SDK's callback runnables, and a fire
+    /// hands one Core's invocation unchanged: its occurrence, schedule,
+    /// trigger time, params and delivery idempotency key are the ones Core
+    /// built. A callback runnable's name taken again, or the steward's
+    /// reserved one, is refused.
+    #[tokio::test]
+    async fn a_rust_host_runnable_is_registered_beside_the_callback_runnables() {
+        let bridge = ScriptedCallbackBridge::new(Ok(Value::Null));
+        let collector = Arc::new(RecordingRunnable::default());
+        let host = gateway_runnable_host_with(
+            None,
+            Some((
+                Arc::clone(&bridge) as Arc<dyn CallbackBridge>,
+                vec![runnable_name("digest")],
+            )),
+            vec![(
+                runnable_name("inbox-collector"),
+                Arc::clone(&collector) as Arc<dyn HostRunnable>,
+            )],
+        )
+        .expect("compose runnable host")
+        .expect("runnables registered");
+        assert_eq!(
+            host.probe_runnable(&runnable_name("digest")),
+            meerkat::RunnableProbe::Registered
+        );
+        assert_eq!(
+            host.probe_runnable(&runnable_name("inbox-collector")),
+            meerkat::RunnableProbe::Registered
+        );
+        let mut invocation = callback_invocation(
+            "inbox-collector",
+            Some(r#"{"mob_id":"payments","source_id":"inbox"}"#),
+        );
+        invocation.delivery_idempotency_key = format!(
+            "schedule:{}:occurrence:{}",
+            invocation.schedule_id, invocation.occurrence_id
+        );
+        host.run_occurrence(invocation.clone())
+            .await
+            .expect("the host's runnable completes the occurrence");
+        let handed = collector.handed();
+        assert_eq!(handed.len(), 1);
+        let handed = &handed[0];
+        assert_eq!(handed.occurrence_id, invocation.occurrence_id);
+        assert_eq!(handed.schedule_id, invocation.schedule_id);
+        assert_eq!(
+            handed.delivery_idempotency_key, invocation.delivery_idempotency_key,
+            "Core's delivery idempotency key reaches the runnable unchanged"
+        );
+        assert_eq!(handed.runnable, invocation.runnable);
+        assert_eq!(handed.trigger_time, invocation.trigger_time);
+        assert_eq!(
+            handed.params.as_deref().map(RawValue::get),
+            invocation.params.as_deref().map(RawValue::get)
+        );
+        assert!(
+            bridge.calls.lock().expect("calls lock").is_empty(),
+            "a host runnable's fire never reaches the callback bridge"
+        );
+        for taken in ["digest", STEWARD_DREAM_RUNNABLE] {
+            let refused = gateway_runnable_host_with(
+                None,
+                Some((
+                    Arc::clone(&bridge) as Arc<dyn CallbackBridge>,
+                    vec![runnable_name("digest")],
+                )),
+                vec![(
+                    runnable_name(taken),
+                    Arc::clone(&collector) as Arc<dyn HostRunnable>,
+                )],
+            );
+            assert!(refused.is_err(), "{taken} refuses the composition");
+        }
+    }
+
+    /// A source's runner fires on a governed gateway: the schedule host runs
+    /// the collector's host runnable with the source it collects and Core's
+    /// delivery identity for the occurrence, where the same runtime refuses
+    /// a scheduled fire to a member. Collecting is host work, not member
+    /// admission.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declared_source_runner_fires_on_a_governed_gateway() {
+        use crate::mob_announcements::AnnouncementStore as _;
+
+        let collector = Arc::new(RecordingRunnable::default());
+        let runnables = gateway_runnable_host_with(
+            None,
+            None,
+            vec![(
+                runnable_name("inbox-collector"),
+                Arc::clone(&collector) as Arc<dyn HostRunnable>,
+            )],
+        )
+        .expect("compose runnable host");
+        let governed = HostedScheduleFixture::with_runnables(true, runnables).await;
+
+        let sources = tempfile::tempdir().expect("sources dir");
+        let store = crate::mob_announcements::SqliteAnnouncementStore::open(
+            sources.path().join("mob_announcements.sqlite3"),
+        )
+        .expect("announcement store");
+        let put: crate::mob_announcements::PutSource = serde_json::from_value(json!({
+            "mob_id": "payments",
+            "source_id": "inbox",
+            "expected_revision": null,
+            "new_generation": false,
+            "config": {
+                "identity": {
+                    "provider": "google.gmail",
+                    "principal": {
+                        "kind": "connector_verified_account",
+                        "issuer": "https://accounts.example",
+                        "strategy_id": "oauth-code",
+                        "subject": "subject-1",
+                    },
+                    "scope": { "kind": "mailbox_label", "id": "INBOX" },
+                },
+                "observation": { "baseline": "delta", "deletions": "explicit" },
+                "topics": ["mail.received"],
+                "audience": [
+                    { "kind": "member", "member": { "mob_id": "payments", "identity": "agent:a" } }
+                ],
+                "routes": [{ "kind": "direct" }],
+                "runner": { "host_runnable": "inbox-collector", "every_seconds": 60 },
+            },
+        }))
+        .expect("a source declaration");
+        let source = store
+            .put_source(
+                &crate::mob_announcements::OperationId::new("put-inbox").expect("operation id"),
+                put,
+                1,
+            )
+            .await
+            .expect("source declared");
+        crate::schedule_wiring::ScheduleSourceRunners::new(governed.schedules.clone())
+            .reconcile(&source)
+            .await
+            .expect("the runner's schedule");
+        let schedules = governed.schedules.list().await.expect("list schedules");
+        assert_eq!(schedules.len(), 1, "{schedules:#?}");
+        let schedule_id = schedules[0].schedule_id.clone();
+
+        let deadline = tokio::time::Instant::now() + HOSTED_FIRE_TERMINAL_WAIT;
+        let occurrence = loop {
+            let completed = governed
+                .schedules
+                .list_occurrences(&schedule_id)
+                .await
+                .expect("list occurrences")
+                .into_iter()
+                .find(|occurrence| occurrence.phase == OccurrencePhase::Completed);
+            if let Some(occurrence) = completed {
+                break occurrence;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the runner's first occurrence never completed: {:#?}",
+                governed.schedules.list_occurrences(&schedule_id).await
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let handed = collector.handed();
+        let invocation = handed
+            .iter()
+            .find(|invocation| invocation.occurrence_id == occurrence.occurrence_id)
+            .unwrap_or_else(|| panic!("the collector ran the occurrence: {handed:#?}"));
+        assert_eq!(invocation.runnable.as_str(), "inbox-collector");
+        assert_eq!(invocation.schedule_id, schedule_id);
+        assert_eq!(
+            invocation
+                .params
+                .as_deref()
+                .map(|params| serde_json::from_str::<Value>(params.get()).expect("params")),
+            Some(json!({ "mob_id": "payments", "source_id": "inbox" }))
+        );
+        assert_eq!(
+            invocation.delivery_idempotency_key,
+            meerkat::ScheduleDeliveryIdentity::for_occurrence(&occurrence).idempotency_key,
+            "the collector dedupes on Core's delivery identity for the occurrence"
+        );
+        assert_eq!(
+            governed.llm_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "collecting runs no turn"
+        );
+        governed.shutdown().await;
     }
 }

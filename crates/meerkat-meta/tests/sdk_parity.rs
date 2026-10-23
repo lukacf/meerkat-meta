@@ -21,6 +21,9 @@ use std::process::Command;
 
 use serde::Deserialize;
 
+#[path = "support/sdk_build_lock.rs"]
+mod sdk_build_lock;
+
 #[derive(Debug, Deserialize)]
 struct ScriptCheck {
     name: String,
@@ -202,6 +205,8 @@ fn select_python_for_phase11() -> Option<String> {
 #[test]
 #[ignore] // requires Python venv setup (~7s)
 fn phase11_sdk_001_sdk_002_choke_110_and_e2e_1101_parity_contracts() {
+    // Builds in sdk/: one SDK build of this checkout at a time.
+    let _sdk_build = sdk_build_lock::lock_sdk_build(&repo_root());
     assert_command_success(
         "TypeScript",
         "validation",

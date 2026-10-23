@@ -19,7 +19,7 @@ from launchkit.ordinary_application_source import OrdinaryApplicationHost
 from launchkit.projects import DraftConflict
 from test_local_application_registry import (
     registry, product, no_product_execution, no_processes, new_guide, build,
-    accept_source_fixture, install_fixture, workspace, bind_registry,
+    accept_source_fixture, install_fixture, workspace, bind_registry, MANAGED_MODELS_WITHOUT_CUSTODY,
 )
 
 
@@ -126,7 +126,7 @@ async def test_acquisition_plan_keeps_existing_toolkit_factory(ordinary_registry
     assert type(f.registry.host_for_build(saved["id"], result["build_id"])) is ForgeApplicationHost
 
 
-def reloaded_registry(f, *, gateway=None):
+def reloaded_registry(f, *, gateway=None, model_configuration=None):
     from launchkit.guide_store import GuideStore
     from launchkit.guide import GuideService
     from launchkit.implementation import ImplementationService
@@ -135,7 +135,8 @@ def reloaded_registry(f, *, gateway=None):
     implementation = ImplementationService(f.implementation.root.parent, guide)
     service = deployment.DeploymentService(f.service.root.parent, guide, implementation)
     owner = LocalApplicationRegistry(guide_store=store, implementation=implementation,
-        deployment=service, runtime_target=f.target, ordinary_meta_gateway=f.gateway if gateway is None else gateway)
+        deployment=service, runtime_target=f.target, ordinary_meta_gateway=f.gateway if gateway is None else gateway,
+        model_configuration=model_configuration)
     implementation.prepare_workspace = owner.prepare_workspace
     bind_registry(service, owner)
     return store, implementation, service, owner
@@ -462,3 +463,65 @@ async def test_apply_after_reload_selects_no_replacement_owner_for_a_helperless_
     await service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
     assert owner._selected_replacement(saved["id"], directory.name, staged["update"]["update_id"]) is None
     assert deployment.read_receipt(directory)["update"]["update_id"] == staged["update"]["update_id"]
+
+
+async def test_install_of_a_helperless_plan_with_host_managed_models_needs_application_model_custody(
+        ordinary_registry, monkeypatch):
+    """Without the launcher's application model configuration, Install refuses before any worker.
+
+    Start would refuse later anyway; Install says why and what to do first.
+    """
+    f = ordinary_registry
+    assert f.registry._selected_model_configuration() is None
+    saved = ordinary_guide(f)
+    saved["proposal"]["agent_classes"][0]["model_auth"] = "managed_host"
+    saved = f.store.save(saved, saved["version"])
+    result = await build(f, saved)
+    await accept_source_fixture(f, result)
+    with pytest.raises(DraftConflict, match=MANAGED_MODELS_WITHOUT_CUSTODY):
+        await install_fixture(f, saved, result, monkeypatch)
+    assert not (f.root / ("installed-" + saved["id"])).exists()
+    assert not f.service.tasks and not f.service.processes
+
+
+async def test_helperless_application_installed_without_custody_starts_once_forge_has_it(
+        ordinary_registry, tmp_path, monkeypatch):
+    """An application without a setup helper, with host-managed models, installed as Forge 0.9.4 allowed.
+
+    That Install kept no model state. Start without the launcher's application
+    model configuration refuses with its guidance and launches nothing. After
+    Forge restarts with that configuration, the same installation starts with it.
+    """
+    from launchkit import connect_application_startup
+    from launchkit.deployment_application_bootstrap import MANAGED_START_WITHOUT_CUSTODY, read_bootstrap_admission
+    from test_managed_model_factory_selection import model_source
+    f = ordinary_registry
+    assert f.registry._selected_model_configuration() is None
+    saved = ordinary_guide(f)
+    saved["proposal"]["agent_classes"][0]["model_auth"] = "managed_host"
+    saved = f.store.save(saved, saved["version"])
+    result = await build(f, saved)
+    await accept_source_fixture(f, result)
+    assert connect_application_startup._managed_model_classes({"classes": saved["proposal"]["agent_classes"]})
+    with monkeypatch.context() as earlier:
+        # Forge 0.9.4 had no Install refusal for this plan. Only that check is
+        # left out here, for this one Install.
+        earlier.setattr(connect_application_startup, "_managed_model_classes", lambda spec: ())
+        directory, _ = await install_fixture(f, saved, result, monkeypatch)
+    before = len(f.service.launched)
+    with pytest.raises(CustodyError) as refused:
+        await f.service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
+    assert str(refused.value) == MANAGED_START_WITHOUT_CUSTODY
+    assert len(f.service.launched) == before
+    # Forge restarts with the launcher's application model configuration.
+    selection = model_source(tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", selection["credential_config_root"])
+    store, implementation, service, owner = reloaded_registry(f, model_configuration=selection)
+    launched = []
+    monkeypatch.setattr(service, "_launch", lambda *args, **kwargs: launched.append((args, kwargs)))
+    await service.action(saved["id"], directory.name, "restart", action_request_id=str(uuid4()))
+    assert len(launched) == 1 and launched[0][0][1] == "start"
+    admitted = read_bootstrap_admission(directory, launched[0][1]["bootstrap_selection"])
+    assert admitted["application_startup"]["model_configuration"] == selection
+    assert owner._selected_startup(saved["id"], directory.name)["model_configuration"] == selection
+    assert not service.tasks and not service.processes

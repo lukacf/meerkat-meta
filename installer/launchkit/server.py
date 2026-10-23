@@ -10,7 +10,6 @@ import shutil
 import subprocess
 import os
 import re
-import time
 from urllib.parse import quote
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -38,6 +37,7 @@ from .visualization_operations import VisualizationConflict, VisualizationIntent
 from .visualization_review import ReviewAdmissionUnavailable, VisualizationReviewService, bundled_review_reference_context
 from .visual_review_runtime import VisualReviewRuntime
 from .implementation import ImplementationService, BuildSelectionUnavailable
+from .owner_shutdown import Owner, stop_owners
 from .owned_console import (browser_console_url, console_response, resolve_owner,
                             resolve_guide_owner, MAX_BODY as CONSOLE_MAX_BODY)
 from .forge_application_host import ForgeApplicationHost, application_setup_binding
@@ -55,13 +55,9 @@ from .provider_settings import ProviderSettings, ProviderSettingsUnavailable, ca
 from .checker_setup import CheckerSetupService
 from .toolkit_saved_requests import ToolkitSavedRequests, ToolkitSavedRequestsError, MAX_MANIFEST_BYTES
 
-VERSION = "0.8.47"
 APP_ROOT = Path(__file__).resolve().parents[1]
 checker_setup = CheckerSetupService(APP_ROOT)
 LOG = logging.getLogger(__name__)
-# uvicorn configures this logger at INFO, so the owners' stop lines show
-# under every uvicorn launch.
-STOP_LOG = logging.getLogger("uvicorn.error")
 
 
 def setup_home():
@@ -297,33 +293,28 @@ async def lifespan(app):
         await visual_review_runtime.reconcile_terminated()
         yield
     finally:
-        # Each service retains ownership of different native work. A failed
-        # cleanup must not prevent the remaining owners from stopping theirs.
-        failures = []
-        for name, service in (
-            ("guide operations", guide_operations),
-            ("visualization operations", visualization_operations),
-            ("visualization reviews", visualization_reviews),
-            ("visual critic runtime", visual_review_runtime),
-            ("remote deployment", remote_deployment),
-            ("GCP resource preparation", gcp_provisioning),
-            ("GCP access checks", gcp_preflight),
-            ("deployment", deployment),
-            ("rehearsal", rehearsal),
-            ("implementation", implementation),
-            ("checker preparation", checker_setup),
-            ("saved Toolkit requests", toolkit_saved_requests),
-            ("architect", architect),
-        ):
-            STOP_LOG.info("Meta Forge: stopping %s", name)
-            started = time.monotonic()
-            try:
-                await service.shutdown()
-            except BaseException as error:
-                STOP_LOG.warning("Meta Forge: stopping %s failed (%s)", name, type(error).__name__)
-                failures.append((name, error))
-            else:
-                STOP_LOG.info("Meta Forge: stopped %s in %.1f s", name, time.monotonic() - started)
+        # Each service retains ownership of different native work. A failed or
+        # hung cleanup must not prevent the remaining owners from stopping theirs.
+        # The deployment, implementation and rehearsal workers stop themselves
+        # on owner loss; stop_owners never signals them, and no owner names
+        # its groups.
+        def workers(service):
+            return lambda: list((getattr(service, "processes", None) or {}).values())
+        failures = await stop_owners((
+            Owner("guide operations", guide_operations),
+            Owner("visualization operations", visualization_operations),
+            Owner("visualization reviews", visualization_reviews),
+            Owner("visual critic runtime", visual_review_runtime),
+            Owner("remote deployment", remote_deployment),
+            Owner("GCP resource preparation", gcp_provisioning),
+            Owner("GCP access checks", gcp_preflight),
+            Owner("deployment", deployment, workers=workers(deployment)),
+            Owner("rehearsal", rehearsal, workers=workers(rehearsal)),
+            Owner("implementation", implementation, workers=workers(implementation)),
+            Owner("checker preparation", checker_setup),
+            Owner("saved Toolkit requests", toolkit_saved_requests),
+            Owner("architect", architect),
+        ))
         if failures:
             raise BaseExceptionGroup(
                 "Meta Forge cleanup failed for: " + ", ".join(name for name, _ in failures),
@@ -430,9 +421,34 @@ def cloud_capability() -> dict:
     return {"available": True, "project": project, "reason": "Google Cloud CLI found. Check the selected account and project in guided deployment before provisioning."}
 
 
+def forge_release():
+    """The Forge release: installer/pyproject.toml's version, which forge-release.py tags."""
+    import tomllib
+    return tomllib.loads((APP_ROOT / "pyproject.toml").read_text())["project"]["version"]
+
+
+def ordinary_runtime():
+    """The Meta runtime and gateway the trusted launcher selected for ordinary
+    applications; None without such a selection, as in the developer entry."""
+    host = application_host
+    if type(host) is not LocalApplicationRegistry or host.runtime_target is None or host.ordinary_meta_gateway is None:
+        return None
+    target = host.runtime_target
+    return {"sdk": target.meta.distribution, "version": target.meta.version, "target": target.target,
+            "gateway_sha256": host.ordinary_meta_gateway.sha256}
+
+
+def agent_team_runtime():
+    """The public Meta release every compiled agent team installs, in every entry."""
+    from . import public_meta_runtime
+    return {"sdk": public_meta_runtime.SDK_DISTRIBUTION, "version": public_meta_runtime.VERSION,
+            "release": public_meta_runtime.RELEASE_URL}
+
+
 @app.get("/api/capabilities")
 async def capabilities():
-    return {"planner": planner_capability(), "platform": "mac" if platform.system() == "Darwin" else "linux", "gcp": await asyncio.to_thread(cloud_capability), "version": VERSION,
+    return {"planner": planner_capability(), "platform": "mac" if platform.system() == "Darwin" else "linux", "gcp": await asyncio.to_thread(cloud_capability),
+            "version": forge_release(), "ordinary_runtime": ordinary_runtime(), "agent_team_runtime": agent_team_runtime(),
             "rehearsal": {"start_request_replay": True}, "agent_team": deployment.agent_team_availability()}
 
 

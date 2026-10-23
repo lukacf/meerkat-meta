@@ -21,6 +21,9 @@ use std::process::Command;
 
 use serde::Deserialize;
 
+#[path = "support/sdk_build_lock.rs"]
+mod sdk_build_lock;
+
 #[derive(Debug, Deserialize)]
 struct ScriptCheck {
     name: String,
@@ -214,6 +217,8 @@ fn select_python_for_phase_h2() -> Option<String> {
 #[test]
 #[ignore] // requires Python venv + cargo build (~15s)
 fn phase_h2_req_h2_001_req_h2_002_python_rpc_reference_app_parity_contracts() {
+    // Builds in sdk/: one SDK build of this checkout at a time.
+    let _sdk_build = sdk_build_lock::lock_sdk_build(&repo_root());
     let temp = tempfile::tempdir().expect("python phase_h2 venv tempdir");
     let venv_dir = temp.path().join("venv");
     let venv_dir_str = venv_dir.to_string_lossy().to_string();

@@ -220,8 +220,12 @@ async def prepare_application(service, guide_id, deployment_id, *, application_h
     if deployment_id in service._application_preparations:
         raise CustodyError("Settle the original preparation custody before any new preparation.")
     directory, receipt, stopped = service._stopped_application_owner(guide_id, deployment_id)
+    from .deployment_application_bootstrap import same_installation_apart_from_staged_update
+    # The install-time Supervisor's receipt predates an update staged after
+    # Install; that pointer alone does not change the installation it owns.
     if (supervisor.directory != directory or supervisor.destination != Path(receipt["destination"])
-            or service._configuration_binding(supervisor.receipt) != service._configuration_binding(receipt)):
+            or not same_installation_apart_from_staged_update(service._configuration_binding(supervisor.receipt),
+                service._configuration_binding(receipt), receipt)):
         raise CustodyError("Preparation cannot substitute a Supervisor from another installation.")
     supervisor.require_child_slot()
     if getattr(supervisor, "_selected_sdk_install_task", None) is not None:

@@ -355,8 +355,18 @@ struct RuntimeEntry {
     /// The runtime's own projection holds only the non-owning back-edge.
     /// Console MCP App routing reads it as the candidate's identity runtime.
     identity_owner: Option<crate::identity_first::PublicIdentityRuntime>,
+    memory_panel: Option<Arc<dyn crate::memory::capabilities::MemoryPanelStore>>,
     console_events: ConsoleEventStore,
     visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
+}
+
+/// Native service handles from one current registration. No store data is copied.
+pub(crate) struct ConsolePanelRuntime {
+    pub(crate) key: String,
+    pub(crate) namespace: String,
+    pub(crate) runtime: MobRuntime,
+    pub(crate) memory: Option<Arc<dyn crate::memory::capabilities::MemoryPanelStore>>,
+    registration_id: uuid::Uuid,
 }
 
 /// Current native route candidate, never derived from a transcript frame.
@@ -1177,19 +1187,23 @@ impl MetaConsoleAggregator {
     }
 
     pub fn register_runtime(&self, registration: ConsoleRuntimeRegistration) {
-        let identity_runtime = registration.runtime.identity_runtime();
-        self.register_owned_runtime_handles_with_policy(
-            registration.runtime_key,
-            registration.identity_namespace,
-            registration.runtime.mob_runtime().clone(),
-            identity_runtime,
-            registration.runtime.console_events(),
-            registration.visibility_policy,
-        );
+        let identity_owner = registration.runtime.identity_runtime();
+        self.register_entry(RuntimeEntry {
+            registration_id: uuid::Uuid::new_v4(),
+            runtime_key: registration.runtime_key,
+            identity_namespace: registration.identity_namespace,
+            runtime: registration.runtime.mob_runtime().clone(),
+            identity_runtime: identity_owner
+                .as_ref()
+                .map(|owner| Arc::clone(owner.runtime())),
+            identity_owner,
+            memory_panel: registration.runtime.memory_panel_store(),
+            console_events: registration.runtime.console_events(),
+            visibility_policy: registration.visibility_policy,
+        });
     }
 
-    /// [`Self::register_runtime_handles_with_policy`] for a copy exported to
-    /// the host: the entry keeps the public identity owner.
+    /// Export the native runtime and its identity owner atomically.
     pub(crate) fn register_owned_runtime_handles_with_policy(
         &self,
         runtime_key: impl Into<String>,
@@ -1199,22 +1213,45 @@ impl MetaConsoleAggregator {
         console_events: ConsoleEventStore,
         visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
     ) {
-        let runtime_key = runtime_key.into();
-        self.register_runtime_handles_with_policy(
-            runtime_key.clone(),
-            identity_namespace,
+        self.register_entry(RuntimeEntry {
+            registration_id: uuid::Uuid::new_v4(),
+            runtime_key: runtime_key.into(),
+            identity_namespace: identity_namespace.into(),
             runtime,
-            identity_runtime
+            identity_runtime: identity_runtime
                 .as_ref()
-                .map(|identity_runtime| Arc::clone(identity_runtime.runtime())),
+                .map(|owner| Arc::clone(owner.runtime())),
+            identity_owner: identity_runtime,
+            memory_panel: None,
             console_events,
             visibility_policy,
-        );
-        if let Ok(mut runtimes) = self.inner.runtimes.write()
-            && let Some(entry) = runtimes.get_mut(&runtime_key)
-        {
-            entry.identity_owner = identity_runtime;
-        }
+        });
+    }
+
+    pub(crate) fn panel_runtimes(&self) -> ConsoleLogResult<Vec<ConsolePanelRuntime>> {
+        let entries = self
+            .inner
+            .runtimes
+            .read()
+            .map_err(|_| std::io::Error::other("Console runtime registry is unavailable"))?;
+        Ok(entries
+            .values()
+            .map(|entry| ConsolePanelRuntime {
+                key: entry.runtime_key.clone(),
+                namespace: entry.identity_namespace.clone(),
+                runtime: entry.runtime.clone(),
+                memory: entry.memory_panel.clone(),
+                registration_id: entry.registration_id,
+            })
+            .collect())
+    }
+
+    pub(crate) fn panel_runtime_is_current(&self, runtime: &ConsolePanelRuntime) -> bool {
+        self.inner.runtimes.read().is_ok_and(|entries| {
+            entries
+                .get(&runtime.key)
+                .is_some_and(|entry| entry.registration_id == runtime.registration_id)
+        })
     }
 
     /// Namespace resolution only. The caller must validate native identity and
@@ -1262,14 +1299,21 @@ impl MetaConsoleAggregator {
         let identity_namespace = identity_namespace.into();
         let entry = RuntimeEntry {
             registration_id: uuid::Uuid::new_v4(),
-            runtime_key: runtime_key.clone(),
+            runtime_key,
             identity_namespace,
             runtime,
             identity_runtime,
             identity_owner: None,
-            console_events: console_events.clone(),
+            memory_panel: None,
+            console_events,
             visibility_policy,
         };
+        self.register_entry(entry);
+    }
+
+    fn register_entry(&self, entry: RuntimeEntry) {
+        let runtime_key = entry.runtime_key.clone();
+        let console_events = entry.console_events.clone();
         if let Ok(mut runtimes) = self.inner.runtimes.write() {
             self.inner
                 .has_registered_runtime
@@ -4275,6 +4319,7 @@ async fn collect_identity_records(
         .clone();
     let mut identities = Vec::new();
     for entry in entries.values() {
+        let mut identity_display_names = BTreeMap::new();
         if let Some(identity_runtime) = entry.identity_runtime.as_ref() {
             let topology_peers =
                 identity_runtime_topology_peers(entry, identity_runtime.as_ref()).await;
@@ -4284,6 +4329,12 @@ async fn collect_identity_records(
                     .get(&record.identity)
                     .cloned()
                     .unwrap_or_default();
+                if let (Some(session), Some(name)) = (&record.session_id, &status.display_name) {
+                    identity_display_names.insert(
+                        record.identity.clone(),
+                        (session.clone(), name.as_str().to_owned()),
+                    );
+                }
                 if Box::pin(console_identity_record_visible(entry, &record)).await {
                     identities.push(record);
                 }
@@ -4312,7 +4363,26 @@ async fn collect_identity_records(
             Box::pin(member_sources_for_entry(entry)).await
         };
         for resolved in members {
-            if let Some(record) = identity_record_for_resolved_member(&resolved).await {
+            if let Some(mut record) = identity_record_for_resolved_member(&resolved).await {
+                record.topology_peers = resolved
+                    .member
+                    .wired_to
+                    .iter()
+                    .map(|peer| {
+                        project_topology_peer(
+                            peer.as_str(),
+                            &entry.identity_namespace,
+                            Some(&entries),
+                        )
+                    })
+                    .collect();
+                // Live binding and wiring come from the mob; display names come
+                // from its matching durable identity, never another session.
+                if let Some((session, name)) = identity_display_names.get(&record.identity)
+                    && record.session_id.as_ref() == Some(session)
+                {
+                    record.display_name.clone_from(name);
+                }
                 Box::pin(capture_member_provenance(inner, &resolved, &record)).await;
                 if Box::pin(resolved_member_visible(&resolved, &record)).await {
                     identities.push(record);
@@ -4321,6 +4391,37 @@ async fn collect_identity_records(
         }
     }
     Ok(dedupe_identity_records(identities))
+}
+
+// A local roster ID and an external canonical comms name are different
+// contracts. Resolve the latter through its registered mob, never by an
+// unscoped member-name search that could connect two repositories' coders.
+fn project_topology_peer(
+    peer: &str,
+    local_namespace: &str,
+    entries: Option<&BTreeMap<String, RuntimeEntry>>,
+) -> String {
+    let Ok(external) = peer.parse::<meerkat_core::connection::MemberCommsName>() else {
+        return apply_namespace(
+            &crate::member_comms_id::runtime_alias_str(peer),
+            local_namespace,
+        );
+    };
+    if let Some(entries) = entries {
+        let mut matches = entries
+            .values()
+            .filter(|entry| entry.runtime.handle().mob_id().as_str() == external.mob_id());
+        if let Some(target) = matches.next()
+            && matches.next().is_none()
+        {
+            return apply_namespace(
+                &crate::member_comms_id::runtime_alias_str(external.member()),
+                &target.identity_namespace,
+            );
+        }
+    }
+    // An unregistered or ambiguously registered remote stays unresolved.
+    peer.to_owned()
 }
 
 async fn identity_runtime_topology_peers(
@@ -9342,7 +9443,7 @@ async fn identity_record_for_member(
         topology_peers: member
             .wired_to
             .iter()
-            .map(|peer| crate::member_comms_id::runtime_alias_str(peer.as_str()).into_owned())
+            .map(|peer| project_topology_peer(peer.as_str(), &entry.identity_namespace, None))
             .collect(),
         labels,
     })
@@ -11650,6 +11751,7 @@ comms = true
                 .identity_runtime()
                 .map(|identity_runtime| Arc::clone(identity_runtime.runtime())),
             identity_owner: None,
+            memory_panel: None,
             console_events: runtime.console_events(),
             visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
         }
@@ -12342,6 +12444,7 @@ comms = true
                 .identity_runtime()
                 .map(|identity_runtime| Arc::clone(identity_runtime.runtime())),
             identity_owner: None,
+            memory_panel: None,
             console_events: runtime.console_events(),
             visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
         };
@@ -13184,6 +13287,7 @@ comms = true
                 .identity_runtime()
                 .map(|identity_runtime| Arc::clone(identity_runtime.runtime())),
             identity_owner: None,
+            memory_panel: None,
             console_events: runtime.console_events(),
             visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
         };
@@ -13276,6 +13380,7 @@ comms = true
                     runtime: runtime.mob_runtime().clone(),
                     identity_runtime: Some(identity_runtime),
                     identity_owner: None,
+                    memory_panel: None,
                     console_events: runtime.console_events(),
                     visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
                 },
@@ -13460,6 +13565,7 @@ comms = true
                     runtime: runtime.mob_runtime().clone(),
                     identity_runtime: Some(identity_runtime.clone()),
                     identity_owner: None,
+                    memory_panel: None,
                     console_events: runtime.console_events(),
                     visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
                 },
@@ -13568,6 +13674,7 @@ comms = true
                     runtime: runtime.mob_runtime().clone(),
                     identity_runtime: Some(identity_runtime),
                     identity_owner: None,
+                    memory_panel: None,
                     console_events: runtime.console_events(),
                     visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
                 },
@@ -13740,6 +13847,7 @@ comms = true
                     runtime: runtime.mob_runtime().clone(),
                     identity_runtime: Some(identity_runtime),
                     identity_owner: None,
+                    memory_panel: None,
                     console_events: runtime.console_events(),
                     visibility_policy: Arc::new(HideConsoleIdentity("other:singleton")),
                 },
@@ -13853,6 +13961,7 @@ comms = true
                     runtime: hidden_runtime.mob_runtime().clone(),
                     identity_runtime: Some(hidden_identity_runtime),
                     identity_owner: None,
+                    memory_panel: None,
                     console_events: hidden_runtime.console_events(),
                     visibility_policy: Arc::new(HideRuntimeMemberIdentity("rt:review:singleton:0")),
                 },
@@ -13866,6 +13975,7 @@ comms = true
                     runtime: visible_runtime.mob_runtime().clone(),
                     identity_runtime: Some(visible_identity_runtime),
                     identity_owner: None,
+                    memory_panel: None,
                     console_events: visible_runtime.console_events(),
                     visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
                 },
@@ -13979,6 +14089,7 @@ comms = true
                     runtime: runtime.mob_runtime().clone(),
                     identity_runtime: Some(identity_runtime),
                     identity_owner: None,
+                    memory_panel: None,
                     console_events: runtime.console_events(),
                     visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
                 },
@@ -14079,6 +14190,7 @@ comms = true
                     runtime: runtime.mob_runtime().clone(),
                     identity_runtime: Some(identity_runtime),
                     identity_owner: None,
+                    memory_panel: None,
                     console_events: runtime.console_events(),
                     visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
                 },
@@ -14233,6 +14345,7 @@ comms = true
                     runtime: runtime.mob_runtime().clone(),
                     identity_runtime: Some(identity_runtime),
                     identity_owner: None,
+                    memory_panel: None,
                     console_events: runtime.console_events(),
                     visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
                 },
@@ -14492,6 +14605,123 @@ comms = true
         );
 
         let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_repository_rosters_keep_names_and_resolvable_peer_endpoints()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let aggregator = MetaConsoleAggregator::in_memory();
+        let mut runtimes = Vec::new();
+        for namespace in ["repo-a", "repo-b"] {
+            let runtime = build_empty_runtime(&format!("mixed-topology-{namespace}")).await;
+            let authority = Arc::new(crate::identity_first::IdentityRuntime::new(
+                crate::identity_first::IdentityRuntimeConfig {
+                    continuity_store: Arc::new(
+                        crate::identity_first::LocalContinuityStore::in_memory()?,
+                    ),
+                    lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
+                    runtime_instance_id: namespace.to_owned(),
+                    has_runtime_store: true,
+                    durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                    bridge: Some(Arc::new(crate::identity_first::MobSessionBridge::new(
+                        runtime.mob_handle(),
+                    ))),
+                    default_timeout: None,
+                },
+            ));
+            let specialist = crate::identity_first::AgentIdentity::parse("domain:media")?;
+            authority
+                .register(crate::identity_first::DurableAgentSpec {
+                    identity: specialist.clone(),
+                    profile: meerkat_mob::ProfileName::from("worker"),
+                    addressability: crate::identity_first::AgentAddressability::Addressable,
+                    display_name: Some(crate::identity_first::DisplayName::parse(
+                        "Media specialist",
+                    )?),
+                    labels: BTreeMap::new(),
+                    context: None,
+                    additional_instructions: Vec::new(),
+                    initial_message: None,
+                    runtime_mode_override: None,
+                    backend: None,
+                    binding: None,
+                    placement: None,
+                })
+                .await;
+            authority.materialize(&specialist).await?;
+            runtime
+                .mob_handle()
+                .ensure_member(SpawnMemberSpec::new("worker", "coder"))
+                .await?;
+            let specialist_member = crate::member_comms_id::mob_member_id(specialist.as_str());
+            runtime
+                .mob_handle()
+                .wire(
+                    specialist_member.clone(),
+                    meerkat_mob::AgentIdentity::from("coder"),
+                )
+                .await?;
+            runtime
+                .mob_handle()
+                .wire(meerkat_mob::AgentIdentity::from("coder"), specialist_member)
+                .await?;
+            aggregator.register_runtime_handles_with_policy(
+                namespace,
+                namespace,
+                runtime.mob_runtime().clone(),
+                Some(authority),
+                runtime.console_events(),
+                Arc::new(AllowAllConsoleVisibilityPolicy),
+            );
+            runtimes.push(runtime);
+        }
+        // The same raw coder ID exists in both mobs. Connect the actual
+        // endpoint so the projection must use the remote mob's namespace.
+        let coder_id = meerkat_mob::AgentIdentity::from("coder");
+        let remote = runtimes[1]
+            .mob_handle()
+            .member_peer_endpoint(&coder_id)
+            .await?
+            .ok_or("remote coder endpoint missing")?;
+        runtimes[0]
+            .mob_handle()
+            .wire(
+                coder_id,
+                meerkat_mob::PeerTarget::External(remote.descriptor),
+            )
+            .await?;
+        let records = aggregator.list_identities_fresh().await?;
+        for runtime in runtimes {
+            let _ = runtime.mob_handle().stop().await;
+        }
+        for namespace in ["repo-a", "repo-b"] {
+            let specialist = records
+                .iter()
+                .find(|record| record.identity == format!("{namespace}/domain:media"))
+                .ok_or("missing specialist")?;
+            let coder = records
+                .iter()
+                .find(|record| record.identity == format!("{namespace}/coder"))
+                .ok_or("missing coder")?;
+            assert_eq!(specialist.display_name, "Media specialist");
+            assert_eq!(specialist.topology_peers, vec![coder.identity.clone()]);
+            let expected: BTreeSet<_> = if namespace == "repo-a" {
+                [specialist.identity.clone(), "repo-b/coder".to_owned()]
+                    .into_iter()
+                    .collect()
+            } else {
+                [specialist.identity.clone()].into_iter().collect()
+            };
+            assert_eq!(
+                coder
+                    .topology_peers
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                expected
+            );
+        }
         Ok(())
     }
 

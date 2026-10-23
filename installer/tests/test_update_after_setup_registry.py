@@ -527,3 +527,50 @@ async def test_after_a_forge_restart_apply_before_the_first_setup_waits_for_the_
         assert {key: after.get(key) for key in keys} == {key: before.get(key) for key in keys}
     finally:
         await restarted.implementation.shutdown()
+
+
+async def test_update_staged_before_the_first_setup_keeps_that_setup_available_on_the_registry(registry, monkeypatch):
+    """Stage right after Install, then the first setup, through the launcher's registry."""
+    f = registry
+    monkeypatch.setattr(f.service.service_manager, "command", unavailable_service_query)
+    saved = new_guide(f)
+    installed = await build(f, saved)
+    await accept_source_fixture(f, installed)
+    host = f.registry.host_for_build(saved["id"], installed["build_id"])
+    directory, destination = await install_fixture(f, saved, installed, monkeypatch)
+    f.saved, f.installed, f.guide_id, f.directory, f.destination = saved, installed, saved["id"], directory, destination
+    second = await continuation(f)
+    update = await stage(f, second["build_id"])
+    assert update["status"] == "staged" and "setup_restore_sha256" not in update
+    owner = host._preparation_inputs.__self__
+    inputs = owner.preparation_inputs(saved["id"], directory.name)
+    inventory = deepcopy(host._inventory)
+    actual = {"schema": 1, "mob_id": inventory["mob_id"],
+        "helper_identity": inventory["helper_identity"], "realm_id": "opaque-inert-realm",
+        "members": [{"identity": row["identity"], "member": {
+            "mob_id": inventory["mob_id"], "role": row["profile"],
+            "member": "inert-original-native-" + str(index)}}
+            for index, row in enumerate(inventory["roster"])]}
+
+    async def inventory_command(argv, phase, timeout, *, raw_outcome):
+        assert argv[1] == "--lower-application-inventory"
+        return {"returncode": 0, "stdout": encoded(actual), "stderr": b"inert inventory boundary\n"}
+
+    monkeypatch.setattr(inputs.supervisor, "command", inventory_command)
+    status = await f.registry.setup_status(f.service, saved["id"], directory.name)
+    assert status["available"] and status["action"] == "prepare-setup", status.get("detail")
+    prepared = await f.service.action(saved["id"], directory.name, "prepare-setup",
+        action_request_id=str(uuid4()))
+    assert prepared["action_request"]["outcome"] == "returned", prepared["action_request"]
+    fresh_pin = owner.startup_selection(saved["id"], directory.name)
+    assert json.loads(fresh_pin.read())["kind"] == "fresh"
+    f.service.launched.clear()
+    started = await f.service.action(saved["id"], directory.name, "finish-setup", action_request_id=str(uuid4()))
+    assert started["action_request"]["outcome"] == "returned", started["action_request"]
+    selected, mode, options = f.service.launched[-1]
+    assert (selected, mode) == (directory, "start")
+    admitted = bootstrap.read_bootstrap_admission(directory, options["bootstrap_selection"])
+    assert admitted["application_startup"] == json.loads(fresh_pin.read())
+    receipt = deployment.read_receipt(directory)
+    assert receipt["build_id"] == installed["build_id"]
+    assert (receipt["update"]["update_id"], receipt["update"]["status"]) == (update["update_id"], "staged")

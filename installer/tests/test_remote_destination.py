@@ -1376,3 +1376,25 @@ def test_actual_fixture_listener_proof_is_joined_to_frozen_application_projectio
     (proc / '42/fd/7').unlink()
     result = controller._application_experiences(root, owner, observed)
     assert result['entries'][0]['listener_owned'] is False and result['entries'][0]['listener_token'] is None
+
+
+def test_product_preflight_names_the_cpython_its_product_needs(destination, monkeypatch):
+    """A product whose control tools need another CPython fails one named check, before transfer."""
+    root, request, files, live = destination
+    from launchkit import remote_product_control as control
+    needed = sys.version_info.minor + 1
+    manifest = {'format': control.FORMAT, 'interpreter': {'implementation': sys.implementation.name,
+        'machine': 'x86_64', 'python_tag': 'cp3' + str(needed), 'abi_tag': 'cp3' + str(needed),
+        'glibc_minimum': [2, 31]}}
+    monkeypatch.setattr(controller, 'PRODUCT_CONTROL_MANIFEST', json.dumps(manifest).encode(), raising=False)
+    monkeypatch.setattr(controller, 'PRODUCT_CONTROL_ADAPTER_SOURCE', Path(control.__file__).read_bytes(),
+        raising=False)
+    result = controller.handle({**request, 'action': 'preflight'})
+    assert 'error' not in result, result
+    assert result['ready'] is False and result['status'] == 'preflight'
+    (check,) = [row for row in result['checks'] if row['name'] == 'product-interpreter']
+    assert check['status'] == 'failed'
+    assert 'CPython 3.%d on Linux x86_64 with glibc 2.31 or newer' % needed in check['detail']
+    assert 'this destination runs CPython %d.%d on x86_64 with glibc 2.31' % sys.version_info[:2] in check['detail']
+    assert 'product_interpreter' not in result and result['private_settings_supported'] is False
+    assert not root.exists()

@@ -15,6 +15,7 @@ import {
   type IdleWatermark,
 } from "./lib/idle-reconcile";
 import React from "react";
+import { selectedPanelRuntime, scopedPanelParams, framesForPanelRuntime, loadPanelRuntimeSelection, savePanelRuntimeSelection } from "./lib/panel-runtime";
 import "@console-components/styles";
 import "./console-host.css";
 
@@ -714,6 +715,51 @@ const ACTIVITY_SKIP_EVENTS = new Set([
 // CONSOLE APP
 // ============================================================================
 
+function emptyMemoryPanelData(): MemoryPanelData {
+  return {
+    records: [],
+    realms: [],
+    quarantineRecords: [],
+    pendingPromotions: [],
+    dreams: [],
+    detail: null,
+    detailLoading: false,
+    unavailable: false,
+    error: null,
+    nextCursor: null,
+    recordsDenied: false,
+    dreamsDenied: false,
+    operatorScopeDenied: false,
+    mobScopeDenied: false,
+    overview: null,
+    overviewDenied: false,
+    proposals: [],
+    proposalsDenied: false,
+    injections: [],
+    injectionsDenied: false,
+    harvests: [],
+    harvestsDenied: false,
+    dreamRuns: [],
+    dreamRunsDenied: false,
+    auditVerdicts: [],
+    auditVerdictsDenied: false,
+    canDecideQuarantine: false,
+  };
+}
+
+function emptyWorkGraphPanelData(): WorkGraphPanelData {
+  return {
+    items: [],
+    edges: [],
+    attention: [],
+    events: [],
+    capturedAt: null,
+    unavailable: false,
+    denied: false,
+    error: null,
+  };
+}
+
 export function ConsoleApp(props: ConsoleAppProps): React.JSX.Element {
   // All authorized state belongs to one host authority and transport lifetime.
   // A keyed instance clears it in the same commit as the host scope change.
@@ -815,6 +861,31 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const [experience, setExperience] = React.useState<ConsoleExperience | null>(
     null,
   );
+  const persistentSendScope = storageNamespace?.trim() || (experience?.storage_scope?.trim()
+    ? JSON.stringify([baseUrl, experience.storage_scope]) : null);
+  const savedPanelRuntimeSelection = React.useMemo(
+    () => loadPanelRuntimeSelection(browserLocalStorage(), persistentSendScope),
+    [persistentSendScope],
+  );
+  const [panelRuntimeSelection, setPanelRuntimeSelection] = React.useState<{scope: string | null; key: string} | null>(null);
+  const explicitPanelRuntime = panelRuntimeSelection?.scope === persistentSendScope
+    ? panelRuntimeSelection.key : savedPanelRuntimeSelection;
+  const panelRuntimeKey = selectedPanelRuntime(explicitPanelRuntime, experience?.panel_runtimes);
+  // An explicitly empty shared registry is a setup state, not an access grant.
+  // Missing experience or a denied configured service must keep its normal gate.
+  const emptyPanelRegistry = experience?.panel_runtimes?.length === 0
+    && experience.memory?.available === false
+    && experience.workgraph?.available === false;
+  React.useEffect(() => {
+    if (!panelRuntimeKey) return;
+    setPanelRuntimeSelection(current => current?.scope === persistentSendScope && current.key === panelRuntimeKey
+      ? current : {scope: persistentSendScope, key: panelRuntimeKey});
+    savePanelRuntimeSelection(browserLocalStorage(), persistentSendScope, panelRuntimeKey);
+  }, [persistentSendScope, panelRuntimeKey]);
+  const panelRuntimeKeyRef = React.useRef(panelRuntimeKey);
+  panelRuntimeKeyRef.current = panelRuntimeKey;
+  const [memoryDataRuntimeKey, setMemoryDataRuntimeKey] = React.useState("");
+  const [workGraphDataRuntimeKey, setWorkGraphDataRuntimeKey] = React.useState("");
   const [agents, setAgents] = React.useState<ConsoleAgent[]>([]);
   // Roster labels keyed by public alias (durable identity and member id), so
   // transcript rows can name a peer the way the sidebar does.
@@ -861,50 +932,16 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     config: null,
     error: null,
   });
-  const [memoryData, setMemoryData] = React.useState<MemoryPanelData>({
-    records: [],
-    realms: [],
-    quarantineRecords: [],
-    pendingPromotions: [],
-    dreams: [],
-    detail: null,
-    detailLoading: false,
-    unavailable: false,
-    error: null,
-    nextCursor: null,
-    recordsDenied: false,
-    dreamsDenied: false,
-    operatorScopeDenied: false,
-    mobScopeDenied: false,
-    overview: null,
-    overviewDenied: false,
-    proposals: [],
-    proposalsDenied: false,
-    injections: [],
-    injectionsDenied: false,
-    harvests: [],
-    harvestsDenied: false,
-    dreamRuns: [],
-    dreamRunsDenied: false,
-    auditVerdicts: [],
-    auditVerdictsDenied: false,
-    canDecideQuarantine: false,
-  });
-  const [workGraphData, setWorkGraphData] = React.useState<WorkGraphPanelData>({
-    items: [],
-    edges: [],
-    attention: [],
-    events: [],
-    version: 0,
-    sorted: null,
-    busyLifecycle: new ConsoleActivityProjection(),
-    busyFoldedThroughMs: Number.NEGATIVE_INFINITY,
-    busyFoldValid: true,
-    capturedAt: null,
-    unavailable: false,
-    denied: false,
-    error: null,
-  });
+  const [memoryData, setMemoryData] = React.useState<MemoryPanelData>(emptyMemoryPanelData);
+  const [workGraphData, setWorkGraphData] = React.useState<WorkGraphPanelData>(emptyWorkGraphPanelData);
+  React.useEffect(() => {
+    // Never display a previous repository's cached data under a new scope,
+    // including when that new scope fails to load or disappears.
+    setMemoryDataRuntimeKey("");
+    setWorkGraphDataRuntimeKey("");
+    setMemoryData(emptyMemoryPanelData());
+    setWorkGraphData(emptyWorkGraphPanelData());
+  }, [panelRuntimeKey]);
   const [topologyQueryResult, setTopologyQueryResult] = React.useState<unknown>(null);
   const [topologyCapabilities, setTopologyCapabilities] =
     React.useState<ConsoleTopologyControlCapabilities | null>(null);
@@ -1187,6 +1224,27 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     return requireWorkbenchTarget(buildControlTarget(kind));
   }
 
+  function runtimeScopedPanel(kind: "memory" | "workgraph", content: React.ReactNode) {
+    if (emptyPanelRegistry) return <div className="console-panel runtime-panel-empty">
+      <h2>{kind === "memory" ? "Memory" : "WorkGraph"}</h2>
+      <p role="status">No teams are running.</p>
+      <p>Finish setting up a team to inspect its memory and work graph.</p>
+    </div>;
+    const runtimes = experience?.panel_runtimes;
+    if (!runtimes) return content;
+    const loaded = (kind === "memory" ? memoryDataRuntimeKey : workGraphDataRuntimeKey) === panelRuntimeKey;
+    return <div className="runtime-scoped-panel" key={`${kind}:${panelRuntimeKey}`}>
+      <label className="runtime-panel-selector">Mob
+        <select aria-label={`${kind === "memory" ? "Memory" : "Work Graph"} mob`} value={panelRuntimeKey}
+          onChange={event => setPanelRuntimeSelection({scope: persistentSendScope, key: event.target.value})}>
+          {!runtimes.some(runtime => runtime.key === panelRuntimeKey) && <option value={panelRuntimeKey}>Runtime unavailable</option>}
+          {runtimes.map(runtime => <option key={runtime.key} value={runtime.key}>{runtime.label}</option>)}
+        </select>
+      </label>
+      {loaded ? content : <div className="console-panel" role="status">Loading {kind === "memory" ? "memory" : "work graph"}...</div>}
+    </div>;
+  }
+
   async function executeHeadlessCommand(
     command: typeof CONSOLE_COMMAND_NAMES[keyof typeof CONSOLE_COMMAND_NAMES],
     target: ConsoleWorkbenchTarget,
@@ -1195,7 +1253,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     return (await consoleController.commands.execute({
       command,
       target,
-      params,
+      params: scopedPanelParams(target.kind, panelRuntimeKey, params),
     })).result;
   }
 
@@ -1863,8 +1921,6 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const sendControllerRef = React.useRef(consoleController);
   sendControllerRef.current = consoleController;
   const transientSendScope = React.useMemo(() => `transient:${createIdempotencyKey()}`, [consoleController]);
-  const persistentSendScope = storageNamespace?.trim() || (experience?.storage_scope?.trim()
-    ? JSON.stringify([baseUrl, experience.storage_scope]) : null);
   const sendScope = persistentSendScope || `${transientSendScope}:${baseUrl}`;
   const [composerTabId] = React.useState(() => {
     try { return consoleComposerTabId(window.sessionStorage, createIdempotencyKey); }
@@ -2664,11 +2720,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     if (configuredVisible.length > 0) {
       const extra: NavKind[] = [];
       if (experience?.access?.can_administer === true) extra.push("access");
-      // The Memory panel is gated server-side per principal, never by view
-      // config: `can_read` alone decides whether the nav entry appears.
-      if (experience?.memory?.can_read === true) extra.push("memory");
-      // WorkGraph is likewise server-gated: configured service + view grant.
-      if (experience?.workgraph?.available === true && experience?.workgraph?.can_view === true) {
+      // An empty shared registry offers a setup explanation only. Configured
+      // services still require the server-projected read/view grants.
+      if (emptyPanelRegistry || experience?.memory?.can_read === true) extra.push("memory");
+      if (emptyPanelRegistry || (experience?.workgraph?.available === true && experience?.workgraph?.can_view === true)) {
         extra.push("workgraph");
       }
       return extra.length > 0 ? [...configuredVisible, ...extra] : configuredVisible;
@@ -2682,10 +2737,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     // The Access admin surface is gated server-side per principal, never by
     // view config: administrators always get it, nobody else ever does.
     if (experience?.access?.can_administer === true) controls.push("access");
-    // Same for the Memory panel: server-side `can_read` gates the entry.
-    if (experience?.memory?.can_read === true) controls.push("memory");
-    // Same for WorkGraph: configured service + per-caller view grant.
-    if (experience?.workgraph?.available === true && experience?.workgraph?.can_view === true) {
+    // Empty shared registries keep these destinations discoverable without
+    // making store requests or replacing configured-service access checks.
+    if (emptyPanelRegistry || experience?.memory?.can_read === true) controls.push("memory");
+    if (emptyPanelRegistry || (experience?.workgraph?.available === true && experience?.workgraph?.can_view === true)) {
       controls.push("workgraph");
     }
     return controls;
@@ -2695,6 +2750,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     experience?.memory?.can_read,
     experience?.workgraph?.available,
     experience?.workgraph?.can_view,
+    emptyPanelRegistry,
     hasMobControlSurface,
   ]);
 
@@ -2851,7 +2907,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [panelRefreshFlight, baseUrl, accessScope]);
 
-  const refreshMemoryData = React.useCallback(() => panelRefreshFlight("memory", async () => {
+  const refreshMemoryData = React.useCallback(() => panelRefreshFlight(`memory:${panelRuntimeKey}`, async () => {
+    if (emptyPanelRegistry) return;
     const memoryTarget = controlWorkbenchTarget("memory");
     try {
       let records: MemoryPanelRecord[] = [];
@@ -2990,6 +3047,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           ),
         ]);
 
+      if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+      setMemoryDataRuntimeKey(panelRuntimeKey);
       setMemoryData((current) => ({
         ...current,
         records,
@@ -3020,6 +3079,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       }));
     } catch (err) {
       // -32601 means the panel is not configured on this runtime.
+      if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+      setMemoryDataRuntimeKey(panelRuntimeKey);
       if (jsonRpcErrorCode(err) === -32601) {
         setMemoryData((current) => ({ ...current, unavailable: true, error: null }));
         return;
@@ -3027,13 +3088,14 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       setMemoryData((current) => ({ ...current, error: errorMessage(err) }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [panelRefreshFlight, baseUrl, experience?.memory?.can_review_quarantine]);
+  }), [panelRefreshFlight, baseUrl, panelRuntimeKey, emptyPanelRegistry, experience?.memory?.can_review_quarantine]);
 
   // Overlapping refreshes (debounced live signals, manual refresh, post-
   // mutation re-reads) can resolve out of order — sequence them so a stale
   // snapshot never overwrites a fresher one.
   const workGraphRefreshSequencerRef = React.useRef(createWorkGraphRefreshSequencer());
-  const refreshWorkGraphData = React.useCallback(() => panelRefreshFlight("workgraph", async () => {
+  const refreshWorkGraphData = React.useCallback(() => panelRefreshFlight(`workgraph:${panelRuntimeKey}`, async () => {
+    if (emptyPanelRegistry) return;
     const workGraphTarget = controlWorkbenchTarget("workgraph");
     const isCurrent = workGraphRefreshSequencerRef.current.begin();
     try {
@@ -3071,7 +3133,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           if (jsonRpcErrorCode(err) !== -32030) throw err;
         }
       }
-      if (!isCurrent()) return;
+      if (!isCurrent() || panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+      setWorkGraphDataRuntimeKey(panelRuntimeKey);
       setWorkGraphData({
         items: snapshot?.items || [],
         edges: snapshot?.edges || [],
@@ -3083,7 +3146,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         error: null,
       });
     } catch (err) {
-      if (!isCurrent()) return;
+      if (!isCurrent() || panelRuntimeKeyRef.current !== panelRuntimeKey) return;
+      setWorkGraphDataRuntimeKey(panelRuntimeKey);
       // -32601 (method absent) and -32041 (workgraph_unavailable) both mean
       // no WorkGraph service on this runtime; so does a missing capability
       // advertisement (the headless layer throws before dispatch).
@@ -3097,7 +3161,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       setWorkGraphData((current) => ({ ...current, error: errorMessage(err) }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [panelRefreshFlight, baseUrl]);
+  }), [panelRefreshFlight, baseUrl, panelRuntimeKey, emptyPanelRegistry]);
 
   /// Filtered/paged panel/records query for the Records filter bar, the
   /// keyset load-more, and the lattice page-walk. Resolves null STRICTLY on
@@ -3114,12 +3178,12 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         )) as MemoryPanelRecordsResult | null;
       } catch (err) {
         if (memorySectionOutcome(err) === "denied") return null;
-        setMemoryData((current) => ({ ...current, error: errorMessage(err) }));
+        if (panelRuntimeKeyRef.current === panelRuntimeKey) setMemoryData((current) => ({ ...current, error: errorMessage(err) }));
         throw err;
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [baseUrl],
+    [baseUrl, panelRuntimeKey],
   );
 
   /// Evidence click-through: resolve a MemoryEvidenceRef against the
@@ -3132,8 +3196,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     ): Promise<ConversationTimelineEntry[] | null> => {
       if (!evidence.session_id) return null;
       try {
+        const namespace = experience?.panel_runtimes?.find(runtime => runtime.key === panelRuntimeKey)?.namespace;
+        const scopedIdentity = identity && namespace && !identity.startsWith(`${namespace}/`) ? `${namespace}/${identity}` : identity;
         const pageFact = await consoleController.timeline.query({
-          ...(identity ? { identity } : {}),
+          ...(scopedIdentity ? { identity: scopedIdentity } : {}),
           mode: "recent",
           limit: 1000,
         });
@@ -3150,7 +3216,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         return null;
       }
     },
-    [consoleController],
+    [consoleController, panelRuntimeKey, experience?.panel_runtimes],
   );
 
   const loadMemoryRecordDetail = React.useCallback(
@@ -3170,8 +3236,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
               injections: result.injections || [],
             }
           : null;
+        if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
         setMemoryData((current) => ({ ...current, detail, detailLoading: false }));
       } catch (err) {
+        if (panelRuntimeKeyRef.current !== panelRuntimeKey) return;
         setMemoryData((current) => ({
           ...current,
           detail: null,
@@ -3181,7 +3249,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [baseUrl],
+    [baseUrl, panelRuntimeKey],
   );
 
   /// One quarantine decision (meta/memory/quarantine/decide), bound to the
@@ -3336,7 +3404,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const visiblePanelKey = JSON.stringify(visiblePanelTargets);
   React.useEffect(() => {
     void refreshPanelDataRef.current().catch(() => {});
-  }, [visiblePanelKey, accessScope, experience?.access?.can_administer]);
+  }, [visiblePanelKey, accessScope, panelRuntimeKey, emptyPanelRegistry, experience?.access?.can_administer]);
 
   const scheduleExperienceRefresh = React.useCallback(() => {
     if (experienceTimerRef.current !== null) return;
@@ -3420,6 +3488,9 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       const snapshot = await executeHeadlessCommand(
         CONSOLE_COMMAND_NAMES.workgraphSnapshot,
         controlWorkbenchTarget("workgraph"),
+        experience?.panel_runtimes ? {
+          runtime_key: experience.panel_runtimes.find(runtime => identity.startsWith(`${runtime.namespace}/`))?.key || "",
+        } : undefined,
       );
       appendFrame(
         identity,
@@ -5310,8 +5381,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     if (
       (target.kind === "routing" ||
         target.kind === "gating" ||
-        target.kind === "gates" ||
-        target.kind === "workgraph") &&
+        target.kind === "gates") &&
       !hasMobControlSurface
     ) {
       return (
@@ -5429,7 +5499,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         />
       );
     if (target.kind === "memory")
-      return (
+      return runtimeScopedPanel("memory",
         <MemoryPanel
           records={memoryData.records}
           realms={memoryData.realms}
@@ -5458,7 +5528,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           dreamRunsDenied={memoryData.dreamRunsDenied}
           auditVerdicts={memoryData.auditVerdicts}
           auditVerdictsDenied={memoryData.auditVerdictsDenied}
-          liveFrames={activityRef.current}
+          liveFrames={framesForPanelRuntime(activityRef.current, experience?.panel_runtimes ? panelRuntimeKey : undefined)}
           onRefresh={() => void refreshMemoryData()}
           onSelectRecord={(realm, memoryId) => void loadMemoryRecordDetail(realm, memoryId)}
           onClearDetail={() =>
@@ -5485,7 +5555,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       );
     if (target.kind === "workgraph") {
       const workGraphPanelHandlers = makeWorkGraphOperatorHandlers();
-      return (
+      return runtimeScopedPanel("workgraph",
         <WorkGraphPanel
           data={workGraphData}
           canManage={canManageWorkGraph}

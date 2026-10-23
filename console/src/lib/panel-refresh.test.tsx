@@ -8,14 +8,15 @@
  * with requests made meanwhile coalesced into one trailing refresh.
  */
 import React from "react";
-import { act, render } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { act, fireEvent, render, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ConsoleApp } from "../ConsoleApp";
 import { buildControlTarget } from "./adapters";
 import { CONSOLE_RPC_METHODS } from "./contract";
 import type { MetaConsoleTransport } from "./headless";
 import type { ConsoleFrame } from "../types";
+import { savePanelRuntimeSelection } from "./panel-runtime";
 
 const CHAT = "identity:agent-000";
 
@@ -165,4 +166,84 @@ describe("event-driven panel refresh", () => {
     expect(harness.topologyQueries).toBe(settled);
     view.unmount();
   }, 30_000);
+});
+
+describe("empty shared-console panels", () => {
+  beforeEach(() => window.localStorage.clear());
+  afterEach(() => window.localStorage.clear());
+
+  function emptyExperience() {
+    return {
+      ...experience(),
+      agent_sidebar: { live_snapshot: { agents: [] } },
+      panel_runtimes: [],
+      memory: { available: false, can_read: false },
+      workgraph: { available: false, can_view: false, can_manage: false },
+    };
+  }
+
+  it("keeps Memory and WorkGraph discoverable without querying a nonexistent team", async () => {
+    const harness = transport();
+    harness.loadExperience = async () => emptyExperience() as never;
+    const execute = vi.fn(harness.executeCommand);
+    harness.executeCommand = execute;
+    const view = render(<ConsoleApp baseUrl="" transport={harness} />);
+    const memory = await view.findByRole("button", { name: "Memory", exact: true });
+    fireEvent.click(memory);
+    expect(await view.findByText("No teams are running.")).toBeTruthy();
+    expect(view.getByText("Finish setting up a team to inspect its memory and work graph.")).toBeTruthy();
+    expect(view.queryByRole("combobox", { name: "Memory mob" })).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "WorkGraph", exact: true }));
+    expect(await view.findByRole("heading", { name: "WorkGraph", exact: true })).toBeTruthy();
+    expect(view.getByText("No teams are running.")).toBeTruthy();
+    expect(execute.mock.calls.filter(([input]) => /memory|workgraph/i.test(input.command))).toHaveLength(0);
+    view.unmount();
+  });
+
+  it.each(["Memory", "WorkGraph"])("opens %s data when the saved team becomes available", async (name) => {
+    savePanelRuntimeSelection(window.localStorage, JSON.stringify(["", "refresh-principal"]), "alpha");
+    let started = false;
+    const harness = transport();
+    harness.loadExperience = async () => (started ? {
+      ...experience(),
+      panel_runtimes: [{ key: "alpha", label: "Alpha", namespace: "alpha", memory: true, workgraph: true }],
+      memory: { available: true, can_read: true },
+      workgraph: { available: true, can_view: true, can_manage: false },
+    } : emptyExperience()) as never;
+    const execute = vi.fn(harness.executeCommand);
+    harness.executeCommand = execute;
+    const view = render(<ConsoleApp baseUrl="" transport={harness} />);
+    fireEvent.click(await view.findByRole("button", { name, exact: true }));
+    expect(await view.findByText("No teams are running.")).toBeTruthy();
+    const queries = () => execute.mock.calls.filter(([input]) => /memory|workgraph/i.test(input.command));
+    expect(queries()).toHaveLength(0);
+    started = true;
+    await act(async () => harness.live?.({
+      id: `ready:${name}`, event: "member_ready", identity: CHAT,
+      timestampMs: Date.now(), cursor: "console:2000", data: {},
+    }));
+    await waitFor(() => expect(queries().length).toBeGreaterThan(0));
+    expect(view.queryByText("No teams are running.")).toBeNull();
+    expect(view.getByRole("combobox", { name: name === "Memory" ? "Memory mob" : "Work Graph mob" })).toHaveValue("alpha");
+    for (const [input] of queries()) expect(input.params?.runtime_key).toBe("alpha");
+    view.unmount();
+  });
+
+  it.each([undefined, [{ key: "restricted", label: "Restricted", namespace: "restricted", memory: true, workgraph: true }]])(
+    "does not replace missing capability information or denied access with a setup explanation (%j)",
+    async (runtimes) => {
+      const harness = transport();
+      harness.loadExperience = vi.fn(async () => ({
+        ...emptyExperience(), panel_runtimes: runtimes,
+        memory: { available: true, can_read: false },
+        workgraph: { available: true, can_view: false, can_manage: false },
+      }) as never);
+      const view = render(<ConsoleApp baseUrl="" transport={harness} />);
+      await waitFor(() => expect(harness.loadExperience).toHaveBeenCalled());
+      expect(view.queryByRole("button", { name: "Memory", exact: true })).toBeNull();
+      expect(view.queryByRole("button", { name: "WorkGraph", exact: true })).toBeNull();
+      expect(view.queryByText("No teams are running.")).toBeNull();
+      view.unmount();
+    },
+  );
 });

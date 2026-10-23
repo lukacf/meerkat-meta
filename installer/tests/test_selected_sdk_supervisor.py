@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import sys
 import threading
+import time
+from time import sleep
 
 import pytest
 
@@ -244,16 +246,44 @@ async def test_interruption_joins_original_child_before_staging_is_removed(super
     assert_reaped(files.children[0])
 
 
-@pytest.mark.parametrize("mode", ["timeout", "pip-failure"])
+@pytest.mark.parametrize("mode", ["timeout", "timeout-after-slow-staging", "pip-failure"])
 async def test_install_failure_joins_child_and_refuses_later_commands(supervised_files, mode):
     files = supervised_files
-    files.mode = mode
-    expected = TimeoutError if mode == "timeout" else installed.CandidateArtifactError
+    files.mode = "timeout" if mode.startswith("timeout") else mode
+    if mode == "timeout-after-slow-staging":
+        # A loaded host stages the wheels slowly before the first pip child.
+        fence, staged = files.require_current, []
+        def slow_fence():
+            if not staged:
+                staged.append(True)
+                time.sleep(0.2)
+            return fence()
+        files.require_current = slow_fence
+    expected = TimeoutError if mode.startswith("timeout") else installed.CandidateArtifactError
+    # The deadline covers staging too, so it must outlast slow staging and
+    # expire while the timeout leg's pip child sleeps (30 s), not before it.
     with pytest.raises(expected):
-        await selected_install(files, timeout=0.15 if mode == "timeout" else 3)
+        await selected_install(files, timeout=3)
     assert len(files.children) == 1 and files.owner.child is None
     assert not list((files.root / ".venv").glob(".forge-selected-*"))
     assert_reaped(files.children[0])
+
+
+async def test_a_deadline_that_expires_during_staging_starts_no_child(supervised_files):
+    files = supervised_files
+    files.mode = "timeout"
+    # Staging outlasts the whole deadline, so its fence refuses before any pip child.
+    fence, staged = files.require_current, []
+    def slow_fence():
+        if not staged:
+            staged.append(True)
+            time.sleep(0.3)
+        return fence()
+    files.require_current = slow_fence
+    with pytest.raises(TimeoutError):
+        await selected_install(files, timeout=0.1)
+    assert files.children == [] and files.owner.child is None
+    assert not list((files.root / ".venv").glob(".forge-selected-*"))
 
 
 async def test_unconfirmed_child_cleanup_retains_staging_until_original_owner_recovers(supervised_files):
@@ -336,19 +366,32 @@ async def test_replaced_owner_after_pip_refuses_nested_readback_and_dependencies
     assert_reaped(files.children[0])
 
 
-async def test_pair_deadline_is_not_reset_for_dependency_phase(supervised_files):
+@pytest.mark.parametrize("staging", ["prompt", "slow"])
+async def test_pair_deadline_is_not_reset_for_dependency_phase(supervised_files, staging):
     files = supervised_files
+    if staging == "slow":
+        # A loaded host stages the wheels slowly before the first pip child.
+        fence, staged = files.require_current, []
+        def slow_fence():
+            if not staged:
+                staged.append(True)
+                sleep(0.8)
+            return fence()
+        files.require_current = slow_fence
     loop = asyncio.get_running_loop()
     clock = [loop.time()]
     original_time = loop.time
     original = files.owner.command
     deadlines = []
+    # The deadline covers staging too, so it must outlast slow staging. The
+    # fixture clock then moves past it once the first child has run.
+    pair_deadline = 3
 
     async def command(args, phase, timeout, **options):
         deadlines.append(timeout)
         result = await original(args, phase, timeout, **options)
         if len(deadlines) == 1:
-            clock[0] = original_time() + 1
+            clock[0] = original_time() + pair_deadline + 1
         return result
 
     files.owner.command = command
@@ -360,7 +403,7 @@ async def test_pair_deadline_is_not_reset_for_dependency_phase(supervised_files)
     loop.time = time
     try:
         with pytest.raises(TimeoutError):
-            await selected_install(files, timeout=0.7)
+            await selected_install(files, timeout=pair_deadline)
     finally:
         loop.time = original_time
     assert len(deadlines) == len(files.children) == 1

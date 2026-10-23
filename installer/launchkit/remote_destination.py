@@ -487,6 +487,27 @@ def _preflight(request, root, identity, binding, host):
             'checks': checks, 'destination_state': folder, 'continuity': continuity}
 
 
+def _product_interpreter_check(manifest):
+    """The failed preflight check for a guest the product's control tools cannot use."""
+    needed = manifest.get('interpreter') if isinstance(manifest, dict) else None
+    needed = needed if isinstance(needed, dict) else {}
+    tag = needed.get('python_tag')
+    match = re.fullmatch(r'cp(3)(\d{1,2})', tag) if isinstance(tag, str) else None
+    python = 'CPython ' + match.group(1) + '.' + match.group(2) if match else 'its selected CPython'
+    machine = needed.get('machine')
+    machine = machine if isinstance(machine, str) and re.fullmatch(r'[A-Za-z0-9_]{1,16}', machine) else 'its selected CPU'
+    floor = needed.get('glibc_minimum')
+    floor = ('glibc %d.%d or newer' % tuple(floor) if isinstance(floor, list) and len(floor) == 2
+             and all(type(part) is int and 0 <= part < 1000 for part in floor) else 'its selected glibc')
+    libc, version = platform.libc_ver()
+    guest = 'CPython %d.%d on %s with %s' % (sys.version_info.major, sys.version_info.minor,
+        platform.machine()[:32] or 'an unknown CPU', (libc + ' ' + version)[:32] if libc else 'an unknown libc')
+    return {'name': 'product-interpreter', 'status': 'failed',
+            'detail': 'The selected product\'s control tools need ' + python + ' on Linux ' + machine + ' with '
+                      + floor + '; this destination runs ' + guest + '. Make that CPython the destination\'s '
+                      'python3, or choose a destination that has it, then recheck.'}
+
+
 def _excluded(name):
     parts = name.split('/')
     return bool(PRIVATE_COMPONENTS.intersection(parts) or parts[0] in PRIVATE_ROOTS or name.endswith('.receipt.json'))
@@ -2182,7 +2203,13 @@ def handle(request, *, product_stream=None):
             result = _preflight(request, root, identity, binding, host)
             if globals().get('PRODUCT_CONTROL_MANIFEST') is not None:
                 adapter, manifest = _product_adapter()
-                result['product_interpreter'] = adapter['guest_interpreter'](manifest)
+                try:
+                    result['product_interpreter'] = adapter['guest_interpreter'](manifest)
+                except ValueError:
+                    # Name what the selected product needs as a failed check,
+                    # before any transfer, rather than as an internal error.
+                    result['checks'].append(_product_interpreter_check(manifest))
+                    result['ready'] = False
                 result['private_settings_supported'] = False
         else:
             _expected(request, host)

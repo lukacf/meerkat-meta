@@ -53,3 +53,16 @@ pub(crate) fn owner_unobserved(session_id: &meerkat_core::SessionId) -> bool {
         false
     }
 }
+
+/// Inside a source advance's transaction, after its items, its cursor and
+/// its receipt were written and before the commit.
+pub(crate) fn inside_source_advance() {
+    #[cfg(feature = "announcement-test-faults")]
+    hit("inside_source_advance");
+}
+
+/// After a source advance committed, before its answer.
+pub(crate) fn after_source_advance() {
+    #[cfg(feature = "announcement-test-faults")]
+    hit("after_source_advance");
+}

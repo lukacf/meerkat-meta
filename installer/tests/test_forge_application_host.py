@@ -398,3 +398,34 @@ def test_readback_preserves_installed_binding_when_host_has_no_startup_selection
         "original-guide", "original-installation"))
     assert result["reason"] == "host_unavailable" and result["available"] is False
     assert result["build_id"] == "installed-original-build" and result["package_sha256"] == "a" * 64
+
+
+@pytest.mark.parametrize("carrier", ["no-attribute", "ad-hoc-matching-attribute"])
+def test_host_factory_refuses_configured_custody_for_a_real_application_host(selected, tmp_path, monkeypatch,
+        carrier):
+    """A real application host has no application model owner that the factory entry could check.
+
+    Its owner comes from its preparation inputs, and the server's host selection
+    does not read any model attribute. So configured custody refuses before the
+    server is selected, even when an ad hoc attribute matches its selection.
+    """
+    from launchkit import application_host_launch as launch, packaged_runtime
+    from test_application_host_launch import model_owner
+    owner = model_owner(tmp_path, monkeypatch)
+    for name in ("_selected_target", "_application_model_custody"):
+        monkeypatch.setattr(packaged_runtime, name, None)
+    packaged_runtime.configure_application_model_custody(owner)
+    host = selected.host
+    assert type(host) is ForgeApplicationHost
+    if carrier == "ad-hoc-matching-attribute":
+        host.model_configuration = owner.selection()
+    selections = []
+    server = SimpleNamespace(app=object(), select_application_host=selections.append)
+    load = launch.importlib.import_module
+    monkeypatch.setenv(launch.FACTORY_ENV, "trusted_operator.selection:make_host")
+    monkeypatch.setattr(launch.importlib, "import_module", lambda name: (
+        SimpleNamespace(make_host=lambda: host) if name == "trusted_operator.selection"
+        else server if name == "launchkit.server" else load(name)))
+    with pytest.raises(CustodyError, match="cannot reach the selection"):
+        launch.create_app()
+    assert selections == []

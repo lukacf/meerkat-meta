@@ -15,20 +15,29 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::store::AnnouncementStore;
+use super::sources::{
+    AdvanceSource, AnnouncementSource, AuditAction, AuditQuery, AuditReason, AuditRow,
+    CollectionPhase, Coverage, CoverageGap, DeletionCapability, ItemChange, ItemOutcome,
+    ItemOutcomeKind, MAX_SOURCES_PER_GATEWAY, MAX_SOURCES_PER_MOB, MAX_STREAMS_PER_SOURCE,
+    MemberFacts, OnboardingMode, Principal, PutSource, RecordSourceFailure, RosterFacts,
+    SourceAdvance, SourceChange, SourceConfig, SourceConflictRecord, SourceFailureRecord,
+    SourceQuery, SourceState, SourceStream, StreamPhase, TopicOwnership, covers,
+};
+use super::store::{AnnouncementStore, SubmissionCheck};
 use super::types::{
-    AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
-    BatchGap, BatchId, BatchItem, BatchPosition, BatchQuery, BatchState, BatchStateTag,
+    AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Announcer, Batch,
+    BatchEvent, BatchGap, BatchId, BatchItem, BatchPosition, BatchQuery, BatchState, BatchStateTag,
     ExpiryReport, GapReason, LateOutcome, MAX_BACKFILL, MAX_ITEM_WIRE_BYTES, MAX_PAGE, Member,
     MemberBacklog, MemberRoute, MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport,
-    PutSubscription, Result, SealingPolicy, SourceKey, StartFrontier, Subscription,
-    SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
-    SubscriptionState, Topic, content_digest, header_wire_bound, merge_gaps, render_batch,
-    render_gap, render_item, request_fingerprint, wire_budget, wire_len,
+    PutSubscription, Result, SOURCE_KEY_PREFIX, SealingPolicy, Selector, SourceId, SourceKey,
+    StartFrontier, Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd,
+    SubscriptionId, SubscriptionState, Topic, content_digest, header_wire_bound, merge_gaps,
+    quoted, render_batch, render_gap, render_item, request_fingerprint, wire_budget, wire_len,
 };
 
-/// The mob announcement store's tables. A provider applies this through its own
-/// migration ledger before handing a connection to
+/// The mob announcement store's version 1 tables, frozen with the release
+/// that shipped them (0.9.4). A provider applies this and then [`SCHEMA_V2`]
+/// through its own migration ledger before handing a connection to
 /// [`SqliteAnnouncementStore::from_connection`].
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS announcement_logs (
@@ -99,6 +108,51 @@ CREATE TABLE IF NOT EXISTS member_routes (
  checked_through INTEGER);
 CREATE INDEX IF NOT EXISTS member_routes_by_route ON member_routes (route, member);";
 
+/// The tables version 2 adds: announcement sources, one row per
+/// `(mob_id, source_id)` holding its current generation, the topics the
+/// sources own, the streams each generation onboarded, the counted audit
+/// of what sources' audiences and routes refused, withheld, held, released
+/// or let through, one entry per source, generation, member, action and
+/// reason, and the owed items held while their member does not pass. A
+/// provider applies this after [`SCHEMA`].
+pub const SCHEMA_V2: &str = "
+CREATE TABLE IF NOT EXISTS announcement_sources (
+ mob_id TEXT NOT NULL, source_id TEXT NOT NULL, generation INTEGER NOT NULL,
+ state TEXT NOT NULL, identity_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL,
+ record TEXT NOT NULL, PRIMARY KEY (mob_id, source_id));
+CREATE INDEX IF NOT EXISTS announcement_sources_by_identity
+ ON announcement_sources (mob_id, identity_key, state);
+CREATE TABLE IF NOT EXISTS announcement_source_topics (
+ mob_id TEXT NOT NULL, topic TEXT NOT NULL, source_id TEXT NOT NULL, kind TEXT NOT NULL,
+ PRIMARY KEY (mob_id, topic));
+CREATE INDEX IF NOT EXISTS announcement_source_topics_by_source
+ ON announcement_source_topics (mob_id, source_id);
+CREATE TABLE IF NOT EXISTS announcement_source_streams (
+ mob_id TEXT NOT NULL, source_id TEXT NOT NULL, stream TEXT NOT NULL,
+ generation INTEGER NOT NULL, phase TEXT NOT NULL, mode TEXT NOT NULL,
+ max_items INTEGER, backfilled INTEGER NOT NULL, since_ms INTEGER NOT NULL,
+ PRIMARY KEY (mob_id, source_id, stream));
+CREATE TABLE IF NOT EXISTS announcement_audit (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, mob_id TEXT NOT NULL, source_id TEXT NOT NULL,
+ generation INTEGER NOT NULL, member TEXT NOT NULL, action TEXT NOT NULL,
+ reason TEXT NOT NULL, count INTEGER NOT NULL, first_at_ms INTEGER NOT NULL,
+ last_at_ms INTEGER NOT NULL, record TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS announcement_audit_counted
+ ON announcement_audit (mob_id, source_id, generation, member, action, reason);
+CREATE INDEX IF NOT EXISTS announcement_audit_by_source
+ ON announcement_audit (mob_id, source_id, id);
+CREATE INDEX IF NOT EXISTS announcement_audit_by_member
+ ON announcement_audit (member, id);
+CREATE TABLE IF NOT EXISTS announcement_holds (
+ subscription_id TEXT NOT NULL, mob_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+ member TEXT NOT NULL, source_id TEXT NOT NULL, generation INTEGER NOT NULL,
+ held_at_ms INTEGER NOT NULL, checked_at_ms INTEGER NOT NULL, record TEXT NOT NULL,
+ PRIMARY KEY (subscription_id, mob_id, sequence));
+CREATE INDEX IF NOT EXISTS announcement_holds_by_member
+ ON announcement_holds (member, checked_at_ms);
+CREATE INDEX IF NOT EXISTS announcement_holds_by_check
+ ON announcement_holds (checked_at_ms);";
+
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
 }
@@ -150,10 +204,12 @@ impl SqliteAnnouncementStore {
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
             .map_err(storage)?;
         connection.execute_batch(SCHEMA).map_err(storage)?;
+        connection.execute_batch(SCHEMA_V2).map_err(storage)?;
         Ok(Self::from_connection(connection, None))
     }
 
-    /// The caller must have applied [`SCHEMA`] under its migration contract.
+    /// The caller must have applied [`SCHEMA`] and [`SCHEMA_V2`] under its
+    /// migration contract.
     pub fn from_connection(
         connection: Connection,
         guard: Option<Arc<dyn ConnectionGuard>>,
@@ -638,7 +694,10 @@ fn backlog_for(db: &Connection, member: &Member) -> Result<Option<MemberBacklog>
             "SELECT COUNT(*), COALESCE(SUM(o.rendered_bytes), 0), MIN(o.captured_at_ms)
              FROM owed_announcements o JOIN member_subscriptions s ON s.id = o.subscription_id
              WHERE o.member = ?1 AND o.settlement IS NULL AND o.batch_id IS NULL
-               AND s.state = 'active'",
+               AND s.state = 'active'
+               AND NOT EXISTS (
+                 SELECT 1 FROM announcement_holds h WHERE h.subscription_id = o.subscription_id
+                   AND h.mob_id = o.mob_id AND h.sequence = o.sequence)",
             params![member.key()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -700,7 +759,12 @@ fn complete_backlog(
 // Operations
 // ---------------------------------------------------------------------------
 
-fn announce_in(db: &Connection, request: &AnnounceRequest, now_ms: u64) -> Result<AnnounceOutcome> {
+fn announce_in(
+    db: &Connection,
+    request: &AnnounceRequest,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<AnnounceOutcome> {
     request.validate()?;
     let digest = request.digest();
     if let Some(existing) = announcement_by_key(db, &request.mob_id, &request.source_key)? {
@@ -716,6 +780,12 @@ fn announce_in(db: &Connection, request: &AnnounceRequest, now_ms: u64) -> Resul
             captured_for: captured,
         });
     }
+    // The key prefix of source items and a topic a source owns are reached
+    // only by that source's items and, on a forward topic, by its triage
+    // route's own member. A replay above meets its original; this guards
+    // only what would be announced now.
+    request.ensure_key_open()?;
+    ensure_topics_open(db, request)?;
     let head: Option<i64> = db
         .query_row(
             "SELECT head_sequence FROM announcement_logs WHERE mob_id = ?1",
@@ -782,6 +852,7 @@ fn announce_in(db: &Connection, request: &AnnounceRequest, now_ms: u64) -> Resul
         )
         .map_err(storage)?;
     }
+    let owners = topic_sources(db, &announcement.mob_id, &announcement.topics)?;
     let mut captured = Vec::new();
     for subscription in subscriptions_for_topics(db, &announcement.topics)?.into_values() {
         if !subscription
@@ -796,6 +867,26 @@ fn announce_in(db: &Connection, request: &AnnounceRequest, now_ms: u64) -> Resul
             .copied()
             .unwrap_or(0);
         if sequence <= after {
+            continue;
+        }
+        // A topic a source owns admits only the members its audience covers
+        // and its routes reach, and none that owns a live conversation on
+        // its scope.
+        if let Some((reason, owned)) =
+            withholding(&owners, &subscription, &announcement.topics, facts)
+        {
+            count_audit(
+                db,
+                &AuditKey {
+                    mob_id: announcement.mob_id.clone(),
+                    source_id: owned.source_id.clone(),
+                    generation: owned.generation,
+                    member: subscription.member.clone(),
+                    action: AuditAction::CaptureWithheld,
+                    reason,
+                },
+                now_ms,
+            )?;
             continue;
         }
         insert_owed(
@@ -1475,6 +1566,9 @@ fn backlogs_in(db: &Connection, limit: usize) -> Result<Vec<MemberBacklog>> {
                AND NOT EXISTS (
                  SELECT 1 FROM announcement_batches b WHERE b.member = o.member
                    AND b.state IN ('sealed', 'submitting', 'committed'))
+               AND NOT EXISTS (
+                 SELECT 1 FROM announcement_holds h WHERE h.subscription_id = o.subscription_id
+                   AND h.mob_id = o.mob_id AND h.sequence = o.sequence)
              GROUP BY o.member
              ORDER BY MIN(o.captured_at_ms), o.member
              LIMIT ?1",
@@ -1514,9 +1608,13 @@ fn seal_batch_in(
     member: &Member,
     batch_id: &BatchId,
     policy: &SealingPolicy,
+    facts: &RosterFacts,
     now_ms: u64,
 ) -> Result<Option<Batch>> {
     policy.validate()?;
+    // What the member holds is checked afresh first: what passes now is
+    // released and seals with the rest.
+    release_holds(db, member, policy.max_count, facts, now_ms)?;
     let Some(backlog) = backlog_for(db, member)? else {
         return Ok(None);
     };
@@ -1544,6 +1642,9 @@ fn seal_batch_in(
              FROM owed_announcements o JOIN member_subscriptions s ON s.id = o.subscription_id
              WHERE o.member = ?1 AND o.settlement IS NULL AND o.batch_id IS NULL
                AND s.state = 'active'
+               AND NOT EXISTS (
+                 SELECT 1 FROM announcement_holds h WHERE h.subscription_id = o.subscription_id
+                   AND h.mob_id = o.mob_id AND h.sequence = o.sequence)
              ORDER BY o.captured_at_ms, o.mob_id, o.sequence, o.subscription_id
              LIMIT ?2",
         )
@@ -1571,11 +1672,31 @@ fn seal_batch_in(
     // The encoded body is its header, its gap lines and each item's
     // encoding without the quotes: JSON escapes character by character.
     let mut wire = wire_budget.map_or(0, |_| header_wire_bound(batch_id));
+    let mut subscriptions: BTreeMap<SubscriptionId, Option<Subscription>> = BTreeMap::new();
     for (subscription, revision, mob_id, sequence, rendered) in candidates {
         let key = (MobId::new(mob_id)?, uint(sequence)?);
         let rendered = uint(rendered)?;
-        if !announcements.contains_key(&key) {
-            let announcement = announcement_at(db, &key.0, key.1)?;
+        let subscription_id = SubscriptionId::new(subscription)?;
+        // Each item is read once, by the first subscription that names it.
+        let fresh = if announcements.contains_key(&key) {
+            None
+        } else {
+            Some(announcement_at(db, &key.0, key.1)?)
+        };
+        // An item its member no longer passes is held, not sealed.
+        if !subscriptions.contains_key(&subscription_id) {
+            let loaded = load_subscription(db, &subscription_id)?;
+            subscriptions.insert(subscription_id.clone(), loaded);
+        }
+        let announcement = fresh.as_ref().or_else(|| announcements.get(&key));
+        if let (Some(Some(owner)), Some(announcement)) =
+            (subscriptions.get(&subscription_id), announcement)
+            && let Some(refusal) = owed_refusal(db, owner, announcement, facts)?
+        {
+            hold_owed(db, &subscription_id, &key, member, &refusal, now_ms)?;
+            continue;
+        }
+        if let Some(announcement) = fresh {
             let item = render_item(&announcement);
             let item_wire = wire_len(&item).saturating_sub(2);
             let over_bytes = bytes.saturating_add(rendered) > policy.max_bytes;
@@ -1589,7 +1710,7 @@ fn seal_batch_in(
             announcements.insert(key.clone(), announcement);
             items.push(item);
         }
-        owed.push((SubscriptionId::new(subscription)?, uint(revision)?, key));
+        owed.push((subscription_id, uint(revision)?, key));
     }
     if owed.is_empty() {
         return Ok(None);
@@ -1778,12 +1899,78 @@ fn expire_in(
     let budget = u64::try_from(limit.max(1)).unwrap_or(u64::MAX);
     let mut report = ExpiryReport::default();
 
+    // Held items past the window expire with their own audit entry, and no
+    // gap line tells their member of them: it may not learn of what it may
+    // not receive.
+    let mut statement = db
+        .prepare(
+            "SELECT h.subscription_id, h.mob_id, h.sequence, h.member, h.record
+             FROM announcement_holds h JOIN owed_announcements o
+               ON o.subscription_id = h.subscription_id AND o.mob_id = h.mob_id
+              AND o.sequence = h.sequence
+             WHERE o.batch_id IS NULL AND o.settlement IS NULL AND o.captured_at_ms <= ?1
+             ORDER BY o.captured_at_ms, h.member, h.mob_id, h.sequence LIMIT ?2",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![cutoff, int(budget.saturating_add(1))?], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(storage)?;
+    let mut held = Vec::new();
+    for row in rows {
+        held.push(row.map_err(storage)?);
+    }
+    drop(statement);
+    if held.len() as u64 > budget {
+        held.truncate(usize::try_from(budget).unwrap_or(usize::MAX));
+        report.more = true;
+    }
+    for (subscription_id, mob_id, sequence, member, record) in held {
+        let refusal: OwedRefusal = decode(&record)?;
+        db.execute(
+            "UPDATE owed_announcements SET settlement = 'expired'
+             WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3
+               AND batch_id IS NULL AND settlement IS NULL",
+            params![subscription_id, mob_id, sequence],
+        )
+        .map_err(storage)?;
+        db.execute(
+            "DELETE FROM announcement_holds
+             WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3",
+            params![subscription_id, mob_id, sequence],
+        )
+        .map_err(storage)?;
+        count_audit(
+            db,
+            &AuditKey {
+                mob_id: MobId::new(mob_id)?,
+                source_id: refusal.source_id,
+                generation: refusal.generation,
+                member: Member::from_key(&member)?,
+                action: AuditAction::ExpiredWhileHeld,
+                reason: refusal.reason,
+            },
+            now_ms,
+        )?;
+        report.captures += 1;
+    }
+
     // Captures no batch holds, owed longer than the window: each
     // announcement once per member, oldest first.
     let mut statement = db
         .prepare(
-            "SELECT member, mob_id, sequence, MIN(captured_at_ms) AS at FROM owed_announcements
+            "SELECT member, mob_id, sequence, MIN(captured_at_ms) AS at FROM owed_announcements o
              WHERE batch_id IS NULL AND settlement IS NULL AND captured_at_ms <= ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM announcement_holds h WHERE h.subscription_id = o.subscription_id
+                   AND h.mob_id = o.mob_id AND h.sequence = o.sequence)
              GROUP BY member, mob_id, sequence ORDER BY at, member, mob_id, sequence LIMIT ?2",
         )
         .map_err(storage)?;
@@ -1810,7 +1997,12 @@ fn expire_in(
         db.execute(
             "UPDATE owed_announcements SET settlement = 'expired'
              WHERE member = ?1 AND mob_id = ?2 AND sequence = ?3
-               AND batch_id IS NULL AND settlement IS NULL",
+               AND batch_id IS NULL AND settlement IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM announcement_holds h
+                 WHERE h.subscription_id = owed_announcements.subscription_id
+                   AND h.mob_id = owed_announcements.mob_id
+                   AND h.sequence = owed_announcements.sequence)",
             params![member, mob_id, sequence],
         )
         .map_err(storage)?;
@@ -2138,13 +2330,1722 @@ fn prune_in(db: &Connection, now_ms: u64, retention_ms: u64, limit: usize) -> Re
         )
         .map_err(storage)? as u64;
     report.more |= report.lineage >= budget;
+
+    // Audit entries are kept for the retention window from their last count.
+    let audited = db
+        .execute(
+            "DELETE FROM announcement_audit WHERE id IN (
+               SELECT id FROM announcement_audit WHERE last_at_ms <= ?1 ORDER BY id LIMIT ?2)",
+            params![cutoff, int(budget)?],
+        )
+        .map_err(storage)? as u64;
+    report.more |= audited >= budget;
+
+    // A hold whose item is no longer open (its subscription ended, or the
+    // item settled otherwise) holds nothing.
+    let orphans = db
+        .execute(
+            "DELETE FROM announcement_holds WHERE rowid IN (
+               SELECT h.rowid FROM announcement_holds h WHERE NOT EXISTS (
+                 SELECT 1 FROM owed_announcements o
+                 WHERE o.subscription_id = h.subscription_id AND o.mob_id = h.mob_id
+                   AND o.sequence = h.sequence AND o.settlement IS NULL
+                   AND o.batch_id IS NULL)
+               LIMIT ?1)",
+            params![int(budget)?],
+        )
+        .map_err(storage)? as u64;
+    report.more |= orphans >= budget;
     Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// Announcement sources
+// ---------------------------------------------------------------------------
+
+fn load_source(
+    db: &Connection,
+    mob_id: &MobId,
+    source_id: &SourceId,
+) -> Result<Option<AnnouncementSource>> {
+    let record: Option<String> = db
+        .query_row(
+            "SELECT record FROM announcement_sources WHERE mob_id = ?1 AND source_id = ?2",
+            params![mob_id.as_str(), source_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    record.as_deref().map(decode).transpose()
+}
+
+fn write_source(db: &Connection, source: &AnnouncementSource) -> Result<()> {
+    db.execute(
+        "INSERT INTO announcement_sources
+         (mob_id, source_id, generation, state, identity_key, updated_at_ms, record)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(mob_id, source_id) DO UPDATE SET generation = excluded.generation,
+           state = excluded.state, identity_key = excluded.identity_key,
+           updated_at_ms = excluded.updated_at_ms, record = excluded.record",
+        params![
+            source.mob_id.as_str(),
+            source.source_id.as_str(),
+            int(source.generation)?,
+            source.state.as_str(),
+            source.identity.key()?,
+            int(source.updated_at_ms)?,
+            encode(source)?,
+        ],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// The source that owns `topic` in `mob_id`, with the kind of ownership.
+fn topic_owner(
+    db: &Connection,
+    mob_id: &MobId,
+    topic: &Topic,
+) -> Result<Option<(SourceId, TopicOwnership)>> {
+    let row: Option<(String, String)> = db
+        .query_row(
+            "SELECT source_id, kind FROM announcement_source_topics
+             WHERE mob_id = ?1 AND topic = ?2",
+            params![mob_id.as_str(), topic.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(storage)?;
+    row.map(|(source_id, kind)| Ok((SourceId::new(source_id)?, TopicOwnership::parse(&kind)?)))
+        .transpose()
+}
+
+/// Refuse an announcement on a topic a source owns, unless it is that
+/// source's own item on one of its topics, or the triage member of the
+/// source's route announcing on that route's forward topic while the source
+/// is not ended.
+fn ensure_topics_open(db: &Connection, request: &AnnounceRequest) -> Result<()> {
+    for topic in &request.topics {
+        let Some((source_id, kind)) = topic_owner(db, &request.mob_id, topic)? else {
+            continue;
+        };
+        let allowed = match (&request.announced_by, kind) {
+            (Announcer::Source { source_id: own }, TopicOwnership::Source) => *own == source_id,
+            (Announcer::Member { identity }, TopicOwnership::Forward) => {
+                load_source(db, &request.mob_id, &source_id)?.is_some_and(|source| {
+                    source.state != SourceState::Ended
+                        && source
+                            .config()
+                            .forwarding_member(topic)
+                            .is_some_and(|member| {
+                                member.mob_id == request.mob_id && member.identity == *identity
+                            })
+                })
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err(AnnouncementStoreError::TopicOwnedBySource {
+                topic: topic.clone(),
+                source_id,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Claim every topic `source` owns, refusing one another source owns. A
+/// topic the source no longer names stays its own: ownership is never
+/// released here.
+fn claim_topics(db: &Connection, source: &AnnouncementSource) -> Result<()> {
+    for (topic, kind) in source.config().owned_topics() {
+        if let Some((owner, _)) = topic_owner(db, &source.mob_id, &topic)?
+            && owner != source.source_id
+        {
+            return Err(AnnouncementStoreError::TopicOwned {
+                topic,
+                source_id: owner,
+            });
+        }
+        db.execute(
+            "INSERT INTO announcement_source_topics (mob_id, topic, source_id, kind)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(mob_id, topic) DO UPDATE SET kind = excluded.kind",
+            params![
+                source.mob_id.as_str(),
+                topic.as_str(),
+                source.source_id.as_str(),
+                kind.as_str(),
+            ],
+        )
+        .map_err(storage)?;
+    }
+    Ok(())
+}
+
+/// The refusal of a change at a revision the source has moved past.
+fn source_stale(source: &AnnouncementSource) -> AnnouncementStoreError {
+    AnnouncementStoreError::SourceStaleRevision {
+        revision: source.revision,
+        generation: source.generation,
+        cursor: source.cursor.clone(),
+    }
+}
+
+/// Refuse a source of a principal's scope another live source of the mob
+/// already reads, and a source past the live-source bounds.
+fn ensure_source_admitted(db: &Connection, source: &AnnouncementSource) -> Result<()> {
+    let taken: Option<String> = db
+        .query_row(
+            "SELECT source_id FROM announcement_sources
+             WHERE mob_id = ?1 AND identity_key = ?2 AND state != 'ended' AND source_id != ?3
+             ORDER BY source_id LIMIT 1",
+            params![
+                source.mob_id.as_str(),
+                source.identity.key()?,
+                source.source_id.as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    if let Some(taken) = taken {
+        return Err(AnnouncementStoreError::SourceIdentityTaken {
+            source_id: SourceId::new(taken)?,
+        });
+    }
+    let (in_mob, in_gateway): (i64, i64) = db
+        .query_row(
+            "SELECT COUNT(*) FILTER (WHERE mob_id = ?1), COUNT(*) FROM announcement_sources
+             WHERE state != 'ended' AND NOT (mob_id = ?1 AND source_id = ?2)",
+            params![source.mob_id.as_str(), source.source_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(storage)?;
+    if uint(in_mob)? >= u64::from(MAX_SOURCES_PER_MOB) {
+        return Err(AnnouncementStoreError::SourceLimit {
+            limit: MAX_SOURCES_PER_MOB,
+            mob_id: Some(source.mob_id.clone()),
+        });
+    }
+    if uint(in_gateway)? >= u64::from(MAX_SOURCES_PER_GATEWAY) {
+        return Err(AnnouncementStoreError::SourceLimit {
+            limit: MAX_SOURCES_PER_GATEWAY,
+            mob_id: None,
+        });
+    }
+    Ok(())
+}
+
+fn put_source_in(
+    db: &Connection,
+    operation: &OperationId,
+    request: &PutSource,
+    now_ms: u64,
+) -> Result<AnnouncementSource> {
+    let fingerprint = request_fingerprint("put_source", request)?;
+    if let Some(result) = operation_result(db, operation, &fingerprint)? {
+        return decode(&result);
+    }
+    request.config.validate()?;
+    request.config.validate_for(&request.mob_id)?;
+    let config = request.config.clone();
+    let existing = load_source(db, &request.mob_id, &request.source_id)?;
+    let source = match (existing, request.expected_revision) {
+        (None, None) => AnnouncementSource::begin(
+            request.mob_id.clone(),
+            request.source_id.clone(),
+            1,
+            1,
+            config,
+            now_ms,
+        ),
+        (None, Some(_)) => return Err(AnnouncementStoreError::UnknownSource),
+        // Declaring an ended source again starts its next generation; the
+        // revision keeps rising across generations.
+        (Some(existing), None) if existing.state == SourceState::Ended => {
+            AnnouncementSource::begin(
+                request.mob_id.clone(),
+                request.source_id.clone(),
+                existing.generation + 1,
+                existing.revision + 1,
+                config,
+                now_ms,
+            )
+        }
+        (Some(existing), None) => return Err(source_stale(&existing)),
+        (Some(existing), Some(_)) if existing.state == SourceState::Ended => {
+            return Err(AnnouncementStoreError::SourceEnded);
+        }
+        (Some(existing), Some(expected)) if existing.revision != expected => {
+            return Err(source_stale(&existing));
+        }
+        (Some(existing), Some(_)) if request.new_generation => AnnouncementSource::begin(
+            request.mob_id.clone(),
+            request.source_id.clone(),
+            existing.generation + 1,
+            existing.revision + 1,
+            config,
+            now_ms,
+        ),
+        (Some(mut existing), Some(_)) => {
+            if existing.identity != config.identity {
+                return Err(AnnouncementStoreError::IdentityImmutable);
+            }
+            existing.reconfigure(config);
+            existing.revision += 1;
+            existing.updated_at_ms = now_ms;
+            existing.refresh_status();
+            existing
+        }
+    };
+    ensure_source_admitted(db, &source)?;
+    ensure_routes_admitted(db, &source)?;
+    claim_topics(db, &source)?;
+    // A new generation onboards its streams again.
+    db.execute(
+        "DELETE FROM announcement_source_streams
+         WHERE mob_id = ?1 AND source_id = ?2 AND generation != ?3",
+        params![
+            source.mob_id.as_str(),
+            source.source_id.as_str(),
+            int(source.generation)?,
+        ],
+    )
+    .map_err(storage)?;
+    write_source(db, &source)?;
+    record_operation(db, operation, &fingerprint, now_ms, &encode(&source)?)?;
+    Ok(source)
+}
+
+#[derive(Serialize)]
+struct SourceChangeRequest<'a> {
+    mob_id: &'a MobId,
+    source_id: &'a SourceId,
+    expected_revision: u64,
+    change: SourceChange,
+}
+
+fn change_source_in(
+    db: &Connection,
+    operation: &OperationId,
+    mob_id: &MobId,
+    source_id: &SourceId,
+    expected_revision: u64,
+    change: SourceChange,
+    now_ms: u64,
+) -> Result<AnnouncementSource> {
+    let fingerprint = request_fingerprint(
+        "change_source",
+        &SourceChangeRequest {
+            mob_id,
+            source_id,
+            expected_revision,
+            change,
+        },
+    )?;
+    if let Some(result) = operation_result(db, operation, &fingerprint)? {
+        return decode(&result);
+    }
+    let mut source =
+        load_source(db, mob_id, source_id)?.ok_or(AnnouncementStoreError::UnknownSource)?;
+    if source.state == SourceState::Ended {
+        return Err(AnnouncementStoreError::SourceEnded);
+    }
+    if source.revision != expected_revision {
+        return Err(source_stale(&source));
+    }
+    let changed = match change {
+        SourceChange::Pause => {
+            let changed = source.state != SourceState::Paused;
+            source.state = SourceState::Paused;
+            changed
+        }
+        SourceChange::Resume { rebaseline } => {
+            let changed = source.state != SourceState::Active || rebaseline;
+            source.state = SourceState::Active;
+            if rebaseline {
+                source.rebaseline();
+            }
+            changed
+        }
+        SourceChange::End => {
+            source.state = SourceState::Ended;
+            true
+        }
+    };
+    if changed {
+        source.revision += 1;
+        source.updated_at_ms = now_ms;
+        source.refresh_status();
+        write_source(db, &source)?;
+    }
+    record_operation(db, operation, &fingerprint, now_ms, &encode(&source)?)?;
+    Ok(source)
+}
+
+fn sources_in(db: &Connection, query: &SourceQuery) -> Result<Vec<AnnouncementSource>> {
+    let (after_mob, after_source) = query
+        .after
+        .as_ref()
+        .map_or((None, None), |(mob_id, source_id)| {
+            (Some(mob_id.as_str()), Some(source_id.as_str()))
+        });
+    let mut statement = db
+        .prepare(
+            "SELECT record FROM announcement_sources
+             WHERE (?1 IS NULL OR mob_id = ?1)
+               AND (?2 IS NULL OR (mob_id, source_id) > (?2, ?3))
+               AND (?4 IS NULL OR state = ?4)
+             ORDER BY mob_id, source_id LIMIT ?5",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(
+            params![
+                query.mob_id.as_ref().map(MobId::as_str),
+                after_mob,
+                after_source,
+                query.state.map(SourceState::as_str),
+                page(query.limit)?,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(storage)?;
+    rows.map(|record| decode(&record.map_err(storage)?))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Advancing a source
+// ---------------------------------------------------------------------------
+
+/// One stream of a source's current generation.
+struct StreamRow {
+    phase: CollectionPhase,
+    mode: OnboardingMode,
+    max_items: Option<u32>,
+    backfilled: u32,
+    since_ms: u64,
+}
+
+fn small(value: i64) -> Result<u32> {
+    u32::try_from(value).map_err(|_| storage(format!("{value} is out of range")))
+}
+
+fn load_stream(
+    db: &Connection,
+    source: &AnnouncementSource,
+    stream: &str,
+) -> Result<Option<StreamRow>> {
+    let row: Option<(String, String, Option<i64>, i64, i64)> = db
+        .query_row(
+            "SELECT phase, mode, max_items, backfilled, since_ms FROM announcement_source_streams
+             WHERE mob_id = ?1 AND source_id = ?2 AND stream = ?3 AND generation = ?4",
+            params![
+                source.mob_id.as_str(),
+                source.source_id.as_str(),
+                stream,
+                int(source.generation)?,
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage)?;
+    row.map(|(phase, mode, max_items, backfilled, since_ms)| {
+        Ok(StreamRow {
+            phase: CollectionPhase::parse(&phase)?,
+            mode: OnboardingMode::parse(&mode)?,
+            max_items: max_items.map(small).transpose()?,
+            backfilled: small(backfilled)?,
+            since_ms: uint(since_ms)?,
+        })
+    })
+    .transpose()
+}
+
+fn write_stream(
+    db: &Connection,
+    source: &AnnouncementSource,
+    stream: &str,
+    row: &StreamRow,
+) -> Result<()> {
+    db.execute(
+        "INSERT INTO announcement_source_streams
+         (mob_id, source_id, stream, generation, phase, mode, max_items, backfilled, since_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(mob_id, source_id, stream) DO UPDATE SET generation = excluded.generation,
+           phase = excluded.phase, mode = excluded.mode, max_items = excluded.max_items,
+           backfilled = excluded.backfilled, since_ms = excluded.since_ms",
+        params![
+            source.mob_id.as_str(),
+            source.source_id.as_str(),
+            stream,
+            int(source.generation)?,
+            row.phase.as_str(),
+            row.mode.as_str(),
+            row.max_items.map(i64::from),
+            i64::from(row.backfilled),
+            int(row.since_ms)?,
+        ],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// How many of the generation's streams are live, and how many onboard.
+fn count_streams(db: &Connection, source: &AnnouncementSource) -> Result<(u32, u32)> {
+    let (live, onboarding): (i64, i64) = db
+        .query_row(
+            "SELECT COUNT(*) FILTER (WHERE phase = 'live'), COUNT(*) FILTER (WHERE phase != 'live')
+             FROM announcement_source_streams
+             WHERE mob_id = ?1 AND source_id = ?2 AND generation = ?3",
+            params![
+                source.mob_id.as_str(),
+                source.source_id.as_str(),
+                int(source.generation)?,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(storage)?;
+    Ok((small(live)?, small(onboarding)?))
+}
+
+fn source_streams_in(
+    db: &Connection,
+    mob_id: &MobId,
+    source_id: &SourceId,
+) -> Result<Vec<SourceStream>> {
+    let Some(source) = load_source(db, mob_id, source_id)? else {
+        return Ok(Vec::new());
+    };
+    let mut statement = db
+        .prepare(
+            "SELECT stream, phase, mode, max_items, backfilled, since_ms
+             FROM announcement_source_streams
+             WHERE mob_id = ?1 AND source_id = ?2 AND generation = ?3
+             ORDER BY stream",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(
+            params![
+                source.mob_id.as_str(),
+                source.source_id.as_str(),
+                int(source.generation)?,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .map_err(storage)?;
+    rows.map(|row| {
+        let (stream, phase, mode, max_items, backfilled, since_ms) = row.map_err(storage)?;
+        Ok(SourceStream {
+            stream,
+            phase: CollectionPhase::parse(&phase)?,
+            mode: OnboardingMode::parse(&mode)?,
+            max_items: max_items.map(small).transpose()?,
+            backfilled: small(backfilled)?,
+            since_ms: uint(since_ms)?,
+        })
+    })
+    .collect()
+}
+
+/// Refuse a collector's step that is not the source's current one: a
+/// paused or ended source, another revision, another principal, or another
+/// cursor version, in that order.
+fn ensure_current_step(
+    source: &AnnouncementSource,
+    expected_revision: u64,
+    principal: &Principal,
+    expected_version: u64,
+) -> Result<()> {
+    match source.state {
+        SourceState::Paused => return Err(AnnouncementStoreError::SourcePaused),
+        SourceState::Ended => return Err(AnnouncementStoreError::SourceEnded),
+        _ => {}
+    }
+    if source.revision != expected_revision {
+        return Err(source_stale(source));
+    }
+    if source.identity.principal.canonical()? != principal.canonical()? {
+        return Err(AnnouncementStoreError::PrincipalChanged {
+            pinned_digest: source.identity.principal.digest()?,
+            offered_digest: principal.digest()?,
+        });
+    }
+    if source.cursor.version != expected_version {
+        return Err(AnnouncementStoreError::SourceVersionConflict {
+            revision: source.revision,
+            state: source.state,
+            cursor: source.cursor.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// A time a gap notice names, in UTC to the second.
+fn utc(ms: u64) -> String {
+    i64::try_from(ms)
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map_or_else(
+            || format!("{ms} ms"),
+            |time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+}
+
+/// Announce the one notice a coverage gap or a rebaseline owes the
+/// source's subscribers: on its topics, under its own key, in typed words
+/// that name no adapter text but the reason's class. Returns whether it
+/// captured anything.
+/// The one notice a rebaseline or a coverage gap owes.
+struct GapNotice<'a> {
+    /// The cursor version the step commits.
+    version: u64,
+    what: &'a str,
+    reason: &'a str,
+    /// The end of the window changes may be missing from.
+    until_ms: u64,
+}
+
+fn announce_gap_notice(
+    db: &Connection,
+    source: &AnnouncementSource,
+    gap: &GapNotice<'_>,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<bool> {
+    let GapNotice {
+        version,
+        what,
+        reason,
+        until_ms,
+    } = *gap;
+    let since_ms = source
+        .health
+        .last_success_at_ms
+        .unwrap_or(source.created_at_ms);
+    let notice = AnnounceRequest {
+        mob_id: source.mob_id.clone(),
+        announced_by: Announcer::Source {
+            source_id: source.source_id.clone(),
+        },
+        source_key: SourceKey::new(format!(
+            "{SOURCE_KEY_PREFIX}{}:gap:{}:{version}",
+            source.source_id, source.generation
+        ))?,
+        topics: source.topics.clone(),
+        body: format!(
+            "Source {} {what} ({reason}): changes between {} and {} may be missing.",
+            quoted(source.source_id.as_str()),
+            utc(since_ms),
+            utc(until_ms)
+        ),
+        correlation_id: None,
+        causes: Vec::new(),
+    };
+    Ok(!announce_in(db, &notice, facts, now_ms)?
+        .captured_for
+        .is_empty())
+}
+
+fn advance_source_in(
+    db: &Connection,
+    operation: &OperationId,
+    request: &AdvanceSource,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<SourceAdvance> {
+    request.validate()?;
+    let fingerprint = request_fingerprint("advance_source", request)?;
+    if let Some(result) = operation_result(db, operation, &fingerprint)? {
+        let mut answer: SourceAdvance = decode(&result)?;
+        answer.replayed = true;
+        return Ok(answer);
+    }
+    let mut source = load_source(db, &request.mob_id, &request.source_id)?
+        .ok_or(AnnouncementStoreError::UnknownSource)?;
+    ensure_current_step(
+        &source,
+        request.expected_revision,
+        &request.principal,
+        request.expected_version,
+    )?;
+
+    // What the declaration allows.
+    for item in &request.items {
+        if let Some(topic) = item
+            .topics
+            .iter()
+            .find(|topic| !source.topics.contains(*topic))
+        {
+            return Err(AnnouncementStoreError::Invalid(format!(
+                "topic {topic} is not one of the source's own topics"
+            )));
+        }
+    }
+    if source.observation.deletions == DeletionCapability::Unobservable
+        && request
+            .items
+            .iter()
+            .any(|item| item.change == ItemChange::Delete)
+    {
+        return Err(AnnouncementStoreError::DeletionsUnobservable);
+    }
+
+    // Onboarding: the source's own phase for this step, then its streams.
+    let phase = if request.rebaseline.is_some() {
+        CollectionPhase::Baselining
+    } else {
+        source.collection
+    };
+    if phase == CollectionPhase::Baselining && !request.items.is_empty() {
+        return Err(AnnouncementStoreError::BaselineRequired);
+    }
+    let mut streams: BTreeMap<String, StreamRow> = BTreeMap::new();
+    let mut new_streams = 0usize;
+    for entry in &request.streams {
+        let row = match load_stream(db, &source, &entry.stream)? {
+            Some(row) if row.phase == CollectionPhase::Live => {
+                return Err(AnnouncementStoreError::Invalid(
+                    "an onboarded stream is live already".to_string(),
+                ));
+            }
+            Some(row) if row.mode != entry.mode || row.max_items != entry.max_items => {
+                return Err(AnnouncementStoreError::Invalid(
+                    "a stream onboards in one mode, with one bound".to_string(),
+                ));
+            }
+            Some(row) => row,
+            None => {
+                new_streams += 1;
+                StreamRow {
+                    phase: match entry.mode {
+                        OnboardingMode::Backfill => CollectionPhase::Backfilling,
+                        _ => CollectionPhase::Baselining,
+                    },
+                    mode: entry.mode,
+                    max_items: entry.max_items,
+                    backfilled: 0,
+                    since_ms: now_ms,
+                }
+            }
+        };
+        streams.insert(entry.stream.clone(), row);
+    }
+    if new_streams > 0 {
+        let (live, onboarding) = count_streams(db, &source)?;
+        if live as usize + onboarding as usize + new_streams > MAX_STREAMS_PER_SOURCE {
+            return Err(AnnouncementStoreError::TooLarge(format!(
+                "a source onboards at most {MAX_STREAMS_PER_SOURCE} streams"
+            )));
+        }
+    }
+    let mut per_stream: BTreeMap<String, u32> = BTreeMap::new();
+    for item in &request.items {
+        *per_stream.entry(item.stream.clone()).or_default() += 1;
+    }
+    let mut unbaselined = Vec::new();
+    for stream in per_stream.keys().filter(|stream| !stream.is_empty()) {
+        if !streams.contains_key(stream)
+            && let Some(row) = load_stream(db, &source, stream)?
+        {
+            streams.insert(stream.clone(), row);
+        }
+        if streams
+            .get(stream)
+            .is_none_or(|row| row.phase == CollectionPhase::Baselining)
+        {
+            unbaselined.push(stream.clone());
+        }
+    }
+    if !unbaselined.is_empty() {
+        return Err(AnnouncementStoreError::StreamNotBaselined {
+            streams: unbaselined,
+        });
+    }
+    let default_items = per_stream.get("").copied().unwrap_or(0);
+    if phase == CollectionPhase::Backfilling && default_items > 0 {
+        let remaining = source
+            .backfill_bound()
+            .unwrap_or(0)
+            .saturating_sub(source.backfilled);
+        if default_items > remaining {
+            return Err(AnnouncementStoreError::BackfillBoundExceeded {
+                remaining,
+                stream: None,
+            });
+        }
+    }
+    for (stream, count) in per_stream.iter().filter(|(stream, _)| !stream.is_empty()) {
+        if let Some(row) = streams.get(stream)
+            && row.phase == CollectionPhase::Backfilling
+        {
+            let remaining = row.max_items.unwrap_or(0).saturating_sub(row.backfilled);
+            if *count > remaining {
+                return Err(AnnouncementStoreError::BackfillBoundExceeded {
+                    remaining,
+                    stream: Some(stream.clone()),
+                });
+            }
+        }
+    }
+    let settles = request.settles();
+    let source_onboarded = settles && phase != CollectionPhase::Live;
+    if (source_onboarded || request.streams.iter().any(|entry| entry.is_final))
+        && request.coverage.is_none()
+    {
+        return Err(AnnouncementStoreError::Invalid(
+            "the final page of a baseline, a backfill or a stream onboarding says what it \
+             covered"
+                .to_string(),
+        ));
+    }
+
+    // The items, in order: announced, replayed or a recorded conflict.
+    let announcer = Announcer::Source {
+        source_id: source.source_id.clone(),
+    };
+    let mut outcomes = Vec::with_capacity(request.items.len());
+    let mut captured = false;
+    let (mut announced, mut replayed, mut conflicts) = (0u64, 0u64, 0u64);
+    for item in &request.items {
+        let key = item.key(&source.source_id, &source.identity)?;
+        let announcement = AnnounceRequest {
+            mob_id: source.mob_id.clone(),
+            announced_by: announcer.clone(),
+            source_key: key.clone(),
+            topics: item.topics.clone(),
+            body: item.body.clone(),
+            correlation_id: item.correlation_id.clone(),
+            causes: Vec::new(),
+        };
+        let mut outcome = ItemOutcome {
+            item_id: item.item_id.clone(),
+            version: item.version.clone(),
+            source_key: key.clone(),
+            outcome: ItemOutcomeKind::Announced,
+            sequence: None,
+            captured: None,
+            existing_digest: None,
+            offered_digest: None,
+        };
+        match announce_in(db, &announcement, facts, now_ms) {
+            Ok(committed) if committed.replayed => {
+                replayed += 1;
+                outcome.outcome = ItemOutcomeKind::Replayed;
+                outcome.sequence = Some(committed.announcement.sequence);
+            }
+            Ok(committed) => {
+                announced += 1;
+                captured |= !committed.captured_for.is_empty();
+                outcome.sequence = Some(committed.announcement.sequence);
+                outcome.captured =
+                    Some(u32::try_from(committed.captured_for.len()).unwrap_or(u32::MAX));
+            }
+            Err(AnnouncementStoreError::AnnouncementConflict { existing }) => {
+                conflicts += 1;
+                let offered = announcement.digest();
+                source.health.last_conflict = Some(SourceConflictRecord {
+                    source_key: key,
+                    existing_sequence: existing.sequence,
+                    existing_digest: existing.digest.clone(),
+                    offered_digest: offered.clone(),
+                    at_ms: now_ms,
+                });
+                outcome.outcome = ItemOutcomeKind::Conflict;
+                outcome.sequence = Some(existing.sequence);
+                outcome.existing_digest = Some(existing.digest);
+                outcome.offered_digest = Some(offered);
+            }
+            Err(error) => return Err(error),
+        }
+        outcomes.push(outcome);
+    }
+
+    // One gap notice for a rebaseline or a final page that cannot prove
+    // complete coverage.
+    let version = request.expected_version + 1;
+    let gap = match (&request.rebaseline, &request.coverage) {
+        (Some(rebaseline), _) => Some((
+            "is taking a fresh baseline",
+            rebaseline.reason.as_str().to_string(),
+        )),
+        (None, Some(Coverage::Gap(CoverageGap { reason }))) => {
+            Some(("could not prove complete coverage", reason.clone()))
+        }
+        _ => None,
+    };
+    if let Some((what, reason)) = gap {
+        let until_ms = request.collected_at_ms.unwrap_or(now_ms);
+        let notice = GapNotice {
+            version,
+            what,
+            reason: &reason,
+            until_ms,
+        };
+        captured |= announce_gap_notice(db, &source, &notice, facts, now_ms)?;
+        source.health.totals.gaps += 1;
+    }
+
+    // The cursor, the phases and the health.
+    source.cursor.version = version;
+    source.cursor.token.clone_from(&request.next_cursor);
+    source.cursor.advanced_at_ms = Some(now_ms);
+    if request.rebaseline.is_some() {
+        source.collection = CollectionPhase::Baselining;
+    }
+    if phase == CollectionPhase::Backfilling {
+        source.backfilled = source.backfilled.saturating_add(default_items);
+    }
+    if source_onboarded {
+        source.collection = CollectionPhase::Live;
+    }
+    for (stream, count) in &per_stream {
+        if let Some(row) = streams.get_mut(stream)
+            && row.phase == CollectionPhase::Backfilling
+        {
+            row.backfilled = row.backfilled.saturating_add(*count);
+        }
+    }
+    let mut phases = Vec::with_capacity(request.streams.len());
+    for entry in &request.streams {
+        if let Some(row) = streams.get_mut(&entry.stream) {
+            if entry.is_final && row.phase != CollectionPhase::Live {
+                row.phase = CollectionPhase::Live;
+                row.since_ms = now_ms;
+            }
+            phases.push(StreamPhase {
+                stream: entry.stream.clone(),
+                phase: row.phase,
+            });
+        }
+    }
+    for (stream, row) in &streams {
+        write_stream(db, &source, stream, row)?;
+    }
+    let (live, onboarding) = count_streams(db, &source)?;
+    source.streams.live = live;
+    source.streams.onboarding = onboarding;
+    let health = &mut source.health;
+    health.consecutive_failures = 0;
+    if settles {
+        health.last_success_at_ms = Some(now_ms);
+    }
+    health.totals.announced += announced;
+    health.totals.replayed += replayed;
+    health.totals.conflicts += conflicts;
+    if announced > 0 {
+        health.last_new_item_at_ms = Some(now_ms);
+    }
+    health.observe(request.observed, now_ms);
+    source.updated_at_ms = now_ms;
+    source.refresh_status();
+    write_source(db, &source)?;
+    let answer = SourceAdvance {
+        source,
+        replayed: false,
+        items: outcomes,
+        streams: phases,
+        captured,
+    };
+    record_operation(db, operation, &fingerprint, now_ms, &encode(&answer)?)?;
+    super::faults::inside_source_advance();
+    Ok(answer)
+}
+
+/// Count an onboarding refusal of an advance toward its source's failure
+/// streak, in a transaction of its own, unless the source moved since.
+fn count_refusal_in(
+    db: &Connection,
+    request: &AdvanceSource,
+    kind: &str,
+    now_ms: u64,
+) -> Result<()> {
+    let Some(mut source) = load_source(db, &request.mob_id, &request.source_id)? else {
+        return Ok(());
+    };
+    if source.state != SourceState::Active
+        || source.revision != request.expected_revision
+        || source.cursor.version != request.expected_version
+    {
+        return Ok(());
+    }
+    let health = &mut source.health;
+    health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+    health.totals.refusals += 1;
+    health.last_failure = Some(SourceFailureRecord {
+        class: format!("refused:{kind}"),
+        at_ms: now_ms,
+        retry_after_ms: None,
+        detail: None,
+    });
+    source.refresh_status();
+    write_source(db, &source)
+}
+
+fn record_failure_in(
+    db: &Connection,
+    operation: &OperationId,
+    request: &RecordSourceFailure,
+    now_ms: u64,
+) -> Result<AnnouncementSource> {
+    request.validate()?;
+    let fingerprint = request_fingerprint("record_source_failure", request)?;
+    if let Some(result) = operation_result(db, operation, &fingerprint)? {
+        return decode(&result);
+    }
+    let mut source = load_source(db, &request.mob_id, &request.source_id)?
+        .ok_or(AnnouncementStoreError::UnknownSource)?;
+    ensure_current_step(
+        &source,
+        request.expected_revision,
+        &request.principal,
+        request.expected_version,
+    )?;
+    let health = &mut source.health;
+    health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+    health.last_failure = Some(SourceFailureRecord {
+        class: request.failure.class.as_str().to_string(),
+        at_ms: now_ms,
+        retry_after_ms: request.failure.retry_after_ms,
+        detail: request.failure.detail.clone(),
+    });
+    source.refresh_status();
+    write_source(db, &source)?;
+    record_operation(db, operation, &fingerprint, now_ms, &encode(&source)?)?;
+    Ok(source)
+}
+
+// ---------------------------------------------------------------------------
+// Who may receive a source's items
+// ---------------------------------------------------------------------------
+
+/// The source owning a topic: its id, its current generation and its
+/// declaration.
+struct OwnedTopic {
+    source_id: SourceId,
+    generation: u64,
+    config: SourceConfig,
+}
+
+/// The sources owning any of `topics` in `mob_id`, by topic.
+fn topic_sources(
+    db: &Connection,
+    mob_id: &MobId,
+    topics: &BTreeSet<Topic>,
+) -> Result<BTreeMap<Topic, OwnedTopic>> {
+    let mut owners = BTreeMap::new();
+    let mut loaded: BTreeMap<SourceId, (u64, SourceConfig)> = BTreeMap::new();
+    for topic in topics {
+        let Some((source_id, _)) = topic_owner(db, mob_id, topic)? else {
+            continue;
+        };
+        if !loaded.contains_key(&source_id) {
+            let Some(source) = load_source(db, mob_id, &source_id)? else {
+                return Err(storage(format!(
+                    "topic {topic} is owned by a source the store does not hold"
+                )));
+            };
+            loaded.insert(source_id.clone(), (source.generation, source.config()));
+        }
+        if let Some((generation, config)) = loaded.get(&source_id) {
+            owners.insert(
+                topic.clone(),
+                OwnedTopic {
+                    source_id,
+                    generation: *generation,
+                    config: config.clone(),
+                },
+            );
+        }
+    }
+    Ok(owners)
+}
+
+/// Why `subscription` may not capture an announcement on `topics`, if it
+/// may not: the reason, and the source that withholds it. A topic no source
+/// owns lets it capture. A topic a source owns lets it capture only when the
+/// member owns no live conversation on the source's scope, the topic's
+/// audience covers it as the roster facts the owner read say (a member those
+/// facts do not name is covered by a member grant alone), and, for one of
+/// the source's own topics, a direct route names the topic or the member
+/// triages it. Routes bind every subscriber, one from before a route change
+/// too.
+fn withholding<'a>(
+    owners: &'a BTreeMap<Topic, OwnedTopic>,
+    subscription: &Subscription,
+    topics: &BTreeSet<Topic>,
+    facts: &RosterFacts,
+) -> Option<(AuditReason, &'a OwnedTopic)> {
+    let member = &subscription.member;
+    let mut refusal = None;
+    for topic in subscription.selector.topics.intersection(topics) {
+        // A topic no source owns lets the subscription capture.
+        let owned = owners.get(topic)?;
+        let config = &owned.config;
+        let reason = if config.conversation_members.contains(member) {
+            AuditReason::RouteConflict
+        } else if !config
+            .audience_of(topic)
+            .is_some_and(|audience| covers(audience, member, facts.get(member)))
+        {
+            AuditReason::AudienceNotCovered
+        } else if config.topics.contains(topic)
+            && !config.directly_routes(topic)
+            && !config.triages(member, topic)
+        {
+            AuditReason::NoDirectRoute
+        } else {
+            return None;
+        };
+        refusal.get_or_insert((reason, owned));
+    }
+    refusal
+}
+
+/// What one counted audit entry is about. Every refusal or withholding with
+/// the same key counts on the same entry.
+#[derive(Serialize, serde::Deserialize)]
+struct AuditKey {
+    mob_id: MobId,
+    source_id: SourceId,
+    generation: u64,
+    member: Member,
+    action: AuditAction,
+    reason: AuditReason,
+}
+
+/// Count one refusal or withholding on its entry: the first makes the entry,
+/// and each later one adds to its count and moves its last time.
+fn count_audit(db: &Connection, key: &AuditKey, now_ms: u64) -> Result<()> {
+    db.execute(
+        "INSERT INTO announcement_audit (mob_id, source_id, generation, member, action,
+           reason, count, first_at_ms, last_at_ms, record)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?8)
+         ON CONFLICT (mob_id, source_id, generation, member, action, reason) DO UPDATE SET
+           count = count + 1, last_at_ms = MAX(last_at_ms, excluded.last_at_ms)",
+        params![
+            key.mob_id.as_str(),
+            key.source_id.as_str(),
+            int(key.generation)?,
+            key.member.key(),
+            key.action.as_str(),
+            key.reason.as_str(),
+            int(now_ms)?,
+            encode(key)?,
+        ],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+fn audit_in(db: &Connection, query: &AuditQuery) -> Result<Vec<AuditRow>> {
+    let member = query.member.as_ref().map(Member::key);
+    let mut statement = db
+        .prepare(
+            "SELECT id, count, first_at_ms, last_at_ms, record FROM announcement_audit
+             WHERE (?1 IS NULL OR mob_id = ?1) AND (?2 IS NULL OR source_id = ?2)
+               AND (?3 IS NULL OR member = ?3) AND (?4 IS NULL OR action = ?4) AND id > ?5
+             ORDER BY id LIMIT ?6",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(
+            params![
+                query.mob_id.as_ref().map(MobId::as_str),
+                query.source_id.as_ref().map(SourceId::as_str),
+                member,
+                query.action.map(AuditAction::as_str),
+                int(query.after.unwrap_or(0))?,
+                page(query.limit)?,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(storage)?;
+    rows.map(|row| {
+        let (id, count, first_at_ms, last_at_ms, record) = row.map_err(storage)?;
+        let key: AuditKey = decode(&record)?;
+        let last_at_ms = uint(last_at_ms)?;
+        Ok(AuditRow {
+            id: uint(id)?,
+            at_ms: last_at_ms,
+            action: key.action,
+            mob_id: key.mob_id,
+            source_id: key.source_id,
+            generation: key.generation,
+            member: key.member,
+            reason: key.reason,
+            count: uint(count)?,
+            first_at_ms: uint(first_at_ms)?,
+            last_at_ms,
+        })
+    })
+    .collect()
+}
+
+/// Why an owed item may not reach its member now: the reason, and the
+/// source and generation that refuse it.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct OwedRefusal {
+    reason: AuditReason,
+    source_id: SourceId,
+    generation: u64,
+}
+
+/// The check of capture, made again for an owed item: whether
+/// `subscription`'s member may still receive `announcement`, as the roster
+/// facts the owner read say. An item on no source's topic always may.
+fn owed_refusal(
+    db: &Connection,
+    subscription: &Subscription,
+    announcement: &Announcement,
+    facts: &RosterFacts,
+) -> Result<Option<OwedRefusal>> {
+    let owners = topic_sources(db, &announcement.mob_id, &announcement.topics)?;
+    Ok(
+        withholding(&owners, subscription, &announcement.topics, facts).map(|(reason, owned)| {
+            OwedRefusal {
+                reason,
+                source_id: owned.source_id.clone(),
+                generation: owned.generation,
+            }
+        }),
+    )
+}
+
+/// Hold an owed item: it stays owed, no batch takes it, and the hold is
+/// counted in the audit.
+fn hold_owed(
+    db: &Connection,
+    subscription_id: &SubscriptionId,
+    key: &(MobId, u64),
+    member: &Member,
+    refusal: &OwedRefusal,
+    now_ms: u64,
+) -> Result<()> {
+    db.execute(
+        "INSERT OR REPLACE INTO announcement_holds
+           (subscription_id, mob_id, sequence, member, source_id, generation, held_at_ms,
+            checked_at_ms, record)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+        params![
+            subscription_id.as_str(),
+            key.0.as_str(),
+            int(key.1)?,
+            member.key(),
+            refusal.source_id.as_str(),
+            int(refusal.generation)?,
+            int(now_ms)?,
+            encode(refusal)?,
+        ],
+    )
+    .map_err(storage)?;
+    count_audit(
+        db,
+        &AuditKey {
+            mob_id: key.0.clone(),
+            source_id: refusal.source_id.clone(),
+            generation: refusal.generation,
+            member: member.clone(),
+            action: AuditAction::ItemsHeld,
+            reason: refusal.reason,
+        },
+        now_ms,
+    )
+}
+
+/// The held items the next check reads: open, on an active subscription,
+/// and held by their source's current generation (a new generation
+/// inherits nothing held, so an earlier generation's holds wait out
+/// retention and never stand in front of these).
+const CHECKABLE_HOLDS: &str = "FROM announcement_holds h
+     JOIN owed_announcements o ON o.subscription_id = h.subscription_id
+      AND o.mob_id = h.mob_id AND o.sequence = h.sequence
+     JOIN member_subscriptions s ON s.id = h.subscription_id
+     JOIN announcement_sources src ON src.mob_id = h.mob_id AND src.source_id = h.source_id
+      AND src.generation = h.generation
+     WHERE o.settlement IS NULL AND o.batch_id IS NULL AND s.state = 'active'";
+
+/// Check the member's held items afresh, the ones checked longest ago first
+/// and at most `limit`: one that now passes is released and counted; one
+/// that still fails is stamped checked, so every hold is reached within a
+/// few checks however many stand in front of it.
+fn release_holds(
+    db: &Connection,
+    member: &Member,
+    limit: u32,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<()> {
+    let mut statement = db
+        .prepare(&format!(
+            "SELECT h.subscription_id, h.mob_id, h.sequence, h.record {CHECKABLE_HOLDS}
+               AND h.member = ?1
+             ORDER BY h.checked_at_ms, h.held_at_ms, h.mob_id, h.sequence, h.subscription_id
+             LIMIT ?2"
+        ))
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![member.key(), i64::from(limit)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(storage)?;
+    let mut held = Vec::new();
+    for row in rows {
+        held.push(row.map_err(storage)?);
+    }
+    drop(statement);
+    for (subscription_id, mob_id, sequence, record) in held {
+        let subscription_id = SubscriptionId::new(subscription_id)?;
+        let key = (MobId::new(mob_id)?, uint(sequence)?);
+        let refusal: OwedRefusal = decode(&record)?;
+        let Some(subscription) = load_subscription(db, &subscription_id)? else {
+            continue;
+        };
+        let announcement = announcement_at(db, &key.0, key.1)?;
+        if owed_refusal(db, &subscription, &announcement, facts)?.is_some() {
+            db.execute(
+                "UPDATE announcement_holds SET checked_at_ms = ?4
+                 WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3",
+                params![
+                    subscription_id.as_str(),
+                    key.0.as_str(),
+                    int(key.1)?,
+                    int(now_ms)?
+                ],
+            )
+            .map_err(storage)?;
+            continue;
+        }
+        db.execute(
+            "DELETE FROM announcement_holds
+             WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3",
+            params![subscription_id.as_str(), key.0.as_str(), int(key.1)?],
+        )
+        .map_err(storage)?;
+        count_audit(
+            db,
+            &AuditKey {
+                mob_id: key.0,
+                source_id: refusal.source_id,
+                generation: refusal.generation,
+                member: member.clone(),
+                action: AuditAction::ItemsReleased,
+                reason: refusal.reason,
+            },
+            now_ms,
+        )?;
+    }
+    Ok(())
+}
+
+/// Members whose held items are due a fresh check (see [`CHECKABLE_HOLDS`]):
+/// one last checked at or before `checked_before_ms`, the member whose
+/// oldest check is oldest first, so a member whose check keeps failing
+/// takes one place of a page and never the page.
+fn members_with_holds_due_in(
+    db: &Connection,
+    checked_before_ms: u64,
+    limit: usize,
+) -> Result<Vec<Member>> {
+    let mut statement = db
+        .prepare(&format!(
+            "SELECT h.member, MIN(h.checked_at_ms) AS checked {CHECKABLE_HOLDS}
+               AND h.checked_at_ms <= ?1
+             GROUP BY h.member ORDER BY checked, h.member LIMIT ?2"
+        ))
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![int(checked_before_ms)?, page(limit)?], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(storage)?;
+    rows.map(|member| Member::from_key(&member.map_err(storage)?))
+        .collect()
+}
+
+/// The last check before a submission of batch `id`, in state `expected`
+/// (sealed, or submitting after an answer that nothing was committed):
+/// every item is checked again. When one fails and `may_cancel`, the batch
+/// is cancelled, its failing items are held, the rest reopen for the
+/// member's next batch, and its gap lines go to that batch. Without
+/// `may_cancel` nothing changes.
+fn check_before_submission_in(
+    db: &Connection,
+    id: &BatchId,
+    expected: BatchStateTag,
+    facts: &RosterFacts,
+    may_cancel: bool,
+    now_ms: u64,
+) -> Result<SubmissionCheck> {
+    let mut batch = load_batch(db, id)?.ok_or(AnnouncementStoreError::UnknownBatch)?;
+    let current = batch.state.tag();
+    if current != expected {
+        return Err(AnnouncementStoreError::BatchMoved { current });
+    }
+    let event = match expected {
+        BatchStateTag::Sealed => BatchEvent::Cancel,
+        BatchStateTag::Submitting => BatchEvent::CancelNotCommitted,
+        other => {
+            return Err(AnnouncementStoreError::Invalid(format!(
+                "a {} batch has no check before a submission",
+                other.as_str()
+            )));
+        }
+    };
+    let mut failing = Vec::new();
+    for item in &batch.items {
+        let Some(subscription) = load_subscription(db, &item.subscription_id)? else {
+            continue;
+        };
+        let announcement = announcement_at(db, &item.mob_id, item.sequence)?;
+        if let Some(refusal) = owed_refusal(db, &subscription, &announcement, facts)? {
+            failing.push((
+                item.subscription_id.clone(),
+                (item.mob_id.clone(), item.sequence),
+                refusal,
+            ));
+        }
+    }
+    if failing.is_empty() {
+        return Ok(SubmissionCheck::Passed);
+    }
+    if !may_cancel {
+        return Ok(SubmissionCheck::Failed);
+    }
+    let next = batch.state.apply(&event)?;
+    // The batch reports nothing: its gap lines go to the member's next one.
+    add_gaps(db, &batch.member, &batch.gaps)?;
+    db.execute(
+        "UPDATE owed_announcements SET batch_id = NULL
+         WHERE batch_id = ?1 AND settlement IS NULL",
+        params![batch.id.as_str()],
+    )
+    .map_err(storage)?;
+    for (subscription_id, key, refusal) in &failing {
+        hold_owed(db, subscription_id, key, &batch.member, refusal, now_ms)?;
+    }
+    batch.state = next;
+    batch.updated_at_ms = now_ms;
+    update_batch(db, &batch)?;
+    Ok(SubmissionCheck::Cancelled(Box::new(batch)))
+}
+
+/// Count each item of the admitted batch `id` its member no longer passes:
+/// it reached the member across a revocation.
+fn audit_delivered_across_in(
+    db: &Connection,
+    id: &BatchId,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<()> {
+    let batch = load_batch(db, id)?.ok_or(AnnouncementStoreError::UnknownBatch)?;
+    for item in &batch.items {
+        let Some(subscription) = load_subscription(db, &item.subscription_id)? else {
+            continue;
+        };
+        let announcement = announcement_at(db, &item.mob_id, item.sequence)?;
+        if let Some(refusal) = owed_refusal(db, &subscription, &announcement, facts)? {
+            count_audit(
+                db,
+                &AuditKey {
+                    mob_id: item.mob_id.clone(),
+                    source_id: refusal.source_id,
+                    generation: refusal.generation,
+                    member: batch.member.clone(),
+                    action: AuditAction::DeliveredAcrossRevocation,
+                    reason: refusal.reason,
+                },
+                now_ms,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The roster facts of one member, as a store check reads them.
+fn facts_of(member: &Member, facts: Option<MemberFacts>) -> RosterFacts {
+    let mut roster = RosterFacts::default();
+    if let Some(found) = facts {
+        roster.insert(member.clone(), found);
+    }
+    roster
+}
+
+/// A subscription a source's audience or routes refused: the refusal, and
+/// the source, generation and reason its audit entry counts under.
+struct SubscriptionRefusal {
+    error: AnnouncementStoreError,
+    mob_id: MobId,
+    source_id: SourceId,
+    generation: u64,
+    reason: AuditReason,
+}
+
+/// The member's live subscriptions.
+fn member_live_subscriptions(db: &Connection, member: &Member) -> Result<Vec<Subscription>> {
+    let mut statement = db
+        .prepare(
+            "SELECT record FROM member_subscriptions
+             WHERE member = ?1 AND state IN ('active', 'paused')",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![member.key()], |row| row.get::<_, String>(0))
+        .map_err(storage)?;
+    rows.map(|record| decode(&record.map_err(storage)?))
+        .collect()
+}
+
+/// Whether subscriptions with these selectors reach `config`'s source in
+/// `mob_id` directly (one of its own topics) and through a forward (one of
+/// its forward topics).
+fn reaches<'a>(
+    config: &SourceConfig,
+    mob_id: &MobId,
+    selectors: impl Iterator<Item = &'a Selector>,
+) -> (bool, bool) {
+    let forwards: BTreeSet<Topic> = config
+        .owned_topics()
+        .into_iter()
+        .filter(|(_, kind)| *kind == TopicOwnership::Forward)
+        .map(|(topic, _)| topic)
+        .collect();
+    let (mut direct, mut forward) = (false, false);
+    for selector in selectors.filter(|selector| selector.mobs.contains(mob_id)) {
+        direct |= !selector.topics.is_disjoint(&config.topics);
+        forward |= !selector.topics.is_disjoint(&forwards);
+    }
+    (direct, forward)
+}
+
+/// The refusal of a subscription a source's audience or routes do not
+/// admit, if they do not: for every topic it selects that a source owns, the
+/// member must own no live conversation on the source's scope, the topic's
+/// audience must cover it, a source topic must have a direct route unless
+/// the member triages it, and with its other live subscriptions the member
+/// must not reach the source both directly and through a forward.
+fn ensure_subscription_admitted(
+    db: &Connection,
+    request: &PutSubscription,
+    facts: Option<&MemberFacts>,
+) -> Result<Option<SubscriptionRefusal>> {
+    let member = &request.member;
+    let mut sources: BTreeMap<(MobId, SourceId), OwnedTopic> = BTreeMap::new();
+    for mob_id in &request.selector.mobs {
+        for (topic, owned) in topic_sources(db, mob_id, &request.selector.topics)? {
+            let config = &owned.config;
+            let refused = if config.conversation_members.contains(member) {
+                Some((
+                    AuditReason::RouteConflict,
+                    AnnouncementStoreError::ConversationMember {
+                        source_id: owned.source_id.clone(),
+                    },
+                ))
+            } else if !config
+                .audience_of(&topic)
+                .is_some_and(|audience| covers(audience, member, facts))
+            {
+                Some((
+                    AuditReason::AudienceNotCovered,
+                    AnnouncementStoreError::AudienceNotCovered {
+                        source_id: owned.source_id.clone(),
+                        topic: topic.clone(),
+                    },
+                ))
+            } else if config.topics.contains(&topic)
+                && !config.directly_routes(&topic)
+                && !config.triages(member, &topic)
+            {
+                Some((
+                    AuditReason::NoDirectRoute,
+                    AnnouncementStoreError::NoDirectRoute {
+                        source_id: owned.source_id.clone(),
+                        topic: topic.clone(),
+                    },
+                ))
+            } else {
+                None
+            };
+            if let Some((reason, error)) = refused {
+                return Ok(Some(SubscriptionRefusal {
+                    error,
+                    mob_id: mob_id.clone(),
+                    source_id: owned.source_id,
+                    generation: owned.generation,
+                    reason,
+                }));
+            }
+            sources.insert((mob_id.clone(), owned.source_id.clone()), owned);
+        }
+    }
+    if sources.is_empty() {
+        return Ok(None);
+    }
+    let others = member_live_subscriptions(db, member)?;
+    for ((mob_id, source_id), owned) in sources {
+        let selectors = std::iter::once(&request.selector).chain(
+            others
+                .iter()
+                .filter(|other| other.id != request.id)
+                .map(|other| &other.selector),
+        );
+        if reaches(&owned.config, &mob_id, selectors) == (true, true) {
+            return Ok(Some(SubscriptionRefusal {
+                error: AnnouncementStoreError::RouteOverlap {
+                    source_id: source_id.clone(),
+                    member: member.clone(),
+                },
+                mob_id,
+                source_id,
+                generation: owned.generation,
+                reason: AuditReason::RouteOverlap,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Put a subscription the sources' audiences and routes admit. A refusal
+/// comes back inside, with what its audit entry counts under, and leaves
+/// the store unchanged.
+fn put_subscription_admitted_in(
+    db: &Connection,
+    operation: &OperationId,
+    request: &PutSubscription,
+    facts: Option<&MemberFacts>,
+    now_ms: u64,
+) -> Result<std::result::Result<Subscription, SubscriptionRefusal>> {
+    // A replay of a committed put answers its original.
+    let fingerprint = request_fingerprint("put_subscription", request)?;
+    if let Some(result) = operation_result(db, operation, &fingerprint)? {
+        return Ok(Ok(decode(&result)?));
+    }
+    if let Some(refusal) = ensure_subscription_admitted(db, request, facts)? {
+        return Ok(Err(refusal));
+    }
+    Ok(Ok(put_subscription_in(db, operation, request, now_ms)?))
+}
+
+/// Refuse a declaration under which an existing live subscriber would reach
+/// the source both directly and through a forward.
+fn ensure_routes_admitted(db: &Connection, source: &AnnouncementSource) -> Result<()> {
+    let config = source.config();
+    let owned: BTreeSet<Topic> = config
+        .owned_topics()
+        .into_iter()
+        .map(|(topic, _)| topic)
+        .collect();
+    let mut by_member: BTreeMap<Member, Vec<Subscription>> = BTreeMap::new();
+    for subscription in subscriptions_for_topics(db, &owned)?.into_values() {
+        if subscription.selector.mobs.contains(&source.mob_id) {
+            by_member
+                .entry(subscription.member.clone())
+                .or_default()
+                .push(subscription);
+        }
+    }
+    for (member, subscriptions) in by_member {
+        let selectors = subscriptions
+            .iter()
+            .map(|subscription| &subscription.selector);
+        if reaches(&config, &source.mob_id, selectors) == (true, true) {
+            return Err(AnnouncementStoreError::RouteOverlap {
+                source_id: source.source_id.clone(),
+                member,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The topics `source_id` owns in `mob_id`.
+fn source_topics(db: &Connection, mob_id: &MobId, source_id: &SourceId) -> Result<BTreeSet<Topic>> {
+    let mut statement = db
+        .prepare(
+            "SELECT topic FROM announcement_source_topics WHERE mob_id = ?1 AND source_id = ?2",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![mob_id.as_str(), source_id.as_str()], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(storage)?;
+    rows.map(|topic| Topic::new(topic.map_err(storage)?))
+        .collect()
+}
+
+/// The members whose live subscriptions take any of `topics` a source owns
+/// in `mob_id`: the members whose roster facts a capture there needs.
+fn owned_topic_subscribers_in(
+    db: &Connection,
+    mob_id: &MobId,
+    topics: &BTreeSet<Topic>,
+) -> Result<BTreeSet<Member>> {
+    let mut owned = BTreeSet::new();
+    for topic in topics {
+        if topic_owner(db, mob_id, topic)?.is_some() {
+            owned.insert(topic.clone());
+        }
+    }
+    if owned.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    Ok(subscriptions_for_topics(db, &owned)?
+        .into_values()
+        .filter(|subscription| subscription.selector.mobs.contains(mob_id))
+        .map(|subscription| subscription.member)
+        .collect())
 }
 
 #[async_trait]
 impl AnnouncementStore for SqliteAnnouncementStore {
     async fn announce(&self, request: AnnounceRequest, now_ms: u64) -> Result<AnnounceOutcome> {
-        self.run(move |db| announce_in(db, &request, now_ms)).await
+        self.announce_with_facts(request, &RosterFacts::default(), now_ms)
+            .await
+    }
+
+    async fn announce_with_facts(
+        &self,
+        request: AnnounceRequest,
+        facts: &RosterFacts,
+        now_ms: u64,
+    ) -> Result<AnnounceOutcome> {
+        let facts = facts.clone();
+        self.run(move |db| announce_in(db, &request, &facts, now_ms))
+            .await
     }
 
     async fn announcement(
@@ -2163,9 +4064,44 @@ impl AnnouncementStore for SqliteAnnouncementStore {
         request: PutSubscription,
         now_ms: u64,
     ) -> Result<Subscription> {
-        let operation = operation.clone();
-        self.run(move |db| put_subscription_in(db, &operation, &request, now_ms))
+        self.put_subscription_with_facts(operation, request, None, now_ms)
             .await
+    }
+
+    async fn put_subscription_with_facts(
+        &self,
+        operation: &OperationId,
+        request: PutSubscription,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<Subscription> {
+        let request = Arc::new(request);
+        let put = {
+            let (operation, request) = (operation.clone(), Arc::clone(&request));
+            move |db: &Connection| {
+                put_subscription_admitted_in(db, &operation, &request, facts.as_ref(), now_ms)
+            }
+        };
+        let refusal = match self.run(put).await? {
+            Ok(subscription) => return Ok(subscription),
+            Err(refusal) => refusal,
+        };
+        // A refusal leaves the store unchanged, then is counted on its own.
+        let key = AuditKey {
+            mob_id: refusal.mob_id,
+            source_id: refusal.source_id,
+            generation: refusal.generation,
+            member: request.member.clone(),
+            action: AuditAction::SubscriptionRefused,
+            reason: refusal.reason,
+        };
+        if let Err(audit_error) = self.run(move |db| count_audit(db, &key, now_ms)).await {
+            tracing::warn!(
+                error = %audit_error,
+                "a refused subscription could not be audited"
+            );
+        }
+        Err(refusal.error)
     }
 
     async fn change_subscription(
@@ -2310,9 +4246,80 @@ impl AnnouncementStore for SqliteAnnouncementStore {
         policy: &SealingPolicy,
         now_ms: u64,
     ) -> Result<Option<Batch>> {
-        let (member, batch_id, policy) = (member.clone(), batch_id.clone(), *policy);
-        self.run(move |db| seal_batch_in(db, &member, &batch_id, &policy, now_ms))
+        self.seal_batch_with_facts(member, batch_id, policy, None, now_ms)
             .await
+    }
+
+    async fn seal_batch_with_facts(
+        &self,
+        member: &Member,
+        batch_id: &BatchId,
+        policy: &SealingPolicy,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<Option<Batch>> {
+        let (member, batch_id, policy) = (member.clone(), batch_id.clone(), *policy);
+        let facts = facts_of(&member, facts);
+        self.run(move |db| seal_batch_in(db, &member, &batch_id, &policy, &facts, now_ms))
+            .await
+    }
+
+    async fn check_before_submission(
+        &self,
+        id: &BatchId,
+        expected: BatchStateTag,
+        facts: Option<MemberFacts>,
+        may_cancel: bool,
+        now_ms: u64,
+    ) -> Result<SubmissionCheck> {
+        let id = id.clone();
+        self.run(move |db| {
+            let member = load_batch(db, &id)?
+                .ok_or(AnnouncementStoreError::UnknownBatch)?
+                .member;
+            let facts = facts_of(&member, facts);
+            check_before_submission_in(db, &id, expected, &facts, may_cancel, now_ms)
+        })
+        .await
+    }
+
+    async fn members_with_holds_due(
+        &self,
+        checked_before_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<Member>> {
+        self.run(move |db| members_with_holds_due_in(db, checked_before_ms, limit))
+            .await
+    }
+
+    async fn release_holds(
+        &self,
+        member: &Member,
+        facts: Option<MemberFacts>,
+        limit: u32,
+        now_ms: u64,
+    ) -> Result<()> {
+        let member = member.clone();
+        let facts = facts_of(&member, facts);
+        self.run(move |db| release_holds(db, &member, limit, &facts, now_ms))
+            .await
+    }
+
+    async fn audit_delivered_across_revocation(
+        &self,
+        id: &BatchId,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<()> {
+        let id = id.clone();
+        self.run(move |db| {
+            let member = load_batch(db, &id)?
+                .ok_or(AnnouncementStoreError::UnknownBatch)?
+                .member;
+            let facts = facts_of(&member, facts);
+            audit_delivered_across_in(db, &id, &facts, now_ms)
+        })
+        .await
     }
 
     async fn batch(&self, id: &BatchId) -> Result<Option<Batch>> {
@@ -2483,5 +4490,146 @@ impl AnnouncementStore for SqliteAnnouncementStore {
     async fn prune(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<PruneReport> {
         self.run(move |db| prune_in(db, now_ms, retention_ms, limit))
             .await
+    }
+
+    async fn put_source(
+        &self,
+        operation: &OperationId,
+        request: PutSource,
+        now_ms: u64,
+    ) -> Result<AnnouncementSource> {
+        let operation = operation.clone();
+        self.run(move |db| put_source_in(db, &operation, &request, now_ms))
+            .await
+    }
+
+    async fn change_source(
+        &self,
+        operation: &OperationId,
+        mob_id: &MobId,
+        source_id: &SourceId,
+        expected_revision: u64,
+        change: SourceChange,
+        now_ms: u64,
+    ) -> Result<AnnouncementSource> {
+        let (operation, mob_id, source_id) = (operation.clone(), mob_id.clone(), source_id.clone());
+        self.run(move |db| {
+            change_source_in(
+                db,
+                &operation,
+                &mob_id,
+                &source_id,
+                expected_revision,
+                change,
+                now_ms,
+            )
+        })
+        .await
+    }
+
+    async fn advance_source(
+        &self,
+        operation: &OperationId,
+        request: AdvanceSource,
+        now_ms: u64,
+    ) -> Result<SourceAdvance> {
+        self.advance_source_with_facts(operation, request, &RosterFacts::default(), now_ms)
+            .await
+    }
+
+    async fn advance_source_with_facts(
+        &self,
+        operation: &OperationId,
+        request: AdvanceSource,
+        facts: &RosterFacts,
+        now_ms: u64,
+    ) -> Result<SourceAdvance> {
+        let request = Arc::new(request);
+        let step = {
+            let (operation, request, facts) =
+                (operation.clone(), Arc::clone(&request), facts.clone());
+            move |db: &Connection| advance_source_in(db, &operation, &request, &facts, now_ms)
+        };
+        let result = self.run(step).await;
+        // An onboarding refusal leaves the source unchanged, then counts
+        // toward its failure streak on its own. A failure to count it never
+        // replaces the refusal the caller is owed.
+        if let Err(error) = &result
+            && let Some(kind) = error.onboarding_refusal()
+            && let Err(count_error) = self
+                .run(move |db| count_refusal_in(db, &request, kind, now_ms))
+                .await
+        {
+            tracing::warn!(
+                refusal = kind,
+                error = %count_error,
+                "an onboarding refusal of a source advance could not be counted"
+            );
+        }
+        result
+    }
+
+    async fn owned_topic_subscribers(
+        &self,
+        mob_id: &MobId,
+        topics: &BTreeSet<Topic>,
+    ) -> Result<BTreeSet<Member>> {
+        let (mob_id, topics) = (mob_id.clone(), topics.clone());
+        self.run(move |db| owned_topic_subscribers_in(db, &mob_id, &topics))
+            .await
+    }
+
+    async fn source_subscribers(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<BTreeSet<Member>> {
+        let (mob_id, source_id) = (mob_id.clone(), source_id.clone());
+        self.run(move |db| {
+            let topics = source_topics(db, &mob_id, &source_id)?;
+            owned_topic_subscribers_in(db, &mob_id, &topics)
+        })
+        .await
+    }
+
+    async fn audit(&self, query: &AuditQuery) -> Result<Vec<AuditRow>> {
+        let query = query.clone();
+        self.run(move |db| audit_in(db, &query)).await
+    }
+
+    async fn record_source_failure(
+        &self,
+        operation: &OperationId,
+        request: RecordSourceFailure,
+        now_ms: u64,
+    ) -> Result<AnnouncementSource> {
+        let operation = operation.clone();
+        self.run(move |db| record_failure_in(db, &operation, &request, now_ms))
+            .await
+    }
+
+    async fn source_streams(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<Vec<SourceStream>> {
+        let (mob_id, source_id) = (mob_id.clone(), source_id.clone());
+        self.run(move |db| source_streams_in(db, &mob_id, &source_id))
+            .await
+    }
+
+    async fn source(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<Option<AnnouncementSource>> {
+        let (mob_id, source_id) = (mob_id.clone(), source_id.clone());
+        self.run(move |db| load_source(db, &mob_id, &source_id))
+            .await
+    }
+
+    async fn sources(&self, query: &SourceQuery) -> Result<Vec<AnnouncementSource>> {
+        let query = query.clone();
+        self.run(move |db| sources_in(db, &query)).await
     }
 }

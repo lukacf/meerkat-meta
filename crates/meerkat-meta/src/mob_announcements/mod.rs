@@ -41,6 +41,7 @@ pub mod native;
 pub mod owner;
 pub mod remote;
 pub mod rpc;
+pub mod sources;
 pub mod sqlite;
 pub(crate) mod storage;
 pub mod store;
@@ -69,18 +70,31 @@ pub use native::{
 pub use owner::{
     AdmittedInput, AnnouncementConfig, AnnouncementError, AnnouncementService,
     DEFAULT_RETENTION_MS, DeliveryObservation, MIN_RETENTION_MS, NativeObservation, RoundReport,
+    SourceRunners,
 };
 pub use remote::{KeyedInjectServer, RemoteMemberDelivery};
-pub use sqlite::{ConnectionGuard, SCHEMA, SqliteAnnouncementStore};
-pub use store::AnnouncementStore;
+pub use sources::{
+    AdvanceSource, AnnouncementSource, AudienceGrant, AuditAction, AuditQuery, AuditReason,
+    AuditRow, BaselineCapability, CollectionPhase, ConnectionKind, Coverage, CoverageGap,
+    DeletionCapability, FailureClass, ItemChange, ItemOutcome, ItemOutcomeKind, MemberFacts,
+    ObservationCapability, Observed, OnboardingMode, Principal, PutSource, Rebaseline,
+    RebaselineReason, RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceConfig,
+    SourceConflictRecord, SourceConnection, SourceCursor, SourceDelivery, SourceFailure,
+    SourceFailureRecord, SourceHealth, SourceHealthPolicy, SourceHealthStatus, SourceIdentity,
+    SourceItem, SourcePage, SourcePriority, SourceQuery, SourceRoute, SourceRunner, SourceScope,
+    SourceStart, SourceState, SourceStream, SourceStreamCounts, SourceTotals, StreamOnboarding,
+    StreamPhase, TopicOwnership, UnhandledPolicy,
+};
+pub use sqlite::{ConnectionGuard, SCHEMA, SCHEMA_V2, SqliteAnnouncementStore};
+pub use store::{AnnouncementStore, SubmissionCheck};
 pub use types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementRef, AnnouncementStoreError,
     Announcer, Batch, BatchEvent, BatchEventTag, BatchId, BatchItem, BatchQuery, BatchState,
     BatchStateTag, ChildMemberLimits, LateOutcome, MAX_ITEM_WIRE_BYTES, MAX_REMOTE_BODY_WIRE_BYTES,
     Member, MemberBacklog, MemberIdentity, MemberRouteRecord, MobId, NativeReceipt, OperationId,
-    PruneReport, PutSubscription, SealingPolicy, Selector, Settlement, SourceKey, StartFrontier,
-    Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
-    SubscriptionState, SuccessorBatch, Topic,
+    PruneReport, PutSubscription, SOURCE_KEY_PREFIX, SealingPolicy, Selector, Settlement, SourceId,
+    SourceKey, StartFrontier, Subscription, SubscriptionChange, SubscriptionChangeOutcome,
+    SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch, Topic,
 };
 
 /// `runtime_options.mob_announcements`, as a host passes it at startup.

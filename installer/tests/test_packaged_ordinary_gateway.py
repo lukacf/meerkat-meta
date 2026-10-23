@@ -144,3 +144,120 @@ def test_selected_ordinary_gateway_needs_an_opened_package(monkeypatch):
     monkeypatch.setattr(packaged_runtime, "_selected_target", None)
     with pytest.raises(ValueError, match="Open the packaged runtime"):
         packaged_runtime.selected_ordinary_gateway()
+
+
+def application_model_owner(tmp_path, monkeypatch):
+    """An inert private application model source with Linux custody, for these rows only."""
+    from launchkit import connect_application_startup as startup
+    directory = tmp_path / "application-model-owner"
+    directory.mkdir(mode=0o700)
+    config = directory / "host.toml"
+    config.write_bytes(b'[model]\nselected = "inert-application-custody-specimen"\n')
+    config.chmod(0o600)
+    root = directory / "xdg"
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(startup, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(root))
+    return startup._ModelConfiguration.observe({"host_config": {"path": str(config),
+        "sha256": hashlib.sha256(config.read_bytes()).hexdigest()}, "credential_config_root": str(root)})
+
+
+@pytest.fixture
+def packaged_entry(monkeypatch):
+    """create_app with its package opening and server selection observed, nothing else."""
+    target, gateway = object(), ExactFile(Path("/inert/vendor/ordinary/rpc_gateway"), "a" * 64)
+    selections = []
+    state = SimpleNamespace(target=target, gateway=gateway, included=False, selections=selections)
+    for name in ("_selected_target", "_selected_root", "_selected_ordinary_gateway", "_application_model_custody",
+            "_private_model_route", "_private_model_custody"):
+        monkeypatch.setattr(packaged_runtime, name, None)
+
+    def open_selection(root=None):
+        monkeypatch.setattr(packaged_runtime, "_selected_target", target)
+        monkeypatch.setattr(packaged_runtime, "_selected_ordinary_gateway", gateway if state.included else None)
+        return target
+
+    state.server = SimpleNamespace(app=object(),
+        select_local_application_runtime=lambda selected, **options: selections.append((selected, options)))
+    monkeypatch.setattr(packaged_runtime, "open_selection", open_selection)
+    monkeypatch.setattr(packaged_runtime.importlib, "import_module",
+        lambda name: state.server if name == "launchkit.server" else pytest.fail(name))
+    return state
+
+
+@pytest.mark.parametrize("included", [False, True], ids=["helper-only", "ordinary-gateway"])
+def test_packaged_entry_gives_its_applications_the_selected_application_model_custody(
+        packaged_entry, tmp_path, monkeypatch, included):
+    owner = application_model_owner(tmp_path, monkeypatch)
+    packaged_entry.included = included
+    packaged_runtime.configure_application_model_custody(owner)
+    assert packaged_runtime.create_app() is packaged_entry.server.app
+    expected = {"model_configuration": owner}
+    if included:
+        expected["ordinary_meta_gateway"] = packaged_entry.gateway
+    assert packaged_entry.selections == [(packaged_entry.target, expected)]
+    assert packaged_entry.selections[0][1]["model_configuration"] is owner
+
+
+def test_packaged_entry_without_application_model_custody_is_unchanged(packaged_entry):
+    assert packaged_runtime.create_app() is packaged_entry.server.app
+    assert packaged_entry.selections == [(packaged_entry.target, {})]
+
+
+def test_application_model_custody_is_explicit_and_separate_from_the_guide_route(
+        packaged_entry, tmp_path, monkeypatch):
+    owner = application_model_owner(tmp_path, monkeypatch)
+    # The Guide's private model route never supplies application credentials.
+    packaged_runtime.configure_private_model_route({"provider": "openai", "model": "inert-model"}, owner)
+    assert packaged_runtime.create_app() is packaged_entry.server.app
+    assert packaged_entry.selections == [(packaged_entry.target, {})]
+
+
+@pytest.mark.parametrize("misuse", ["after-open", "replaced", "not-an-owner", "changed-source"])
+def test_application_model_custody_selection_refuses_misuse(packaged_entry, tmp_path, monkeypatch, misuse):
+    from launchkit.connect_installer_caller import CustodyError
+    other = None
+    if misuse == "replaced":
+        (tmp_path / "other").mkdir()
+        other = application_model_owner(tmp_path / "other", monkeypatch)
+    owner = application_model_owner(tmp_path, monkeypatch)
+    if misuse == "after-open":
+        packaged_runtime.open_selection()
+        with pytest.raises(ValueError, match="before opening the packaged runtime"):
+            packaged_runtime.configure_application_model_custody(owner)
+    elif misuse == "replaced":
+        packaged_runtime.configure_application_model_custody(owner)
+        with pytest.raises(ValueError, match="cannot be replaced"):
+            packaged_runtime.configure_application_model_custody(other)
+    elif misuse == "not-an-owner":
+        with pytest.raises(TypeError, match="application model configuration owner"):
+            packaged_runtime.configure_application_model_custody(owner.selection())
+    else:
+        packaged_runtime.configure_application_model_custody(owner)
+        owner.host_config.path.write_bytes(b"[model]\nselected = 'changed'\n")
+        with pytest.raises(CustodyError):
+            packaged_runtime.create_app()
+    assert packaged_entry.selections == []
+
+
+def test_one_owner_can_serve_both_the_guide_route_and_the_applications(packaged_entry, tmp_path, monkeypatch):
+    owner = application_model_owner(tmp_path, monkeypatch)
+    packaged_runtime.configure_private_model_route({"provider": "openai", "model": "inert-model"}, owner)
+    packaged_runtime.configure_application_model_custody(owner)
+    assert packaged_runtime.create_app() is packaged_entry.server.app
+    assert packaged_entry.selections == [(packaged_entry.target, {"model_configuration": owner})]
+    assert packaged_runtime._private_model_custody is owner
+
+
+def test_application_model_custody_outside_the_process_root_refuses_when_selected(
+        packaged_entry, tmp_path, monkeypatch):
+    from launchkit.connect_installer_caller import CustodyError
+    owner = application_model_owner(tmp_path, monkeypatch)
+    other = tmp_path / "another-credential-root"
+    other.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(other))
+    with pytest.raises(CustodyError, match="one model credential root"):
+        packaged_runtime.configure_application_model_custody(owner)
+    assert packaged_runtime._application_model_custody is None
+    assert packaged_runtime.create_app() is packaged_entry.server.app
+    assert packaged_entry.selections == [(packaged_entry.target, {})]

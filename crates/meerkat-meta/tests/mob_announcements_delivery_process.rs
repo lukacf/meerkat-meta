@@ -20,6 +20,11 @@
 //! A third has a member whose profile opts into the member tools announce
 //! from its own model turn: the loopback model calls `mob_announce`, and
 //! another member's subscription receives the announcement as that member's.
+//!
+//! Two more kill a gateway while an announcement source's collector advances
+//! it: inside the advance's transaction, which leaves neither its items nor
+//! its cursor, and after its commit, which delivers its items exactly once
+//! and answers the collector's retry with the original result.
 
 #![cfg(feature = "announcement-test-faults")]
 #![allow(
@@ -596,6 +601,8 @@ struct Gateway {
     stderr: Arc<Mutex<Vec<String>>>,
     next_id: u64,
     roster: Vec<Value>,
+    /// Every `callback/schedule_fire` the gateway sent, in order.
+    fires: Vec<Value>,
 }
 
 impl Gateway {
@@ -664,6 +671,7 @@ impl Gateway {
             stderr,
             next_id: 0,
             roster: Vec::new(),
+            fires: Vec::new(),
         }
     }
 
@@ -754,8 +762,16 @@ impl Gateway {
                 let roster = Value::Array(self.roster.clone());
                 self.send(&json!({ "jsonrpc": "2.0", "id": id, "result": roster }));
             }
+            // A host runnable this harness registered fired: it collects
+            // nothing, and the fire completes.
+            "callback/schedule_fire" => {
+                self.fires
+                    .push(message.get("params").cloned().unwrap_or(Value::Null));
+                self.send(&json!({ "jsonrpc": "2.0", "id": id, "result": {} }));
+            }
             other if other.starts_with("callback/") => panic!(
-                "[{}] unexpected host callback {other}: this harness provides only a roster",
+                "[{}] unexpected host callback {other}: this harness provides a roster and \
+                 schedule fires",
                 self.label
             ),
             _ => {}
@@ -842,30 +858,56 @@ fn boot_with(
     bootstrap_mode: &str,
     max_delay_ms: u64,
 ) -> Gateway {
+    boot_with_runnables(
+        label,
+        state,
+        host_config,
+        fault,
+        roster,
+        bootstrap_mode,
+        max_delay_ms,
+        &[],
+    )
+}
+
+/// [`boot_with`], registering `runnables` as the host's schedule runnables
+/// (`runtime_options.host_runnables`): their fires arrive as
+/// `callback/schedule_fire` and are recorded in [`Gateway::fires`].
+#[allow(clippy::too_many_arguments)]
+fn boot_with_runnables(
+    label: &str,
+    state: &Path,
+    host_config: &Path,
+    fault: Option<&str>,
+    roster: Vec<Value>,
+    bootstrap_mode: &str,
+    max_delay_ms: u64,
+    runnables: &[&str],
+) -> Gateway {
     let mut gateway = Gateway::start(label, fault);
     gateway.roster = roster;
-    let response = gateway.request(
-        "meta/init",
-        json!({
-            "persistent_state": state,
-            "mob_config": mob_config(),
-            "has_roster_provider": true,
-            "runtime_options": {
-                "meerkat_config_path": host_config,
-                "identity_bootstrap_mode": { "mode": bootstrap_mode },
-                "mob_announcements": {
-                    "enabled": true,
-                    "batch": {
-                        "max_count": 256,
-                        "max_bytes": 1_048_576,
-                        "max_delay_ms": max_delay_ms,
-                        "min_wake_interval_ms": 0
-                    }
+    let mut params = json!({
+        "persistent_state": state,
+        "mob_config": mob_config(),
+        "has_roster_provider": true,
+        "runtime_options": {
+            "meerkat_config_path": host_config,
+            "identity_bootstrap_mode": { "mode": bootstrap_mode },
+            "mob_announcements": {
+                "enabled": true,
+                "batch": {
+                    "max_count": 256,
+                    "max_bytes": 1_048_576,
+                    "max_delay_ms": max_delay_ms,
+                    "min_wake_interval_ms": 0
                 }
             }
-        }),
-        INIT_TIMEOUT,
-    );
+        }
+    });
+    if !runnables.is_empty() {
+        params["runtime_options"]["host_runnables"] = json!(runnables);
+    }
+    let response = gateway.request("meta/init", params, INIT_TIMEOUT);
     assert!(
         response.get("error").is_none(),
         "[{label}] init failed: {response}\n{}",
@@ -1893,6 +1935,342 @@ fn a_retired_member_waits_until_its_destroyed_mob_ends_the_subscription() {
         ended["ended"],
         json!({ "kind": "member_mob_ended", "why": "destroyed" }),
         "{ended}"
+    );
+    gateway.shutdown_and_reap();
+}
+
+// ---------------------------------------------------------------------------
+// Announcement sources across a crash
+// ---------------------------------------------------------------------------
+
+const SOURCE_TOPIC: &str = "mail.received";
+const SOURCE_ITEM_MARKER: &str = "SOURCE-ITEM-INVOICE-7";
+
+/// The verified account the source "inbox" reads.
+fn inbox_principal() -> Value {
+    json!({
+        "kind": "connector_verified_account",
+        "issuer": "https://accounts.example",
+        "strategy_id": "oauth-code",
+        "subject": "subject-1"
+    })
+}
+
+/// Boot a gateway over `state` whose roster is the specialist, sealing an
+/// owed announcement at once.
+fn boot_collecting(label: &str, state: &Path, host_config: &Path, fault: Option<&str>) -> Gateway {
+    boot_with(
+        label,
+        state,
+        host_config,
+        fault,
+        vec![roster_spec()],
+        "eager_materialize",
+        0,
+    )
+}
+
+/// Declare the source "inbox" in this gateway's mob, take its baseline, and
+/// subscribe the specialist to its topic.
+fn declare_live_inbox(gateway: &mut Gateway) {
+    gateway.call(
+        "meta/mob_announcements/sources/put",
+        json!({
+            "operation_id": "put-inbox",
+            "source_id": "inbox",
+            "identity": {
+                "provider": "google.gmail",
+                "principal": inbox_principal(),
+                "scope": { "kind": "mailbox_label", "id": "INBOX" }
+            },
+            "connection": { "kind": "connect_setup", "id": "setup-1" },
+            "observation": { "baseline": "delta", "deletions": "explicit" },
+            "topics": [SOURCE_TOPIC],
+            "audience": [{ "kind": "member", "member": member(IDENTITY) }]
+        }),
+    );
+    let baseline = gateway.call(
+        "meta/mob_announcements/sources/advance",
+        json!({
+            "operation_id": "baseline",
+            "source_id": "inbox",
+            "expected_revision": 1,
+            "expected_version": 0,
+            "principal": inbox_principal(),
+            "next_cursor": "c1",
+            "coverage": "complete"
+        }),
+    );
+    assert_eq!(
+        baseline["source"]["collection"],
+        json!("live"),
+        "{baseline}"
+    );
+    gateway.call(
+        "meta/mob_announcements/subscriptions/put",
+        json!({
+            "operation_id": "subscribe-inbox",
+            "subscription_id": "inbox-mail",
+            "member": member(IDENTITY),
+            "topics": [SOURCE_TOPIC]
+        }),
+    );
+}
+
+/// The collector's step that brings one new invoice mail.
+fn invoice_step() -> Value {
+    json!({
+        "operation_id": "schedule:collector:occurrence:1:v1",
+        "source_id": "inbox",
+        "expected_revision": 1,
+        "expected_version": 1,
+        "principal": inbox_principal(),
+        "next_cursor": "c2",
+        "items": [{
+            "item_id": "msg-7",
+            "version": "h-1",
+            "change": "upsert",
+            "topics": [SOURCE_TOPIC],
+            "body": format!("{SOURCE_ITEM_MARKER}: an invoice arrived")
+        }]
+    })
+}
+
+/// Send the invoice step to a gateway booted at `point` and wait for it to
+/// die there.
+fn advance_into_fault(gateway: &mut Gateway, point: &str) {
+    gateway.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "advance",
+        "method": "meta/mob_announcements/sources/advance",
+        "params": invoice_step()
+    }));
+    let status = gateway.wait_for_exit(SETTLE_TIMEOUT);
+    assert!(
+        !status.success(),
+        "the gateway must die at the fault point: {status}\n{}",
+        gateway.stderr_tail()
+    );
+    let tail = gateway.stderr_tail();
+    assert!(
+        tail.contains(&fault_line(point)),
+        "the gateway died somewhere else\n{tail}"
+    );
+}
+
+/// The specialist's one delivered batch, waiting until it is delivered and
+/// checking at every read that there is never a second one.
+fn the_one_delivered_batch(gateway: &mut Gateway) -> Value {
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < SETTLE_TIMEOUT,
+            "the item was never delivered\n{}",
+            gateway.stderr_tail()
+        );
+        let all = deliveries(gateway);
+        assert!(all.len() <= 1, "exactly one batch, never a second: {all:?}");
+        if let Some(batch) = all.first()
+            && batch["state"]["state"] == json!("delivered")
+        {
+            return batch.clone();
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// How many model requests carried the invoice as their new input.
+fn invoice_turns(log: &Arc<Mutex<ModelLog>>) -> usize {
+    log.lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| last_message_text(request).contains(SOURCE_ITEM_MARKER))
+        .count()
+}
+
+#[test]
+fn a_gateway_killed_inside_an_advance_keeps_neither_items_nor_cursor() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    let mut first = boot_collecting("inside-1", state.path(), &host_config, None);
+    declare_live_inbox(&mut first);
+    first.shutdown_and_reap();
+    drop(first);
+
+    // Boot 2 dies inside the advance's transaction, after its item and its
+    // cursor were written and before the commit.
+    let mut second = boot_collecting(
+        "inside-2",
+        state.path(),
+        &host_config,
+        Some("inside_source_advance"),
+    );
+    advance_into_fault(&mut second, "inside_source_advance");
+    drop(second);
+
+    // Boot 3: neither the item nor the cursor survived.
+    let mut third = boot_collecting("inside-3", state.path(), &host_config, None);
+    let source = third.call(
+        "meta/mob_announcements/sources/get",
+        json!({ "source_id": "inbox" }),
+    )["source"]
+        .clone();
+    assert_eq!(source["cursor"]["version"], json!(1), "{source}");
+    assert_eq!(source["cursor"]["token"], json!("c1"), "{source}");
+    assert!(deliveries(&mut third).is_empty(), "nothing was captured");
+    // The same step is new to the store: it commits now, and is delivered.
+    let advanced = third.call("meta/mob_announcements/sources/advance", invoice_step());
+    assert_eq!(advanced["replayed"], json!(false), "{advanced}");
+    assert_eq!(
+        advanced["items"][0]["outcome"],
+        json!("announced"),
+        "{advanced}"
+    );
+    assert_eq!(
+        advanced["source"]["cursor"]["version"],
+        json!(2),
+        "{advanced}"
+    );
+    let batch = the_one_delivered_batch(&mut third);
+    wait_until(
+        "the invoice turn to reach the model",
+        SETTLE_TIMEOUT,
+        || invoice_turns(&log) > 0,
+    );
+    assert_eq!(invoice_turns(&log), 1, "{batch}");
+    third.shutdown_and_reap();
+}
+
+#[test]
+fn a_gateway_killed_after_an_advance_delivers_its_items_exactly_once() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    let mut first = boot_collecting("after-1", state.path(), &host_config, None);
+    declare_live_inbox(&mut first);
+    first.shutdown_and_reap();
+    drop(first);
+
+    // Boot 2 dies after the advance committed, before the collector hears
+    // its answer.
+    let mut second = boot_collecting(
+        "after-2",
+        state.path(),
+        &host_config,
+        Some("after_source_advance"),
+    );
+    advance_into_fault(&mut second, "after_source_advance");
+    drop(second);
+
+    // Boot 3: the collector retries its step and is answered the original;
+    // the specialist gets the invoice in exactly one batch and one turn.
+    let mut third = boot_collecting("after-3", state.path(), &host_config, None);
+    let retried = third.call("meta/mob_announcements/sources/advance", invoice_step());
+    assert_eq!(retried["replayed"], json!(true), "{retried}");
+    assert_eq!(
+        retried["items"][0]["outcome"],
+        json!("announced"),
+        "the original answer: {retried}"
+    );
+    assert_eq!(
+        retried["source"]["cursor"]["version"],
+        json!(2),
+        "{retried}"
+    );
+    let batch = the_one_delivered_batch(&mut third);
+    let observed = third.call(
+        "meta/mob_announcements/deliveries/observe",
+        json!({ "batch_id": batch["id"] }),
+    );
+    assert_eq!(
+        observed["batch"]["items"].as_array().map(Vec::len),
+        Some(1),
+        "{observed}"
+    );
+    wait_until(
+        "the invoice turn to reach the model",
+        SETTLE_TIMEOUT,
+        || invoice_turns(&log) > 0,
+    );
+    assert_eq!(invoice_turns(&log), 1, "{observed}");
+    third.shutdown_and_reap();
+}
+
+/// A source's runner first fires at its declaration, within the schedule
+/// host's own pickup of due occurrences.
+const RUNNER_FIRE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// A source declared with a runner gets a schedule that fires the host's
+/// runnable (here an SDK one, `callback/schedule_fire`) with the source it
+/// collects, without waiting a whole interval.
+#[test]
+fn a_source_runner_fires_the_hosts_runnable_with_its_source() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    let mut gateway = boot_with_runnables(
+        "runner",
+        state.path(),
+        &host_config,
+        None,
+        vec![roster_spec()],
+        "eager_materialize",
+        0,
+        &["inbox-collector"],
+    );
+    let declared = gateway.call(
+        "meta/mob_announcements/sources/put",
+        json!({
+            "operation_id": "put-inbox",
+            "source_id": "inbox",
+            "identity": {
+                "provider": "google.gmail",
+                "principal": inbox_principal(),
+                "scope": { "kind": "mailbox_label", "id": "INBOX" }
+            },
+            "connection": { "kind": "connect_setup", "id": "setup-1" },
+            "observation": { "baseline": "delta", "deletions": "explicit" },
+            "topics": [SOURCE_TOPIC],
+            "audience": [{ "kind": "member", "member": member(IDENTITY) }],
+            "runner": { "host_runnable": "inbox-collector", "every_seconds": 60 }
+        }),
+    );
+    assert_eq!(
+        declared["source"]["runner"],
+        json!({ "host_runnable": "inbox-collector", "every_seconds": 60 })
+    );
+    // The schedule Meta keeps for the runner fires the host's runnable with
+    // the source it collects.
+    let start = Instant::now();
+    while gateway.fires.is_empty() {
+        assert!(
+            start.elapsed() < RUNNER_FIRE_TIMEOUT,
+            "the runner never fired\n{}",
+            gateway.stderr_tail()
+        );
+        gateway.pump();
+        thread::sleep(Duration::from_millis(200));
+    }
+    let fire = gateway.fires[0].clone();
+    assert_eq!(fire["runnable"], json!("inbox-collector"), "{fire}");
+    assert_eq!(
+        fire["occurrence"]["payload"],
+        json!({ "mob_id": MOB_ID, "source_id": "inbox" }),
+        "{fire}"
     );
     gateway.shutdown_and_reap();
 }

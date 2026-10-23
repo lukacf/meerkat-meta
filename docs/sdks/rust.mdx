@@ -294,6 +294,68 @@ agents create.
 `observe` is synchronous and must not block, and a panic in it propagates on
 the deciding task (the member's turn).
 
+### Agent customizer on a host-composed gateway
+
+A host composing the stdio gateway (`rpc_gateway::run_persistent_with_host`)
+can wrap the gateway's agent customizer by answering
+`GatewayHostComposition::compose_agent_customizer`. When the init registers a
+roster provider, the gateway asks once, after `bind_runtime` and before the
+identity context is installed, with the customizer it composed: the SDK's
+agent customizer (`.agent_customizer(...)` in Python, `.agentCustomizer(...)`
+in TypeScript), wrapped by agent memory when that is configured. The answer is
+the customizer of every identity member build: the roster bootstrap's and the
+later ones, such as a reset's fresh session. The default keeps the composed
+customizer, and a gateway without a roster provider never asks.
+
+A wrapper delegates `after_create` as well as `customize_build`. The gateway
+calls `after_create` once after each build of a live member that ran
+`customize_build`, with the session the build created or resumed,
+best-effort: an error is logged and the build stands. It calls it with no lock
+of the identity held, so once the init has settled an `after_create` can call
+back into the gateway for the same identity; during the roster bootstrap the
+gateway still answers `init_in_progress`. The call can come after the
+operation that built the member has answered. The context's `model` is the
+build's model, else the model of the profile when the mob definition declares
+it inline; it is empty for a realm-bound profile the build sets no model for.
+`AgentCustomizer::after_create` has a no-op default, so a wrapper that
+overrides only `customize_build` silently drops the SDK's `after_create`
+callback. A member Core rebuilds on its own (its restore at a restart, a
+delivery-time repair) calls neither: the identity's customizer tools stay
+attached through its tool dispatcher.
+
+The hook can wrap the composed customizer, but it cannot add one. Whether a
+customizer is composed is settled before the hook runs, because the registry
+that keeps each member's `customize_build` tools across rebuilds (a restart,
+a respawn, a delivery-time repair) exists only when one is composed. A
+customizer added later would lose its tools at the first rebuild. So:
+
+- When the init registers no SDK agent customizer and configures no agent
+  memory, the gateway offers `None`. The host answers `Ok(None)` to start
+  without a customizer, or `Err` to refuse init.
+- Answering a customizer for `None` refuses init with `-32603`, and so does
+  answering `None` for a composed customizer.
+
+An application whose host gives members tools or other build-time surface
+through this hook, such as one that declares member classes, must therefore
+configure the SDK's agent customizer. A pass-through is enough:
+
+```python
+from meerkat_meta import AgentCustomizerProtocol
+
+class PassThrough(AgentCustomizerProtocol):
+    async def customize_build(self, context, spec, draft) -> None:
+        pass  # the host's wrapper adds what its members need
+
+# Meta.builder() ... .agent_customizer(PassThrough()) ... .build()
+```
+
+In TypeScript, `.agentCustomizer({ async customizeBuild() {} })` does the
+same. A host that needs a customizer and is offered `None` answers
+`Err(GatewayHostError::AgentCustomizerRequired)`, so init fails before the
+identity bootstrap instead of starting members without their surface. The
+init failure (`-32603`) carries the variant's text, which tells the operator
+to configure the SDK agent customizer and that a pass-through is enough.
+
 ### Fork instruction policy
 
 A fork of a member with activated host instructions does with them what the

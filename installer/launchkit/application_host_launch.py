@@ -6,6 +6,14 @@ qualified product runtime target, optionally with its application model
 configuration owner, or original local and Linux control selections.
 Targets enable source creation inside deliberate Build; the launcher itself
 does not prepare, install or start applications.
+
+Application model custody that a launcher configured for this process with
+packaged_runtime.configure_application_model_custody is never dropped here. A
+bare product target and an ordinary selection without its own owner take it.
+A selection whose owner has the same selection keeps its own. Any other
+selection refuses before the server is selected, an application host included:
+its model owner comes from its preparation inputs, which this entry cannot
+check.
 """
 from __future__ import annotations
 
@@ -13,10 +21,17 @@ import importlib
 import inspect
 import keyword
 import os
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, replace
 
 
 FACTORY_ENV = "META_FORGE_APPLICATION_HOST_FACTORY"
+APPLICATION_MODEL_OWNERS_DIFFER = ("The application model custody configured for this Forge differs from the "
+    "model owner its application host factory selected. Select one application model owner.")
+APPLICATION_MODEL_CUSTODY_UNCARRIED = ("The application model custody configured for this Forge cannot reach the "
+    "selection its application host factory returned. Return a Meta Toolkit product target, a "
+    "ToolkitApplicationSelection or an OrdinaryMetaApplicationSelection, or start this host without configured "
+    "custody.")
 
 
 def _factory_reference(value):
@@ -98,6 +113,34 @@ def _require_toolkit_selection(selected):
     selected.model_configuration.require_filesystem_current()
 
 
+def _configured_application_model_custody():
+    """The owner configure_application_model_custody selected in this process, or None.
+
+    That function belongs to the packaged entry's module. A process that never
+    imported the module configured no custody.
+    """
+    packaged = sys.modules.get("launchkit.packaged_runtime")
+    return None if packaged is None else packaged.configured_application_model_custody()
+
+
+def _with_configured_custody(selected, custody, target_type):
+    """Carry configured application model custody into the factory's selection, or refuse."""
+    from .connect_installer_caller import CustodyError
+    if type(selected) is target_type:
+        return ToolkitApplicationSelection(selected, custody)
+    if type(selected) is OrdinaryMetaApplicationSelection and selected.model_configuration is None:
+        return replace(selected, model_configuration=custody)
+    if type(selected) in (ToolkitApplicationSelection, OrdinaryMetaApplicationSelection):
+        owner = selected.model_configuration
+        if not callable(getattr(owner, "selection", None)) or owner.selection() != custody.selection():
+            raise CustodyError(APPLICATION_MODEL_OWNERS_DIFFER)
+        return selected
+    # An application host's model owner comes from its preparation inputs, which
+    # this entry cannot check against custody; a local and Linux control
+    # selection carries none. Both refuse.
+    raise CustodyError(APPLICATION_MODEL_CUSTODY_UNCARRIED)
+
+
 def create_app():
     """Uvicorn --factory entry point; configured failures stop startup."""
     module, attribute = _factory_reference(os.environ.get(FACTORY_ENV))
@@ -119,6 +162,9 @@ def create_app():
         if inspect.iscoroutine(selected):
             selected.close()
         raise TypeError("The trusted factory must return an exact ForgeApplicationHost, MetaToolkitRuntimeTarget, ApplicationRuntimeSelection, OrdinaryMetaApplicationSelection or ToolkitApplicationSelection.")
+    custody = _configured_application_model_custody()
+    if custody is not None:
+        selected = _with_configured_custody(selected, custody, target_type)
     server = importlib.import_module("launchkit.server")
     if type(selected) is ToolkitApplicationSelection:
         _require_toolkit_selection(selected)

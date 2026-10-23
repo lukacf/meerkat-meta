@@ -14663,6 +14663,18 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         let _ = runtime;
         Ok(())
     }
+    /// The host's own schedule runnables, registered beside the steward's
+    /// and the SDK's callback runnables (`runtime_options.host_runnables`).
+    /// A mob announcement source's runner names one; each fire hands the
+    /// runnable Core's [`meerkat::HostRunnableInvocation`] unchanged, its
+    /// delivery idempotency key included. A host whose collectors need its
+    /// own authority (its `HostAuthService`) composes them here: a callback
+    /// runnable runs in the SDK process, which holds none. Taken once at
+    /// init, before the schedule host starts; a name taken twice, or the
+    /// memory steward's reserved one, refuses init. The default hands none.
+    fn host_runnables(&self) -> Result<crate::schedule_wiring::HostRunnables, GatewayHostError> {
+        Ok(Vec::new())
+    }
     /// Hold the identity roster's freshly created members before their
     /// publication, for at most this long (the one setup deadline of the
     /// whole bootstrap pass). `None` (the default) bootstraps as before.
@@ -15257,11 +15269,21 @@ pub enum GatewayHostCloseReason {
     CallerCancelled,
 }
 
+/// A native host composition's error. Each variant has a fixed text, which
+/// the gateway reports as the init failure. Later releases can add variants,
+/// so a match on it needs a wildcard arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GatewayHostError {
     Unavailable,
     Denied,
     SettlementIncomplete,
+    /// The host needs an agent customizer and the gateway composed none:
+    /// [`GatewayHostComposition::compose_agent_customizer`] was offered `None`
+    /// because the init registers no SDK agent customizer and configures no
+    /// agent memory. The host cannot add one, so it refuses init with this,
+    /// whose text tells the operator to configure the SDK agent customizer.
+    AgentCustomizerRequired,
 }
 
 impl std::fmt::Display for GatewayHostError {
@@ -15270,6 +15292,10 @@ impl std::fmt::Display for GatewayHostError {
             Self::Unavailable => "native host composition is unavailable",
             Self::Denied => "native host composition refused admission",
             Self::SettlementIncomplete => "native host settlement is incomplete",
+            Self::AgentCustomizerRequired => {
+                "the native host composition requires an agent customizer: configure the SDK \
+                 agent customizer (a pass-through is enough)"
+            }
         })
     }
 }
@@ -18257,7 +18283,7 @@ external_addressable = true
     // Run the schedule driver after identity-first restore, so legacy
     // resumable-session repair can see live member bridge-session bindings and
     // due occurrences do not race identity materialization.
-    let (schedule_host, _schedule_watchdog) = if let Some((
+    let (schedule_host, _schedule_watchdog, runner_schedules) = if let Some((
         schedule_service,
         mob_target_registry,
         service,
@@ -18292,14 +18318,22 @@ external_addressable = true
                 gateway_options.host_runnables.clone(),
             )
         });
-        let runnable_host = match crate::schedule_wiring::gateway_runnable_host(
+        // A Rust host's own runnables compose into the same registry.
+        let host_runnables = match host {
+            Some(host) => host
+                .host_runnables()
+                .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?,
+            None => Vec::new(),
+        };
+        let runnable_host = match crate::schedule_wiring::gateway_runnable_host_with(
             agent_memory_steward.clone(),
             callback_runnables,
+            host_runnables,
         ) {
             Ok(host) => host,
             Err(error) => {
-                // Structurally unreachable: names are deduplicated and the
-                // reserved steward name rejected at option parse time.
+                // A host runnable named like a callback runnable or the
+                // steward's: init is refused, never one silently dropped.
                 return Err(fail_init(
                     &request_id,
                     -32602,
@@ -18307,6 +18341,9 @@ external_addressable = true
                 ));
             }
         };
+        // Mob announcement sources' runners are kept on this schedule
+        // service, installed once the announcement owner attaches below.
+        let runner_schedules = schedule_service.clone();
         if let Some(steward) = agent_memory_steward.as_ref()
             && let Err(error) = crate::schedule_wiring::ensure_steward_dream_schedule(
                 &schedule_service,
@@ -18342,7 +18379,7 @@ external_addressable = true
             },
         )
         .await;
-        (schedule_host, Some(watchdog))
+        (schedule_host, Some(watchdog), Some(runner_schedules))
     } else {
         if !gateway_options.host_runnables.is_empty() {
             tracing::warn!(
@@ -18351,7 +18388,23 @@ external_addressable = true
                  host-runnable schedule targets will never fire"
             );
         }
-        (None, None)
+        // A Rust host's runnables have no schedule host here either: said
+        // once, as for the SDK's, never dropped silently.
+        let host_runnables = match host {
+            Some(host) => host
+                .host_runnables()
+                .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?,
+            None => Vec::new(),
+        };
+        if !host_runnables.is_empty() {
+            tracing::warn!(
+                runnables = host_runnables.len(),
+                "the gateway host composes schedule runnables but this gateway runs no \
+                 schedule host (ephemeral mode, or schedule store unavailable): \
+                 host-runnable schedule targets will never fire"
+            );
+        }
+        (None, None, None)
     };
 
     resources.schedule_host = schedule_host;
@@ -18784,6 +18837,16 @@ external_addressable = true
         announcements
             .compose(&runtime, &storage_layout)
             .map_err(|message| fail_init(&request_id, -32602, message))?;
+    }
+    // A source with a runner gets its durable schedule on this gateway's
+    // schedule service: the sources already declared now, each later one as
+    // it is put or changed.
+    if let (Some(service), Some(announcements)) = (runner_schedules, runtime.mob_announcements()) {
+        announcements
+            .install_source_runners(Arc::new(
+                crate::schedule_wiring::ScheduleSourceRunners::new(service),
+            ))
+            .await;
     }
     // The runtime is composed: seal what the control listener's keyed inject
     // plane serves, through the one composition every surface shares.

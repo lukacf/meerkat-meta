@@ -2307,14 +2307,16 @@ class DeploymentService:
                 # of the application's startup/health result. No authored code
                 # can supply the worker's completion signal.
                 arguments = [sys.executable, "-c",
-                    "import asyncio,sys; from launchkit.deployment import interactive_worker; "
+                    "import asyncio,sys; from launchkit.owned_worker import serve_as_owned_worker; "
+                    "serve_as_owned_worker(); from launchkit.deployment import interactive_worker; "
                     "sys.exit(asyncio.run(interactive_worker(*sys.argv[1:])) or 0)",
                     str(directory), mode, receipt.get("interactive_lifecycle_id", "")]
             if bootstrap_selection is not None:
                 owner_argument = (", owner_source_sha256=" + repr(hashlib.sha256(bootstrap_owner_source).hexdigest())
                     if bootstrap_owner_source is not None else "")
                 arguments = [sys.executable, "-c",
-                    "import asyncio,sys; from launchkit.deployment import bootstrap_interactive_worker; "
+                    "import asyncio,sys; from launchkit.owned_worker import serve_as_owned_worker; "
+                    "serve_as_owned_worker(); from launchkit.deployment import bootstrap_interactive_worker; "
                     "sys.exit(asyncio.run(bootstrap_interactive_worker(*sys.argv[1:]" + owner_argument + ")) or 0)",
                     str(directory), receipt.get("interactive_lifecycle_id", ""),
                     bootstrap_selection["path"], bootstrap_selection["sha256"]]
@@ -3686,13 +3688,19 @@ class DeploymentService:
                 # Stage, read from the private journal projection. Apply also
                 # requires the owner's current publication. Rollback and recovery
                 # may read their own unfinished transaction as lineage.
-                from .deployment_application_bootstrap import SETUP_RESTORE_CHANGED
+                from .deployment_application_bootstrap import SETUP_RESTORE_CHANGED, UPDATE_STAGED_BEFORE_SETUP
                 from .deployment_updates import setup_restore_pin, update_binding
                 selected = read_receipt(directory).get("update") or {}
                 recorded = setup_restore_pin(directory, selected)
                 if (action == "apply-update" and recorded is not None
                         and self._setup_update_restore(receipt["guide_id"], deployment_id) != recorded):
                     raise DraftConflict(SETUP_RESTORE_CHANGED)
+                if (action == "apply-update" and recorded is None
+                        and self._setup_update_restore(receipt["guide_id"], deployment_id) is not None):
+                    # Staged before the first setup, so Stage recorded no
+                    # completed Restore. That setup is complete now: the
+                    # update needs a new Stage, not the Fresh refusal below.
+                    raise DraftConflict(UPDATE_STAGED_BEFORE_SETUP)
                 require_update_bootstrap_history(directory, recorded,
                     in_flight=update_binding(selected) if action != "apply-update"
                         and selected.get("update_id") == update_id else None)

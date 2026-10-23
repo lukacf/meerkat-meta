@@ -5,6 +5,8 @@
  * SSE bridge for streaming agent and mob events.
  */
 
+import { TransportError } from "./errors.js";
+
 // -- Types ----------------------------------------------------------------
 
 export interface SseEvent {
@@ -39,18 +41,23 @@ export function encodeSseEvent(event: SseEvent): string {
  *
  * Handles `id:`, `event:`, `data:` fields and comment lines (`:` prefix).
  * Events are emitted on blank-line boundaries per the SSE spec.
+ *
+ * The stream is decoded as UTF-8 incrementally, so a character that a chunk
+ * boundary splits arrives whole. Bytes that are not UTF-8, including a stream
+ * that ends inside a character, throw {@link TransportError} (caused by the
+ * decoder's `TypeError`) instead of being replaced with U+FFFD.
  */
 export async function* parseSseStream(
   body: AsyncIterable<Uint8Array>,
 ): AsyncGenerator<SseEvent, void, undefined> {
-  const decoder = new TextDecoder("utf-8");
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   let buffer = "";
   let currentId: string | null = null;
   let currentEvent = "message";
   const currentData: string[] = [];
 
   for await (const chunk of body) {
-    buffer += decoder.decode(chunk, { stream: true });
+    buffer += decodeUtf8(decoder, chunk);
 
     while (buffer.includes("\n")) {
       const idx = buffer.indexOf("\n");
@@ -90,12 +97,23 @@ export async function* parseSseStream(
     }
   }
 
-  // Flush any remaining event if the stream ended without a trailing blank line.
-  if (currentData.length > 0) {
-    yield {
-      id: currentId,
-      event: currentEvent,
-      data: currentData.join("\n"),
-    };
+  // A stream that ends inside a character is refused; an unterminated last
+  // line is still dropped.
+  decodeUtf8(decoder);
+
+  // The SSE spec discards pending data at the end of the stream: an event
+  // without its closing blank line is never dispatched.
+}
+
+/**
+ * One step of the stream's fatal UTF-8 decode (the final flush when `chunk` is
+ * absent): bytes that are not UTF-8 refuse the stream with the SDK's
+ * transport error.
+ */
+function decodeUtf8(decoder: InstanceType<typeof TextDecoder>, chunk?: Uint8Array): string {
+  try {
+    return chunk === undefined ? decoder.decode() : decoder.decode(chunk, { stream: true });
+  } catch (error) {
+    throw new TransportError("SSE stream is not valid UTF-8", { cause: error });
   }
 }

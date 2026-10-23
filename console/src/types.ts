@@ -266,6 +266,8 @@ export interface RuntimeCapabilities {
 }
 
 export interface ConsoleExperience {
+  /** Native stores currently registered with a shared console. */
+  panel_runtimes?: import("@console-core").ConsoleExperience["panel_runtimes"];
   /** Opaque server-owned runtime and principal scope for browser persistence. */
   storage_scope?: string;
   /**

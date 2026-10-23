@@ -55,9 +55,17 @@ jobs:
           path: forge-toolchain.json
           if-no-files-found: error
 
-  backend:
+  # The backend suite runs in shards balanced on recorded test time
+  # (installer/tests/forge_shards.py). forge-release.py binds the backend job
+  # below, which runs only once every shard has passed.
+  backend-shard:
+    name: backend shard ${{ matrix.shard }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -119,42 +127,46 @@ jobs:
           print("Authenticated DOM dependency closure is ready.")
           PY
       - name: Isolated controller subprocess checks
+        if: matrix.shard == 0
         run: >-
           python -m pytest -q
           installer/tests/test_remote_destination.py::test_actual_isolated_cli_emits_one_bounded_frame_and_no_raw_error
           installer/tests/test_remote_interface_bundle.py
           --tb=short
+      - name: Select this shard's test files
+        run: python installer/tests/forge_shards.py ${{ matrix.shard }} 12 forge-shard-files.txt forge-shard-startup.txt
+      # The backend job checks these lists of every shard together.
+      - name: Retain this shard's plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: forge-shard-plan-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: |
+            forge-shard-files.txt
+            forge-shard-startup.txt
+          if-no-files-found: error
+      # Every failure is reported: no failure limit stops a shard early.
       - name: Backend regression tests
-        run: python -m pytest -vv installer/tests --maxfail=10 --tb=short --durations=20 --junitxml=forge-pytest.xml
+        run: python -m pytest -vv --tb=short --durations=20 --junitxml=forge-pytest.xml $(cat forge-shard-files.txt)
       # Application startup code runs against the selected product's Meta SDK,
-      # not the Guide SDK installed above. Recheck it with this checkout's SDK.
+      # not the Guide SDK installed above. Rerun this shard's share of
+      # installer/tests/checkout_sdk_startup_tests.txt with this checkout's SDK,
+      # also after a failure above, so that every failure is reported.
       - name: Application startup checks with this checkout's Meta SDK
+        if: ${{ !cancelled() }}
         env:
           PYTHONPATH: sdk/python:installer
-        run: >-
-          python -m pytest -q --tb=short
-          installer/tests/test_ordinary_meta_startup.py
-          installer/tests/test_ordinary_meta_bootstrap.py
-          installer/tests/test_application_startup.py
-          installer/tests/test_application_update_startup.py
-          installer/tests/test_application_restart.py
-          installer/tests/test_application_host_launch.py
-          installer/tests/test_deployment_application_startup.py
-          installer/tests/test_deployment_application_bootstrap.py
-          installer/tests/test_selected_startup_host.py
-          installer/tests/test_product_installed_bootstrap.py
-          installer/tests/test_product_start_entry.py
-          installer/tests/test_native_console_login.py
-          installer/tests/test_native_callback_member_contract.py
-          installer/tests/test_default_native_console_login.py
-      # forge-release.py binds a reused run to the versions it ran with.
+        run: |
+          if test -s forge-shard-startup.txt; then
+            python -m pytest -q --tb=short $(cat forge-shard-startup.txt)
+          fi
+      # The backend job binds the versions every shard recorded.
       - name: Record the toolchain
         run: |
           printf '{"python": "%s", "node": "%s"}\n' "$(python3 --version 2>&1)" "$(node --version)" > forge-toolchain.json
       - name: Retain the toolchain
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: forge-toolchain-${{ github.job }}-${{ github.run_attempt }}
+          name: forge-toolchain-${{ github.job }}-${{ matrix.shard }}-${{ github.run_attempt }}
           path: forge-toolchain.json
           if-no-files-found: error
       # Artifact names are unique within a run; a rerun attempt uploads its own.
@@ -162,6 +174,45 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: forge-pytest-${{ github.run_attempt }}
+          name: forge-pytest-${{ matrix.shard }}-${{ github.run_attempt }}
           path: forge-pytest.xml
           if-no-files-found: ignore
+
+  backend:
+    needs: backend-shard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Collect the shards' plans
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: forge-shard-plan-*-${{ github.run_attempt }}
+          path: plans
+      # Each shard planned on its own. Fail unless together they ran every
+      # installer test file once and reran every listed startup file once.
+      - name: Check that the shards ran every test file once
+        run: python3 installer/tests/forge_shards.py verify 12 plans
+      - name: Collect the shards' toolchains
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: forge-toolchain-backend-shard-*-${{ github.run_attempt }}
+          path: shards
+      # forge-release.py binds a reused run to the versions it ran with; every
+      # shard must have recorded the same ones.
+      - name: Record the toolchain
+        run: |
+          python3 - > forge-toolchain.json <<'PY'
+          import pathlib
+          records = sorted(pathlib.Path("shards").glob("*/forge-toolchain.json"))
+          values = {path.read_text() for path in records}
+          if len(records) != 12 or len(values) != 1:
+              raise SystemExit(f"Expected 12 identical shard toolchains, found {len(records)} records of {len(values)} kinds.")
+          print(values.pop(), end="")
+          PY
+      - name: Retain the toolchain
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: forge-toolchain-${{ github.job }}-${{ github.run_attempt }}
+          path: forge-toolchain.json
+          if-no-files-found: error
