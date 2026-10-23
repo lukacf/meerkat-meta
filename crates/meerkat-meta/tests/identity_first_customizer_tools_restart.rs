@@ -20,6 +20,9 @@
 //!   publication before its member exists: the customizer is called no extra
 //!   time, and the early failure stays pending until the materialization
 //!   publishes.
+//! - A member meerkat's resume revives whose identity the roster no longer
+//!   lists starts no run before the roster pass retires it: nothing
+//!   publishes its customizer tools, and the mob build holds its run starts.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -84,12 +87,13 @@ fn durable_spec(name: &str) -> DurableAgentSpec {
     }
 }
 
-struct OneMemberRoster;
+/// A roster that lists these identities.
+struct ListedRoster(&'static [&'static str]);
 
 #[async_trait]
-impl RosterProvider for OneMemberRoster {
+impl RosterProvider for ListedRoster {
     async fn roster(&self, _context: &RosterContext) -> Result<Vec<DurableAgentSpec>, RosterError> {
-        Ok(vec![durable_spec(MEMBER)])
+        Ok(self.0.iter().map(|name| durable_spec(name)).collect())
     }
 }
 
@@ -184,6 +188,14 @@ impl CaptureClient {
     fn last(&self) -> Option<String> {
         self.requests.lock().unwrap().last().cloned()
     }
+    /// Whether a model request carried `text`.
+    fn saw(&self, text: &str) -> bool {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.contains(text))
+    }
 }
 
 impl meerkat_client::LlmClient for CaptureClient {
@@ -230,6 +242,18 @@ async fn boot(
     customizer: Arc<dyn AgentCustomizer>,
     mode: IdentityBootstrapMode,
 ) -> meerkat_meta::UnifiedRuntime {
+    boot_listing(mob_id, state, capture, customizer, mode, &[MEMBER]).await
+}
+
+/// [`boot`] with a roster that lists `roster`.
+async fn boot_listing(
+    mob_id: &str,
+    state: &Path,
+    capture: CaptureClient,
+    customizer: Arc<dyn AgentCustomizer>,
+    mode: IdentityBootstrapMode,
+    roster: &'static [&'static str],
+) -> meerkat_meta::UnifiedRuntime {
     Box::pin(
         UnifiedRuntimeBuilder::default()
             .definition(
@@ -240,7 +264,7 @@ async fn boot(
             .continuity_from_state_dir(state)
             .await
             .expect("open the state-dir identity substrate")
-            .roster_provider(Arc::new(OneMemberRoster))
+            .roster_provider(Arc::new(ListedRoster(roster)))
             .agent_customizer(customizer)
             .identity_bootstrap_mode(mode)
             .identity_runtime_instance_id(mob_id)
@@ -695,5 +719,154 @@ async fn a_first_boot_owes_no_customizer_publication_before_its_member_exists() 
     let status = identity_runtime.status(&id(MEMBER)).await.expect("status");
     assert!(status.customizer_tools_pending.is_none(), "{status:?}");
     assert!(resolved_tools(&runtime).await.contains(&TOOL.to_string()));
+    runtime.shutdown().await;
+}
+
+/// Set in the child process of
+/// [`a_restored_member_the_roster_no_longer_lists_starts_no_run_before_it_is_retired`]:
+/// the state directory its first boot runs in.
+const DROPPED_CHILD_STATE: &str = "META_CUSTOMIZER_TOOLS_DROPPED_CHILD_STATE";
+/// A member the first boot runs and the restart's roster no longer lists.
+const DROPPED: &str = "personal:bob";
+/// The work [`DroppedMemberProbe`] submits to [`DROPPED`]'s member.
+const PROBE: &str = "work for the member the roster no longer lists";
+/// How long [`DroppedMemberProbe`] waits for that work to start a run.
+const DROPPED_RUN_BOUND: Duration = Duration::from_secs(3);
+
+/// A host customizer that declares [`TOOL`]. On its first build that carries
+/// the mob handle (the identity bootstrap's publication for the restored
+/// members it owes, which runs before the roster pass) it submits work to the
+/// member of [`DROPPED`], which the build revived, and records how the submit
+/// went and whether the work started a run within [`DROPPED_RUN_BOUND`].
+struct DroppedMemberProbe {
+    capture: CaptureClient,
+    probe: std::sync::Mutex<Option<(String, bool)>>,
+}
+
+#[async_trait]
+impl AgentCustomizer for DroppedMemberProbe {
+    async fn customize_build(
+        &self,
+        context: &AgentBuildContext,
+        _spec: &DurableAgentSpec,
+        draft: &mut AgentBuildDraft,
+    ) -> Result<(), CustomizerError> {
+        if let Some(handle) = context.runtime_services.mob_handle()
+            && self.probe.lock().unwrap().is_none()
+        {
+            let member_id = meerkat_meta::member_comms_id::mob_member_id(DROPPED);
+            let submitted = match handle.member(&member_id).await {
+                Ok(member) => match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    member.send(
+                        meerkat_core::ContentInput::Text(PROBE.to_string()),
+                        meerkat_core::types::HandlingMode::Queue,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => "admitted".to_string(),
+                    Ok(Err(error)) => format!("refused: {error}"),
+                    Err(_) => "unanswered".to_string(),
+                },
+                Err(error) => format!("no member: {error}"),
+            };
+            let deadline = Instant::now() + DROPPED_RUN_BOUND;
+            while !self.capture.saw(PROBE) && Instant::now() < deadline {
+                sleep(Duration::from_millis(50)).await;
+            }
+            *self.probe.lock().unwrap() = Some((submitted, self.capture.saw(PROBE)));
+        }
+        draft.local_external_tools = LocalExternalToolOverlay::new(Arc::new(HostTools));
+        Ok(())
+    }
+}
+
+/// After an unclean stop meerkat's resume revives every member the first
+/// boot ran while the mob is built, the one whose identity the restart's
+/// roster no longer lists as well. Nothing publishes that member's customizer
+/// tools: the build holds its run starts, so work submitted to it before the
+/// identity bootstrap's roster pass retires it starts no run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_member_the_roster_no_longer_lists_starts_no_run_before_it_is_retired() {
+    const MOB_ID: &str = "customizer-tools-restart-f";
+    if let Some(state) = std::env::var_os(DROPPED_CHILD_STATE) {
+        // The child: the first boot runs both members, then exits without
+        // shutdown.
+        let runtime = boot_listing(
+            MOB_ID,
+            Path::new(&state),
+            CaptureClient::default(),
+            Arc::new(ToolCustomizer::default()),
+            IdentityBootstrapMode::EagerMaterialize,
+            &[MEMBER, DROPPED],
+        )
+        .await;
+        let identity_runtime = runtime.identity_runtime().expect("identity runtime");
+        for name in [MEMBER, DROPPED] {
+            let status = identity_runtime.status(&id(name)).await.expect("status");
+            assert!(status.session_id.is_some(), "{name} runs: {status:?}");
+        }
+        sleep(Duration::from_millis(500)).await;
+        std::process::exit(0);
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "a_restored_member_the_roster_no_longer_lists_starts_no_run_before_it_is_retired",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(DROPPED_CHILD_STATE, &state)
+        .status()
+        .expect("run the first boot in a child process");
+    assert!(child.success(), "the child's first boot failed: {child}");
+
+    let capture = CaptureClient::default();
+    let probe = Arc::new(DroppedMemberProbe {
+        capture: capture.clone(),
+        probe: std::sync::Mutex::new(None),
+    });
+    let runtime = boot_listing(
+        MOB_ID,
+        &state,
+        capture.clone(),
+        probe.clone(),
+        IdentityBootstrapMode::LazyMaterialize,
+        &[MEMBER],
+    )
+    .await;
+    let (submitted, ran) = probe
+        .probe
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the identity bootstrap's publication ran the probe before the roster pass");
+    assert!(
+        !ran,
+        "the restored member the roster no longer lists started no run before the roster pass \
+         retired it (the work submitted to it: {submitted})"
+    );
+    let dropped_member = meerkat_meta::member_comms_id::mob_member_id(DROPPED);
+    let members = runtime
+        .mob_runtime()
+        .handle()
+        .list_members()
+        .await
+        .into_iter()
+        .map(|member| member.agent_identity.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        !members.contains(&dropped_member.to_string()),
+        "the roster pass retired the member the roster no longer lists: {members:?}"
+    );
+    sleep(Duration::from_millis(500)).await;
+    assert!(
+        !capture.saw(PROBE),
+        "the work submitted to the retired member never ran"
+    );
     runtime.shutdown().await;
 }
