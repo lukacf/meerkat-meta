@@ -296,7 +296,7 @@ Unset options are not sent.
 |--------|-------------|----------|
 | `announce(sourceKey, topics, body, { mobId?, correlationId?, causes? })` | `announce` | `AnnounceResult` |
 | `announcementGet(mobId, sourceKey)` | `get` | `Announcement \| null` |
-| `announcementSubscriptionPut(operationId, subscriptionId, member, topics, { mobs?, start?, expectedRevision? })` | `subscriptions/put` | `AnnouncementSubscription` |
+| `announcementSubscriptionPut(operationId, subscriptionId, member, topics, { mobs?, start?, expectedRevision?, delivery? })` | `subscriptions/put` | `AnnouncementSubscription` (`delivery` and `awaitHandling` when set) |
 | `announcementRoleTemplatePut(operationId, templateId, members, topics, { mobs?, expectedRevision? })` | `subscriptions/put` with `members` | `AnnouncementRoleTemplate` |
 | `announcementSubscriptionPause` / `Resume` / `Cancel(operationId, subscriptionId, expectedRevision)` | `subscriptions/{pause,resume,cancel}` | `AnnouncementSubscriptionChange` (for a role template `template` and `children`) |
 | `announcementSubscriptionGet(subscriptionId)` | `subscriptions/get` | `AnnouncementSubscriptionView` (`template` for a role template's id) |
@@ -311,7 +311,7 @@ Unset options are not sent.
 | `announcementSourceAdvance(operationId, sourceId, expectedRevision, expectedVersion, principal, nextCursor, options?)` | `sources/advance` | `SourceAdvanceResult` |
 | `announcementSourceRecordFailure(operationId, sourceId, expectedRevision, expectedVersion, principal, failure, { mobId? })` | `sources/record_failure` | `AnnouncementSource` |
 | `announcementAuditList({ mobId?, sourceId?, member?, action?, after?, limit? })` | `audit/list` | `AnnouncementAuditEntry[]` |
-| `announcementMemberGet(member)` | `members/get` | `AnnouncementMemberView` |
+| `announcementMemberGet(member)` | `members/get` | `AnnouncementMemberView` (with `handling`) |
 | `announcementMemberList({ after?, limit?, escalated? })` | `members/list` | `AnnouncementMemberView[]` |
 | `announcementEscalationsList({ after?, limit?, open? })` | `escalations/list` | `AnnouncementEscalationsPage` (`next`, and `events`, or `escalations` with `open: true`) |
 | `announcementDeclarationsApply(declarations?, { revision? })` | `declarations/apply` | `AnnouncementDeclarationsView` (`revision`, `digest`, `records`) |
@@ -391,7 +391,7 @@ lastCursor = page.next;
 ```
 
 `StatusResult.mobAnnouncements` (`MobAnnouncementsStatus`: `sources`,
-`members`, `openEscalations`, `lastEventCursor`) reads
+`members`, `handling`, `openEscalations`, `lastEventCursor`) reads
 `meta/status.mob_announcements`. It is absent when mob announcements are
 disabled, and `null` when their database could not be read. A source's
 `health` adds

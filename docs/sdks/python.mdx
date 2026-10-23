@@ -1025,7 +1025,7 @@ only when set.
 |--------|-------------|---------|
 | `announce(source_key, topics, body, *, mob_id=None, correlation_id=None, causes=None)` | `announce` | `AnnounceResult` (`announcement`, `replayed`, `captured`) |
 | `announcement_get(mob_id, source_key)` | `get` | `Announcement` or `None` |
-| `announcement_subscription_put(operation_id, subscription_id, member, topics, *, mobs=None, start=None, expected_revision=None)` | `subscriptions/put` | `AnnouncementSubscription` |
+| `announcement_subscription_put(operation_id, subscription_id, member, topics, *, mobs=None, start=None, expected_revision=None, delivery=None)` | `subscriptions/put` | `AnnouncementSubscription` (`delivery` and `await_handling` when set) |
 | `announcement_role_template_put(operation_id, template_id, members, topics, *, mobs=None, expected_revision=None)` | `subscriptions/put` with `members` | `AnnouncementRoleTemplate` |
 | `announcement_subscription_pause` / `_resume` / `_cancel(operation_id, subscription_id, expected_revision)` | `subscriptions/{pause,resume,cancel}` | `AnnouncementSubscriptionChange` (`subscription`, `unresolved_batches`; for a role template `template` and `children`) |
 | `announcement_subscription_get(subscription_id)` | `subscriptions/get` | `AnnouncementSubscriptionView` (`subscription`, `marker`, `backlog`, and `template` for a role template's id) |
@@ -1040,7 +1040,7 @@ only when set.
 | `announcement_source_advance(operation_id, source_id, expected_revision, expected_version, principal, next_cursor, **options)` | `sources/advance` | `SourceAdvanceResult` (`source`, `replayed`, `items`, `streams`) |
 | `announcement_source_record_failure(operation_id, source_id, expected_revision, expected_version, principal, failure, *, mob_id=None)` | `sources/record_failure` | `AnnouncementSource` |
 | `announcement_audit_list(*, mob_id=None, source_id=None, member=None, action=None, after=None, limit=None)` | `audit/list` | `list[AnnouncementAuditEntry]` |
-| `announcement_member_get(member)` | `members/get` | `AnnouncementMemberView` (`member`, `backlog`, `marker`, `escalations`) |
+| `announcement_member_get(member)` | `members/get` | `AnnouncementMemberView` (`member`, `backlog`, `marker`, `escalations`, `handling`) |
 | `announcement_member_list(*, after=None, limit=None, escalated=None)` | `members/list` | `list[AnnouncementMemberView]` |
 | `announcement_escalations_list(*, after=None, limit=None, open=None)` | `escalations/list` | `AnnouncementEscalationsPage` (`next`, and `events`, or `escalations` with `open=True`) |
 | `announcement_declarations_apply(declarations=None, *, revision=None)` | `declarations/apply` | `AnnouncementDeclarationsView` (`revision`, `digest`, `records`) |
@@ -1114,7 +1114,7 @@ last_cursor = page.next
 ```
 
 `StatusResult.mob_announcements` (`MobAnnouncementsStatus`: `sources`,
-`members`, `open_escalations`, `last_event_cursor`) reads
+`members`, `handling`, `open_escalations`, `last_event_cursor`) reads
 `meta/status.mob_announcements`. It is `None` when mob announcements are
 disabled or their database could not be read. A source's
 `AnnouncementSourceHealth` adds `escalations`, `quiet_monitoring`,
@@ -1291,7 +1291,7 @@ from meerkat_meta import (
     AnnouncementSourcePutResult, AnnouncementSourceStream, AnnouncementSourceView,
     SourceAdvanceResult, SourceItemOutcome, SourceStreamPhase,
     AnnouncementAuditEntry, MobAnnouncementsCapability, MobAnnouncementsStatus,
-    AnnouncementMemberView, AnnouncementMemberBacklog,
+    AnnouncementMemberView, AnnouncementMemberBacklog, AnnouncementMemberHandling,
     AnnouncementEscalation, AnnouncementEscalationEvent, AnnouncementEscalationsPage,
     supports_announcement_sources, MOB_ANNOUNCEMENT_SOURCES_V1,
     MobAnnouncementsUnavailableError, AnnouncementConflictError,

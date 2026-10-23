@@ -236,6 +236,8 @@ escalation is a durable record, and only one is open per cause and subject.
   stays quiet or its snapshots stay empty.
 - A member escalates when its deliveries have waited for an hour, when its
   batches report gaps, and when items are held because its coverage changed.
+  It also escalates when it holds items for an operator after an unhandled
+  turn, and when its turns keep ending with no receipt that says how.
 - A declared record that stays pending escalates as well.
 
 An escalation stays open while its condition holds. While it is open, it is

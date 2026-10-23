@@ -2207,7 +2207,7 @@ each as one Meerkat host continuation. The design, defaults and limits are in
 |--------|--------|--------|
 | `meta/mob_announcements/announce` | `{mob_id?, source_key, topics, body, correlation_id?, causes?}` | `{announcement, replayed, captured}` |
 | `meta/mob_announcements/get` | `{mob_id, source_key}` | `{announcement}` (`null` when absent) |
-| `meta/mob_announcements/subscriptions/put` | `{operation_id, subscription_id, member?, members?, topics, mobs?, start?, expected_revision?}` | `{subscription}` |
+| `meta/mob_announcements/subscriptions/put` | `{operation_id, subscription_id, member?, members?, topics, mobs?, start?, expected_revision?, delivery?}` | `{subscription}` |
 | `meta/mob_announcements/subscriptions/pause`, `resume`, `cancel` | `{operation_id, subscription_id, expected_revision}` | `{subscription, unresolved_batches}`, or `{template, children, unresolved_batches}` for a role template |
 | `meta/mob_announcements/subscriptions/get` | `{subscription_id}` | `{subscription, marker}`, and `template` for a role template's id |
 | `meta/mob_announcements/subscriptions/list` | `{member?, after?, limit?}` | `{subscriptions}` |
@@ -2255,7 +2255,12 @@ it was. Such a batch is read again once per quiet window until what it keeps
 is final (anything but `pending`) or retention removes it.
 
 A put names exactly one of `member`, one member, and `members`, every member
-of a mob with a role (a [role template](#role-templates)).
+of a mob with a role (a [role template](#role-templates)). `delivery` is
+`{"await_handling": bool}`: whether the member's next batch waits until the
+turn of its previous one has ended, for at most 15 minutes. Left out, it is
+on for the triage member of a triage route that takes a topic the
+subscription selects, and off for any other member. A subscription answers
+it as `delivery` when it was set.
 `member` is `{"mob_id": "<mob id>", "identity": "<identity>"}`: an identity
 is unique only within its mob. A member of this gateway's mob must be a
 registered identity served by this gateway's runtime: one placed on a host or
@@ -2369,7 +2374,8 @@ plain announcement, it is `on_unhandled` in
 - `hold` keeps the items for an operator, and `held` counts them. Some
   items are held whatever the policy says: those past the automatic
   redeliveries, and those whose turn ended in a reset or an interrupted
-  tool process.
+  tool process. A member that holds items escalates as `unhandled` (see
+  [Mob announcement health](#mob-announcement-health)).
 - `report` is the default for plain announcements, as in 0.9.4. It only
   records and counts the outcome.
 
@@ -2713,6 +2719,8 @@ The causes:
 | `suspended` | member | the member's deliveries have waited for an hour (its suspend marker) |
 | `member_gap` | member | a batch of its reported missing announcements, or a gap waits for its next batch |
 | `audience_hold` | member | it has items held because its coverage changed, or a capture for it was withheld for coverage |
+| `unhandled` | member | it holds items for an operator after an unhandled turn, until they are redelivered, dismissed or expire (see [Delivery handling](#delivery-handling)) |
+| `handled_unverified` | member | its turns ended `handled_unverified` as often as `handled_unverified_threshold` (3 by default) within a day |
 | `declaration_pending` | declaration | a declared record or a role template's child is pending (see [Mob announcement declarations](#mob-announcement-declarations)); `record_kind` is `source`, `subscription` or `role_child` |
 
 Some conditions happen rather than hold: a conflict, a source gap, a batch
@@ -2758,7 +2766,7 @@ topic. A new subscription to it replays nothing.
 of members in member order after `after`: those with an active or paused
 subscription, a suspend marker or an open escalation. With
 `"escalated": true`, it lists only members with an open escalation. Both
-answer `{member, backlog, marker, escalations}`:
+answer `{member, backlog, marker, escalations, handling}`:
 
 - `backlog` is `{eligible_count, eligible_bytes, oldest_captured_at_ms,
   last_sealed_at_ms, outstanding, held_audience, held_unhandled,
@@ -2777,6 +2785,11 @@ answer `{member, backlog, marker, escalations}`:
   shape of a subscription's `marker` and keeps the time it was first seen
   across restarts.
 - `escalations` lists its open escalations.
+- `handling` is `{pending, handled, handled_unverified, unhandled, held,
+  oldest_unhandled_at_ms}`: its admitted batches by handling
+  (`handled_unverified` is never counted as `handled`), the items it holds
+  for an operator now, and when its oldest unhandled turn was read
+  (`null` without one).
 
 A member with nothing recorded answers zero counts, no marker and no
 escalations.
@@ -2805,12 +2818,14 @@ end.
 With mob announcements enabled, `meta/status` carries a `mob_announcements`
 object, or `null` when the announcement database could not be read:
 `{"sources": {active, paused, failing, stale}, "members": {suspended,
-unhandled_held}, "escalations": {open, last_event_cursor}}`.
+unhandled_held}, "handling": {pending, handled, handled_unverified,
+unhandled}, "escalations": {open, last_event_cursor}}`.
 
 - `active` counts every active source, and `failing` and `stale` the
   active sources with that health status.
 - `suspended` counts the members with a suspend marker, and
-  `unhandled_held` is 0 in this release.
+  `unhandled_held` the items held for an operator, over all members.
+- `handling` counts the admitted batches by handling, over all members.
 - `last_event_cursor` is where a host that starts now reads escalation
   events from.
 

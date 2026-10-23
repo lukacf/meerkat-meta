@@ -94,6 +94,17 @@ All notable changes to the Python SDK are documented here.
   template's id answer `template` and `children` instead.
   `AnnouncementSubscriptionView` gains `template`. The type is new in
   this release, so no earlier code relies on `subscription` being set.
+- `announcement_subscription_put` takes `delivery`
+  (`{"await_handling": bool}`), sent only when set: whether the member's
+  next batch waits until the turn of its previous one has ended.
+  `AnnouncementSubscription` gains `delivery` and `await_handling`, `None`
+  when the subscription did not set them.
+- `AnnouncementMemberView.handling` (`AnnouncementMemberHandling`:
+  `pending`, `handled`, `handled_unverified`, `unhandled`, `held`,
+  `oldest_unhandled_at_ms`) is `None` from a gateway that does not report
+  it. `MobAnnouncementsStatus.handling` counts admitted batches by handling,
+  and is empty from such a gateway. The escalation causes `unhandled` and
+  `handled_unverified` read as sent.
 
 ## 0.9.4
 
