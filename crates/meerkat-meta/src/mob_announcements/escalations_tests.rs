@@ -13,8 +13,9 @@ use super::owner::{AnnouncementConfig, AnnouncementService};
 use super::store::AnnouncementStore;
 use super::tests::{
     Harness, OWN_MOB, SOURCES_ADVANCE, SOURCES_GET, SOURCES_PUT, SOURCES_RECORD_FAILURE,
-    ScriptedNative, advance_params, harness_with, member, owed, principal_of, source_params,
-    subscribe_to_inbox, try_host_call, upsert, with, with_items,
+    SUBSCRIPTIONS_PUT, ScriptedNative, advance_params, harness_with, identity_first_test_builder,
+    identity_first_test_runtime, member, owed, principal_of, source_params, subscribe_to_inbox,
+    try_host_call, upsert, with, with_items,
 };
 use super::{NativeDelivery, SuspendCause};
 
@@ -679,6 +680,157 @@ async fn sources_put_reports_affected_subscriptions_and_delivery_readiness() {
     .await
     .unwrap();
     assert_eq!(replaced["affected_subscriptions"], json!(1), "{replaced}");
+}
+
+/// On a governed gateway, setup already says local delivery is refused:
+/// sources/put answers it in `delivery_readiness` and meta/capabilities in
+/// `local_delivery`, both from the fact the subscription check reads, and a
+/// local member's subscription is refused `governed_runtime` as before.
+#[tokio::test]
+async fn a_governed_gateway_reports_refused_local_delivery_at_setup_and_in_capabilities() {
+    let mut native = ScriptedNative::new();
+    native.governed = true;
+    let harness = harness_with(native);
+    let refused = json!({ "kind": "refused", "cause": "governed_runtime" });
+    let created = try_host_call(
+        &harness.service,
+        SOURCES_PUT,
+        source_params("put-1", "inbox", "subject-1", &["mail.received"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(created["delivery_readiness"], refused, "{created}");
+    assert_eq!(
+        super::rpc::capabilities_projection(Some(&harness.service)).await,
+        json!({
+            "sources": "v1",
+            "local_delivery": refused,
+            "governed_admission": false,
+        })
+    );
+    let subscription = try_host_call(
+        &harness.service,
+        SUBSCRIPTIONS_PUT,
+        json!({
+            "operation_id": "subscribe-a",
+            "subscription_id": "sub-a",
+            "member": { "mob_id": OWN_MOB, "identity": "agent:a" },
+            "topics": ["mail.received"],
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        subscription.data.as_ref().and_then(|data| data.get("kind")),
+        Some(&json!("governed_runtime")),
+        "{subscription:?}"
+    );
+}
+
+/// Sources are host work, not member admission: a governed gateway declares
+/// a source, takes its baseline, advances it with an item, records a failure
+/// and recovers on the next advance, as any gateway does.
+#[tokio::test]
+async fn a_governed_gateway_still_collects_and_advances_sources() {
+    let mut native = ScriptedNative::new();
+    native.governed = true;
+    let harness = harness_with(native);
+    inbox(&harness, None).await;
+    let advanced = try_host_call(
+        &harness.service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("advance-1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        advanced["items"][0]["outcome"],
+        json!("announced"),
+        "{advanced}"
+    );
+    assert_eq!(advanced["source"]["cursor"]["version"], json!(2));
+    fail(&harness, 2, 1_000 + MINUTE, 1).await;
+    let failing = health(&harness).await;
+    assert_eq!(failing["status"], json!("failing"), "{failing}");
+    assert_eq!(failing["consecutive_failures"], json!(1));
+    advance(&harness, 2, 1_000 + 2 * MINUTE, None, &[]).await;
+    let recovered = health(&harness).await;
+    assert_eq!(recovered["status"], json!("ok"), "{recovered}");
+    assert_eq!(recovered["consecutive_failures"], json!(0));
+}
+
+/// A gateway composed with mob announcements and no governed host says so in
+/// its first meta/capabilities answer: the feature capability, the new
+/// methods, and local delivery ready. One composed without them names
+/// neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ungoverned_gateway_reports_ready_local_delivery_at_boot() {
+    async fn capabilities(runtime: &crate::UnifiedRuntime) -> Value {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "meta/capabilities",
+            "params": {},
+        })
+        .to_string();
+        let answer = crate::rpc::handle_unified_rpc_json(
+            runtime,
+            &request,
+            std::time::Duration::from_secs(30),
+            None,
+            None,
+        )
+        .await;
+        serde_json::from_str::<Value>(&answer).unwrap()["result"].clone()
+    }
+    let sources_v1 = json!("mob_announcements.sources.v1");
+    let state = tempfile::tempdir().unwrap();
+    let runtime = Box::pin(
+        identity_first_test_builder(state.path(), "mob-k-boot-ready", "")
+            .await
+            .mob_announcements(AnnouncementConfig::default())
+            .build(),
+    )
+    .await
+    .expect("the builder composes mob announcements");
+    let answer = capabilities(&runtime).await;
+    assert!(
+        answer["feature_capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&sources_v1),
+        "{answer}"
+    );
+    assert_eq!(
+        answer["mob_announcements"],
+        json!({
+            "sources": "v1",
+            "local_delivery": { "kind": "ready" },
+            "governed_admission": false,
+        }),
+        "{answer}"
+    );
+    let methods = answer["methods"].as_array().unwrap();
+    for method in [MEMBERS_GET, MEMBERS_LIST, ESCALATIONS_LIST] {
+        assert!(methods.contains(&json!(method)), "{method}: {answer}");
+    }
+    runtime.shutdown().await;
+
+    let plain_state = tempfile::tempdir().unwrap();
+    let plain = identity_first_test_runtime(plain_state.path(), "mob-k-boot-plain").await;
+    let answer = capabilities(&plain).await;
+    assert_eq!(answer["mob_announcements"], Value::Null, "{answer}");
+    assert!(
+        !answer["feature_capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&sources_v1),
+        "{answer}"
+    );
+    plain.shutdown().await;
 }
 
 /// A source whose runner this gateway does not schedule (no schedule service

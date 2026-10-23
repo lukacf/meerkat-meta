@@ -8778,7 +8778,7 @@ impl crate::identity_first::contracts::RosterProvider for StatusRoster {
 /// agent:a on its roster, for tests of its own native seam. Each test
 /// names its own mob: the comms names a runtime registers are
 /// process-wide, so two runtimes of one mob in parallel tests collide.
-async fn identity_first_test_runtime(
+pub(super) async fn identity_first_test_runtime(
     state: &std::path::Path,
     mob_id: &str,
 ) -> crate::UnifiedRuntime {
@@ -8789,7 +8789,7 @@ async fn identity_first_test_runtime(
 
 /// The builder of [`identity_first_test_runtime`], before `build()`.
 /// `tools` adds lines to the member profile's tools table.
-async fn identity_first_test_builder(
+pub(super) async fn identity_first_test_builder(
     state: &std::path::Path,
     mob_id: &str,
     tools: &str,
