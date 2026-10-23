@@ -124,16 +124,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   item is checked again; a batch with an item that fails is cancelled
   while nothing native holds it, its failing items are held and the rest
   reopen for the member's next batch.
-  - A held item is released only by a fresh check at the member's next
-    seal, and only while the source generation that held it is current;
-    held items alone start no seal.
+  - A held item is released only by a fresh check: at the member's next
+    seal, and at least every 5 minutes while the member has nothing else
+    to seal, so one whose member passes again goes out within minutes
+    though nothing new comes. Only the source generation that held it
+    releases it, and a roster that cannot be read decides nothing: the
+    check waits for a read.
+  - On a peer route a batch is never cancelled while an earlier request
+    for it may still commit, inside the quiet window after that request;
+    past it, what the request did is read first.
   - A held item past the retention window expires, and no gap line
     reports it to its member.
   - `meta/mob_announcements/audit/list` counts the new actions
     `items_held`, `items_released`, `expired_while_held` and
-    `delivered_across_revocation`: a batch committed while its member
-    passed and admitted after it stopped, which nothing Meta controls
-    stands between on a gateway without a governed binder.
+    `delivered_across_revocation`, counted when Meta observes an admission
+    of an item its member no longer passes: on a gateway without a
+    governed binder nothing Meta controls stands between a commit and its
+    admission.
 
 ### Changed
 

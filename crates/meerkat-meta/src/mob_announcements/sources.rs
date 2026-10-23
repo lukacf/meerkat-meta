@@ -1718,9 +1718,9 @@ pub enum AuditAction {
     ItemsReleased,
     /// Held items outlived the retention window.
     ExpiredWhileHeld,
-    /// A batch committed while its member passed was admitted after the
-    /// member stopped passing: nothing Meta controls stands between the two
-    /// on a gateway without a governed binder.
+    /// Meta observed an admission of an item its member no longer passes:
+    /// on a gateway without a governed binder nothing Meta controls stands
+    /// between a commit and its admission.
     DeliveredAcrossRevocation,
 }
 

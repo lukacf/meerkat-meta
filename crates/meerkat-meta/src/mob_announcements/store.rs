@@ -170,6 +170,10 @@ pub trait AnnouncementStore: Send + Sync {
     /// route also stops where its JSON-encoded body, counted with
     /// [`super::types::header_wire_bound`], would exceed one peer request
     /// ([`super::types::MAX_REMOTE_BODY_WIRE_BYTES`]).
+    ///
+    /// A store that keeps sources seals here with no roster facts, so a
+    /// member is covered by member grants alone: a caller whose sources
+    /// grant by role or label uses [`Self::seal_batch_with_facts`].
     async fn seal_batch(
         &self,
         member: &Member,
@@ -198,22 +202,50 @@ pub trait AnnouncementStore: Send + Sync {
 
     /// The last check before a native submission of batch `id`, which is in
     /// state `expected`: sealed, or submitting after an answer that nothing
-    /// was committed, so nothing native holds it. Every item is checked
-    /// again against its member's coverage and routes (`facts`). When all
-    /// pass, the batch is left as it is and `None` comes back. Otherwise the
-    /// batch is cancelled: its failing items are held, the rest reopen for
-    /// the member's next batch, its gap lines go to that batch, and the
-    /// cancelled batch comes back. A store without sources owns no topic and
-    /// passes every batch.
+    /// was committed. Every item is checked again against its member's
+    /// coverage and routes (`facts`). When all pass, the batch is left as it
+    /// is. When one fails and `may_cancel` (nothing native can hold the
+    /// batch any more), the batch is cancelled: its failing items are held,
+    /// the rest reopen for the member's next batch and its gap lines go to
+    /// that batch. Without `may_cancel` (an earlier request to a peer may
+    /// still commit) nothing changes and the failure comes back. A store
+    /// without sources owns no topic and passes every batch.
     async fn check_before_submission(
         &self,
         id: &BatchId,
         expected: BatchStateTag,
         facts: Option<MemberFacts>,
+        may_cancel: bool,
         now_ms: u64,
-    ) -> Result<Option<Batch>> {
-        let _ = (id, expected, facts, now_ms);
-        Ok(None)
+    ) -> Result<SubmissionCheck> {
+        let _ = (id, expected, facts, may_cancel, now_ms);
+        Ok(SubmissionCheck::Passed)
+    }
+
+    /// Members whose held items are due a fresh check: a hold of the
+    /// source's current generation, on an active subscription, last checked
+    /// at or before `checked_before_ms`; at most `limit` members.
+    async fn members_with_holds_due(
+        &self,
+        checked_before_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<Member>> {
+        let _ = (checked_before_ms, limit);
+        Ok(Vec::new())
+    }
+
+    /// Check `member`'s held items afresh, at most `limit`, the ones checked
+    /// longest ago first: one that passes is released and counted; one that
+    /// still fails is stamped checked, so the next check reaches the others.
+    async fn release_holds(
+        &self,
+        member: &Member,
+        facts: Option<MemberFacts>,
+        limit: u32,
+        now_ms: u64,
+    ) -> Result<()> {
+        let _ = (member, facts, limit, now_ms);
+        Ok(())
     }
 
     /// Count, for batch `id` just admitted into its member's session, each
@@ -465,6 +497,18 @@ pub trait AnnouncementStore: Send + Sync {
         let _ = query;
         Err(no_sources())
     }
+}
+
+/// What the last check before a submission found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubmissionCheck {
+    /// Every item passes.
+    Passed,
+    /// An item fails, and the batch was left as it is.
+    Failed,
+    /// An item failed and the batch was cancelled.
+    Cancelled(Box<Batch>),
 }
 
 fn no_sources() -> AnnouncementStoreError {
