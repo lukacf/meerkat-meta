@@ -17091,3 +17091,116 @@ async fn a_cancelled_subscriptions_row_does_not_vouch_for_its_item_at_the_last_c
         "the cancelled row does not vouch: {check:?}"
     );
 }
+
+/// An item that only a cancelled subscription's row brings is still checked
+/// at the last check before a submission: with no live row to judge it by,
+/// its own rows judge it, and one that fails cancels the batch.
+#[tokio::test]
+async fn an_item_only_a_cancelled_subscription_brings_is_still_checked_at_the_last_check() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let audience = serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]);
+    let inbox = |operation: &str, routes: serde_json::Value| {
+        with(
+            with(
+                source_params(
+                    operation,
+                    "inbox",
+                    "subject-1",
+                    &["mail.received", "mail.flagged"],
+                ),
+                "audience",
+                audience.clone(),
+            ),
+            "routes",
+            routes,
+        )
+    };
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox("put", serde_json::json!([{ "kind": "direct" }])),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "b-received", "agent:b", &["mail.received"])
+        .await
+        .unwrap();
+    try_subscribe(service, "b-flagged", "agent:b", &["mail.flagged"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[
+                serde_json::json!({
+                    "item_id": "m-1",
+                    "version": "v1",
+                    "change": "upsert",
+                    "topics": ["mail.received"],
+                    "body": "first",
+                }),
+                serde_json::json!({
+                    "item_id": "m-2",
+                    "version": "v1",
+                    "change": "upsert",
+                    "topics": ["mail.flagged"],
+                    "body": "second",
+                }),
+            ],
+        ),
+    )
+    .await
+    .unwrap();
+    // Sealed, and not submitted yet: m-1 through b-received, m-2 through
+    // b-flagged alone.
+    let batch = harness
+        .store
+        .seal_batch(
+            &member("agent:b"),
+            &batch_id("b-both"),
+            &policy(),
+            10_000_000,
+        )
+        .await
+        .unwrap()
+        .expect("sealed");
+    assert_eq!(batch.items.len(), 2, "{batch:?}");
+    // The flagged subscription is cancelled; the batch stays sealed for the
+    // received one. Then mail.flagged loses its direct route.
+    service
+        .change_subscription(
+            &op("cancel-flagged"),
+            &sid("b-flagged"),
+            1,
+            SubscriptionChange::Cancel,
+        )
+        .await
+        .unwrap();
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox(
+                "received-only",
+                serde_json::json!([{ "kind": "direct", "topics": ["mail.received"] }]),
+            ),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    let check = harness
+        .store
+        .check_before_submission(&batch.id, BatchStateTag::Sealed, None, true, 10_000_001)
+        .await
+        .unwrap();
+    assert!(
+        matches!(check, super::store::SubmissionCheck::Cancelled(_)),
+        "m-2 is checked through its cancelled row: {check:?}"
+    );
+}
