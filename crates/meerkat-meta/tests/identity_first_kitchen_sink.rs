@@ -35,12 +35,80 @@ use meerkat_meta::identity_first::contracts::{AgentCustomizer, RosterProvider, T
 use meerkat_meta::identity_first::orchestrator::RestoreOutcome;
 use meerkat_meta::identity_first::{
     AgentAddressability, AgentBuildContext, AgentBuildDraft, AgentIdentity, ContinuityStore,
-    CustomizerError, DurabilityPolicy, DurableAgentSpec, IdentityFirstRuntimeContext,
-    IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig, IdentityRuntimeError,
-    LocalContinuityStore, LocalLeaseProvider, ManagedPeerEdge, MemberRuntimeBinding, RosterContext,
-    RosterError, SessionBridge, TopologyContext, TopologyError, wire_cross_mob_by_identity,
+    CustomizerError, DispatchInput, DurabilityPolicy, DurableAgentSpec,
+    IdentityFirstRuntimeContext, IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig,
+    IdentityRuntimeError, LocalContinuityStore, LocalLeaseProvider, ManagedPeerEdge,
+    MemberRuntimeBinding, RosterContext, RosterError, SessionBridge, TopologyContext,
+    TopologyError, TurnOutcome, TurnOutput, TurnTicket, TurnTracking, wire_cross_mob_by_identity,
 };
 use meerkat_meta::mob_handle_runtime::SessionCreatedContext;
+
+// ---------------------------------------------------------------------------
+// Turn helpers
+// ---------------------------------------------------------------------------
+
+/// Dispatch `text` with system origin, as `dispatch_text` does, and return the
+/// ticket of the turn it admitted.
+async fn dispatch_ticketed(
+    irt: &Arc<IdentityRuntime>,
+    identity: &AgentIdentity,
+    text: impl Into<String>,
+) -> TurnTicket {
+    let ticketed = irt
+        .dispatch_with_turn_ticket(identity, None, &DispatchInput::system(text))
+        .await
+        .unwrap_or_else(|error| panic!("dispatch to {identity}: {error}"));
+    tracked(identity, &ticketed.turn)
+}
+
+/// Send `text`, as `send_text` does (queued, no interaction id), and return
+/// the ticket of the turn it admitted.
+async fn send_text_ticketed(
+    irt: &Arc<IdentityRuntime>,
+    identity: &AgentIdentity,
+    text: impl Into<String>,
+) -> TurnTicket {
+    let ticketed = irt
+        .send_with_turn_ticket(
+            identity,
+            None,
+            &meerkat_core::ContentInput::Text(text.into()),
+            meerkat_core::types::HandlingMode::Queue,
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("send to {identity}: {error}"));
+    tracked(identity, &ticketed.turn)
+}
+
+/// The ticket of a turn the delivery admitted. Every member here is turn
+/// driven, so an untracked turn is a fault of the row.
+fn tracked(identity: &AgentIdentity, turn: &TurnTracking) -> TurnTicket {
+    match turn {
+        TurnTracking::Tracked(ticket) => *ticket,
+        TurnTracking::Unavailable(reason) => {
+            panic!("{identity}'s turn was not tracked: {reason}")
+        }
+    }
+}
+
+/// Wait for the turn admitted under `ticket` and return that turn's own text.
+/// Not `wait_for_output`, which returns a preview an earlier turn left, and
+/// not the identity's next completion, which a peer's message can satisfy:
+/// the ticket names this delivery's turn, and its outcome carries the turn's
+/// own output.
+async fn turn_output(
+    irt: &IdentityRuntime,
+    identity: &AgentIdentity,
+    ticket: TurnTicket,
+) -> String {
+    match irt.wait_for_turn(identity, ticket, WAIT_TIMEOUT).await {
+        TurnOutcome::Completed {
+            output: TurnOutput::Text { text, .. },
+        } => text,
+        other => panic!("{identity}'s turn did not complete with text: {other:?}"),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Env helpers
@@ -612,54 +680,42 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
 
     // --- Round 0: Writers submit initial drafts ---
     eprintln!("[Phase 2] Round 0: Writers drafting...");
-    author_irt
-        .dispatch_text(
-            &id("writer:a"),
-            "Write the world's greatest joke about large language models. \
+    let writer_a_turn = dispatch_ticketed(
+        &author_irt,
+        &id("writer:a"),
+        "Write the world's greatest joke about large language models. \
              It should be funny to both AI researchers and normal people. \
              2-4 sentences max. No explanation.",
-        )
-        .await
-        .expect("dispatch to writer:a");
+    )
+    .await;
 
-    author_irt
-        .dispatch_text(
-            &id("writer:b"),
-            "Write the world's greatest joke about large language models. \
+    let writer_b_turn = dispatch_ticketed(
+        &author_irt,
+        &id("writer:b"),
+        "Write the world's greatest joke about large language models. \
              Go for something that reveals a deep truth about LLMs in a surprising, \
              hilarious way. 2-4 sentences max. No explanation.",
-        )
-        .await
-        .expect("dispatch to writer:b");
+    )
+    .await;
 
-    let joke_a = author_irt
-        .wait_for_output(&id("writer:a"), WAIT_TIMEOUT)
-        .await
-        .expect("writer:a output");
-    let joke_b = author_irt
-        .wait_for_output(&id("writer:b"), WAIT_TIMEOUT)
-        .await
-        .expect("writer:b output");
+    let joke_a = turn_output(&author_irt, &id("writer:a"), writer_a_turn).await;
+    let joke_b = turn_output(&author_irt, &id("writer:b"), writer_b_turn).await;
     eprintln!("[Phase 2] Writer A: {joke_a}");
     eprintln!("[Phase 2] Writer B: {joke_b}");
 
     // --- Lead author picks the best draft ---
-    author_irt
-        .dispatch_text(
-            &id("lead:author"),
-            format!(
-                "Two writers submitted LLM jokes. Pick the funnier one and output ONLY \
+    let lead_author_turn = dispatch_ticketed(
+        &author_irt,
+        &id("lead:author"),
+        format!(
+            "Two writers submitted LLM jokes. Pick the funnier one and output ONLY \
                  the joke text (2-4 sentences, no commentary):\n\n\
                  Writer A: {joke_a}\n\nWriter B: {joke_b}"
-            ),
-        )
-        .await
-        .expect("dispatch to lead:author");
+        ),
+    )
+    .await;
 
-    let mut current_joke = author_irt
-        .wait_for_output(&id("lead:author"), WAIT_TIMEOUT)
-        .await
-        .expect("lead:author pick output");
+    let mut current_joke = turn_output(&author_irt, &id("lead:author"), lead_author_turn).await;
     eprintln!("[Phase 2] Lead's pick: {current_joke}");
 
     // --- Refinement loop: authors ↔ critics up to 10 rounds ---
@@ -672,30 +728,22 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         eprintln!("\n[Phase 2] === Round {round}/{MAX_ROUNDS} ===");
 
         // Send to both judges for scoring
-        critic_irt
-            .dispatch_text(
-                &id("judge:x"),
+        let judge_x_turn = dispatch_ticketed(
+            &critic_irt,
+            &id("judge:x"),
                 format!("Score this LLM joke. Start with 'SCORE: N/10' then give feedback.\n\n{current_joke}"),
-            )
-            .await
-            .expect("dispatch to judge:x");
+        )
+        .await;
 
-        critic_irt
-            .dispatch_text(
-                &id("judge:y"),
+        let judge_y_turn = dispatch_ticketed(
+            &critic_irt,
+            &id("judge:y"),
                 format!("Score this LLM joke. Start with 'SCORE: N/10' then give feedback.\n\n{current_joke}"),
-            )
-            .await
-            .expect("dispatch to judge:y");
+        )
+        .await;
 
-        let review_x = critic_irt
-            .wait_for_output(&id("judge:x"), WAIT_TIMEOUT)
-            .await
-            .expect("judge:x output");
-        let review_y = critic_irt
-            .wait_for_output(&id("judge:y"), WAIT_TIMEOUT)
-            .await
-            .expect("judge:y output");
+        let review_x = turn_output(&critic_irt, &id("judge:x"), judge_x_turn).await;
+        let review_y = turn_output(&critic_irt, &id("judge:y"), judge_y_turn).await;
 
         let score_x = extract_score(&review_x).unwrap_or(5);
         let score_y = extract_score(&review_y).unwrap_or(5);
@@ -719,47 +767,39 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
         }
 
         // Send feedback to lead author for revision
-        author_irt
-            .dispatch_text(
-                &id("lead:author"),
-                format!(
-                    "The critics scored your joke {score_x}/10 and {score_y}/10. \
+        let lead_author_turn = dispatch_ticketed(
+            &author_irt,
+            &id("lead:author"),
+            format!(
+                "The critics scored your joke {score_x}/10 and {score_y}/10. \
                      Here's their feedback:\n\n\
                      Judge X: {review_x}\n\n\
                      Judge Y: {review_y}\n\n\
                      Revise the joke based on this feedback. Output ONLY the improved \
                      joke text (2-4 sentences, no commentary). Aim for {TARGET_SCORE}/10."
-                ),
-            )
-            .await
-            .expect("dispatch revision to lead:author");
+            ),
+        )
+        .await;
 
-        current_joke = author_irt
-            .wait_for_output(&id("lead:author"), WAIT_TIMEOUT)
-            .await
-            .expect("lead:author revision output");
+        current_joke = turn_output(&author_irt, &id("lead:author"), lead_author_turn).await;
         eprintln!("[Phase 2] Revised joke: {current_joke}");
 
         round += 1;
     }
 
     // --- Deliver final joke to coordinator ---
-    author_irt
-        .send_text(
-            &id("coordinator:mc"),
-            format!(
-                "After {round} round(s) of refinement, here is the team's final joke \
+    let coordinator_mc_turn = send_text_ticketed(
+        &author_irt,
+        &id("coordinator:mc"),
+        format!(
+            "After {round} round(s) of refinement, here is the team's final joke \
                  (best score: {best_score}/10):\n\n{current_joke}\n\n\
                  Present this as the team's masterpiece."
-            ),
-        )
-        .await
-        .expect("send final joke to coordinator");
+        ),
+    )
+    .await;
 
-    let final_delivery = author_irt
-        .wait_for_output(&id("coordinator:mc"), WAIT_TIMEOUT)
-        .await
-        .expect("coordinator final output");
+    let final_delivery = turn_output(&author_irt, &id("coordinator:mc"), coordinator_mc_turn).await;
     eprintln!("[Phase 2] FINAL DELIVERY:\n{final_delivery}");
 
     assert!(
@@ -1126,19 +1166,15 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
     eprintln!("\n--- Phase 7: Critic mob post-dropout ---");
 
     // Verify remaining critic agents still function after judge:y dropout
-    critic_irt2
-        .dispatch_text(
-            &id("judge:x"),
-            "Score this joke 1-10: 'A programmer walks into a bar and orders 1.0 beers. \
+    let judge_x_turn = dispatch_ticketed(
+        &critic_irt2,
+        &id("judge:x"),
+        "Score this joke 1-10: 'A programmer walks into a bar and orders 1.0 beers. \
              The bartender says: you sure you don\\'t want 1.00000000001?'",
-        )
-        .await
-        .expect("dispatch to judge:x post-dropout");
+    )
+    .await;
 
-    let jx_output = critic_irt2
-        .wait_for_output(&id("judge:x"), WAIT_TIMEOUT)
-        .await
-        .expect("Phase 7 judge:x output");
+    let jx_output = turn_output(&critic_irt2, &id("judge:x"), judge_x_turn).await;
     eprintln!("[Phase 7] judge:x scored post-dropout: {jx_output}");
 
     eprintln!(
@@ -1327,19 +1363,15 @@ async fn e2e_kitchen_sink_two_mob_chaos() {
     eprintln!("\n--- Phase 10: Final delivery post-chaos ---");
 
     // Send to coordinator to prove the whole system still works after all chaos
-    author_irt2
-        .send_text(
-            &id("coordinator:mc"),
-            "The joke collaboration survived all the chaos. Summarize what happened \
+    let coordinator_mc_turn = send_text_ticketed(
+        &author_irt2,
+        &id("coordinator:mc"),
+        "The joke collaboration survived all the chaos. Summarize what happened \
              and declare the project complete.",
-        )
-        .await
-        .expect("final delivery to coordinator");
+    )
+    .await;
 
-    let final_output = author_irt2
-        .wait_for_output(&id("coordinator:mc"), WAIT_TIMEOUT)
-        .await
-        .expect("Phase 10 final output");
+    let final_output = turn_output(&author_irt2, &id("coordinator:mc"), coordinator_mc_turn).await;
     eprintln!("[Phase 10] coordinator:mc final: {final_output}");
 
     // Final status check on all remaining active identities
