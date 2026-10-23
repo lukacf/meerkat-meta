@@ -45,6 +45,9 @@ def test_ordinary_runtime_is_the_trusted_launchers_selected_meta_and_gateway(mon
     from launchkit.connect_installer_caller import ExactFile
     from launchkit.runtime_candidates import MetaToolkitRuntimeTarget
     from launchkit.sdk_wheel_integrity import WheelByteExpectation
+    # object.__setattr__ accepts any name: pin the target's own field names too.
+    import dataclasses
+    assert {"target", "meta"} <= {field.name for field in dataclasses.fields(MetaToolkitRuntimeTarget)}
     target = object.__new__(MetaToolkitRuntimeTarget)
     object.__setattr__(target, "target", "macos-arm64")
     object.__setattr__(target, "meta", WheelByteExpectation(distribution="meerkat-meta", version="0.9.5",
