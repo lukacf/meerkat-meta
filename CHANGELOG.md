@@ -51,6 +51,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   session_id }`: the roster compile or wake that meets a member the host made
   directly on the mob under the identity's member id. An exhaustive match on
   `IdentityRuntimeError` adds the arm.
+- A tool's output travels once, on `tool_result_received`, following Meerkat's
+  `AgentEvent::ToolExecutionCompleted`, which no longer carries the result
+  body. Meta's projection (every SSE stream, `meta/events/subscribe`,
+  event-log row and console frame) derives the flat `result` string on
+  `tool_result_received`, beside its `content`, and `tool_execution_completed`
+  carries neither: its tool fields are `id`, `tool_call_id`, `name`,
+  `is_error` and `duration_ms`, the execution fact for the same `id`. The
+  Python SDK moves `result` from `ToolExecutionCompleted` to
+  `ToolResultReceived` (its last field), and the TypeScript SDK moves it from
+  `ToolExecutionCompletedEvent` to `ToolResultReceivedEvent`. Code that read a
+  tool's output from the completion reads it from the result event for the
+  same `id`, and a positional pattern on `ToolExecutionCompleted` loses its
+  `result` slot. Console timeline frames rebuilt from session history keep the
+  `tool_execution_completed` kind and their output. An event from an older
+  server still parses: a completion's `result` is ignored, and a result event
+  without one reads `""`.
 
 ### Added
 

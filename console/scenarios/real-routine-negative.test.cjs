@@ -98,9 +98,8 @@ function frames(action = "interrupt") {
   return [{ kind: "run_started", payload: {} }, ...stoppedTools(expected.scenarioId).flatMap(tool => [
     { kind: "tool_call_requested", payload: { tool_call_id: tool.id, name: tool.name, args: tool.args } },
     ...(tool.step === "late" && action === "interrupt" ? [] : ["tool_execution_completed", "tool_result_received"].map(kind => ({ kind,
-      payload: { tool_call_id: tool.id, name: tool.name, source_event_type: kind,
-        content: [{ type: "text", text: tool.result }], is_error: tool.error,
-        ...(kind === "tool_execution_completed" ? { result: tool.result } : {}) } }))),
+      payload: { tool_call_id: tool.id, name: tool.name, source_event_type: kind, is_error: tool.error,
+        ...(kind === "tool_result_received" ? { content: [{ type: "text", text: tool.result }], result: tool.result } : {}) } }))),
   ]), action === "cancel_after_boundary"
     ? { kind: "interaction_failed", payload: { source_event_type: "run_failed", error_report: { class: "cancelled", message: "Stopped" } } }
     : { kind: "interaction_failed", payload: { source_event_type: "interaction_failed", reason: { kind: "cancelled" } } }]
@@ -224,14 +223,21 @@ test("each completed tool channel is required exactly once and preserves its bod
       const duplicate = frames(spec.action), original = duplicate.find(select);
       duplicate.splice(-1, 0, { ...original, id: "duplicate-result", source_event_id: "duplicate-result" });
       assert.throws(() => assertStoppedFrames(duplicate, spec), /one .*result/);
-      for (const mutate of [
+      const bodyMutations = kind === "tool_result_received" ? [
         frame => { frame.payload.content[0].text += "changed"; },
+        frame => { frame.payload.result = "conflicting raw result"; },
+      ] : [
+        // The execution fact carries no body; the result event carries the output.
+        frame => { frame.payload.result = tool.result; },
+        frame => { frame.payload.content = [{ type: "text", text: tool.result }]; },
+      ];
+      for (const mutate of [
+        ...bodyMutations,
         frame => { frame.payload.is_error = !tool.error; },
         frame => { frame.payload.name = "wrong_tool"; },
-        frame => { frame.payload.result = "conflicting raw result"; },
       ]) {
         const bad = frames(spec.action); mutate(bad.find(select));
-        assert.throws(() => assertStoppedFrames(bad, spec), /exact result|actual result outcome|exact tool name/);
+        assert.throws(() => assertStoppedFrames(bad, spec), /exact result|actual result outcome|exact tool name|carries no result body/);
       }
     }
   }
@@ -282,7 +288,8 @@ test("stop proof rejects missing or duplicate calls, mutated bytes, later work, 
   assert.throws(() => assertStoppedFrames(missing, expected), /one call/);
   const duplicate = frames(); duplicate.push({ ...duplicate[1], id: "duplicate", source_event_id: "duplicate" });
   assert.throws(() => assertStoppedFrames(duplicate, expected), /one call/);
-  const altered = frames(); altered[2].payload.content[0].text = altered[2].payload.content[0].text.trim();
+  const altered = frames(), alteredResult = altered.find(frame => frame.kind === "tool_result_received");
+  alteredResult.payload.content[0].text = alteredResult.payload.content[0].text.trim();
   assert.throws(() => assertStoppedFrames(altered, expected), /exact result/);
   const continued = frames(); continued.push({ ...continued[1], id: "after", source_event_id: "after", payload: { tool_call_id: `fixture-${expected.scenarioId}-ready` } });
   assert.throws(() => assertStoppedFrames(continued, expected), /no later tool/);

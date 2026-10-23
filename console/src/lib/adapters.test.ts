@@ -23,6 +23,7 @@ import {
 } from "./adapters";
 import { MEERKAT_1608_KICKOFF_NOTICES } from "./fixtures/meerkat-1608-kickoff-notices";
 import { describeFailure, summarizeFailureData } from "./failure-summary";
+import type { ConsoleFrame } from "../types";
 
 test("authorization feedback projects a typed operation refusal without ending the active run", () => {
   const frames = [
@@ -1690,14 +1691,24 @@ test("mapFramesToTimelineEntries renders generate_image result images immediatel
         timestampMs: 20,
         data: { id: "tool-1", name: "generate_image", args: { prompt: "ALL CLEAR" } },
       },
+      // The execution fact carries no body; the result event carries the
+      // generated images.
       {
         id: "evt-tool-done",
         event: "tool_execution_completed",
         interactionId: "turn-1",
         timestampMs: 30,
+        data: { id: "tool-1", name: "generate_image", is_error: false, duration_ms: 900 },
+      },
+      {
+        id: "evt-tool-result",
+        event: "tool_result_received",
+        interactionId: "turn-1",
+        timestampMs: 30,
         data: {
           id: "tool-1",
           name: "generate_image",
+          is_error: false,
           result: JSON.stringify({
             images: [
               {
@@ -8839,6 +8850,67 @@ test("workgraph failure notes dedupe by tool-call id across live and history twi
   );
 });
 
+test("workgraph cards fold the result event and take failure detail from it, not the bodiless execution fact", () => {
+  const created = { item: workGraphItem({ id: "item-split", title: "Split target", status: "open", revision: 1 }) };
+  const frames = [
+    {
+      id: "wg-split-0-call",
+      event: "tool_call_requested",
+      interactionId: "turn-split",
+      timestampMs: 1_779_405_464_000,
+      data: { id: "wg-split-0-tc", name: "workgraph_create", args: { title: "Split target" } },
+    },
+    {
+      id: "wg-split-0-completed",
+      event: "tool_execution_completed",
+      interactionId: "turn-split",
+      timestampMs: 1_779_405_464_100,
+      data: { id: "wg-split-0-tc", name: "workgraph_create", is_error: false, duration_ms: 4 },
+    },
+    {
+      id: "wg-split-0-received",
+      event: "tool_result_received",
+      interactionId: "turn-split",
+      timestampMs: 1_779_405_464_200,
+      data: { id: "wg-split-0-tc", name: "workgraph_create", is_error: false, result: JSON.stringify(created) },
+    },
+    {
+      id: "wg-split-call",
+      event: "tool_call_requested",
+      interactionId: "turn-split",
+      timestampMs: 1_779_405_465_000,
+      data: { id: "wg-split-tc", name: "workgraph_claim", args: { id: "item-split", expected_revision: 9 } },
+    },
+    // The execution fact comes first and carries no body; the result event
+    // for the same call carries the failure detail.
+    {
+      id: "wg-split-completed",
+      event: "tool_execution_completed",
+      interactionId: "turn-split",
+      timestampMs: 1_779_405_465_100,
+      data: { id: "wg-split-tc", name: "workgraph_claim", is_error: true, duration_ms: 4 },
+    },
+    {
+      id: "wg-split-received",
+      event: "tool_result_received",
+      interactionId: "turn-split",
+      timestampMs: 1_779_405_465_200,
+      data: { id: "wg-split-tc", name: "workgraph_claim", is_error: true, result: "revision conflict: expected 9, found 1" },
+    },
+  ];
+
+  const cards = mapFramesToTimelineEntries(WORKGRAPH_AGENT, frames)
+    .filter((entry) => entry.kind === "workgraph");
+  assert.equal(cards.length, 1);
+  const card = cards[0];
+  if (card.kind !== "workgraph") return;
+  assert.match(JSON.stringify(card), /Split target/, "the created item is folded from the result event");
+  assert.equal(card.lastActionFailed, true);
+  const failureLines = (card.recentEvents || []).filter((line) => line.startsWith("✗ workgraph_claim failed"));
+  assert.equal(failureLines.length, 1, `one note per failed call, got ${JSON.stringify(card.recentEvents)}`);
+  assert.match(failureLines[0], /revision conflict/);
+});
+
 test("workgraph post-reload snapshot refresh echoes re-hydrate operator-driven state without minting cards", () => {
   // History restored after a page reload: the agent created the item at
   // revision 1; the operator's close ran pre-reload and its client-local
@@ -9466,6 +9538,53 @@ test("a council emits ONE card even when two frames each carry the sealed result
   assert.equal(toolRows.length, 0, "the raw council tool call is suppressed");
 });
 
+test("a council card renders from the result event when the execution fact carries no body", () => {
+  const sealed = {
+    result: {
+      council_id: "c-single",
+      exit_reason: { reason: "completed" },
+      rounds_completed: 1,
+      participants: [],
+      exchanges: [],
+      merge: { kind: "no_merge" },
+    },
+    cleanup: { debts: [] },
+    replayed: false,
+  };
+  const entries = mapFramesToTimelineEntries(
+    { agent_id: "planner", member_id: "planner", label: "Planner", kind: "identity" },
+    [
+      {
+        id: "evt-1",
+        event: "tool_call",
+        data: {
+          name: "council",
+          tool_call_id: "call-1",
+          arguments: JSON.stringify({ topic: "Ship or hold?", participants: [] }),
+        },
+      },
+      {
+        id: "evt-2",
+        event: "tool_execution_completed",
+        data: { name: "council", tool_call_id: "call-1", is_error: false, duration_ms: 40 },
+      },
+      {
+        id: "evt-3",
+        event: "tool_result_received",
+        data: { name: "council", tool_call_id: "call-1", is_error: false, result: JSON.stringify(sealed) },
+      },
+    ] as never,
+  );
+
+  const councils = entries.filter((entry) => entry.kind === "council");
+  assert.equal(councils.length, 1, "exactly one council card, from the result event");
+  assert.equal((councils[0] as { topic: string }).topic, "Ship or hold?");
+  const toolRows = entries.filter((entry) => (
+    entry.kind === "message" && JSON.stringify(entry).includes('"name":"council"')
+  ));
+  assert.equal(toolRows.length, 0, "the bodiless execution fact leaves no bare council row");
+});
+
 // A MID-TURN STEER. The operator types while the agent is still working, and
 // everything the agent produces afterwards must render BELOW that message.
 //
@@ -10010,24 +10129,29 @@ const SCREENSHOT_CONTENT = [
 for (const [surface, mapTimeline] of [["stock", mapFramesToTimelineEntries], ["shared", mapFramesToTimelineEntriesShared]] as const) {
 test(`${surface}: live tool results render their images and keep only text as the result`, () => {
   const agent = { agent_id: "pilot", member_id: "pilot", label: "pilot", kind: "mob_agent" as const };
-  for (const completed of [
-    // tool_execution_completed carries a text-only `result` beside the content.
-    { id: "done", event: "tool_execution_completed", data: { id: "shot", name: "computer_screenshot", is_error: false, result: "Captured the screen.", content: SCREENSHOT_CONTENT } },
-    // tool_result_received carries the content only.
-    { id: "done", event: "tool_result_received", data: { id: "shot", name: "computer_screenshot", is_error: false, content: SCREENSHOT_CONTENT } },
-  ]) {
-    const entries = mapTimeline(agent, [
-      { id: "start", event: "tool_execution_started", data: { id: "shot", name: "computer_screenshot", args: {} } },
-      completed,
-    ]);
+  const start = { id: "start", event: "tool_execution_started", data: { id: "shot", name: "computer_screenshot", args: {} } };
+  // The execution fact carries no body. The result event carries the
+  // content and the text-only `result` Meta derives from it.
+  const completed = { id: "completed", event: "tool_execution_completed", data: { id: "shot", name: "computer_screenshot", is_error: false, duration_ms: 12 } };
+  const received = { id: "received", event: "tool_result_received", data: { id: "shot", name: "computer_screenshot", is_error: false, result: "Captured the screen.\nreceipt: 1", content: SCREENSHOT_CONTENT } };
+  // A result event from an older server carries the content only.
+  const contentOnly = { ...received, data: { id: "shot", name: "computer_screenshot", is_error: false, content: SCREENSHOT_CONTENT } };
+  for (const [order, frames] of [
+    ["the execution fact first", [start, completed, received]],
+    ["the result event first", [start, received, completed]],
+    ["results before their call", [received, completed, start]],
+    ["a result event without a derived result", [start, completed, contentOnly]],
+  ] as Array<[string, ConsoleFrame[]]>) {
+    const entries = mapTimeline(agent, frames);
     const [block] = toolCallBlocksIn(entries).filter((item) => item.toolCallId === "shot");
-    assert.ok(block, completed.event);
+    assert.ok(block, order);
+    assert.equal(block.status, "success", order);
     const images = block.images as Array<Record<string, unknown>>;
-    assert.equal(images.length, 1, completed.event);
+    assert.equal(images?.length, 1, order);
     assert.equal(images[0]?.src, "data:image/png;base64,iVBORw0KGgo=");
-    assert.equal(typeof block.result, "string");
+    assert.equal(typeof block.result, "string", order);
     assert.doesNotMatch(block.result as string, /iVBORw0KGgo/, "no base64 is shown as text");
-    assert.match(block.result as string, /Captured the screen\./);
+    assert.match(block.result as string, /Captured the screen\./, order);
   }
 });
 

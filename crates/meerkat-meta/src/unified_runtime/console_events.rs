@@ -644,7 +644,13 @@ impl ConsoleEventStore {
             return;
         }
 
-        if let Some(image_result) = parse_generate_image_tool_result(&projected_data) {
+        // A generated image is projected once per tool call, from the result
+        // event: it alone carries the result body. The execution fact for the
+        // same call carries none, and an older payload of it that still does
+        // must not project the images a second time.
+        if event_type.as_str() == "tool_result_received"
+            && let Some(image_result) = parse_generate_image_tool_result(&projected_data)
+        {
             for (idx, image) in image_result.images.iter().enumerate() {
                 self.append_envelope(ConsoleIdentityEventEnvelope {
                     event_id: format!("{}#assistant_image:{idx}", event.event_id),
@@ -1216,9 +1222,9 @@ fn parse_generate_image_tool_result(
             serde_json::from_value(result_value.clone()).ok()
         };
     }
-    // meerkat 0.7 removed the flat `result` key from ToolExecutionCompleted;
-    // meta's ingest edges re-derive it, but fall back to the typed
-    // `content` blocks so raw 0.7-shaped payloads still project image frames.
+    // Meta's ingest edges derive the flat `result` on the result event; fall
+    // back to its typed `content` blocks so a raw result payload without it
+    // still projects image frames.
     let text = payload
         .get("content")?
         .as_array()?
@@ -2112,9 +2118,49 @@ mod tests {
             Arc::clone(&binary),
         )));
         store.register_runtime_identity("rt:pilot:1", "pilot").await;
+        // The execution fact comes first and carries no body; the result
+        // event that follows carries the tool's output.
+        store
+            .project_unified_event(&completed_without_body("evt-completed", "shot"))
+            .await;
         store
             .project_unified_event(&screenshot_result("tool_result_received", "evt-received"))
             .await;
+
+        let frames = tool_result_frames(&store).await;
+        assert_eq!(frames.len(), 2);
+        let completed = frame_of(&frames, "tool_execution_completed");
+        assert!(completed.get("content").is_none(), "{completed:#}");
+        assert!(completed.get("result").is_none(), "{completed:#}");
+        let received = frame_of(&frames, "tool_result_received");
+        let image = &received["content"][1];
+        assert_eq!(image["source"], json!("blob"), "{received:#}");
+        assert_eq!(received["content"][0]["text"], json!("Captured."));
+        let blob_id = image["blob_id"].as_str().expect("blob id").to_string();
+        assert!(
+            !serde_json::to_string(&frames)
+                .expect("frames serialize")
+                .contains("iVBORw0KGgo"),
+            "no frame carries the image bytes"
+        );
+        let stored = binary
+            .get_bytes(&meerkat_core::BlobId::new(blob_id))
+            .await
+            .expect("the image is in the session blob store");
+        assert_eq!(stored.media_type, "image/png");
+    }
+
+    /// An execution-fact payload from an older producer may still carry the
+    /// body; its images go by blob reference too, never inline.
+    #[tokio::test]
+    async fn an_older_completed_payload_with_a_body_carries_images_by_blob_reference() {
+        let binary: Arc<dyn crate::blob_store::BinaryBlobStore> =
+            Arc::new(crate::blob_store::ObjectStoreBlobStore::memory());
+        let store = ConsoleEventStore::new();
+        store.install_blob_store(Arc::new(crate::blob_store::Base64BlobStoreAdapter::new(
+            Arc::clone(&binary),
+        )));
+        store.register_runtime_identity("rt:pilot:1", "pilot").await;
         store
             .project_unified_event(&screenshot_result(
                 "tool_execution_completed",
@@ -2123,31 +2169,118 @@ mod tests {
             .await;
 
         let frames = tool_result_frames(&store).await;
-        assert_eq!(frames.len(), 2);
-        let blob_ids: Vec<String> = frames
-            .iter()
-            .map(|frame| {
-                let image = &frame["content"][1];
-                assert_eq!(image["source"], json!("blob"), "{frame:#}");
-                assert_eq!(frame["content"][0]["text"], json!("Captured."));
-                image["blob_id"].as_str().expect("blob id").to_string()
-            })
-            .collect();
-        assert_eq!(
-            blob_ids[0], blob_ids[1],
-            "both frames name the same content-addressed blob"
-        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["content"][1]["source"], json!("blob"));
         assert!(
             !serde_json::to_string(&frames)
                 .expect("frames serialize")
                 .contains("iVBORw0KGgo"),
             "no frame carries the image bytes"
         );
-        let stored = binary
-            .get_bytes(&meerkat_core::BlobId::new(blob_ids[0].clone()))
+    }
+
+    fn completed_without_body(event_id: &str, tool_call_id: &str) -> EventEnvelope<UnifiedEvent> {
+        agent_event_with_payload(
+            event_id,
+            "rt:pilot:1",
+            "tool_execution_completed",
+            json!({
+                "id": tool_call_id,
+                "name": "computer_screenshot",
+                "is_error": false,
+                "duration_ms": 12,
+            }),
+        )
+    }
+
+    fn frame_of<'a>(frames: &'a [Value], source_event_type: &str) -> &'a Value {
+        frames
+            .iter()
+            .find(|frame| frame["source_event_type"] == json!(source_event_type))
+            .expect("a frame of the event type is projected")
+    }
+
+    fn generate_image_payload(with_body: bool) -> Value {
+        let image_result = json!({
+            "operation_id": "00000000-0000-0000-0000-0000000000aa",
+            "terminal": { "terminal": "generated" },
+            "images": [
+                {
+                    "image_id": "00000000-0000-0000-0000-000000000051",
+                    "blob_ref": {
+                        "blob_id": "sha256:test-generated-image",
+                        "media_type": "image/png"
+                    },
+                    "media_type": "image/png",
+                    "width": 1024,
+                    "height": 768
+                }
+            ],
+            "provider_text": { "disposition": "not_emitted" },
+            "revised_prompt": { "disposition": "not_requested" },
+            "native_metadata": { "provider": "not_emitted" }
+        });
+        let mut payload = json!({
+            "id": "call-image",
+            "tool_call_id": "call-image",
+            "name": "generate_image",
+            "is_error": false,
+        });
+        if with_body {
+            let text = serde_json::to_string(&image_result).expect("serialize image result");
+            payload["result"] = json!(text);
+            payload["content"] = json!([{ "type": "text", "text": text }]);
+        }
+        payload
+    }
+
+    async fn assistant_image_frames(store: &ConsoleEventStore) -> Vec<Value> {
+        store
+            .replay_all(None)
             .await
-            .expect("the image is in the session blob store");
-        assert_eq!(stored.media_type, "image/png");
+            .expect("replay")
+            .into_iter()
+            .filter(|event| event.event_type == "assistant_image")
+            .map(|event| event.data)
+            .collect()
+    }
+
+    /// A generated image is projected exactly once per tool call: from the
+    /// result event, never from the execution fact, whether or not that
+    /// fact carries a body.
+    #[tokio::test]
+    async fn a_generated_image_is_projected_once_from_the_result_event() {
+        for completed_has_body in [false, true] {
+            let store = ConsoleEventStore::new();
+            store.register_runtime_identity("rt:pilot:1", "pilot").await;
+            let mut completed = generate_image_payload(completed_has_body);
+            completed["duration_ms"] = json!(12);
+            store
+                .project_unified_event(&agent_event_with_payload(
+                    "evt-completed",
+                    "rt:pilot:1",
+                    "tool_execution_completed",
+                    completed,
+                ))
+                .await;
+            store
+                .project_unified_event(&agent_event_with_payload(
+                    "evt-received",
+                    "rt:pilot:1",
+                    "tool_result_received",
+                    generate_image_payload(true),
+                ))
+                .await;
+
+            let images = assistant_image_frames(&store).await;
+            assert_eq!(images.len(), 1, "body on completed: {completed_has_body}");
+            assert_eq!(
+                images[0]["source_event_type"],
+                json!("tool_result_received")
+            );
+            assert_eq!(images[0]["tool_call_id"], json!("call-image"));
+            assert_eq!(images[0]["blob_id"], json!("sha256:test-generated-image"));
+        }
     }
 
     #[tokio::test]
