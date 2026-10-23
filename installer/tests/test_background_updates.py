@@ -168,6 +168,20 @@ async def background(tmp_path, monkeypatch):
     await service.shutdown()
 
 
+@pytest.fixture
+def unflushed_writes(monkeypatch):
+    """For rows that time the update's own budgets in fractions of a second.
+
+    The update budget also pays for the work before the candidate starts,
+    21 fsyncs among it. Under host I/O pressure that work took up to 2.1 s,
+    the first pending check found a 1 s update budget already spent, and the
+    row saw its own rollback instead of the pending wait. These rows check
+    budget handoffs, not durability, so their writes skip the flush. Other
+    rows keep real fsyncs.
+    """
+    monkeypatch.setattr(os, "fsync", lambda descriptor: None)
+
+
 async def test_apply_and_explicit_rollback_use_fresh_service_health_without_replacing_frozen_host(background):
     service, directory, target, old, private, identity, manager, definition = background
     unit = Path(definition["unit_path"]).read_bytes()
@@ -206,16 +220,21 @@ async def test_apply_and_explicit_rollback_use_fresh_service_health_without_repl
     assert services.verify_service(directory, result)["host_files"] == manifest
 
 
-async def test_pending_update_waits_past_both_budgets_then_commits_only_fresh_ready(background, monkeypatch):
+async def test_pending_update_waits_past_both_budgets_then_commits_only_fresh_ready(background, monkeypatch, unflushed_writes):
     service, directory, target, old, private, identity, manager, _ = background
-    monkeypatch.setattr(services, "SERVICE_START_TIMEOUT", 1)
-    monkeypatch.setattr(services, "SERVICE_UPDATE_TIMEOUT", 1.5)
+    monkeypatch.setattr(services, "SERVICE_START_TIMEOUT", 2)
+    # The update budget also pays for the work before the candidate starts
+    # (up to 1.8 s without flushes, with 16 runs on 4 cores).
+    monkeypatch.setattr(services, "SERVICE_UPDATE_TIMEOUT", 3.5)
     manager.behaviors = ["pending"]
     task = asyncio.create_task(services.update_background(directory, manager, "update", update_id=identity))
     try:
-        await asyncio.wait_for(manager.started.wait(), 5)
+        await asyncio.wait_for(manager.started.wait(), 30)
         pending = read_receipt(directory)
-        await asyncio.sleep(1.65)
+        # Pending suspends both budgets for at most the update budget's length,
+        # so the start budget runs again during this wait. Its 2 s keep the
+        # check and the commit clear of it.
+        await asyncio.sleep(services.SERVICE_UPDATE_TIMEOUT + .15)
         assert not task.done(), "A recoverable native admission is not an update timeout"
         waiting = read_receipt(directory)
         assert waiting["status"] == "starting" and waiting["health"] == "pending"
@@ -229,7 +248,7 @@ async def test_pending_update_waits_past_both_budgets_then_commits_only_fresh_re
             bootstrap={"complete": True, "ready": True, "counts": {"broken": 0},
                        "identities": {"lead:main": {"state": "active"}}},
             startup_console_health={"attempt_id": attempt, "status": "pass"})
-        await asyncio.wait_for(task, 5)
+        await asyncio.wait_for(task, 30)
         result = read_receipt(directory)
         assert result["update"]["status"] == "completed"
         assert result["update_service_verification"]["startup_attempt_id"] == attempt
@@ -336,15 +355,20 @@ async def test_pending_update_is_bounded_and_rolls_back(background, monkeypatch,
 
 
 @pytest.mark.parametrize("after_pending", ["unknown", "cancel", "failed-then-stalled-fallback", "stalled-observation"])
-async def test_leaving_pending_restores_bounds_and_exact_cleanup(background, monkeypatch, after_pending):
+async def test_leaving_pending_restores_bounds_and_exact_cleanup(background, monkeypatch, unflushed_writes, after_pending):
     service, directory, target, old, private, identity, manager, _ = background
-    monkeypatch.setattr(services, "SERVICE_START_TIMEOUT", .25)
-    monkeypatch.setattr(services, "SERVICE_UPDATE_TIMEOUT", 1)
+    # The first check after the start must land inside this budget, and
+    # pending must outlast it before the row leaves pending.
+    monkeypatch.setattr(services, "SERVICE_START_TIMEOUT", 1)
+    # The update budget also pays for the work before the candidate starts
+    # (up to 1.8 s without flushes, with 16 runs on 4 cores). What is left
+    # bounds the stalled rows and must carry the rollback after pending.
+    monkeypatch.setattr(services, "SERVICE_UPDATE_TIMEOUT", 4)
     manager.behaviors = ["pending", "block" if after_pending == "failed-then-stalled-fallback" else "ready"]
     task = asyncio.create_task(services.update_background(directory, manager, "update", update_id=identity))
     try:
-        await asyncio.wait_for(manager.started.wait(), 5)
-        await asyncio.sleep(.4)
+        await asyncio.wait_for(manager.started.wait(), 30)
+        await asyncio.sleep(services.SERVICE_START_TIMEOUT + .25)
         assert not task.done() and manager.stops == []
         if after_pending == "cancel":
             task.cancel()
@@ -354,7 +378,7 @@ async def test_leaving_pending_restores_bounds_and_exact_cleanup(background, mon
             assert read_receipt(directory)["update"]["status"] == "restored-stopped"
         elif after_pending == "unknown":
             update_receipt(directory, admission_health=None, bootstrap=None, health="unknown")
-            await asyncio.wait_for(task, 5)
+            await asyncio.wait_for(task, 30)
             result = read_receipt(directory)
             assert result["update"]["status"] == "rolled-back"
             assert result["build_id"] == old["build_id"]
@@ -370,7 +394,7 @@ async def test_leaving_pending_restores_bounds_and_exact_cleanup(background, mon
                 return await original_observe(definition)
 
             monkeypatch.setattr(manager, "observe", stalled_observe)
-            await asyncio.wait_for(task, 4)
+            await asyncio.wait_for(task, 30)
             result = read_receipt(directory)
             assert result["update"]["status"] == "rolled-back"
             assert result["build_id"] == old["build_id"]
@@ -379,7 +403,7 @@ async def test_leaving_pending_restores_bounds_and_exact_cleanup(background, mon
             # Shield distinguishes the update's own restored deadline from
             # this test's safety timeout; it cannot pass by cancelling it.
             with pytest.raises(TimeoutError):
-                await asyncio.wait_for(asyncio.shield(task), 4)
+                await asyncio.wait_for(asyncio.shield(task), 30)
             assert task.done(), "The transaction's own deadline must bound fallback after pending"
             assert manager.starts == [service.implementation.identity, old["build_id"]]
             assert manager.stops == [service.implementation.identity, old["build_id"]]
