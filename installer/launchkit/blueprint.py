@@ -11,6 +11,8 @@ from .schema import Advanced, Cloud, DEFAULT_MODELS, DeploymentSpec, Project, Pr
 from .planning_limits import MAX_CLASSES, MAX_FLOW_STEPS, MAX_IDENTITIES, MAX_INSTANCES_PER_CLASS, MAX_PEER_EDGES
 
 ID = r"^[a-z][a-z0-9_-]{0,39}$"
+# A declared identity combines a class ID (40), ':' and a named member key (20).
+MAX_IDENTITY_LENGTH = 61
 ENV = r"^[A-Z][A-Z0-9_]{0,79}$"
 MODEL = r"^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$"
 PLACEHOLDER = re.compile(r"\$\{([A-Z][A-Z0-9_]{0,79})\}")
@@ -232,19 +234,19 @@ def validate_url(value):
 
 
 class Edge(StrictModel):
-    a: str = Field(max_length=60)
-    b: str = Field(max_length=60)
+    a: str = Field(max_length=MAX_IDENTITY_LENGTH)
+    b: str = Field(max_length=MAX_IDENTITY_LENGTH)
 
 
 class Topology(StrictModel):
     mode: Literal["hub", "mesh", "pipeline", "manual"] = "hub"
-    entrypoint: str = Field(max_length=60)
+    entrypoint: str = Field(max_length=MAX_IDENTITY_LENGTH)
     edges: list[Edge] = Field(default_factory=list, max_length=MAX_PEER_EDGES)
 
 
 class FlowStep(StrictModel):
     id: str = Field(pattern=ID)
-    agent: str = Field(max_length=60)
+    agent: str = Field(max_length=MAX_IDENTITY_LENGTH)
     prompt: str = Field(min_length=1, max_length=12000)
     depends_on: list[str] = Field(default_factory=list, max_length=MAX_FLOW_STEPS)
     timeout_ms: int = Field(default=120000, ge=1000, le=1800000, strict=True)
@@ -314,7 +316,7 @@ class CloudOptions(Cloud):
 class AcquisitionSetup(StrictModel):
     """Desired application setup role; not a native member or authorization."""
 
-    helper_identity: str = Field(min_length=3, max_length=61,
+    helper_identity: str = Field(min_length=3, max_length=MAX_IDENTITY_LENGTH,
         description="One existing desired Blueprint identity. This is not a native member binding or proof of native profile exclusivity.")
     helper_profile: Literal["dedicated", "exclusive_application_role"] = Field(
         description="Desired preparation profile strategy. Native preparation must validate the actual member and live roster before applying it.")

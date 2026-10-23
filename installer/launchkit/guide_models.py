@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from pydantic import Field, StringConstraints, field_validator, model_serializer, model_validator
 
+from .blueprint import MAX_IDENTITY_LENGTH
 from .schema import StrictModel
 
 STAGES = ("purpose", "connections", "knowledge", "autonomy", "destination", "review")
@@ -83,7 +84,7 @@ class RequestedFeature(StrictModel):
 class IncomingDataRoute(StrictModel):
     """Desired recipient, not a runtime subscription or an access grant."""
 
-    recipient: str = Field(min_length=1, max_length=60)
+    recipient: str = Field(min_length=1, max_length=MAX_IDENTITY_LENGTH)
     delivery: Literal["direct", "triage", "conversation"]
     recipient_kind: Literal["identity", "class"] = Field(default="identity",
         description="A proposed identity, or a whole proposed class including future members. A class is desired scope, not a native role selector or access grant.")
