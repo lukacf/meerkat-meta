@@ -19,6 +19,10 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
 
 use super::availability::{EvidenceClass, SuspendCause, SuspendMarker};
+use super::escalations::{
+    Escalation, EscalationEvent, EscalationEventKind, EscalationNotice, EscalationPass,
+    EscalationSubject, MemberRead, StatusCounts,
+};
 pub use super::native::AdmittedInput;
 use super::native::{
     MemberMobScan, MemberProblem, MemberRoute, MobOrigin, MobPresence, NativeDelivery,
@@ -54,6 +58,13 @@ fn member_problem(member: &Member, problem: MemberProblem) -> AnnouncementError 
 
 /// Announcements and settled batches are kept this long after they settle.
 pub const DEFAULT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// The shortest wait before an open escalation is notified again.
+pub const MIN_RENOTIFY_AFTER_MS: u64 = 60 * 1_000;
+
+/// How long an open escalation waits before it is notified again by
+/// default: a day.
+pub const DEFAULT_RENOTIFY_AFTER_MS: u64 = 24 * 60 * 60 * 1_000;
 /// The shortest retention window: a retry of an announcement or a subscription
 /// change inside it still meets its original result.
 pub const MIN_RETENTION_MS: u64 = 60 * 60 * 1_000;
@@ -89,6 +100,37 @@ const PRUNE_LIMIT: usize = 1_000;
 /// Where escalation events reach the host: the gateway's `meta/on_error`
 /// hook.
 pub type ErrorSink = Arc<dyn Fn(crate::unified_runtime::ErrorEvent) + Send + Sync>;
+
+/// The host notification for one escalation event.
+fn escalation_error_event(notice: EscalationNotice) -> crate::unified_runtime::ErrorEvent {
+    use crate::unified_runtime::ErrorEvent;
+    let EscalationNotice {
+        event,
+        mut escalation,
+    } = notice;
+    match event.event {
+        EscalationEventKind::Resolved => ErrorEvent::MobAnnouncementEscalationResolved {
+            escalation_id: event.escalation_id,
+            cause: event.cause,
+            subject: event.subject,
+            resolved_at_ms: event.at_ms,
+            cursor: event.cursor,
+        },
+        kind => {
+            // The record as it stood at this event: open, at the event's
+            // count, though a later notification or the resolution may
+            // already have changed the stored one.
+            escalation.renotify_count = event.renotify_count;
+            escalation.resolved_at_ms = None;
+            ErrorEvent::MobAnnouncementEscalated {
+                escalation,
+                event: kind,
+                renotify_count: event.renotify_count,
+                cursor: event.cursor,
+            }
+        }
+    }
+}
 
 /// Configurable announcement policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +195,16 @@ impl AnnouncementConfig {
         self.child_limits
             .validate()
             .map_err(|error| Invalid(format!("child_member_limits: {error}")))?;
+        if self.renotify_after_ms < MIN_RENOTIFY_AFTER_MS {
+            return Err(Invalid(format!(
+                "renotify_after_ms must be at least {MIN_RENOTIFY_AFTER_MS}"
+            )));
+        }
+        for grant in &self.health_audience {
+            grant
+                .validate()
+                .map_err(|error| Invalid(format!("health_audience: {error}")))?;
+        }
         Ok(())
     }
 }
@@ -168,7 +220,7 @@ impl Default for AnnouncementConfig {
             peer_request_window_ms: crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS,
             child_limits: ChildMemberLimits::default(),
             member_tools_in_child_mobs: false,
-            renotify_after_ms: 0,
+            renotify_after_ms: DEFAULT_RENOTIFY_AFTER_MS,
             health_audience: Vec::new(),
         }
     }
@@ -419,6 +471,15 @@ struct Inner {
     /// Runner reconciles pass one at a time, each reading the source's
     /// record as it stands then.
     runners_gate: tokio::sync::Mutex<()>,
+    /// Whether the persisted markers were read into `markers`.
+    markers_loaded: AtomicBool,
+    /// When each member's marker was last persisted.
+    marker_writes: std::sync::Mutex<BTreeMap<Member, u64>>,
+    /// Where escalation events reach the host.
+    error_sink: std::sync::Mutex<Option<ErrorSink>>,
+    /// The last escalation event pushed to the host; read from the store at
+    /// the first pass, so events from before a restart are not pushed again.
+    pushed_cursor: std::sync::Mutex<Option<u64>>,
 }
 
 /// Keeps sources' runner schedules in line with their records: Meta's
@@ -601,6 +662,10 @@ impl AnnouncementService {
                 stopped: AtomicBool::new(false),
                 runners: std::sync::Mutex::new(None),
                 runners_gate: tokio::sync::Mutex::new(()),
+                markers_loaded: AtomicBool::new(false),
+                marker_writes: std::sync::Mutex::new(BTreeMap::new()),
+                error_sink: std::sync::Mutex::new(None),
+                pushed_cursor: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -610,7 +675,13 @@ impl AnnouncementService {
     }
 
     /// Send every escalation event to `sink` as it is written.
-    pub fn set_error_sink(&self, _sink: ErrorSink) {}
+    pub fn set_error_sink(&self, sink: ErrorSink) {
+        *self
+            .inner
+            .error_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
+    }
 
     /// Why the member's deliveries wait now, if they do: the latest
     /// classified outcome of an attempt for it.
@@ -624,41 +695,189 @@ impl AnnouncementService {
     }
 
     /// Record why the member's deliveries wait. The same wait on the same
-    /// evidence keeps the time it was first seen and shows its latest
-    /// detail. The marker is the latest attempt's: it can outlive the wait
-    /// it names (after a cancel, or once the batch settles) until the
-    /// member's next attempt or a restart.
-    fn mark(&self, member: &Member, cause: SuspendCause, evidence: EvidenceClass, now: u64) {
-        let mut markers = self
-            .inner
-            .markers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let since_ms = markers
-            .get(member)
-            .filter(|marker| marker.evidence == evidence && marker.cause.same_wait(&cause))
-            .map_or(now, |marker| marker.since_ms);
-        markers.insert(
-            member.clone(),
-            SuspendMarker {
+    /// evidence keeps the time it was first seen, across restarts too, and
+    /// shows its latest detail. The marker is the latest attempt's: it can
+    /// outlive the wait it names (after a cancel, or once the batch settles)
+    /// until the member's next attempt. It is persisted when its cause or
+    /// evidence changes, and at most once per failure report interval
+    /// otherwise; nothing reads it to decide a transition.
+    async fn mark(&self, member: &Member, cause: SuspendCause, evidence: EvidenceClass, now: u64) {
+        self.load_markers().await;
+        let (marker, changed) = {
+            let mut markers = self
+                .inner
+                .markers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let same = markers
+                .get(member)
+                .filter(|marker| marker.evidence == evidence && marker.cause.same_wait(&cause))
+                .map(|marker| marker.since_ms);
+            let marker = SuspendMarker {
                 cause,
                 evidence,
-                since_ms,
-            },
-        );
+                since_ms: same.unwrap_or(now),
+            };
+            markers.insert(member.clone(), marker.clone());
+            (marker, same.is_none())
+        };
+        let due = {
+            let mut writes = self
+                .inner
+                .marker_writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let due = changed
+                || writes
+                    .get(member)
+                    .is_none_or(|at| now.saturating_sub(*at) >= FAILURE_REPORT_INTERVAL_MS);
+            if due {
+                writes.insert(member.clone(), now);
+            }
+            due
+        };
+        if due
+            && let Err(error) = self
+                .inner
+                .store
+                .put_member_marker(member, Some(marker), now)
+                .await
+        {
+            tracing::warn!(member = %member, %error, "announcement member marker not persisted");
+        }
     }
 
     /// The member's deliveries move again.
-    fn unmark(&self, member: &Member) {
-        self.inner
+    async fn unmark(&self, member: &Member) {
+        self.load_markers().await;
+        let removed = self
+            .inner
             .markers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(member)
+            .is_some();
+        self.inner
+            .marker_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(member);
+        if removed
+            && let Err(error) = self
+                .inner
+                .store
+                .put_member_marker(member, None, self.now())
+                .await
+        {
+            tracing::warn!(member = %member, %error, "announcement member marker not removed");
+        }
+    }
+
+    /// Read the persisted markers once, so a wait seen before a restart
+    /// keeps its time.
+    async fn load_markers(&self) {
+        if self.inner.markers_loaded.load(Ordering::SeqCst) {
+            return;
+        }
+        match self.inner.store.member_markers().await {
+            Ok(persisted) => {
+                let mut markers = self
+                    .inner
+                    .markers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (member, marker) in persisted {
+                    markers.entry(member).or_insert(marker);
+                }
+                self.inner.markers_loaded.store(true, Ordering::SeqCst);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "announcement member markers not read");
+            }
+        }
     }
 
     fn now(&self) -> u64 {
         (self.inner.clock)()
+    }
+
+    /// The open escalations, of `subject` when one is named.
+    pub async fn open_escalations(
+        &self,
+        subject: Option<&EscalationSubject>,
+    ) -> Result<Vec<Escalation>, AnnouncementError> {
+        Ok(self.inner.store.open_escalations(subject).await?)
+    }
+
+    /// The escalation events after `after`, and the cursor to read on from.
+    pub async fn escalation_events(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<(Vec<EscalationEvent>, u64), AnnouncementError> {
+        Ok(self.inner.store.escalation_events(after, limit).await?)
+    }
+
+    /// The cursor of the last escalation event.
+    pub async fn last_escalation_cursor(&self) -> Result<u64, AnnouncementError> {
+        Ok(self.inner.store.last_escalation_cursor().await?)
+    }
+
+    /// What members/get reads about `member`.
+    pub async fn member_read(&self, member: &Member) -> Result<MemberRead, AnnouncementError> {
+        Ok(self.inner.store.member_read(member).await?)
+    }
+
+    /// What members/list reads.
+    pub async fn member_reads(
+        &self,
+        after: Option<&Member>,
+        limit: usize,
+        escalated: bool,
+    ) -> Result<Vec<MemberRead>, AnnouncementError> {
+        Ok(self
+            .inner
+            .store
+            .member_reads(after, limit, escalated)
+            .await?)
+    }
+
+    /// The live subscriptions a source's audience and routes bind.
+    pub async fn source_bound_subscriptions(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<u32, AnnouncementError> {
+        Ok(self
+            .inner
+            .store
+            .source_bound_subscriptions(mob_id, source_id)
+            .await?)
+    }
+
+    /// meta/status's mob announcement counts.
+    pub async fn status_counts(&self) -> Result<StatusCounts, AnnouncementError> {
+        Ok(self.inner.store.status_counts().await?)
+    }
+
+    /// Whether this gateway schedules sources' runners: a gateway with a
+    /// schedule service installed them.
+    pub fn runners_installed(&self) -> bool {
+        self.inner
+            .runners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Whether this gateway delivers to its own members: the fact the
+    /// subscription check reads.
+    pub fn local_delivery(&self) -> serde_json::Value {
+        match self.inner.native.governs_work_authority() {
+            Ok(false) => serde_json::json!({ "kind": "ready" }),
+            Ok(true) => serde_json::json!({ "kind": "refused", "cause": "governed_runtime" }),
+            Err(error) => serde_json::json!({ "kind": "unavailable", "detail": error.0 }),
+        }
     }
 
     /// Ask the dispatcher for a round.
@@ -716,6 +935,18 @@ impl AnnouncementService {
         &self,
         request: AnnounceRequest,
     ) -> Result<AnnounceOutcome, AnnouncementError> {
+        if request
+            .topics
+            .iter()
+            .any(|topic| topic.as_str() == super::escalations::HEALTH_TOPIC)
+        {
+            return Err(AnnouncementError::Store(AnnouncementStoreError::Invalid(
+                format!(
+                    "the topic {} is reserved for health announcements",
+                    super::escalations::HEALTH_TOPIC
+                ),
+            )));
+        }
         self.ensure_hosted(&BTreeSet::from([request.mob_id.clone()]))
             .await?;
         // The roster facts of the members whose subscriptions take a topic a
@@ -911,13 +1142,25 @@ impl AnnouncementService {
             .source_subscribers(&request.mob_id, &request.source_id)
             .await?;
         let facts = self.roster_facts(subscribers).await;
+        let subject = EscalationSubject::Source {
+            mob_id: request.mob_id.clone(),
+            source_id: request.source_id.clone(),
+        };
         let advance = self
             .inner
             .store
             .advance_source_with_facts(operation, request, &facts, self.now())
             .await?;
         super::faults::after_source_advance();
-        if advance.captured {
+        // An advance can end what an open escalation of its source reports
+        // (a failure streak, a quiet window): the next round settles it
+        // rather than the dispatcher's longest idle.
+        let escalated = match self.inner.store.open_escalations(Some(&subject)).await {
+            Ok(open) => !open.is_empty(),
+            // Not read: the next round settles it all the same.
+            Err(_) => true,
+        };
+        if advance.captured || escalated {
             self.wake();
         }
         Ok(advance)
@@ -930,11 +1173,13 @@ impl AnnouncementService {
         operation: &OperationId,
         request: RecordSourceFailure,
     ) -> Result<AnnouncementSource, AnnouncementError> {
-        Ok(self
+        let source = self
             .inner
             .store
             .record_source_failure(operation, request, self.now())
-            .await?)
+            .await?;
+        self.wake();
+        Ok(source)
     }
 
     /// Audited refusals and withholdings of sources' audiences and routes.
@@ -1357,7 +1602,7 @@ impl AnnouncementService {
 
     /// End every live subscription of a member that is gone for good.
     async fn end_member(&self, member: &Member, end: SubscriptionEnd, now: u64) {
-        self.unmark(member);
+        self.unmark(member).await;
         match self.inner.store.end_member(member, end.clone(), now).await {
             Ok(ended) if !ended.is_empty() => {
                 tracing::info!(
@@ -1669,7 +1914,101 @@ impl AnnouncementService {
                 None => {}
             }
         }
+        self.escalation_pass(now).await;
         Ok(report)
+    }
+
+    /// One escalation pass: raise and resolve every source and member
+    /// condition from the records as they stand, notify open escalations
+    /// again when due, and push the events it wrote to the host. A failure
+    /// leaves the next round to try again.
+    async fn escalation_pass(&self, now: u64) {
+        self.load_markers().await;
+        if self
+            .inner
+            .pushed_cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+        {
+            match self.inner.store.last_escalation_cursor().await {
+                Ok(cursor) => {
+                    *self
+                        .inner
+                        .pushed_cursor
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cursor);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "announcement escalation cursor not read");
+                    return;
+                }
+            }
+        }
+        let facts = match self.inner.store.health_subscribers().await {
+            Ok(members) => self.roster_facts(members).await,
+            Err(error) => {
+                tracing::warn!(%error, "announcement health subscribers not read");
+                RosterFacts::default()
+            }
+        };
+        let pass = EscalationPass {
+            renotify_after_ms: self.inner.config.renotify_after_ms,
+            health_audience: self.inner.config.health_audience.clone(),
+            retention_ms: self.inner.config.retention_ms,
+        };
+        if let Err(error) = self.inner.store.escalation_pass(pass, &facts, now).await {
+            tracing::warn!(%error, "announcement escalation pass failed; the next round retries");
+        }
+        self.push_escalations().await;
+    }
+
+    /// Push every escalation event after the last one pushed to the host's
+    /// error sink, in cursor order.
+    async fn push_escalations(&self) {
+        let sink = self
+            .inner
+            .error_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        loop {
+            let Some(after) = *self
+                .inner
+                .pushed_cursor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            else {
+                return;
+            };
+            let notices = match self
+                .inner
+                .store
+                .escalation_notices(after, super::types::MAX_PAGE)
+                .await
+            {
+                Ok(notices) => notices,
+                Err(error) => {
+                    tracing::warn!(%error, "announcement escalation events not read");
+                    return;
+                }
+            };
+            let full = notices.len() == super::types::MAX_PAGE;
+            for notice in notices {
+                let cursor = notice.event.cursor;
+                if let Some(sink) = &sink {
+                    sink(escalation_error_event(notice));
+                }
+                *self
+                    .inner
+                    .pushed_cursor
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cursor);
+            }
+            if !full {
+                return;
+            }
+        }
     }
 
     /// Seal a member's due backlog into one batch on its kept route. The
@@ -2708,7 +3047,7 @@ impl AnnouncementService {
             // An answered read ends the wait it marked; what it says decides
             // the batch.
             Ok(status) => {
-                self.unmark(&batch.member);
+                self.unmark(&batch.member).await;
                 Ok(StatusStep::Status(status))
             }
             Err(NativeStatusError::Unavailable {
@@ -2723,7 +3062,7 @@ impl AnnouncementService {
                     detail = %detail,
                     "announcement native status unavailable"
                 );
-                self.mark(&batch.member, cause, evidence, now);
+                self.mark(&batch.member, cause, evidence, now).await;
                 Ok(StatusStep::Wait)
             }
             Err(NativeStatusError::Blocked { cause, detail }) => Ok(StatusStep::Moved(Box::new(
@@ -2773,7 +3112,7 @@ impl AnnouncementService {
                     cause = %cause,
                     "announcement member cannot take a delivery now; the batch waits"
                 );
-                self.mark(&batch.member, cause, evidence, now);
+                self.mark(&batch.member, cause, evidence, now).await;
                 Err(PrepareStep::Waits)
             }
             Err(PrepareError::Unavailable(error)) => {
@@ -2832,7 +3171,7 @@ impl AnnouncementService {
     async fn submit(&self, batch: &Batch, now: u64) -> Result<SubmitStep, AnnouncementError> {
         let event = match self.inner.native.submit(batch, now).await {
             Ok(receipt) => {
-                self.unmark(&batch.member);
+                self.unmark(&batch.member).await;
                 BatchEvent::NativeCommitted { receipt }
             }
             Err(NativeSubmitError::NotCommitted { cause, evidence }) => {
@@ -2843,7 +3182,7 @@ impl AnnouncementService {
                     evidence = evidence.as_str(),
                     "announcement submission committed nothing; the batch is owed again"
                 );
-                self.mark(&batch.member, cause, evidence, now);
+                self.mark(&batch.member, cause, evidence, now).await;
                 self.apply(batch, BatchEvent::SubmitRefused, now).await?;
                 return Ok(SubmitStep::Owed);
             }
@@ -2859,7 +3198,7 @@ impl AnnouncementService {
                     detail = %detail,
                     "announcement submission outcome unknown; the native status will settle it"
                 );
-                self.mark(&batch.member, cause, evidence, now);
+                self.mark(&batch.member, cause, evidence, now).await;
                 return Ok(SubmitStep::ReadStatus);
             }
             Err(NativeSubmitError::Blocked { cause, detail }) => BatchEvent::Block {

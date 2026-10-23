@@ -2090,6 +2090,10 @@ async fn handle_unified_rpc_json_inner(
                     .cloned()
                     .unwrap_or(Value::Null);
             }
+            if let Some(announcements) = runtime.mob_announcements() {
+                result["mob_announcements"] =
+                    crate::mob_announcements::rpc::status_projection(&announcements).await;
+            }
             // Members created under one of the console's runtime-plane
             // identities before every creation path refused them.
             if let Some(reserved) =
@@ -2381,6 +2385,22 @@ async fn handle_unified_rpc_json_inner(
                 .resolved_storage()
                 .map(|summary| summary.status_json())
                 .unwrap_or(Value::Null);
+            let mut feature_capabilities = live
+                .map(crate::live_wiring::LiveRpcHandler::feature_capabilities)
+                .unwrap_or_default();
+            if runtime.mob_announcements().is_some() {
+                feature_capabilities.extend(
+                    crate::mob_announcements::rpc::announcement_feature_capabilities()
+                        .into_iter()
+                        .filter_map(|name| {
+                            crate::live_contracts::FeatureCapability::new(name).ok()
+                        }),
+                );
+            }
+            let announcement_capabilities = crate::mob_announcements::rpc::capabilities_projection(
+                runtime.mob_announcements().as_ref(),
+            )
+            .await;
             JsonRpcResponse {
                 jsonrpc: JSONRPC_VERSION.to_string(),
                 id: response_id,
@@ -2391,9 +2411,10 @@ async fn handle_unified_rpc_json_inner(
                     // the same live registration carries open authority and
                     // its mechanically derived bound-ready binder beside the
                     // sealed WebRTC answer transport.
-                    "feature_capabilities": live
-                        .map(crate::live_wiring::LiveRpcHandler::feature_capabilities)
-                        .unwrap_or_default(),
+                    "feature_capabilities": feature_capabilities,
+                    // Mob announcement sources, as this gateway runs them;
+                    // null when announcements are disabled.
+                    "mob_announcements": announcement_capabilities,
                     "runtime_type": "unified",
                     "methods": methods,
                     "storage": storage,

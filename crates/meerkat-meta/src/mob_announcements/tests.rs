@@ -7954,6 +7954,7 @@ fn the_walk_parses_every_declared_module_and_reexport() {
 fn every_public_announcement_enum_is_non_exhaustive() {
     let public_modules = [
         ("availability", include_str!("availability.rs")),
+        ("escalations", include_str!("escalations.rs")),
         ("native", include_str!("native.rs")),
         ("owner", include_str!("owner.rs")),
         ("remote", include_str!("remote.rs")),

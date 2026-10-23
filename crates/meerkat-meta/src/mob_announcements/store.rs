@@ -4,6 +4,11 @@ use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 
+use super::availability::SuspendMarker;
+use super::escalations::{
+    Escalation, EscalationEvent, EscalationNotice, EscalationPass, EscalationSubject, MemberRead,
+    StatusCounts,
+};
 use super::sources::{
     AdvanceSource, AnnouncementSource, AuditQuery, AuditRow, MemberFacts, PutSource,
     RecordSourceFailure, RosterFacts, SourceAdvance, SourceChange, SourceQuery, SourceStream,
@@ -498,6 +503,115 @@ pub trait AnnouncementStore: Send + Sync {
         let _ = query;
         Err(no_sources())
     }
+
+    /// One escalation pass, in one transaction: every source and member
+    /// condition raised or resolved, open escalations notified again when
+    /// due, events past the retention window pruned, and each new raise or
+    /// notification announced on the health topic to its audience, with the
+    /// roster `facts` of the topic's subscribers. Answers the events it
+    /// wrote.
+    async fn escalation_pass(
+        &self,
+        pass: EscalationPass,
+        facts: &RosterFacts,
+        now_ms: u64,
+    ) -> Result<Vec<EscalationNotice>> {
+        let _ = (pass, facts, now_ms);
+        Err(no_escalations())
+    }
+
+    /// The escalation events after `after`, at most `limit`, and the cursor
+    /// to read on from.
+    async fn escalation_events(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<(Vec<EscalationEvent>, u64)> {
+        let _ = (after, limit);
+        Err(no_escalations())
+    }
+
+    /// The escalation events after `after`, each with its escalation as it
+    /// stands: what the owner pushes to the host.
+    async fn escalation_notices(&self, after: u64, limit: usize) -> Result<Vec<EscalationNotice>> {
+        let _ = (after, limit);
+        Err(no_escalations())
+    }
+
+    /// The open escalations, of `subject` when one is named.
+    async fn open_escalations(
+        &self,
+        subject: Option<&EscalationSubject>,
+    ) -> Result<Vec<Escalation>> {
+        let _ = subject;
+        Err(no_escalations())
+    }
+
+    /// The cursor of the last escalation event; 0 before any.
+    async fn last_escalation_cursor(&self) -> Result<u64> {
+        Err(no_escalations())
+    }
+
+    /// The member's persisted suspend marker.
+    async fn member_marker(&self, member: &Member) -> Result<Option<SuspendMarker>> {
+        let _ = member;
+        Err(no_escalations())
+    }
+
+    /// Persist the member's suspend marker, or remove it with `None`.
+    async fn put_member_marker(
+        &self,
+        member: &Member,
+        marker: Option<SuspendMarker>,
+        now_ms: u64,
+    ) -> Result<()> {
+        let _ = (member, marker, now_ms);
+        Err(no_escalations())
+    }
+
+    /// Every persisted suspend marker.
+    async fn member_markers(&self) -> Result<Vec<(Member, SuspendMarker)>> {
+        Err(no_escalations())
+    }
+
+    /// What members/get reads about `member`.
+    async fn member_read(&self, member: &Member) -> Result<MemberRead> {
+        let _ = member;
+        Err(no_escalations())
+    }
+
+    /// What members/list reads: members after `after`, at most `limit`,
+    /// only those with an open escalation when `escalated`.
+    async fn member_reads(
+        &self,
+        after: Option<&Member>,
+        limit: usize,
+        escalated: bool,
+    ) -> Result<Vec<MemberRead>> {
+        let _ = (after, limit, escalated);
+        Err(no_escalations())
+    }
+
+    /// The members subscribed to the reserved health topic.
+    async fn health_subscribers(&self) -> Result<BTreeSet<Member>> {
+        Err(no_escalations())
+    }
+
+    /// The live subscriptions a source's audience and routes bind: those
+    /// that select one of its topics.
+    async fn source_bound_subscriptions(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<u32> {
+        let _ = (mob_id, source_id);
+        Err(no_sources())
+    }
+
+    /// meta/status's mob announcement counts.
+    async fn status_counts(&self) -> Result<StatusCounts> {
+        Err(no_escalations())
+    }
 }
 
 /// What the last check before a submission found.
@@ -514,4 +628,8 @@ pub enum SubmissionCheck {
 
 fn no_sources() -> AnnouncementStoreError {
     AnnouncementStoreError::Storage("this announcement store keeps no sources".to_string())
+}
+
+fn no_escalations() -> AnnouncementStoreError {
+    AnnouncementStoreError::Storage("this announcement store keeps no escalations".to_string())
 }

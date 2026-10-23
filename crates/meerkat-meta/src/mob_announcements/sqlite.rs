@@ -15,13 +15,21 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::availability::SuspendMarker;
+use super::escalations::{
+    CONFLICT_WINDOW_MS, Escalation, EscalationCause, EscalationEvent, EscalationEventKind,
+    EscalationNotice, EscalationPass, EscalationSubject, HEALTH_TOPIC, MemberBacklogRead,
+    MemberRead, QuietEvidence, SUSPENDED_ESCALATION_MS, StatusCounts, health_body, health_key,
+    health_topic,
+};
 use super::sources::{
-    AdvanceSource, AnnouncementSource, AuditAction, AuditQuery, AuditReason, AuditRow,
-    CollectionPhase, Coverage, CoverageGap, DeletionCapability, ItemChange, ItemOutcome,
+    AdvanceSource, AnnouncementSource, AudienceGrant, AuditAction, AuditQuery, AuditReason,
+    AuditRow, CollectionPhase, Coverage, CoverageGap, DeletionCapability, ItemChange, ItemOutcome,
     ItemOutcomeKind, MAX_SOURCES_PER_GATEWAY, MAX_SOURCES_PER_MOB, MAX_STREAMS_PER_SOURCE,
-    MemberFacts, OnboardingMode, Principal, PutSource, RecordSourceFailure, RosterFacts,
+    MemberFacts, Observed, OnboardingMode, Principal, PutSource, RecordSourceFailure, RosterFacts,
     SourceAdvance, SourceChange, SourceConfig, SourceConflictRecord, SourceFailureRecord,
-    SourceQuery, SourceState, SourceStream, StreamPhase, TopicOwnership, covers,
+    SourceHealthStatus, SourceQuery, SourceState, SourceStream, StreamPhase, TopicOwnership,
+    covers,
 };
 use super::store::{AnnouncementStore, SubmissionCheck};
 use super::types::{
@@ -151,7 +159,19 @@ CREATE TABLE IF NOT EXISTS announcement_holds (
 CREATE INDEX IF NOT EXISTS announcement_holds_by_member
  ON announcement_holds (member, checked_at_ms);
 CREATE INDEX IF NOT EXISTS announcement_holds_by_check
- ON announcement_holds (checked_at_ms);";
+ ON announcement_holds (checked_at_ms);
+CREATE TABLE IF NOT EXISTS announcement_escalations (
+ escalation_id TEXT NOT NULL PRIMARY KEY, cause TEXT NOT NULL, subject TEXT NOT NULL,
+ mob_id TEXT, open INTEGER NOT NULL, notified_at_ms INTEGER NOT NULL, record TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS announcement_escalations_open
+ ON announcement_escalations (cause, subject) WHERE open = 1;
+CREATE INDEX IF NOT EXISTS announcement_escalations_by_subject
+ ON announcement_escalations (subject);
+CREATE TABLE IF NOT EXISTS announcement_escalation_events (
+ cursor INTEGER PRIMARY KEY AUTOINCREMENT, escalation_id TEXT NOT NULL,
+ at_ms INTEGER NOT NULL, record TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS announcement_member_markers (
+ member TEXT NOT NULL PRIMARY KEY, written_at_ms INTEGER NOT NULL, record TEXT NOT NULL);";
 
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
@@ -4632,4 +4652,886 @@ impl AnnouncementStore for SqliteAnnouncementStore {
         let query = query.clone();
         self.run(move |db| sources_in(db, &query)).await
     }
+
+    async fn escalation_pass(
+        &self,
+        pass: EscalationPass,
+        facts: &RosterFacts,
+        now_ms: u64,
+    ) -> Result<Vec<EscalationNotice>> {
+        let facts = facts.clone();
+        self.run(move |db| escalation_pass_in(db, &pass, &facts, now_ms))
+            .await
+    }
+
+    async fn escalation_events(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<(Vec<EscalationEvent>, u64)> {
+        self.run(move |db| escalation_events_in(db, after, limit))
+            .await
+    }
+
+    async fn escalation_notices(&self, after: u64, limit: usize) -> Result<Vec<EscalationNotice>> {
+        self.run(move |db| escalation_notices_in(db, after, limit))
+            .await
+    }
+
+    async fn open_escalations(
+        &self,
+        subject: Option<&EscalationSubject>,
+    ) -> Result<Vec<Escalation>> {
+        let subject = subject.cloned();
+        self.run(move |db| open_escalations_in(db, subject.as_ref()))
+            .await
+    }
+
+    async fn last_escalation_cursor(&self) -> Result<u64> {
+        self.run(last_escalation_cursor_in).await
+    }
+
+    async fn member_marker(&self, member: &Member) -> Result<Option<SuspendMarker>> {
+        let member = member.clone();
+        self.run(move |db| member_marker_in(db, &member)).await
+    }
+
+    async fn put_member_marker(
+        &self,
+        member: &Member,
+        marker: Option<SuspendMarker>,
+        now_ms: u64,
+    ) -> Result<()> {
+        let member = member.clone();
+        self.run(move |db| put_member_marker_in(db, &member, marker.as_ref(), now_ms))
+            .await
+    }
+
+    async fn member_markers(&self) -> Result<Vec<(Member, SuspendMarker)>> {
+        self.run(member_markers_in).await
+    }
+
+    async fn member_read(&self, member: &Member) -> Result<MemberRead> {
+        let member = member.clone();
+        self.run(move |db| member_read_in(db, &member)).await
+    }
+
+    async fn member_reads(
+        &self,
+        after: Option<&Member>,
+        limit: usize,
+        escalated: bool,
+    ) -> Result<Vec<MemberRead>> {
+        let after = after.cloned();
+        self.run(move |db| members_in(db, after.as_ref(), limit, escalated))
+            .await
+    }
+
+    async fn health_subscribers(&self) -> Result<BTreeSet<Member>> {
+        self.run(health_subscribers_in).await
+    }
+
+    async fn source_bound_subscriptions(
+        &self,
+        mob_id: &MobId,
+        source_id: &SourceId,
+    ) -> Result<u32> {
+        let (mob_id, source_id) = (mob_id.clone(), source_id.clone());
+        self.run(move |db| source_bound_subscriptions_in(db, &mob_id, &source_id))
+            .await
+    }
+
+    async fn status_counts(&self) -> Result<StatusCounts> {
+        self.run(status_counts_in).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Escalations, persisted markers and member reads
+// ---------------------------------------------------------------------------
+
+/// Every source of every mob, in `(mob_id, source_id)` order.
+fn all_sources_in(db: &Connection) -> Result<Vec<AnnouncementSource>> {
+    let mut all = Vec::new();
+    let mut after = None;
+    loop {
+        let page = sources_in(
+            db,
+            &SourceQuery {
+                mob_id: None,
+                after: after.clone(),
+                state: None,
+                limit: MAX_PAGE,
+            },
+        )?;
+        let full = page.len() >= MAX_PAGE;
+        after = page
+            .last()
+            .map(|source| (source.mob_id.clone(), source.source_id.clone()));
+        all.extend(page);
+        if !full {
+            return Ok(all);
+        }
+    }
+}
+
+/// The open escalation of `cause` on `subject`, if any.
+fn open_escalation_in(
+    db: &Connection,
+    cause: EscalationCause,
+    subject: &EscalationSubject,
+) -> Result<Option<Escalation>> {
+    db.query_row(
+        "SELECT record FROM announcement_escalations
+         WHERE cause = ?1 AND subject = ?2 AND open = 1",
+        params![cause.as_str(), subject.key()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(storage)?
+    .map(|record| decode(&record))
+    .transpose()
+}
+
+fn write_escalation(db: &Connection, escalation: &Escalation, notified_at_ms: u64) -> Result<()> {
+    db.execute(
+        "INSERT INTO announcement_escalations
+         (escalation_id, cause, subject, mob_id, open, notified_at_ms, record)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(escalation_id) DO UPDATE SET open = excluded.open,
+           notified_at_ms = excluded.notified_at_ms, record = excluded.record",
+        params![
+            escalation.escalation_id,
+            escalation.cause.as_str(),
+            escalation.subject.key(),
+            escalation.subject.mob_id().map(MobId::as_str),
+            i64::from(escalation.resolved_at_ms.is_none()),
+            int(notified_at_ms)?,
+            encode(escalation)?,
+        ],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// Write `event` of `escalation` as the next event row, and answer it with
+/// its cursor.
+fn record_escalation_event(
+    db: &Connection,
+    escalation: &Escalation,
+    event: EscalationEventKind,
+    now_ms: u64,
+) -> Result<EscalationEvent> {
+    let record = EscalationEvent {
+        cursor: 0,
+        escalation_id: escalation.escalation_id.clone(),
+        event,
+        cause: escalation.cause,
+        subject: escalation.subject.clone(),
+        since_ms: escalation.since_ms,
+        at_ms: now_ms,
+        renotify_count: escalation.renotify_count,
+    };
+    db.execute(
+        "INSERT INTO announcement_escalation_events (escalation_id, at_ms, record)
+         VALUES (?1, ?2, ?3)",
+        params![escalation.escalation_id, int(now_ms)?, encode(&record)?],
+    )
+    .map_err(storage)?;
+    let cursor = uint(db.last_insert_rowid())?;
+    Ok(EscalationEvent { cursor, ..record })
+}
+
+/// Raise `cause` on `subject`, condition since `since_ms`: an open
+/// escalation of the pair is kept as it is, with no new event; otherwise a
+/// new one opens and its "raised" event is written in the same transaction.
+/// Idempotent; run inside the caller's store transaction.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the declaration and handling slices raise through it in their own transactions"
+    )
+)]
+pub(super) fn raise_escalation_in(
+    db: &Connection,
+    cause: EscalationCause,
+    subject: &EscalationSubject,
+    since_ms: u64,
+    now_ms: u64,
+) -> Result<()> {
+    raise_escalation_with_in(db, cause, subject, since_ms, None, now_ms).map(drop)
+}
+
+/// [`raise_escalation_in`], with a quiet source's evidence, answering the
+/// event it wrote, if it wrote one.
+fn raise_escalation_with_in(
+    db: &Connection,
+    cause: EscalationCause,
+    subject: &EscalationSubject,
+    since_ms: u64,
+    evidence: Option<QuietEvidence>,
+    now_ms: u64,
+) -> Result<Option<EscalationNotice>> {
+    if open_escalation_in(db, cause, subject)?.is_some() {
+        return Ok(None);
+    }
+    let escalation = Escalation {
+        escalation_id: format!("escalation-{}", uuid::Uuid::new_v4()),
+        cause,
+        subject: subject.clone(),
+        since_ms,
+        raised_at_ms: now_ms,
+        renotify_count: 0,
+        resolved_at_ms: None,
+        evidence,
+    };
+    write_escalation(db, &escalation, now_ms)?;
+    let event = record_escalation_event(db, &escalation, EscalationEventKind::Raised, now_ms)?;
+    Ok(Some(EscalationNotice { event, escalation }))
+}
+
+/// Close the open escalation of `cause` on `subject`, if any, with a
+/// "resolved" event; nothing otherwise. Idempotent; run inside the caller's
+/// store transaction.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the declaration and handling slices resolve through it in their own transactions"
+    )
+)]
+pub(super) fn resolve_escalation_in(
+    db: &Connection,
+    cause: EscalationCause,
+    subject: &EscalationSubject,
+    now_ms: u64,
+) -> Result<()> {
+    resolve_escalation_with_in(db, cause, subject, now_ms).map(drop)
+}
+
+fn resolve_escalation_with_in(
+    db: &Connection,
+    cause: EscalationCause,
+    subject: &EscalationSubject,
+    now_ms: u64,
+) -> Result<Option<EscalationNotice>> {
+    let Some(mut escalation) = open_escalation_in(db, cause, subject)? else {
+        return Ok(None);
+    };
+    escalation.resolved_at_ms = Some(now_ms);
+    write_escalation(db, &escalation, now_ms)?;
+    let event = record_escalation_event(db, &escalation, EscalationEventKind::Resolved, now_ms)?;
+    Ok(Some(EscalationNotice { event, escalation }))
+}
+
+/// Raise `cause` on `subject` when `since_ms` is `Some` (the condition
+/// holds, since then), resolve it otherwise; answer the event written.
+fn settle_escalation_in(
+    db: &Connection,
+    cause: EscalationCause,
+    subject: &EscalationSubject,
+    since_ms: Option<u64>,
+    evidence: Option<QuietEvidence>,
+    now_ms: u64,
+) -> Result<Option<EscalationNotice>> {
+    match since_ms {
+        Some(since_ms) => raise_escalation_with_in(db, cause, subject, since_ms, evidence, now_ms),
+        None => resolve_escalation_with_in(db, cause, subject, now_ms),
+    }
+}
+
+/// Notify again every open escalation notified longer than
+/// `renotify_after_ms` ago: the same id, a higher count, a "renotified"
+/// event.
+fn renotify_due_in(
+    db: &Connection,
+    renotify_after_ms: u64,
+    now_ms: u64,
+) -> Result<Vec<EscalationNotice>> {
+    let Some(due_before) = now_ms.checked_sub(renotify_after_ms) else {
+        return Ok(Vec::new());
+    };
+    let records: Vec<String> = {
+        let mut statement = db
+            .prepare(
+                "SELECT record FROM announcement_escalations
+                 WHERE open = 1 AND notified_at_ms <= ?1 ORDER BY escalation_id",
+            )
+            .map_err(storage)?;
+        statement
+            .query_map(params![int(due_before)?], |row| row.get(0))
+            .map_err(storage)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(storage)?
+    };
+    let mut notices = Vec::new();
+    for record in records {
+        let mut escalation: Escalation = decode(&record)?;
+        escalation.renotify_count = escalation.renotify_count.saturating_add(1);
+        write_escalation(db, &escalation, now_ms)?;
+        let event =
+            record_escalation_event(db, &escalation, EscalationEventKind::Renotified, now_ms)?;
+        notices.push(EscalationNotice { event, escalation });
+    }
+    Ok(notices)
+}
+
+fn escalations_where(
+    db: &Connection,
+    sql: &str,
+    values: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<Escalation>> {
+    let mut statement = db.prepare(sql).map_err(storage)?;
+    let records: Vec<String> = statement
+        .query_map(values, |row| row.get(0))
+        .map_err(storage)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(storage)?;
+    records.iter().map(|record| decode(record)).collect()
+}
+
+/// The open escalations, of `subject` when one is named.
+fn open_escalations_in(
+    db: &Connection,
+    subject: Option<&EscalationSubject>,
+) -> Result<Vec<Escalation>> {
+    match subject {
+        Some(subject) => escalations_where(
+            db,
+            "SELECT record FROM announcement_escalations
+             WHERE subject = ?1 AND open = 1 ORDER BY escalation_id",
+            &[&subject.key()],
+        ),
+        None => escalations_where(
+            db,
+            "SELECT record FROM announcement_escalations WHERE open = 1 ORDER BY escalation_id",
+            &[],
+        ),
+    }
+}
+
+/// The escalation events after `after`, at most `limit`, and the cursor to
+/// read on from: the last one read, or `after` when there is none.
+fn escalation_events_in(
+    db: &Connection,
+    after: u64,
+    limit: usize,
+) -> Result<(Vec<EscalationEvent>, u64)> {
+    let mut statement = db
+        .prepare(
+            "SELECT cursor, record FROM announcement_escalation_events
+             WHERE cursor > ?1 ORDER BY cursor LIMIT ?2",
+        )
+        .map_err(storage)?;
+    let rows: Vec<(i64, String)> = statement
+        .query_map(params![int(after)?, page(limit)?], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(storage)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(storage)?;
+    let mut next = after;
+    let mut events = Vec::with_capacity(rows.len());
+    for (cursor, record) in rows {
+        let cursor = uint(cursor)?;
+        let event: EscalationEvent = decode(&record)?;
+        next = cursor;
+        events.push(EscalationEvent { cursor, ..event });
+    }
+    Ok((events, next))
+}
+
+/// The escalation events after `after`, each with its escalation as it
+/// stands now: what the owner pushes to the host.
+fn escalation_notices_in(
+    db: &Connection,
+    after: u64,
+    limit: usize,
+) -> Result<Vec<EscalationNotice>> {
+    let (events, _) = escalation_events_in(db, after, limit)?;
+    let mut notices = Vec::with_capacity(events.len());
+    for event in events {
+        let record: Option<String> = db
+            .query_row(
+                "SELECT record FROM announcement_escalations WHERE escalation_id = ?1",
+                params![event.escalation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        if let Some(record) = record {
+            notices.push(EscalationNotice {
+                event,
+                escalation: decode(&record)?,
+            });
+        }
+    }
+    Ok(notices)
+}
+
+fn last_escalation_cursor_in(db: &Connection) -> Result<u64> {
+    let last: Option<i64> = db
+        .query_row(
+            "SELECT MAX(cursor) FROM announcement_escalation_events",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    last.map_or(Ok(0), uint)
+}
+
+/// The member's persisted suspend marker.
+fn member_marker_in(db: &Connection, member: &Member) -> Result<Option<SuspendMarker>> {
+    db.query_row(
+        "SELECT record FROM announcement_member_markers WHERE member = ?1",
+        params![member.key()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(storage)?
+    .map(|record| decode(&record))
+    .transpose()
+}
+
+/// Persist the member's marker, or remove it when `None`.
+fn put_member_marker_in(
+    db: &Connection,
+    member: &Member,
+    marker: Option<&SuspendMarker>,
+    now_ms: u64,
+) -> Result<()> {
+    match marker {
+        Some(marker) => db.execute(
+            "INSERT INTO announcement_member_markers (member, written_at_ms, record)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(member) DO UPDATE SET written_at_ms = excluded.written_at_ms,
+               record = excluded.record",
+            params![member.key(), int(now_ms)?, encode(marker)?],
+        ),
+        None => db.execute(
+            "DELETE FROM announcement_member_markers WHERE member = ?1",
+            params![member.key()],
+        ),
+    }
+    .map_err(storage)?;
+    Ok(())
+}
+
+fn member_markers_in(db: &Connection) -> Result<Vec<(Member, SuspendMarker)>> {
+    let mut statement = db
+        .prepare("SELECT member, record FROM announcement_member_markers ORDER BY member")
+        .map_err(storage)?;
+    let rows: Vec<(String, String)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(storage)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(storage)?;
+    rows.iter()
+        .map(|(member, record)| Ok((Member::from_key(member)?, decode(record)?)))
+        .collect()
+}
+
+fn count_in(db: &Connection, sql: &str, values: &[&dyn rusqlite::ToSql]) -> Result<u64> {
+    let count: i64 = db
+        .query_row(sql, values, |row| row.get(0))
+        .map_err(storage)?;
+    uint(count)
+}
+
+/// What members/get reads about one member.
+fn member_read_in(db: &Connection, member: &Member) -> Result<MemberRead> {
+    let key = member.key();
+    let backlog = backlog_for(db, member)?;
+    let held_audience = count_in(
+        db,
+        "SELECT COUNT(*) FROM announcement_holds WHERE member = ?1",
+        &[&key],
+    )?;
+    let withheld_audience = count_in(
+        db,
+        "SELECT COALESCE(SUM(count), 0) FROM announcement_audit
+         WHERE member = ?1 AND action = 'capture_withheld' AND reason = 'audience_not_covered'",
+        &[&key],
+    )?;
+    let last_sealed_at_ms: Option<i64> = db
+        .query_row(
+            "SELECT last_sealed_at_ms FROM announcement_members WHERE member = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?
+        .flatten();
+    let outstanding = count_in(
+        db,
+        "SELECT COUNT(*) FROM announcement_batches
+         WHERE member = ?1 AND state IN ('sealed', 'submitting', 'committed')",
+        &[&key],
+    )? > 0;
+    Ok(MemberRead {
+        member: member.clone(),
+        backlog: MemberBacklogRead {
+            eligible_count: backlog.as_ref().map_or(0, |backlog| backlog.eligible_count),
+            eligible_bytes: backlog.as_ref().map_or(0, |backlog| backlog.eligible_bytes),
+            oldest_captured_at_ms: backlog
+                .as_ref()
+                .map(|backlog| backlog.oldest_captured_at_ms),
+            last_sealed_at_ms: last_sealed_at_ms.map(uint).transpose()?,
+            outstanding,
+            held_audience,
+            held_unhandled: 0,
+            held_refused: 0,
+            withheld_audience,
+        },
+        marker: member_marker_in(db, member)?,
+        escalations: open_escalations_in(
+            db,
+            Some(&EscalationSubject::Member {
+                member: member.clone(),
+            }),
+        )?,
+    })
+}
+
+/// The members members/list reads: every member with a live subscription,
+/// a persisted marker or an open escalation, in key order after `after`;
+/// only those with an open escalation when `escalated`.
+fn members_in(
+    db: &Connection,
+    after: Option<&Member>,
+    limit: usize,
+    escalated: bool,
+) -> Result<Vec<MemberRead>> {
+    let mut statement = db
+        .prepare(
+            "SELECT member FROM (
+               SELECT member FROM member_subscriptions WHERE state IN ('active', 'paused')
+               UNION SELECT member FROM announcement_member_markers
+               UNION SELECT substr(subject, 8) FROM announcement_escalations
+                 WHERE open = 1 AND subject LIKE 'member:%')
+             WHERE member > ?1 ORDER BY member",
+        )
+        .map_err(storage)?;
+    let after = after.map(Member::key).unwrap_or_default();
+    let keys: Vec<String> = statement
+        .query_map(params![after], |row| row.get(0))
+        .map_err(storage)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(storage)?;
+    let mut members = Vec::new();
+    for key in keys {
+        if members.len() >= limit {
+            break;
+        }
+        let read = member_read_in(db, &Member::from_key(&key)?)?;
+        if escalated && read.escalations.is_empty() {
+            continue;
+        }
+        members.push(read);
+    }
+    Ok(members)
+}
+
+/// The members subscribed to the reserved health topic.
+fn health_subscribers_in(db: &Connection) -> Result<BTreeSet<Member>> {
+    let mut statement = db
+        .prepare(
+            "SELECT DISTINCT s.member FROM member_subscriptions s
+             JOIN member_subscription_topics t ON t.subscription_id = s.id
+             WHERE t.topic = ?1 AND s.state IN ('active', 'paused')",
+        )
+        .map_err(storage)?;
+    let keys: Vec<String> = statement
+        .query_map(params![HEALTH_TOPIC], |row| row.get(0))
+        .map_err(storage)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(storage)?;
+    keys.iter().map(|key| Member::from_key(key)).collect()
+}
+
+/// The live subscriptions a source's audience and routes bind: those that
+/// select one of its topics.
+fn source_bound_subscriptions_in(
+    db: &Connection,
+    mob_id: &MobId,
+    source_id: &SourceId,
+) -> Result<u32> {
+    let topics = source_topics(db, mob_id, source_id)?;
+    let mut bound = BTreeSet::new();
+    for subscription in subscriptions_for_topics(db, &topics)?.into_values() {
+        if matches!(
+            subscription.state,
+            SubscriptionState::Active | SubscriptionState::Paused
+        ) && subscription.selector.matches(mob_id, &topics)
+        {
+            bound.insert(subscription.id);
+        }
+    }
+    Ok(u32::try_from(bound.len()).unwrap_or(u32::MAX))
+}
+
+/// meta/status's counts.
+fn status_counts_in(db: &Connection) -> Result<StatusCounts> {
+    let mut counts = StatusCounts::default();
+    for source in all_sources_in(db)? {
+        match (source.state, source.health.status) {
+            (SourceState::Paused, _) => counts.sources_paused += 1,
+            (SourceState::Active, SourceHealthStatus::Failing) => {
+                counts.sources_active += 1;
+                counts.sources_failing += 1;
+            }
+            (SourceState::Active, SourceHealthStatus::Stale) => {
+                counts.sources_active += 1;
+                counts.sources_stale += 1;
+            }
+            (SourceState::Active, _) => counts.sources_active += 1,
+            _ => {}
+        }
+    }
+    counts.members_suspended =
+        count_in(db, "SELECT COUNT(*) FROM announcement_member_markers", &[])?;
+    counts.open_escalations = count_in(
+        db,
+        "SELECT COUNT(*) FROM announcement_escalations WHERE open = 1",
+        &[],
+    )?;
+    counts.last_event_cursor = last_escalation_cursor_in(db)?;
+    Ok(counts)
+}
+
+/// The evidence class of a quiet window's latest advance.
+fn quiet_evidence(source: &AnnouncementSource) -> QuietEvidence {
+    let health = &source.health;
+    if health.last_observed_at_ms.is_none()
+        || health.last_observed_at_ms != health.last_success_at_ms
+    {
+        return QuietEvidence::Unreported;
+    }
+    match health.last_observed {
+        Some(Observed::Delta) => QuietEvidence::DeltaConfirmed,
+        Some(Observed::Snapshot { records: 0 }) => QuietEvidence::SnapshotEmpty,
+        Some(Observed::Snapshot { .. }) => QuietEvidence::SnapshotNonempty,
+        None => QuietEvidence::Unreported,
+    }
+}
+
+/// What the escalation pass raises or resolves for one source: each source
+/// cause with the time its condition began, or `None` when it does not hold.
+fn source_conditions(
+    source: &AnnouncementSource,
+    now_ms: u64,
+) -> Vec<(EscalationCause, Option<u64>, Option<QuietEvidence>)> {
+    let active = source.state == SourceState::Active;
+    let health = &source.health;
+    let policy = &source.health_policy;
+    let last_success = health.last_success_at_ms.unwrap_or(source.created_at_ms);
+    let elapsed = |since: u64| now_ms.saturating_sub(since);
+    let failing = active
+        && health.consecutive_failures > 0
+        && (health.consecutive_failures >= policy.escalate_after_failures
+            || elapsed(last_success) >= policy.escalate_after_ms);
+    let stale = active && elapsed(last_success) >= policy.stale_after_ms;
+    let live = active && source.collection == CollectionPhase::Live;
+    let quiet = policy.quiet_after_ms.and_then(|window| {
+        let start = health
+            .last_new_item_at_ms
+            .unwrap_or(0)
+            .max(source.created_at_ms);
+        (live && elapsed(start) >= window && elapsed(last_success) < window).then_some(start)
+    });
+    let empty = policy.empty_after_ms.and_then(|window| {
+        health
+            .empty_snapshot_since_ms
+            .filter(|since| active && elapsed(*since) >= window)
+    });
+    let conflicts = health
+        .last_conflict
+        .as_ref()
+        .map(|conflict| conflict.at_ms)
+        .filter(|at| active && elapsed(*at) < CONFLICT_WINDOW_MS);
+    let gap = (active && health.totals.gaps > 0 && source.collection != CollectionPhase::Live)
+        .then_some(now_ms);
+    vec![
+        (
+            EscalationCause::FailureStreak,
+            failing.then_some(last_success),
+            None,
+        ),
+        (EscalationCause::Stale, stale.then_some(last_success), None),
+        (
+            EscalationCause::Quiet,
+            quiet,
+            quiet.map(|_| quiet_evidence(source)),
+        ),
+        (EscalationCause::EmptyCoverage, empty, None),
+        (EscalationCause::Conflicts, conflicts, None),
+        (EscalationCause::SourceGap, gap, None),
+    ]
+}
+
+/// Announce `notice` to the agents `audience` covers on the reserved health
+/// topic of its mob: a host announcement with a typed body. A member outside
+/// the audience that subscribes to the topic captures nothing.
+fn announce_health_in(
+    db: &Connection,
+    notice: &EscalationNotice,
+    audience: &[AudienceGrant],
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<()> {
+    let escalation = &notice.escalation;
+    let Some(mob_id) = escalation.subject.mob_id() else {
+        return Ok(());
+    };
+    if audience.is_empty() || notice.event.event == EscalationEventKind::Resolved {
+        return Ok(());
+    }
+    let request = AnnounceRequest {
+        mob_id: mob_id.clone(),
+        announced_by: Announcer::Host,
+        source_key: SourceKey::new(health_key(escalation))?,
+        topics: [health_topic()?].into(),
+        body: health_body(escalation, notice.event.event),
+        correlation_id: None,
+        causes: Vec::new(),
+    };
+    let outcome = announce_health_unchecked_in(db, &request, facts, now_ms)?;
+    for subscription_id in outcome.captured_for {
+        let Some(subscription) = load_subscription(db, &subscription_id)? else {
+            continue;
+        };
+        if !covers(
+            audience,
+            &subscription.member,
+            facts.get(&subscription.member),
+        ) {
+            db.execute(
+                "DELETE FROM owed_announcements
+                 WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3",
+                params![
+                    subscription_id.as_str(),
+                    outcome.announcement.mob_id.as_str(),
+                    int(outcome.announcement.sequence)?,
+                ],
+            )
+            .map_err(storage)?;
+        }
+    }
+    Ok(())
+}
+
+/// The escalation pass's own announce: the health topic is reserved, so it
+/// is opened only here.
+fn announce_health_unchecked_in(
+    db: &Connection,
+    request: &AnnounceRequest,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<AnnounceOutcome> {
+    announce_in(db, request, facts, now_ms)
+}
+
+/// One escalation pass, in one transaction: every source cause raised or
+/// resolved from the source records as they stand, the member causes from
+/// the persisted markers, holds and gaps, open escalations notified again
+/// when due, events past the retention window pruned, and each new raise or
+/// notification announced on the health topic to its audience.
+fn escalation_pass_in(
+    db: &Connection,
+    pass: &EscalationPass,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<Vec<EscalationNotice>> {
+    let mut notices = Vec::new();
+    let mut audiences: BTreeMap<String, Vec<AudienceGrant>> = BTreeMap::new();
+    for source in all_sources_in(db)? {
+        let subject = EscalationSubject::Source {
+            mob_id: source.mob_id.clone(),
+            source_id: source.source_id.clone(),
+        };
+        audiences.insert(subject.key(), source.audience.clone());
+        for (cause, since_ms, evidence) in source_conditions(&source, now_ms) {
+            notices.extend(settle_escalation_in(
+                db, cause, &subject, since_ms, evidence, now_ms,
+            )?);
+        }
+    }
+    let markers: BTreeMap<Member, SuspendMarker> = member_markers_in(db)?.into_iter().collect();
+    let mut members: BTreeSet<Member> = markers.keys().cloned().collect();
+    for escalation in open_escalations_in(db, None)? {
+        if let EscalationSubject::Member { member } = escalation.subject {
+            members.insert(member);
+        }
+    }
+    for key in [
+        "SELECT DISTINCT member FROM announcement_holds",
+        "SELECT DISTINCT member FROM announcement_gaps",
+    ] {
+        let mut statement = db.prepare(key).map_err(storage)?;
+        let keys: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .map_err(storage)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(storage)?;
+        for member in keys {
+            members.insert(Member::from_key(&member)?);
+        }
+    }
+    for member in members {
+        let subject = EscalationSubject::Member {
+            member: member.clone(),
+        };
+        let key = member.key();
+        let suspended = markers
+            .get(&member)
+            .map(|marker| marker.since_ms)
+            .filter(|since| now_ms.saturating_sub(*since) >= SUSPENDED_ESCALATION_MS);
+        let held_since: Option<i64> = db
+            .query_row(
+                "SELECT MIN(held_at_ms) FROM announcement_holds WHERE member = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        let gaps = count_in(
+            db,
+            "SELECT COUNT(*) FROM announcement_gaps WHERE member = ?1",
+            &[&key],
+        )?;
+        let conditions = [
+            (EscalationCause::Suspended, suspended),
+            (
+                EscalationCause::AudienceHold,
+                held_since.map(uint).transpose()?,
+            ),
+            (EscalationCause::MemberGap, (gaps > 0).then_some(now_ms)),
+        ];
+        for (cause, since_ms) in conditions {
+            notices.extend(settle_escalation_in(
+                db, cause, &subject, since_ms, None, now_ms,
+            )?);
+        }
+    }
+    notices.extend(renotify_due_in(db, pass.renotify_after_ms, now_ms)?);
+    if let Some(before) = now_ms.checked_sub(pass.retention_ms) {
+        db.execute(
+            "DELETE FROM announcement_escalation_events WHERE at_ms < ?1",
+            params![int(before)?],
+        )
+        .map_err(storage)?;
+        db.execute(
+            "DELETE FROM announcement_escalations WHERE open = 0 AND notified_at_ms < ?1",
+            params![int(before)?],
+        )
+        .map_err(storage)?;
+    }
+    for notice in &notices {
+        let audience = match &notice.escalation.subject {
+            EscalationSubject::Member { .. } => pass.health_audience.as_slice(),
+            subject => audiences.get(&subject.key()).map_or(&[][..], Vec::as_slice),
+        };
+        announce_health_in(db, notice, audience, facts, now_ms)?;
+    }
+    Ok(notices)
 }

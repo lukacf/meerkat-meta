@@ -958,3 +958,53 @@ fn escalation_options_default_to_a_day_and_no_health_audience() {
     assert_eq!(parsed.renotify_after_ms, 2 * DAY);
     assert_eq!(parsed.health_audience.len(), 1);
 }
+
+/// The raise and resolve the declaration and handling slices call inside
+/// their own store transactions are idempotent: a second raise of an open
+/// escalation keeps it as it is and writes no event, a resolve without an
+/// open one writes nothing, and each write is one event at the next cursor.
+#[tokio::test]
+async fn the_escalation_api_is_idempotent_inside_a_store_transaction() {
+    use super::escalations::{
+        DeclarationRecordKind, EscalationCause, EscalationEventKind, EscalationSubject,
+    };
+    use super::sqlite::{SqliteAnnouncementStore, raise_escalation_in, resolve_escalation_in};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mob_announcements.sqlite3");
+    let store = SqliteAnnouncementStore::open(&path).unwrap();
+    let subject = EscalationSubject::Declaration {
+        record_kind: DeclarationRecordKind::Subscription,
+        id: "sub-1".to_string(),
+    };
+    let pending = EscalationCause::DeclarationPending;
+    let mut db = rusqlite::Connection::open(&path).unwrap();
+    let transaction = db.transaction().unwrap();
+    raise_escalation_in(&transaction, pending, &subject, 10, 20).unwrap();
+    raise_escalation_in(&transaction, pending, &subject, 15, 25).unwrap();
+    resolve_escalation_in(&transaction, EscalationCause::Stale, &subject, 25).unwrap();
+    transaction.commit().unwrap();
+    let open = store.open_escalations(None).await.unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].since_ms, 10, "the second raise kept the open one");
+    assert_eq!(open[0].raised_at_ms, 20);
+
+    let transaction = db.transaction().unwrap();
+    resolve_escalation_in(&transaction, pending, &subject, 30).unwrap();
+    resolve_escalation_in(&transaction, pending, &subject, 35).unwrap();
+    transaction.commit().unwrap();
+    assert!(store.open_escalations(None).await.unwrap().is_empty());
+    let (events, next) = store.escalation_events(0, 10).await.unwrap();
+    let kinds: Vec<_> = events.iter().map(|event| event.event).collect();
+    assert_eq!(
+        kinds,
+        [EscalationEventKind::Raised, EscalationEventKind::Resolved]
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.escalation_id == open[0].escalation_id)
+    );
+    assert_eq!(next, events[1].cursor);
+    assert!(events[0].cursor < events[1].cursor);
+}

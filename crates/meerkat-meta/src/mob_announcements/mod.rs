@@ -36,6 +36,7 @@
 //! per announcement.
 
 pub mod availability;
+pub mod escalations;
 mod faults;
 pub mod native;
 pub mod owner;
@@ -63,6 +64,10 @@ pub use availability::{
     BlockCause, DepartureEvidence, EvidenceClass, MemberDeparture, NotServedHereCause,
     SuspendCause, SuspendMarker,
 };
+pub use escalations::{
+    DeclarationRecordKind, Escalation, EscalationCause, EscalationEvent, EscalationEventKind,
+    EscalationSubject, HEALTH_TOPIC, MemberBacklogRead, MemberRead, QuietEvidence,
+};
 pub use native::{
     ANNOUNCEMENT_CONTINUATION_NAMESPACE, AnnouncementNativeDelivery, IdentityService, MemberMobEnd,
     MemberMobScan, MemberProblem, MemberRoute, MobNativeDelivery, MobPresence, NativeDelivery,
@@ -71,8 +76,8 @@ pub use native::{
 };
 pub use owner::{
     AdmittedInput, AnnouncementConfig, AnnouncementError, AnnouncementService,
-    DEFAULT_RETENTION_MS, DeliveryObservation, MIN_RETENTION_MS, NativeObservation, RoundReport,
-    SourceRunners,
+    DEFAULT_RENOTIFY_AFTER_MS, DEFAULT_RETENTION_MS, DeliveryObservation, ErrorSink,
+    MIN_RETENTION_MS, NativeObservation, RoundReport, SourceRunners,
 };
 pub use remote::{KeyedInjectServer, RemoteMemberDelivery};
 pub use sources::{
@@ -114,6 +119,10 @@ struct AnnouncementOptions {
     member_tools_in_child_mobs: bool,
     #[serde(default)]
     child_member_limits: Option<ChildMemberLimitOptions>,
+    #[serde(default)]
+    renotify_after_ms: Option<u64>,
+    #[serde(default)]
+    health_audience: Option<Vec<sources::AudienceGrant>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -229,6 +238,12 @@ pub fn parse_options(
         let current = &mut config.child_limits;
         current.subscriptions = limits.subscriptions.unwrap_or(current.subscriptions);
         current.per_mob = limits.per_mob.unwrap_or(current.per_mob);
+    }
+    if let Some(renotify_after_ms) = options.renotify_after_ms {
+        config.renotify_after_ms = renotify_after_ms;
+    }
+    if let Some(health_audience) = options.health_audience {
+        config.health_audience = health_audience;
     }
     config
         .validate()
@@ -356,6 +371,8 @@ impl AnnouncementComposition {
         let member_limits = config.member_limits;
         let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config)
             .map_err(|error| error.to_string())?;
+        // Escalation events reach the host through the gateway's error hook.
+        service.set_error_sink(runtime.error_sink());
         if !runtime.attach_mob_announcements(service.clone()) {
             return Err("mob announcements are already attached to this runtime".to_string());
         }
