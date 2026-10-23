@@ -843,15 +843,24 @@ async def test_confirmed_exact_owner_recovers_two_unknown_slots_across_restart_w
     assert len(other_runtime.calls) == 1
 
 
+class TransportTimedOut:
+    """The native request is sent, then its transport times out: its outcome stays unknown."""
+
+    async def wait(self):
+        raise TimeoutError("inert transport timeout specimen")
+
+
 @pytest.mark.asyncio
 async def test_wrong_or_stale_owner_confirmation_cannot_release_other_live_generation(tmp_path):
     operations, runtime_A, runtime_B = Operations(), Runtime(), Runtime()
     current = {"runtime": runtime_A}
     owners = {runtime_A: OWNER_A, runtime_B: OWNER_B}
+    # No wall-clock budget decides whether a review is dispatched: each native
+    # request is sent and then times out in its transport, so both stay live.
     review = VisualizationReviewService(runtime=lambda: current["runtime"], runtime_owner_id=lambda exact: owners.get(exact),
-        operations=operations, expected_renderer_hash=RENDERER, root=tmp_path, timeout=0.01)
+        operations=operations, expected_renderer_hash=RENDERER, root=tmp_path)
     runtime_A.service = runtime_B.service = review
-    runtime_A.release = runtime_B.release = asyncio.Event()
+    runtime_A.release = runtime_B.release = TransportTimedOut()
     first = await review.submit(**source(operations, "A"))
     await finish(review)
     current["runtime"] = runtime_B
