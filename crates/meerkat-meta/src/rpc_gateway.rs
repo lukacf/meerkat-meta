@@ -2617,6 +2617,23 @@ default_binding = "local"
                 .await
         }
 
+        async fn commit_prepared_whole_blob_run_rebase(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            rebase: meerkat_runtime::store::PreparedWholeBlobRunRebaseStoreParts,
+        ) -> Result<
+            meerkat_runtime::store::WholeBlobRunRebaseOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .commit_prepared_whole_blob_run_rebase(runtime_id, rebase)
+                .await
+        }
+
+        fn supports_whole_blob_run_rebase(&self) -> bool {
+            self.inner.supports_whole_blob_run_rebase()
+        }
+
         async fn atomic_apply(
             &self,
             runtime_id: &meerkat_runtime::LogicalRuntimeId,

@@ -422,6 +422,20 @@ impl RuntimeStore for BodyReadCountingRuntimeStore {
             .await
     }
 
+    async fn commit_prepared_whole_blob_run_rebase(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        rebase: PreparedWholeBlobRunRebaseStoreParts,
+    ) -> Result<WholeBlobRunRebaseOutcome, RuntimeStoreError> {
+        self.inner
+            .commit_prepared_whole_blob_run_rebase(runtime_id, rebase)
+            .await
+    }
+
+    fn supports_whole_blob_run_rebase(&self) -> bool {
+        self.inner.supports_whole_blob_run_rebase()
+    }
+
     async fn atomic_apply(
         &self,
         runtime_id: &LogicalRuntimeId,

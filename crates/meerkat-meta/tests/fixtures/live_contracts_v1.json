@@ -98,6 +98,56 @@
       "mode": "transcript_only"
     }
   },
+  "channel_handle_with_advisories": {
+    "channel_id": "live-ch-1",
+    "target_identity": "identity:example",
+    "transport": {
+      "transport": "websocket",
+      "url": "wss://gateway.example/live/ws",
+      "token": "fixture-token"
+    },
+    "capabilities": {
+      "audio_in": true,
+      "audio_out": true,
+      "text_in": true,
+      "text_out": true,
+      "image_in": true,
+      "video_in": false,
+      "transcript_supported": true,
+      "barge_in_supported": true,
+      "provider_native_resume": false
+    },
+    "continuity": {
+      "mode": "transcript_only"
+    },
+    "advisories": ["staged_prompt_refused", "a_future_advisory"]
+  },
+  "pending_channel_handle_with_advisories": {
+    "channel_id": "live-ch-1",
+    "target_identity": "identity:example",
+    "execution_mode": "client_context",
+    "pending_receipt": "opaque-pending-receipt",
+    "transport": {
+      "transport": "webrtc",
+      "token": "fixture-token",
+      "answer_method": "live/webrtc/answer"
+    },
+    "capabilities": {
+      "audio_in": true,
+      "audio_out": true,
+      "text_in": false,
+      "text_out": true,
+      "image_in": false,
+      "video_in": false,
+      "transcript_supported": true,
+      "barge_in_supported": true,
+      "provider_native_resume": false
+    },
+    "continuity": {
+      "mode": "transcript_only"
+    },
+    "advisories": ["staged_prompt_refused", "a_future_advisory"]
+  },
   "active_channel_handle": {
     "channel_id": "live-ch-1",
     "target_identity": "identity:example",

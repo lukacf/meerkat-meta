@@ -78,6 +78,72 @@ fn binding(owner: &str, key: &str) -> ContinuationKeyBinding {
     }
 }
 
+/// Store parts of a real WholeBlob run re-base, prepared over an in-memory
+/// store of its own. The probe answers without reading them, but only the
+/// runtime's preparation mints the value the call takes.
+async fn run_rebase_parts() -> meerkat_runtime::store::PreparedWholeBlobRunRebaseStoreParts {
+    use meerkat_core::types::{Message, UserMessage};
+
+    let source = meerkat_runtime::InMemoryRuntimeStore::new();
+    let mut original = meerkat_core::Session::new();
+    original.push(Message::User(UserMessage::text("hello".to_string())));
+    original.push(Message::User(UserMessage::text("again".to_string())));
+    let runtime_id = LogicalRuntimeId::for_session(original.id());
+    source
+        .commit_session_snapshot(
+            &runtime_id,
+            meerkat_runtime::store::SerializedSessionSnapshot {
+                session_snapshot: serde_json::to_vec(&original)
+                    .expect("the session serializes")
+                    .into(),
+            },
+        )
+        .await
+        .expect("the committed base lands");
+    let committed = source
+        .load_committed_whole_blob_snapshot(&runtime_id)
+        .await
+        .expect("the committed base loads")
+        .expect("a committed base");
+    let payload = meerkat_runtime::store::VerifiedCommittedWholeBlobPayload::from_committed(
+        original.id(),
+        committed,
+    )
+    .expect("the committed base verifies");
+    let run_id = meerkat_core::lifecycle::RunId::new();
+    let mut live = original.clone();
+    live.push(Message::User(UserMessage::text("next".to_string())));
+    live.set_run_cursor(&meerkat_core::SessionRunCursor::new(
+        run_id.clone(),
+        Vec::new(),
+        0,
+        meerkat_core::RunResumePoint::AwaitingModel,
+    ))
+    .expect("the run cursor is recorded");
+    let mut compacted = live.clone();
+    let parent = compacted
+        .transcript_revision()
+        .expect("the live transcript has a revision");
+    let commit = compacted
+        .commit_transcript_rewrite(
+            meerkat_core::TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+            vec![Message::User(UserMessage::compaction_summary("compacted"))],
+            meerkat_core::TranscriptRewriteReason::new("compaction"),
+            Some("forwarding-probe-rebase".to_string()),
+            Some(parent),
+        )
+        .expect("the compaction rewrite commits");
+    meerkat_runtime::store::PreparedWholeBlobRunRebase::prepare(
+        payload,
+        None,
+        run_id,
+        compacted,
+        std::slice::from_ref(&commit),
+    )
+    .expect("the run re-base prepares")
+    .store_parts()
+}
+
 /// Drive every forwarded method through `store`, a decorator over `probe`,
 /// and require the probe's own answer from exactly one call of each.
 pub(crate) async fn assert_forwards_to(
@@ -167,6 +233,18 @@ pub(crate) async fn assert_forwards_to(
         Some(COMMIT_OUTCOME_DEADLINE),
         "the inner store's commit outcome deadline"
     );
+    assert!(
+        store.supports_whole_blob_run_rebase(),
+        "the inner store's run re-base support"
+    );
+    let rebase = run_rebase_parts().await;
+    assert_eq!(
+        store
+            .commit_prepared_whole_blob_run_rebase(&address, rebase)
+            .await
+            .expect("the inner store's outcome"),
+        meerkat_runtime::store::WholeBlobRunRebaseOutcome::Stale
+    );
     assert_eq!(
         probe.calls(),
         vec![
@@ -181,6 +259,8 @@ pub(crate) async fn assert_forwards_to(
             "load_delivery_generation",
             "delivery_generation_reader",
             "commit_outcome_deadline",
+            "supports_whole_blob_run_rebase",
+            "commit_prepared_whole_blob_run_rebase",
         ],
         "each method reaches the inner store exactly once"
     );
@@ -304,6 +384,22 @@ mod store_impl {
         fn commit_outcome_deadline(&self) -> Option<std::time::Duration> {
             self.record("commit_outcome_deadline");
             Some(COMMIT_OUTCOME_DEADLINE)
+        }
+
+        // The trait default answers `false`.
+        fn supports_whole_blob_run_rebase(&self) -> bool {
+            self.record("supports_whole_blob_run_rebase");
+            true
+        }
+
+        // The trait default refuses with `Unsupported`.
+        async fn commit_prepared_whole_blob_run_rebase(
+            &self,
+            _runtime_id: &LogicalRuntimeId,
+            _rebase: meerkat_runtime::store::PreparedWholeBlobRunRebaseStoreParts,
+        ) -> Result<meerkat_runtime::store::WholeBlobRunRebaseOutcome, RuntimeStoreError> {
+            self.record("commit_prepared_whole_blob_run_rebase");
+            Ok(meerkat_runtime::store::WholeBlobRunRebaseOutcome::Stale)
         }
 
         async fn commit_session_snapshot(

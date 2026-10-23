@@ -86,6 +86,24 @@ TRAIT_SPECS: tuple[TraitSpec, ...] = (
         source_relpath="src/service/mod.rs",
         min_expected_methods=4,
     ),
+    # The other two base traits MobSessionService requires. Unchecked until
+    # 2026-10-23, when a scan found both decorators answering the defaults of
+    # `append_authenticated_system_context` and
+    # `append_authorized_system_context` (typed `Unavailable`, so a governed
+    # append through the mob's service failed) and of `send_comms` (a send
+    # on the raw comms runtime instead of the inner service's own send).
+    TraitSpec(
+        name="SessionServiceCommsExt",
+        package="meerkat-core",
+        source_relpath="src/service/mod.rs",
+        min_expected_methods=4,
+    ),
+    TraitSpec(
+        name="SessionServiceControlExt",
+        package="meerkat-core",
+        source_relpath="src/service/mod.rs",
+        min_expected_methods=4,
+    ),
     TraitSpec(
         name="RuntimeStore",
         package="meerkat-runtime",

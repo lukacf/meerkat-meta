@@ -51,6 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   session_id }`: the roster compile or wake that meets a member the host made
   directly on the mob under the identity's member id. An exhaustive match on
   `IdentityRuntimeError` adds the arm.
+- `LiveChannelHandle` and `PendingLiveChannelHandle` gain `advisories:
+  Vec<WireLiveOpenAdvisory>`, what the open went ahead without (see Fixed).
+  Rust code that builds either handle as a struct literal adds the field
+  (`Vec::new()` for none); `from_open_result` and `new` carry it from
+  Meerkat's `LiveOpenResult`. On the wire the key is left out when empty.
+  Older Meta crates, older Python and TypeScript SDKs and an outdated
+  embedded console refuse a live channel handle that carries `advisories`,
+  which is only sent after a hook refuses a staged prompt; upgrade clients
+  together with the gateway.
 
 ### Added
 
@@ -1057,6 +1066,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   for it. A live member the identity runtime spawned (its spawn carries the
   `agent_identity` label) without its record is still refused, and so is a
   member an export entry names.
+- A voice-first member's staged create-time prompt reaches the realtime model.
+  A member created with its first turn deferred and its prompt staged
+  (`InitialTurnPolicy::Defer` with `DeferredPromptPolicy::Stage`) and then
+  opened with `meta/live/open` had its prompt held back until its first text
+  turn. The open now delivers it once, through the
+  `RunStarted` hooks a turn carrying it would run, as the member's newest user
+  row before the seed is read. As in Meerkat's ordinary open, the delivery
+  takes the member's turn boundary, which the seed read waits for anyway, so
+  it adds no wait; a member with nothing staged costs the open nothing. On an
+  `openai-live` gateway Meerkat's own open projections deliver it. A hook that refuses the prompt keeps it staged for
+  the first text turn and the open goes ahead without it: the `meta/live/open`
+  result, the pending handle (also from `meta/console/voice/open`) and a
+  replacement handle carry `advisories: ["staged_prompt_refused"]`, a key left
+  out when there are none. The Python and TypeScript SDK handles carry
+  `advisories` too, keeping an advisory they do not know as the string the
+  server sent and failing closed only on a malformed field.
+- A mob member whose session persists HeadCanonical serves its next turn
+  after a compaction that staged memory, as Meerkat 0.9.5 fixes it: the live
+  actor adopts the runtime's metadata-only compaction finalization through
+  `SessionService::acknowledge_runtime_compaction_finalization`. Meta's two
+  mob session-service wrappers now forward that acknowledgement; the trait
+  default refuses it, which would have kept the refused turn for those
+  members. Both wrappers also forward three methods they answered with
+  trait defaults until now. The authenticated and authorized system-context
+  appends refused with the default `Unavailable`, so the outcome of a
+  governed live delegation through a mob, which is appended to the member's
+  session, was refused as `Unavailable`. `send_comms` sent on the raw comms
+  runtime instead of through the wrapped service. The decorator conformance
+  check (`scripts/verify-session-service-decorators.py`) now covers the comms
+  and control extension traits as well.
 - `meta_gateway storage-migrate-native` writes no first-boot row for a retired
   member the host made directly on the mob (a helper or a fork child): the
   census admits it as `raw_member`, as it does a live one. Before, it planned

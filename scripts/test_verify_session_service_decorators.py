@@ -187,6 +187,36 @@ impl meerkat_core::SessionServiceHistoryExt for ForwardingService {
 '''
 
 
+CONTROL_EXT_TRAIT_SRC = '''
+pub trait SessionServiceControlExt: SessionService {
+    async fn append_system_context(
+        &self,
+        id: &SessionId,
+        req: AppendSystemContextRequest,
+    ) -> Result<AppendSystemContextResult, SessionControlError>;
+    async fn append_authenticated_system_context(
+        &self,
+        control: Arc<SystemContextControlRequest>,
+    ) -> Result<AppendSystemContextResult, SessionControlError> {
+        let _ = control;
+        Err(crate::OperationAuthorizationError::Unavailable.into())
+    }
+}
+'''
+
+CONTROL_EXT_IMPL_SRC = '''
+impl meerkat_core::service::SessionServiceControlExt for ForwardingService {
+    async fn append_system_context(
+        &self,
+        id: &SessionId,
+        req: AppendSystemContextRequest,
+    ) -> Result<AppendSystemContextResult, SessionControlError> {
+        self.inner.append_system_context(id, req).await
+    }
+}
+'''
+
+
 class DecoratorConformanceGate(unittest.TestCase):
     def test_runtime_store_spec_is_checked_and_exemption_needs_a_reason(self) -> None:
         spec = next(s for s in gate.TRAIT_SPECS if s.name == "RuntimeStore")
@@ -238,10 +268,33 @@ class DecoratorConformanceGate(unittest.TestCase):
     def test_every_spec_is_addressed_by_name(self) -> None:
         self.assertEqual(
             [s.name for s in gate.TRAIT_SPECS],
-            ["MobSessionService", "SessionService", "SessionServiceHistoryExt", "RuntimeStore"],
+            [
+                "MobSessionService",
+                "SessionService",
+                "SessionServiceHistoryExt",
+                "SessionServiceCommsExt",
+                "SessionServiceControlExt",
+                "RuntimeStore",
+            ],
         )
-        for spec in gate.TRAIT_SPECS[:3]:
-            self.assertEqual(spec.exempt, {}, spec.name)
+        for spec in gate.TRAIT_SPECS:
+            if spec.name != "RuntimeStore":
+                self.assertEqual(spec.exempt, {}, spec.name)
+
+    def test_control_extension_defaulted_refusal_is_checked(self) -> None:
+        # The 2026-10-23 scan: the decorators forwarded `append_system_context`
+        # but answered the refusing default of the authenticated append.
+        spec = next(s for s in gate.TRAIT_SPECS if s.name == "SessionServiceControlExt")
+        methods = gate.trait_methods(CONTROL_EXT_TRAIT_SRC, spec.name)
+        self.assertEqual(
+            set(methods), {"append_system_context", "append_authenticated_system_context"}
+        )
+        impls = gate.production_impls(CONTROL_EXT_IMPL_SRC, spec.name)
+        self.assertEqual([t for t, _ in impls], ["ForwardingService"])
+        self.assertEqual(
+            gate.missing_methods(methods, set(), impls[0][1], spec.exempt),
+            ["append_authenticated_system_context"],
+        )
 
     def test_base_trait_defaulted_method_is_checked(self) -> None:
         # The 0.8.51 defect: the decorators implemented SessionServiceHistoryExt

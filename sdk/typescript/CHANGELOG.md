@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `LiveChannelHandle` and `PendingLiveChannelHandle` have an optional
+  `advisories`, what the live open went ahead without, present only when the
+  gateway reported something. `"staged_prompt_refused"` means a run-start hook
+  refused the member's staged create-time prompt, which stays staged for its
+  first text turn. An advisory this SDK does not know is kept as the string
+  the gateway sent; a field that is not an array of non-empty strings throws
+  `TypeError`. `liveChannelHandleToWire` and `pendingLiveChannelHandleToWire`
+  write the key only when it is not empty.
 - `MobHandle.scheduleTools()` returns `ScheduleToolsResult`, the definitions
   of Meerkat's durable schedule tools from `meta/schedule/tools`: one
   `ScheduleToolDefinition` (`name`, `description`, `inputSchema`) per tool,

@@ -474,12 +474,16 @@ fn init_accepts_host_runnables_and_rejects_duplicates() {
 // mint a member session without live provider keys).
 // ---------------------------------------------------------------------------
 mod cross_provider_open {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
+    use async_trait::async_trait;
     use meerkat::test_fixtures::realtime::ScriptedRealtimeSessionFactory;
     use meerkat::{AgentFactory, Config, FactoryAgentBuilder, PersistentSessionService};
     use meerkat_client::TestClient;
-    use meerkat_client::realtime_session::RealtimeSessionFactory;
+    use meerkat_client::realtime_session::{
+        RealtimeExternalSessionTarget, RealtimeSession, RealtimeSessionFactory,
+        RealtimeSessionOpenConfig,
+    };
     use meerkat_core::service::{
         CreateSessionRequest, DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions,
         SessionService as _,
@@ -496,8 +500,95 @@ mod cross_provider_open {
         service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
         machine: Arc<meerkat_runtime::MeerkatMachine>,
         factory: Arc<ScriptedRealtimeSessionFactory>,
+        /// The realtime seed of every open, in open order.
+        seeds: Arc<SeedRecordingFactory>,
         session_id: SessionId,
+        /// The member's state directory, where the run-start hook keeps its
+        /// log and reads its refusal switch.
+        state_path: std::path::PathBuf,
         _state: tempfile::TempDir,
+    }
+
+    /// The scripted factory, also recording the realtime seed each open
+    /// hands the provider, so a row can read what the realtime model was
+    /// given.
+    struct SeedRecordingFactory {
+        scripted: Arc<ScriptedRealtimeSessionFactory>,
+        seeds: Mutex<Vec<Vec<meerkat_core::Message>>>,
+    }
+
+    impl SeedRecordingFactory {
+        /// The user rows of each recorded seed, in open order.
+        fn seeded_user_rows(&self) -> Vec<Vec<String>> {
+            self.seeds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|seed| user_row_texts(seed.as_slice()))
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl RealtimeSessionFactory for SeedRecordingFactory {
+        fn capabilities(&self) -> meerkat_contracts::RealtimeCapabilities {
+            self.scripted.capabilities()
+        }
+
+        fn supports_provider(&self, provider: meerkat_core::Provider) -> bool {
+            self.scripted.supports_provider(provider)
+        }
+
+        async fn open_session(
+            &self,
+            open_config: &RealtimeSessionOpenConfig,
+        ) -> Result<Box<dyn RealtimeSession>, meerkat_client::LlmError> {
+            self.scripted.open_session(open_config).await
+        }
+
+        async fn attach_external_session(
+            &self,
+            target: &RealtimeExternalSessionTarget,
+            open_config: &RealtimeSessionOpenConfig,
+        ) -> Result<Box<dyn RealtimeSession>, meerkat_client::LlmError> {
+            self.scripted
+                .attach_external_session(target, open_config)
+                .await
+        }
+
+        async fn open_live_adapter(
+            &self,
+            open_config: &RealtimeSessionOpenConfig,
+        ) -> Result<Arc<dyn meerkat_core::live_adapter::LiveAdapter>, meerkat_client::LlmError>
+        {
+            self.seeds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(open_config.seed_messages().to_vec());
+            self.scripted.open_live_adapter(open_config).await
+        }
+    }
+
+    /// The text of every user row in `messages`, in order.
+    fn user_row_texts(messages: &[meerkat_core::Message]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                meerkat_core::Message::User(user) => Some(user.text_content()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What the fixture member session carries beyond the cross-provider
+    /// shape.
+    #[derive(Clone, Copy, Default)]
+    struct MemberSetup {
+        /// A create-time prompt staged for the session's first interaction
+        /// (`InitialTurnPolicy::Defer` with `DeferredPromptPolicy::Stage`).
+        staged_prompt: Option<&'static str>,
+        /// The member's agent runs [`run_start_guardrail`].
+        run_start_hook: bool,
     }
 
     /// A persistent service + machine pair carrying one Anthropic-identity
@@ -505,6 +596,12 @@ mod cross_provider_open {
     /// binding included), with the live context's realtime factory swapped
     /// for the scripted fixture.
     async fn anthropic_member_stack() -> LiveOpenStack {
+        anthropic_member_stack_with(MemberSetup::default()).await
+    }
+
+    /// [`anthropic_member_stack`] with the member session set up as `setup`
+    /// says.
+    async fn anthropic_member_stack_with(setup: MemberSetup) -> LiveOpenStack {
         let state = tempfile::tempdir().expect("state dir");
         let state_path = state.path().join("state");
         std::fs::create_dir_all(&state_path).expect("create state dir");
@@ -526,7 +623,11 @@ mod cross_provider_open {
             .expect("acquire the gateway live fixture runtime machine"),
         );
         let agent_factory = AgentFactory::new(&state_path).builtins(false);
-        let mut builder = FactoryAgentBuilder::new(agent_factory.clone(), Config::default());
+        let mut config = Config::default();
+        if setup.run_start_hook {
+            config.hooks.entries.push(run_start_guardrail(&state_path));
+        }
+        let mut builder = FactoryAgentBuilder::new(agent_factory.clone(), config);
         builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
             session_store.clone(),
         )));
@@ -556,13 +657,19 @@ mod cross_provider_open {
         let created = service
             .create_session(CreateSessionRequest {
                 model: "claude-sonnet-4-5".to_string(),
-                prompt: meerkat_core::ContentInput::Text(String::new()),
+                prompt: meerkat_core::ContentInput::Text(
+                    setup.staged_prompt.unwrap_or_default().to_string(),
+                ),
                 injected_context: Vec::new(),
                 system_prompt: meerkat_core::config::SystemPromptOverride::Inherit,
                 max_tokens: None,
                 event_tx: None,
                 initial_turn: InitialTurnPolicy::Defer,
-                deferred_prompt_policy: DeferredPromptPolicy::default(),
+                deferred_prompt_policy: if setup.staged_prompt.is_some() {
+                    DeferredPromptPolicy::Stage
+                } else {
+                    DeferredPromptPolicy::default()
+                },
                 build: Some(SessionBuildOptions {
                     provider: Some(meerkat_core::Provider::Anthropic),
                     auth_binding: Some(meerkat_core::AuthBindingRef {
@@ -602,6 +709,10 @@ mod cross_provider_open {
             .expect("record mob-owned ingress for member session");
 
         let scripted = Arc::new(ScriptedRealtimeSessionFactory::new());
+        let seeds = Arc::new(SeedRecordingFactory {
+            scripted: Arc::clone(&scripted),
+            seeds: Mutex::new(Vec::new()),
+        });
         let mut ctx = attach_live(
             Arc::clone(&service),
             Arc::clone(&machine),
@@ -610,14 +721,16 @@ mod cross_provider_open {
             "ws://127.0.0.1:0".to_string(),
             None,
         );
-        ctx.session_factory = Arc::clone(&scripted) as Arc<dyn RealtimeSessionFactory>;
+        ctx.session_factory = Arc::clone(&seeds) as Arc<dyn RealtimeSessionFactory>;
 
         LiveOpenStack {
             ctx,
             service,
             machine,
             factory: scripted,
+            seeds,
             session_id: created.session_id,
+            state_path,
             _state: state,
         }
     }
@@ -951,6 +1064,285 @@ mod cross_provider_open {
         );
 
         assert_eq!(stack.factory.open_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // A voice-first member's staged create-time prompt at `meta/live/open`.
+    // Every row runs on both live paths: the ordinary gateway delivers the
+    // prompt itself before it reads the seed, and an `openai-live` gateway's
+    // open goes through Meerkat's own open projection, which delivers it.
+    // -----------------------------------------------------------------------
+
+    const STAGED: &str = "Remember the codeword ORBIT-7 for later.";
+    const CODEWORD: &str = "ORBIT-7";
+    /// The file in the member's state directory whose presence makes
+    /// [`run_start_guardrail`] refuse the staged prompt.
+    const REFUSE_STAGED: &str = "refuse-staged";
+
+    /// The open every row makes: the member's text model is Anthropic, so the
+    /// channel selects the OpenAI realtime lane.
+    fn cross_provider_open_params() -> Value {
+        json!({"provider": "openai", "model": "gpt-realtime-2"})
+    }
+
+    /// A foreground run-start guardrail command: it appends one line to
+    /// `run-started.log` in `dir` for every `RunStarted` it is offered and,
+    /// while [`REFUSE_STAGED`] exists in `dir`, refuses a run whose input
+    /// carries the staged prompt's codeword.
+    fn run_start_guardrail(dir: &std::path::Path) -> meerkat_core::HookEntryConfig {
+        let script = r#"payload=$(cat)
+printf 'run_started\n' >> "$1/run-started.log"
+case "$payload" in
+  *"$2"*)
+    if [ -e "$1/$3" ]; then
+      printf '%s' '{"decision":{"decision":"deny","hook_id":"staged-prompt-guard","reason_code":"policy_violation","message":"the staged prompt is refused"}}'
+      exit 0
+    fi
+    ;;
+esac
+printf '%s' '{}'"#;
+        meerkat_core::HookEntryConfig {
+            id: meerkat_core::HookId::new("staged-prompt-guard"),
+            point: meerkat_core::HookPoint::RunStarted,
+            mode: meerkat_core::HookExecutionMode::Foreground,
+            capability: meerkat_core::HookCapability::Guardrail,
+            timeout_ms: Some(5_000),
+            runtime: meerkat_core::HookAdapterConfig::command(
+                "/bin/sh",
+                vec![
+                    "-c".into(),
+                    script.into(),
+                    "staged-prompt-guard".into(),
+                    dir.display().to_string(),
+                    CODEWORD.into(),
+                    REFUSE_STAGED.into(),
+                ],
+                std::collections::HashMap::new(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// How many `RunStarted` invocations the member's run-start hook saw.
+    fn run_start_hook_calls(stack: &LiveOpenStack) -> usize {
+        std::fs::read_to_string(stack.state_path.join("run-started.log"))
+            .map_or(0, |log| log.lines().count())
+    }
+
+    /// The text of every committed user row of the member's transcript.
+    async fn committed_user_rows(stack: &LiveOpenStack) -> Vec<String> {
+        let history = meerkat::SessionServiceHistoryExt::read_history(
+            &*stack.service,
+            &stack.session_id,
+            meerkat_core::service::SessionHistoryQuery {
+                offset: 0,
+                limit: None,
+            },
+        )
+        .await
+        .expect("the member's committed history");
+        user_row_texts(&history.messages)
+    }
+
+    /// Close the channel `opened` names.
+    async fn close_opened(stack: &LiveOpenStack, opened: &JsonRpcResponse) -> JsonRpcResponse {
+        let channel_id = opened
+            .result
+            .as_ref()
+            .and_then(|result| result.get("channel_id"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        handle_live_method(
+            &stack.ctx,
+            &stack.service,
+            &stack.machine,
+            meerkat_meta::live_wiring::LiveSurfaceAuthority::host_trusted_stdio(),
+            None,
+            "meta/live/close",
+            &json!({ "channel_id": channel_id }),
+            json!("close-staged-prompt-test"),
+        )
+        .await
+    }
+
+    /// The advisories an open result carries; `None` when it carries none.
+    fn advisories(opened: &JsonRpcResponse) -> Option<Value> {
+        opened
+            .result
+            .as_ref()
+            .and_then(|result| result.get("advisories"))
+            .cloned()
+    }
+
+    /// A voice-first member: its first live open delivers the staged
+    /// create-time prompt once, through the run-start hook a turn carrying it
+    /// would run, committed before the realtime seed is read, so the realtime
+    /// model is given it. A second open finds nothing staged: it runs no hook
+    /// and commits no second row, and its seed carries the prompt once, from
+    /// the transcript. Neither open reports an advisory.
+    #[tokio::test]
+    async fn a_voice_first_open_delivers_the_staged_prompt_once() {
+        let _open_guard = LIVE_OPEN_TEST_LOCK.lock().await;
+        let stack = anthropic_member_stack_with(MemberSetup {
+            staged_prompt: Some(STAGED),
+            run_start_hook: true,
+        })
+        .await;
+
+        let first = open(&stack, cross_provider_open_params()).await;
+        let rows_after_first = committed_user_rows(&stack).await;
+        let hook_calls_after_first = run_start_hook_calls(&stack);
+        let closed = close_opened(&stack, &first).await;
+        let second = open(&stack, cross_provider_open_params()).await;
+        let rows = committed_user_rows(&stack).await;
+        let hook_calls = run_start_hook_calls(&stack);
+        let seeds = stack.seeds.seeded_user_rows();
+        let _ = close_opened(&stack, &second).await;
+        stack.service.shutdown().await;
+
+        let staged = vec![STAGED.to_string()];
+        assert!(
+            first.error.is_none()
+                && advisories(&first).is_none()
+                && rows_after_first == staged
+                && hook_calls_after_first == 1
+                && closed.error.is_none()
+                && second.error.is_none()
+                && advisories(&second).is_none()
+                && rows == staged
+                && hook_calls == 1
+                && seeds == [staged.clone(), staged.clone()],
+            "the first open must deliver the staged prompt once, ahead of its seed, and a \
+             second open must deliver nothing again: first={first:?} \
+             rows_after_first={rows_after_first:?} \
+             hook_calls_after_first={hook_calls_after_first} closed={closed:?} \
+             second={second:?} rows={rows:?} hook_calls={hook_calls} seeds={seeds:?}"
+        );
+    }
+
+    /// A voice-first member whose turn boundary a holder other than a turn
+    /// has when the open arrives: the open delivers the staged prompt at the
+    /// boundary, which its seed read waits for anyway, so it completes only
+    /// once the boundary is free, and it still delivers the prompt once,
+    /// ahead of its seed, with no advisory.
+    #[tokio::test]
+    async fn a_held_turn_boundary_delays_a_voice_first_open_which_still_delivers_once() {
+        let _open_guard = LIVE_OPEN_TEST_LOCK.lock().await;
+        let stack = anthropic_member_stack_with(MemberSetup {
+            staged_prompt: Some(STAGED),
+            run_start_hook: true,
+        })
+        .await;
+
+        let boundary = stack
+            .service
+            .acquire_runtime_turn_finalization_guard(&stack.session_id)
+            .await;
+        let mut opening = std::pin::pin!(open(&stack, cross_provider_open_params()));
+        let while_held =
+            tokio::time::timeout(std::time::Duration::from_millis(250), opening.as_mut()).await;
+        // Only the hook log is read while the boundary is held: the delivery
+        // has not run its hook yet.
+        let hook_calls_while_held = run_start_hook_calls(&stack);
+        drop(boundary);
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(30), opening.as_mut())
+            .await
+            .expect("the open completes once the boundary is free");
+        let rows = committed_user_rows(&stack).await;
+        let hook_calls = run_start_hook_calls(&stack);
+        let seeds = stack.seeds.seeded_user_rows();
+        let _ = close_opened(&stack, &opened).await;
+        stack.service.shutdown().await;
+
+        let staged = vec![STAGED.to_string()];
+        assert!(
+            while_held.is_err()
+                && hook_calls_while_held == 0
+                && opened.error.is_none()
+                && advisories(&opened).is_none()
+                && rows == staged
+                && hook_calls == 1
+                && seeds == [staged.clone()],
+            "a held boundary must delay the open, which must then deliver the staged prompt \
+             once ahead of its seed: while_held={while_held:?} \
+             hook_calls_while_held={hook_calls_while_held} opened={opened:?} rows={rows:?} \
+             hook_calls={hook_calls} seeds={seeds:?}"
+        );
+    }
+
+    /// A member with nothing staged: the open does no delivery work. The
+    /// run-start hook never runs, nothing is committed, the seed carries no
+    /// user row, and the open result carries no advisory.
+    #[tokio::test]
+    async fn an_open_with_nothing_staged_does_no_delivery_work() {
+        let _open_guard = LIVE_OPEN_TEST_LOCK.lock().await;
+        let stack = anthropic_member_stack_with(MemberSetup {
+            staged_prompt: None,
+            run_start_hook: true,
+        })
+        .await;
+
+        let opened = open(&stack, cross_provider_open_params()).await;
+        let rows = committed_user_rows(&stack).await;
+        let hook_calls = run_start_hook_calls(&stack);
+        let seeds = stack.seeds.seeded_user_rows();
+        let _ = close_opened(&stack, &opened).await;
+        stack.service.shutdown().await;
+
+        assert!(
+            opened.error.is_none()
+                && advisories(&opened).is_none()
+                && rows.is_empty()
+                && hook_calls == 0
+                && seeds == [Vec::<String>::new()],
+            "an open with nothing staged must run no hook and commit nothing: \
+             opened={opened:?} rows={rows:?} hook_calls={hook_calls} seeds={seeds:?}"
+        );
+    }
+
+    /// A run-start hook that refuses the staged prompt at the open: the open
+    /// goes ahead without it and its result carries the
+    /// `staged_prompt_refused` advisory, nothing is committed, and the seed
+    /// does not carry it. The prompt stays staged: once the hook admits it,
+    /// the next open delivers it once and reports no advisory.
+    #[tokio::test]
+    async fn a_refused_staged_prompt_is_an_open_advisory_and_stays_staged() {
+        let _open_guard = LIVE_OPEN_TEST_LOCK.lock().await;
+        let stack = anthropic_member_stack_with(MemberSetup {
+            staged_prompt: Some(STAGED),
+            run_start_hook: true,
+        })
+        .await;
+        let refusal_switch = stack.state_path.join(REFUSE_STAGED);
+        std::fs::write(&refusal_switch, b"").expect("arm the staged-prompt refusal");
+
+        let refused = open(&stack, cross_provider_open_params()).await;
+        let rows_after_refusal = committed_user_rows(&stack).await;
+        let closed = close_opened(&stack, &refused).await;
+        std::fs::remove_file(&refusal_switch).expect("disarm the staged-prompt refusal");
+        let admitted = open(&stack, cross_provider_open_params()).await;
+        let rows = committed_user_rows(&stack).await;
+        let hook_calls = run_start_hook_calls(&stack);
+        let seeds = stack.seeds.seeded_user_rows();
+        let _ = close_opened(&stack, &admitted).await;
+        stack.service.shutdown().await;
+
+        let staged = vec![STAGED.to_string()];
+        assert!(
+            refused.error.is_none()
+                && advisories(&refused) == Some(json!(["staged_prompt_refused"]))
+                && rows_after_refusal.is_empty()
+                && closed.error.is_none()
+                && admitted.error.is_none()
+                && advisories(&admitted).is_none()
+                && rows == staged
+                && hook_calls == 2
+                && seeds == [Vec::new(), staged.clone()],
+            "a refused staged prompt must be the open's advisory and stay staged for the \
+             next open, which delivers it once: refused={refused:?} \
+             rows_after_refusal={rows_after_refusal:?} closed={closed:?} \
+             admitted={admitted:?} rows={rows:?} hook_calls={hook_calls} seeds={seeds:?}"
+        );
     }
 }
 
