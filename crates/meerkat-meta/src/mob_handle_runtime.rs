@@ -9368,11 +9368,12 @@ impl MobRuntime {
         // carries the service.
         builder = builder.with_workgraph_service(spec.workgraph_service.clone());
 
-        // Durable workers (profiles with `durable = true`): before Meerkat
-        // resumes such a worker's interrupted run, the gate checks over the
-        // same mob-realm service that the worker still holds its WorkGraph
-        // work. Without a service there is no claim to read, no gate is
-        // installed, and the run resumes unchecked.
+        // Durable workers (members spawned with a durable identity: the
+        // members of a `durable = true` profile, and every identity-first
+        // member): before Meerkat resumes such a worker's interrupted run,
+        // the gate checks over the same mob-realm service that the worker
+        // still holds its WorkGraph work. Without a service there is no claim
+        // to read, no gate is installed, and the run resumes unchecked.
         if let Some(service) = spec.workgraph_service.clone() {
             builder = builder.with_durable_resume_gate(Arc::new(
                 crate::workgraph_resume_gate::WorkGraphResumeGate::new(service),

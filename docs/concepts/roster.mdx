@@ -262,29 +262,37 @@ Meerkat rebuilds a durable worker on its session after a crash, kill or
 restart, and continues the run it was in from its last committed round.
 Meerkat keeps no WorkGraph claim alive while the worker is down, so a worker
 that was down longer than its lease can come back to work that has moved on.
-When the mob runtime is composed with a WorkGraph service, Meta answers
-Meerkat's resume check from that WorkGraph before the run continues:
+Before such a run continues, Meerkat asks the mob's resume check. It asks for
+every member spawned with a durable identity: the members of a
+`durable = true` profile, and every identity-first member, whose spawn always
+carries one. When the mob runtime is composed with a WorkGraph service, Meta
+answers the check from that WorkGraph:
 
 - A run dispatched for an item (its input carries the WorkGraph attention
-  projection) continues only while the item is live, unclaimed or claimed by
-  the worker under a lease that has not lapsed, and while its attention
-  binding is active or paused and still targets the worker.
+  projection) continues only while the item lives in the mob's realm and is
+  live, unclaimed or claimed by the worker under a lease that has not lapsed,
+  and while its attention binding is active or paused and still targets the
+  worker.
 - A run that named no item continues unless a claim the worker holds has
   lapsed. A worker that holds no claim continues.
-- Otherwise the run is superseded: Meerkat stops it as `superseded` and
-  settles its inputs as a stop would. A lapsed lease is committed first, with
-  the WorkGraph's lease-expiry observation, so the item can be claimed again.
-- When the WorkGraph cannot be read, the check answers unavailable. Meerkat
-  retries it a bounded number of times, then refuses the resume.
+- Otherwise the run is superseded. Meerkat settles it the way a stop does:
+  its bound inputs are abandoned as refused resumes, the run ends failed with
+  the check's reason, and it never resumes. A lapsed lease is committed
+  first, with the WorkGraph's lease-expiry observation, so the item can be
+  claimed again, and every later attempt of the same resume answers
+  superseded too.
+- When the WorkGraph cannot be read, or the run's attention projection does
+  not decode, the check answers unavailable. Meerkat asks again, up to three
+  attempts, then settles the run the same way.
 
 The check knows the worker by its member owner key
 (`agent:mob/<mob_id>/agent/<identity>`) and by its session (`session:<id>`);
-a claim under any other key belongs to another owner. Two limits apply. A run that
-named no item, whose lapsed claim another worker took while it was down,
-holds no claim any more, so the check cannot see the move and the run
+a claim under any other key belongs to another owner. Two limits apply. A
+run that named no item, whose lapsed claim another worker took while it was
+down, holds no claim any more, so the check cannot see the move and the run
 continues; its later WorkGraph writes are revision-checked and conflict. And
-the mobs that agents create through the mob tools have no check: their durable
-workers continue unchecked.
+the mobs that agents create through the mob tools have no check: their
+durable workers continue unchecked.
 
 ## Deep member status
 

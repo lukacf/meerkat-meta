@@ -1,29 +1,38 @@
 //! The durable worker resume gate over the mob realm's WorkGraph.
 //!
-//! A profile that declares `durable = true` spawns durable workers. After a
-//! crash, kill or restart of a persisted mob, Meerkat rebuilds such a worker
-//! on its session and resumes the run it was in from its last committed
-//! round. Before that resume Meerkat asks the host's
-//! [`meerkat_mob::DurableResumeGate`] whether the run's work is still the
-//! worker's. Work leases stay host-side: Meerkat renews no WorkGraph claim,
-//! so a worker that was down longer than its lease can come back to an item
-//! that was released or taken. [`WorkGraphResumeGate`] reads the mob realm's
-//! WorkGraph and answers:
+//! After a crash, kill or restart of a persisted mob, Meerkat rebuilds a
+//! durable worker on its session and resumes the run it was in from its
+//! last committed round. A durable worker is any member spawned with a
+//! durable identity: the members of a `durable = true` profile, and every
+//! identity-first member, whose spawn always carries one. Before that resume
+//! Meerkat asks the host's [`meerkat_mob::DurableResumeGate`] whether the
+//! run's work is still the worker's. Work leases stay host-side: Meerkat
+//! renews no WorkGraph claim, so a worker that was down longer than its lease
+//! can come back to an item that was released or taken.
+//! [`WorkGraphResumeGate`] reads the mob realm's WorkGraph and answers:
 //!
 //! - **With the run's attention projection** (the
 //!   `workgraph.attention_projection` one of its bound inputs was dispatched
 //!   under), the projected item decides. The run is superseded when the item
-//!   is gone or terminal, when another owner holds its claim, when the
-//!   worker's own claim lease has lapsed, or when the projection's attention
-//!   binding has stopped or now targets another owner. It continues
-//!   otherwise.
+//!   lives outside the mob's realm, is gone or terminal, when another owner
+//!   holds its claim, when the worker's own claim lease has lapsed, or when
+//!   the projection's attention binding has stopped or now targets another
+//!   owner. It continues otherwise.
+//! - **With a projection that does not decode**, the gate can neither name
+//!   the item nor treat the run as one without attention, so it answers
+//!   unavailable.
 //! - **Without one**, every non-terminal item whose claim the worker holds is
 //!   checked. A lapsed lease supersedes the run; otherwise, including when
 //!   the worker holds no claim, the run continues.
 //! - A lapsed lease is first committed with `observe_lease_expiry`, as a
 //!   lease sweep would, so the item can be claimed again.
-//! - A WorkGraph read fault answers unavailable. Meerkat retries the gate a
-//!   bounded number of times and then refuses the resume.
+//! - A WorkGraph read fault answers unavailable. Meerkat asks again a bounded
+//!   number of times and then settles the run as superseded.
+//!
+//! Meerkat drops an attempt that outlasts its timeout and asks again, so the
+//! gate is idempotent across the attempts of one resume: a superseded verdict
+//! is remembered for the run before anything is written, and every later
+//! attempt answers it.
 //!
 //! The worker is "this worker" under either of its WorkGraph names: its
 //! member owner key (`agent:mob/<mob_id>/agent/<identity>`, the only form a
@@ -34,6 +43,9 @@
 //! more, so the gate cannot see the move and the run continues. Its later
 //! WorkGraph writes are still revision-checked and conflict.
 
+use std::collections::VecDeque;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use chrono::{DateTime, Utc};
 use meerkat::{
     AttentionBindingRequest, AttentionContextProjection, ObserveLeaseExpiryRequest,
@@ -41,11 +53,17 @@ use meerkat::{
     WorkOwnerKey, WorkStatus,
 };
 use meerkat_core::SessionId;
+use meerkat_core::lifecycle::RunId;
 
 /// How many non-terminal items the claim scan reads: the WorkGraph's
 /// largest list page. A realm with more open items is scanned up to here,
 /// with a warning.
 const CLAIM_SCAN_LIMIT: usize = 1000;
+
+/// How many superseded runs the gate remembers. A superseded run is settled
+/// and never resumed again, so only the attempts of a resume still in
+/// flight need the record.
+const REMEMBERED_SUPERSEDED_RUNS: usize = 256;
 
 /// The gate's answer before it is handed to Meerkat.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +95,51 @@ pub(crate) struct ResumingWorker<'a> {
     pub mob_id: &'a meerkat_mob::MobId,
     pub agent_identity: &'a meerkat_mob::AgentIdentity,
     pub session_id: &'a SessionId,
+    pub run_id: &'a RunId,
     pub attention_projection: Option<&'a AttentionContextProjection>,
+    /// Why the run's attention projection does not decode, when its overlay
+    /// carries one that does not.
+    pub attention_projection_unreadable: Option<&'a str>,
+}
+
+/// The runs this gate already superseded, so every later attempt of the
+/// same resume answers the same. Meerkat drops an attempt that outlasts its
+/// timeout, and a dropped attempt may already have committed a lapsed
+/// lease's expiry, after which the item reads as unclaimed: a fresh decision
+/// would then let the run continue. The verdict is remembered before that
+/// write, keyed by the worker's session and run.
+#[derive(Default)]
+struct SupersededRuns {
+    runs: Mutex<VecDeque<(String, String)>>,
+}
+
+impl SupersededRuns {
+    fn key(worker: ResumingWorker<'_>) -> String {
+        format!("{}/{}", worker.session_id, worker.run_id)
+    }
+
+    fn recall(&self, run: &str) -> Option<String> {
+        self.lock()
+            .iter()
+            .find(|(key, _)| key == run)
+            .map(|(_, reason)| reason.clone())
+    }
+
+    /// Remember `reason` for `run`; the first reason stays.
+    fn remember(&self, run: &str, reason: &str) {
+        let mut runs = self.lock();
+        if runs.iter().any(|(key, _)| key == run) {
+            return;
+        }
+        if runs.len() >= REMEMBERED_SUPERSEDED_RUNS {
+            runs.pop_front();
+        }
+        runs.push_back((run.to_string(), reason.to_string()));
+    }
+
+    fn lock(&self) -> MutexGuard<'_, VecDeque<(String, String)>> {
+        self.runs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// The worker's two WorkGraph names.
@@ -118,29 +180,54 @@ impl<'a> WorkerKeys<'a> {
 /// same mob-scoped service the mob's attention overlays read.
 pub(crate) struct WorkGraphResumeGate {
     service: WorkGraphService,
+    superseded: SupersededRuns,
 }
 
 impl WorkGraphResumeGate {
     pub(crate) fn new(service: WorkGraphService) -> Self {
-        Self { service }
+        Self {
+            service,
+            superseded: SupersededRuns::default(),
+        }
     }
 
     /// The verdict for `worker`. Never fails: a WorkGraph fault is
-    /// [`ResumeCheck::Unavailable`].
+    /// [`ResumeCheck::Unavailable`]. A run once superseded stays superseded
+    /// on every later attempt of its resume.
     pub(crate) async fn check_worker(&self, worker: ResumingWorker<'_>) -> ResumeCheck {
-        match self.decide(worker).await {
+        let run = SupersededRuns::key(worker);
+        if let Some(reason) = self.superseded.recall(&run) {
+            return ResumeCheck::Superseded(reason);
+        }
+        let check = match self.decide(worker, &run).await {
             Ok(check) => check,
             Err(error) => {
                 ResumeCheck::Unavailable(format!("the WorkGraph could not be read: {error}"))
             }
+        };
+        if let ResumeCheck::Superseded(reason) = &check {
+            self.superseded.remember(&run, reason);
         }
+        check
     }
 
-    async fn decide(&self, worker: ResumingWorker<'_>) -> Result<ResumeCheck, WorkGraphError> {
+    async fn decide(
+        &self,
+        worker: ResumingWorker<'_>,
+        run: &str,
+    ) -> Result<ResumeCheck, WorkGraphError> {
+        // The run executes under attention the gate cannot read, so it can
+        // neither name the run's item nor treat the run as one without
+        // attention: it cannot decide.
+        if let Some(reason) = worker.attention_projection_unreadable {
+            return Ok(ResumeCheck::Unavailable(format!(
+                "the run's WorkGraph attention projection does not decode: {reason}"
+            )));
+        }
         let keys = WorkerKeys::of(worker);
         match worker.attention_projection {
-            Some(projection) => self.decide_projected(&keys, projection).await,
-            None => self.decide_by_claims(&keys).await,
+            Some(projection) => self.decide_projected(&keys, projection, run).await,
+            None => self.decide_by_claims(&keys, run).await,
         }
     }
 
@@ -150,12 +237,17 @@ impl WorkGraphResumeGate {
         &self,
         keys: &WorkerKeys<'_>,
         projection: &AttentionContextProjection,
+        run: &str,
     ) -> Result<ResumeCheck, WorkGraphError> {
         let work_ref = &projection.work_ref;
+        // A member resolves its attention only in its mob's realm, so a
+        // projection from elsewhere is not this worker's work any more. The
+        // condition never changes, so it supersedes at once: an unavailable
+        // answer would only make Meerkat retry the same refusal.
         if work_ref.realm_id != self.service.default_realm_id()
             || work_ref.namespace != *self.service.default_namespace()
         {
-            return Ok(ResumeCheck::Unavailable(format!(
+            return Ok(ResumeCheck::Superseded(format!(
                 "the run's work item {} lives in realm '{}' namespace '{}', which this gate \
                  cannot read (it reads realm '{}' namespace '{}')",
                 work_ref.item_id,
@@ -183,7 +275,7 @@ impl WorkGraphResumeGate {
             }
             Err(error) => return Err(error),
         };
-        if let Some(check) = self.decide_item(keys, &item).await? {
+        if let Some(check) = self.decide_item(keys, &item, run).await? {
             return Ok(check);
         }
         let binding_id = &projection.binding_id;
@@ -221,7 +313,11 @@ impl WorkGraphResumeGate {
     }
 
     /// The run named no item: every claim the worker holds decides.
-    async fn decide_by_claims(&self, keys: &WorkerKeys<'_>) -> Result<ResumeCheck, WorkGraphError> {
+    async fn decide_by_claims(
+        &self,
+        keys: &WorkerKeys<'_>,
+        run: &str,
+    ) -> Result<ResumeCheck, WorkGraphError> {
         if keys.member.is_none() && keys.session.is_none() {
             return Ok(ResumeCheck::Continue);
         }
@@ -255,7 +351,7 @@ impl WorkGraphResumeGate {
         // gives all of them up.
         let mut verdict = ResumeCheck::Continue;
         for (item, claim) in held {
-            if let Some(lapsed) = self.lapsed_claim(item, claim, now).await
+            if let Some(lapsed) = self.lapsed_claim(item, claim, now, run).await
                 && verdict == ResumeCheck::Continue
             {
                 verdict = lapsed;
@@ -271,6 +367,7 @@ impl WorkGraphResumeGate {
         &self,
         keys: &WorkerKeys<'_>,
         item: &WorkItem,
+        run: &str,
     ) -> Result<Option<ResumeCheck>, WorkGraphError> {
         if let Some(terminal) = terminal_status_name(item.status) {
             return Ok(Some(ResumeCheck::Superseded(format!(
@@ -289,24 +386,32 @@ impl WorkGraphResumeGate {
             ))));
         }
         let now = self.service.store().get_store_time_utc().await?;
-        Ok(self.lapsed_claim(item, claim, now).await)
+        Ok(self.lapsed_claim(item, claim, now, run).await)
     }
 
     /// Superseded when the worker's claim on `item` has lapsed at `now` (the
-    /// store's clock, which stamped the claim). The expiry is committed
-    /// first, so the item can be claimed again; a commit that fails (the item
-    /// moved meanwhile) still supersedes, because the lease has lapsed all
-    /// the same. A claim without a lease never lapses.
+    /// store's clock, which stamped the claim). The verdict is remembered for
+    /// `run` before anything is written. The expiry is then committed, so the
+    /// item can be claimed again; a commit that fails (the item moved
+    /// meanwhile) still supersedes, because the lease has lapsed all the
+    /// same. A claim without a lease never lapses.
     async fn lapsed_claim(
         &self,
         item: &WorkItem,
         claim: &WorkClaim,
         now: DateTime<Utc>,
+        run: &str,
     ) -> Option<ResumeCheck> {
         let lease_expires_at = claim.lease_expires_at?;
         if lease_expires_at > now {
             return None;
         }
+        let reason = format!(
+            "its claim on work item {} lapsed at {}",
+            item.id,
+            lease_expires_at.to_rfc3339()
+        );
+        self.superseded.remember(run, &reason);
         if let Err(error) = self
             .service
             .observe_lease_expiry(ObserveLeaseExpiryRequest {
@@ -325,11 +430,7 @@ impl WorkGraphResumeGate {
                  superseded all the same"
             );
         }
-        Some(ResumeCheck::Superseded(format!(
-            "its claim on work item {} lapsed at {}",
-            item.id,
-            lease_expires_at.to_rfc3339()
-        )))
+        Some(ResumeCheck::Superseded(reason))
     }
 }
 
@@ -354,7 +455,9 @@ impl meerkat_mob::DurableResumeGate for WorkGraphResumeGate {
                 mob_id: &request.mob_id,
                 agent_identity: &request.agent_identity,
                 session_id: &request.session_id,
+                run_id: &request.run_id,
                 attention_projection: request.attention_projection.as_ref(),
+                attention_projection_unreadable: request.attention_projection_unreadable.as_deref(),
             })
             .await;
         match &check {
@@ -362,14 +465,14 @@ impl meerkat_mob::DurableResumeGate for WorkGraphResumeGate {
                 mob_id = %request.mob_id,
                 agent_identity = %request.agent_identity,
                 session_id = %request.session_id,
-                run_id = ?request.run_id,
+                run_id = %request.run_id,
                 "durable resume gate: the worker still holds its work; the run resumes"
             ),
             ResumeCheck::Superseded(reason) => tracing::info!(
                 mob_id = %request.mob_id,
                 agent_identity = %request.agent_identity,
                 session_id = %request.session_id,
-                run_id = ?request.run_id,
+                run_id = %request.run_id,
                 %reason,
                 "durable resume gate: the run's work moved; the run is superseded"
             ),
@@ -377,7 +480,7 @@ impl meerkat_mob::DurableResumeGate for WorkGraphResumeGate {
                 mob_id = %request.mob_id,
                 agent_identity = %request.agent_identity,
                 session_id = %request.session_id,
-                run_id = ?request.run_id,
+                run_id = %request.run_id,
                 %reason,
                 "durable resume gate: no answer from the WorkGraph; Meerkat retries the gate"
             ),
@@ -427,6 +530,7 @@ mod tests {
         mob_id: meerkat_mob::MobId,
         identity: meerkat_mob::AgentIdentity,
         session_id: SessionId,
+        run_id: RunId,
     }
 
     impl Worker {
@@ -435,6 +539,17 @@ mod tests {
                 mob_id: meerkat_mob::MobId::from(MOB),
                 identity: meerkat_mob::AgentIdentity::from(identity),
                 session_id: SessionId::new(),
+                run_id: RunId::new(),
+            }
+        }
+
+        /// The same worker, resuming another run of its session.
+        fn next_run(&self) -> Self {
+            Self {
+                mob_id: self.mob_id.clone(),
+                identity: self.identity.clone(),
+                session_id: self.session_id.clone(),
+                run_id: RunId::new(),
             }
         }
 
@@ -446,7 +561,9 @@ mod tests {
                 mob_id: &self.mob_id,
                 agent_identity: &self.identity,
                 session_id: &self.session_id,
+                run_id: &self.run_id,
                 attention_projection: projection,
+                attention_projection_unreadable: None,
             }
         }
     }
@@ -687,7 +804,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_projection_outside_the_gates_realm_is_unavailable() {
+    async fn a_projection_outside_the_gates_realm_supersedes_the_run() {
         let service = service();
         let worker = Worker::named(WORKER);
         let (_item, mut projection) = goal_for(
@@ -702,8 +819,8 @@ mod tests {
         let gate = WorkGraphResumeGate::new(service);
         let check = gate.check_worker(worker.resuming(Some(&projection))).await;
         assert!(
-            matches!(&check, ResumeCheck::Unavailable(reason) if reason.contains("another-realm")),
-            "{check:?}"
+            superseded_reason(&check).contains("another-realm"),
+            "a deterministic refusal settles at once: {check:?}"
         );
     }
 
@@ -785,6 +902,118 @@ mod tests {
         assert!(
             matches!(projected, ResumeCheck::Unavailable(_)),
             "{projected:?}"
+        );
+    }
+
+    /// Meerkat drops an attempt that outlasts its timeout and asks again. An
+    /// attempt that committed the lapsed lease's expiry leaves the item
+    /// unclaimed, and the next attempt of the same resume must still answer
+    /// superseded; another run of the worker is decided afresh.
+    #[tokio::test]
+    async fn a_superseded_run_answers_the_same_on_every_attempt() {
+        let service = service();
+        let worker = Worker::named(WORKER);
+        let (item, projection) = goal_for(
+            &service,
+            GoalAttentionTarget::Owner {
+                owner_key: member_key(WORKER),
+            },
+        )
+        .await;
+        claim(&service, &item, member_key(WORKER), lapsing_soon()).await;
+        let_the_lease_lapse().await;
+
+        let gate = WorkGraphResumeGate::new(service.clone());
+        let first = gate.check_worker(worker.resuming(Some(&projection))).await;
+        assert!(superseded_reason(&first).contains("lapsed"), "{first:?}");
+        let after = service
+            .get(None, None, item.id.clone())
+            .await
+            .expect("read the item");
+        assert_eq!(after.claim, None, "the first attempt released the claim");
+
+        let again = gate.check_worker(worker.resuming(Some(&projection))).await;
+        assert_eq!(again, first, "a later attempt answers the same");
+
+        let next = worker.next_run();
+        assert_eq!(
+            gate.check_worker(next.resuming(Some(&projection))).await,
+            ResumeCheck::Continue,
+            "another run of the worker is decided afresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_projection_is_unavailable() {
+        let service = service();
+        let worker = Worker::named(WORKER);
+        let gate = WorkGraphResumeGate::new(service);
+        let resuming = ResumingWorker {
+            attention_projection_unreadable: Some("missing field `binding_id`"),
+            ..worker.resuming(None)
+        };
+
+        let check = gate.check_worker(resuming).await;
+        assert!(
+            matches!(&check, ResumeCheck::Unavailable(reason) if reason.contains("binding_id")),
+            "never read as a run without attention: {check:?}"
+        );
+    }
+
+    /// The trait impl reads Meerkat's request as it is built.
+    #[tokio::test]
+    async fn the_gate_answers_meerkats_request() {
+        use meerkat_mob::DurableResumeGate as _;
+
+        let service = service();
+        let (item, projection) = goal_for(
+            &service,
+            GoalAttentionTarget::Owner {
+                owner_key: member_key(WORKER),
+            },
+        )
+        .await;
+        claim(&service, &item, member_key(OTHER), in_an_hour()).await;
+        let gate = WorkGraphResumeGate::new(service);
+        let request = || {
+            meerkat_mob::DurableResumeRequest::new(
+                meerkat_mob::MobId::from(MOB),
+                meerkat_mob::AgentIdentity::from(WORKER),
+                meerkat_mob::ProfileName::from("worker"),
+                SessionId::new(),
+                RunId::new(),
+                vec![meerkat_core::lifecycle::InputId::new()],
+            )
+        };
+
+        let projected = gate
+            .check(&request().with_attention_projection(Some(projection)))
+            .await;
+        assert!(
+            matches!(
+                &projected,
+                meerkat_mob::DurableResumeVerdict::Superseded { reason }
+                    if reason.contains(&member_key(OTHER).canonical())
+            ),
+            "{projected:?}"
+        );
+
+        let unreadable = gate
+            .check(&request().with_attention_projection_unreadable(Some("bad".to_string())))
+            .await;
+        assert!(
+            matches!(
+                unreadable,
+                meerkat_mob::DurableResumeVerdict::Unavailable { .. }
+            ),
+            "{unreadable:?}"
+        );
+
+        // No projection: the worker holds no claim, so the run continues.
+        let plain = gate.check(&request()).await;
+        assert!(
+            matches!(plain, meerkat_mob::DurableResumeVerdict::Continue),
+            "{plain:?}"
         );
     }
 
