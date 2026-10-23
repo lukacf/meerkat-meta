@@ -7958,6 +7958,14 @@ mod tests {
     fn rpc_test_mob_spec(
         temp_dir: &tempfile::TempDir,
     ) -> Result<MobBootstrapSpec, Box<dyn std::error::Error + Send + Sync>> {
+        rpc_test_mob_spec_for(temp_dir, &unique_rpc_test_mob_id())
+    }
+
+    /// [`rpc_test_mob_spec`] of the mob `mob_id`.
+    fn rpc_test_mob_spec_for(
+        temp_dir: &tempfile::TempDir,
+        mob_id: &str,
+    ) -> Result<MobBootstrapSpec, Box<dyn std::error::Error + Send + Sync>> {
         let session_path = temp_dir.path().join("sessions");
         std::fs::create_dir_all(&session_path)?;
         let factory = AgentFactory::new(&session_path).comms(true);
@@ -7974,7 +7982,7 @@ external_addressable = true
 [profiles.worker.tools]
 comms = true
 "#,
-            unique_rpc_test_mob_id()
+            mob_id
         ))?;
         Ok(
             MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
@@ -8283,6 +8291,80 @@ shell = true
             "meta/status omits the field when no member holds a reserved identity: {status:#?}"
         );
         let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
+    /// The stdio `meta/status` of `runtime`.
+    async fn unified_rpc_status(
+        runtime: &UnifiedRuntime,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(serde_json::from_str(
+            &handle_unified_rpc_json(
+                runtime,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "meta/status"}).to_string(),
+                Duration::from_secs(1),
+                None,
+                None,
+            )
+            .await,
+        )?)
+    }
+
+    /// The stdio `meta/status` names why a mob's actor stopped, beside
+    /// `mob_state`, which stays the last phase the actor published: a
+    /// fail-stopped actor keeps its last live phase, so the phase alone reads
+    /// a stopped mob as running. A running mob's status names no failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unified_rpc_status_names_a_stopped_mob_actors_failure()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let running_dir = tempfile::tempdir()?;
+        let running = reservation_test_runtime(&running_dir, "rpc-status-running").await?;
+        let status = unified_rpc_status(&running).await?;
+        assert!(
+            status["result"].get("mob_failure").is_none(),
+            "a running mob's status names no failure: {status:#?}"
+        );
+        let _ = running.mob_handle().stop().await;
+
+        let stopped_dir = tempfile::tempdir()?;
+        let mob_id = unique_rpc_test_mob_id();
+        meerkat_mob::fail_stop_next_actor_start_for_test(&meerkat_mob::MobId::from(
+            mob_id.as_str(),
+        ));
+        let stopped = Box::pin(
+            UnifiedRuntime::builder()
+                .mob_spec(rpc_test_mob_spec_for(&stopped_dir, &mob_id)?)
+                .module_config(MetaConfig {
+                    modules: Vec::new(),
+                    discovery: DiscoverySpec {
+                        namespace: "rpc-status-fail-stopped".to_string(),
+                        modules: Vec::new(),
+                    },
+                    pre_spawn: Vec::new(),
+                })
+                .timeout(Duration::from_secs(1))
+                .build(),
+        )
+        .await?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            stopped.mob_handle().actor_task_watch().wait(),
+        )
+        .await?;
+        let status = unified_rpc_status(&stopped).await?;
+        assert!(
+            status["result"]["mob_failure"]
+                .as_str()
+                .is_some_and(|failure| !failure.is_empty()),
+            "the stopped actor's failure is named: {status:#?}"
+        );
+        assert!(
+            matches!(
+                status["result"]["mob_state"].as_str(),
+                Some("Some(Creating)" | "Some(Running)")
+            ),
+            "mob_state stays the last phase: {status:#?}"
+        );
         Ok(())
     }
 
