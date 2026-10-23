@@ -393,6 +393,84 @@ def test_product_input_growth_refuses_before_restoring_its_mode(
         assert reads == [] and handles == []
 
 
+@pytest.mark.parametrize("defect", ["null", "array", "scalar", "missing-selection",
+    "missing-paths", "selection-array", "paths-array"])
+def test_malformed_product_container_refuses_before_payload_reads(
+        product, bundle_source, tmp_path, monkeypatch, capsys, defect):
+    from launchkit import distribution, product_distribution
+
+    root, _, _, guide = guide_product_inputs(product, bundle_source, monkeypatch)
+    target, _, _ = development(product)
+    output = tmp_path / "malformed-product.zip"
+    product_distribution.package(root, target, guide, output)
+    extracted = tmp_path / "malformed-product"
+    with zipfile.ZipFile(output) as archive:
+        archive.extractall(extracted)
+    manifest = extracted / distribution.MANIFEST
+    data = json.loads(manifest.read_bytes())
+    if defect in {"null", "array", "scalar"}:
+        data["product"] = {"null": None, "array": [], "scalar": "invalid"}[defect]
+    elif defect.startswith("missing-"):
+        data["product"].pop(defect.removeprefix("missing-"))
+    else:
+        data["product"][defect.removesuffix("-array")] = []
+    manifest.write_bytes(json_bytes(data))
+
+    def payload_read(*args, **kwargs):
+        pytest.fail("A malformed product container must be refused before reading payload files.")
+
+    monkeypatch.setattr(product_distribution, "_ordinary", payload_read)
+    with pytest.raises(distribution.DistributionError, match="original selection and paths"):
+        product_distribution.verify(extracted)
+    monkeypatch.setattr("sys.argv", ["distribution", "--bootstrap-inputs", str(extracted)])
+    with pytest.raises(SystemExit) as stopped:
+        distribution.main()
+    assert stopped.value.code == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "could not verify its public package inputs" in output.err
+    assert "Traceback" not in output.err
+
+
+@pytest.mark.parametrize("section, field, value, message", [
+    ("paths", "artifact_root", None, "locator must stay inside its distribution"),
+    ("paths", "artifact_root", [], "locator must stay inside its distribution"),
+    ("paths", "artifact_root", 12, "locator must stay inside its distribution"),
+    ("selection", "assembly", None, "original selected Meta and Toolkit product"),
+    ("selection", "meta_wheel", [], "original selected Meta and Toolkit product"),
+    ("selection", "dependency_wheels", None, "packaged dependency inventory changed"),
+    ("paths", "dependency_wheels", None, "packaged dependency inventory changed"),
+    ("selection", "dependency_wheels", "invalid", "packaged dependency inventory changed"),
+    ("paths", "dependency_wheels", "invalid", "packaged dependency inventory changed"),
+    ("selection", "dependency_wheels", [None], "packaged dependency inventory changed"),
+])
+def test_malformed_product_relocation_uses_normal_startup_refusal(
+        product, bundle_source, tmp_path, monkeypatch, capsys, section, field, value, message):
+    from launchkit import distribution, product_distribution
+
+    root, _, _, guide = guide_product_inputs(product, bundle_source, monkeypatch)
+    target, _, _ = development(product)
+    output = tmp_path / "malformed-locator.zip"
+    product_distribution.package(root, target, guide, output)
+    extracted = tmp_path / "malformed-locator"
+    with zipfile.ZipFile(output) as archive:
+        archive.extractall(extracted)
+    manifest = extracted / distribution.MANIFEST
+    data = json.loads(manifest.read_bytes())
+    data["product"][section][field] = value
+    manifest.write_bytes(json_bytes(data))
+    with pytest.raises(ValueError, match=message):
+        product_distribution.verify(extracted)
+    monkeypatch.setattr("sys.argv", ["distribution", "--bootstrap-inputs", str(extracted)])
+    with pytest.raises(SystemExit) as stopped:
+        distribution.main()
+    assert stopped.value.code == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "could not verify its public package inputs" in output.err
+    assert "Traceback" not in output.err
+
+
 def test_a_pending_guide_client_pin_refuses_packaging_and_verification(
         product, bundle_source, tmp_path, monkeypatch):
     from launchkit import distribution, product_distribution, guide_sdk
