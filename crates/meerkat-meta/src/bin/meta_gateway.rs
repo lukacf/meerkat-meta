@@ -606,12 +606,6 @@ fn gateway_agent_config(
     Ok(meerkat_meta::with_meta_compaction_defaults(config))
 }
 
-/// Returns (session_service, runtime_adapter, binary_blob_store).
-///
-/// The session service and explicit runtime adapter share the same runtime
-/// store. The service acquires that adapter before its schedule, voice, and
-/// mob hosts are composed.
-#[allow(clippy::too_many_arguments)]
 /// The builder every member of this gateway is built through, in the
 /// persistent and the ephemeral arm alike. Each construction is prepared
 /// only after its configured MCP servers have connected or failed, so the
@@ -622,6 +616,12 @@ fn member_agent_builder(factory: AgentFactory, config: Config) -> FactoryAgentBu
     builder
 }
 
+/// Returns (session_service, runtime_adapter, binary_blob_store).
+///
+/// The session service and explicit runtime adapter share the same runtime
+/// store. The service acquires that adapter before its schedule, voice, and
+/// mob hosts are composed.
+#[allow(clippy::too_many_arguments)]
 fn build_persistent_session_service(
     layout: &MetaStorageLayout,
     runtime_root: PathBuf,
