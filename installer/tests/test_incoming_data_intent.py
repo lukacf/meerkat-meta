@@ -108,6 +108,51 @@ def test_removed_class_cannot_remain_a_recipient():
         publish(value)
 
 
+@pytest.mark.parametrize("first_unassigned", [False, True])
+def test_sources_may_independently_route_to_the_same_named_members_and_empty_class(first_unassigned):
+    plan = starter_blueprint().model_dump(mode="json")
+    lead = next(item for item in plan["agent_classes"] if item["id"] == "lead")
+    lead.update(instances=2, members=[
+        {"key": key, "name": key.title(), "instructions": "Review relevant project changes."}
+        for key in ("primary", "backup")])
+    next(item for item in plan["agent_classes"] if item["id"] == "review")["instances"] = 0
+    plan["topology"] = {"mode": "hub", "entrypoint": "lead:primary", "edges": []}
+    plan["flows"] = []
+    value = brief()
+    template = value["incoming_data"][0]
+    value["incoming_data"] = []
+    for index in range(32):
+        source = copy.deepcopy(template)
+        source["id"] = f"source_{index}"
+        source["routes"] = [
+            ({"recipient": "lead", "recipient_kind": "class", "delivery": "direct"}
+             if index % 2 else {"recipient": "lead:primary", "delivery": "conversation"}),
+            {"recipient": "review", "recipient_kind": "class", "delivery": "direct"}]
+        value["incoming_data"].append(source)
+    if first_unassigned:
+        value["incoming_data"][0]["routes"] = []
+    before = copy.deepcopy((value, plan))
+    result = publish(value, plan)
+    assert result["brief"] == DesignBrief.model_validate(value).model_dump(mode="json")
+    assert (value, plan) == before
+
+
+@pytest.mark.parametrize("class_first", [False, True])
+def test_later_source_still_rejects_class_member_overlap_and_allows_correction(class_first):
+    value = brief()
+    template = value["incoming_data"][0]
+    value["incoming_data"] = [{**copy.deepcopy(template), "id": f"source_{index}"} for index in range(32)]
+    routes = [{"recipient": "lead", "recipient_kind": "class", "delivery": "direct"},
+              {"recipient": "lead:main", "delivery": "conversation"}]
+    value["incoming_data"][-1]["routes"] = routes if class_first else routes[::-1]
+    before = copy.deepcopy(value)
+    with pytest.raises(ValueError, match="class and identity routes must not overlap"):
+        publish(value)
+    assert value == before
+    value["incoming_data"][-1]["routes"].pop()
+    assert publish(value)["brief"] == DesignBrief.model_validate(value).model_dump(mode="json")
+
+
 @pytest.mark.parametrize("change,error", [
     (lambda s: s["routes"].append({"recipient": "lead:main", "delivery": "conversation"}), "one incoming route"),
     (lambda s: s["routes"].append({"recipient": "lead:main", "delivery": "triage"}), "one incoming route"),

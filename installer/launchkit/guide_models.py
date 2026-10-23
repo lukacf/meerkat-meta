@@ -305,7 +305,8 @@ def validate_guide_publication(args: dict, context: dict, proposal: dict | None,
     # an actual proposal or an existing saved design can supply recipients.
     if proposal is None and context.get("saved_plan_available") is False:
         selected = None
-    route_plan = None
+    class_recipients = None
+    identities = set()
     for source in value.brief.incoming_data:
         if any(identity not in evidence for identity in source.source_message_ids):
             raise ValueError("Incoming data cites missing or non-user evidence.")
@@ -315,16 +316,18 @@ def validate_guide_publication(args: dict, context: dict, proposal: dict | None,
             from .blueprint import Blueprint
             if not selected:
                 raise ValueError("Propose the team before assigning incoming data recipients.")
-            if route_plan is None:
+            if class_recipients is None:
                 route_plan = Blueprint.model_validate(selected)
-            classes = {item.id: item for item in route_plan.agent_classes}
-            identities = set(route_plan.identities())
+                # One immutable membership snapshot for this publication. The
+                # overlap accumulator below still belongs to each source.
+                class_recipients = {item.id: frozenset(item.identities()) for item in route_plan.agent_classes}
+                identities = {identity for members in class_recipients.values() for identity in members}
             selected_identities = set()
             for route in source.routes:
                 if route.recipient_kind == "class":
-                    if route.recipient not in classes:
+                    if route.recipient not in class_recipients:
                         raise ValueError("Incoming data class routes must name an existing class in the proposed team.")
-                    recipients = set(classes[route.recipient].identities())
+                    recipients = class_recipients[route.recipient]
                 else:
                     if route.recipient not in identities:
                         raise ValueError("Incoming data routes must name an existing identity in the proposed team.")
