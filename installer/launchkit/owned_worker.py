@@ -10,11 +10,39 @@ import asyncio
 from contextvars import ContextVar
 import os
 import signal
+import threading
+import time
 
 from .deployment_deadlines import WORKER_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOUT
 
 owned_job_deadline = ContextVar("owned_job_deadline", default=None)
 EXIT_OBSERVATION_TIMEOUT = 1
+_owner_loss_bound = None
+
+
+def end_after_owner_loss(budget=None):
+    """Bound this worker's own stop once its owner is gone (stdin EOF).
+
+    No owner signals a worker it stopped waiting for: the worker stops itself
+    on owner loss. Only a worker leading its own session, as its owner spawns
+    it, arms this, once. If it still runs `budget` seconds later (by default
+    WORKER_STOP_TIMEOUT, the bound its live owner waits), it applies that
+    owner's escalation to its own group: SIGTERM, then SIGKILL.
+    """
+    global _owner_loss_bound
+    if _owner_loss_bound is None and os.getsid(0) == os.getpid():
+        budget = WORKER_STOP_TIMEOUT if budget is None else budget
+        def end():
+            try:
+                os.killpg(os.getpid(), signal.SIGTERM)
+                time.sleep(.2)
+                os.killpg(os.getpid(), signal.SIGKILL)
+            finally:
+                os._exit(1)
+        _owner_loss_bound = threading.Timer(budget, end)
+        _owner_loss_bound.daemon = True
+        _owner_loss_bound.start()
+    return _owner_loss_bound
 
 
 def begin_worker_cleanup(stop):

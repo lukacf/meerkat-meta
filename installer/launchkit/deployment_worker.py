@@ -28,7 +28,7 @@ from .deployment_deadlines import (APPLICATION_STOP_TIMEOUT, LEGACY_USER_SERVICE
                                    reported_gateway_horizon, shutdown_budget)
 from .deployment_ports import require_available_console_port, LocalConsolePortUnavailable
 from .native_definition_continuity import valid_continuity_projection
-from .owned_worker import spawn_owned_worker
+from .owned_worker import end_after_owner_loss, spawn_owned_worker
 
 INSTALL_TIMEOUT = 1200
 CHECK_TIMEOUT = 180
@@ -2370,6 +2370,8 @@ async def owner_input(supervisor):
     while True:
         line = await reader.readline()
         if not line:
+            from .deployment import worker_stop_timeout
+            end_after_owner_loss(worker_stop_timeout(supervisor.directory))
             supervisor.stop.set()
             return "owner_lost"
         try:

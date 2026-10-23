@@ -17,7 +17,7 @@ from .architect import _native_request, _schema
 from .blueprint import Blueprint
 from .compiler import _runtime, mob_toml
 from .implementation import now, update_receipt
-from .owned_worker import begin_worker_cleanup, owned_job_deadline
+from .owned_worker import begin_worker_cleanup, end_after_owner_loss, owned_job_deadline
 from .guide_runtime import selected_runtime, configure_builder, build_with_cleanup
 from .rehearsal import (MAX_TRACE_BYTES, MAX_TRACE_FRAMES, REHEARSAL_SECONDS, REHEARSAL_IDLE_SECONDS,
     MAX_REHEARSAL_TURNS, MAX_COMMAND_BYTES, SCOPE, deadline_after, masked_capabilities, validate_trial)
@@ -610,8 +610,10 @@ async def run(directory, *, owned_stdin=False):
                 if command["kind"] == "end" and set(command) != {"kind", "id"}:
                     raise ValueError("Invalid host End command.")
                 commands.put_nowait(command)
-        except (OSError, EOFError, ValueError, asyncio.QueueFull):
+        except (OSError, EOFError, ValueError, asyncio.QueueFull) as error:
             loop.remove_reader(owner_fd)
+            if isinstance(error, (OSError, EOFError)):
+                end_after_owner_loss()
             request_stop()
     if owner_fd is not None:
         loop.add_reader(owner_fd, owner_closed)
