@@ -1167,10 +1167,10 @@ pub enum IdentityRuntimeError {
     /// data: an invalid key or a conflict (which names the first delivery)
     /// committed nothing new; a host that cannot keep the key refused before
     /// committing; an unreadable continuation status may leave a commit
-    /// standing, so retry the same key.
+    /// standing, so retry the same key. Boxed: a mob error is large.
     KeyedSendRefused {
         identity: AgentIdentity,
-        error: meerkat_mob::MobError,
+        error: Box<meerkat_mob::MobError>,
     },
     /// A send status read named a session the identity never had: neither
     /// its current session nor one Core's member history binds to it.
@@ -1465,7 +1465,7 @@ impl std::fmt::Display for IdentityRuntimeError {
                  runtime binding changed while its wiring ran; nothing stale was committed"
             ),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
-            Self::KeyedSendRefused { identity, error } => match error {
+            Self::KeyedSendRefused { identity, error } => match error.as_ref() {
                 meerkat_mob::MobError::MemberSendIdempotency { refusal, .. } => {
                     write!(f, "keyed send to identity '{identity}': {refusal}")
                 }
@@ -10205,10 +10205,10 @@ impl IdentityRuntime {
         let refused = |refusal: meerkat_mob::MemberSendIdempotencyRefusal| {
             IdentityRuntimeError::KeyedSendRefused {
                 identity: identity.clone(),
-                error: meerkat_mob::MobError::MemberSendIdempotency {
+                error: Box::new(meerkat_mob::MobError::MemberSendIdempotency {
                     identity: member.clone(),
                     refusal,
-                },
+                }),
             }
         };
         // Refused before anything is woken: a key that is not canonical key
@@ -10275,7 +10275,7 @@ impl IdentityRuntime {
             .await
             .map_err(|error| IdentityRuntimeError::KeyedSendRefused {
                 identity: identity.clone(),
-                error,
+                error: Box::new(error),
             })
     }
 
