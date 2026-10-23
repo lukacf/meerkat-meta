@@ -847,8 +847,9 @@ fn a_dropped_member_stays_held_until_it_is_retired(test: &str, lazy: bool) {
 /// the same definition a later roster read gets from the running mob, on a
 /// fresh launch (the definition as the build normalizes it, here with its
 /// provider parameters declared as a resume override) and on a resume (the
-/// stored one). The early refusal read keeps the supplied definition as
-/// given.
+/// stored one). The early refusal read, made before the mob store is read,
+/// is handed the supplied definition in that same form, so every roster read
+/// of one boot sees one definition, as a roster provider may require.
 #[test]
 fn the_boot_roster_is_read_from_the_booted_definition_on_a_fresh_launch_and_a_resume() {
     serve_if_host_process();
@@ -882,10 +883,9 @@ fn the_boot_roster_is_read_from_the_booted_definition_on_a_fresh_launch_and_a_re
             &run.init_rosters[1]["mob_definition"], booted,
             "{what}: the boot roster is read from the definition the mob runs"
         );
-        assert_ne!(
+        assert_eq!(
             &run.init_rosters[0]["mob_definition"], booted,
-            "{what}: the early refusal read is handed the supplied definition as given, \
-             before the build normalizes it"
+            "{what}: the early refusal read is handed the definition in the same form"
         );
     }
 }

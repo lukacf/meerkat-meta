@@ -19,6 +19,8 @@
 //! - A member meerkat's resume revives whose identity the roster no longer
 //!   lists starts no run before the roster pass retires it: nothing
 //!   publishes its customizer tools, and the mob build holds its run starts.
+//!   A host-adopted identity's member, which the roster pass never retires
+//!   and no roster publication covers, is not held: it runs as before.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -669,10 +671,11 @@ const DROPPED_RUN_BOUND: Duration = Duration::from_secs(3);
 /// A host customizer that declares [`TOOL`]. On its first build that carries
 /// the mob handle (the identity bootstrap's publication for the restored
 /// members it owes, which runs before the roster pass) it submits work to the
-/// member of [`DROPPED`], which the build revived, and records how the submit
+/// member of `target`, which the build revived, and records how the submit
 /// went and whether the work started a run within [`DROPPED_RUN_BOUND`].
 struct DroppedMemberProbe {
     capture: CaptureClient,
+    target: &'static str,
     probe: std::sync::Mutex<Option<(String, bool)>>,
 }
 
@@ -687,7 +690,7 @@ impl AgentCustomizer for DroppedMemberProbe {
         if let Some(handle) = context.runtime_services.mob_handle()
             && self.probe.lock().unwrap().is_none()
         {
-            let member_id = meerkat_meta::member_comms_id::mob_member_id(DROPPED);
+            let member_id = meerkat_meta::member_comms_id::mob_member_id(self.target);
             let submitted = match handle.member(&member_id).await {
                 Ok(member) => match tokio::time::timeout(
                     Duration::from_secs(10),
@@ -761,6 +764,7 @@ async fn a_restored_member_the_roster_no_longer_lists_starts_no_run_before_it_is
     let capture = CaptureClient::default();
     let probe = Arc::new(DroppedMemberProbe {
         capture: capture.clone(),
+        target: DROPPED,
         probe: std::sync::Mutex::new(None),
     });
     let runtime = boot_listing(
@@ -800,6 +804,187 @@ async fn a_restored_member_the_roster_no_longer_lists_starts_no_run_before_it_is
     assert!(
         !capture.saw(PROBE),
         "the work submitted to the retired member never ran"
+    );
+    runtime.shutdown().await;
+}
+
+/// Set in the child process of
+/// [`a_host_adopted_member_the_roster_no_longer_lists_is_not_held_after_a_restart`]:
+/// the state directory its first boot runs in.
+const ADOPTED_CHILD_STATE: &str = "META_CUSTOMIZER_TOOLS_ADOPTED_CHILD_STATE";
+/// A member the first boot runs, a host then adopts, and the restart's roster
+/// no longer lists.
+const ADOPTED: &str = "personal:carol";
+
+/// A host adopts `name`'s live member through Core: Core then holds an
+/// identity intent row for it and its reconciler drives it, so the roster
+/// pass never retires it. Waits (bounded) until Core's reconciler reports it
+/// converged.
+async fn adopt(runtime: &meerkat_meta::UnifiedRuntime, mob_id: &str, name: &str) {
+    let handle = runtime.mob_handle();
+    let core_identity = meerkat_meta::member_comms_id::roster_member_id_for_identity(name);
+    let entry = handle
+        .get_member(&core_identity)
+        .await
+        .expect("Core's roster read")
+        .expect("a live member to adopt");
+    let session_id = entry
+        .bridge_session_id()
+        .expect("the member's session")
+        .clone();
+    let request = meerkat_mob::AdoptMemberIdentityDeclaration {
+        mob_id: meerkat_mob::MobId::from(mob_id),
+        agent_identity: core_identity.clone(),
+        request_id: meerkat_mob::IdentityAdoptionId::new("restart-adoption")
+            .expect("valid adoption id"),
+        precondition: meerkat_mob::IdentityAdoptionPrecondition::ExpectedAbsent,
+        declaration_scope: meerkat_mob::IdentityDeclarationScopeId::new("restart-host")
+            .expect("valid declaration scope"),
+        declaration_revision: 1,
+        session: meerkat_mob::DesiredSessionTarget {
+            session_id: session_id.clone(),
+            lineage_id: meerkat_core::SessionLineageId::for_session(&session_id),
+            lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+            authority_policy: meerkat_mob::DesiredSessionAuthorityPolicy::RequireExisting,
+        },
+        member: meerkat_mob::IdentityProfileMemberDeclaration {
+            profile_name: entry.role.clone(),
+            profile_override: None,
+            model_override: None,
+            external_addressable_override: None,
+            context: None,
+            labels: Some(entry.labels.clone()),
+            additional_instructions: None,
+            system_prompt_override: None,
+            tool_access_policy: None,
+            auth_binding: None,
+            budget_limits: None,
+            runtime_mode: None,
+            required_env_keys: Vec::new(),
+            required_local_callback_tools: Vec::new(),
+            execution: meerkat_mob::DesiredExecution::ControllingSession,
+        },
+        wiring_custody: Default::default(),
+        owned_wiring: Default::default(),
+        convergence: meerkat_mob::IdentityConvergenceMode::Drain { max_wait_ms: 1_000 },
+    };
+    let adopted = handle
+        .adopt_member_identity_declaration(request)
+        .await
+        .expect("Core adopts the live member");
+    assert!(
+        matches!(
+            adopted.adoption,
+            meerkat_mob::IdentityAdoptionOutcome::Adopted { .. }
+        ),
+        "{:?}",
+        adopted.adoption
+    );
+    assert!(
+        converged(&handle, &core_identity, Duration::from_secs(30)).await,
+        "Core converges the adopted identity"
+    );
+}
+
+/// Whether Core's reconciler reports `core_identity` converged within
+/// `bound`: until then Core keeps the member's admission closed while it
+/// seats the adopted material.
+async fn converged(
+    handle: &meerkat_mob::MobHandle,
+    core_identity: &meerkat_mob::AgentIdentity,
+    bound: Duration,
+) -> bool {
+    let deadline = Instant::now() + bound;
+    loop {
+        let observation = handle
+            .identity_convergence_status(core_identity)
+            .await
+            .expect("Core's convergence status read");
+        if let meerkat_mob::IdentityStoredObservation::Valid(status) = &observation
+            && status.condition() == meerkat_mob::IdentityConvergenceCondition::Converged
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A host adopted a member's identity, and the restart's roster no longer
+/// lists it. Meerkat's resume revives the member while the mob is built, as
+/// it revives every member after an unclean stop. The roster pass never
+/// retires a host-adopted identity and no roster publication covers it, so
+/// a hold staged for it would never be released: the mob build holds none of
+/// its run starts, and once Core's reconciler admits work to it again, its
+/// runs start as before the restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_adopted_member_the_roster_no_longer_lists_is_not_held_after_a_restart() {
+    const MOB_ID: &str = "customizer-tools-restart-g";
+    if let Some(state) = std::env::var_os(ADOPTED_CHILD_STATE) {
+        // The child: the first boot runs both members, a host adopts one,
+        // then the process exits without shutdown.
+        let runtime = boot_listing(
+            MOB_ID,
+            Path::new(&state),
+            CaptureClient::default(),
+            Arc::new(ToolCustomizer::default()),
+            IdentityBootstrapMode::EagerMaterialize,
+            &[MEMBER, ADOPTED],
+        )
+        .await;
+        adopt(&runtime, MOB_ID, ADOPTED).await;
+        sleep(Duration::from_millis(500)).await;
+        std::process::exit(0);
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "a_host_adopted_member_the_roster_no_longer_lists_is_not_held_after_a_restart",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ADOPTED_CHILD_STATE, &state)
+        .status()
+        .expect("run the first boot in a child process");
+    assert!(child.success(), "the child's first boot failed: {child}");
+
+    let runtime = boot_listing(
+        MOB_ID,
+        &state,
+        CaptureClient::default(),
+        Arc::new(ToolCustomizer::default()),
+        IdentityBootstrapMode::LazyMaterialize,
+        &[MEMBER],
+    )
+    .await;
+    let handle = runtime.mob_handle();
+    let adopted_member = meerkat_meta::member_comms_id::roster_member_id_for_identity(ADOPTED);
+    let entry = handle
+        .get_member(&adopted_member)
+        .await
+        .expect("Core's roster read")
+        .expect("the roster pass leaves the host-adopted member");
+    let session_id = entry
+        .bridge_session_id()
+        .expect("the adopted member's session")
+        .clone();
+    let machine = runtime
+        .mob_runtime()
+        .session_service()
+        .expect("session service")
+        .acquire_runtime_adapter(None)
+        .expect("acquire the customizer restart fixture's runtime adapter")
+        .expect("the runtime adapter");
+    assert_eq!(
+        machine.run_starts_held_for_test(&session_id).await,
+        Some(false),
+        "the host-adopted member the roster no longer lists holds no run starts after the \
+         restart's bootstrap: nothing would ever release a hold on it"
     );
     runtime.shutdown().await;
 }
