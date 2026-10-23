@@ -161,7 +161,9 @@ def test_exported_console_opening_uses_startup_url_with_private_port(target, pri
                        and any(isinstance(value, ast.FormattedValue) and isinstance(value.value, ast.Attribute)
                                and value.value.attr == "console_url" for value in node.value.args[0].values))
     context = SimpleNamespace()
-    selected = {"os": connectors["os"], "spec": definition, "application": SimpleNamespace(context=context)}
+    # The shipped template has no hosted Console origin unless startup configures one.
+    selected = {"os": connectors["os"], "spec": definition, "application": SimpleNamespace(context=context),
+                "hosted_origin": None}
     exec(compile(ast.Module(body=[port, url, printed_url], type_ignores=[]), "app.py", "exec"), selected)
     actual_url = f"http://127.0.0.1:{private_port}/console"
     assert context.console_url == actual_url
