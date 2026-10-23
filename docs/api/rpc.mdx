@@ -261,7 +261,7 @@ errors. SDKs surface it on `RpcError.data`.
 | `-32044` | A mob announcement method on a gateway that did not enable mob announcements (see [Mob announcements](#mob-announcements-optional)). `MobAnnouncementsUnavailableError` in both SDKs. | `{kind: "mob_announcements_unavailable"}` |
 | `-32045` | Mob announcement conflict: a source key already bound to other content, a stale subscription or source revision, a collector step from a cursor version another step already moved, a reused operation id, a batch that moved. `AnnouncementConflictError` in both SDKs; a source's stale revision is `SourceStaleRevisionError` and a moved cursor `SourceVersionConflictError`, both carrying the source's current position. | `{kind: "announcement_conflict", existing}`, `{kind: "stale_revision", current_revision}` (a subscription), `{kind: "stale_revision", current_revision, current_version, generation, cursor}` (a source), `{kind: "source_version_conflict", current_version, cursor, state, revision}`, `{kind: "operation_reused"}` or `{kind: "batch_moved", current}` |
 | `-32046` | `meta/mob_announcements/subscriptions/put` start frontier outside a mob's announcements: older than what is retained, or beyond its head (a mob that has announced nothing yet is at head 0). `AnnouncementFrontierError` in both SDKs. | `{kind: "gap", mob_id, earliest_retained}` or `{kind: "frontier_beyond_head", mob_id, head}` |
-| `-32047` | Mob announcement typed refusal. `AnnouncementRefusedError` in both SDKs. | `{kind}`: `governed_runtime`, `unknown_member` (with `member`), `unusable_member`, `unusable_peer`, `subscription_cancelled`, `subscription_ended` (with `end`), `member_mismatch`, `unrelated_mob` (with `mob_id`; member tools only), `ambiguous_mob` (with `mob_id`, or `kept_route`), `child_member_limit` (with `limit`, and `mob_id` for the bound per mob) or `native_unavailable`; for sources (see [Mob announcement sources](#mob-announcement-sources)) `source_paused`, `source_ended`, `principal_changed` (with `pinned_digest`, `offered_digest`), `baseline_required`, `stream_not_baselined` (with `streams`), `backfill_bound_exceeded` (with `remaining`, and `stream` for a stream's bound), `deletions_unobservable`, `topic_owned` and `topic_owned_by_source` (with `topic`, `source_id`), `source_identity_taken` (with `source_id`), `identity_immutable`, `principal_not_allowed` (with `principal_kind`), `audience_not_covered` and `no_direct_route` (with `source_id`, `topic`), `route_overlap` (with `source_id`, `member`), `route_conflict` (with `conflict: "conversation"`, `source_id`), `route_selector_unsupported` (with `selector`) or `source_limit` (with `limit`, and `mob_id`, `null` for the gateway's bound) |
+| `-32047` | Mob announcement typed refusal. `AnnouncementRefusedError` in both SDKs. | `{kind}`: `governed_runtime`, `unknown_member` (with `member`), `unusable_member`, `unusable_peer`, `subscription_cancelled`, `subscription_ended` (with `end`), `member_mismatch`, `unrelated_mob` (with `mob_id`; member tools only), `ambiguous_mob` (with `mob_id`, or `kept_route`), `child_member_limit` (with `limit`, and `mob_id` for the bound per mob) or `native_unavailable`; for sources (see [Mob announcement sources](#mob-announcement-sources)) `source_paused`, `source_ended`, `principal_changed` (with `pinned_digest`, `offered_digest`), `baseline_required`, `stream_not_baselined` (with `streams`), `backfill_bound_exceeded` (with `remaining`, and `stream` for a stream's bound), `deletions_unobservable`, `topic_owned` and `topic_owned_by_source` (with `topic`, `source_id`), `source_identity_taken` (with `source_id`), `identity_immutable`, `principal_not_allowed` (with `principal_kind`), `audience_not_covered` and `no_direct_route` (with `source_id`, `topic`), `route_overlap` (with `source_id`, `member`), `route_conflict` (with `conflict: "conversation"`, `source_id`), `route_selector_unsupported` (with `selector`) or `source_limit` (with `limit`, and `mob_id`, `null` for the gateway's bound); for declarations (see [Mob announcement declarations](#mob-announcement-declarations)) `declaration_rollback` (with `applied`), `declaration_digest_conflict` (with `revision`), `role_template_limit` (with `limit`) or `subscription_id_taken` (with `subscription_id`) |
 | `-32048` | A mob announcement method names a subscription, delivery, source or mob that does not exist here. `AnnouncementNotFoundError` in both SDKs. | `{kind: "unknown_subscription"}`, `{kind: "unknown_delivery"}`, `{kind: "unknown_source"}` or `{kind: "unknown_mob", mobs}` |
 
 A wake that Core holds until an operator acts answers `-32603` with a
@@ -2188,8 +2188,9 @@ announcements answers them there exactly as `rpc_gateway` does:
 `-32044` `mob_announcements_unavailable`. On the console every method, the
 reads included, requires the `runtime.admin` grant, and a read-only console
 refuses the ones that change state (`announce`,
-`subscriptions/{put,pause,resume,cancel}`, `deliveries/reconcile` and
-`sources/{put,pause,resume,end,advance,record_failure}`). On the
+`subscriptions/{put,pause,resume,cancel}`, `deliveries/reconcile`,
+`sources/{put,pause,resume,end,advance,record_failure}` and
+`declarations/apply`). On the
 console, `subscriptions/put` refuses a `member` whose identity is `_system`
 or `__console__` (`-32602`), the identities the console reserves for its own
 events. The host announces a development to a mob hosted on
@@ -2203,9 +2204,9 @@ each as one Meerkat host continuation. The design, defaults and limits are in
 |--------|--------|--------|
 | `meta/mob_announcements/announce` | `{mob_id?, source_key, topics, body, correlation_id?, causes?}` | `{announcement, replayed, captured}` |
 | `meta/mob_announcements/get` | `{mob_id, source_key}` | `{announcement}` (`null` when absent) |
-| `meta/mob_announcements/subscriptions/put` | `{operation_id, subscription_id, member, topics, mobs?, start?, expected_revision?}` | `{subscription}` |
-| `meta/mob_announcements/subscriptions/pause`, `resume`, `cancel` | `{operation_id, subscription_id, expected_revision}` | `{subscription, unresolved_batches}` |
-| `meta/mob_announcements/subscriptions/get` | `{subscription_id}` | `{subscription, marker}` |
+| `meta/mob_announcements/subscriptions/put` | `{operation_id, subscription_id, member?, members?, topics, mobs?, start?, expected_revision?}` | `{subscription}` |
+| `meta/mob_announcements/subscriptions/pause`, `resume`, `cancel` | `{operation_id, subscription_id, expected_revision}` | `{subscription, unresolved_batches}`, or `{template, children, unresolved_batches}` for a role template |
+| `meta/mob_announcements/subscriptions/get` | `{subscription_id}` | `{subscription, marker}`, and `template` for a role template's id |
 | `meta/mob_announcements/subscriptions/list` | `{member?, after?, limit?}` | `{subscriptions}` |
 | `meta/mob_announcements/deliveries/list` | `{member?, subscription_id?, after?, limit?}` | `{deliveries}` |
 | `meta/mob_announcements/deliveries/observe` | `{batch_id}` | `{batch, native, input?, marker?}` |
@@ -2248,6 +2249,8 @@ was read. It never reopens the batch, and the member's next batch goes on as
 it was. Such a batch is read again once per quiet window until what it keeps
 is final (anything but `pending`) or retention removes it.
 
+A put names exactly one of `member`, one member, and `members`, every member
+of a mob with a role (a [role template](#role-templates)).
 `member` is `{"mob_id": "<mob id>", "identity": "<identity>"}`: an identity
 is unique only within its mob. A member of this gateway's mob must be a
 registered identity served by this gateway's runtime: one placed on a host or
@@ -2487,6 +2490,124 @@ disabled, and otherwise `{"sources": "v1", "local_delivery": {"kind":
 can reach this gateway's members now. Sources collect on every gateway. The
 SDKs keep every kind and state above as an open string, and an unknown
 refusal kind on its code's error class.
+
+### Mob announcement declarations
+
+A host can declare sources and subscriptions instead of putting each one:
+in its mob announcement options, inline as `declarations` or in a packaged
+JSON sidecar file named by `declarations_path` (see
+[Configuration](/reference/configuration#mob-announcement-declarations)),
+or at runtime with `declarations/apply`. Meta reconciles them at startup,
+before its dispatcher starts, and at each apply, and creates, replaces and
+ends only the records a declaration made.
+
+| Method | Params | Result |
+|--------|--------|--------|
+| `meta/mob_announcements/declarations/apply` | `{revision?, declarations?}` | `{revision, digest, records}` |
+| `meta/mob_announcements/declarations/get` | `{}` | `{revision, digest, records}` |
+
+Declarations are `{revision, sources?, subscriptions?}`:
+
+- `revision` is the host's own revision of what it declares; a higher one
+  replaces what is applied.
+- Each of `sources` takes the `sources/put` params without `operation_id`,
+  `expected_revision` and `new_generation`, which the reconciler supplies.
+- Each of `subscriptions` is `{subscription_id, member | members, topics,
+  mobs?, start?, delivery?}`: `member` subscribes one member, and
+  `members`, `{"mob_id", "role"}`, makes a [role template](#role-templates).
+  `start` is `{"kind": "now"}`, the only start a declaration takes, and
+  `delivery` with `{"await_handling": true}` is refused until a later
+  release. A declared `subscription_id` is at most 200 bytes.
+- `mob_id` and `mobs` default to this gateway's mob, as for `sources/put`
+  and `subscriptions/put`.
+
+`declarations/apply` follows the gateway's source of declarations: a
+gateway that declares none, or declares them inline, applies the
+declarations the call carries, with `revision` the same as theirs; one with
+a sidecar takes no declarations in the call and reads the file again.
+Anything else is refused `-32602`. A lower revision than the applied one is
+refused `declaration_rollback` (with `applied`), and the applied revision
+with other declarations `declaration_digest_conflict` (with `revision`);
+the applied revision with the same declarations changes nothing and retries
+what is pending. Declarations the static checks refuse are refused whole
+before anything changes, each with its own kind, and at startup they fail
+the gateway's init: bounds and shapes, a duplicate source or subscription
+id (a source id once across every mob), a topic two declared sources own
+(forward topics too), two declared sources on one principal's scope
+(`source_identity_taken`, naming the first), each source's configuration as
+`sources/put` checks it, a triage member its source's audience can never
+cover, a conversation member subscribed to its own scope, and a member
+whose declared subscriptions together would reach a declared source both
+directly and through its forward.
+
+Each record a declaration makes is marked with the revision and the digest
+of its declared form. The reconciler creates, replaces and ends only marked
+records, through the same paths as `sources/put`, `subscriptions/put` and
+the verbs, so every check of those methods applies, and it never touches a
+record made at runtime. A changed subscription is replaced in place at its
+revision: what it captured stays owed, and its new selector captures from
+now. A record dropped from the declarations is ended (a source) or
+cancelled (a subscription). An operator's pause holds. An operator's end or
+cancel holds while the record's declaration is unchanged (`suppressed`);
+once it changes, a source starts its next generation, and a subscription is
+pending (`subscription_cancelled` or `subscription_ended`) until retention
+removes the old record, then made again under its id; declared under a new
+`subscription_id` it is made at once.
+
+A record the runtime refuses for now does not refuse the apply: it is
+`pending` with the refusal its put met (such as `unknown_member`,
+`audience_not_covered` or `route_overlap`), or `unmanaged_record` when a
+record made at runtime holds its id, and the rest of the declarations
+apply. A pending record is retried at startup, at each apply and whenever
+the gateway's set of mobs changes. At startup the options' declarations
+take effect when nothing is applied yet or they name a higher revision than
+the applied one, so an apply made at runtime stands across a restart until
+the options move past it; options at the applied revision with other
+content are logged once as a warning.
+
+`declarations/get` reads the applied `revision` (0 before any) and its
+`digest`, and `records`, one per declared source and subscription and one
+per child of a declared role template: `{kind, id, status, refusal?,
+collection?, delivery?}`. `kind` is `source`, `subscription` or
+`role_child`; `status` is `applied`, `pending`, `suppressed`, or `left` for
+a role child whose member left the role; `refusal` is `{kind, message}`. An
+applied source carries `collection` (`baselining`, `backfilling`, `live`,
+`failing` or `stale`), and an applied subscription or role child carries
+`delivery`: `{"kind": "ready"}`, or `{"kind": "refused", "cause"}` when
+deliveries cannot reach this gateway's members.
+
+#### Role templates
+
+A subscription with `members` instead of `member` is a role template, made
+through a declaration or `subscriptions/put` (never the member tools). It
+never delivers by itself. At each announcement it matches, Meta reads the
+members the mob's roster gives the role and captures for each through a
+child subscription with the id `"<template id>/<16 hex digits>"`, made in
+the capture's own transaction, so a member spawned with the role later
+captures from its first matching announcement. A child passes every check a
+subscription passes; one that fails is pending with its refusal, captures
+nothing, and is admitted again at a later capture or trigger. A member that
+no longer has the role stops capturing at once and keeps what it already
+owes; its child is `left`, never cancelled for leaving, and captures again
+once the member has the role again. A template has at most 256 children
+(`role_template_limit`). A subscription and a role template never share an
+id: either put refuses the id the other holds (`subscription_id_taken`).
+
+`subscriptions/put` with `members` answers the template as `subscription`:
+`{id, members, topics, mobs, state, revision, created_at_ms,
+updated_at_ms}`, `state` `active`, `paused` or `cancelled`, and
+`subscriptions/get` with a template's id answers it as `template`, beside
+`"subscription": null`. A template's id is at most 200 bytes (`-32602`
+otherwise), so its children's ids stay within bounds. Replacing its
+selector admits each child again with the full checks of a put.
+`subscriptions/pause`, `resume` and `cancel` take a template's id and change
+its children with it in one step, answering `{template, children,
+unresolved_batches}`: a paused template pauses its live children and makes
+no new ones, its resume resumes every child its pause paused (a child an
+operator paused itself stays paused), and its cancel cancels the template
+and its children as a subscription's cancel does.
+Children are subscriptions: `subscriptions/get` and `subscriptions/list`
+read them.
 
 ## See also
 

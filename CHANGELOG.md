@@ -205,7 +205,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     `subscriptions/resume` and `subscriptions/cancel` take a template's id
     too and change its children with it in one step, answering
     `{template, children, unresolved_batches}`. A paused template makes no
-    new children, and its resume resumes every child its pause paused.
+    new children, and its resume resumes every child its pause paused; a
+    child an operator paused itself stays paused. `subscriptions/get` reads
+    a template by its id, and a template's id is at most 200 bytes.
   - New method `meta/mob_announcements/declarations/get` reads the applied
     revision and digest and each declared record's status (`applied`,
     `pending`, `suppressed`, or `left` for a role child whose member left
