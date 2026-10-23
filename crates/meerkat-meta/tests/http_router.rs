@@ -261,9 +261,24 @@ fn sc_001_reference_app_router_proves_unified_owned_console_path() {
 #[test]
 fn sc_002_unified_shutdown_stops_mob_before_router_and_module_teardown() {
     let lifecycle_source = include_str!("../src/unified_runtime/lifecycle.rs");
+    assert_eq!(
+        lifecycle_source.matches("let mob_stop = self").count(),
+        1,
+        "shutdown stops the mob once"
+    );
     let mob_stop = lifecycle_source
-        .find("mob_stop = self.stop_mob().await")
+        .find("let mob_stop = self")
         .expect("shutdown must stop mob");
+    let mob_stop_end = mob_stop
+        + lifecycle_source[mob_stop..]
+            .find(';')
+            .expect("the stop statement ends");
+    // The terminal Shutdown decides each member's run (a durable member's is
+    // kept for its next start), so the stop before it must not cancel them.
+    assert!(
+        lifecycle_source[mob_stop..mob_stop_end].contains("leave_runs_running()"),
+        "the shutdown's stop must leave the members' runs running"
+    );
     let close_event_router = lifecycle_source
         .find("self.close_event_router().await;")
         .expect("shutdown must close event router");
