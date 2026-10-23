@@ -1838,12 +1838,16 @@ validation. R0-R3 describes consequences for native observability; it does not
 approve an operation or declare a tool read-only. Neither source validation nor
 callback availability establishes execution permission.
 
-Ordinary packages can omit this file. The selected native preparation path
-requires it before application loading and connector/state creation. Changed or
-malformed source is refused, and a fixed selection with dynamic roster hooks is
-currently unsupported. The trusted compiler can join original source to a
-retained native inventory from its same caller, preserving the command, process
-and source pins. It maps only returned native member bindings and hashes the
+The selected native preparation path requires explicit policy source before
+application loading and connector/state creation, and refuses changed or
+malformed source. For the compiler-selected helperless route,
+`application/native-tool-policy.json` covers exactly the compiled seed identities;
+future members receive grants through native class admission and governed Add.
+This route supports dynamic roster hooks. Legacy packages may omit
+`application/tool-policy.json`; when supplied, that fixed-roster policy remains
+incompatible with dynamic roster hooks. The trusted compiler can join original
+source to a retained native inventory from its same caller, preserving the
+command, process and source pins. It maps only returned native member bindings and hashes the
 original source bytes. The installation owner must retain private exact-byte
 copies for this caller while checking the original accepted source separately.
 Canonical compilation and native provider binding remain required. This trusted
