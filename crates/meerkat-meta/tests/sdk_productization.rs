@@ -21,6 +21,9 @@ use std::process::Command;
 
 use serde::Deserialize;
 
+#[path = "support/sdk_build_lock.rs"]
+mod sdk_build_lock;
+
 #[derive(Debug, Deserialize)]
 struct ScriptCheck {
     name: String,
@@ -287,6 +290,8 @@ fn node_augmented_path() -> String {
 #[test]
 #[ignore]
 fn phase_g_req_g_001_req_g_002_sdk_productization_contracts() {
+    // Builds in sdk/: one SDK build of this checkout at a time.
+    let _sdk_build = sdk_build_lock::lock_sdk_build(&repo_root());
     let node_path = node_augmented_path();
     let path_env = [("PATH", node_path.clone())];
 

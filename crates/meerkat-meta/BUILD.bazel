@@ -14640,6 +14640,7 @@ rust_test(
     ],
     srcs = [
         "tests/reference_app.rs",
+        "tests/support/sdk_build_lock.rs",
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
@@ -16460,6 +16461,7 @@ rust_test(
     ],
     srcs = [
         "tests/sdk_parity.rs",
+        "tests/support/sdk_build_lock.rs",
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
@@ -16575,6 +16577,7 @@ rust_test(
     ],
     srcs = [
         "tests/sdk_productization.rs",
+        "tests/support/sdk_build_lock.rs",
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
