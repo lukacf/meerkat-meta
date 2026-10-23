@@ -1353,14 +1353,16 @@ class ImplementationService:
                 if not receipt or receipt.get("status") not in {"failed", "interrupted"}:
                     raise DraftConflict("A fresh build needs an already stopped incomplete build.")
                 current = await self.status(guide_id, state=state)
+                # A fresh build uses the current guide, without copying the old
+                # source. Its exact checked predecessor may predate that guide.
                 if (not receipt or current.get("status") not in {"failed", "interrupted"}
-                        or current.get("current") is not True or current.get("source_verified") is not True
+                        or current.get("source_verified") is not True
                         or current.get("source_digest") != expected_fresh_source_digest
                         or current.get("worker_stop_confirmed") is not True
                         or current.get("cleanup_pending") or current.get("cleanup_in_progress")
                         or current.get("cleanup_custody_lost")
                         or previous.name in self.processes or previous_task is not None and not previous_task.done()):
-                    raise DraftConflict("A fresh build needs the exact current incomplete source and confirmed builder cleanup.")
+                    raise DraftConflict("A fresh build needs the exact selected incomplete source and confirmed builder cleanup.")
             proposal = state.get("proposal") or state.get("blueprint")
             if not proposal:
                 raise ValueError("Describe a concrete job and get a proposed system before building.")
@@ -1786,7 +1788,9 @@ class ImplementationService:
                                 or start_fresh and (current_receipt.get("status") not in {"failed", "interrupted"}
                                     or current_receipt.get("worker_stop_confirmed") is not True
                                     or current_receipt.get("cleanup_pending") or current_receipt.get("cleanup_in_progress")
-                                    or current_receipt.get("cleanup_custody_lost"))
+                                    or current_receipt.get("cleanup_custody_lost") or not verified
+                                    or verified.get("ready_to_package") is not True or verified.get("status") != "pass"
+                                    or verified.get("tests_run", 0) <= 0)
                                 or preserve_design and (current_receipt.get("status") != "completed"
                                     or current_receipt.get("cleanup_pending") or current_receipt.get("cleanup_in_progress")
                                     or digest != framework_baseline.previous_source_digest or not verified

@@ -670,28 +670,35 @@ const acceptedCandidateBuild = (changes = {}) => {
     framework: { runtime_candidate: { format: "forge-meta-toolkit-runtime-selection-v1" } }, ...changes };
 };
 
-test("fresh build binds the incomplete source once and preserves the unsent note", async () => {
-  const initial = acceptedCandidateBuild({ status: "interrupted", ready_to_package: false });
-  const bodies = [];
-  await mounted({ initial, onPost({ body }) {
-    bodies.push(body);
-    return response(receipt("fresh-B", { status: "queued" }));
-  } }, async ui => {
-    const fresh = ui.button("Start a fresh build");
-    assert.ok(fresh && !fresh.disabled);
-    await ui.flush(() => { fresh.click(); fresh.click(); });
-    assert.equal(ui.current().build_id, "fresh-B");
-    assert.equal(ui.text(), initialDraft);
-    assert.equal(ui.savedDraft(), initialDraft);
+for (const current of [true, false]) {
+  test(`fresh build binds the incomplete source once and preserves the unsent note: current=${current}`, async () => {
+    const initial = acceptedCandidateBuild({ status: "interrupted", ready_to_package: false,
+      current, current_guide_version: current ? state.version : null,
+      guide_version: current ? state.version : state.version - 1 });
+    const bodies = [];
+    await mounted({ initial, onPost({ body }) {
+      bodies.push(body);
+      return response(receipt("fresh-B", { status: "queued" }));
+    } }, async ui => {
+      const fresh = ui.button("Start a fresh build");
+      assert.ok(fresh && !fresh.disabled);
+      if (!current) assert.equal(ui.button("Rebuild with updated runtime"), undefined);
+      await ui.flush(() => { fresh.click(); fresh.click(); });
+      assert.equal(ui.current().build_id, "fresh-B");
+      assert.equal(ui.text(), initialDraft);
+      assert.equal(ui.savedDraft(), initialDraft);
+    });
+    assert.deepEqual(bodies, [{ version: state.version, request: "", previous_build_id: initial.build_id,
+      start_fresh: true, previous_source_digest: candidateDigest }]);
   });
-  assert.deepEqual(bodies, [{ version: state.version, request: "", previous_build_id: initial.build_id,
-    start_fresh: true, previous_source_digest: candidateDigest }]);
-});
+}
 
 for (const changes of [{ source_verified: false }, { worker_stop_confirmed: false },
-  { cleanup_pending: true }, { source_digest: "" }, { status: "completed" }]) {
+  { cleanup_pending: true }, { cleanup_in_progress: true }, { cleanup_custody_lost: true },
+  { source_digest: "" }, { status: "completed" }, { guide_id: otherState.id }]) {
   test(`fresh build is absent for unavailable source or cleanup: ${JSON.stringify(changes)}`, async () => {
-    await mounted({ initial: acceptedCandidateBuild({ status: "interrupted", ready_to_package: false, ...changes }) }, async ui => {
+    await mounted({ initial: acceptedCandidateBuild({ status: "interrupted", ready_to_package: false,
+      current: false, current_guide_version: null, guide_version: state.version - 1, ...changes }) }, async ui => {
       assert.equal(ui.button("Start a fresh build"), undefined);
       assert.equal(ui.calls.filter(call => call.method === "POST").length, 0);
     });
