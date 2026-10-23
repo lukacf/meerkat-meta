@@ -1883,3 +1883,158 @@ async fn a_declared_source_past_its_stale_window_reads_stale() {
         "{view}"
     );
 }
+
+/// A declared subscription's delivery reaches the subscription it makes:
+/// `{"await_handling": true}` as it is, and a delivery naming nothing (`{}`)
+/// the same as none, the default, with the same digest.
+#[tokio::test]
+async fn a_declared_subscription_carries_its_delivery() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let mut waiting = declared_subscription("waits", "agent:a", &["ops.one"]);
+    waiting["delivery"] = serde_json::json!({ "await_handling": true });
+    let mut empty = declared_subscription("plain", "agent:b", &["ops.two"]);
+    empty["delivery"] = serde_json::json!({});
+    try_apply(
+        service,
+        1,
+        serde_json::json!([]),
+        serde_json::json!([waiting.clone(), empty]),
+    )
+    .await
+    .unwrap();
+    let found = try_host_call(
+        service,
+        SUBSCRIPTIONS_GET,
+        serde_json::json!({ "subscription_id": "waits" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        found["subscription"]["delivery"],
+        serde_json::json!({ "await_handling": true }),
+        "{found}"
+    );
+    let found = try_host_call(
+        service,
+        SUBSCRIPTIONS_GET,
+        serde_json::json!({ "subscription_id": "plain" }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        found["subscription"].get("delivery").is_none(),
+        "an empty delivery is the default: {found}"
+    );
+    // The same revision with the empty delivery left out is the same
+    // declaration: no digest conflict.
+    try_apply(
+        service,
+        1,
+        serde_json::json!([]),
+        serde_json::json!([
+            waiting,
+            declared_subscription("plain", "agent:b", &["ops.two"])
+        ]),
+    )
+    .await
+    .unwrap();
+}
+
+/// A declared role template's delivery reaches every child it makes.
+#[tokio::test]
+async fn a_declared_template_gives_its_children_its_delivery() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    harness.native.set_roster_facts("agent:b", "reviewer", &[]);
+    let mut template = declared_template("reviewers", "reviewer", &["deploy.done"]);
+    template["delivery"] = serde_json::json!({ "await_handling": false });
+    try_apply(
+        service,
+        1,
+        serde_json::json!([]),
+        serde_json::json!([template]),
+    )
+    .await
+    .unwrap();
+    host_announces(service, "deploy-1", &["deploy.done"]).await;
+    let child = role_children(&declared(service).await, "reviewers")[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let found = try_host_call(
+        service,
+        SUBSCRIPTIONS_GET,
+        serde_json::json!({ "subscription_id": child }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        found["subscription"]["delivery"],
+        serde_json::json!({ "await_handling": false }),
+        "{found}"
+    );
+}
+
+/// The host's `subscriptions/put` with `members` takes a delivery beside
+/// them: the template keeps it, and its children carry it.
+#[tokio::test]
+async fn a_host_template_put_gives_its_children_its_delivery() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    harness.native.set_roster_facts("agent:b", "reviewer", &[]);
+    let put = try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "template",
+            "subscription_id": "reviewers",
+            "members": { "mob_id": OWN_MOB, "role": "reviewer" },
+            "topics": ["deploy.done"],
+            "delivery": { "await_handling": true },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        put["subscription"]["delivery"],
+        serde_json::json!({ "await_handling": true }),
+        "{put}"
+    );
+    host_announces(service, "deploy-1", &["deploy.done"]).await;
+    let found = try_host_call(
+        service,
+        SUBSCRIPTIONS_GET,
+        serde_json::json!({ "subscription_id": "reviewers" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        found["template"]["delivery"],
+        serde_json::json!({ "await_handling": true }),
+        "{found}"
+    );
+    let listed = try_host_call(
+        service,
+        "meta/mob_announcements/subscriptions/list",
+        serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    let child = listed["subscriptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|subscription| {
+            subscription["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("reviewers/"))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("a child is made: {listed}"));
+    assert_eq!(
+        child["delivery"],
+        serde_json::json!({ "await_handling": true }),
+        "{child}"
+    );
+}
