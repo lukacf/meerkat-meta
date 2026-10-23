@@ -106,6 +106,111 @@ def pairs(plan):
     return [(row["action"], row["resource"]) for row in plan["acquisition"]["proposal_ceiling"]["actions"]]
 
 
+def helperless_fixture(root, *, empty=False):
+    f = Fixture(root)
+    application = f.plan["application"]
+    for name in ("helper", "helper_tools", "helper_profile"):
+        del application[name]
+    del f.plan["acquisition"]
+    f.plan["authorities"] = {}
+    native = f.plan["owner"]["native_host"]
+    for rows in (native["members"], application["members"], application["roster"],
+                 application["tool_policy"]["members"]):
+        rows.pop(0)
+        if empty:
+            rows.clear()
+    if empty:
+        native["routes"] = []
+    application["member_classes"] = [{"id": "project", "profile": "application__project",
+        "factory": "application:project", "callbacks": [], "grants": []}]
+    return f
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_helperless_plan_preserves_selected_classes_without_acquisition_or_effects(tmp_path, empty):
+    f = helperless_fixture(tmp_path, empty=empty)
+    original = deepcopy(f.plan)
+    assert f.assemble() == original and f.plan == original
+    assert f.source.read_bytes() == encoded(original) and f.checks == 2
+    assert set(f.root.iterdir()) == {f.source}
+
+
+def test_helperless_plan_retains_actual_original_controller_selection(tmp_path):
+    f = helperless_fixture(tmp_path)
+    f.plan["authorities"] = {"controllers": [{"target": {
+        "kind": "original_route", "route": "caller-console"},
+        "issuance_id": "retained-controller-id", "controller_route": "native-controller-key"}]}
+    assert f.assemble() == f.plan
+    f.plan["authorities"]["controllers"][0]["target"]["route"] = "unselected-route"
+    with pytest.raises(CustodyError, match="unknown original route"):
+        f.assemble()
+
+
+@pytest.mark.parametrize("field", ["helper", "helper_tools", "helper_profile", "acquisition"])
+def test_helperless_plan_refuses_partial_or_null_helper_selection(tmp_path, field):
+    f = helperless_fixture(tmp_path)
+    target = f.plan if field == "acquisition" else f.plan["application"]
+    target[field] = None
+    with pytest.raises(CustodyError):
+        f.assemble()
+    assert set(f.root.iterdir()) == {f.source}
+
+
+@pytest.mark.parametrize("field", ["agent_setup", "helper_report", "helper_mcp", "helper_catalog"])
+def test_helperless_plan_refuses_helper_authority_fields_even_when_empty(tmp_path, field):
+    f = helperless_fixture(tmp_path)
+    f.plan["authorities"][field] = [] if field == "agent_setup" else None
+    with pytest.raises(CustodyError, match="PreparationAuthorityIntent"):
+        f.assemble()
+    assert set(f.root.iterdir()) == {f.source}
+
+
+@pytest.mark.parametrize("change", ["controller", "setup_capability"])
+def test_helperless_plan_refuses_helper_controller_and_retained_setup_capability(tmp_path, change):
+    f = helperless_fixture(tmp_path)
+    if change == "controller":
+        f.plan["authorities"]["controllers"] = [{"target": {"kind": "helper"},
+            "issuance_id": "retained-helper-controller"}]
+    else:
+        for members in (f.plan["application"]["members"], f.plan["owner"]["native_host"]["members"]):
+            members[0]["setup_capability"] = {"route": "caller-console",
+                "parent": {"opaque_native_lineage": "retained"}}
+    with pytest.raises(CustodyError, match="actual helper"):
+        f.assemble()
+
+
+@pytest.mark.parametrize("classes", [[], None, ["project"]])
+def test_empty_helperless_plan_requires_native_class_declarations(tmp_path, classes):
+    f = helperless_fixture(tmp_path, empty=True)
+    f.plan["application"]["member_classes"] = classes
+    with pytest.raises(CustodyError):
+        f.assemble()
+
+
+@pytest.mark.parametrize("change", ["roster", "members", "policy"])
+def test_empty_helperless_plan_refuses_invented_initial_inventory(tmp_path, change):
+    f = helperless_fixture(tmp_path, empty=True)
+    if change == "roster":
+        f.plan["application"]["roster"].append({"identity": "project:placeholder",
+            "profile": "application__project"})
+    elif change == "members":
+        f.plan["application"]["members"].append(f.caller)
+    else:
+        f.plan["application"]["tool_policy"]["members"].append({
+            "member_identity": "invented", "grants": []})
+    with pytest.raises(CustodyError):
+        f.assemble()
+    assert set(f.root.iterdir()) == {f.source}
+
+
+def test_helperful_plan_also_preserves_selected_member_classes(tmp_path):
+    f = Fixture(tmp_path)
+    f.plan["authorities"] = {}
+    f.plan["application"]["member_classes"] = [{"id": "project", "profile": "application__project",
+        "factory": "application:project", "callbacks": [], "grants": []}]
+    assert f.assemble() == f.plan
+
+
 @pytest.mark.parametrize("mode", ["preparation", "inert_acquisition", "checked_installation"])
 def test_explicit_helper_composition_preserves_presenter_policy_and_other_members(tmp_path, mode):
     f = Fixture(tmp_path)

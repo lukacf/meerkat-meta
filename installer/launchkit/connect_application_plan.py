@@ -103,7 +103,7 @@ def _source_binding(route, channels, realm):
 
 
 def _assemble(plan):
-    _closed(plan, _PLAN_FIELDS, "ApplicationPreparationPlan")
+    _closed(plan, _PLAN_FIELDS - {"acquisition"}, "ApplicationPreparationPlan", {"acquisition"})
     if type(plan["schema"]) is not int or plan["schema"] != 1:
         raise CustodyError("ApplicationPreparationPlan requires schema 1.")
     for name in ("deployment_root", "output"):
@@ -127,8 +127,6 @@ def _assemble(plan):
         "ingress_domain", "members", "routes"}, "PreparedNativeHost", {"service_parent_administration"})
     realm = _text(native["realm"], "Native realm")
     members = _array(native["members"], "Prepared native members")
-    if not members:
-        raise CustodyError("The actual initial member inventory must be finite and nonempty.")
     by_member = {}
     for member in members:
         _closed(member, _MEMBER_FIELDS, "PreparedNativeMember", {"setup_capability"})
@@ -157,10 +155,22 @@ def _assemble(plan):
     _selected_service_parent_administration(native.get("service_parent_administration"),
         routes=native["routes"], remote_operator=native["remote_operator"])
 
+    helper_fields = {"helper", "helper_tools", "helper_profile"}
     application = _closed(plan["application"], {"schema", "realm", "definition", "roster",
-        "members", "helper", "helper_tools", "helper_profile", "tool_policy"}, "ApplicationSetupCompilationInput")
+        "members", "tool_policy"}, "ApplicationSetupCompilationInput", helper_fields | {"member_classes"})
     if type(application["schema"]) is not int or application["schema"] != 4:
         raise CustodyError("Application setup requires schema 4, without surface placeholders.")
+    selected_helper_fields = helper_fields & application.keys()
+    if selected_helper_fields and selected_helper_fields != helper_fields:
+        raise CustodyError("Application setup requires all helper fields or none.")
+    has_helper = bool(selected_helper_fields)
+    if ("acquisition" in plan) != has_helper:
+        raise CustodyError("Acquisition parameters require the same explicit helper selection.")
+    declarations = _array(application.get("member_classes", []), "Native member-class declarations")
+    if any(not isinstance(item, dict) for item in declarations):
+        raise CustodyError("Native member-class declarations must retain their selected objects.")
+    if not members and (has_helper or not declarations):
+        raise CustodyError("An empty initial inventory requires helperless native member classes.")
     if not _same(application["members"], members):
         raise CustodyError("Application and owner member selections differ.")
     selected_realm = _closed(application["realm"], {"realm_id", "context_root", "state_root"}, "ApplicationSetupRealm", {"user_config_root"})
@@ -180,19 +190,20 @@ def _assemble(plan):
     _closed(definition, {"format", "text" if definition["format"] == "toml" else "definition"}, "ApplicationSetupDefinition")
     if definition["format"] == "toml" and not isinstance(definition["text"], str):
         raise CustodyError("The exact TOML definition must remain text.")
-    helper = _closed(application["helper"], {"member", "ingress_actor", "logical_executor",
-        "represented_subject", "controller_parent", "operation_basis"}, "InstalledSetupSelection",
-        {"report_capability", "catalog_capability"})
-    _preparation_helper_catalog_capability(helper.get("catalog_capability"), helper["operation_basis"])
-    helper_binding = _binding(helper["member"])
-    if not any(_same(helper_binding, member["member"]) for member in members):
-        raise CustodyError("The helper must be an actual selected native member.")
-    _array(helper["controller_parent"], "Selected helper controller parents")
-    # Preserve the trusted application's explicit checked-install composition.
-    # The actual native driver still requires its retained terminal or Console
-    # presenter and owns review, tool admission and installation permission.
-    if application["helper_tools"] not in {"preparation", "inert_acquisition", "checked_installation"} or application["helper_profile"] not in {"dedicated", "exclusive_application_role"}:
-        raise CustodyError("The setup helper requires its exact selected native strategy.")
+    if has_helper:
+        helper = _closed(application["helper"], {"member", "ingress_actor", "logical_executor",
+            "represented_subject", "controller_parent", "operation_basis"}, "InstalledSetupSelection",
+            {"report_capability", "catalog_capability"})
+        _preparation_helper_catalog_capability(helper.get("catalog_capability"), helper["operation_basis"])
+        helper_binding = _binding(helper["member"])
+        if not any(_same(helper_binding, member["member"]) for member in members):
+            raise CustodyError("The helper must be an actual selected native member.")
+        _array(helper["controller_parent"], "Selected helper controller parents")
+        # Preserve the trusted application's explicit checked-install composition.
+        # The actual native driver still requires its retained terminal or Console
+        # presenter and owns review, tool admission and installation permission.
+        if application["helper_tools"] not in {"preparation", "inert_acquisition", "checked_installation"} or application["helper_profile"] not in {"dedicated", "exclusive_application_role"}:
+            raise CustodyError("The setup helper requires its exact selected native strategy.")
     policy = _closed(application["tool_policy"], {"provider_id", "policy_id", "revision", "source", "members"}, "ApplicationToolPolicyInput")
     policy_members = _array(policy["members"], "Explicit member tool policy")
     policy_names = []
@@ -204,7 +215,8 @@ def _assemble(plan):
         raise CustodyError("Tool policy must select every actual native member exactly once.")
 
     authorities = _closed(plan["authorities"], set(), "PreparationAuthorityIntent",
-        {"controllers", "agent_setup", "helper_report", "helper_mcp", "helper_catalog"})
+        {"controllers", "agent_setup", "helper_report", "helper_mcp", "helper_catalog"}
+        if has_helper else {"controllers"})
     issuance_ids, controller_targets = set(), set()
     for name in ("helper_mcp", "helper_catalog"):
         request = authorities.get(name)
@@ -235,6 +247,8 @@ def _assemble(plan):
         _closed(request, {"target", "issuance_id"}, "PreparedControllerIntent", {"controller_route"})
         target = request["target"]
         if isinstance(target, dict) and target.get("kind") == "helper":
+            if not has_helper:
+                raise CustodyError("A helper controller request requires an actual helper.")
             _closed(target, {"kind"}, "Helper controller target")
             key = ("helper",)
         elif isinstance(target, dict) and target.get("kind") == "original_route":
@@ -253,7 +267,7 @@ def _assemble(plan):
             raise CustodyError("Authority requests repeat a target or issuance ID.")
         controller_targets.add(key)
         issuance_ids.add(issue)
-    if not helper["controller_parent"] and ("helper",) not in controller_targets:
+    if has_helper and not helper["controller_parent"] and ("helper",) not in controller_targets:
         raise CustodyError("An empty helper controller selection requires its explicit request.")
 
     selected_targets, requested_members = set(), set()
@@ -263,6 +277,8 @@ def _assemble(plan):
         capability = member.get("setup_capability")
         if capability is None:
             continue
+        if not has_helper:
+            raise CustodyError("A configured setup capability requires an actual helper.")
         _closed(capability, {"route", "parent"}, "Configured agent setup capability", {"helper_targets"})
         _preparation_setup_targets(capability.get("helper_targets", []), compiled=True)
         route = _text(capability["route"], "Configured setup original route")
@@ -309,6 +325,11 @@ def _assemble(plan):
             if issue in issuance_ids:
                 raise CustodyError("Authority requests repeat an issuance ID.")
             issuance_ids.add(issue)
+
+    if not has_helper:
+        # This path has no acquisition service or helper authority. Preserve
+        # the original class and controller declarations for native validation.
+        return plan
 
     acquisition = _closed(plan["acquisition"], {"backend_generation", "proposal_ceiling", "output_audience", "limits"}, "ApplicationAcquisitionParameters", {"console_setup", "standing_policy"})
     _selected_standing_policy(acquisition.get("standing_policy"), helper_tools=application["helper_tools"])

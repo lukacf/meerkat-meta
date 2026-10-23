@@ -1250,12 +1250,20 @@ def _inventory_input(content):
     if len(content) > MAX_INVENTORY_BYTES:
         raise CustodyError("The inventory input exceeds its native artifact limit.")
     source = _json(content)
-    if (not isinstance(source, dict) or set(source) != {"schema", "mob_id", "roster", "helper_identity"}
+    required = {"schema", "mob_id", "roster"}
+    if (not isinstance(source, dict) or not required <= source.keys()
+            or source.keys() - required - {"helper_identity", "member_classes"}
             or type(source["schema"]) is not int or source["schema"] != 1
-            or any(not isinstance(source[name], str) or not source[name]
-                   for name in ("mob_id", "helper_identity"))
-            or not isinstance(source["roster"], list) or not source["roster"]):
+            or not isinstance(source["mob_id"], str) or not source["mob_id"]
+            or ("helper_identity" in source and (type(source["helper_identity"]) is not str
+                or not source["helper_identity"]))
+            or not isinstance(source["roster"], list)):
         raise CustodyError("Inventory requires the exact schema 1 compiler input.")
+    declarations = source.get("member_classes", [])
+    if type(declarations) is not list or any(type(item) is not dict for item in declarations):
+        raise CustodyError("Inventory requires an exact native member-class declaration list.")
+    if not source["roster"] and not declarations:
+        raise CustodyError("An empty inventory requires explicit native member-class declarations.")
     identities = set()
     for row in source["roster"]:
         if (not isinstance(row, dict)
@@ -1264,18 +1272,24 @@ def _inventory_input(content):
                 or row["identity"] in identities):
             raise CustodyError("The inventory roster has missing or repeated identity/profile facts.")
         identities.add(row["identity"])
-    if source["helper_identity"] not in identities:
+    if "helper_identity" in source and source["helper_identity"] not in identities:
         raise CustodyError("The selected inventory helper is absent from its exact roster.")
     # DurableAgentSpec and identifier decoding remain native-owned. Preserve
-    # every roster field and its source bytes; only these two facts join rows.
+    # every roster field and class declaration as source bytes; only these two
+    # facts join rows. Native validates the CompiledMemberClass contents.
     return source
 
 
 def _inventory_receipt(receipt, source):
-    if (set(receipt) != {"schema", "mob_id", "realm_id", "helper_identity", "members"}
+    has_helper = "helper_identity" in source
+    fields = {"schema", "mob_id", "realm_id", "members"}
+    if has_helper:
+        fields.add("helper_identity")
+    if (not isinstance(receipt, dict)
+            or set(receipt) != fields
             or type(receipt["schema"]) is not int or receipt["schema"] != 1
             or not _same_json_value(receipt["mob_id"], source["mob_id"])
-            or not _same_json_value(receipt["helper_identity"], source["helper_identity"])
+            or (has_helper and not _same_json_value(receipt["helper_identity"], source["helper_identity"]))
             or not isinstance(receipt["realm_id"], str) or not receipt["realm_id"]
             or not isinstance(receipt["members"], list)
             or len(receipt["members"]) != len(source["roster"])):
