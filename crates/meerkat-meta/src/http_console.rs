@@ -15,7 +15,6 @@ use base64::Engine;
 use meerkat_contracts::WireRuntimeBinding;
 use meerkat_core::ContentInput;
 use meerkat_core::comms::TrustedPeerDescriptor;
-use meerkat_mob::MobState;
 use meerkat_mob::ids::{AgentIdentity, AgentRuntimeId, FenceToken, MobId};
 use meerkat_mob::launch::MemberLaunchMode;
 use meerkat_mob::runtime::reconcile::MemberFilter;
@@ -8966,10 +8965,13 @@ async fn handle_console_runtime_rpc_with_visibility(
         })
         .await,
         "meta/status" => {
-            let mob_state = runtime.handle().status_observation_snapshot();
+            // A fail-stopped actor keeps its last live phase: it does not run.
+            let running = crate::mob_handle_runtime::mob_observed_running(
+                &runtime.handle().lifecycle_observation(),
+            );
             let mut result = serde_json::json!({
                 "contract_version": crate::rpc::META_CONTRACT_VERSION,
-                "running": matches!(mob_state, MobState::Creating | MobState::Running),
+                "running": running,
                 // Console routes to MobRuntime directly — no module runtime available.
                 // Return [] to keep StatusResult.loaded_modules schema-consistent.
                 "loaded_modules": serde_json::json!([]),
@@ -12602,10 +12604,10 @@ async fn build_live_snapshot(
         Box::pin(read_model.snapshot_for_cut(runtime, identity_runtime, &request_cut)).await;
     let cut = read_model_state.identity_cut.newer(&request_cut);
     // Whether the mob runs is its owner's answer now, as `meta/status`
-    // reads it: a cached walk can predate a stop.
-    let running = Some(matches!(
-        runtime.handle().status_observation_snapshot(),
-        MobState::Creating | MobState::Running
+    // reads it: a cached walk can predate a stop, and a fail-stopped actor
+    // keeps its last live phase.
+    let running = Some(crate::mob_handle_runtime::mob_observed_running(
+        &runtime.handle().lifecycle_observation(),
     ));
     // Hot path: clone the pre-projected members from the cached read
     // model. NO `handle.*` async calls happen here — the background

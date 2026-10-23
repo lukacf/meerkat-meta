@@ -523,14 +523,11 @@ impl BoundMob {
     }
 
     /// Whether the binding still stands for a live mob, which another
-    /// activation under the id may not replace.
+    /// activation under the id may not replace. A mob whose actor has
+    /// stopped is not live, whatever phase it last published: a restart
+    /// recovers it under the same id.
     fn is_live(&self) -> bool {
-        !matches!(
-            self.handle.status_observation_snapshot(),
-            meerkat_mob::MobState::Stopped
-                | meerkat_mob::MobState::Completed
-                | meerkat_mob::MobState::Destroyed
-        )
+        crate::mob_handle_runtime::mob_observed_running(&self.handle.lifecycle_observation())
     }
 }
 
