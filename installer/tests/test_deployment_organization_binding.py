@@ -12,7 +12,7 @@ from launchkit import deployment
 from launchkit.artifact_binding import inputs, package_matches
 from launchkit.deployment_sources import read_package_source
 from launchkit.projects import DraftConflict, fingerprint
-from test_deployment import Guide, Implementation, Service
+from test_deployment import Guide, Implementation, Service, submit
 
 
 ORGANIZATION = {"id": "example", "version": "1", "guide_context": "Use the approved identity contract"}
@@ -110,3 +110,64 @@ async def test_deployment_options_keeps_frozen_package_organization_scope(tmp_pa
         port_read.assert_not_called()
     assert implementation.package.return_value == (frozen_payload, slug)
     assert not service.tasks
+
+
+@pytest.mark.parametrize("change", ["changed", "removed", "chat_only"])
+async def test_installed_application_retains_organization_currentness(tmp_path, monkeypatch, change):
+    guide = Guide()
+    guide.state["organization"] = deepcopy(ORGANIZATION)
+    implementation = Implementation(guide)
+    implementation.digest = "a" * 64
+    service = Service(tmp_path / "host", guide, implementation)
+    service.service_manager = SimpleNamespace(capability=AsyncMock(return_value={"available": False}))
+    monkeypatch.setattr(deployment, "require_available_console_port", lambda *args, **kwargs: None)
+    monkeypatch.setattr(deployment, "observe_local_console_port", lambda *args, **kwargs: {"available": True})
+    try:
+        receipt = await submit(service, tmp_path / "application")
+        directory = service._directory(guide.identity)
+        deployment.materialize(directory)
+        await service.action(guide.identity, receipt["deployment_id"], "stop")
+        package = (directory / "package.zip").read_bytes()
+        assert receipt["organization_hash"] == fingerprint(ORGANIZATION)
+        assert (await service.status(guide.identity))["current"] is True
+        if change == "removed":
+            del guide.state["organization"]
+        elif change == "changed":
+            guide.state["organization"]["version"] = "2"
+        else:
+            guide.state["version"] += 1
+        assert (await service.status(guide.identity))["current"] is (change == "chat_only")
+        retained = deployment.read_receipt(directory)
+        assert retained["organization_hash"] == receipt["organization_hash"]
+        assert retained["guide_version"] == 4
+        assert (directory / "package.zip").read_bytes() == package
+        assert not service.processes
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.parametrize("change", ["changed", "null", "missing_source_field"])
+def test_application_receipt_cannot_claim_another_organization(change):
+    state = Guide().state
+    report = {"build_id": "build", "guide_version": state["version"], **inputs(state),
+              "organization_hash": fingerprint(ORGANIZATION), "verification": {"digest": "a" * 64}}
+    receipt = {key: report[key] for key in ("build_id", "guide_version", "blueprint_hash", "organization_hash")}
+    if change == "missing_source_field":
+        del report["organization_hash"]
+        receipt["organization_hash"] = None
+    else:
+        receipt["organization_hash"] = None if change == "null" else "b" * 64
+    files = {"implementation-report.json": (json.dumps(report).encode(), 0o644)}
+    with pytest.raises(ValueError, match="^The installed source binding could not be verified\\.$"):
+        read_package_source(files, receipt)
+
+
+def test_legacy_application_receipt_is_read_without_backfilling_organization():
+    state = Guide().state
+    report = {"build_id": "build", "guide_version": state["version"], **inputs(state),
+              "organization_hash": fingerprint(ORGANIZATION), "verification": {"digest": "a" * 64}}
+    receipt = {key: report[key] for key in ("build_id", "guide_version", "blueprint_hash")}
+    before = deepcopy(receipt)
+    source = read_package_source({"implementation-report.json": (json.dumps(report).encode(), 0o644)}, receipt)
+    assert source["organization_hash"] == report["organization_hash"]
+    assert receipt == before and "organization_hash" not in receipt

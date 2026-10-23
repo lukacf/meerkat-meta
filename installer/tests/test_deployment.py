@@ -70,6 +70,8 @@ class Implementation:
         report = {"build_id": build_id, "guide_version": self.original["version"],
             "brief_hash": fingerprint(self.guide.state.get("brief") or {}),
             "blueprint_hash": fingerprint(self.guide.state["proposal"]), "verification": {"digest": self.digest}, "unresolved": ["Actual external data not verified"]}
+        if self.original.get("organization") is not None:
+            report["organization_hash"] = fingerprint(self.original["organization"])
         with zipfile.ZipFile(result, "w") as archive:
             for path, content in {"deployment.json": json.dumps(self.definition), "implementation-report.json": json.dumps(report),
                 "app.py": "print('native test fixture')\n", "install.sh": self.install_script, "application/__init__.py": ""}.items():
