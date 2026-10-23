@@ -206,6 +206,22 @@ async def test_dynamic_roster_refuses_a_replacement_start_first_with_its_own_tex
     assert not f.events and f.app.context.runtime is None and f.owner.callbacks is None
 
 
+@pytest.mark.asyncio
+async def test_replacement_with_ordinary_declarations_keeps_the_typed_refusal(fixture):
+    from launchkit.connect_application_startup import DYNAMIC_ROSTER_UNSUPPORTED
+    f = fixture
+    value = json.loads(f.plan.read())
+    value["application"]["member_classes"] = [{"id": "reader", "profile": "reusable-reader",
+        "factory": "application:reader", "callbacks": [], "grants": []}]
+    f.plan = write(f.plan.path, content(value))
+    f.owner = f.make_owner()
+    f.app.dynamic = True
+    with pytest.raises(CustodyError) as refused:
+        await f.owner.prepare(f.app)
+    assert str(refused.value) == DYNAMIC_ROSTER_UNSUPPORTED
+    assert not f.events
+
+
 @pytest.mark.parametrize("pin_name", ["selection", "prior", "plan", "compilation", "activation", "gateway"])
 async def test_retained_input_changes_refuse_before_sdk_construction(fixture, pin_name):
     f = fixture

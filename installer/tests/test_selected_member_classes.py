@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from launchkit.connect_application_callbacks import SelectedApplicationCallbacks
+from launchkit.connect_application_startup import DYNAMIC_ROSTER_UNSUPPORTED
 from launchkit.connect_installer_caller import CustodyError, ExactFile
 from test_application_callbacks import Fixture
 
@@ -73,14 +74,17 @@ def test_reusable_profile_waits_for_exact_identity_customizer(tmp_path):
         with pytest.raises(CustodyError): f.callbacks.helper_agent(draft, f.by_profile)
 
 
-def test_identity_projection_changes_only_the_exact_observed_helper_profile(tmp_path):
+@pytest.mark.parametrize("ordinary", [
+    {"identity": "reader:new", "profile": "reusable-reader"},
+    {"identity": "reader:main", "profile": "reader-source"},
+])
+def test_identity_projection_changes_only_the_exact_observed_helper_profile(tmp_path, ordinary):
     f = ClassFixture(tmp_path)
     f.observe()
     original = {"identity": "helper:setup", "profile": "helper-source", "labels": {"role": "helper"}}
     projected = f.callbacks.project_identity_spec(original)
     assert projected == {**original, "profile": f.profile}
     assert original["profile"] == "helper-source"
-    ordinary = {"identity": "reader:new", "profile": "reusable-reader"}
     assert f.callbacks.project_identity_spec(ordinary) == ordinary
     with pytest.raises(CustodyError):
         f.callbacks.project_identity_spec({"identity": "reader:new", "profile": "helper-source"})
@@ -98,7 +102,7 @@ def test_actual_callback_surface_must_equal_declared_class(tmp_path):
         f.callbacks.require_member_callbacks({**agent, "classId": "helper"}, [tool])
 
 
-def startup_fixture(tmp_path, monkeypatch, mode):
+def startup_fixture(tmp_path, monkeypatch, mode, *, declarations=None):
     from test_application_startup import Fixture as Fresh, pin
     from test_application_restart import RestartFixture
     from launchkit.connect_application_startup import FreshApplicationStartup
@@ -106,7 +110,7 @@ def startup_fixture(tmp_path, monkeypatch, mode):
     value = json.loads(f.plan.read())
     value["application"]["definition"]["definition"]["profiles"]["reusable-reader"] = {
         "model": "selected-model", "tools": {"comms": True}}
-    value["application"]["member_classes"] = [{"id": "reader", "profile": "reusable-reader",
+    value["application"]["member_classes"] = declarations if declarations is not None else [{"id": "reader", "profile": "reusable-reader",
         "factory": "application:reader", "callbacks": [], "grants": []}]
     f.plan = pin(f.plan.path, json.dumps(value).encode())
     if mode == "restored":
@@ -120,6 +124,18 @@ def startup_fixture(tmp_path, monkeypatch, mode):
     f.app.dynamic = True
     f.app.deployment = {"classes": [{"id": "reader"}], "applicationProfiles": {"reader": "reusable-reader"}}
     return f
+
+
+@pytest.mark.parametrize("mode", ["fresh", "restored"])
+@pytest.mark.asyncio
+async def test_shared_workflow_only_declarations_keep_the_typed_refusal(tmp_path, monkeypatch, mode):
+    declarations = [{"id": "workflow", "purpose": "shared_workflow", "profile": "native-workflow-profile",
+        "factory": "native-workflow-factory", "callbacks": [], "grants": []}]
+    f = startup_fixture(tmp_path, monkeypatch, mode, declarations=declarations)
+    with pytest.raises(CustodyError) as refused:
+        await f.owner.prepare(f.app)
+    assert str(refused.value) == DYNAMIC_ROSTER_UNSUPPORTED
+    assert f.events == []
 
 
 @pytest.mark.parametrize("mode", ["fresh", "restored"])
