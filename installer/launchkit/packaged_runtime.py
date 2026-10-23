@@ -33,7 +33,9 @@ def configure_application_model_custody(custody):
     configuration owner that the launcher selections carry; create_app passes
     it to the local application registry, which checks it again. It may be the
     same owner the Guide's route uses, or another one over the same root: a
-    process has one supported model credential root, XDG_CONFIG_HOME.
+    process has one supported model credential root, XDG_CONFIG_HOME. A Forge
+    started with an application host factory carries it too, or refuses to
+    start (application_host_launch).
     """
     global _application_model_custody
     from .connect_application_startup import _ModelConfiguration
@@ -52,6 +54,16 @@ def configure_application_model_custody(custody):
         raise CustodyError(APPLICATION_MODEL_ROOT) from error
     custody.require_filesystem_current()
     _application_model_custody = custody
+
+
+def configured_application_model_custody():
+    """The owner configure_application_model_custody selected, or None.
+
+    A Forge started with an application host factory reads it too
+    (application_host_launch), so the owner reaches that entry's selection or
+    startup refuses; it is never dropped.
+    """
+    return _application_model_custody
 
 
 def configure_private_model_route(route, custody):

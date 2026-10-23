@@ -110,7 +110,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   one Forge process has one model credential root, its `XDG_CONFIG_HOME`, and
   a custody over another root is refused at that call. Applications whose
   agents use host-managed models then install and start from the packaged
-  entry.
+  entry. A Forge started with an application host factory
+  (`META_FORGE_APPLICATION_HOST_FACTORY`) carries that custody too: a bare
+  product target, or an ordinary selection without its own model owner,
+  takes it, and a selection with another owner, or one that cannot carry it,
+  stops startup instead of dropping it.
 
 ### Changed
 
