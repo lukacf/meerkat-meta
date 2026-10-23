@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+from time import sleep
 
 import pytest
 
@@ -365,8 +366,18 @@ async def test_replaced_owner_after_pip_refuses_nested_readback_and_dependencies
     assert_reaped(files.children[0])
 
 
-async def test_pair_deadline_is_not_reset_for_dependency_phase(supervised_files):
+@pytest.mark.parametrize("staging", ["prompt", "slow"])
+async def test_pair_deadline_is_not_reset_for_dependency_phase(supervised_files, staging):
     files = supervised_files
+    if staging == "slow":
+        # A loaded host stages the wheels slowly before the first pip child.
+        fence, staged = files.require_current, []
+        def slow_fence():
+            if not staged:
+                staged.append(True)
+                sleep(0.8)
+            return fence()
+        files.require_current = slow_fence
     loop = asyncio.get_running_loop()
     clock = [loop.time()]
     original_time = loop.time
