@@ -331,6 +331,61 @@ detached member forks) is refused with `MobError::ForkInstructionRefused`
 instead. See [Fork instruction policy](/reference/configuration#fork-instruction-policy)
 for what a fork copies and what `ReactivateInherited` trusts.
 
+### Session hooks and mob operator authority
+
+A session hook (`SessionHook`, installed with `.session_hook(...)`) runs
+`before_create` on every build of a session: a member's first build and each
+rebuild of its session, including the restore of a member after a restart.
+An edit the hook makes to the request applies to that build only.
+
+A member whose profile enables `tools.mob` gets Meerkat's default mob operator
+authority, which may spawn every profile of its mob. A host narrows it in the
+hook, on the build's `mob_tool_authority_context`, and leaves alone a build
+whose authority holds no scope in its mob (a member of a child mob, for
+example). The sample uses `meerkat-core`, `meerkat-runtime` and `async-trait`
+as direct dependencies besides `meerkat-meta`:
+
+```rust
+use async_trait::async_trait;
+use meerkat_core::service::{CreateSessionRequest, SessionError};
+use meerkat_meta::SessionHook;
+use meerkat_runtime::mob_operator_authority::restrict_spawn_profiles_in_mob;
+
+struct WorkersOnly;
+
+#[async_trait]
+impl SessionHook for WorkersOnly {
+    async fn before_create(&self, req: &mut CreateSessionRequest) -> Result<(), SessionError> {
+        let Some(build) = req.build.as_mut() else {
+            return Ok(());
+        };
+        let Some(authority) = build.mob_tool_authority_context.as_ref() else {
+            return Ok(());
+        };
+        if !authority.spawn_profile_scope().contains_key("my-mob") {
+            return Ok(());
+        }
+        let narrowed = restrict_spawn_profiles_in_mob(authority, "my-mob", ["worker"])
+            .map_err(SessionError::Unsupported)?;
+        build.mob_tool_authority_context = Some(narrowed);
+        Ok(())
+    }
+}
+```
+
+The member's `spawn_member` and `spawn_many_members` then refuse any other
+profile of that mob with `access_denied`. A batch that names one is refused
+whole: none of its members spawn.
+
+The narrowing is per build, and so is a disable of the member's mob tools
+made in the hook. Neither is restored as authority: a restore build reaches
+the hook with the profile's setting and the default authority again. Make the
+edit on every build, restores included, or a restored member returns to the
+default authority. A hook that also installs host tools composes them over
+the session's own tools
+(`meerkat_meta::tool_compose::ComposedExternalTools::over`), so the member
+keeps its mob tools and the authority Meerkat binds on them.
+
 ## Module routing
 
 ### `route_module_call`

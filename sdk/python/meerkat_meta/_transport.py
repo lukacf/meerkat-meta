@@ -27,11 +27,18 @@ _CURRENT_TRANSPORT = object()
 # final 130-second wire deadline.
 _PROVIDER_CALLBACK_COMPLETION_SECONDS = 125.0
 
-# The fallback matches the stock gateway's advertised shutdown horizon. It
-# covers two 130-second callback windows, runtime event/mob drains, bounded
+# The shutdown wait when no valid horizon was advertised. The stock gateway
+# advertises its own stdio_shutdown_horizon_ms (432_000 ms in 0.9.5) in its
+# `accepted` answer to meta/init, before any bootstrap, and the transport
+# waits that value instead. This fallback governs only a stop before that
+# answer (nothing durable has run yet), an older or custom gateway without
+# the shutdown handshake (the stdin EOF protocol), and a handshake gateway
+# that advertises no valid horizon. For those gateways it covers two
+# 130-second callback windows, runtime event/mob drains, bounded
 # RPC/HTTP/stdout phases, and response-delivery/process-reap margin.
-# It is also the safe fallback for handshake-capable custom gateways which do
-# not yet advertise an explicit horizon.
+# MetaRuntime.gateway_shutdown_horizon_ms is then None. A supervisor that
+# sizes its stop from it falls back to its own unreported horizon: Meta
+# Forge uses the stock 432_000 ms and widens an earlier systemd unit to fit.
 _GATEWAY_SHUTDOWN_GRACE_SECONDS = 337.0
 _MAX_GATEWAY_SHUTDOWN_HORIZON_MS = 2_147_483_647
 _PROCESS_TERMINATE_GRACE_SECONDS = 5.0
@@ -376,6 +383,7 @@ class PersistentTransport:
         self._stderr_file = None
         self._supports_shutdown_handshake = False
         self._shutdown_horizon_seconds = _GATEWAY_SHUTDOWN_GRACE_SECONDS
+        self._advertised_shutdown_horizon_ms: int | None = None
         # What stops observed for the current child (``last_termination``).
         # The escalation and the shutdown answer belong to that child: a later
         # stop of the same child keeps them and never asks it twice.
@@ -599,6 +607,7 @@ class PersistentTransport:
             # Capabilities and streams belong to this exact child.
             self._supports_shutdown_handshake = False
             self._shutdown_horizon_seconds = _GATEWAY_SHUTDOWN_GRACE_SECONDS
+            self._advertised_shutdown_horizon_ms = None
             # So do the stop record and progress: a new child starts without.
             self._last_termination = None
             self._attempted_escalation = "none"
@@ -1021,6 +1030,7 @@ class PersistentTransport:
                 and result.get("stdio_shutdown_handshake") is True
             )
             shutdown_horizon = _GATEWAY_SHUTDOWN_GRACE_SECONDS
+            advertised_horizon_ms = None
             if supports_shutdown_handshake and isinstance(result, dict):
                 horizon_ms = result.get("stdio_shutdown_horizon_ms")
                 if (
@@ -1029,10 +1039,12 @@ class PersistentTransport:
                     and 0 < horizon_ms <= _MAX_GATEWAY_SHUTDOWN_HORIZON_MS
                 ):
                     shutdown_horizon = horizon_ms / 1000.0
+                    advertised_horizon_ms = horizon_ms
             with self._pending_lock:
                 if process is self._process:
                     self._supports_shutdown_handshake = supports_shutdown_handshake
                     self._shutdown_horizon_seconds = shutdown_horizon
+                    self._advertised_shutdown_horizon_ms = advertised_horizon_ms
         return response
 
     def _send_sync_running(
@@ -1397,6 +1409,18 @@ class PersistentTransport:
         one's record, and a stop with nothing to stop never overwrites one.
         """
         return getattr(self, "_last_termination", None)
+
+    @property
+    def advertised_shutdown_horizon_ms(self) -> int | None:
+        """The shutdown horizon the current gateway advertised and was accepted.
+
+        Milliseconds, from the ``stdio_shutdown_horizon_ms`` of a ``meta/init``
+        that also advertised the shutdown handshake. ``None`` before that
+        ``meta/init``, or when the gateway advertised no valid horizon and
+        this transport waits its own default. A new process never inherits
+        an earlier one's value.
+        """
+        return getattr(self, "_advertised_shutdown_horizon_ms", None)
 
     @property
     def child_ended(self) -> GatewayChildEndedError | None:

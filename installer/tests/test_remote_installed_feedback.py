@@ -21,7 +21,7 @@ from launchkit.remote_deployment import (
     RemoteDeploymentService, read_receipt, source_archive, update_receipt, write_private,
 )
 from launchkit.remote_installed_feedback import remote_application_use, improve_remote_application
-from test_remote_deployment import Guide, Implementation, Transport, connect
+from test_remote_deployment import Guide, Implementation, Transport, connect, longest_loop_gap, slow_package_reads
 
 
 DIGEST = "a" * 64
@@ -676,3 +676,50 @@ async def test_rehashed_remote_report_version_cannot_replace_exact_saved_build_p
         await service.status(service.guide.identity, force=True)
     assert record_bytes(service) == before and service.transport.calls == calls
     service.implementation.submit.assert_not_awaited()
+
+
+async def test_remote_first_job_read_leaves_the_event_loop_free(tmp_path, monkeypatch):
+    service, _ = await prepared(tmp_path, catalog=json.dumps({"tasks": [TASK]}))
+    slow_package_reads(monkeypatch)
+    value, gap = await longest_loop_gap(remote_application_use(service, service.guide.identity))
+    assert value["status"] == "stopped" and value["first_use"]["tasks"] == [TASK]
+    assert gap < 0.5
+
+
+async def test_remote_success_report_leaves_the_event_loop_free(tmp_path, monkeypatch):
+    service, directory = await prepared(tmp_path)
+    receipt, request_id = read_receipt(directory), str(uuid.uuid4())
+    slow_package_reads(monkeypatch)
+    report, gap = await longest_loop_gap(service.record_success(service.guide.identity,
+        service.guide.state["version"], receipt["deployment_id"], receipt["build_id"],
+        receipt["accepted_source_digest"], receipt["package_sha256"], request_id=request_id, task=TASK["request"]))
+    assert report["outcome"] == "worked" and report["request_id"] == request_id
+    assert gap < 0.5
+
+
+async def test_remote_success_report_refuses_a_record_rewritten_before_its_lock(tmp_path, monkeypatch):
+    from launchkit import installed_feedback
+    service, directory = await prepared(tmp_path)
+    receipt = read_receipt(directory)
+    original = installed_feedback._success_lock
+    def rewritten(path):
+        if path == directory / "journal.lock":
+            # Another writer finishes after the package read, before this lock.
+            update_receipt(directory, detail="Rewritten by another writer.")
+        return original(path)
+    monkeypatch.setattr(installed_feedback, "_success_lock", rewritten)
+    with pytest.raises(DraftConflict, match="being updated"):
+        await service.record_success(service.guide.identity, service.guide.state["version"],
+            receipt["deployment_id"], receipt["build_id"], receipt["accepted_source_digest"],
+            receipt["package_sha256"], request_id=str(uuid.uuid4()), task=TASK["request"])
+    assert not (directory / "human-success-reports").exists()
+    assert read_receipt(directory)["detail"] == "Rewritten by another writer."
+
+
+async def test_remote_feedback_leaves_the_event_loop_free(tmp_path, monkeypatch):
+    service, _ = await prepared(tmp_path)
+    body = await feedback_body(service)
+    slow_package_reads(monkeypatch)
+    queued, gap = await longest_loop_gap(improve(service, body))
+    assert queued == {"build_id": "new-candidate", "status": "queued"}
+    assert gap < 0.5

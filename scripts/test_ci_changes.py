@@ -224,6 +224,15 @@ CROSS_AREA_READS = {
     # A dependency's examples/* workspace metadata in Forge's lockfile names
     # examples but does not load this repository's example applications.
     ("installer/", "examples/"): set(),
+    # installer/tests/test_gateway_shutdown_horizon.py pins the shutdown
+    # horizon crates/meerkat-meta/src/rpc_gateway.rs advertises. Forge's
+    # workflow runs it on the pull requests its path filters select and on
+    # the dispatched run a Forge release binds. A pull request that changes
+    # only the gateway source starts no Forge run, so the next one reports
+    # any drift. No lane here runs it. Its read of the Python SDK is like
+    # every installer read of it: Forge's path filters include sdk/python.
+    ("installer/tests/test_gateway_shutdown_horizon.py", "crates/"): set(),
+    ("installer/tests/test_gateway_shutdown_horizon.py", "sdk/python/"): set(),
     ("scripts/", "Makefile"): set(),
     ("scripts/", ".config/nextest.toml"): set(),
     ("scripts/", "examples/"): set(),

@@ -13,6 +13,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   context with `META_FORGE_ORGANIZATION` and the
   `meerkat_forge.organizations.v1` Python entry-point group. New setups retain
   their selected contribution; examples remain editable drafts.
+- The Python and TypeScript runtimes report the shutdown horizon their
+  gateway advertised in `meta/init`, as the transport accepted it:
+  `runtime.gateway_shutdown_horizon_ms` and
+  `runtime.gatewayShutdownHorizonMs`, in milliseconds. The value is `None` or
+  `null` before `meta/init`, or when the gateway advertised no valid horizon
+  and the transport waits its own default. A replacement gateway process
+  never inherits an earlier value. The transports expose it as
+  `advertised_shutdown_horizon_ms` and `advertisedShutdownHorizonMs()`. A
+  process that supervises an application can use it to size its stop window.
+- `meta/schedule/tools` lists the definitions of Meerkat's durable schedule
+  tools (`meerkat_schedule_*`), unchanged from Meerkat's own `schedule/tools`
+  result, on the unified stdio and console (`POST /console/rpc`) surfaces,
+  and `meta/capabilities` advertises it there. The answer is static: no
+  schedule store is opened, no schedule host is started, and params are
+  ignored. These are the base definitions; inside a member's session,
+  `meerkat_schedule_create` and `meerkat_schedule_update` also accept a
+  `current_session` session target. The module-only surface, the
+  aggregator-only console and the Flow Editor do not serve it. The Python and
+  TypeScript SDKs read it with `MobHandle.schedule_tools()` and
+  `MobHandle.scheduleTools()`.
+- An identity that owes its host a held completion (a held roster pass or a
+  held member add did not publish its member) is refused with structured
+  data on the same `-32603`: `{kind: "held_completion_owed", identity}`. It
+  rides every wake, reset and delivery refusal outside a held pass that
+  covers the identity, a refused `meta/reconcile_identity` outcome
+  (`error.data`) and, after an eager roster pass, the identity's bootstrap
+  status entry (`restore.kind`). A host can now read such an identity as an
+  admission still owed rather than a failed member without parsing the
+  message; before, the refusal carried no data. The held member add's docs
+  also name `IdentityRuntime::restore_flow` as a path outside the bootstrap
+  controller, and say that a listed, owed member can be added again without
+  unlisting it first.
 
 ### Changed
 
@@ -54,6 +86,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Start failure instead of only a runtime log line. An installation from
   0.9.4 or earlier gets its list at its first Start. Forge 0.9.4 ignores the
   new installation record field.
+- The `SessionHook` documentation and the Rust SDK guide say how a host
+  narrows a member's mob operator authority: in `before_create`, with
+  `restrict_spawn_profiles_in_mob` on the build's
+  `mob_tool_authority_context`. The narrowing applies to one session build,
+  and so does a disable of the member's mob tools made in the hook. Neither
+  is restored as authority: the build that restores a member after a restart
+  reaches the hook with the profile's setting and the default authority
+  again (every profile of its mob spawnable). Make the edit on every build,
+  restores included, or a restored member returns to the default authority.
+  Behaviour is unchanged; end-to-end rows now pin it for host-spawned and
+  identity members, with host tools composed over the member's own, and
+  across a restart: with and without a hook that narrows the restore build,
+  and after a hook disabled the mob tools on the first build only.
+- The mob's terminal teardown in `UnifiedRuntime::shutdown` is bounded by 35
+  seconds (`MOB_TERMINAL_SHUTDOWN_BUDGET`, 5 before), and durable child mobs
+  stand down in a 10-second window of their own
+  (`CHILD_MOB_STAND_DOWN_BUDGET`), taken when the root's teardown has
+  returned. The teardown still returns as soon as its last member is
+  unregistered, so a normal shutdown takes no longer. The runtime shutdown
+  timeout rises from 337 to 377 seconds, and the advertised
+  `stdio_shutdown_horizon_ms` from 392000 to 432000; hosts that honor the
+  advertised value need no change.
 
 ### Fixed
 
@@ -98,6 +152,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   checking the installed files and the selected product, run outside the
   server's event loop, so a large package on a small host no longer stalls
   the rest of Forge.
+- Meta Forge also keeps answering other requests while the guide checks an
+  installed application's source, which it does on every guide turn; while
+  it lists Google Cloud accounts and projects for an application, checks a
+  cloud project for it or creates its cloud computer; and while it
+  connects, installs, configures, starts, stops or checks the status of a
+  remote installation, opens or checks browser access to it, or shows its
+  first jobs and takes a success report or feedback about it. The package
+  work these need runs outside the server's event loop: reading, hashing
+  and unpacking the saved packages to check them, checking the remote
+  controller, hashing and unpacking the accepted package, archiving its
+  source, saving a remote installation's copy of it and a product's control
+  bundle, and comparing a local installation's files.
+- Meta Forge refuses a Meta/Toolkit product application installation on a
+  Linux computer whose glibc is older than the product declares, before
+  anything is installed. The product's resource build record states the
+  oldest glibc its native programs run on (glibc 2.39 for the 0.9.4
+  product). Forge offered Fresh install on an older glibc, such as 2.35,
+  and installed an application that then failed when it started. The
+  refusal names both glibc versions. The generated package README states
+  the same declared floor instead of a fixed glibc 2.39.
+- "Stage accepted update" refuses an update to a Meta/Toolkit product that
+  this computer cannot install, before anything is staged: a product that
+  declares a newer glibc than this computer has, or whose packages are
+  built for another CPython than Forge runs on. Forge refused such an update
+  only while applying it, after the current runtime had been set aside.
+- A remote Meta/Toolkit product installation through a launcher-selected
+  Linux control (the `META_FORGE_APPLICATION_HOST_FACTORY` developer hook)
+  is refused before Forge connects to the remote computer when the
+  control's glibc minimum is below the product's declared floor. The remote
+  check compared the computer's glibc only with that minimum. The refusal
+  names both glibc versions.
+- A shutdown of a mob with hundreds of members no longer reports the members
+  whose runtime unregister was still running at 5 seconds as
+  `UnregisterPending` with a "could not settle" warning, leaving their
+  registrations to finish after the report: the teardown waits for them.
+- A root teardown that used its whole budget no longer starves the durable
+  child-mob stand-down. It ran on the deadline the root had already used, so
+  the child root stayed claimed for the rest of the process (a same-process
+  successor got `AlreadyClaimed`) and `meta/shutdown` could report
+  `runtime_cleanup_completed: false`, even for a runtime with no child mobs.
+- Forge stops a local or destination application within the shutdown horizon
+  its gateway advertised. Its stop budgets were sized for a pinned 347-second
+  horizon (an application stop of 367 seconds), shorter than the stock
+  gateway's horizon (392 seconds in 0.9.4, 432 seconds now), so a stop could
+  cut the gateway during native cleanup. The generated application reports
+  its runtime's `gateway_shutdown_horizon_ms` at readiness. The application
+  stop, the worker's and the host's waits, the service unit's stop timeout and
+  the service manager's stop and restart commands are derived from it; an
+  application that reports nothing gets this repository's gateway horizon. New
+  services get the derived stop timeout from the start, and an interactive run
+  and Forge's own waits and service commands use the derived budgets at once.
+  A background service runs the supervisor that was saved when it was
+  installed, so one installed before 0.9.5 keeps its earlier stop budgets
+  until **Apply support update** under **Installation support** replaces that
+  supervisor. After that, a Linux user service keeps its frozen unit and, when
+  that unit's stop timeout is shorter than the derived one (the unreported
+  horizon's when its application reports none), gets an owned systemd drop-in
+  with the derived stop timeout. Until the drop-in and the manager's reload
+  succeed, and under launchd, a service run fits its application stop inside
+  the stop timeout its manager enforces: 367 seconds under an earlier
+  397-second unit. A destination's supervisor comes with its package, so it
+  does the same for its own unit from the next package the destination runs.
+  The Guide's rehearsal, implementation and trial workers wait the derived
+  budget too.
+- Meta Forge no longer leaves a partial remote installation behind when a
+  connect is cancelled or refused partway, so removing the cloud computer
+  afterwards no longer fails on it.
 
 ### Known limitations
 
@@ -121,6 +242,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Toolkit product application that has not finished its setup: the update
   stops as "recovery needed", and its previous package and private data are
   kept. Finish such an application's setup before you apply an update.
+- A macOS LaunchAgent keeps the stop timeout it was installed with (397
+  seconds from Forge before 0.9.5). launchd has no drop-in, so a longer
+  horizon that its application reports later is not applied. The
+  application's stop is shortened to fit it (367 seconds, or 15 under the
+  45-second timeout of the earliest releases), so native cleanup can be cut
+  short, and Forge still records its own cleanup.
+- A destination deployed from a package that Forge 0.9.4 accepted keeps that
+  release's destination helper and its stop budgets until the package is
+  rebuilt.
+- On Linux, logout and shutdown stop user services within the systemd user
+  manager's own stop timeout (`TimeoutStopSec=120s` by default), whatever Forge
+  sets. The unit's stop timeout governs an explicit Stop or Restart.
 
 ## [0.9.4] - 2026-10-22
 

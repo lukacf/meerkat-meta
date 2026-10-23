@@ -20,6 +20,7 @@ class TestNewSymbolsExist:
         "MobpackAgentDefinitionsResult", "MobpackCatalogsResult",
         "MobpackSkillsCatalogResult", "MobpackTemplatesResult",
         "MobpackToolsCatalogResult",
+        "ScheduleToolDefinition", "ScheduleToolsResult",
         "MobpackValidationResult", "MobpackDiagnostic", "MobpackDisplayRow",
         "MobpackSourceFile", "MobpackSourceResult", "MobpackExportResult",
         "MobpackImportResult", "MobpackDraftRow", "MobpackDraftSummary",

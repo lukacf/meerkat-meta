@@ -20,11 +20,13 @@ import sys
 import uuid
 
 from .projects import DraftConflict
-from .deployment_deadlines import (USER_SERVICE_STOP_TIMEOUT, SERVICE_STOP_COMMAND_TIMEOUT,
-                                   LEGACY_USER_SERVICE_STOP_TIMEOUT)
+from .deployment_deadlines import (UNREPORTED_GATEWAY_SHUTDOWN_HORIZON_MS, USER_SERVICE_STOP_TIMEOUT, SERVICE_STOP_COMMAND_MARGIN,
+                                   LEGACY_USER_SERVICE_STOP_TIMEOUT, reported_gateway_horizon,
+                                   service_stop_budgets, shutdown_budget)
 
 SERVICE_TIMEOUT = 60
 SERVICE_UPDATE_TIMEOUT = 1200
+SERVICE_PENDING_MAX_WAIT = 1200
 SERVICE_START_TIMEOUT = 270
 UPDATE_STARTUP_PROTOCOL = 1
 CANDIDATE_STARTUP_PROTOCOL = 1
@@ -168,6 +170,123 @@ def unit_bytes(plan, *, legacy=False):
             "Environment=PYTHONNOUSERSITE=1\n\n[Install]\nWantedBy=default.target\n").encode()
 
 
+def unit_gateway_horizon(record):
+    """The gateway horizon a unit or plan was sized for; None for the unreported one."""
+    try:
+        return reported_gateway_horizon(record)
+    except ValueError:
+        raise DraftConflict("The recorded service shutdown budget is unsupported. Its definition is preserved.") from None
+
+
+STOP_BUDGET_DROP_IN = "forge-stop-budget.conf"
+
+
+def stop_budget_drop_in(service):
+    """The owned systemd drop-in that widens a recorded unit's stop budget."""
+    return Path(service["unit_path"] + ".d") / STOP_BUDGET_DROP_IN
+
+
+def drop_in_bytes(stop_timeout):
+    return f"[Service]\nTimeoutStopSec={stop_timeout}\n".encode()
+
+
+def owned_drop_in(content, unit_budget, recorded):
+    """The recorded drop-in, or the earlier one a longer widening has not replaced yet.
+
+    A widening records its budget before it replaces the drop-in, so an
+    interrupted one leaves the earlier drop-in: a budget above the unit's own
+    and below the recorded one. The next readiness replaces it.
+    """
+    if content == drop_in_bytes(recorded):
+        return True
+    earlier = re.fullmatch(rb"\[Service\]\nTimeoutStopSec=([1-9][0-9]{0,7})\n", content)
+    return earlier is not None and unit_budget < int(earlier[1]) < recorded
+
+
+def recorded_stop_budget(receipt):
+    """The widened stop budget recorded outside the service identity, or None."""
+    record = receipt.get("service_stop_budget")
+    if record is None:
+        return None
+    if (not isinstance(record, dict) or set(record) != {"gateway_shutdown_horizon_ms", "stop_timeout_seconds"}
+            or unit_gateway_horizon(record) is None or type(record["stop_timeout_seconds"]) is not int
+            or record["stop_timeout_seconds"] != shutdown_budget(record["gateway_shutdown_horizon_ms"])["service"]):
+        raise DraftConflict("The recorded service shutdown budget is unsupported. Its definition is preserved.")
+    return record
+
+
+def _drop_in_content(path):
+    for parent in (path, path.parent):
+        if parent.is_symlink():
+            raise DraftConflict("The service control path cannot contain symbolic links.")
+    return private_file(path) if path.exists() else None
+
+
+def stop_command_timeout(service):
+    """Outlast the manager's own stop of this unit, never below the current budget's."""
+    budget = service.get("stop_timeout_seconds", LEGACY_USER_SERVICE_STOP_TIMEOUT)
+    if service["manager"] == "systemd-user":
+        try:
+            content = _drop_in_content(stop_budget_drop_in(service))
+        except (OSError, DraftConflict):
+            content = None
+        widened = re.fullmatch(rb"\[Service\]\nTimeoutStopSec=([0-9]{1,8})\n", content or b"")
+        if widened:
+            budget = max(budget, int(widened[1]))
+    return max(budget, USER_SERVICE_STOP_TIMEOUT) + SERVICE_STOP_COMMAND_MARGIN
+
+
+def widen_service_stop_budget(directory, horizon_ms):
+    """Widen a recorded unit's stop budget to a reported horizon; return the reload to run.
+
+    An application that reports nothing (None) is sized for the unreported
+    horizon, which the record names explicitly.
+
+    The unit bytes and the service identity never change: an owned systemd
+    drop-in carries the larger TimeoutStopSec. Its record is written first, so
+    an interrupted write leaves a controllable unit with the earlier drop-in or
+    none, and every readiness while a record exists rewrites a missing or
+    earlier drop-in and reloads the manager again, completing an interrupted
+    step. It never narrows a budget. launchd reads ExitTimeOut only when it
+    loads a job, so a recorded plist keeps its own.
+    """
+    from .deployment import now, read_receipt, receipt_lock
+    from .templates.storage_setup import write_private
+    directory = Path(directory)
+    service = verify_service(directory, read_receipt(directory))
+    if service["manager"] != "systemd-user":
+        return None
+    sized_for = UNREPORTED_GATEWAY_SHUTDOWN_HORIZON_MS if horizon_ms is None else horizon_ms
+    budget = shutdown_budget(sized_for)["service"]
+    drop_in = stop_budget_drop_in(service)
+    with receipt_lock(directory):
+        receipt = read_receipt(directory)
+        if service_binding(receipt.get("service") or {}) != service_binding(service):
+            raise DraftConflict("The owned service definition changed. No service was controlled.")
+        record = recorded_stop_budget(receipt)
+        recorded = 0 if record is None else record["stop_timeout_seconds"]
+        if budget > max(service.get("stop_timeout_seconds", LEGACY_USER_SERVICE_STOP_TIMEOUT), recorded):
+            record = {"gateway_shutdown_horizon_ms": sized_for, "stop_timeout_seconds": budget}
+            write_private(directory / "receipt.json", {**receipt, "service_stop_budget": record, "updated_at": now()})
+        elif record is None:
+            return None
+        content = drop_in_bytes(record["stop_timeout_seconds"])
+        if _drop_in_content(drop_in) != content:
+            drop_in.parent.mkdir(mode=0o700, exist_ok=True)
+            temporary = drop_in.with_name("." + drop_in.name + "." + uuid.uuid4().hex)
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, drop_in)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
+    return [service["manager_executable"], "--user", "daemon-reload"]
+
+
 def verify_service(directory, receipt):
     if "supervisor_refresh" in receipt:
         from .deployment_supervisor import require_complete
@@ -183,9 +302,10 @@ def verify_service(directory, receipt):
     plan["interpreter"] = interpreter
     # Missing metadata identifies the exact older renderer, not permission to
     # rewrite its frozen unit or claim it has the current graceful-stop budget.
+    # A budget is the legacy one, the earlier pin's, or derived from the
+    # unreported horizon or the one this unit was sized for.
     stop_timeout = service.get("stop_timeout_seconds", LEGACY_USER_SERVICE_STOP_TIMEOUT)
-    if type(stop_timeout) is not int or stop_timeout not in {
-            LEGACY_USER_SERVICE_STOP_TIMEOUT, USER_SERVICE_STOP_TIMEOUT}:
+    if type(stop_timeout) is not int or stop_timeout not in service_stop_budgets(unit_gateway_horizon(service)):
         raise DraftConflict("The recorded service shutdown budget is unsupported. Its definition is preserved.")
     plan["stop_timeout_seconds"] = stop_timeout
     if "bootstrap_selection" in service:
@@ -205,6 +325,18 @@ def verify_service(directory, receipt):
         raise DraftConflict("This recorded owned systemd unit has an invalid quoted WorkingDirectory. Its original definition is preserved; activation requires a verified service-definition migration.")
     if digest(content) != service.get("unit_sha256") or content != unit_bytes(plan):
         raise DraftConflict("The owned service definition changed. No service was controlled.")
+    # A widened stop budget lives outside the service identity: the recorded
+    # drop-in, byte-exact, the earlier one an interrupted widening left, or
+    # none yet after an interrupted first write.
+    record = recorded_stop_budget(receipt)
+    if plan["manager"] != "systemd-user":
+        if record is not None:
+            raise DraftConflict("The recorded service shutdown budget is unsupported. Its definition is preserved.")
+    else:
+        widened = _drop_in_content(stop_budget_drop_in(plan))
+        if widened is not None and (record is None or not owned_drop_in(
+                widened, stop_timeout, record["stop_timeout_seconds"])):
+            raise DraftConflict("The owned service definition changed. No service was controlled.")
     host = Path(directory) / "service-host"
     manifest = service.get("host_files")
     if not isinstance(manifest, dict) or not manifest or len(manifest) > 256:
@@ -381,6 +513,12 @@ def prepare_service(directory, receipt, *, bootstrap_selection=None, source_cust
             raise DraftConflict("The frozen service cannot replace its original Restore selection.")
         return service
     plan = service_plan(receipt["deployment_id"], directory)
+    # A longer horizon the application last reported widens the new unit;
+    # it never gets less than the unreported horizon's budget.
+    horizon_ms = unit_gateway_horizon(receipt)
+    if horizon_ms is not None and shutdown_budget(horizon_ms)["service"] > plan["stop_timeout_seconds"]:
+        plan["stop_timeout_seconds"] = shutdown_budget(horizon_ms)["service"]
+        plan["gateway_shutdown_horizon_ms"] = horizon_ms
     if bootstrap_selection is not None:
         from .deployment_application_bootstrap import observe_bootstrap_admission
         selected, observed = observe_bootstrap_admission(directory, bootstrap_selection,
@@ -551,17 +689,18 @@ class UserServiceManager:
             await self.command([executable, "disable", service["domain"] + "/" + label])
             if observation["loaded"]:
                 await self.command([executable, "bootout", service["domain"] + "/" + label],
-                                   timeout=SERVICE_STOP_COMMAND_TIMEOUT)
+                                   timeout=stop_command_timeout(service))
         else:
             await self.command([executable, "--user", "disable", "--now", label + ".service"],
-                               timeout=SERVICE_STOP_COMMAND_TIMEOUT)
+                               timeout=stop_command_timeout(service))
         return await self.observe(service)
 
 
 def _service_health_current(current, expected):
     from .deployment_updates import inspection_binding, _same_toml
     return (_same_toml(inspection_binding(current), inspection_binding(expected))
-            and _same_toml(current.get("bootstrap"), expected.get("bootstrap")))
+            and _same_toml(current.get("bootstrap"), expected.get("bootstrap"))
+            and _same_toml(current.get("admission_health"), expected.get("admission_health")))
 
 
 def _record_service_observation(directory, service, public, observation, *, expected_receipt, detail=None):
@@ -585,6 +724,7 @@ def _record_service_observation(directory, service, public, observation, *, expe
 async def background_status(directory, manager):
     """Read actual manager ownership; never revive a saved PID or readiness flag."""
     from .deployment import now, package_files, read_receipt, verify_destination
+    from .admission_health import fresh_pending_admission
     directory = Path(directory)
     receipt = read_receipt(directory)
     inspected_receipt = receipt
@@ -602,7 +742,11 @@ async def background_status(directory, manager):
             return {**receipt, "process_live": False, "health": "unknown", "console_url": None}
         observed_pid = observation.get("pid")
         matching = bool(observed_pid and observed_pid == receipt.get("service_supervisor_pid"))
-        confirmed = matching and receipt["status"] == "running" and receipt.get("runtime_pid") and receipt.get("bootstrap")
+        pending = bool(matching and receipt["status"] == "starting" and receipt.get("runtime_pid")
+            and receipt.get("process_live") is True and receipt.get("health") == "pending"
+            and fresh_pending_admission(receipt) is not None)
+        confirmed = (matching and receipt["status"] == "running" and receipt.get("runtime_pid")
+            and receipt.get("bootstrap") and receipt.get("admission_health") is None)
         healthy = False
         if confirmed:
             definition = json.loads(files["deployment.json"][0])
@@ -622,8 +766,9 @@ async def background_status(directory, manager):
             except Exception:
                 healthy = False
         changes = {"service_observation": {**observation, "checked_at": now(), "owned": True},
-                   "process_live": bool(confirmed), "health": "ready" if healthy else "unavailable",
-                   "console_url": url if healthy else None, "health_checked_at": now()}
+                   "process_live": bool(confirmed or pending), "health": "ready" if healthy else "pending" if pending else "unavailable",
+                   "console_url": url if healthy else None,
+                   "health_checked_at": receipt.get("health_checked_at") if pending else now()}
         if observed_pid and not matching:
             changes.update(status="starting", runtime_pid=None, bootstrap=None)
         elif not observed_pid:
@@ -850,6 +995,24 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
             self.previous_instance = self.receipt.get("service_instance_id")
             self.previous_attempt = self.receipt.get("startup_attempt_id")
             self.failed_start = None
+            self.pending_update_remaining = None
+            self.pending_started_at = None
+            self.pending_suspended = 0.0
+            self.pending_limit = min(SERVICE_PENDING_MAX_WAIT, SERVICE_UPDATE_TIMEOUT)
+
+        def resume_update_budget(self):
+            if self.pending_update_remaining is not None:
+                observed_at = asyncio.get_running_loop().time()
+                elapsed = observed_at - self.pending_started_at
+                paused = min(elapsed, max(0.0, self.pending_limit - self.pending_suspended))
+                self.pending_suspended += paused
+                remaining = self.pending_update_remaining - (elapsed - paused)
+                if not update_deadline.expired():
+                    update_deadline.reschedule(observed_at + max(0.0, remaining))
+                self.pending_update_remaining = None
+                self.pending_started_at = None
+                return paused
+            return 0.0
 
         async def before_source_change(self):
             from .deployment import await_validation
@@ -891,6 +1054,10 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
                 self.failed_start["failed_attempt"] = failed.get("startup_attempt_id")
                 self.failed_start["failed_logs"] = failed.get("logs", [])
                 raise
+            finally:
+                # A pending attempt must not disable bounds on cleanup or a
+                # later fallback attempt, even on cancellation or failure.
+                self.resume_update_budget()
 
         def retain_failed_start(self):
             context = self.failed_start
@@ -923,6 +1090,7 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
         async def start_service(self, definition, *, on_ready=None):
             from .deployment_updates import checked_package
             from .deployment import verify_destination
+            from .admission_health import fresh_pending_admission
             receipt = read_receipt(self.directory)
             service = await require_stopped_service(self.directory, manager)
             require_original()
@@ -931,15 +1099,20 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
             expected = (receipt["build_id"], receipt["package_sha256"])
             journal(self.directory, "Starting the exact owned background service; awaiting fresh native startup and authenticated Console health.",
                     status="starting", phase="update", runtime_pid=None, bootstrap=None,
-                    startup_attempt_id=None, startup_console_health=None, console_url=None,
+                    startup_attempt_id=None, startup_console_health=None, admission_health=None, console_url=None,
                     health="unknown", health_checked_at=None, process_live=False)
             await manager.start(service)
             require_original()
             deadline = asyncio.get_running_loop().time() + SERVICE_START_TIMEOUT
+            pending_since = None
             while True:
                 if self.stop.is_set():
                     raise asyncio.CancelledError
-                observed = await background_status(self.directory, manager)
+                # Suspending the admission wait never permits an unbounded
+                # manager/health query. Each active observation is still
+                # limited by the transaction budget left before pending.
+                async with asyncio.timeout(self.pending_update_remaining):
+                    observed = await background_status(self.directory, manager)
                 require_original()
                 current = read_receipt(self.directory)
                 if ((current["build_id"], current["package_sha256"]) != expected
@@ -949,6 +1122,33 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
                 verify_destination(current, files)
                 instance, attempt = current.get("service_instance_id"), current.get("startup_attempt_id")
                 health = current.get("startup_console_health") or {}
+                manager_observation = observed.get("service_observation") or {}
+                pending = (observed.get("status") == "starting" and observed.get("health") == "pending"
+                    and observed.get("process_live") is True
+                    and manager_observation.get("owned") is True
+                    and manager_observation.get("state") in {"running", "active"}
+                    and manager_observation.get("pid") == current.get("service_supervisor_pid")
+                    and instance and instance != previous_instance and attempt and attempt != previous_attempt
+                    and current.get("service_cleanup_confirmed") is False
+                    and _service_health_current(current, observed)
+                    and fresh_pending_admission(current) is not None)
+                checked_at = asyncio.get_running_loop().time()
+                suspended = self.pending_suspended + (checked_at - pending_since if pending_since is not None else 0.0)
+                pause = pending and suspended < self.pending_limit
+                if pause and pending_since is None:
+                    remaining = update_deadline.when() - checked_at
+                    if remaining <= 0 or checked_at >= deadline:
+                        raise TimeoutError("The update startup deadline expired before admission recovery was observed.")
+                    # Fresh pending frames may suspend the normal budgets,
+                    # within one cumulative cap across this transaction.
+                    # Even a parked manager query remains bounded overall.
+                    self.pending_update_remaining = remaining
+                    self.pending_started_at = checked_at
+                    update_deadline.reschedule(checked_at + remaining + self.pending_limit - self.pending_suspended)
+                    pending_since = checked_at
+                elif not pause and pending_since is not None:
+                    deadline += self.resume_update_budget()
+                    pending_since = None
                 if (observed.get("status") == "running" and observed.get("health") == "ready"
                         and observed.get("process_live") is True
                         and instance and instance != previous_instance and attempt and attempt != previous_attempt
@@ -974,13 +1174,13 @@ async def update_background(directory, manager, mode, *, update_id, update_selec
                     return
                 if current.get("status") == "failed":
                     raise RuntimeError("The background application failed its native startup. Inspect the retained redacted diagnostics.")
-                if asyncio.get_running_loop().time() >= deadline:
+                if not pause and asyncio.get_running_loop().time() >= deadline:
                     raise TimeoutError("The owned background service did not supply fresh native startup and authenticated Console health in time.")
                 await asyncio.sleep(0.2)
 
     supervisor = BackgroundSupervisor(directory)
     try:
-        async with asyncio.timeout(SERVICE_UPDATE_TIMEOUT):
+        async with asyncio.timeout(SERVICE_UPDATE_TIMEOUT) as update_deadline:
             require_original()
             await update_runtime(supervisor, mode, update_id=update_id,
                 expected_binding=expected_binding, update_selection=update_selection)

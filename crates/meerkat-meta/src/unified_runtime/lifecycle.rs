@@ -5,10 +5,24 @@ use std::future::IntoFuture;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-/// Bound on the mob actor's terminal teardown in [`UnifiedRuntime::shutdown`].
-/// It runs after the mob stop quiesced members, inside the mob quiesce window
-/// the published shutdown horizon already counts.
-pub const MOB_TERMINAL_SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+/// Bound on the mob actor's terminal teardown in [`UnifiedRuntime::shutdown`],
+/// a phase of its own in the published shutdown horizon.
+///
+/// The teardown unregisters every member runtime concurrently and returns as
+/// soon as the last one ends, so the bound only caps a slow teardown: a large
+/// fleet's unregisters, each several durable commits through one runtime
+/// store, finish inside it, and a member still pending at it really is stuck.
+pub const MOB_TERMINAL_SHUTDOWN_BUDGET: Duration = Duration::from_secs(35);
+
+/// Bound on standing durable child mobs down in [`UnifiedRuntime::shutdown`],
+/// taken when the root mob's terminal teardown has returned, so a root that
+/// spends its whole budget does not starve the child root. A phase of its own
+/// in the published shutdown horizon.
+///
+/// It covers the agent mob-tool state's admission close, each child's own
+/// shutdown and the state's stand-down. A child mob with a fleet too large to
+/// unregister within it is reported Retained, and its root stays owned.
+pub const CHILD_MOB_STAND_DOWN_BUDGET: Duration = Duration::from_secs(10);
 
 /// Budget the shutdown horizon reserves for joining retired supervisor
 /// cleanups. Meta runs no lease-renewal or continuity-repair
@@ -250,6 +264,17 @@ impl UnifiedRuntime {
     }
 
     pub async fn shutdown(&self) -> UnifiedRuntimeShutdownReport {
+        self.shutdown_with_root_budget(MOB_TERMINAL_SHUTDOWN_BUDGET)
+            .await
+    }
+
+    /// [`Self::shutdown`] with `root_budget` bounding the mob actor's
+    /// terminal teardown in place of [`MOB_TERMINAL_SHUTDOWN_BUDGET`]. The
+    /// child stand-down keeps [`CHILD_MOB_STAND_DOWN_BUDGET`].
+    pub(super) async fn shutdown_with_root_budget(
+        &self,
+        root_budget: Duration,
+    ) -> UnifiedRuntimeShutdownReport {
         // The close begins under the bootstrap completion's gate: a running
         // publication finishes first, and every later one is refused.
         self.close_gate.close();
@@ -401,10 +426,6 @@ impl UnifiedRuntime {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
 
-        // Durable child mobs share the root's terminal teardown window, so the
-        // advertised shutdown horizon gains no new phase.
-        let terminal_window_deadline = std::time::Instant::now() + MOB_TERMINAL_SHUTDOWN_BUDGET;
-
         // `stop` quiesces members but keeps the mob actor - and its
         // `{mob_id}/__mob_supervisor__` in-proc route - alive for resume.
         // UnifiedRuntime shutdown is terminal, and meerkat 0.8.23 refuses
@@ -415,17 +436,19 @@ impl UnifiedRuntime {
         // route registered and is reported loudly rather than failing the
         // report.
         let mob_terminal_shutdown = if mob_stop.is_ok() {
-            self.shutdown_mob_actor().await
+            self.shutdown_mob_actor(root_budget).await
         } else {
             MobTerminalShutdownOutcome::SkippedMobStopFailed
         };
 
         // Durable child mobs stand down after the root mob, which a failed
         // root stop skips because children may still be running. Their root
-        // claim is released only after a proven stand-down.
+        // claim is released only after a proven stand-down. Their window
+        // starts now: a root teardown that spent its whole budget must not
+        // leave them an expired deadline.
         let child_mob_stand_down = if mob_stop.is_ok() {
             self.mob_runtime
-                .stand_down_child_mobs(terminal_window_deadline)
+                .stand_down_child_mobs(std::time::Instant::now() + CHILD_MOB_STAND_DOWN_BUDGET)
                 .await
         } else if self.mob_runtime.owns_child_mob_root() {
             crate::child_mob_storage::ChildMobStandDownOutcome::SkippedMobStopFailed
@@ -433,11 +456,11 @@ impl UnifiedRuntime {
             crate::child_mob_storage::ChildMobStandDownOutcome::NotConfigured
         };
 
-        // The member teardown above is bounded below a stdio close's own
-        // bound, and an agent's release of its MCP router is not a cleanup
-        // receipt. Start every member MCP close in custody and wait for each
-        // native outcome before any cleanup is reported: only a close that
-        // reported settled counts as complete.
+        // The member teardown above is bounded, so it can end before a stdio
+        // close's own bound, and an agent's release of its MCP router is not a
+        // cleanup receipt. Start every member MCP close in custody and wait
+        // for each native outcome before any cleanup is reported: only a close
+        // that reported settled counts as complete.
         let member_mcp_settlement = self.settle_member_mcp().await;
 
         // The mob stop and terminal teardown above end a member's in-flight
@@ -570,9 +593,11 @@ impl UnifiedRuntime {
     /// The mob actor's terminal teardown, once: meerkat 0.8.51's
     /// `shutdown_with_report` owns its convergence (stuck retirements, held
     /// unregisters and in-flight runs are settled or reported, not retried),
-    /// bounded by [`MOB_TERMINAL_SHUTDOWN_BUDGET`].
-    async fn shutdown_mob_actor(&self) -> MobTerminalShutdownOutcome {
-        let deadline = std::time::Instant::now() + MOB_TERMINAL_SHUTDOWN_BUDGET;
+    /// bounded by `budget` ([`MOB_TERMINAL_SHUTDOWN_BUDGET`] in production).
+    /// Its report is final: Meta never follows or rewrites a member's
+    /// outcome after it.
+    async fn shutdown_mob_actor(&self, budget: Duration) -> MobTerminalShutdownOutcome {
+        let deadline = std::time::Instant::now() + budget;
         match self
             .mob_handle()
             .shutdown_with_report(meerkat_mob::ShutdownOptions::default().with_deadline(deadline))
@@ -582,7 +607,9 @@ impl UnifiedRuntime {
                 if !report.is_clean() {
                     tracing::warn!(
                         members = ?report.members,
-                        "mob terminal shutdown completed with members it could not settle"
+                        budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                        "mob terminal shutdown completed with members it could not settle \
+                         within its budget"
                     );
                 }
                 MobTerminalShutdownOutcome::Completed(report)

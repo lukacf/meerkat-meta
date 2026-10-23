@@ -156,6 +156,7 @@ import {
   parseMobRunSnapshot,
   parseCrossMobContactEntry,
   parseModelsCatalogResult,
+  parseScheduleToolsResult,
   parseMobpackToolsCatalogResult,
   parseMobpackSkillsCatalogResult,
   parseMobpackAgentDefinitionsResult,
@@ -252,6 +253,7 @@ import {
   type MobRunSnapshot,
   type CrossMobContactEntry,
   type ModelsCatalogResult,
+  type ScheduleToolsResult,
   type MobpackToolsCatalogResult,
   type MobpackSkillsCatalogResult,
   type MobpackAgentDefinitionsResult,
@@ -916,6 +918,19 @@ export class MetaRuntime {
    */
   lastGatewayTermination(): TransportTermination | null {
     return (this._transport ?? this._lastGatewayTransport)?.lastTermination() ?? null;
+  }
+
+  /**
+   * The shutdown horizon, in milliseconds, that this runtime's gateway
+   * advertised and its transport accepted (see
+   * {@link PersistentTransport.advertisedShutdownHorizonMs}). A process that
+   * supervises this application waits at least this long, plus the
+   * transport's own TERM and KILL graces, before it kills the gateway.
+   * `null` without a running gateway or when the gateway advertised no valid
+   * horizon.
+   */
+  get gatewayShutdownHorizonMs(): number | null {
+    return this._transport?.advertisedShutdownHorizonMs() ?? null;
   }
 
   /**
@@ -2283,6 +2298,18 @@ export class MobHandle {
   async modelsCatalog(): Promise<ModelsCatalogResult> {
     return parseModelsCatalogResult(
       await this._runtime._rpc("meta/models/catalog"),
+    );
+  }
+
+  /**
+   * Meerkat's durable schedule tool definitions (`meta/schedule/tools`), the
+   * base definitions a member whose profile sets `tools.schedule` is given.
+   * Static: the gateway answers without a schedule store or host. Rejects on
+   * a malformed result.
+   */
+  async scheduleTools(): Promise<ScheduleToolsResult> {
+    return parseScheduleToolsResult(
+      await this._runtime._rpc("meta/schedule/tools"),
     );
   }
 

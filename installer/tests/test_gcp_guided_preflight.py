@@ -8,7 +8,8 @@ import pytest
 
 from launchkit.gcp_preflight import GcpPreflightService, RestResult
 from launchkit.projects import DraftConflict
-from test_gcp_preflight import ACCOUNT, PROJECT, NUMBER, ZONE, Local, Cli, Cloud, row
+from test_gcp_preflight import ACCOUNT, PROJECT, NUMBER, ZONE, Local, Cli, Cloud, row, slow_cloud_package_work
+from test_remote_deployment import longest_loop_gap
 
 GUEST_PERMISSION = "compute.instances.getGuestAttributes"
 POLICIES = (
@@ -230,3 +231,11 @@ async def test_bad_policy_envelope_is_controlled_unknown(guided, name, spec):
     result = await check(guided)
     assert row(result, "policy-" + name)["status"] == "unknown"
     assert result["guided_supported"] is False and result["plan"] is None
+
+
+async def test_guided_cloud_check_leaves_the_event_loop_free(guided, monkeypatch):
+    from launchkit import gcp_preflight
+    slow_cloud_package_work(monkeypatch, gcp_preflight)
+    result, gap = await longest_loop_gap(check(guided))
+    assert result["guided_supported"] is True and result["ready_for_plan"] is True
+    assert gap < 0.5

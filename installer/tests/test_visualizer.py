@@ -9,7 +9,7 @@ import pytest
 from launchkit.blueprint import Blueprint, starter_blueprint
 from launchkit.projects import fingerprint
 from launchkit.visualizer import (
-    COMPOSITION_GUIDANCE, CONTRACT_VERSION, LIFECYCLE_GUIDANCE, RESPONSIVE_POPULATION_GUIDANCE, VISUALIZER_PROMPT, VisualizerBusy, VisualizerPending, VisualizerService, VisualizerUnavailable, checked_feedback, checked_inputs, checked_revision_context, inspection_graph, revision_context_binding, visualization_context, visualization_examples,
+    COMPOSITION_GUIDANCE, CONTRACT_VERSION, DYNAMIC_CLASS_GUIDANCE, LIFECYCLE_GUIDANCE, RESPONSIVE_POPULATION_GUIDANCE, VISUALIZER_PROMPT, VisualizerBusy, VisualizerPending, VisualizerService, VisualizerUnavailable, checked_feedback, checked_inputs, checked_revision_context, inspection_graph, revision_context_binding, visualization_context, visualization_examples,
 )
 
 
@@ -186,6 +186,29 @@ def test_fresh_native_profile_uses_the_same_freeform_program_guidance_as_resumed
     for obsolete in ("The body returns JSON data", "positions every model.nodes ID",
                      "only an edge active in the named phase", "no DOM, network, module loader, canvas"):
         assert obsolete not in VISUALIZER_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_source_backed_class_lifecycle_guidance_reaches_author_and_reviewer(service):
+    from launchkit.visualization_review import REVIEW_PROMPT
+    from test_profile_only_classes import graph, profile_plan
+
+    blueprint = profile_plan()
+    inspected_job(service, checked_inputs(blueprint, graph(blueprint)))
+    overview = await service.inspect({"view": "overview"})
+    for prompt in (VISUALIZER_PROMPT, overview["composition_guidance"]):
+        assert DYNAMIC_CLASS_GUIDANCE in prompt
+        assert "Zero initial members alone does not prove automatic discovery" in prompt
+        assert "same continuing\ncontext when reuse is intended" in prompt
+        assert "temporary helper that returns its result and leaves" in prompt
+        assert "Keep illustrative future marks out of model.nodes" in prompt
+    assert "unless the source describes them" in overview["profile_only_guidance"]
+    assert "illustrative and non-selectable" in overview["profile_only_guidance"]
+    review = " ".join(REVIEW_PROMPT.split())
+    assert "zero-start class definitions are not initial agents" in review
+    assert "Source-backed future members can be illustrated as distinct non-selectable marks" in review
+    assert "later work visibly returns to the same continuing context" in review
+    assert "Do not demand a new member, helper, retirement or schedule that the source does not describe" in review
 
 
 def view_scope_inputs(research_count, selected_flow):

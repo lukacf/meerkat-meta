@@ -3,9 +3,9 @@
 //! A member's MCP router adapter belongs to its agent, which releases it when
 //! its session ends. That release is not a cleanup receipt: it returns unit,
 //! and a panicked or aborted session skips it. The member teardown that drives
-//! it is also bounded ([`MOB_TERMINAL_SHUTDOWN_BUDGET`]) below a stdio close's
-//! own bound ([`McpStdioCloseBounds::close_bound`]), so a release can be cut
-//! off while its router's closes still run.
+//! it is also bounded ([`MOB_TERMINAL_SHUTDOWN_BUDGET`]) independently of a
+//! stdio close's own bound ([`McpStdioCloseBounds::close_bound`]), so a
+//! release can be cut off while its router's closes still run.
 //!
 //! So every member factory adopts each adapter into a gateway's custody at
 //! the factory's ownership seam, before any server is staged or connected

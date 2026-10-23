@@ -1008,6 +1008,96 @@ async fn an_aborted_held_add_stays_owed_across_a_restart() {
     let _ = runtime.shutdown().await;
 }
 
+/// After an eager roster pass, an owed member the host had listed reads
+/// `broken` in the bootstrap status, and its restore progress names the
+/// refusal typed (the internal-error code with kind `held_completion_owed`),
+/// so a host reads an admission still owed without parsing the error text.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owed_listed_member_reads_broken_with_its_typed_restore_refusal() {
+    use meerkat_meta::identity_first::{IdentityBootstrapState, IdentityRestoreProgress};
+    let running = AgentIdentity::parse("held-owed-status-running").unwrap();
+    let added = AgentIdentity::parse("held-owed-status-added").unwrap();
+    let roster = vec![member(&running)];
+    let dir = tempfile::tempdir().unwrap();
+    let mob = mob_id("held-owed-status");
+
+    let mut runtime =
+        installed_runtime(&dir, &mob, &roster, Arc::new(SelectingHook::default())).await;
+    runtime
+        .bootstrap_installed_identity_first_context_held(
+            &roster,
+            tokio::time::Instant::now() + Duration::from_mins(1),
+            Box::new(|_members, _completion| Box::pin(async { Ok(()) })),
+        )
+        .await
+        .expect("the running member is published");
+    let context = runtime
+        .identity_first_context()
+        .expect("the identity context");
+    let start = context
+        .add_member_held(
+            member(&added),
+            tokio::time::Instant::now() + Duration::from_mins(1),
+            |_members, _completion| async { Err("the application bundle failed".to_string()) },
+        )
+        .await
+        .expect("the held add starts");
+    match start {
+        meerkat_meta::identity_first::HeldBootstrapStart::Unsettled(settlement) => {
+            settlement
+                .settled()
+                .await
+                .expect_err("the host's refusal aborts the add");
+        }
+        meerkat_meta::identity_first::HeldBootstrapStart::Activated(result) => {
+            panic!("the refused add activated: {:?}", result.outcomes)
+        }
+    }
+    drop(context);
+    let _ = runtime.shutdown().await;
+    drop(runtime);
+
+    // The host had listed the added member: the next runtime's eager pass
+    // refuses it, and the member's bootstrap status entry says why, typed.
+    let listed = vec![member(&running), member(&added)];
+    let mut runtime =
+        installed_runtime(&dir, &mob, &listed, Arc::new(SelectingHook::default())).await;
+    runtime
+        .bootstrap_installed_identity_first_context(&listed)
+        .await
+        .expect("the ordinary bootstrap runs");
+    let status = runtime
+        .identity_runtime()
+        .expect("the identity runtime")
+        .identity_bootstrap_status();
+    let entry = status
+        .identities
+        .get(&added)
+        .expect("the owed member's bootstrap entry");
+    assert_eq!(entry.state, IdentityBootstrapState::Broken, "{entry:?}");
+    assert_eq!(
+        entry.restore,
+        Some(IdentityRestoreProgress::Refused {
+            code: -32603,
+            kind: Some("held_completion_owed".to_string()),
+        }),
+        "{entry:?}"
+    );
+    assert!(
+        entry
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("owes its host a fresh held completion")),
+        "{entry:?}"
+    );
+    assert_eq!(status.counts.broken, 1, "{status:?}");
+    assert!(
+        !status.ready,
+        "an owed member keeps the bootstrap from ready"
+    );
+    let _ = runtime.shutdown().await;
+}
+
 /// More fresh members than the restore pass's construction slots (four by
 /// default): every member still reaches its hold, because a held member
 /// gives its slot back, and the pass decides only once all are held.

@@ -8238,6 +8238,7 @@ async fn handle_console_runtime_rpc_with_visibility(
                 "meta/cross_mob/directory",
                 "meta/peer_pubkey",
                 "meta/storage/doctor",
+                crate::rpc::schedule_methods::SCHEDULE_TOOLS_METHOD,
             ];
             // DERIVED from the canonical registry, on the plane that SERVES these.
             // Split by the family's own classifier: on a read_only console the
@@ -8831,6 +8832,13 @@ async fn handle_console_runtime_rpc_with_visibility(
             .await
         })
         .await,
+        // Static Meerkat schedule tool definitions: a read method that needs no
+        // grant (see `crate::rpc::schedule_methods`).
+        crate::rpc::schedule_methods::SCHEDULE_TOOLS_METHOD => response_value(
+            response_id,
+            Some(crate::rpc::schedule_methods::schedule_tools_result()),
+            None,
+        ),
         // Read-only state-directory diagnosis (registered as a read method:
         // allowed in read-only mode, admin-gated in
         // `console_rpc_access_requirements`).
@@ -15558,6 +15566,122 @@ comms = true
             "{findings:#?}"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn console_rpc_serves_schedule_tools_on_read_only_consoles()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-schedule-tools-serve").await?;
+        // A static read of Meerkat's definitions: an authenticated console and
+        // a read-only one (unauthenticated here) both get it.
+        for is_authenticated in [true, false] {
+            let response = Box::pin(handle_console_runtime_rpc(
+                &runtime,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                rpc_request("meta/schedule/tools"),
+                is_authenticated,
+            ))
+            .await;
+            assert_eq!(response["error"], Value::Null, "{response:#?}");
+            assert_eq!(
+                response["result"],
+                json!({ "tools": meerkat::schedule_tools_list() }),
+                "is_authenticated={is_authenticated}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn console_capabilities_advertise_schedule_tools_to_every_viewer()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-schedule-tools-capabilities").await?;
+        for is_authenticated in [true, false] {
+            let capabilities = Box::pin(handle_console_runtime_rpc(
+                &runtime,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                rpc_request("meta/capabilities"),
+                is_authenticated,
+            ))
+            .await;
+            let advertised = capabilities["result"]["methods"]
+                .as_array()
+                .ok_or("capabilities methods should be an array")?
+                .iter()
+                .filter(|method| method.as_str() == Some("meta/schedule/tools"))
+                .count();
+            assert_eq!(
+                advertised, 1,
+                "is_authenticated={is_authenticated}: {capabilities:#?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The aggregator-only console has no single runtime whose schedule tools
+    /// the definitions would describe, so it neither serves nor advertises them.
+    #[tokio::test]
+    async fn aggregator_rpc_neither_serves_nor_advertises_schedule_tools() {
+        let served = handle_console_aggregator_rpc(
+            None,
+            rpc_request("meta/schedule/tools"),
+            true,
+            false,
+            None,
+            None,
+            &crate::console_aggregator::ConsoleSendScope::Anonymous,
+        )
+        .await;
+        assert_eq!(served["error"]["code"], json!(-32601), "{served:#?}");
+
+        let capabilities = handle_console_aggregator_rpc(
+            None,
+            rpc_request("meta/capabilities"),
+            true,
+            false,
+            None,
+            None,
+            &crate::console_aggregator::ConsoleSendScope::Anonymous,
+        )
+        .await;
+        let methods = capabilities["result"]["methods"]
+            .as_array()
+            .expect("capabilities methods");
+        assert!(
+            methods.iter().all(|method| method != "meta/schedule/tools"),
+            "{methods:#?}"
+        );
+    }
+
+    /// `meta/schedule/tools` lists Meerkat's static tool definitions: no
+    /// identity, no member state, nothing tenant scoped. Leaving it out of both
+    /// console tables is the decision (a read method that needs no grant and is
+    /// advertised to every viewer); this pins it against a later mapping.
+    #[test]
+    fn console_schedule_tools_is_a_grant_free_read_method() {
+        assert!(!super::is_console_mutating_rpc_method(
+            "meta/schedule/tools"
+        ));
+        assert_eq!(
+            super::console_rpc_access_requirements("meta/schedule/tools", &json!({})),
+            None
+        );
     }
 
     #[tokio::test]

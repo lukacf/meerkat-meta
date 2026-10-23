@@ -79,14 +79,23 @@ export type FetchLike = (
 ) => Promise<FetchLikeResponse>;
 
 /**
- * Grace period for the persistent gateway to finish its own shutdown.
+ * Shutdown wait when no valid horizon was advertised. The stock Rust gateway
+ * advertises its own `stdio_shutdown_horizon_ms` (432_000 ms in 0.9.5) in
+ * its `accepted` answer to `meta/init`, before any bootstrap, and the
+ * transport waits that value instead. This fallback governs only a stop
+ * before that answer (nothing durable has run yet), an older or custom
+ * gateway without the shutdown handshake (the stdin EOF protocol), and a
+ * handshake gateway that advertises no valid horizon.
  *
  * Provider operations are publicly required to finish within 120 seconds;
  * the stock Rust gateway gives each callback a hard 130-second wire deadline.
- * Its advertised 335-second horizon covers two such callback windows,
+ * For the gateways this fallback serves, it covers two such callback windows,
  * runtime event/mob drains, bounded RPC/HTTP/stdout phases, and
- * response-delivery/process-reap margin. The same value is the safe fallback
- * for handshake-capable gateways without the newer explicit capability.
+ * response-delivery/process-reap margin.
+ *
+ * `MetaRuntime.gatewayShutdownHorizonMs` is then `null`. A supervisor that
+ * sizes its stop from it falls back to its own unreported horizon: Meta
+ * Forge uses the stock 432_000 ms and widens an earlier systemd unit to fit.
  */
 export const PERSISTENT_TRANSPORT_SHUTDOWN_GRACE_MS = 337_000;
 export const PROVIDER_CALLBACK_COMPLETION_MS = 125_000;
@@ -512,6 +521,7 @@ export class PersistentTransport {
   private _nativeShutdownError: Error | null = null;
   private _supportsShutdownHandshake = false;
   private _shutdownHorizonMs = PERSISTENT_TRANSPORT_SHUTDOWN_GRACE_MS;
+  private _advertisedShutdownHorizonMs: number | null = null;
   private readonly _pending = new Map<
     string,
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
@@ -604,6 +614,7 @@ export class PersistentTransport {
     // a child restart.
     this._supportsShutdownHandshake = false;
     this._shutdownHorizonMs = PERSISTENT_TRANSPORT_SHUTDOWN_GRACE_MS;
+    this._advertisedShutdownHorizonMs = null;
     // A new process gets a new reader.
     this._readerFailure = null;
     // A new process has no termination yet; a previous child's never stands
@@ -860,6 +871,7 @@ export class PersistentTransport {
         result !== null &&
         (result as Record<string, unknown>).stdio_shutdown_handshake === true;
       this._shutdownHorizonMs = PERSISTENT_TRANSPORT_SHUTDOWN_GRACE_MS;
+      this._advertisedShutdownHorizonMs = null;
       if (this._supportsShutdownHandshake) {
         const horizonMs = (result as Record<string, unknown>).stdio_shutdown_horizon_ms;
         if (
@@ -869,6 +881,7 @@ export class PersistentTransport {
           horizonMs <= MAX_GATEWAY_SHUTDOWN_HORIZON_MS
         ) {
           this._shutdownHorizonMs = horizonMs;
+          this._advertisedShutdownHorizonMs = horizonMs;
         }
       }
     }
@@ -1013,6 +1026,18 @@ export class PersistentTransport {
    */
   lastTermination(): TransportTermination | null {
     return this._lastTermination;
+  }
+
+  /**
+   * The shutdown horizon, in milliseconds, that the current gateway process
+   * advertised as `stdio_shutdown_horizon_ms` in a `meta/init` that also
+   * advertised the shutdown handshake, as accepted. `null` before that
+   * `meta/init`, or when the gateway advertised no valid horizon and this
+   * transport waits its own default; a new process never inherits an earlier
+   * one's value.
+   */
+  advertisedShutdownHorizonMs(): number | null {
+    return this._advertisedShutdownHorizonMs;
   }
 
   isRunning(): boolean {

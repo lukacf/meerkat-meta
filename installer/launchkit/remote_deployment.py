@@ -5,11 +5,13 @@ import asyncio
 import base64
 from contextlib import contextmanager
 from copy import deepcopy
+import errno
 import fcntl
 import gzip
 import hashlib
 import io
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -20,8 +22,8 @@ import uuid
 import zlib
 
 from .artifact_binding import current_version, package_matches, proposal_hash
-from .deployment import (MAX_PACKAGE_BYTES, package_files, package_configuration_fields, package_console_scope,
-                         prepare_private_settings, require_accepted, now)
+from .deployment import (MAX_PACKAGE_BYTES, await_validation, package_files, package_configuration_fields,
+                         package_console_scope, prepare_private_settings, require_accepted, now)
 from .deployment_ports import checked_console_port
 from .projects import DraftConflict
 from .ssh_transport import SshTransport, SshTransportError, validate_endpoint
@@ -30,6 +32,7 @@ from .application_access import application_observation
 from .remote_destination import (ControllerError, PRODUCT_RUNTIME_UNSUPPORTED,
                                  connection_prerequisites, private_settings_input)
 
+LOG = logging.getLogger(__name__)
 PROTOCOL = 1
 HASH = re.compile(r"[a-f0-9]{64}")
 FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{20,90}={0,2}")
@@ -38,6 +41,9 @@ PRIVATE_COMPONENTS = {".env", ".venv", ".bin", ".mobkit", ".git", "__pycache__",
 PRIVATE_ROOTS = {"data", "workspace", "source"}
 NEEDED = {"remote_operations.py", "setup.py", "install.sh", "application_configuration.py", "mcp_connections.py"}
 MAX_CONTROLLER = 512 * 1024
+# A new installation is built here, outside every guide's inventory, and
+# renamed into place only once its record is complete.
+STAGING = ".connecting"
 
 
 class RemoteProductActionNotSent(DraftConflict):
@@ -80,6 +86,10 @@ def source_archive(files):
                 info.size, info.mode, info.mtime = len(content), mode, 0
                 archive.addfile(info, io.BytesIO(content))
     return output.getvalue(), digest.hexdigest()
+
+
+def package_digest(payload):
+    return hashlib.sha256(payload).hexdigest()
 
 
 def private_file(path, maximum=MAX_PACKAGE_BYTES):
@@ -144,6 +154,57 @@ def update_receipt(directory, **changes):
         value.update(changes, updated_at=now())
         write_private(Path(directory) / "receipt.json", value)
         return value
+
+
+def _sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _staging_lock(path):
+    """Claim one staging entry for this connect's whole life; None if it is held or gone."""
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise DraftConflict("The remote installation store is not an owned directory.")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # A sweep may have claimed and unlinked this name between the open and
+        # the flock; a claim on a nameless inode protects nothing.
+        current = os.stat(path, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            os.close(descriptor)
+            return None
+        return descriptor
+    except (BlockingIOError, FileNotFoundError):
+        os.close(descriptor)
+        return None
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _end_staging(entry, lock):
+    """Remove a held staging entry, if still there, and release its claim.
+
+    A copy that cannot be removed is left for the next sweep. This never raises,
+    so it cannot replace the error that ended the connect.
+    """
+    try:
+        if entry.exists() and not entry.is_symlink():
+            for item in entry.iterdir():
+                if item.is_symlink() or not item.is_file():
+                    raise OSError("unexpected entry " + item.name)
+                item.unlink()
+            entry.rmdir()
+        entry.with_name(entry.name + ".lock").unlink(missing_ok=True)
+    except OSError as error:
+        LOG.warning("Left the connect staging entry %s for a later sweep: %s", entry.name, error)
+    finally:
+        os.close(lock)
 
 
 def journal(directory, message, **changes):
@@ -430,7 +491,7 @@ class RemoteDeploymentService:
                     continue
                 if receipt.get("target") != "gcp":
                     raise DraftConflict("The saved cloud installation has a different destination type.")
-                _, receipt = self.stored(guide_id, directory.name)
+                _, receipt = await await_validation(self.stored, guide_id, directory.name)
                 if endpoint is None or receipt.get("endpoint") != endpoint or receipt.get("cloud_operation_id") != operation_id:
                     raise DraftConflict("The saved remote installation belongs to a different cloud removal destination.")
                 task = self.tasks.get(directory.name)
@@ -439,7 +500,7 @@ class RemoteDeploymentService:
                     # Its destination worker/operation receipt remains historical.
                     await asyncio.shield(task)
                 async with self.operation_lock(directory):
-                    _, receipt = self.stored(guide_id, directory.name)
+                    _, receipt = await await_validation(self.stored, guide_id, directory.name)
                     if receipt.get("endpoint") != endpoint or receipt.get("cloud_operation_id") != operation_id:
                         raise DraftConflict("The saved cloud installation changed during removal coordination.")
                     closed = await self.browser_access.revoke(guide_id, directory.name,
@@ -525,7 +586,8 @@ class RemoteDeploymentService:
             raise DraftConflict("Build and accept the current application before connecting its destination.")
         payload, slug = (await self.implementation.package(guide_id, build_id, state=state) if supplied_state
                          else await self.implementation.package(guide_id, build_id))
-        files = package_files(payload)
+        # Unpacking the whole package must not hold the event loop.
+        files = await await_validation(package_files, payload)
         spec = json.loads(files["deployment.json"][0])
         report = json.loads(files["implementation-report.json"][0])
         if (report.get("build_id") != build_id or report.get("guide_version") != checked["guide_version"]
@@ -563,19 +625,20 @@ class RemoteDeploymentService:
                 "console_scope": package_console_scope(files, fields, state),
                 **({"product_control": selected} if product else {})}
 
-    def selection_matches(self, receipt, selected):
+    async def selection_matches(self, receipt, selected):
         return (selected["state"]["id"] == receipt["guide_id"]
             and selected["checked"]["guide_version"] == build_guide_version(receipt)
             and selected["checked"]["build_id"] == receipt["build_id"]
             and selected["checked"]["source_digest"] == receipt["accepted_source_digest"]
-            and hashlib.sha256(selected["payload"]).hexdigest() == receipt["package_sha256"])
+            # Hashing the whole package must not hold the event loop.
+            and await await_validation(package_digest, selected["payload"]) == receipt["package_sha256"])
 
     async def current_state(self, receipt, *, state=None):
         try:
             snapshot = state if state is not None else await self.local._guide(receipt["guide_id"])
             options = {"target": receipt.get("target", "linux"), "state": snapshot, "admission": False}
             selected = await self.accepted(receipt["guide_id"], snapshot["version"], receipt["build_id"], **options)
-            if not self.selection_matches(receipt, selected):
+            if not await self.selection_matches(receipt, selected):
                 return None
             if state is None:
                 latest = await self.local._guide(receipt["guide_id"])
@@ -647,7 +710,8 @@ class RemoteDeploymentService:
                 cloud_version = (cloud.get("binding") or {}).get("guide_version")
                 expected = {"guide_id": guide_id, "guide_version": cloud_version, "build_id": build_id,
                     "blueprint_hash": proposal_hash(selected["state"].get("proposal") or selected["state"].get("blueprint")),
-                    "source_digest": selected["checked"]["source_digest"], "package_sha256": hashlib.sha256(selected["payload"]).hexdigest()}
+                    "source_digest": selected["checked"]["source_digest"],
+                    "package_sha256": await await_validation(package_digest, selected["payload"])}
                 proposal = selected["state"].get("proposal") or selected["state"].get("blueprint")
                 if (type(cloud_version) is not int or not 1 <= cloud_version <= version
                         or cloud.get("binding") != expected or endpoint != cloud.get("endpoint")
@@ -660,7 +724,7 @@ class RemoteDeploymentService:
             await self.require_current_request(guide_id, version, files=selected["files"])
             previous = None
             try:
-                directory, previous = self.stored(guide_id)
+                directory, previous = await await_validation(self.stored, guide_id)
             except LookupError:
                 pass
             same = previous and previous["endpoint"] == endpoint and previous["destination_input"] == destination and (
@@ -679,62 +743,109 @@ class RemoteDeploymentService:
             if any(item.is_symlink() for item in (self.root, *self.root.parents)):
                 raise DraftConflict("The owned remote installation store contains a link.")
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            for folder in (self.root, self.root / guide_id):
+            for folder in (self.root, self.root / guide_id, self.root / STAGING):
                 folder.mkdir(exist_ok=True, mode=0o700)
                 info = folder.lstat()
                 if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
                     raise DraftConflict("The remote installation store is not an owned directory.")
                 folder.chmod(0o700)
+            self._sweep_staging()
             directory = self.root / guide_id / identity
-            directory.mkdir(parents=True, mode=0o700)
-            directory.parent.chmod(0o700)
-            from .remote_interface_bundle import controller_bytes
-            product_bundle = None
-            if selected.get("product_control") is not None:
-                from .remote_product_control import freeze_product_control
-                from .remote_product_artifacts import _joined
-                product_bundle = await _joined(freeze_product_control, selected["product_control"],
-                    _owner_current=selected["product_control"].require_current)
-            controller = controller_bytes(**({"product_control": product_bundle} if product_bundle is not None else {}))
-            if len(controller) > MAX_CONTROLLER:
-                raise DraftConflict("The trusted remote controller exceeded its original bound.")
-            _, transferred = source_archive(selected["files"])
-            receipt = {"protocol": PROTOCOL, "deployment_id": identity, "guide_id": guide_id,
-                "guide_version": version, "build_id": build_id,
-                "build_guide_version": selected["checked"]["guide_version"],
-                "accepted_source_digest": selected["checked"]["source_digest"],
-                "package_sha256": hashlib.sha256(selected["payload"]).hexdigest(),
-                "transferred_source_digest": transferred, "controller_sha256": hashlib.sha256(controller).hexdigest(),
-                "endpoint": endpoint, "destination_input": destination, "destination": destination,
-                "status": "connecting", "last_known_status": None, "created_at": now(), "updated_at": now(),
-                "fields": selected["fields"], "console_scope": selected["console_scope"],
-                "preflight": None, "progress": [], "checks": [],
-                "scope": "native-bootstrap-and-console", "custom_interfaces_verified": False,
-                "external_workflows_verified": False, "remote_admission_requested": False,
-                "observation": {"available": False}, "detail": "Checking the chosen Linux computer through its existing trusted SSH connection."}
-            write_bytes(directory / "package.zip", selected["payload"])
-            write_bytes(directory / "controller.py", controller)
-            if product_bundle is not None:
-                from .remote_product_control import _json
-                product_bundle.require_current()
-                control_bytes = _json(product_bundle.manifest)
-                write_bytes(directory / "control-bundle.zip", product_bundle.content)
-                write_bytes(directory / "product-control.json", control_bytes)
-                receipt.update(product_runtime=True,
-                    product_control_manifest_sha256=hashlib.sha256(control_bytes).hexdigest(),
-                    product_control_bundle_sha256=product_bundle.manifest["bundle"]["sha256"],
-                    product_control_bundle_size=product_bundle.manifest["bundle"]["size"])
+            staging = self.root / STAGING / identity
+            lock = _staging_lock(staging.with_name(identity + ".lock"))
+            if lock is None:
+                raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(staging))
+            try:
+                staging.mkdir(mode=0o700)
+                from .remote_interface_bundle import controller_bytes
+                product_bundle = None
+                if selected.get("product_control") is not None:
+                    from .remote_product_control import freeze_product_control
+                    from .remote_product_artifacts import _joined
+                    product_bundle = await _joined(freeze_product_control, selected["product_control"],
+                        _owner_current=selected["product_control"].require_current)
+                controller = controller_bytes(**({"product_control": product_bundle} if product_bundle is not None else {}))
+                if len(controller) > MAX_CONTROLLER:
+                    raise DraftConflict("The trusted remote controller exceeded its original bound.")
+                _, transferred = await await_validation(source_archive, selected["files"])
+                receipt = {"protocol": PROTOCOL, "deployment_id": identity, "guide_id": guide_id,
+                    "guide_version": version, "build_id": build_id,
+                    "build_guide_version": selected["checked"]["guide_version"],
+                    "accepted_source_digest": selected["checked"]["source_digest"],
+                    "package_sha256": await await_validation(package_digest, selected["payload"]),
+                    "transferred_source_digest": transferred, "controller_sha256": hashlib.sha256(controller).hexdigest(),
+                    "endpoint": endpoint, "destination_input": destination, "destination": destination,
+                    "status": "connecting", "last_known_status": None, "created_at": now(), "updated_at": now(),
+                    "fields": selected["fields"], "console_scope": selected["console_scope"],
+                    "preflight": None, "progress": [], "checks": [],
+                    "scope": "native-bootstrap-and-console", "custom_interfaces_verified": False,
+                    "external_workflows_verified": False, "remote_admission_requested": False,
+                    "observation": {"available": False}, "detail": "Checking the chosen Linux computer through its existing trusted SSH connection."}
+                # Writing and syncing the whole package must not hold the event loop.
+                await await_validation(write_bytes, staging / "package.zip", selected["payload"])
+                write_bytes(staging / "controller.py", controller)
+                if product_bundle is not None:
+                    from .remote_product_control import _json
+                    product_bundle.require_current()
+                    control_bytes = _json(product_bundle.manifest)
+                    # Writing and syncing the whole bundle must not hold the event
+                    # loop. Its original owner must still be current afterwards;
+                    # a refusal discards the staged copy like any other failure.
+                    await await_validation(write_bytes, staging / "control-bundle.zip", product_bundle.content)
+                    product_bundle.require_current()
+                    write_bytes(staging / "product-control.json", control_bytes)
+                    receipt.update(product_runtime=True,
+                        product_control_manifest_sha256=hashlib.sha256(control_bytes).hexdigest(),
+                        product_control_bundle_sha256=product_bundle.manifest["bundle"]["sha256"],
+                        product_control_bundle_size=product_bundle.manifest["bundle"]["size"])
+                    if cloud is not None:
+                        cloud_bytes = _json(cloud)
+                        write_bytes(staging / "product-cloud.json", cloud_bytes)
+                        receipt["product_cloud_sha256"] = hashlib.sha256(cloud_bytes).hexdigest()
                 if cloud is not None:
-                    cloud_bytes = _json(cloud)
-                    write_bytes(directory / "product-cloud.json", cloud_bytes)
-                    receipt["product_cloud_sha256"] = hashlib.sha256(cloud_bytes).hexdigest()
-            if cloud is not None:
-                receipt.update(target="gcp", cloud_operation_id=cloud["operation_id"],
-                    detail="Checking the owned Google Cloud computer through its verified IAP SSH connection.")
-            write_private(directory / "receipt.json", receipt)
+                    receipt.update(target="gcp", cloud_operation_id=cloud["operation_id"],
+                        detail="Checking the owned Google Cloud computer through its verified IAP SSH connection.")
+                write_private(staging / "receipt.json", receipt)
+                _sync_directory(staging)
+                if directory.exists() or directory.is_symlink():
+                    raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(directory))
+                os.rename(staging, directory)
+            except BaseException:
+                # A failed or cancelled connect leaves nothing in the inventory.
+                # Every awaited write has returned before this runs.
+                _end_staging(staging, lock)
+                raise
+            _end_staging(staging, lock)
+            # Past the rename the installation is complete under its own name,
+            # even if naming it as the selection below fails.
+            _sync_directory(directory.parent)
             write_private(directory.parent / "latest.json", {"deployment_id": identity})
             self.start_task(directory, "preflight")
             return self.public(receipt, current=True, current_guide_version=version)
+
+    def _sweep_staging(self):
+        """Remove staging copies that no live connect, in any process, still claims."""
+        root, names, unexpected = self.root / STAGING, set(), set()
+        for entry in list(root.iterdir()):
+            name = entry.name.removesuffix(".lock")
+            try:
+                info = entry.lstat()
+            except FileNotFoundError:
+                continue
+            kind = stat.S_ISREG if entry.name.endswith(".lock") else stat.S_ISDIR
+            if not kind(info.st_mode) or info.st_uid != os.getuid() or not operation_identity(name):
+                LOG.warning("Left an unexpected connect staging entry in place: %s", entry.name)
+                unexpected.add(name)
+            else:
+                names.add(name)
+        for name in sorted(names - unexpected):
+            try:
+                lock = _staging_lock(root / (name + ".lock"))
+            except (OSError, DraftConflict) as error:
+                LOG.warning("Left the connect staging entry %s in place: %s", name, error)
+                continue
+            if lock is not None:
+                _end_staging(root / name, lock)
 
     def start_task(self, directory, action):
         identity = directory.name
@@ -749,7 +860,7 @@ class RemoteDeploymentService:
 
     async def rpc(self, directory, receipt, action, *, request_version=None, _publish_product_intent=None, **extra):
         await self.require_cloud_available(receipt)
-        files, _, content = self.frozen(directory, receipt)
+        files, _, content = await await_validation(self.frozen, directory, receipt)
         if request_version is not None:
             await self.require_current_request(receipt["guide_id"], request_version, files=files)
         body = {"action": action, "deployment_id": receipt["deployment_id"], "binding": binding(receipt),
@@ -790,7 +901,7 @@ class RemoteDeploymentService:
             receipt = read_receipt(directory)
             if await self.cloud_status(receipt) is not None:
                 return
-            files, _, _ = self.frozen(directory, receipt)
+            files, _, _ = await await_validation(self.frozen, directory, receipt)
             spec = json.loads(files["deployment.json"][0])
             pending = receipt.get("pending_operation")
             status_request = ({"operation_id": pending["id"]} if action == "status"
@@ -824,7 +935,7 @@ class RemoteDeploymentService:
                     host_key_fingerprint=fingerprint, checks=value.get("checks", []), observation={"available": True},
                     private_settings_supported=value.get("private_settings_supported") is True)
             else:
-                self.adopt(directory, receipt, value)
+                await self.adopt(directory, receipt, value)
             self.last_observed[directory.name] = time.monotonic()
         except (SshTransportError, TimeoutError, OSError) as error:
             self.unavailable(directory, error=error)
@@ -859,7 +970,7 @@ class RemoteDeploymentService:
         update_receipt(directory, status="observation-unavailable", last_known_status=last,
             observation={"available": False}, detail=detail)
 
-    def adopt(self, directory, receipt, value, *, expected_operation=None):
+    async def adopt(self, directory, receipt, value, *, expected_operation=None):
         typed_observation = value.get("status") in {"failed", "recovery-needed"}
         if expected_operation and (not value.get("error") or typed_observation) and value.get("operation_id") != expected_operation:
             raise DraftConflict("The destination did not confirm this exact remote operation. Recheck its saved custody before retrying.")
@@ -896,7 +1007,7 @@ class RemoteDeploymentService:
         product = product_control_observation(receipt, value)
         details["product_control"] = product
         from .remote_browser_access import console_port
-        files, _, _ = self.frozen(directory, receipt)
+        files, _, _ = await await_validation(self.frozen, directory, receipt)
         application_console_url = (product["factory_status"].get("console_url") if product is not None
             else details["service"].get("console_url"))
         details["application_experiences"] = application_observation(files, receipt,
@@ -992,7 +1103,7 @@ class RemoteDeploymentService:
         return value
 
     async def _settings_selection(self, guide_id, deployment_id, version=None, *, product_owner=None):
-        directory, receipt = self.stored(guide_id, deployment_id)
+        directory, receipt = await await_validation(self.stored, guide_id, deployment_id)
         if self.directory(guide_id) != directory:
             raise DraftConflict("Choose the selected remote installation before changing private settings.")
         await self.require_cloud_available(receipt)
@@ -1002,7 +1113,7 @@ class RemoteDeploymentService:
         selected = await self.accepted(guide_id, state["version"], receipt["build_id"],
             target=receipt.get("target", "linux"), state=state,
             **({"product_owner": product_owner} if receipt.get("product_runtime") is True else {}))
-        if not self.selection_matches(receipt, selected):
+        if not await self.selection_matches(receipt, selected):
             raise DraftConflict("The accepted application changed. Preserve this installation before changing private settings.")
         await self._probe(directory, "status")
         receipt = read_receipt(directory)
@@ -1067,7 +1178,7 @@ class RemoteDeploymentService:
                 await self.require_current_request(guide_id, selected["state"]["version"], files=selected["files"])
                 if receipt.get("product_runtime") is True:
                     self._product_owner(product_owner)
-                self.adopt(directory, receipt, value)
+                await self.adopt(directory, receipt, value)
                 return {"version": selected["state"]["version"], "deployment_id": deployment_id,
                     "build_id": receipt["build_id"], "source_digest": receipt["accepted_source_digest"],
                     "package_sha256": receipt["package_sha256"], "guide_version": receipt["guide_version"],
@@ -1120,7 +1231,7 @@ class RemoteDeploymentService:
                 if value.get("configuration_saved") is not True:
                     self.unavailable(directory)
                     return await self.current_public(read_receipt(directory))
-                self.adopt(directory, receipt, value)
+                await self.adopt(directory, receipt, value)
                 journal(directory, "Private settings saved. This remote application remains stopped; restart it explicitly when ready.",
                     ready=False, detail="Private settings saved. This remote application remains stopped; restart it explicitly when ready.")
                 return {**await self.current_public(read_receipt(directory)), "configuration_saved": True}
@@ -1155,7 +1266,7 @@ class RemoteDeploymentService:
         if product is None:
             raise DraftConflict("This installation has no authenticated retained product owner.")
         request = product_action_request(receipt, product, action, action_request_id)
-        self.adopt(directory, receipt, value)
+        await self.adopt(directory, receipt, value)
         receipt = read_receipt(directory)
         # Even an absent journal cannot authorize redelivery of an already
         # posted UUID. The original request may still be in transport.
@@ -1193,7 +1304,7 @@ class RemoteDeploymentService:
             request = product_action_request(receipt, product, action, action_request_id)
             if product is None or request is None:
                 raise DraftConflict("The product owner did not confirm this exact canonical action request.")
-            self.adopt(directory, receipt, value, expected_operation=action_request_id)
+            await self.adopt(directory, receipt, value, expected_operation=action_request_id)
         except (ValueError, LookupError):
             if not intent_started:
                 raise RemoteProductActionNotSent(action, action_request_id) from None
@@ -1259,7 +1370,7 @@ class RemoteDeploymentService:
                     raise DraftConflict("The product owner did not confirm these exact stopped setup inputs.")
                 await self.require_current_request(guide_id, selected["state"]["version"], files=selected["files"])
                 self._product_owner(product_owner)
-                self.adopt(directory, receipt, value)
+                await self.adopt(directory, receipt, value)
                 return {**setup, "source_digest": receipt["accepted_source_digest"],
                     "remote_control_binding": deepcopy(product["binding"])}
 
@@ -1280,7 +1391,7 @@ class RemoteDeploymentService:
                 raise DraftConflict("Start only the current accepted installed source. The older installation can still be stopped.")
             selected = await self.accepted(receipt["guide_id"], snapshot["version"], receipt["build_id"],
                 target=receipt.get("target", "linux"), state=snapshot, product_owner=product_owner)
-            if not self.selection_matches(receipt, selected):
+            if not await self.selection_matches(receipt, selected):
                 raise DraftConflict("The accepted product changed before its runtime action.")
             await self.require_current_request(receipt["guide_id"], snapshot["version"], files=selected["files"])
         capability = {"prepare-setup": "can_prepare_setup", "finish-setup": "can_finish_setup",
@@ -1316,7 +1427,9 @@ class RemoteDeploymentService:
         return value
 
     async def _status(self, guide_id, *, force=False, state=None, interview=False):
-        directory, receipt = self.stored(guide_id)
+        # Reading and hashing the saved package and controller must not hold
+        # the event loop.
+        directory, receipt = await await_validation(self.stored, guide_id)
         # An interview observes admitted work only. It neither starts another
         # destination preflight nor reconciles any browser connection.
         observe = not interview or receipt.get("remote_admission_requested") is True
@@ -1344,11 +1457,11 @@ class RemoteDeploymentService:
         if not isinstance(state, dict) or state.get("id") != guide_id:
             raise ValueError("Remote evidence requires the matching detached guide state.")
         value = await self._status(guide_id, state=state, interview=True)
-        directory, receipt = self.stored(guide_id)
+        directory, receipt = await await_validation(self.stored, guide_id)
         if receipt["deployment_id"] != value["deployment_id"] or binding(receipt) != binding(value):
             raise DraftConflict("The selected remote installation changed during its observation.")
         value = await self._observation_public(receipt, value["source_binding_current"], interview=True)
-        files, _, _ = self.frozen(directory, receipt)
+        files, _, _ = await await_validation(self.frozen, directory, receipt)
         report = json.loads(files["implementation-report.json"][0])
         source = report.get("verification", {}).get("digest")
         if (report.get("build_id") != receipt["build_id"]
@@ -1366,14 +1479,14 @@ class RemoteDeploymentService:
 
     async def install(self, guide_id, version, build_id, deployment_id, settings, *, product_owner=None):
         async with self.lock:
-            directory, receipt = self.stored(guide_id, deployment_id)
+            directory, receipt = await await_validation(self.stored, guide_id, deployment_id)
             async with self.operation_lock(directory):
                 receipt = read_receipt(directory)
                 await self.require_cloud_available(receipt)
                 if self.directory(guide_id) != directory:
                     raise DraftConflict("Choose the selected remote installation before entering private setup.")
                 selected = await self.accepted(guide_id, version, build_id, target=receipt.get("target", "linux"), product_owner=product_owner)
-                if not self.selection_matches(receipt, selected):
+                if not await self.selection_matches(receipt, selected):
                     raise DraftConflict("The application changed. Connect its current accepted source before installing.")
                 continuing_product = selected.get("product_control") is not None and product_transfer_pending(receipt)
                 retry = receipt.get("remote_admission_requested") and receipt["status"] == "not-installed" and receipt.get("admitted") is False
@@ -1406,7 +1519,7 @@ class RemoteDeploymentService:
                             raise DraftConflict("The destination or application changed before installation. Check it again.")
                     if selected.get("product_control") is not None:
                         return await self._install_product(directory, receipt, selected, version, values)
-                    _, archive, _ = self.frozen(directory, receipt)
+                    _, archive, _ = await await_validation(self.frozen, directory, receipt)
                     operation_id = receipt.get("install_operation_id") or str(uuid.uuid4())
                     await self.require_cloud_available(receipt)
                     await self.require_current_request(guide_id, version, files=selected["files"])
@@ -1421,7 +1534,7 @@ class RemoteDeploymentService:
                         value, _ = await self.rpc(directory, receipt, "install", operation_id=operation_id,
                             request_version=version,
                             archive=base64.b64encode(archive).decode("ascii"), settings=values)
-                        self.adopt(directory, receipt, value, expected_operation=operation_id)
+                        await self.adopt(directory, receipt, value, expected_operation=operation_id)
                     except (SshTransportError, TimeoutError, OSError, ValueError, LookupError) as error:
                         self.unavailable(directory, error=error)
                 finally:
@@ -1484,7 +1597,7 @@ class RemoteDeploymentService:
                 require_current=current, cloud=cloud)
             current()
             await self.require_current_request(receipt["guide_id"], version, files=selected["files"])
-            _, _, content = self.frozen(directory, read_receipt(directory))
+            _, _, content = await await_validation(self.frozen, directory, read_receipt(directory))
             body = {"action": "product-control", "deployment_id": receipt["deployment_id"],
                 "binding": original_binding, "destination": receipt["destination"], "expected_host": expected_host}
             artifact = ArtifactFile(directory / "control-bundle.zip", manifest["bundle"]["size"],
@@ -1506,7 +1619,7 @@ class RemoteDeploymentService:
             fresh = read_receipt(directory)
             value, _ = await self.rpc(directory, fresh, "install", operation_id=operation_id,
                 request_version=version, settings=values)
-            self.adopt(directory, fresh, value, expected_operation=operation_id)
+            await self.adopt(directory, fresh, value, expected_operation=operation_id)
         except (SshTransportError, TimeoutError, OSError, ValueError, LookupError) as error:
             # Before byte-install the same explicit private request may continue
             # its original transfer intents. After that boundary, a reply loss
@@ -1518,13 +1631,13 @@ class RemoteDeploymentService:
         if not operation_identity(previous_operation_id):
             raise ValueError("Choose the exact failed installation attempt before retrying.")
         async with self.lock:
-            directory, receipt = self.stored(guide_id, deployment_id)
+            directory, receipt = await await_validation(self.stored, guide_id, deployment_id)
             async with self.operation_lock(directory):
                 await self.require_cloud_available(receipt)
                 if self.directory(guide_id) != directory:
                     raise DraftConflict("Choose the selected remote installation before retrying private setup.")
                 selected = await self.accepted(guide_id, version, build_id, target=receipt.get("target", "linux"))
-                if not self.selection_matches(receipt, selected):
+                if not await self.selection_matches(receipt, selected):
                     raise DraftConflict("The application changed. Retry only its exact accepted installed source.")
                 # A POST replay is an observation until the predecessor is proven
                 # eligible now. It never turns an expired response into fresh work.
@@ -1591,7 +1704,7 @@ class RemoteDeploymentService:
                         result, _ = await self.rpc(directory, receipt, "retry-install", operation_id=operation_id,
                             request_version=version,
                             previous_operation_id=previous_operation_id, settings=values)
-                        self.adopt(directory, receipt, result, expected_operation=operation_id)
+                        await self.adopt(directory, receipt, result, expected_operation=operation_id)
                     except (SshTransportError, TimeoutError, OSError, ValueError, LookupError) as error:
                         self.unavailable(directory, error=error)
                 finally:
@@ -1601,7 +1714,7 @@ class RemoteDeploymentService:
 
     async def action(self, guide_id, deployment_id, action, *, action_request_id=None, product_owner=None):
         async with self.lock:
-            directory, receipt = self.stored(guide_id, deployment_id)
+            directory, receipt = await await_validation(self.stored, guide_id, deployment_id)
             async with self.operation_lock(directory):
                 receipt = read_receipt(directory)
                 await self.require_cloud_available(receipt)
@@ -1629,7 +1742,7 @@ class RemoteDeploymentService:
                     "Browser access is closed while the owned remote service changes. Reconnect after its readiness is verified.")
                 await self.require_cloud_available(receipt)
                 if action == "restart":
-                    files, _, _ = self.frozen(directory, receipt)
+                    files, _, _ = await await_validation(self.frozen, directory, receipt)
                     await self.require_current_request(guide_id, snapshot["version"], files=files)
                 journal(directory, "Requesting an owned remote service operation.", status="stopping" if action == "stop" else "restarting",
                         pending_operation={"id": operation_id, "action": action})
@@ -1637,7 +1750,7 @@ class RemoteDeploymentService:
                 try:
                     value, _ = await self.rpc(directory, receipt, action, operation_id=operation_id,
                         request_version=snapshot["version"] if action == "restart" else None)
-                    self.adopt(directory, receipt, value, expected_operation=operation_id)
+                    await self.adopt(directory, receipt, value, expected_operation=operation_id)
                 except (SshTransportError, TimeoutError, OSError, ValueError, LookupError) as error:
                     self.unavailable(directory, error=error)
                 receipt = read_receipt(directory)

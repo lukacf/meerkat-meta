@@ -27,14 +27,29 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parent
 START_TIMEOUT = 240
-# The compiler fills these from the host's pinned gateway shutdown budget.
-# They are bounded grace/reap allowances, never native cleanup acknowledgments.
+# The compiler fills this from the host's shutdown budget: margins around the
+# gateway shutdown horizon the application reports at readiness, and the
+# horizon assumed when it reports none. They are bounded grace/reap
+# allowances, never native cleanup acknowledgments.
 SHUTDOWN_BUDGET = '__LAUNCH_SHUTDOWN_BUDGET__'
-STOP_TIMEOUT = SHUTDOWN_BUDGET['application']
+
+
+def shutdown_budget(horizon_ms=None):
+    """Stop budgets, in seconds, that enclose one gateway shutdown horizon."""
+    horizon = SHUTDOWN_BUDGET['unreported_horizon_ms'] if horizon_ms is None else horizon_ms
+    application = -(-horizon // 1000) + SHUTDOWN_BUDGET['application_margin']
+    worker = application + SHUTDOWN_BUDGET['force_reap'] + SHUTDOWN_BUDGET['worker_margin']
+    service = worker + SHUTDOWN_BUDGET['service_margin']
+    return {'application': application, 'force_reap': SHUTDOWN_BUDGET['force_reap'], 'worker': worker,
+            'service': service, 'command': service + SHUTDOWN_BUDGET['command_margin'],
+            'legacy_service': SHUTDOWN_BUDGET['legacy_service']}
+
+
+STOP_TIMEOUT = shutdown_budget()['application']
 FORCE_REAP_TIMEOUT = SHUTDOWN_BUDGET['force_reap']
-WORKER_STOP_TIMEOUT = SHUTDOWN_BUDGET['worker']
-SERVICE_STOP_TIMEOUT = SHUTDOWN_BUDGET['service']
-SERVICE_STOP_COMMAND_TIMEOUT = SHUTDOWN_BUDGET['command']
+WORKER_STOP_TIMEOUT = shutdown_budget()['worker']
+SERVICE_STOP_TIMEOUT = shutdown_budget()['service']
+SERVICE_STOP_COMMAND_TIMEOUT = shutdown_budget()['command']
 LEGACY_SERVICE_STOP_TIMEOUT = SHUTDOWN_BUDGET['legacy_service']
 SERVICE_RESTART_COMMAND_TIMEOUT = SERVICE_STOP_COMMAND_TIMEOUT + START_TIMEOUT + 10
 EXIT_OBSERVATION_TIMEOUT = 1
@@ -356,7 +371,27 @@ async def supervised_parent_exit(process):
         await asyncio.sleep(0.01)
 
 
-async def stop_supervised_application(process):
+def reported_gateway_horizon(payload):
+    """The horizon an application reported at readiness; None when it reported none."""
+    value = payload.get('gateway_shutdown_horizon_ms')
+    if value is None:
+        return None
+    if type(value) is not int or not 0 < value <= SHUTDOWN_BUDGET['maximum_horizon_ms']:
+        raise DestinationError('The application reported an invalid gateway shutdown horizon.')
+    return value
+
+
+def application_stop_window(horizon_ms=None, *, stop_budget=None):
+    """The application's stop window, inside the unit budget the manager enforces."""
+    window = STOP_TIMEOUT if horizon_ms is None else shutdown_budget(horizon_ms)['application']
+    if stop_budget is not None:
+        window = min(window, stop_budget - SHUTDOWN_BUDGET['force_reap'] - SHUTDOWN_BUDGET['worker_margin']
+                     - SHUTDOWN_BUDGET['service_margin'])
+    return window
+
+
+async def stop_supervised_application(process, *, horizon_ms=None, stop_budget=None):
+    window = application_stop_window(horizon_ms, stop_budget=stop_budget)
     if process.returncode is None:
         try:
             # The SDK's gateway inherits this group. Let the application keep
@@ -374,7 +409,7 @@ async def stop_supervised_application(process):
             if process.returncode is None:
                 raise
         try:
-            await asyncio.wait_for(supervised_parent_exit(process), STOP_TIMEOUT)
+            await asyncio.wait_for(supervised_parent_exit(process), window)
         except TimeoutError:
             pass
     # Parent exit is separate from owned group cleanup. Escalate only after
@@ -434,10 +469,68 @@ def private_settings(root=ROOT):
 
 
 def service_stop_timeout(receipt):
+    # The legacy budget, the one the earlier pinned horizon gave, or the
+    # unreported horizon's budget.
     value = receipt.get('stop_timeout_seconds', LEGACY_SERVICE_STOP_TIMEOUT)
-    if type(value) is not int or value not in {LEGACY_SERVICE_STOP_TIMEOUT, SERVICE_STOP_TIMEOUT}:
+    if type(value) is not int or value not in {LEGACY_SERVICE_STOP_TIMEOUT, SERVICE_STOP_TIMEOUT,
+            shutdown_budget(SHUTDOWN_BUDGET['earlier_pinned_horizon_ms'])['service']}:
         raise DestinationError('The service receipt has an unsupported shutdown budget. No service was controlled.')
     return value
+
+
+STOP_BUDGET_DROP_IN = 'forge-stop-budget.conf'
+
+
+def stop_budget_drop_in(receipt):
+    """The owned drop-in that widens the unit's stop budget; the unit itself never changes."""
+    return Path(receipt['unit_path'] + '.d') / STOP_BUDGET_DROP_IN
+
+
+def drop_in_bytes(stop_timeout):
+    return ('[Service]\nTimeoutStopSec=' + str(stop_timeout) + '\n').encode()
+
+
+def owned_drop_in(content, unit_budget, recorded):
+    """The recorded drop-in, or the earlier one a longer widening has not replaced yet.
+
+    A widening records its budget before it replaces the drop-in, so an
+    interrupted one leaves the earlier drop-in: a budget above the unit's own
+    and below the recorded one. The next readiness replaces it.
+    """
+    if content == drop_in_bytes(recorded):
+        return True
+    earlier = re.fullmatch(rb'\[Service\]\nTimeoutStopSec=([1-9][0-9]{0,7})\n', content)
+    return earlier is not None and unit_budget < int(earlier[1]) < recorded
+
+
+def recorded_stop_budget(receipt):
+    """The widened stop budget recorded beside the unit identity, or None."""
+    record = receipt.get('service_stop_budget')
+    if record is None:
+        return None
+    try:
+        horizon_ms = reported_gateway_horizon(record) if isinstance(record, dict) else None
+    except DestinationError:
+        horizon_ms = None
+    if (horizon_ms is None or set(record) != {'gateway_shutdown_horizon_ms', 'stop_timeout_seconds'}
+            or type(record['stop_timeout_seconds']) is not int
+            or record['stop_timeout_seconds'] != shutdown_budget(horizon_ms)['service']):
+        raise DestinationError('The service receipt has an unsupported shutdown budget. No service was controlled.')
+    return record
+
+
+def service_command_timeouts(receipt):
+    """Stop and restart command bounds that outlast the unit's widened stop budget."""
+    record = recorded_stop_budget(receipt)
+    if record is None or record['stop_timeout_seconds'] <= SERVICE_STOP_TIMEOUT:
+        return SERVICE_STOP_COMMAND_TIMEOUT, SERVICE_RESTART_COMMAND_TIMEOUT
+    command_timeout = record['stop_timeout_seconds'] + SHUTDOWN_BUDGET['command_margin']
+    return command_timeout, command_timeout + START_TIMEOUT + 10
+
+
+def drop_in_content(path):
+    no_links(path)
+    return ordinary(path, private=True, maximum=4096) if path.exists() else None
 
 
 def unit_content(receipt, *, legacy_directory=False):
@@ -492,7 +585,51 @@ class Operations:
             known_content = content == unit_content(receipt, legacy_directory=True)
         if not known_content or hashlib.sha256(content).hexdigest() != receipt.get('unit_sha256'):
             raise DestinationError('The owned service definition changed. No existing unit was replaced or controlled.')
+        # A widened stop budget is the recorded drop-in, byte-exact, the
+        # earlier one an interrupted widening left, or none yet after an
+        # interrupted first write.
+        record = recorded_stop_budget(receipt)
+        widened = drop_in_content(stop_budget_drop_in(receipt))
+        if widened is not None and (record is None or not owned_drop_in(
+                widened, service_stop_timeout(receipt), record['stop_timeout_seconds'])):
+            raise DestinationError('The owned service definition changed. No existing unit was replaced or controlled.')
         return receipt
+
+    def widen_unit(self, horizon_ms):
+        """Widen the unit's stop budget to a reported horizon; never narrow it.
+
+        The record is written before the drop-in, so an interrupted write
+        leaves a controllable unit with the earlier drop-in or none. Every
+        readiness while a record exists rewrites a missing or earlier drop-in
+        and reloads the manager again, completing an interrupted step.
+        """
+        receipt = self.load()
+        budget = shutdown_budget(horizon_ms)['service']
+        record = recorded_stop_budget(receipt)
+        recorded = 0 if record is None else record['stop_timeout_seconds']
+        drop_in = stop_budget_drop_in(receipt)
+        if budget > max(service_stop_timeout(receipt), recorded):
+            record = {'gateway_shutdown_horizon_ms': horizon_ms, 'stop_timeout_seconds': budget}
+            write_private(self.path, {**receipt, 'service_stop_budget': record})
+        elif record is None:
+            return False
+        content = drop_in_bytes(record['stop_timeout_seconds'])
+        if drop_in_content(drop_in) != content:
+            drop_in.parent.mkdir(mode=0o700, exist_ok=True)
+            import uuid
+            temporary = drop_in.with_name('.' + drop_in.name + '.' + uuid.uuid4().hex)
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                with os.fdopen(descriptor, 'wb') as channel:
+                    channel.write(content)
+                    channel.flush()
+                    os.fsync(channel.fileno())
+                temporary.replace(drop_in)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
+        self.manager(['daemon-reload'])
+        return True
 
     def prepare(self):
         if self.path.exists() or self.path.is_symlink():
@@ -574,7 +711,7 @@ class Operations:
         self.manager(['daemon-reload'])
         self.manager(['enable', Path(receipt['unit_path']).name])
         self.manager(['restart' if restart else 'start', Path(receipt['unit_path']).name],
-                     **({'timeout': SERVICE_RESTART_COMMAND_TIMEOUT} if restart else {}))
+                     **({'timeout': service_command_timeouts(receipt)[1]} if restart else {}))
         deadline = time.monotonic() + START_TIMEOUT + 10
         while time.monotonic() < deadline:
             result = self.status()
@@ -589,7 +726,7 @@ class Operations:
         receipt = self.load(require_source=False, allow_legacy_directory=True)
         before = self.inspect(receipt)
         stopped, _ = self.manager(['stop', Path(receipt['unit_path']).name], allow_failure=True,
-                                  timeout=SERVICE_STOP_COMMAND_TIMEOUT)
+                                  timeout=service_command_timeouts(receipt)[0])
         observed = self.inspect(receipt)
         def invalid_and_inactive(value):
             return (value.get('LoadState') == 'bad-setting' and value.get('ActiveState') == 'inactive'
@@ -616,6 +753,20 @@ class Operations:
             # Recheck authority and manager state immediately before deletion.
             if self.load(require_source=False, allow_legacy_directory=True) != receipt:
                 raise DestinationError('The owned service receipt changed. Its definition was preserved.')
+            # The widened budget goes first: its drop-in, a manager reload, then
+            # its record. Each step leaves a receipt that a rerun can remove.
+            if 'service_stop_budget' in receipt:
+                drop_in = stop_budget_drop_in(receipt)
+                if drop_in_content(drop_in) is not None:
+                    drop_in.unlink()
+                try:
+                    # Only an empty drop-in directory is removed; other files are not ours.
+                    drop_in.parent.rmdir()
+                except OSError:
+                    pass
+                self.manager(['daemon-reload'])
+                receipt = {key: value for key, value in receipt.items() if key != 'service_stop_budget'}
+                write_private(self.path, receipt)
             Path(receipt['unit_path']).unlink()
             self.path.unlink()
             self.manager(['daemon-reload'])
@@ -658,6 +809,9 @@ def startup(payload, spec, pid, port):
 
 async def supervise(operations):
     receipt = operations.load()
+    # The manager enforces the unit's own stop budget until a widening and its
+    # reload succeed.
+    stop_budget = service_stop_timeout(receipt)
     settings = private_settings(operations.root)
     port = int(settings.get('MOBKIT_PORT') or operations.spec['port'])
     stop = asyncio.Event()
@@ -670,6 +824,8 @@ async def supervise(operations):
     pipe = os.fdopen(read_fd, 'rb', buffering=0)
     transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), pipe)
     process = None
+    # The horizon the application's gateway advertised, reported at readiness.
+    horizon_ms = None
     admission_entered = False
     cleanup_confirmed = False
     primary_error = None
@@ -722,6 +878,16 @@ async def supervise(operations):
             raise DestinationError('Native startup did not report readiness before exit or the time limit.')
         payload = json.loads(ready.result())
         bootstrap = startup(payload, operations.spec, process.pid, port)
+        horizon_ms = reported_gateway_horizon(payload)
+        # An application that reports nothing is sized for the unreported horizon.
+        sized_for = SHUTDOWN_BUDGET['unreported_horizon_ms'] if horizon_ms is None else horizon_ms
+        try:
+            if await asyncio.to_thread(operations.widen_unit, sized_for):
+                stop_budget = max(stop_budget, shutdown_budget(sized_for)['service'])
+        except Exception as error:
+            # A refused or failed widening, including a manager reload past
+            # its bound, is reported; it never blocks native readiness.
+            print('The owned service stop budget was not widened: ' + str(error), flush=True)
         while not stop.is_set() and process.returncode is None:
             try:
                 healthy = await asyncio.to_thread(console_healthy, operations.root, operations.spec, payload['console_url'])
@@ -744,7 +910,7 @@ async def supervise(operations):
                     os.close(write_fd)
                 transport.close()
                 if process is not None:
-                    await stop_supervised_application(process)
+                    await stop_supervised_application(process, horizon_ms=horizon_ms, stop_budget=stop_budget)
                     cleanup_confirmed = True
             finally:
                 for task in tasks:

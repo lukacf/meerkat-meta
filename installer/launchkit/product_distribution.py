@@ -26,8 +26,10 @@ MAX_TOTAL = 4 * 1024 * 1024 * 1024
 MAX_FILES = 8192
 
 
-def candidate_readme(guide, target, origin, *, ordinary=False):
-    host = ("Linux x86_64 with glibc 2.39 or newer" if target.target == "linux-x86_64"
+def candidate_readme(guide, target, origin, *, ordinary=False, glibc_floor=None):
+    # A Linux product's glibc floor is the one its resource build declares.
+    linux = "Linux x86_64" + (f" with glibc {glibc_floor[0]}.{glibc_floor[1]} or newer" if glibc_floor else "")
+    host = (linux if target.target == "linux-x86_64"
         else "Apple Silicon macOS 13.5 or newer")
     ordinary_note = (f"\nApplications without a connection setup helper use the included Meta "
         f"{target.meta.version} RPC gateway with that Meta SDK.\n" if ordinary else "")
@@ -245,7 +247,7 @@ def package(root, target, guide, output, *, ordinary_gateway=None):
     with tempfile.TemporaryDirectory(prefix="forge-product-dom-") as temporary:
         candidate_document = Path(temporary).resolve(strict=True) / "README.md"
         candidate_document.write_text(candidate_readme(guide, target, artifacts.origin,
-            ordinary=ordinary_gateway is not None))
+            ordinary=ordinary_gateway is not None, glibc_floor=artifacts.glibc_floor))
         candidate_document.chmod(0o600)
         source_files["README.md"] = candidate_document
         dependencies, dom_hash = prepare_dependencies(Path(temporary).resolve(), source=root.parent / "console")

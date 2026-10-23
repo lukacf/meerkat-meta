@@ -21,8 +21,11 @@ from urllib.parse import urlparse
 from .deployment import (MAX_PACKAGE_BYTES, await_validation, journal, materialize, now, package_files, read_receipt,
                          parse_setting, update_receipt, verify_destination)
 from .projects import DraftConflict
+from .admission_health import NativeAdmissionPending, PENDING_HEALTH_WINDOW, pending_admission
 from .templates.storage_setup import project_lock
-from .deployment_deadlines import APPLICATION_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOUT
+from .deployment_deadlines import (APPLICATION_STOP_TIMEOUT, LEGACY_USER_SERVICE_STOP_TIMEOUT,
+                                   PROCESS_FORCE_REAP_TIMEOUT, USER_SERVICE_STOP_MARGIN, WORKER_STOP_MARGIN,
+                                   reported_gateway_horizon, shutdown_budget)
 from .deployment_ports import require_available_console_port, LocalConsolePortUnavailable
 from .native_definition_continuity import valid_continuity_projection
 from .owned_worker import spawn_owned_worker
@@ -120,18 +123,30 @@ class Redactor:
 
 
 def readiness(payload, definition, expected_pid, port):
-    if not isinstance(payload, dict) or payload.get("pid") != expected_pid:
+    if not isinstance(payload, dict) or type(payload.get("pid")) is not int or payload["pid"] != expected_pid:
         raise ValueError("The application did not provide owned startup evidence.")
     bootstrap = payload.get("bootstrap")
     expected = {item["identity"] for item in definition["agents"]}
+    if not isinstance(bootstrap, dict) or not isinstance(bootstrap.get("identities"), dict) or not expected.issubset(bootstrap["identities"]):
+        raise ValueError("The native startup observation omitted a configured agent.")
+    url = payload.get("console_url", "")
+    if not isinstance(url, str):
+        raise ValueError("The native console does not match this deployment.")
+    parsed = urlparse(url)
+    if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port != port
+            or parsed.path != "/console" or parsed.query or parsed.fragment
+            or parsed.username is not None or parsed.password is not None):
+        raise ValueError("The native console does not match this deployment.")
+    if "admission" in payload:
+        admission = pending_admission(bootstrap, payload["admission"], seeds=expected)
+        if admission is not None:
+            raise NativeAdmissionPending(bootstrap, admission)
     if (not isinstance(bootstrap, dict) or bootstrap.get("complete") is not True
-            or bootstrap.get("ready") is not True or bootstrap.get("counts", {}).get("broken") != 0
+            or bootstrap.get("ready") is not True
+            or not isinstance(bootstrap.get("counts"), dict)
+            or type(bootstrap["counts"].get("broken")) is not int or bootstrap["counts"]["broken"] != 0
             or not expected.issubset(bootstrap.get("identities", {}))):
         raise ValueError("The native agents did not finish bootstrap.")
-    url = payload.get("console_url", "")
-    parsed = urlparse(url)
-    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port != port or parsed.path != "/console":
-        raise ValueError("The native console does not match this deployment.")
     return bootstrap, url
 
 
@@ -174,6 +189,14 @@ def startup_refusal(line):
     return "The application refused to start: " + message.strip()[:2000]
 
 class Supervisor:
+    # The horizon the current child's gateway advertised, reported at readiness.
+    gateway_shutdown_horizon_ms = None
+    # Whether this worker is the recorded operating-system service's own run.
+    service_owned = False
+    # The stop budget its manager enforces on that run: the unit's own until
+    # this run's widening and manager reload succeed. None outside a service.
+    enforced_stop_budget = None
+
     def __init__(self, directory, *, source_custody=None):
         self.directory = Path(directory)
         self.receipt = read_receipt(directory)
@@ -236,7 +259,8 @@ class Supervisor:
                 captured.append(text)
 
     async def terminate(self, timeout=None):
-        timeout = STOP_TIMEOUT if timeout is None else timeout
+        if timeout is None:
+            timeout = self.application_stop_window()
         process = self.child
         if not process:
             return
@@ -265,6 +289,41 @@ class Supervisor:
             await asyncio.wait_for(process.wait(), PROCESS_FORCE_REAP_TIMEOUT)
         except asyncio.TimeoutError:
             raise RuntimeError("The owned application process did not confirm exit after bounded force cleanup.") from None
+
+    def own_service(self):
+        """Run as the recorded operating-system service's own worker."""
+        self.service_owned = True
+        service = read_receipt(self.directory).get("service") or {}
+        budget = service.get("stop_timeout_seconds", LEGACY_USER_SERVICE_STOP_TIMEOUT)
+        self.enforced_stop_budget = budget if service and type(budget) is int else None
+
+    def application_stop_window(self):
+        """The application's stop window, inside the stop budget its manager enforces.
+
+        The force reap, this worker's margin and the service margin must fit
+        too, so that the worker can record its cleanup before the manager
+        kills the unit: 367 seconds under an earlier 397-second unit.
+        """
+        horizon_ms = self.gateway_shutdown_horizon_ms
+        window = STOP_TIMEOUT if horizon_ms is None else shutdown_budget(horizon_ms)["application"]
+        if self.enforced_stop_budget is not None:
+            window = min(window, self.enforced_stop_budget - PROCESS_FORCE_REAP_TIMEOUT - WORKER_STOP_MARGIN
+                         - USER_SERVICE_STOP_MARGIN)
+        return window
+
+    async def widen_service_stop_budget(self, horizon_ms):
+        """The service's own run widens its unit's stop budget; any failure is only logged."""
+        from .deployment_service import UserServiceManager, widen_service_stop_budget
+        try:
+            reload = widen_service_stop_budget(self.directory, horizon_ms)
+            if reload is not None:
+                await UserServiceManager().command(reload)
+                # The manager enforces the widened budget once its reload succeeded.
+                if self.enforced_stop_budget is not None:
+                    self.enforced_stop_budget = max(self.enforced_stop_budget, shutdown_budget(horizon_ms)["service"])
+        except Exception as error:
+            # The widening never blocks native readiness.
+            self.record_log("service", f"The owned service stop budget was not widened: {error}")
 
     async def parent_exit(self, process):
         # asyncio Process.wait() can wait for inherited stdout held by a
@@ -1358,8 +1417,11 @@ class Supervisor:
         require_bootstrap_history_settled(self.directory, bootstrap_selection=original_bootstrap)
         require_bootstrap_original()
         attempt_id = str(uuid.uuid4())
+        # A new child reports its own horizon; until then the stop assumes none.
+        self.gateway_shutdown_horizon_ms = None
         journal(self.directory, "Starting your application and bootstrapping its native agents.",
                 status="starting", phase="start", startup_attempt_id=attempt_id, startup_console_health=None,
+                gateway_shutdown_horizon_ms=None, admission_health=None,
                 startup_port_observation={**observation, "attempt_id": attempt_id,
                     "deployment_id": current["deployment_id"], "package_sha256": current["package_sha256"]},
                 **({"startup_candidate_runtime_proof": candidate_proof} if candidate_proof is not None else {}),
@@ -1411,29 +1473,61 @@ class Supervisor:
         try:
             if cancelled or self.stop.is_set():
                 raise asyncio.CancelledError
-            done, _ = await asyncio.wait({started, exited, stopped}, timeout=START_TIMEOUT, return_when=asyncio.FIRST_COMPLETED)
-            if stopped in done:
-                raise asyncio.CancelledError
-            if exited in done:
-                # A child that refused its source custody said why before exiting.
-                refusal = await self._startup_refusal(started)
-                raise RuntimeError(refusal or f"The application stopped before startup verification (exit {process.returncode}).")
-            if started not in done:
-                raise TimeoutError("The application did not finish native startup verification in time. Rebuild a package with the current host if it lacks Forge readiness reporting.")
-            startup = started.result()
-            if not startup:
-                raise RuntimeError("The application closed its startup verification channel before reporting readiness. Inspect the runtime logs for the native startup failure.")
-            refusal = startup_refusal(startup)
-            if refusal is not None:
-                raise RuntimeError(refusal)
-            try:
-                payload = json.loads(startup)
-            except (ValueError, UnicodeError):
-                raise ValueError("The application returned invalid startup evidence. Inspect the runtime logs and rebuild the checked package.") from None
-            bootstrap, url = readiness(payload, definition, process.pid, self.port)
+            startup_timeout = START_TIMEOUT
+            pending_budget_attempted = False
+            while True:
+                done, _ = await asyncio.wait({started, exited, stopped}, timeout=startup_timeout, return_when=asyncio.FIRST_COMPLETED)
+                if stopped in done:
+                    raise asyncio.CancelledError
+                if exited in done:
+                    # A child that refused its source custody said why before exiting.
+                    refusal = await self._startup_refusal(started)
+                    raise RuntimeError(refusal or f"The application stopped before startup verification (exit {process.returncode}).")
+                if started not in done:
+                    raise TimeoutError("The application did not finish native startup verification in time. Rebuild a package with the current host if it lacks Forge readiness reporting.")
+                startup = started.result()
+                if not startup:
+                    raise RuntimeError("The application closed its startup verification channel before reporting readiness. Inspect the runtime logs for the native startup failure.")
+                refusal = startup_refusal(startup)
+                if refusal is not None:
+                    raise RuntimeError(refusal)
+                try:
+                    payload = json.loads(startup)
+                except (ValueError, UnicodeError):
+                    raise ValueError("The application returned invalid startup evidence. Inspect the runtime logs and rebuild the checked package.") from None
+                try:
+                    bootstrap, url = readiness(payload, definition, process.pid, self.port)
+                except NativeAdmissionPending as pending:
+                    journal(self.directory, "Waiting for agent admission to finish. Your application is not ready yet.",
+                        status="starting", phase="start", bootstrap=pending.bootstrap,
+                        admission_health={"attempt_id": attempt_id, **pending.admission},
+                        console_url=None, runtime_pid=process.pid, process_live=True,
+                        health="pending", health_checked_at=now())
+                    if self.service_owned and not pending_budget_attempted:
+                        # Admission may remain pending while the gateway owns
+                        # durable sessions. Size a Stop for the unreported
+                        # horizon now, still capped by the enforced unit if
+                        # widening fails. Heartbeats do not reload the unit.
+                        await self.widen_service_stop_budget(None)
+                        pending_budget_attempted = True
+                    # Each actual child frame renews this bounded wait. A
+                    # silent child must fail instead of holding startup open.
+                    # This performs no admission or retry.
+                    started = asyncio.create_task(reader.readline())
+                    startup_timeout = PENDING_HEALTH_WINDOW
+                    continue
+                break
+            horizon_ms = reported_gateway_horizon(payload)
+            # Record before use: the host's wait for this worker reads it.
             journal(self.directory, "Native agents finished bootstrap. Checking the actual Console before publishing readiness.",
                     status="starting", phase="start", bootstrap=bootstrap, console_url=None, runtime_pid=process.pid,
-                    process_live=True, health="unknown", health_checked_at=now())
+                    process_live=True, health="unknown", health_checked_at=now(), admission_health=None,
+                    gateway_shutdown_horizon_ms=horizon_ms)
+            self.gateway_shutdown_horizon_ms = horizon_ms
+            if self.service_owned:
+                # An application that reports nothing is sized for the
+                # unreported horizon.
+                await self.widen_service_stop_budget(horizon_ms)
             import httpx
             async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
                 await self.startup_console(client, url, definition, process, exited, stopped)
@@ -1552,7 +1646,7 @@ async def _install_selected_product(supervisor, artifacts, require_current, comm
         _sdk_location)
     from .product_runtime_custody import (await_product_validation, require_product_source,
         require_product_installation)
-    from .deployment import _DestinationSourceObservation, selected_interpreter_refusal
+    from .deployment import _DestinationSourceObservation, selected_host_refusal, selected_interpreter_refusal
     source_observation = None
     def current(fence=require_current):
         if supervisor.stop.is_set():
@@ -1594,9 +1688,9 @@ async def _install_selected_product(supervisor, artifacts, require_current, comm
             destination=supervisor.destination, files=files)
         source_observation = _DestinationSourceObservation(read_receipt(supervisor.directory), files)
         current()
-    # The venv below inherits this interpreter: refuse a closure it cannot
-    # install before anything is installed into it.
-    refusal = selected_interpreter_refusal(artifacts.selection)
+    # The venv below inherits this interpreter, and the native prefix needs
+    # the product's declared glibc: refuse either before anything is installed.
+    refusal = selected_host_refusal(artifacts.glibc_floor) or selected_interpreter_refusal(artifacts.selection)
     if refusal is not None:
         raise DraftConflict(refusal)
     venv = supervisor.destination / ".venv"
@@ -2379,6 +2473,8 @@ async def run(directory, mode, *, update_selection=None, bootstrap_selection=Non
     require_original()
     try:
         supervisor = Supervisor(directory)
+        if mode == "service":
+            supervisor.own_service()
     except Exception:
         if mode == "service":
             journal(directory, "The service could not read its private installed configuration. No native runtime was started.",

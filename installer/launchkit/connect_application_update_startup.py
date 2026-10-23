@@ -15,7 +15,7 @@ from pathlib import Path
 from .connect_accepted_source import AcceptedApplicationSource
 from .connect_application_callbacks import SelectedApplicationCallbacks
 from .connect_application_finalizer import _Current
-from .connect_application_startup import _joined, _source_checks
+from .connect_application_startup import _joined, _source_checks, member_mcp_runtime_options
 from .connect_installer_caller import (
     CustodyError, ExactFile, ProductGatewayFile, _application_update_selection, _json, _path,
     _private_directory, _same_json_value,
@@ -244,7 +244,7 @@ class ReplacementApplicationStartup:
             SelectedHostArtifact(str(self.selection_file.path), self.selection_file.sha256),
             SelectedHostArtifact(str(self.prior_tool_policy.path), self.prior_tool_policy.sha256),
             str(self.association_directory))
-        runtime = ToolkitApplicationUpdateRuntime(config, startup)
+        runtime = ToolkitApplicationUpdateRuntime(config, startup, **member_mcp_runtime_options(application))
         self.runtime = runtime
         application.context.runtime = runtime
         try:

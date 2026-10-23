@@ -85,6 +85,14 @@ elif args[0] == "api":
         if reads >= state["move_tag_at"]:
             state["api"][endpoint]["object"]["sha"] = "b" * 40
             state_path.write_text(json.dumps(state))
+    script = state.get("api_script", {}).get(endpoint)
+    if script:
+        step = script.pop(0)
+        if "update" in step:
+            state["api"][endpoint].update(step["update"])
+        state_path.write_text(json.dumps(state))
+        if "fail" in step:
+            fail(step["fail"])
     if endpoint in state.get("fail_endpoints", []):
         sys.stdout.write(state.get("download_error_body", ""))
         fail("fixture API failure (HTTP 403)")
@@ -853,6 +861,108 @@ class CandidateProtocolTests(unittest.TestCase):
                 self.assertEqual(len(reads), 1, "collection polled main CI instead of refusing")
                 self.assertFalse(any("/zip" in c["args"][1] for c in self.state["calls"] if c["args"][0] == "api"))
                 self.assertFalse((self.root / f"refused-{status}").exists())
+
+    def collect_with_own_run_reads(self, script, *, success=True, name="re-read"):
+        """collect() with a scripted sequence of reads of its own run record."""
+        endpoint = helper.repo_endpoint(f"actions/runs/{RUN}")
+        self.state["api_script"] = {endpoint: script}
+        self.state["calls"] = []
+        self.save()
+        with mock.patch.object(helper.time, "sleep") as sleep:
+            _, error = self.command("collect", "--output-dir", str(self.root / name),
+                                    "--ci-run-id", str(CI), "--ci-run-attempt", "1", success=success)
+        reads = [c["args"][1] for c in self.state["calls"] if c["args"][0] == "api"]
+        return reads, sleep, error
+
+    def test_collect_re_reads_its_own_run_until_github_reports_it_in_progress(self):
+        """GitHub reported a running candidate as queued, then waiting, for a while."""
+        run = helper.repo_endpoint(f"actions/runs/{RUN}")
+        reads, sleep, error = self.collect_with_own_run_reads(
+            [{"update": {"status": "queued"}}, {"update": {"status": "waiting"}},
+             {"update": {"status": "in_progress"}}])
+        self.assertEqual(reads[:4], [run, run, run, helper.repo_endpoint(f"actions/runs/{CI}")])
+        self.assertEqual(sleep.call_args_list, [mock.call(helper.RUN_REREAD_DELAY)] * 2)
+        self.assertIn("read 1/40 missed", error)
+        self.assertIn("status=queued", error)
+        self.assertIn("status=waiting", error)
+        self.assertTrue((self.root / "re-read" / helper.MANIFEST).exists())
+
+    def test_collect_re_reads_its_own_run_after_a_transient_api_failure(self):
+        """GitHub answered 502, then dropped the connection, then answered."""
+        run = helper.repo_endpoint(f"actions/runs/{RUN}")
+        reads, sleep, error = self.collect_with_own_run_reads(
+            [{"fail": "gh: HTTP 502: Bad Gateway"}, {"fail": "error connecting to api.github.com"}])
+        self.assertEqual(reads[:3], [run, run, run])
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(error.count("transient API failure"), 2)
+        self.assertTrue((self.root / "re-read" / helper.MANIFEST).exists())
+
+    def test_collect_refuses_at_once_when_its_own_run_is_wrong_or_the_read_fails_for_good(self):
+        """Only a lagging status or a transient failure is read again."""
+        run = helper.repo_endpoint(f"actions/runs/{RUN}")
+        cases = {
+            "identity": ([{"update": {"head_sha": OTHER_SHA, "status": "queued"}}],
+                         "run source/workflow/event/ref mismatch"),
+            "attempt": ([{"update": {"run_attempt": ATTEMPT + 1}}], "run identity/attempt changed"),
+            "forbidden": ([{"fail": "gh: HTTP 403: Resource not accessible by integration"}], "HTTP 403"),
+        }
+        for label, (script, message) in cases.items():
+            with self.subTest(label):
+                self.state["api"][run] = self.run_info()
+                reads, sleep, error = self.collect_with_own_run_reads(script, success=False, name=f"refused-{label}")
+                self.assertIn(message, error)
+                self.assertEqual(reads, [run], "a refusal that is no lagging read was read again")
+                sleep.assert_not_called()
+                self.assertFalse((self.root / f"refused-{label}").exists())
+
+    def test_collect_refuses_once_its_own_run_never_reports_in_progress(self):
+        run = helper.repo_endpoint(f"actions/runs/{RUN}")
+        reads, sleep, error = self.collect_with_own_run_reads(
+            [{"update": {"status": "queued"}}], success=False, name="never")
+        self.assertEqual(reads, [run] * 40)
+        self.assertEqual(sleep.call_count, 39)
+        self.assertIn("collection requires its in-progress candidate run (after 40 reads over", error)
+        self.assertEqual((helper.RUN_REREAD_ATTEMPTS, helper.RUN_REREAD_DELAY), (40, 15), "10 minutes")
+        self.assertFalse((self.root / "never").exists())
+
+    def collect_with_listing_reads(self, script, *, success=True, name="listing"):
+        """collect() with a scripted sequence of reads of its run's artifact listing."""
+        listing = helper.repo_endpoint(f"actions/runs/{RUN}/artifacts?per_page=100")
+        self.state["api_script"] = {listing: script}
+        self.state["calls"] = []
+        self.save()
+        with mock.patch.object(helper.time, "sleep") as sleep:
+            _, error = self.command("collect", "--output-dir", str(self.root / name),
+                                    "--ci-run-id", str(CI), "--ci-run-attempt", "1", success=success)
+        reads = [c["args"][1] for c in self.state["calls"] if c["args"][0] == "api" and c["args"][1] == listing]
+        return reads, sleep, error
+
+    def test_collect_re_reads_the_artifact_listing_after_a_transient_api_failure(self):
+        """GitHub answered the listing with 503, then reset the connection, then answered."""
+        reads, sleep, error = self.collect_with_listing_reads(
+            [{"fail": "gh: HTTP 503: Service Unavailable"}, {"fail": "read: connection reset by peer"}])
+        self.assertEqual(len(reads), 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(helper.RUN_REREAD_DELAY)] * 2)
+        self.assertEqual(error.count("transient API failure"), 2)
+        self.assertTrue((self.root / "listing" / helper.MANIFEST).exists())
+
+    def test_collect_refuses_at_once_when_the_artifact_listing_fails_for_good_or_is_incomplete(self):
+        """Only a transient failure of the listing is read again: an incomplete listing is no lag here."""
+        listing = helper.repo_endpoint(f"actions/runs/{RUN}/artifacts?per_page=100")
+        complete = copy.deepcopy(self.state["api"][listing])
+        partial = [{"artifacts": complete[0]["artifacts"][:-1], "total_count": len(complete[0]["artifacts"]) - 1}]
+        cases = {
+            "not found": ([{"fail": "gh: HTTP 404: Not Found"}], complete, "HTTP 404"),
+            "incomplete": ([], partial, "missing/duplicate/unexpected target artifacts"),
+        }
+        for label, (script, value, message) in cases.items():
+            with self.subTest(label):
+                self.state["api"][listing] = copy.deepcopy(value)
+                reads, sleep, error = self.collect_with_listing_reads(script, success=False, name=f"listing-{label}")
+                self.assertIn(message, error)
+                self.assertEqual(len(reads), 1, "a refusal that is no transient failure was read again")
+                sleep.assert_not_called()
+                self.assertFalse((self.root / f"listing-{label}").exists())
 
     def test_download_media_negotiation_uses_explicit_endpoint_intent(self):
         aid = self.artifact_ids[0]

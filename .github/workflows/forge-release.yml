@@ -170,8 +170,12 @@ jobs:
 
   require_ci_green:
     name: Require green exact-main CI
-    # Like release.yml's gate, it refuses rather than waits. A branch dry run
-    # has no exact-main CI and skips it; its candidate is never publishable.
+    # Unlike release.yml's gate, which refuses at once, this one reads the
+    # exact-main CI listing again for up to 10 minutes while GitHub has not
+    # listed the run yet, the run is still going, or a read fails with a 5xx
+    # or a dropped connection. A run that finished red refuses at once. A
+    # branch dry run has no exact-main CI and skips it; its candidate is never
+    # publishable.
     needs: [resolve, build_package]
     if: >-
       !cancelled() &&

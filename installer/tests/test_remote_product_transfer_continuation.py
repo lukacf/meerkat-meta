@@ -16,6 +16,7 @@ from pathlib import Path
 import platform
 import pwd
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -26,7 +27,7 @@ from launchkit import remote_product_destination_owner as source_owner
 from launchkit import remote_product_control as control
 from launchkit.artifact_binding import proposal_hash
 from launchkit.deployment import DeploymentService
-from launchkit.projects import fingerprint
+from launchkit.projects import DraftConflict, fingerprint
 from launchkit.remote_deployment import RemoteDeploymentService, read_receipt, controller_program
 from launchkit.runtime_selection import candidate_selection
 from launchkit.ssh_transport import SshTransportError
@@ -37,7 +38,7 @@ from test_meta_toolkit_runtime_update import catalog_target
 from test_product_artifact_transfer import GUIDE, BUILD, SOURCE, frame
 from test_product_artifact_transport import ENDPOINT, FINGERPRINT
 from test_product_destination_owner import package_bytes, no_destination_execution
-from test_remote_deployment import Guide, Implementation, Transport
+from test_remote_deployment import Guide, Implementation, Transport, longest_loop_gap
 from test_remote_product_control import selected_control
 
 
@@ -131,8 +132,8 @@ class OriginalFramedTransport(Transport):
         return {**value, "_transport": {"host_key_fingerprint": self.key}}
 
 
-@pytest.fixture
-async def origin_product(request, tmp_path, monkeypatch, inputs):
+async def origin_service(request, tmp_path, monkeypatch, inputs):
+    """The hook-selected origin and its Linux control before the first remote connection."""
     monkeypatch.setattr(product_fixtures, "TARGET", "linux-x86_64")
     prefix = "meerkat-connect-linux-x86_64"
     monkeypatch.setattr(product_fixtures, "PREFIX", prefix)
@@ -172,15 +173,21 @@ async def origin_product(request, tmp_path, monkeypatch, inputs):
     service = RemoteDeploymentService(tmp_path / "origin", guide, implementation, local,
         transport=transport, product_control_selection=selection)
     transport.origin = service
-    value = await service._connect(GUIDE, 3, BUILD, ENDPOINT, str(destination), product_owner=selection)
-    await asyncio.gather(*list(service.tasks.values()))
-    directory, receipt = service.stored(GUIDE)
-    assert receipt["status"] == "configuration-required" and receipt["preflight"]["ready"]
     return SimpleNamespace(service=service, transport=transport, guide=guide, implementation=implementation,
-        selection=selection, home=home, destination=destination, directory=directory,
-        deployment_id=value["deployment_id"], files=files,
-        settings={"OPENAI_API_KEY": "inert-origin-key", "CONSOLE_USER_ID": "fixture-operator",
-            "CONSOLE_LOGIN_PASSWORD": "inert-original-private-password"})
+        selection=selection, owner=selected, home=home, destination=destination, files=files)
+
+
+@pytest.fixture
+async def origin_product(request, tmp_path, monkeypatch, inputs):
+    f = await origin_service(request, tmp_path, monkeypatch, inputs)
+    value = await f.service._connect(GUIDE, 3, BUILD, ENDPOINT, str(f.destination), product_owner=f.selection)
+    await asyncio.gather(*list(f.service.tasks.values()))
+    f.directory, receipt = f.service.stored(GUIDE)
+    assert receipt["status"] == "configuration-required" and receipt["preflight"]["ready"]
+    f.deployment_id = value["deployment_id"]
+    f.settings = {"OPENAI_API_KEY": "inert-origin-key", "CONSOLE_USER_ID": "fixture-operator",
+        "CONSOLE_LOGIN_PASSWORD": "inert-original-private-password"}
+    return f
 
 
 @pytest.mark.parametrize("boundary", ["artifact-manifest-reply", "source-finish-reply",
@@ -276,3 +283,56 @@ async def test_remote_product_install_never_consults_the_local_interpreter(origi
     installs = [row["payload"] for row in f.transport.calls if row["payload"]["action"] == "install"]
     assert len(installs) == 1 and consulted == []
     assert read_receipt(f.directory)["install_operation_id"] == installs[0]["operation_id"]
+
+
+async def test_product_connect_saves_the_control_bundle_off_the_event_loop(origin_product, monkeypatch):
+    from launchkit import remote_deployment
+    f = origin_product
+    original = remote_deployment.write_bytes
+    def slowed(path, content):
+        if path.name == "control-bundle.zip":
+            time.sleep(1.0)  # Writing and syncing a large control bundle on a small host.
+        return original(path, content)
+    monkeypatch.setattr(remote_deployment, "write_bytes", slowed)
+    value, gap = await longest_loop_gap(f.service._connect(GUIDE, 3, BUILD, ENDPOINT,
+        str(f.home / "other project"), product_owner=f.selection))
+    await asyncio.gather(*list(f.service.tasks.values()))
+    directory = f.service.directory(GUIDE)
+    assert value["deployment_id"] == directory.name != f.deployment_id
+    assert read_receipt(directory)["product_control_bundle_size"] == (directory / "control-bundle.zip").stat().st_size
+    assert gap < 0.5
+
+
+async def test_product_connect_refuses_an_owner_that_changed_while_its_bundle_was_saved(origin_product, monkeypatch):
+    from launchkit import remote_deployment
+    f = origin_product
+    original, saved = remote_deployment.write_bytes, []
+    def owner_changes(path, content):
+        original(path, content)
+        if path.name == "control-bundle.zip":
+            saved.append(path)
+            f.owner.current = False
+    monkeypatch.setattr(remote_deployment, "write_bytes", owner_changes)
+    with pytest.raises(ValueError, match="original control selection owner changed"):
+        await f.service._connect(GUIDE, 3, BUILD, ENDPOINT, str(f.home / "other project"), product_owner=f.selection)
+    assert saved and not saved[0].exists() and not (saved[0].parent / "receipt.json").exists()
+    assert f.service.directory(GUIDE).name == f.deployment_id and not f.service.tasks
+    assert sorted(path.name for path in (f.service.root / GUIDE).iterdir()) == sorted([f.deployment_id, "latest.json"])
+    assert not list((f.service.root / ".connecting").iterdir())
+
+
+async def test_hook_control_below_the_product_glibc_floor_refuses_before_any_remote_request(
+        request, tmp_path, monkeypatch, inputs):
+    # The developer hook's Linux control admits guests from glibc 2.31; the
+    # product declares 2.39. Its guest-side check enforces only the control's
+    # own minimum, so the refusal belongs here, before the first connection.
+    monkeypatch.setattr(product_fixtures, "RESOURCE_RECORD", {"runtime_compatibility": {
+        "supported_host": product_fixtures.LINUX_HOST,
+        "scope": "hash_bound_archive_metadata_and_declared_host_only_not_runtime_qualification"}})
+    f = await origin_service(request, tmp_path, monkeypatch, inputs)
+    with pytest.raises(DraftConflict,
+            match=r"need glibc 2\.39 or newer, but the selected Linux control admits computers with glibc 2\.31"):
+        await f.service._connect(GUIDE, 3, BUILD, ENDPOINT, str(f.destination), product_owner=f.selection)
+    assert not f.transport.calls and not f.transport.frames
+    with pytest.raises(LookupError, match="No remote installation"):
+        f.service.directory(GUIDE)

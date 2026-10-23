@@ -145,6 +145,7 @@ from .types import (
     RediscoverReport,
     RoutingResolution,
     RuntimeRouteResult,
+    ScheduleToolsResult,
     SendMessageResult,
     SpawnResult,
     StatusResult,
@@ -1709,6 +1710,18 @@ class MetaRuntime:
             transport = getattr(self, "_last_gateway_transport", None)
         return getattr(transport, "last_termination", None)
 
+    @property
+    def gateway_shutdown_horizon_ms(self) -> int | None:
+        """The shutdown horizon this runtime's gateway advertised, as accepted.
+
+        Milliseconds (see ``PersistentTransport.advertised_shutdown_horizon_ms``).
+        A process that supervises this application waits at least this long,
+        plus the transport's own TERM and KILL graces, before it kills the
+        gateway. ``None`` without a running gateway or when the gateway
+        advertised no valid horizon.
+        """
+        return getattr(self._transport, "advertised_shutdown_horizon_ms", None)
+
     async def wait_gateway_ended(
         self, timeout: float | None = None
     ) -> GatewayChildEndedError | None:
@@ -2899,6 +2912,17 @@ class MobHandle:
         """Return the curated model catalog with provider defaults."""
         raw = await self._runtime._rpc("meta/models/catalog")
         return ModelsCatalogResult.from_dict(raw)
+
+    async def schedule_tools(self) -> ScheduleToolsResult:
+        """Return the definitions of Meerkat's durable schedule tools.
+
+        Static: the gateway answers ``meta/schedule/tools`` from Meerkat's own
+        definitions, without a schedule store or host. Whether this gateway
+        attached the tools is the ``schedule`` slot of the ``storage``
+        summary. Raises ``ValueError`` on a malformed result.
+        """
+        raw = await self._runtime._rpc("meta/schedule/tools")
+        return ScheduleToolsResult.from_dict(raw)
 
     async def storage_doctor(
         self,

@@ -7,6 +7,7 @@ import io
 import json
 import os
 import tarfile
+import time
 import uuid
 import zipfile
 
@@ -549,24 +550,24 @@ async def test_failed_observation_keeps_evidence_but_must_match_the_submitted_op
     evidence = {"status": "failed", "operation_id": str(uuid.uuid4()), "worker_live": False, "cleanup_confirmed": True,
                 "error": {"code": "operation-failed", "message": "The operation needs attention."}}
     with pytest.raises(DraftConflict):
-        service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
+        await service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
     evidence["operation_id"] = expected
-    service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
+    await service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
     result = read_receipt(directory)
     assert result["status"] == "failed" and result["remote_error_code"] == "operation-failed"
     assert result["worker_live"] is False and result["observation"]["available"] is True
     evidence["cleanup_confirmed"] = False
-    service.adopt(directory, result, evidence, expected_operation=expected)
+    await service.adopt(directory, result, evidence, expected_operation=expected)
     assert read_receipt(directory)["status"] == "recovery-needed"
     evidence.update(cleanup_confirmed=True, worker_live=True, ready=True, source_current=True)
-    service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
+    await service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
     observed = read_receipt(directory)
     assert observed["status"] == "recovery-needed" and observed["ready"] is False
     evidence.pop("worker_live")
-    service.adopt(directory, observed, evidence, expected_operation=expected)
+    await service.adopt(directory, observed, evidence, expected_operation=expected)
     assert read_receipt(directory)["status"] == "recovery-needed"
     evidence["worker_live"] = False
-    service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
+    await service.adopt(directory, read_receipt(directory), evidence, expected_operation=expected)
     observed = read_receipt(directory)
     assert observed["status"] == "failed" and observed["ready"] is False
 
@@ -1216,3 +1217,311 @@ async def test_initial_ordinary_observation_failure_does_not_infer_cloud_from_ta
     assert "cloud_operation_id" not in failed and "install_operation_id" not in failed
     assert failed["observation"] == {"available": False} and failed["preflight"] is None
     assert all(call["payload"]["action"] == "preflight" for call in service.transport.calls)
+
+
+async def test_remote_interview_evidence_leaves_the_event_loop_free(service, monkeypatch):
+    from launchkit import remote_deployment
+    await connect(service)
+    state = deepcopy(service.guide.state)
+    original = remote_deployment.package_files
+    def slowed(payload):
+        time.sleep(1.0)  # A large package on a small host.
+        return original(payload)
+    monkeypatch.setattr(remote_deployment, "package_files", slowed)
+    stalls, done = [], asyncio.Event()
+    async def other_request():
+        while not done.is_set():
+            started = time.monotonic()
+            await asyncio.sleep(0.01)
+            stalls.append(time.monotonic() - started)
+    probe = asyncio.create_task(other_request())
+    await asyncio.sleep(0)  # The other request is waiting on the loop.
+    try:
+        result = await service.guide_status(state["id"], state=state)
+    finally:
+        done.set()
+        await probe
+    assert result["status"] == "configuration-required" and result["owned_package_verified"]
+    assert stalls and max(stalls) < 0.5
+
+
+def slow_package_reads(monkeypatch):
+    from launchkit import remote_deployment
+    for name in ("package_files", "source_archive"):
+        def slowed(*args, original=getattr(remote_deployment, name), **kwargs):
+            time.sleep(1.0)  # A large package on a small host.
+            return original(*args, **kwargs)
+        monkeypatch.setattr(remote_deployment, name, slowed)
+
+
+async def longest_loop_gap(operation):
+    stalls, done = [], asyncio.Event()
+    async def other_request():
+        while not done.is_set():
+            started = time.monotonic()
+            await asyncio.sleep(0.01)
+            stalls.append(time.monotonic() - started)
+    probe = asyncio.create_task(other_request())
+    await asyncio.sleep(0)  # The other request is waiting on the loop.
+    try:
+        result = await operation
+    finally:
+        done.set()
+        await probe
+    return result, max(stalls)
+
+
+async def test_remote_connect_leaves_the_event_loop_free(service, monkeypatch):
+    slow_package_reads(monkeypatch)
+    connected, gap = await longest_loop_gap(connect(service))
+    assert connected["status"] == "configuration-required"
+    assert gap < 0.5
+
+
+async def test_remote_install_leaves_the_event_loop_free(service, monkeypatch):
+    receipt = await connect(service)
+    slow_package_reads(monkeypatch)
+    async def installed():
+        value = await install(service, receipt)
+        await asyncio.gather(*list(service.tasks.values()))
+        return value
+    accepted, gap = await longest_loop_gap(installed())
+    assert accepted["status"] == "installing" and not accepted["can_install"]
+    assert gap < 0.5
+
+
+async def test_remote_status_observation_leaves_the_event_loop_free(service, monkeypatch):
+    receipt = await connect(service)
+    await install(service, receipt)
+    await asyncio.gather(*list(service.tasks.values()))
+    slow_package_reads(monkeypatch)
+    observed, gap = await longest_loop_gap(running(service, receipt))
+    assert observed["status"] == "running" and observed["ready"]
+    assert gap < 0.5
+
+
+def slow_package_hashing(monkeypatch):
+    from launchkit import remote_deployment
+    class Hashing:
+        def __getattr__(self, name):
+            return getattr(hashlib, name)
+        def sha256(self, data=b""):
+            if bytes(data[:4]) == b"PK\x03\x04":
+                time.sleep(1.0)  # Hashing a large package on a small host.
+            return hashlib.sha256(data)
+    monkeypatch.setattr(remote_deployment, "hashlib", Hashing())
+
+
+async def test_remote_connect_hashes_the_package_off_the_event_loop(service, monkeypatch):
+    slow_package_hashing(monkeypatch)
+    connected, gap = await longest_loop_gap(connect(service))
+    assert connected["status"] == "configuration-required"
+    assert gap < 0.5
+
+
+async def test_remote_install_hashes_the_package_off_the_event_loop(service, monkeypatch):
+    receipt = await connect(service)
+    slow_package_hashing(monkeypatch)
+    async def installed():
+        value = await install(service, receipt)
+        await asyncio.gather(*list(service.tasks.values()))
+        return value
+    accepted, gap = await longest_loop_gap(installed())
+    assert accepted["status"] == "installing" and not accepted["can_install"]
+    assert gap < 0.5
+
+
+async def test_remote_status_hashes_the_package_off_the_event_loop(service, monkeypatch):
+    receipt = await connect(service)
+    await install(service, receipt)
+    await asyncio.gather(*list(service.tasks.values()))
+    slow_package_hashing(monkeypatch)
+    observed, gap = await longest_loop_gap(running(service, receipt))
+    assert observed["status"] == "running" and observed["ready"]
+    assert gap < 0.5
+
+
+async def test_remote_stop_and_restart_hash_the_package_off_the_event_loop(service, monkeypatch):
+    receipt = await connect(service)
+    await install(service, receipt)
+    await asyncio.gather(*list(service.tasks.values()))
+    await running(service, receipt)
+    slow_package_hashing(monkeypatch)
+    async def stopped_and_restarted():
+        stopped = await service.action(service.guide.identity, receipt["deployment_id"], "stop")
+        return stopped, await service.action(service.guide.identity, receipt["deployment_id"], "restart")
+    (stopped, restarted), gap = await longest_loop_gap(stopped_and_restarted())
+    assert stopped["status"] == "stopped" and restarted["status"] == "running"
+    assert gap < 0.5
+
+
+def slow_package_writes(monkeypatch):
+    from launchkit import remote_deployment
+    original = remote_deployment.write_bytes
+    def slowed(path, content):
+        if path.name == "package.zip":
+            time.sleep(1.0)  # Writing and syncing a large package on a small host.
+        return original(path, content)
+    monkeypatch.setattr(remote_deployment, "write_bytes", slowed)
+
+
+async def test_remote_connect_writes_the_package_off_the_event_loop(service, monkeypatch):
+    slow_package_writes(monkeypatch)
+    connected, gap = await longest_loop_gap(connect(service))
+    saved = (service.directory(service.guide.identity) / "package.zip").read_bytes()
+    assert connected["status"] == "configuration-required"
+    assert hashlib.sha256(saved).hexdigest() == connected["package_sha256"]
+    assert gap < 0.5
+
+
+async def test_cancelled_connect_leaves_nothing_that_blocks_cloud_removal(service, monkeypatch):
+    import threading
+    from launchkit import remote_deployment
+    entered, release = threading.Event(), threading.Event()
+    original = remote_deployment.source_archive
+    def held(files):
+        entered.set()
+        release.wait(30)
+        return original(files)
+    monkeypatch.setattr(remote_deployment, "source_archive", held)
+    task = asyncio.create_task(service.connect(service.guide.identity, 4, service.implementation.identity,
+        "owned.example", "test", 22, "~/src/team"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        task.cancel()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await prepare_removal(service) is True
+    assert installation_entries(service) == ([], [])
+
+
+async def prepare_removal(service):
+    return await service.prepare_cloud_removal({"guide_id": service.guide.identity, "operation_id": str(uuid.uuid4())})
+
+
+def installation_entries(service):
+    """Names in the guide's installation inventory and in the connect staging area."""
+    parent, staging = service.root / service.guide.identity, service.root / ".connecting"
+    return (sorted(path.name for path in parent.iterdir()) if parent.exists() else [],
+            sorted(path.name for path in staging.iterdir()) if staging.exists() else [])
+
+
+async def test_refused_connect_leaves_nothing_that_blocks_cloud_removal(service, monkeypatch):
+    from launchkit import remote_deployment
+    monkeypatch.setattr(remote_deployment, "MAX_CONTROLLER", 1)
+    with pytest.raises(DraftConflict, match="controller exceeded its original bound"):
+        await service.connect(service.guide.identity, 4, service.implementation.identity,
+            "owned.example", "test", 22, "~/src/team")
+    assert await prepare_removal(service) is True
+    assert installation_entries(service) == ([], [])
+
+
+async def test_cloud_removal_still_refuses_an_installation_with_an_unreadable_receipt(service):
+    await connect(service)
+    (service.directory(service.guide.identity) / "receipt.json").write_text("not a receipt")
+    with pytest.raises(ValueError):
+        await prepare_removal(service)
+
+
+async def test_cloud_removal_still_refuses_an_installation_directory_without_a_receipt(service):
+    await connect(service)
+    (service.root / service.guide.identity / str(uuid.uuid4())).mkdir(mode=0o700)
+    with pytest.raises(FileNotFoundError):
+        await prepare_removal(service)
+
+
+async def test_connect_sweeps_an_abandoned_staging_copy_and_nothing_else(service, tmp_path):
+    staging = service.root / ".connecting"
+    staging.mkdir(parents=True, mode=0o700)
+    abandoned = staging / str(uuid.uuid4())
+    abandoned.mkdir(mode=0o700)
+    (abandoned / "package.zip").write_bytes(b"partial copy")
+    (staging / (abandoned.name + ".lock")).write_bytes(b"")
+    foreign = staging / "not-a-connect"
+    foreign.mkdir(mode=0o700)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    (elsewhere / "keep").write_bytes(b"keep")
+    linked = staging / str(uuid.uuid4())
+    linked.symlink_to(elsewhere, target_is_directory=True)
+    receipt = await connect(service)
+    assert receipt["status"] == "configuration-required"
+    assert not abandoned.exists() and not (staging / (abandoned.name + ".lock")).exists()
+    assert foreign.is_dir() and linked.is_symlink() and (elsewhere / "keep").read_bytes() == b"keep"
+    assert installation_entries(service)[1] == sorted([foreign.name, linked.name])
+    assert await prepare_removal(service) is True
+
+
+async def test_connect_keeps_a_staging_copy_whose_lock_is_held(service):
+    import fcntl
+    staging = service.root / ".connecting"
+    staging.mkdir(parents=True, mode=0o700)
+    live = staging / str(uuid.uuid4())
+    live.mkdir(mode=0o700)
+    (live / "package.zip").write_bytes(b"copy in progress")
+    descriptor = os.open(staging / (live.name + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        await connect(service)
+        assert (live / "package.zip").read_bytes() == b"copy in progress"
+    finally:
+        os.close(descriptor)
+
+
+async def test_connect_names_an_installation_only_after_its_record_is_in_place(service, monkeypatch):
+    from launchkit import remote_deployment
+    original, seen = remote_deployment.write_private, []
+    def witnessed(path, value):
+        if path.name == "latest.json":
+            seen.append(((path.parent / value["deployment_id"] / "receipt.json").is_file(),
+                (service.root / ".connecting" / value["deployment_id"]).exists()))
+        return original(path, value)
+    monkeypatch.setattr(remote_deployment, "write_private", witnessed)
+    receipt = await connect(service)
+    assert seen == [(True, False)]
+    assert installation_entries(service) == (sorted([receipt["deployment_id"], "latest.json"]), [])
+
+
+async def test_connect_never_replaces_an_existing_installation_directory(service, monkeypatch):
+    from types import SimpleNamespace
+    from launchkit import remote_deployment
+    taken = uuid.uuid4()
+    existing = service.root / service.guide.identity / str(taken)
+    existing.mkdir(parents=True, mode=0o700)
+    issued = iter([taken])
+    monkeypatch.setattr(remote_deployment, "uuid", SimpleNamespace(UUID=uuid.UUID,
+        uuid4=lambda: next(issued, None) or uuid.uuid4()))
+    with pytest.raises(FileExistsError):
+        await service.connect(service.guide.identity, 4, service.implementation.identity,
+            "owned.example", "test", 22, "~/src/team")
+    assert existing.is_dir() and not any(existing.iterdir())
+    assert installation_entries(service)[1] == []
+
+
+def test_a_staging_claim_whose_name_was_swept_before_its_lock_is_refused(tmp_path, monkeypatch):
+    import fcntl
+    from launchkit import remote_deployment
+    root = tmp_path / ".connecting"
+    root.mkdir(mode=0o700)
+    identity = str(uuid.uuid4())
+    lock_path, staging = root / (identity + ".lock"), root / identity
+    real_flock, interleaved = fcntl.flock, []
+    def sweep_first(descriptor, operation):
+        if not interleaved:
+            interleaved.append(True)
+            # Another process's sweep claims the new name between this open and
+            # this lock, finds no staging copy and unlinks the lock file.
+            claim = remote_deployment._staging_lock(lock_path)
+            assert claim is not None
+            remote_deployment._end_staging(staging, claim)
+        return real_flock(descriptor, operation)
+    monkeypatch.setattr(remote_deployment.fcntl, "flock", sweep_first)
+    claim = remote_deployment._staging_lock(lock_path)
+    monkeypatch.setattr(remote_deployment.fcntl, "flock", real_flock)
+    try:
+        assert interleaved and claim is None
+    finally:
+        if claim is not None:
+            os.close(claim)

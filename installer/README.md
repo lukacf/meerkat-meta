@@ -1195,6 +1195,32 @@ stopped or restarted from its saved ownership receipt. The interactive mode stay
 supervised by Forge and stops with its host. Both preserve installed files and
 native history.
 
+A stop waits for the application's native gateway shutdown. That is the horizon
+its runtime reports at readiness (this repository's gateway horizon when it reports
+none), plus the SDK's TERM and KILL graces and Forge's own margins. A new owned
+service gets that stop timeout from the start, and an interactive run and Forge's
+own waits and service commands use it at once. A background service runs the
+supervisor that was saved when it was installed, so one installed before Forge
+0.9.5 keeps its earlier stop budgets until **Apply support update** under
+**Installation support** replaces that supervisor. After that, a Linux user
+service keeps its frozen unit: when that unit's stop timeout is shorter than the
+derived one (the unreported horizon's when its application reports none), the
+service's own run adds an owned systemd drop-in, `forge-stop-budget.conf`, with
+the derived stop timeout and reloads the user manager. Until that drop-in and the
+reload succeed, a service run fits its application stop inside the stop timeout
+its manager enforces (367 seconds under an earlier 397-second unit), so Forge can
+still record its cleanup. A destination's supervisor comes with its package and
+does the same for its own unit from the next package the destination runs; a
+destination deployed from a package that Forge 0.9.4 accepted keeps that
+release's helper and stop budgets until the package is rebuilt. A macOS
+LaunchAgent keeps the stop timeout it was installed with (397 seconds from Forge
+before 0.9.5): launchd has no drop-in, so a longer horizon that its application
+reports later is not applied. Its application's stop is shortened to fit that
+timeout (367 seconds, or 15 under the 45-second timeout of the earliest
+releases), so native cleanup can be cut short. On Linux, logout and shutdown are bounded by the systemd
+user manager's own stop timeout (120 seconds by default), whatever the unit sets;
+the unit's stop timeout governs an explicit Stop or Restart.
+
 For a supported stopped local installation, **Stage accepted update** compares
 the exact independently accepted package with the installed source before changing
 anything. Application-only updates can preserve the folder and its private state;
@@ -1431,11 +1457,26 @@ as unconfirmed; closing the tab is not confirmation.
 
 ### Set up an installed application's channels
 
-When the installed Console offers **Set up your app**, its conversation can
-inspect the setup capabilities supplied by that application. Ask what is
-supported before providing service details. The application decides which
-channels, participants and actions it permits; this panel does not add arbitrary
-integrations to an existing build. Enter credentials only in its protected forms.
+For an application built with the matching native Toolkit runtime, use
+**Connect setup** in its installed Console. This panel belongs to the selected
+`ToolkitApplicationSelection` and supports the capabilities supplied by that
+application. Ask what is supported before providing service details, and enter
+credentials only in the protected forms.
+
+Return to the same application's Console to continue setup, including when it
+runs in the background. This requires an installation that already supports the
+panel and a current authorized login. Being installed or running does not itself
+add setup support. For an older application without that capability, return to
+its saved setup in Forge and review a compatible update; there is no automatic
+setup retrofit or separate panel for arbitrary installed applications.
+
+**Set up your app** is a separate, optional generic setup conversation. It uses
+a protocol 1 subprocess selected by `MOBKIT_CONNECT_BIN`. This variable is an
+operator-only advanced legacy override: the installation owner must supply and
+qualify the executable for that application and its current login. Normal
+**Connect setup** uses the matching selected Toolkit product and runtime.
+Changing the variable does not install native setup support, authenticate the
+user or add new application capabilities.
 
 Closing the panel detaches the view and leaves the application running. Reopen
 it to check the original work before sending another request after an uncertain

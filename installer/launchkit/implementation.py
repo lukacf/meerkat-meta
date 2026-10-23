@@ -259,6 +259,28 @@ grant, account authorization or proof that the requested identity is ready. Reta
 pending/failed state until actual native materialization and operation evidence.
 An RPC failure can leave an adopted desired snapshot uncertain; do not claim it
 was rolled back or blindly recreate identities after an observation failure.
+When the selected Toolkit supports governed dynamic-member MCP admission, keep
+its opaque binding references in the SAME application-owned hidden admission row,
+never in desired_roster/admission_roster, model context, public labels or a second
+grant registry. Paired optional retain_member_mcp(value) and
+lookup_member_mcp(selection) hooks use private ordinary JSON:
+selection={admission_id, identity, class}, value={selection, bindings:[opaque refs]}.
+admission_id is the original native Add request.id, not a new correlation.
+These hooks require admission_roster. Open the existing store during build(context),
+before native startup; cold native registration may call lookup before start().
+retain must atomically compare that exact nonvoided admitting row and commit the
+complete bounded set (at most 32 unique refs) before returning None. Exact replay
+may succeed; changed refs, class, identity, admission or a successor row must fail.
+lookup returns that exact committed value for an admitting or listed row. Missing,
+unreadable, voided, retired or mismatched rows must raise, never return implicit [].
+An explicitly committed empty bindings list means no MCP. Neither hook publishes
+the identity or grants access. Connect owns approval, mandate and current binding
+resolution; the normal native admission/finalizer owns publication readiness.
+The host joins entered retention callbacks before stop() closes the store, including
+failed startup and cancellation. Do not swallow a failed write or claim rollback
+from loss of its acknowledgement. Verify restart reads and void/successor races
+against the production store transaction. Existing frozen hosts must be rebuilt
+with this support; do not patch protected source or invent the private protocol.
 An older frozen host without these hooks/applicationProfiles cannot provide this
 lifecycle. Construction and offline trials have runtime=None; native reconcile
 and dynamic native callback availability remain explicitly unavailable until a

@@ -10,7 +10,7 @@ import uuid
 
 import pytest
 
-from launchkit.deployment import DeploymentService, materialize, read_receipt, update_receipt
+from launchkit.deployment import DeploymentService, materialize, now, read_receipt, update_receipt
 from launchkit.deployment_service import (UserServiceManager, background_status, digest,
     prepare_service, service_plan, stop_background, unit_bytes, verify_service)
 from launchkit.deployment_worker import console_health_headers, run
@@ -62,6 +62,34 @@ async def owned(tmp_path, monkeypatch):
     plan = prepare_service(directory, read_receipt(directory))
     yield service, manager, directory, plan
     await service.shutdown()
+
+
+@pytest.mark.parametrize("stale", [False, True])
+async def test_background_observation_preserves_owned_pending_admission(owned, stale):
+    from test_admission_health import pending_payload
+    _, manager, directory, _ = owned
+    payload = pending_payload()
+    attempt = str(uuid.uuid4())
+    manager.observation = {"loaded": True, "pid": 4567, "state": "running"}
+    update_receipt(directory, status="starting", service_supervisor_pid=4567,
+        runtime_pid=6789, process_live=True, startup_attempt_id=attempt,
+        bootstrap=payload["bootstrap"], health="pending", health_checked_at="2000-01-01T00:00:00+00:00" if stale else now(),
+        console_url=None, admission_health={"attempt_id": attempt, **payload["admission"]})
+    before = read_receipt(directory)
+    observed = await background_status(directory, manager)
+    if stale:
+        assert observed["health"] != "pending" and observed["process_live"] is False
+        assert observed["console_url"] is None
+        assert observed["bootstrap"] == before["bootstrap"]
+        return
+    assert observed["status"] == "starting" and observed["health"] == "pending"
+    assert observed["process_live"] is True and observed["console_url"] is None
+    assert observed["health_checked_at"] == before["health_checked_at"], "Manager liveness cannot freshen native evidence"
+    assert observed["bootstrap"] == before["bootstrap"] and observed["admission_health"] == before["admission_health"]
+    manager.observation["pid"] = 9876
+    foreign = await background_status(directory, manager)
+    assert foreign["health"] != "pending" and foreign["process_live"] is False
+    assert not any(call[0] in {"start", "stop"} for call in manager.calls)
 
 
 def test_definitions_quote_paths_keep_secrets_out_and_never_enable_linger(tmp_path):
@@ -218,6 +246,7 @@ async def test_status_refuses_stale_support_after_late_canonical_runtime_change(
 @pytest.mark.parametrize("boundary,changed", [
     ("health", "status"), ("health", "runtime_pid"),
     ("health", "startup_attempt_id"), ("health", "bootstrap"),
+    ("health", "admission_health"),
     ("manager", "startup_attempt_id"), ("manager-error", "status"),
     ("record", "status"),
     ("consumer", "status"), ("consumer", "runtime_pid"),
@@ -235,6 +264,7 @@ async def test_background_health_rejects_late_worker_state_without_overwriting_i
         runtime_pid=9000, bootstrap=bootstrap, detail="Original native startup passed.")
     replacements = {"status": "failed", "runtime_pid": 9001,
         "startup_attempt_id": str(uuid.uuid4()),
+        "admission_health": {"admitting": ["project:one"], "owed": []},
         "bootstrap": {**bootstrap, "ready": False, "counts": {"broken": 1}}}
     published, probes = [], []
 

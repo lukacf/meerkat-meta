@@ -27,7 +27,8 @@ from .templates_v2.application_configuration import validate_application_fields,
 from .templates_v2.console_configuration import (console_configuration,
     console_authentication as declared_console_authentication, validate_console_configuration_values)
 from .artifact_binding import package_matches, report_brief_hash, matches as artifact_matches, current_version, proposal_hash
-from .deployment_deadlines import WORKER_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOUT
+from .deployment_deadlines import (WORKER_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOUT,
+                                   reported_gateway_horizon, shutdown_budget)
 from .deployment_ports import observe_local_console_port, require_available_console_port, installed_console_port
 from .deployment_sources import compile_native_source, read_package_source, native_fields, NATIVE_SOURCE, NATIVE_KEYS
 
@@ -99,6 +100,38 @@ def selected_interpreter_refusal(target, interpreter=None):
             f".venv folder aside and start it again with PYTHON_BIN set to a CPython 3.{needed[0]} interpreter, as the "
             "README describes. Your saved setups are kept.")
     return f"This product's application packages do not support this computer: {', '.join(refused[:3])}."
+
+
+def selected_host_refusal(glibc_floor, interpreter=None):
+    """Why this computer cannot run the selected product's native programs, or None.
+
+    A Linux product declares the oldest glibc they run on. Below it every
+    package still installs, and the application fails only when it starts.
+    """
+    if glibc_floor is None:
+        return None
+    floor = tuple(glibc_floor)
+    host = forge_interpreter() if interpreter is None else interpreter
+    found = tuple(host["glibc_minimum"])
+    if host["system"] == "Linux" and found >= floor:
+        return None
+    needed = f"glibc {floor[0]}.{floor[1]}"
+    present = f"glibc {found[0]}.{found[1]}" if host["system"] == "Linux" and found != (0, 0) else "no glibc"
+    return (f"This product's native programs need {needed} or newer, but this computer has {present}, so the "
+        f"application would install and then fail when it starts. Install it on a Linux computer with {needed} "
+        "or newer, or upgrade this computer's operating system.")
+
+
+def selected_update_refusal(target, interpreter=None):
+    """Why this computer cannot install an update to the selected product, or None.
+
+    Stage asks before it writes anything. The glibc floor comes from the
+    pinned assembly and resource build record alone; the install worker
+    refuses again on the fully read product.
+    """
+    from .runtime_candidates import declared_glibc_floor
+    return (selected_host_refusal(declared_glibc_floor(target), interpreter)
+        or selected_interpreter_refusal(target, interpreter))
 
 
 def product_runtime_source(files, selected, *, verified_artifacts=None, source_custody=None):
@@ -197,6 +230,20 @@ def new_installation_receipt(identity, guide_id, source, version, build_id, dige
 
 def read_receipt(root):
     return json.loads((Path(root) / "receipt.json").read_text())
+
+
+def worker_stop_timeout(root):
+    """Wait for an owned worker's stop around the horizon its application reported.
+
+    The worker records that horizon at readiness and clears it for each new
+    child. An unreadable or invalid record is waited as unreported: the stop
+    itself must not fail on it.
+    """
+    try:
+        horizon_ms = reported_gateway_horizon(read_receipt(root))
+    except (OSError, ValueError, AttributeError):
+        horizon_ms = None
+    return WORKER_STOP_TIMEOUT if horizon_ms is None else shutdown_budget(horizon_ms)["worker"]
 
 
 @contextmanager
@@ -1520,8 +1567,11 @@ class DeploymentService:
         await await_validation(verify_selected_application_dependencies,
             files.get("requirements.application.txt", (b"", 0o644))[0], artifacts)
         from types import SimpleNamespace
+        # The product's glibc floor goes first: the CPython remedy (PYTHON_BIN)
+        # cannot lift it.
         return SimpleNamespace(selection=selected, artifacts=artifacts,
-            interpreter_refusal=selected_interpreter_refusal(artifacts.selection))
+            interpreter_refusal=selected_host_refusal(artifacts.glibc_floor)
+                or selected_interpreter_refusal(artifacts.selection))
 
     async def options(self, guide_id, build_id=None, *, console_port=None, source_kind="application", version=None):
         if source_kind not in {"application", "native-team"}:
@@ -2198,7 +2248,7 @@ class DeploymentService:
                     if process.stdin:
                         process.stdin.close()
                     try:
-                        await asyncio.wait_for(process.wait(), WORKER_STOP_TIMEOUT)
+                        await asyncio.wait_for(process.wait(), worker_stop_timeout(directory))
                     except asyncio.TimeoutError:
                         try:
                             os.killpg(process.pid, 9)
@@ -2581,9 +2631,9 @@ class DeploymentService:
                 pass  # Its actual return and the fixed cleanup record still gate recovery.
         try:
             if task is not None:
-                await asyncio.wait_for(asyncio.shield(task), WORKER_STOP_TIMEOUT)
+                await asyncio.wait_for(asyncio.shield(task), worker_stop_timeout(directory))
             elif process is not None:
-                await asyncio.wait_for(process.wait(), WORKER_STOP_TIMEOUT)
+                await asyncio.wait_for(process.wait(), worker_stop_timeout(directory))
         except asyncio.TimeoutError:
             raise DraftConflict("The owned worker has not finished cleanup. No private settings were changed.") from None
         latest = read_receipt(directory)
@@ -2613,10 +2663,10 @@ class DeploymentService:
 
     async def guide_status(self, guide_id, *, state):
         """Project exact installed source evidence without importing application code."""
+        from .deployment_updates import checked_package
         receipt = await self.status(guide_id, state=state)
         result = {**receipt, "source_verified": False, "source_digest": None}
-        try:
-            from .deployment_updates import checked_package
+        def verified_source():
             _, files = checked_package(self._directory(guide_id), "package.zip", receipt["package_sha256"])
             source = read_package_source(files, receipt)
             digest = source["source_digest"]
@@ -2624,8 +2674,12 @@ class DeploymentService:
             for name in files:
                 info = (destination / name).stat()
                 if info.st_uid != os.getuid() or info.st_nlink != 1:
-                    return result
-            result.update(source_verified=True, source_digest=digest)
+                    return {}
+            return {"source_verified": True, "source_digest": digest}
+        try:
+            # Reading and hashing the saved package and its installed copy
+            # must not hold the event loop.
+            result.update(await await_validation(verified_source))
         except (OSError, ValueError, KeyError, TypeError, DraftConflict):
             # A failed source check is evidence of uncertainty, never a model
             # instruction to repair source or permission to use old acceptance.
@@ -3785,7 +3839,7 @@ class DeploymentService:
                 await process.stdin.drain()
                 if task is not None:
                     try:
-                        await asyncio.wait_for(asyncio.shield(task), WORKER_STOP_TIMEOUT)
+                        await asyncio.wait_for(asyncio.shield(task), worker_stop_timeout(directory))
                     except asyncio.TimeoutError:
                         raise DraftConflict("The owned worker has not finished cleanup. No stopped state was confirmed.") from None
             elif task is not None:

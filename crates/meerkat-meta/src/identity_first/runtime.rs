@@ -1846,6 +1846,13 @@ impl IdentityRuntimeError {
             Self::IdentityHostAdopted { identity } => Some(serde_json::json!({
                 "kind": "identity_host_adopted", "identity": identity, "retryable": false,
             })),
+            // An identity whose held member was not published keeps the
+            // internal-error code; the kind tells its host that the identity
+            // waits for a held pass to publish it, so the host can tell this
+            // pending state apart from any other refusal.
+            Self::HeldCompletionOwed { identity } => Some(serde_json::json!({
+                "kind": "held_completion_owed", "identity": identity,
+            })),
             // The typed repair hold rides the same `durable_resume_hold` key
             // meerkat uses on every surface, so a caller classifies this
             // exactly as it would classify meerkat's own -32013 refusal.
@@ -2276,20 +2283,24 @@ impl IdentityFirstRuntimeContext {
     /// context reads the listing before the member is held and completed. A
     /// spec listed before the add can be read by a pass the host did not
     /// start (a `meta/reconcile_identity`),
-    /// which would embody the member unheld. Two paths run outside the
+    /// which would embody the member unheld. Three paths run outside the
     /// controller, and so outside that guarantee: `meta/reconcile_identity`
     /// on an RPC context that is not attached to the unified runtime reads
-    /// the roster and restores it with no controller, and a host's own
-    /// [`Self::bootstrap_roster`] applies the roster it is given, so a
+    /// the roster and restores it with no controller;
+    /// [`IdentityRuntime::restore_flow`] registers and wakes the roster its
+    /// caller gives, with no controller (it retires nothing); and a host's
+    /// own [`Self::bootstrap_roster`] applies the roster it is given, so a
     /// roster resolved before the add and applied after it retires the
     /// member. When the add ends
     /// [`super::held_bootstrap::HeldBootstrapStart::Unsettled`], unlist the
-    /// spec: the aborted member owes its host a held completion, and every
-    /// pass refuses it
-    /// ([`IdentityRuntimeError::HeldCompletionOwed`]). A caller that goes
-    /// away while `complete` runs after listing never sees `Unsettled`: the
-    /// add aborts and the member stays listed and refused, so the host
-    /// unlists it on its recovery path. Refresh the
+    /// spec, or add it again: the aborted member owes its host a held
+    /// completion, and every pass except a held pass that covers it
+    /// refuses it ([`IdentityRuntimeError::HeldCompletionOwed`], whose
+    /// structured data is `{"kind": "held_completion_owed", "identity"}`).
+    /// A caller that goes away while `complete` runs after listing never
+    /// sees `Unsettled`: the add aborts and the member stays listed and
+    /// refused, so the host unlists it, or adds it again, on its recovery
+    /// path. Refresh the
     /// topology afterwards when the topology provider wires the member.
     ///
     /// The add publishes no bootstrap generation: until the next roster
@@ -19323,6 +19334,25 @@ mod wake_refusal_classifier_tests {
         assert_eq!(data["kind"], "identity_history_unavailable");
         assert_eq!(data["retryable"], true);
         assert!(wake_refusal_of(&unreadable).is_none());
+        Ok(())
+    }
+
+    /// An identity that owes its host a held completion keeps the internal
+    /// error code, and its data names the pending held completion, so a
+    /// host reads the refusal without parsing its message.
+    #[test]
+    fn held_completion_owed_keeps_the_internal_code_with_typed_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let owed = IdentityRuntimeError::HeldCompletionOwed {
+            identity: keeper()?,
+        };
+        assert_eq!(crate::rpc::identity_error_code(&owed), -32603);
+        assert_eq!(
+            owed.structured_data(),
+            Some(serde_json::json!({
+                "kind": "held_completion_owed", "identity": "keeper",
+            }))
+        );
         Ok(())
     }
 

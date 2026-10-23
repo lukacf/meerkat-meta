@@ -26,6 +26,16 @@ from .connect_installer_caller import (
 )
 
 
+def member_mcp_runtime_options(application):
+    """Older frozen applications have no participant; selected ones fail closed.
+
+    Construction happens after application.load and before runtime.connect so
+    native cold registration can read the same already-open admission store.
+    """
+    factory = getattr(application, "member_mcp_runtime_options", None)
+    return factory() if factory is not None else {}
+
+
 def _prepare_context_parents(root, project_lease, require_current, *, initialize):
     """Prepare only the deployment-owned parents required before native init.
 
@@ -529,7 +539,7 @@ class FreshApplicationStartup:
         from meerkat_toolkit.host_control import ApplicationPreparation, SelectedHostArtifact
         runtime = ToolkitApplicationRuntime(config,
             ApplicationPreparation(SelectedHostArtifact(str(self.plan.path), self.plan.sha256),
-                timeout=self.hold_timeout), self.finalizer)
+                timeout=self.hold_timeout), self.finalizer, **member_mcp_runtime_options(application))
         self.runtime = runtime
         application.context.runtime = runtime
         try:
@@ -759,7 +769,7 @@ class RestoredApplicationStartup:
         selection = HostBootstrapSelection(deployment_root=self._selected["deployment_root"],
             **{name: SelectedHostArtifact(**self._selected[name]) for name in
                 ("activation", "policy_manifest", "local_policy")})
-        runtime = ToolkitMobKitRuntime(config, selection)
+        runtime = ToolkitMobKitRuntime(config, selection, **member_mcp_runtime_options(application))
         self.runtime = runtime
         application.context.runtime = runtime
         try:

@@ -1044,7 +1044,11 @@ async def test_worker_reawaits_sdk_startup_drain_after_cancellation(tmp_path, mo
     def register(sig, callback):
         callbacks[sig] = (callback, copy_context())
     monkeypatch.setattr(loop, "add_signal_handler", register)
-    monkeypatch.setattr(worker, "REHEARSAL_SECONDS", .04)
+    # Reaching the SDK's startup drain takes tens of milliseconds, so a short
+    # job limit could expire before the stop this row sends. The row ends the
+    # job itself, once the original cleanup is draining.
+    monkeypatch.setattr(worker, "REHEARSAL_SECONDS", 30)
+    from launchkit.owned_worker import owned_job_deadline
     class Runtime:
         rust_http_base_url = "http://isolated-native"
         async def identity_bootstrap_status(self):
@@ -1052,9 +1056,11 @@ async def test_worker_reawaits_sdk_startup_drain_after_cancellation(tmp_path, mo
         cleanup_task = None
         cleanup_finished = False
         shutdown_calls = 0
+        deadline = None
         async def shutdown(self):
             self.shutdown_calls += 1
             if self.cleanup_task is None:
+                self.deadline = owned_job_deadline.get()
                 async def drain():
                     draining.set()
                     await release.wait()
@@ -1133,8 +1139,14 @@ async def test_worker_reawaits_sdk_startup_drain_after_cancellation(tmp_path, mo
         if trigger == "signal":
             callback, captured = callbacks[signal.SIGTERM]
             loop.call_soon(callback, context=captured)
+        else:
+            runtime.deadline.reschedule(loop.time())
         await asyncio.sleep(.08)
         assert not task.done() and not runtime.cleanup_finished
+        if trigger == "signal":
+            assert runtime.deadline.when() is None  # The stop disarmed the job limit.
+        else:
+            assert runtime.deadline.expired()
         release.set()
         await asyncio.wait_for(task, 1)
         assert runtime.cleanup_finished and runtime.shutdown_calls == 2

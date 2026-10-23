@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 
 from .projects import fingerprint
 from .artifact_binding import current_version, proposal_hash
+from .admission_health import health_is_fresh, retained_pending_admission
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _ATTEMPT = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -32,12 +33,7 @@ def _text(value, limit=100):
 
 
 def _fresh_health(value, now):
-    try:
-        checked = datetime.fromisoformat(value)
-        age = (now - checked).total_seconds()
-        return checked.tzinfo is not None and 0 <= age <= 30
-    except (TypeError, ValueError):
-        return False
+    return health_is_fresh(value, now)
 
 
 def _console(value):
@@ -103,7 +99,15 @@ def project_deployment_evidence(state, receipt=None, *, unavailable=False, now=N
     status = receipt.get("status") if same_guide and receipt.get("status") in _STATES else None
     native = receipt.get("bootstrap") or {}
     clock = now or datetime.now(timezone.utc)
+    admission = None
+    observed_admission = receipt.get("admission_health")
+    if (owned and status == "starting" and receipt.get("process_live") is True
+            and receipt.get("health") == "pending" and _fresh_health(receipt.get("health_checked_at"), clock)):
+        rows = retained_pending_admission(receipt)
+        if rows is not None:
+            admission = {"status": "pending", "admitting_count": len(rows["admitting"]), "owed_count": len(rows["owed"])}
     available = bool(owned and status == "running" and receipt.get("process_live") is True
+        and observed_admission is None
         and receipt.get("health") == "ready" and native.get("complete") is True
         and native.get("ready") is True and type((native.get("counts") or {}).get("broken")) is int
         and native["counts"]["broken"] == 0 and _console(receipt.get("console_url"))
@@ -138,6 +142,7 @@ def project_deployment_evidence(state, receipt=None, *, unavailable=False, now=N
             "phase": receipt.get("phase") if owned and isinstance(receipt.get("phase"), str)
                 and receipt["phase"] in _PHASES else None,
             "startup_health": project_startup_health(receipt) if owned else None,
+            "admission_health": admission,
             "matches_current_application": same_build, "native_runtime_available": available,
             "health_checked_at": _text(receipt.get("health_checked_at")) if available else None,
             "update_status": update_status, "suggested_actions": actions,

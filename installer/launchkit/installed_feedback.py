@@ -405,19 +405,24 @@ async def record_installed_success(service, guide_id, version, deployment_id, bu
 async def record_remote_success(service, guide_id, version, deployment_id, build_id, source_digest,
                                 package_sha256, *, request_id, task):
     """Report frozen remote source without probing SSH or reading its private data."""
-    from .remote_installed_feedback import _stored, _busy
+    from .remote_installed_feedback import _stored, _busy, _unchanged
     body = _success_body(guide_id, version, deployment_id, build_id, source_digest, package_sha256, request_id, task)
     async with service.lock:
         directory = service.directory(guide_id)
         if directory != service.directory(guide_id, deployment_id):
             raise DraftConflict("A different remote installation is selected. Reload its first job before reporting a result.")
         async with service.operation_lock(directory):
+            # The frozen package is read before the journal lock, which is
+            # never held across an await. Under the lock, the record must be
+            # the one that read verified.
+            selected, receipt, exact, _ = await _stored(service, guide_id, deployment_id)
             state = await service.local._guide(guide_id)
             fresh = await service.local._guide(guide_id)
             if fingerprint(fresh) != fingerprint(state):
                 raise DraftConflict("The setup changed while preparing this report. Reload before continuing.")
             with _success_lock(directory / "journal.lock"):
-                selected, receipt, exact, _ = _stored(service, guide_id, deployment_id)
+                if not _unchanged(selected, receipt):
+                    raise DraftConflict("This installation report is being updated. Retry after its current operation finishes.")
                 if _busy(service, receipt) or _mutating(receipt):
                     raise DraftConflict("Finish the owned remote operation or resolve its recovery state before reporting a result.")
                 if receipt.get("remote_admission_requested") is not True or receipt.get("admitted") is not True:
