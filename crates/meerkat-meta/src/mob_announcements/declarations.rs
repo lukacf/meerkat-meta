@@ -1,0 +1,545 @@
+//! Declarations: the announcement sources and subscriptions a host declares
+//! in its mob announcement options (inline, or in a packaged sidecar file)
+//! or applies at runtime, reconciled into the store's records; and
+//! role-selected subscriptions, templates that capture for every member a
+//! mob's roster gives a role.
+//!
+//! A declaration names a revision. The reconciler creates, replaces and
+//! ends only the records a declaration made, each marked with the revision
+//! and the digest of its declared form; records made at runtime are never
+//! touched.
+
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use super::sources::{
+    AudienceGrant, ObservationCapability, SourceConnection, SourceDelivery, SourceHealthPolicy,
+    SourceIdentity, SourceRoute, SourceRunner, SourceStart,
+};
+use super::types::{Member, MobId, SourceId, StartFrontier, SubscriptionId, Topic};
+
+/// At most this many members a role template captures for (its children).
+pub const ROLE_TEMPLATE_LIMIT: u32 = 256;
+
+/// At most this many bytes in a declared subscription id: a role child's id
+/// adds the template's id, a slash and 16 hex digits.
+pub const MAX_DECLARED_SUBSCRIPTION_ID_BYTES: usize = 200;
+
+/// The declarations a host supplies, at one revision (contract 4.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Declarations {
+    pub revision: u64,
+    #[serde(default)]
+    pub sources: Vec<DeclaredSource>,
+    #[serde(default)]
+    pub subscriptions: Vec<DeclaredSubscription>,
+}
+
+/// One declared source: the `sources/put` params without `operation_id`,
+/// `expected_revision` and `new_generation`, which the reconciler supplies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredSource {
+    /// The source's mob; this gateway's own when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mob_id: Option<MobId>,
+    pub source_id: SourceId,
+    pub identity: SourceIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<SourceConnection>,
+    pub observation: ObservationCapability,
+    pub topics: BTreeSet<Topic>,
+    pub audience: Vec<AudienceGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routes: Option<Vec<SourceRoute>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conversation_members: Vec<Member>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<SourceStart>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<SourceDelivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_policy: Option<SourceHealthPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<SourceRunner>,
+}
+
+/// One declared subscription: of one member, or a template of every member
+/// of a mob with a role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredSubscription {
+    pub subscription_id: SubscriptionId,
+    /// One member. Exactly one of `member` and `members` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<Member>,
+    /// Every member of the mob with the role: a role template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<RoleSelector>,
+    pub topics: BTreeSet<Topic>,
+    /// The mobs it captures from; the subscribing mob's own when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mobs: Option<BTreeSet<MobId>>,
+    /// A declared subscription starts now: it never backfills.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<StartFrontier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<DeclaredSubscriptionDelivery>,
+}
+
+/// How a declared subscription's deliveries wait for their handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredSubscriptionDelivery {
+    #[serde(default)]
+    pub await_handling: bool,
+}
+
+/// The members a role template takes: every member of `mob_id` its roster
+/// records with `role` (the profile it was spawned from).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleSelector {
+    pub mob_id: MobId,
+    pub role: String,
+}
+
+/// Where a gateway's declarations come from: its options, inline, or a
+/// packaged sidecar file the options name, read once at init and once per
+/// `declarations/apply`. One source per gateway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeclarationsSource {
+    /// Declared inline in the options; `declarations/apply` carries the
+    /// next ones.
+    Inline(Declarations),
+    /// Read from this sidecar file; `declarations/apply` reads it again and
+    /// carries none.
+    Sidecar {
+        path: PathBuf,
+        declarations: Declarations,
+    },
+}
+
+impl DeclarationsSource {
+    /// The declarations read at init.
+    pub fn declarations(&self) -> &Declarations {
+        match self {
+            Self::Inline(declarations) | Self::Sidecar { declarations, .. } => declarations,
+        }
+    }
+
+    /// The sidecar path, when the declarations come from one.
+    pub fn sidecar(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Inline(_) => None,
+            Self::Sidecar { path, .. } => Some(path),
+        }
+    }
+}
+
+/// A record a declaration manages, by its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DeclarationRecordKind {
+    Source,
+    Subscription,
+    /// A subscription a role template made for one member.
+    RoleChild,
+}
+
+impl DeclarationRecordKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Subscription => "subscription",
+            Self::RoleChild => "role_child",
+        }
+    }
+}
+
+/// Where a declared record stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DeclarationStatus {
+    /// Made or replaced as declared.
+    Applied,
+    /// Refused for a runtime reason; retried at the next trigger.
+    Pending,
+    /// Ended or cancelled by an operator; held until the declaration
+    /// changes the record.
+    Suppressed,
+}
+
+impl DeclarationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Pending => "pending",
+            Self::Suppressed => "suppressed",
+        }
+    }
+}
+
+/// Why a declared record is pending: the refusal its put met.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclarationRefusal {
+    pub kind: String,
+    pub message: String,
+}
+
+/// A declared source's collection, as its health reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DeclaredCollection {
+    Baselining,
+    Backfilling,
+    Live,
+    Failing,
+    Stale,
+}
+
+/// Whether local delivery is ready for a declared record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DeclaredDelivery {
+    Ready,
+    Refused { cause: String },
+}
+
+/// One record in `declarations/get` (contract 4.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclarationRecordView {
+    pub kind: DeclarationRecordKind,
+    pub id: String,
+    pub status: DeclarationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<DeclarationRefusal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<DeclaredCollection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<DeclaredDelivery>,
+}
+
+/// `declarations/get`: the applied revision, its digest and every record
+/// the declarations manage now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclarationsView {
+    pub revision: u64,
+    pub digest: String,
+    pub records: Vec<DeclarationRecordView>,
+}
+
+/// Create a role template (`expected_revision: None`) or replace its
+/// selector at its current revision: `subscriptions/put` with `members`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PutRoleTemplate {
+    pub id: SubscriptionId,
+    pub members: RoleSelector,
+    pub topics: BTreeSet<Topic>,
+    pub mobs: BTreeSet<MobId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+/// A role template as the store keeps it. It never delivers by itself; each
+/// member it takes gets a child subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleTemplate {
+    pub id: SubscriptionId,
+    pub members: RoleSelector,
+    pub topics: BTreeSet<Topic>,
+    pub mobs: BTreeSet<MobId>,
+    /// `active` or `cancelled`.
+    pub state: super::types::SubscriptionState,
+    pub revision: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+type Result<T> = std::result::Result<T, super::types::AnnouncementStoreError>;
+
+fn invalid(message: impl Into<String>) -> super::types::AnnouncementStoreError {
+    super::types::AnnouncementStoreError::Invalid(message.into())
+}
+
+fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|error| invalid(error.to_string()))
+}
+
+impl Declarations {
+    /// The digest of these declarations in a canonical order (sources by
+    /// mob and id, subscriptions by id), with each source's mob filled in:
+    /// the same declarations at the applied revision are a no-op, other
+    /// ones a digest conflict.
+    pub fn digest(&self, own: &MobId) -> Result<String> {
+        let mut sources = self
+            .sources
+            .iter()
+            .map(|source| source.resolved(own))
+            .collect::<Vec<_>>();
+        sources.sort_by(|a, b| (&a.mob_id, &a.source_id).cmp(&(&b.mob_id, &b.source_id)));
+        let mut subscriptions = self
+            .subscriptions
+            .iter()
+            .map(|subscription| subscription.resolved(own))
+            .collect::<Vec<_>>();
+        subscriptions.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
+        let canonical = Self {
+            revision: self.revision,
+            sources,
+            subscriptions,
+        };
+        Ok(super::types::sha256_hex(&[
+            b"declarations",
+            &json_bytes(&canonical)?,
+        ]))
+    }
+}
+
+impl DeclaredSource {
+    /// The source's mob: this gateway's own when the declaration names none.
+    pub fn mob(&self, own: &MobId) -> MobId {
+        self.mob_id.clone().unwrap_or_else(|| own.clone())
+    }
+
+    /// This declaration with its mob filled in, as it is digested and kept.
+    pub fn resolved(&self, own: &MobId) -> Self {
+        Self {
+            mob_id: Some(self.mob(own)),
+            ..self.clone()
+        }
+    }
+
+    /// The digest of this record's declared form: a changed digest replaces
+    /// the record and lifts an operator's end of it.
+    pub fn digest(&self, own: &MobId) -> Result<String> {
+        Ok(super::types::sha256_hex(&[
+            b"declared-source",
+            &json_bytes(&self.resolved(own))?,
+        ]))
+    }
+
+    /// The source's configuration as `sources/put` takes it.
+    pub fn config(&self) -> super::sources::SourceConfig {
+        super::sources::SourceConfig {
+            identity: self.identity.clone(),
+            connection: self.connection.clone(),
+            observation: self.observation,
+            topics: self.topics.clone(),
+            audience: self.audience.clone(),
+            routes: self.routes.clone().unwrap_or_else(|| {
+                vec![SourceRoute::Direct {
+                    topics: None,
+                    streams: None,
+                }]
+            }),
+            conversation_members: self.conversation_members.clone(),
+            start: self.start.clone().unwrap_or_default(),
+            delivery: self.delivery.unwrap_or_default(),
+            health_policy: self.health_policy.unwrap_or_default(),
+            runner: self.runner.clone(),
+        }
+    }
+
+    /// The put that declares this source (`expected_revision: None`) or
+    /// replaces its declaration at its current revision.
+    pub fn put(&self, own: &MobId, expected_revision: Option<u64>) -> super::sources::PutSource {
+        super::sources::PutSource {
+            mob_id: self.mob(own),
+            source_id: self.source_id.clone(),
+            expected_revision,
+            new_generation: false,
+            config: self.config(),
+        }
+    }
+}
+
+impl DeclaredSubscription {
+    /// The mobs it captures from: the subscribing mob's own when the
+    /// declaration names none.
+    pub fn mob_set(&self, own: &MobId) -> BTreeSet<MobId> {
+        self.mobs.clone().unwrap_or_else(|| {
+            let subscribing = self
+                .member
+                .as_ref()
+                .map(|member| member.mob_id.clone())
+                .or_else(|| self.members.as_ref().map(|members| members.mob_id.clone()))
+                .unwrap_or_else(|| own.clone());
+            BTreeSet::from([subscribing])
+        })
+    }
+
+    /// This declaration with its mobs and start filled in, as it is
+    /// digested and kept.
+    pub fn resolved(&self, own: &MobId) -> Self {
+        Self {
+            mobs: Some(self.mob_set(own)),
+            start: Some(StartFrontier::Now),
+            ..self.clone()
+        }
+    }
+
+    /// The digest of this record's declared form.
+    pub fn digest(&self, own: &MobId) -> Result<String> {
+        Ok(super::types::sha256_hex(&[
+            b"declared-subscription",
+            &json_bytes(&self.resolved(own))?,
+        ]))
+    }
+
+    /// The selector it captures with.
+    pub fn selector(&self, own: &MobId) -> super::types::Selector {
+        super::types::Selector {
+            topics: self.topics.clone(),
+            mobs: self.mob_set(own),
+        }
+    }
+
+    /// The put of a one-member subscription, at its current revision when
+    /// it exists; `None` for a template.
+    pub fn put(
+        &self,
+        own: &MobId,
+        expected_revision: Option<u64>,
+    ) -> Option<super::types::PutSubscription> {
+        let member = self.member.clone()?;
+        Some(super::types::PutSubscription {
+            id: self.subscription_id.clone(),
+            member,
+            selector: self.selector(own),
+            start: StartFrontier::Now,
+            expected_revision,
+            route: None,
+            member_mob_cursor: None,
+            child_limits: super::types::ChildMemberLimits::default(),
+        })
+    }
+
+    /// The put of a role template, at its current revision when it exists;
+    /// `None` for a one-member subscription.
+    pub fn template(&self, own: &MobId, expected_revision: Option<u64>) -> Option<PutRoleTemplate> {
+        let members = self.members.clone()?;
+        Some(PutRoleTemplate {
+            id: self.subscription_id.clone(),
+            members,
+            topics: self.topics.clone(),
+            mobs: self.mob_set(own),
+            expected_revision,
+        })
+    }
+}
+
+/// The id of the child a role template makes for `member`: the template's
+/// id, a slash and the first 16 hex digits of the member's digest.
+pub fn role_child_id(template: &SubscriptionId, member: &Member) -> Result<SubscriptionId> {
+    let digest = super::types::sha256_hex(&[b"role-child", member.key().as_bytes()]);
+    let hex = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    SubscriptionId::new(format!("{template}/{}", &hex[..16]))
+}
+
+/// Refuse declarations no gateway applies, whatever the runtime holds:
+/// the whole declaration is refused, and at init the gateway fails closed.
+/// Bounds and shapes, duplicate ids (a source id once across every mob),
+/// a topic two declared sources own, a
+/// declared subscription that names both or neither of `member` and
+/// `members`, one that starts anywhere but now, and the handling wait a
+/// later release adds to declared subscriptions; each declared source's
+/// own configuration as `sources/put` checks it.
+pub fn validate(declarations: &Declarations, own: &MobId) -> Result<()> {
+    let mut sources = BTreeSet::new();
+    let mut owned: std::collections::BTreeMap<(MobId, Topic), SourceId> =
+        std::collections::BTreeMap::new();
+    for source in &declarations.sources {
+        let mob_id = source.mob(own);
+        // A declared source is named by its id alone in declarations/get.
+        if !sources.insert(source.source_id.clone()) {
+            return Err(invalid(format!(
+                "declarations.sources names source {} twice",
+                source.source_id
+            )));
+        }
+        source.config().validate()?;
+        for topic in &source.topics {
+            if let Some(other) =
+                owned.insert((mob_id.clone(), topic.clone()), source.source_id.clone())
+            {
+                return Err(super::types::AnnouncementStoreError::TopicOwned {
+                    topic: topic.clone(),
+                    source_id: other,
+                });
+            }
+        }
+    }
+    let mut subscriptions = BTreeSet::new();
+    for subscription in &declarations.subscriptions {
+        let id = &subscription.subscription_id;
+        if id.as_str().len() > MAX_DECLARED_SUBSCRIPTION_ID_BYTES {
+            return Err(invalid(format!(
+                "a declared subscription id is at most {MAX_DECLARED_SUBSCRIPTION_ID_BYTES} bytes"
+            )));
+        }
+        if !subscriptions.insert(id.clone()) {
+            return Err(invalid(format!(
+                "declarations.subscriptions names subscription {id} twice"
+            )));
+        }
+        match (&subscription.member, &subscription.members) {
+            (Some(_), None) => {}
+            (None, Some(members)) => {
+                if members.role.is_empty() || members.role == "*" {
+                    return Err(invalid(format!(
+                        "subscription {id}: a role-selected subscription names one role"
+                    )));
+                }
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "subscription {id} names exactly one of member and members"
+                )));
+            }
+        }
+        if !matches!(subscription.start, None | Some(StartFrontier::Now)) {
+            return Err(invalid(format!(
+                "subscription {id}: a declared subscription starts now"
+            )));
+        }
+        if subscription
+            .delivery
+            .is_some_and(|delivery| delivery.await_handling)
+        {
+            return Err(invalid(format!(
+                "subscription {id}: delivery.await_handling is not supported by this gateway yet"
+            )));
+        }
+        subscription.selector(own).validate()?;
+    }
+    Ok(())
+}
+
+/// Read and check a declarations sidecar: at init (a failure fails the
+/// gateway closed) and once per `declarations/apply` (a failure refuses
+/// the apply and changes nothing).
+pub fn read_sidecar(path: &std::path::Path, own: &MobId) -> Result<Declarations> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        invalid(format!(
+            "declarations_path {} cannot be read: {error}",
+            path.display()
+        ))
+    })?;
+    let declarations: Declarations = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(format!(
+            "declarations_path {} is not declarations: {error}",
+            path.display()
+        ))
+    })?;
+    validate(&declarations, own)?;
+    Ok(declarations)
+}

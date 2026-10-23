@@ -87,7 +87,7 @@ const RESTART_PAUSE_MAX: Duration = Duration::from_mins(1);
 const PRUNE_LIMIT: usize = 1_000;
 
 /// Configurable announcement policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnnouncementConfig {
     pub policy: SealingPolicy,
     pub retention_ms: u64,
@@ -117,6 +117,10 @@ pub struct AnnouncementConfig {
     /// that names it is refused, and a member a lowered ceiling no longer
     /// covers is built without it.
     pub member_tools_in_child_mobs: bool,
+    /// The sources and subscriptions this gateway declares, as its options
+    /// name them (inline, or a sidecar read at init): reconciled at compose,
+    /// before the dispatcher starts.
+    pub declarations: Option<Arc<super::declarations::DeclarationsSource>>,
 }
 
 impl AnnouncementConfig {
@@ -159,8 +163,16 @@ impl Default for AnnouncementConfig {
             peer_request_window_ms: crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS,
             child_limits: ChildMemberLimits::default(),
             member_tools_in_child_mobs: false,
+            declarations: None,
         }
     }
+}
+
+/// What a declaration method answers until declarations are reconciled.
+fn declarations_unsupported() -> AnnouncementError {
+    AnnouncementError::Store(AnnouncementStoreError::Invalid(
+        "declarations are not supported by this gateway yet".to_string(),
+    ))
 }
 
 /// Announcement refusals and failures, as callers see them.
@@ -596,6 +608,45 @@ impl AnnouncementService {
 
     pub fn config(&self) -> &AnnouncementConfig {
         &self.inner.config
+    }
+
+    /// Apply declarations (contract 4.4): `Some` carries them (a gateway
+    /// with inline declarations or none); `None` reads the gateway's sidecar
+    /// again. A lower revision than the applied one is refused
+    /// [`AnnouncementStoreError::DeclarationRollback`], the applied revision
+    /// with other content [`AnnouncementStoreError::DeclarationDigestConflict`],
+    /// and the applied revision with the same content changes nothing.
+    pub async fn apply_declarations(
+        &self,
+        declarations: Option<super::declarations::Declarations>,
+    ) -> Result<super::declarations::DeclarationsView, AnnouncementError> {
+        let _ = declarations;
+        Err(declarations_unsupported())
+    }
+
+    /// What the declarations manage now (contract 4.6).
+    pub async fn declarations(
+        &self,
+    ) -> Result<super::declarations::DeclarationsView, AnnouncementError> {
+        Err(declarations_unsupported())
+    }
+
+    /// Reconcile the applied declarations again: at compose, before the
+    /// dispatcher starts, and at each trigger that can admit a pending
+    /// record (a mob set change, a health pass).
+    pub async fn reconcile_declarations(&self) -> Result<(), AnnouncementError> {
+        Ok(())
+    }
+
+    /// Create a role template, or replace its selector at its revision
+    /// (`subscriptions/put` with `members`, contract 4.5).
+    pub async fn put_role_template(
+        &self,
+        operation: &OperationId,
+        request: super::declarations::PutRoleTemplate,
+    ) -> Result<super::declarations::RoleTemplate, AnnouncementError> {
+        let _ = (operation, request);
+        Err(declarations_unsupported())
     }
 
     /// Why the member's deliveries wait now, if they do: the latest
@@ -1536,7 +1587,7 @@ impl AnnouncementService {
         let mut guard = self.inner.round.lock().await;
         let walk = &mut *guard;
         let now = self.now();
-        let config = self.inner.config;
+        let config = &self.inner.config;
         let mut report = RoundReport::default();
         // No next look is ever written further ahead than the slowest settle
         // pause, and no report is in the future; one that is predates a step

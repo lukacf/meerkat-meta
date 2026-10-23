@@ -4422,7 +4422,7 @@ async fn a_failing_batch_is_retried_at_the_slow_pace() {
     let service = AnnouncementService::with_clock(
         Arc::clone(&store) as Arc<dyn AnnouncementStore>,
         Arc::new(ScriptedNative::new()) as Arc<dyn NativeDelivery>,
-        config,
+        config.clone(),
         Arc::new(move || reader.load(Ordering::SeqCst)),
     )
     .unwrap();
@@ -9201,7 +9201,7 @@ fn every_constructor_takes_the_member_tools_ceiling_for_child_mobs() {
         member_tools_in_child_mobs: true,
         ..AnnouncementConfig::default()
     };
-    let (_, _, availability) = super::AnnouncementComposition::new(granted)
+    let (_, _, availability) = super::AnnouncementComposition::new(granted.clone())
         .expect("the ceiling composes")
         .member_tool_bundle();
     assert_eq!(

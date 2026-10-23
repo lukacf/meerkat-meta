@@ -36,6 +36,7 @@
 //! per announcement.
 
 pub mod availability;
+pub mod declarations;
 mod faults;
 pub mod native;
 pub mod owner;
@@ -60,6 +61,12 @@ use serde::Deserialize;
 pub use availability::{
     BlockCause, DepartureEvidence, EvidenceClass, MemberDeparture, NotServedHereCause,
     SuspendCause, SuspendMarker,
+};
+pub use declarations::{
+    DeclarationRecordKind, DeclarationRecordView, DeclarationRefusal, DeclarationStatus,
+    Declarations, DeclarationsSource, DeclarationsView, DeclaredCollection, DeclaredDelivery,
+    DeclaredSource, DeclaredSubscription, DeclaredSubscriptionDelivery, PutRoleTemplate,
+    ROLE_TEMPLATE_LIMIT, RoleSelector, RoleTemplate,
 };
 pub use native::{
     ANNOUNCEMENT_CONTINUATION_NAMESPACE, AnnouncementNativeDelivery, IdentityService, MemberMobEnd,
@@ -351,7 +358,7 @@ impl AnnouncementComposition {
             .member_tools_in_child_mobs
             .then(|| Arc::clone(&local));
         let native = AnnouncementNativeDelivery::new(local, remote);
-        let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config)
+        let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config.clone())
             .map_err(|error| error.to_string())?;
         if !runtime.attach_mob_announcements(service.clone()) {
             return Err("mob announcements are already attached to this runtime".to_string());

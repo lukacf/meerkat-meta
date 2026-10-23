@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use super::declarations::{Declarations, PutRoleTemplate, RoleSelector};
 use super::owner::{AnnouncementError, AnnouncementService};
 use super::sources::{
     AdvanceSource, AnnouncementSource, AudienceGrant, AuditAction, AuditQuery, Coverage,
@@ -61,6 +62,8 @@ pub const ANNOUNCEMENT_METHODS: &[&str] = &[
     "meta/mob_announcements/sources/advance",
     "meta/mob_announcements/sources/record_failure",
     "meta/mob_announcements/audit/list",
+    "meta/mob_announcements/declarations/apply",
+    "meta/mob_announcements/declarations/get",
 ];
 
 pub fn is_announcement_method(method: &str) -> bool {
@@ -82,6 +85,7 @@ pub const ANNOUNCEMENT_MUTATE_METHODS: &[&str] = &[
     "meta/mob_announcements/sources/end",
     "meta/mob_announcements/sources/advance",
     "meta/mob_announcements/sources/record_failure",
+    "meta/mob_announcements/declarations/apply",
 ];
 
 pub fn is_announcement_mutating_method(method: &str) -> bool {
@@ -397,6 +401,24 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
                 message,
                 json!({ "conflict": "conversation", "source_id": source_id }),
             ),
+            AnnouncementStoreError::DeclarationRollback { applied } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "declaration_rollback",
+                message,
+                json!({ "applied": applied }),
+            ),
+            AnnouncementStoreError::DeclarationDigestConflict { revision } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "declaration_digest_conflict",
+                message,
+                json!({ "revision": revision }),
+            ),
+            AnnouncementStoreError::RoleTemplateLimit { limit } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "role_template_limit",
+                message,
+                json!({ "limit": limit }),
+            ),
             AnnouncementStoreError::IllegalTransition { .. } => JsonRpcError::new(-32000, message),
             AnnouncementStoreError::TooLarge(_) | AnnouncementStoreError::Invalid(_) => {
                 invalid_params(message)
@@ -453,7 +475,13 @@ fn default_start() -> StartFrontier {
 struct PutSubscriptionParams {
     operation_id: OperationId,
     subscription_id: SubscriptionId,
-    member: Member,
+    /// One member; exactly one of `member` and `members` is present.
+    #[serde(default)]
+    member: Option<Member>,
+    /// Every roster member of a mob with a role: a role template. Host
+    /// calls and declarations only; the member tool cannot make one.
+    #[serde(default)]
+    members: Option<RoleSelector>,
     topics: BTreeSet<Topic>,
     /// The mobs hosted here whose announcements the subscription takes;
     /// this gateway's own mob when absent.
@@ -464,6 +492,21 @@ struct PutSubscriptionParams {
     #[serde(default)]
     expected_revision: Option<u64>,
 }
+
+/// `meta/mob_announcements/declarations/apply`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyDeclarationsParams {
+    #[serde(default)]
+    revision: Option<u64>,
+    #[serde(default)]
+    declarations: Option<Declarations>,
+}
+
+/// A method that takes no params.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyParams {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -732,12 +775,42 @@ pub async fn handle_announcement_method(
             let mobs = request
                 .mobs
                 .unwrap_or_else(|| BTreeSet::from([own_mob.clone()]));
+            let member = match (request.member, request.members) {
+                (Some(member), None) => member,
+                (None, Some(members)) => {
+                    // A template starts now: it never backfills.
+                    if request.start != StartFrontier::Now {
+                        return Err(invalid_params(
+                            "a role-selected subscription starts now".to_string(),
+                        ));
+                    }
+                    let template = service
+                        .put_role_template(
+                            &request.operation_id,
+                            PutRoleTemplate {
+                                id: request.subscription_id,
+                                members,
+                                topics: request.topics,
+                                mobs,
+                                expected_revision: request.expected_revision,
+                            },
+                        )
+                        .await
+                        .map_err(rpc_error)?;
+                    return Ok(json!({ "subscription": to_value(template)? }));
+                }
+                _ => {
+                    return Err(invalid_params(
+                        "a subscription names exactly one of member and members".to_string(),
+                    ));
+                }
+            };
             let subscription = service
                 .put_subscription(
                     &request.operation_id,
                     PutSubscription {
                         id: request.subscription_id,
-                        member: request.member,
+                        member,
                         selector: Selector {
                             topics: request.topics,
                             mobs,
@@ -983,6 +1056,37 @@ pub async fn handle_announcement_method(
                 .map(listed_source)
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(json!({ "sources": listed }))
+        }
+        "meta/mob_announcements/declarations/apply" => {
+            let request: ApplyDeclarationsParams = params(raw)?;
+            // Both present (inline declarations), or both absent: the
+            // gateway's sidecar is read again.
+            let declarations = match (request.revision, request.declarations) {
+                (Some(revision), Some(declarations)) => {
+                    if declarations.revision != revision {
+                        return Err(invalid_params(format!(
+                            "the declarations name revision {}, the apply {revision}",
+                            declarations.revision
+                        )));
+                    }
+                    Some(declarations)
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(invalid_params(
+                        "an apply carries both revision and declarations, or neither".to_string(),
+                    ));
+                }
+            };
+            let view = service
+                .apply_declarations(declarations)
+                .await
+                .map_err(rpc_error)?;
+            to_value(view)
+        }
+        "meta/mob_announcements/declarations/get" => {
+            let _: EmptyParams = params(raw)?;
+            to_value(service.declarations().await.map_err(rpc_error)?)
         }
         _ => Err(JsonRpcError::new(-32601, "Method not found")),
     }
