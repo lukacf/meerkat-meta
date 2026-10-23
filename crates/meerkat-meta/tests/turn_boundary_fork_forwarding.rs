@@ -126,6 +126,7 @@ fn fork_target(member: &str) -> meerkat_core::DurableSessionForkTarget {
         cache_identity: None,
         source_admission: meerkat_core::DurableForkSourceAdmission::Quiescent,
         inherited_instructions: meerkat_core::ForkInstructionPolicy::default(),
+        declared_instructions: meerkat_core::ForkInstructionPolicy::default(),
     }
 }
 
