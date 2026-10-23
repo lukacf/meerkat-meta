@@ -4136,6 +4136,22 @@ macro_rules! delegate_mob_session_service {
                     .interrupt_run_with_machine_authority(session_id, expected_run_id, authority)
                     .await
             }
+            // meerkat 0.9.5: the exact-run suspend of a graceful requeue stop,
+            // trait default `Ok(false)` ("this service cannot suspend; leave
+            // the stop to hard-cancel the run"). The mob provisioner's
+            // `suspend_run_if_current` calls it on this wrapper, so an
+            // unforwarded default hard-cancels a durable member's run that
+            // the stop should keep for the member's next start.
+            async fn suspend_run_with_machine_authority(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+                expected_run_id: &meerkat_core::lifecycle::RunId,
+                authority: meerkat_runtime::MachineSessionControlAuthority,
+            ) -> Result<bool, SessionError> {
+                self.inner
+                    .suspend_run_with_machine_authority(session_id, expected_run_id, authority)
+                    .await
+            }
             async fn cancel_after_boundary_with_machine_authority(
                 &self,
                 session_id: &meerkat_core::types::SessionId,
@@ -5403,6 +5419,19 @@ impl MobSessionService for AfterCreateMobSessionService {
     ) -> Result<bool, SessionError> {
         self.inner
             .interrupt_run_with_machine_authority(session_id, expected_run_id, authority)
+            .await
+    }
+    // meerkat 0.9.5 exact-run suspend of a graceful requeue stop, default
+    // `Ok(false)`, which hard-cancels the run (see the same seam in
+    // `delegate_mob_session_service!`).
+    async fn suspend_run_with_machine_authority(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+        expected_run_id: &meerkat_core::lifecycle::RunId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, SessionError> {
+        self.inner
+            .suspend_run_with_machine_authority(session_id, expected_run_id, authority)
             .await
     }
     async fn cancel_after_boundary_with_machine_authority(
@@ -15674,6 +15703,13 @@ comms = true
                 meerkat_core::CommittedSessionBoundaryAuthority,
             )>,
         >,
+        /// Every exact run the probe was asked to suspend.
+        suspended_runs: Mutex<
+            Vec<(
+                meerkat_core::types::SessionId,
+                meerkat_core::lifecycle::RunId,
+            )>,
+        >,
     }
 
     impl ForwardingProbe {
@@ -16300,6 +16336,21 @@ comms = true
             }
         }
 
+        async fn suspend_run_with_machine_authority(
+            &self,
+            session_id: &meerkat_core::types::SessionId,
+            expected_run_id: &meerkat_core::lifecycle::RunId,
+            _authority: meerkat_runtime::MachineSessionControlAuthority,
+        ) -> Result<bool, SessionError> {
+            self.record("suspend_run_with_machine_authority");
+            self.suspended_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((session_id.clone(), expected_run_id.clone()));
+            // The trait default answers `false`.
+            Ok(true)
+        }
+
         async fn cancel_after_boundary_with_machine_authority(
             &self,
             session_id: &meerkat_core::types::SessionId,
@@ -16533,6 +16584,45 @@ comms = true
                     .expect("probe acknowledgements"),
                 vec![(session_id.clone(), authority.clone())],
                 "{shape}: the exact authority reaches the inner service"
+            );
+        }
+    }
+
+    /// Both production decorators, alone and stacked as the builder stacks
+    /// them, forward the exact-run suspend of a graceful requeue stop to the
+    /// service they wrap, with the exact run, and return its answer. Without
+    /// the forward the trait default answers `false`: the stop hard-cancels a
+    /// durable member's run instead of keeping it for the member's next start.
+    #[tokio::test]
+    async fn mob_session_wrappers_forward_the_exact_run_suspend_of_a_requeue_stop() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let run_id = meerkat_core::lifecycle::RunId::new();
+        let machine = meerkat_runtime::MeerkatMachine::ephemeral();
+        let probe = Arc::new(ForwardingProbe::default());
+        for (shape, wrapper) in decorated_shapes(&probe) {
+            probe.calls.lock().expect("probe calls").clear();
+            probe.suspended_runs.lock().expect("probe suspends").clear();
+            let suspended = MobSessionService::suspend_run_with_machine_authority(
+                wrapper.as_ref(),
+                &session_id,
+                &run_id,
+                machine.session_control_authority(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{shape}: the wrapped service suspends: {error}"));
+            assert!(
+                suspended,
+                "{shape}: the inner service's answer comes back, not the default"
+            );
+            assert_eq!(
+                probe.calls(),
+                vec!["suspend_run_with_machine_authority"],
+                "{shape}: the inner service suspends, exactly once"
+            );
+            assert_eq!(
+                *probe.suspended_runs.lock().expect("probe suspends"),
+                vec![(session_id.clone(), run_id.clone())],
+                "{shape}: the exact run reaches the inner service"
             );
         }
     }
@@ -17610,6 +17700,21 @@ comms = true
         )
         .await
         .expect("machine-authorized cancel should treat a missing live session as quiesced");
+        assert!(
+            MobSessionService::suspend_run_with_machine_authority(
+                &wrapped,
+                &session_id,
+                &run_id,
+                wrapped
+                    .acquire_runtime_adapter(None)
+                    .expect("acquire runtime adapter")
+                    .expect("wrapper should expose runtime adapter")
+                    .session_control_authority(),
+            )
+            .await
+            .expect("machine-authorized suspend should forward to inner service"),
+            "the inner service's suspend answer comes back, not the trait default"
+        );
 
         MobSessionService::archive_with_mob_lifecycle_authority(&wrapped, &session_id)
             .await
@@ -17711,6 +17816,7 @@ comms = true
             probe.calls(),
             vec![
                 "cancel_after_boundary_with_machine_authority",
+                "suspend_run_with_machine_authority",
                 "archive_with_mob_lifecycle_authority",
                 "reconcile_runtime_compaction_projections",
                 "acknowledge_runtime_compaction_finalization",
