@@ -10052,6 +10052,12 @@ fn the_version_two_schema_is_pinned() {
             "index announcement_audit_counted on announcement_audit: mob_id, source_id, \
              generation, member, action, reason"
                 .to_string(),
+            "table announcement_holds: subscription_id TEXT notnull pk1, mob_id TEXT notnull \
+             pk2, sequence INTEGER notnull pk3, member TEXT notnull, held_at_ms INTEGER \
+             notnull, record TEXT notnull"
+                .to_string(),
+            "index announcement_holds_by_member on announcement_holds: member, held_at_ms"
+                .to_string(),
             "table announcement_source_streams: mob_id TEXT notnull pk1, source_id TEXT \
              notnull pk2, stream TEXT notnull pk3, generation INTEGER notnull, phase TEXT \
              notnull, mode TEXT notnull, max_items INTEGER, backfilled INTEGER notnull, \
@@ -10162,12 +10168,13 @@ async fn a_version_one_store_migrates_to_version_two_in_place() {
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
              AND name IN ('announcement_sources', 'announcement_source_topics',
-                          'announcement_source_streams', 'announcement_audit')",
+                          'announcement_source_streams', 'announcement_audit',
+                          'announcement_holds')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 4);
+    assert_eq!(tables, 5);
 }
 
 // ---------------------------------------------------------------------------
@@ -14432,4 +14439,428 @@ async fn a_runtime_source_runner_gets_its_schedule_too() {
             ("inbox-collector", serde_json::json!("inbox"), 60),
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Announcement sources: holds. What a member is owed and may no longer
+// receive is held at its next seal and at the last check before every
+// submission, released only by a fresh check, and expires at retention,
+// each counted in the audit.
+// ---------------------------------------------------------------------------
+
+/// This mob's member "agent:b", as the wire names it.
+fn agent_b() -> serde_json::Value {
+    serde_json::json!({ "mob_id": OWN_MOB, "identity": "agent:b" })
+}
+
+/// The audit entries of `member` for `action`, read without the filter.
+async fn entries_for(
+    service: &AnnouncementService,
+    member: serde_json::Value,
+    action: &str,
+) -> Vec<serde_json::Value> {
+    audit_rows(service, serde_json::json!({ "member": member }))
+        .await
+        .into_iter()
+        .filter(|entry| entry["action"] == serde_json::json!(action))
+        .collect()
+}
+
+/// "inbox" covers "agent:a" and "agent:b" on its direct route; "agent:b"
+/// subscribes directly and captures one item, "m-1", while covered.
+async fn b_owes_an_inbox_item(service: &AnnouncementService) {
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]),
+            serde_json::json!([{ "kind": "direct" }]),
+        ),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "b-direct", "agent:b", &["mail.received"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(advanced["items"][0]["captured"], serde_json::json!(1));
+}
+
+/// "inbox"'s audience at `revision` becomes `grants`, on its direct route.
+async fn inbox_audience(
+    service: &AnnouncementService,
+    operation: &str,
+    revision: u64,
+    grants: serde_json::Value,
+) {
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox_with(operation, grants, serde_json::json!([{ "kind": "direct" }])),
+            "expected_revision",
+            serde_json::json!(revision),
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+/// The batches sealed for "agent:b".
+async fn batches_of_b(service: &AnnouncementService) -> Vec<Batch> {
+    service
+        .deliveries(&BatchQuery {
+            member: Some(member("agent:b")),
+            limit: 10,
+            ..BatchQuery::default()
+        })
+        .await
+        .unwrap()
+}
+
+/// A member that lost coverage after it captured an item has the item held
+/// at its next seal: nothing is sealed or submitted for it, and the hold is
+/// counted in the audit.
+#[tokio::test]
+async fn a_member_losing_coverage_has_owed_items_held() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    b_owes_an_inbox_item(service).await;
+    inbox_audience(
+        service,
+        "narrow",
+        1,
+        serde_json::json!([member_grant("agent:a")]),
+    )
+    .await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let batches = batches_of_b(service).await;
+    assert!(batches.is_empty(), "nothing is sealed for b: {batches:?}");
+    assert_eq!(harness.native.submits(), 0, "nothing reaches b");
+    let held = entries_for(service, agent_b(), "items_held").await;
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["reason"], serde_json::json!("audience_not_covered"));
+    assert_eq!(held[0]["source_id"], serde_json::json!("inbox"));
+    assert_eq!(held[0]["generation"], serde_json::json!(1));
+    assert_eq!(held[0]["count"], serde_json::json!(1));
+}
+
+/// Held items are released only by a fresh check at the member's next seal:
+/// regaining coverage moves nothing by itself, and the next seal checks
+/// again, releases the held item and seals it with what came since.
+#[tokio::test]
+async fn regained_coverage_releases_held_items_only_after_a_fresh_check() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    b_owes_an_inbox_item(service).await;
+    inbox_audience(
+        service,
+        "narrow",
+        1,
+        serde_json::json!([member_grant("agent:a")]),
+    )
+    .await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert!(batches_of_b(service).await.is_empty(), "held at the seal");
+
+    // Coverage comes back: nothing moves without a check.
+    inbox_audience(
+        service,
+        "widen",
+        2,
+        serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]),
+    )
+    .await;
+    harness.clock.store(200_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert!(
+        batches_of_b(service).await.is_empty(),
+        "a held item is no backlog of its own"
+    );
+    assert!(
+        entries_for(service, agent_b(), "items_released")
+            .await
+            .is_empty()
+    );
+
+    // The next seal checks afresh: the held item goes with what came since.
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v2", 3, 2, "c3"),
+            &[upsert("m-2", "v1", "second")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(300_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let batches = batches_of_b(service).await;
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(
+        batches[0].items.len(),
+        2,
+        "the released item and the new one"
+    );
+    let released = entries_for(service, agent_b(), "items_released").await;
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert_eq!(released[0]["count"], serde_json::json!(1));
+    assert_eq!(
+        released[0]["reason"],
+        serde_json::json!("audience_not_covered")
+    );
+}
+
+/// A batch sealed while its member was covered is checked again immediately
+/// before its submission: a revocation in between cancels it while nothing
+/// native holds it, and its item is held.
+#[tokio::test]
+async fn a_batch_sealed_before_a_revocation_is_cancelled_at_its_last_check() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    b_owes_an_inbox_item(service).await;
+    let policy = SealingPolicy {
+        max_count: 256,
+        max_bytes: 1_048_576,
+        max_delay_ms: 60_000,
+        min_wake_interval_ms: 60_000,
+    };
+    let sealed = harness
+        .store
+        .seal_batch(&member("agent:b"), &batch_id("b-sealed"), &policy, 100_000)
+        .await
+        .unwrap()
+        .expect("sealed while b is covered");
+    inbox_audience(
+        service,
+        "narrow",
+        1,
+        serde_json::json!([member_grant("agent:a")]),
+    )
+    .await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert_eq!(harness.native.submits(), 0, "the last check stops it");
+    let batches = batches_of_b(service).await;
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(batches[0].id, sealed.id);
+    assert_eq!(batches[0].state, BatchState::Cancelled);
+    let held = entries_for(service, agent_b(), "items_held").await;
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["reason"], serde_json::json!("audience_not_covered"));
+}
+
+/// A resubmission after an answer that nothing was committed is checked
+/// again first: a revocation while the outcome was open cancels the batch
+/// instead of submitting it again.
+#[tokio::test]
+async fn a_resubmission_after_nothing_committed_is_checked_again() {
+    let native = native_serving(&["agent:b"]);
+    native.ledger.lock().unwrap().unanswered = true;
+    let harness = harness_with(native);
+    let service = &harness.service;
+    b_owes_an_inbox_item(service).await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert_eq!(harness.native.submits(), 1);
+    let batches = batches_of_b(service).await;
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(batches[0].state, BatchState::Submitting { attempt: 1 });
+
+    inbox_audience(
+        service,
+        "narrow",
+        1,
+        serde_json::json!([member_grant("agent:a")]),
+    )
+    .await;
+    harness.native.ledger.lock().unwrap().unanswered = false;
+    harness.round_after_pause().await;
+    assert_eq!(harness.native.submits(), 1, "no second submission");
+    let batches = batches_of_b(service).await;
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(batches[0].state, BatchState::Cancelled);
+    let held = entries_for(service, agent_b(), "items_held").await;
+    assert_eq!(held.len(), 1, "{held:?}");
+}
+
+/// A held item past the retention window expires with a counted audit
+/// entry, and no gap line reports it to the member.
+#[tokio::test]
+async fn items_held_past_retention_expire_with_an_audit_row() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    b_owes_an_inbox_item(service).await;
+    inbox_audience(
+        service,
+        "narrow",
+        1,
+        serde_json::json!([member_grant("agent:a")]),
+    )
+    .await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert!(batches_of_b(service).await.is_empty(), "held at the seal");
+
+    let (retention_ms, _) = retention_and_quiet();
+    let later = 1_000 + retention_ms + 1;
+    harness
+        .store
+        .expire(later, retention_ms, 0, 100)
+        .await
+        .unwrap();
+    let expired = entries_for(service, agent_b(), "expired_while_held").await;
+    assert_eq!(expired.len(), 1, "{expired:?}");
+    assert_eq!(expired[0]["count"], serde_json::json!(1));
+    assert_eq!(
+        expired[0]["reason"],
+        serde_json::json!("audience_not_covered")
+    );
+
+    // Coverage back, the next item reaches b alone: the expired one is gone
+    // and no gap line tells of it.
+    inbox_audience(
+        service,
+        "widen",
+        2,
+        serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]),
+    )
+    .await;
+    harness.clock.store(later, Ordering::SeqCst);
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v2", 3, 2, "c3"),
+            &[upsert("m-2", "v1", "second")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(later + 100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let batches = batches_of_b(service).await;
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(batches[0].items.len(), 1);
+    assert!(batches[0].gaps.is_empty(), "{:?}", batches[0].gaps);
+}
+
+/// Routes bind what is already owed too: an item an earlier direct
+/// subscriber captured before the direct route was removed is held at its
+/// next seal, counted as `no_direct_route`.
+#[tokio::test]
+async fn an_item_owed_before_a_route_change_is_not_sealed_for_an_earlier_direct_subscriber() {
+    let harness = harness_with(native_serving(&["agent:b", "agent:t"]));
+    let service = &harness.service;
+    let audience = serde_json::json!([
+        member_grant("agent:a"),
+        member_grant("agent:b"),
+        member_grant("agent:t")
+    ]);
+    let triage = triage_by("agent:t", serde_json::json!([member_grant("agent:a")]));
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            audience.clone(),
+            serde_json::json!([{ "kind": "direct" }, triage.clone()]),
+        ),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "b-direct", "agent:b", &["mail.received"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first")],
+        ),
+    )
+    .await
+    .unwrap();
+    // The direct route goes before b's item is sealed.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            inbox_with("triage-only", audience, serde_json::json!([triage])),
+            "expected_revision",
+            serde_json::json!(1),
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert!(
+        batches_of_b(service).await.is_empty(),
+        "nothing sealed for b"
+    );
+    let held = entries_for(service, agent_b(), "items_held").await;
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["reason"], serde_json::json!("no_direct_route"));
+}
+
+/// On a gateway without a governed binder, a batch committed while its
+/// member was covered and admitted after a revocation reaches the member:
+/// nothing Meta controls stands between the commit and the admission. The
+/// delivery is counted as `delivered_across_revocation`.
+#[tokio::test]
+async fn a_batch_admitted_after_a_revocation_is_audited_as_delivered_across_it() {
+    let mut native = native_serving(&["agent:b"]);
+    native.apply_on_commit = false;
+    let harness = harness_with(native);
+    let service = &harness.service;
+    b_owes_an_inbox_item(service).await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let batches = batches_of_b(service).await;
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(batches[0].state.tag(), BatchStateTag::Committed);
+
+    inbox_audience(
+        service,
+        "narrow",
+        1,
+        serde_json::json!([member_grant("agent:a")]),
+    )
+    .await;
+    harness
+        .native
+        .ledger
+        .lock()
+        .unwrap()
+        .bindings
+        .get_mut(batches[0].id.as_str())
+        .unwrap()
+        .2 = true;
+    harness.round_after_pause().await;
+    let batches = batches_of_b(service).await;
+    assert_eq!(batches[0].state.tag(), BatchStateTag::Delivered);
+    let across = entries_for(service, agent_b(), "delivered_across_revocation").await;
+    assert_eq!(across.len(), 1, "{across:?}");
+    assert_eq!(
+        across[0]["reason"],
+        serde_json::json!("audience_not_covered")
+    );
+    assert_eq!(across[0]["count"], serde_json::json!(1));
 }
