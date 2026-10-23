@@ -428,10 +428,11 @@ impl UnifiedRuntime {
         let identity_authority_release = IdentityAuthorityReleaseOutcome::NotConfigured;
         if mob_stop.is_ok() {
             // Break the MobRuntime <-> IdentityRuntime authority cycle only
-            // after physical members are gone. This is required for failed
-            // builders to release persistent topology/store locks before
-            // returning Err; on a failed mob stop the authority deliberately
-            // stays attached.
+            // after the mob is stopped; the runs it left running end, or are
+            // kept, in the terminal teardown below. This is required for
+            // failed builders to release persistent topology/store locks
+            // before returning Err; on a failed mob stop the authority
+            // deliberately stays attached.
             self.mob_runtime.clear_identity_runtime_authority();
             *self
                 .implicit_delegate_identity_runtime
