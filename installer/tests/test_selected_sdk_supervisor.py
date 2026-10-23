@@ -259,8 +259,10 @@ async def test_install_failure_joins_child_and_refuses_later_commands(supervised
             return fence()
         files.require_current = slow_fence
     expected = TimeoutError if mode.startswith("timeout") else installed.CandidateArtifactError
+    # The deadline covers staging too, so it must outlast slow staging and
+    # expire while the timeout leg's pip child sleeps (30 s), not before it.
     with pytest.raises(expected):
-        await selected_install(files, timeout=0.15 if mode.startswith("timeout") else 3)
+        await selected_install(files, timeout=3)
     assert len(files.children) == 1 and files.owner.child is None
     assert not list((files.root / ".venv").glob(".forge-selected-*"))
     assert_reaped(files.children[0])
