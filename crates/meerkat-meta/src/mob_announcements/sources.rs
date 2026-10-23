@@ -749,6 +749,14 @@ impl SourceConfig {
                 MAX_ID_BYTES,
                 "a runner host runnable",
             )?;
+            // Core names no runnable by blanks, and the steward's is Meta's.
+            if runner.host_runnable.trim().is_empty()
+                || runner.host_runnable == crate::schedule_wiring::STEWARD_DREAM_RUNNABLE
+            {
+                return Err(AnnouncementStoreError::Invalid(
+                    "runner.host_runnable must name the host's collector runnable".to_string(),
+                ));
+            }
             if !(MIN_RUNNER_SECONDS..=MAX_RUNNER_SECONDS).contains(&runner.every_seconds) {
                 return Err(AnnouncementStoreError::Invalid(
                     "runner.every_seconds must be one minute to 30 days".to_string(),
