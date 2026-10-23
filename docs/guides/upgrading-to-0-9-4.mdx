@@ -242,7 +242,7 @@ the common refusals:
 | `UnrecognizedSessionDatabase` | A file in the state directory holds 0.9.3 sessions under a name the layout does not know. | See [A session database named by store_path](#a-session-database-named-by-store_path). |
 | `StateFileUnreadable` | A SQLite file in the state directory could not be read to check whether it holds sessions; the scan fails closed. | Fix the file, or move it out of the state directory, then rerun. |
 | `MobStoreUnnamed`, `MobStoreMissing`, `MobStoreConflict`, `MobStoreManifestWithoutStore` | The directory's mob store is not where the census looks, or `--mob-store` contradicts it. | See [Embedded builder apps](#embedded-builder-apps); the report names the remedy under each. |
-| `IdentityDisagrees` | Core's last binding for an identity is on another session or on none, or Core last bound the session to another identity. With in-memory mob storage, where Core holds no binding, two records that bind one session are both refused: one session resumes one identity. | Settle the identity's record with the 0.9.3 binary (or delete the identity), then rerun. |
+| `IdentityDisagrees` | Core's last binding for an identity is on another session or on none, Core last bound the session to another identity, or Core holds a live member that the identity runtime spawned (its spawn carries the `agent_identity` label) and that no continuity record names. With in-memory mob storage, where Core holds no binding, two records that bind one session are both refused: one session resumes one identity. | Settle the identity's record with the 0.9.3 binary (or delete the identity), then rerun. |
 | `CoreMissing` | The projection binds an identity to a session, but Core's mob store holds no member for it since its latest reset. | Settle or delete the identity with the 0.9.3 binary, then rerun. |
 | `Unlisted` | Core's mob store binds an identity that the continuity export does not list. | Add the identity to the export's identity list, export again, then rerun. |
 
@@ -270,6 +270,15 @@ binds (`Resume`), gets a row that
 resumes its session. An identity 0.9.3 deleted (Core's last binding is
 retired, and the projection holds no session for it) gets a row that starts
 it fresh (`FreshAfterDelete`).
+
+A live mob member that no continuity record names and that the identity
+runtime did not spawn is admitted as `RawMember`: the host made it directly
+on the mob (with `meta/ensure_member` or `meta/spawn_member` on the stdio
+gateway, as a helper or fork, or through its own mob calls), and 0.9.3 never
+recorded such a member. `--apply` leaves the member, its session and its
+history in Core, writes no first-boot row for it, and 0.9.4 leaves it to the
+host, as 0.9.3 did. Its session is usually held by `runtime.sqlite` alone,
+which is admitted too.
 
 ## Embedded builder apps
 

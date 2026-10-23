@@ -1001,6 +1001,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ceil(members / concurrency) to the init. Before, only a host with a document
   MCP binding waited, and any other member's surface was captured while its
   servers were still connecting, without their tools or their MCP provenance.
+- `meta_gateway storage-migrate-native` admits a live mob member the host
+  made directly on the mob (for example with `meta/ensure_member` on the
+  stdio gateway, or through its own mob calls) that no continuity record
+  names: the census classifies it `raw_member` instead of refusing it as
+  `identity_disagrees`, whose remedy (settle the record with 0.9.3) could not
+  be met, because 0.9.3 never records such a member. `--apply` leaves the
+  member, its session and its history in Core and writes no first-boot row
+  for it. A live member the identity runtime spawned (its spawn carries the
+  `agent_identity` label) without its record is still refused, and so is a
+  member an export entry names.
 
 ### Known limitations
 
