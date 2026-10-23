@@ -148,14 +148,28 @@ impl AnnouncementService {
         if let Some(own) = self.inner.native.own_mob() {
             if let Some(source) = self.inner.config.declarations.as_deref() {
                 let declarations = source.declarations();
-                let newer = self
-                    .inner
-                    .store
-                    .applied_declarations()
-                    .await?
-                    .is_none_or(|applied| declarations.revision > applied.revision);
-                if newer {
-                    self.record_applied(declarations, &own).await?;
+                match self.inner.store.applied_declarations().await? {
+                    Some(applied) if declarations.revision < applied.revision => {}
+                    Some(applied) if declarations.revision == applied.revision => {
+                        // An apply at runtime reached this revision with
+                        // other content: it stands, and the boot says so once.
+                        let digest = declarations.digest(&own)?;
+                        if digest != applied.digest
+                            && !self
+                                .inner
+                                .options_conflict_warned
+                                .swap(true, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            tracing::warn!(
+                                revision = applied.revision,
+                                applied_digest = %applied.digest,
+                                options_digest = %digest,
+                                "mob announcement options declare the applied revision with \
+                                 other content; the applied declarations stand"
+                            );
+                        }
+                    }
+                    _ => self.record_applied(declarations, &own).await?,
                 }
             }
             self.reconcile_applied(&own).await?;
@@ -351,6 +365,27 @@ impl AnnouncementService {
         }
     }
 
+    /// Mark a create as `mark_put` does, except that a refusal because a
+    /// record of the other kind holds the id makes the declared one
+    /// unmanaged: the reconciler never made that record.
+    async fn mark_created<T>(
+        &self,
+        before: Option<&DeclarationMark>,
+        base: DeclarationMark,
+        put: Result<T, AnnouncementError>,
+        managed: bool,
+    ) -> Result<(), AnnouncementError> {
+        if matches!(
+            &put,
+            Err(AnnouncementError::Store(
+                AnnouncementStoreError::SubscriptionIdTaken { .. }
+            ))
+        ) {
+            return self.mark_replayed(before, base, put).await;
+        }
+        self.mark_put(before, base, put, managed).await
+    }
+
     /// The create of a record that a live record made at runtime already
     /// holds: replayed, it meets its receipt when the reconciler made the
     /// record and a crash lost the mark; otherwise the record is unmanaged.
@@ -529,7 +564,7 @@ impl AnnouncementService {
             };
             let operation = step_operation("create-subscription", &id, &digest, None)?;
             let put = self.put_subscription(&operation, request).await;
-            return self.mark_put(before, base, put, managed).await;
+            return self.mark_created(before, base, put, managed).await;
         };
         if let Some(terminal) = found.terminal_refusal() {
             return self.mark_terminal(before, base, terminal).await;
@@ -594,7 +629,7 @@ impl AnnouncementService {
             };
             let operation = step_operation("create-template", &id, &digest, None)?;
             let put = self.put_role_template(&operation, request).await;
-            return self.mark_put(before, base, put, managed).await;
+            return self.mark_created(before, base, put, managed).await;
         };
         if template.state == SubscriptionState::Cancelled {
             // Cancelled: held while its declaration is unchanged; declared

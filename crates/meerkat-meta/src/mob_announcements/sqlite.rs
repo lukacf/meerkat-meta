@@ -1058,6 +1058,12 @@ fn put_subscription_in(
         load_subscription(db, &request.id)?,
         request.expected_revision,
     ) {
+        // Subscriptions and role templates share one id space.
+        (None, None) if load_role_template(db, &request.id)?.is_some() => {
+            return Err(AnnouncementStoreError::SubscriptionIdTaken {
+                subscription_id: request.id.clone(),
+            });
+        }
         (None, None) => create_subscription(db, request, now_ms)?,
         (None, Some(_)) => return Err(AnnouncementStoreError::UnknownSubscription),
         (Some(existing), None) => {
@@ -5608,9 +5614,9 @@ fn put_role_template_in(
         request.expected_revision,
     ) {
         (None, None) => {
-            if let Some(found) = load_subscription(db, &request.id)? {
-                return Err(AnnouncementStoreError::StaleRevision {
-                    current: found.revision,
+            if load_subscription(db, &request.id)?.is_some() {
+                return Err(AnnouncementStoreError::SubscriptionIdTaken {
+                    subscription_id: request.id.clone(),
                 });
             }
             RoleTemplate {

@@ -246,6 +246,11 @@ pub enum AnnouncementStoreError {
     RoleTemplateLimit {
         limit: u32,
     },
+    /// The id is held by the other kind: a subscription and a role template
+    /// never share an id.
+    SubscriptionIdTaken {
+        subscription_id: SubscriptionId,
+    },
 }
 
 impl AnnouncementStoreError {
@@ -423,6 +428,10 @@ impl fmt::Display for AnnouncementStoreError {
             Self::RoleTemplateLimit { limit } => {
                 write!(f, "a role template captures for at most {limit} members")
             }
+            Self::SubscriptionIdTaken { subscription_id } => write!(
+                f,
+                "{subscription_id} is taken: a subscription and a role template never share an id"
+            ),
         }
     }
 }

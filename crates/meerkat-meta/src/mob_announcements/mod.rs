@@ -105,6 +105,10 @@ pub use types::{
     SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch, Topic,
 };
 
+/// How long the dispatcher waits at startup for the first reconcile of the
+/// declarations before it starts anyway.
+const DECLARATIONS_RECONCILE_BEFORE_START: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `runtime_options.mob_announcements`, as a host passes it at startup.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -416,16 +420,20 @@ impl AnnouncementComposition {
         if !bound {
             return Err("the member tools are already bound".to_string());
         }
-        // The declarations are reconciled once the owner is composed (the
-        // options' ones first, when newer than the applied ones), as at
-        // every later trigger: a runtime refusal waits as pending.
-        let reconciling = service.clone();
+        // The dispatcher starts once the declarations are reconciled (the
+        // options' ones first, when newer than the applied ones), so its
+        // first round runs on what they made and dropped. A reconcile that
+        // fails or outlasts its bound is logged and the dispatcher starts
+        // anyway; later triggers reconcile again, and a runtime refusal
+        // waits as pending.
+        let starting = service.clone();
         drop(tokio::spawn(async move {
-            if let Err(error) = reconciling.reconcile_declarations().await {
-                tracing::warn!(%error, "mob announcement declarations not reconciled at compose");
-            }
+            drop(
+                starting
+                    .start_after_reconcile(DECLARATIONS_RECONCILE_BEFORE_START)
+                    .await,
+            );
         }));
-        drop(service.start());
         drop(service.watch_mobs());
         Ok(service)
     }

@@ -430,6 +430,12 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
                 message,
                 json!({ "limit": limit }),
             ),
+            AnnouncementStoreError::SubscriptionIdTaken { subscription_id } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "subscription_id_taken",
+                message,
+                json!({ "subscription_id": subscription_id }),
+            ),
             AnnouncementStoreError::IllegalTransition { .. } => JsonRpcError::new(-32000, message),
             AnnouncementStoreError::TooLarge(_) | AnnouncementStoreError::Invalid(_) => {
                 invalid_params(message)

@@ -419,6 +419,9 @@ struct Inner {
     /// Applies and reconciles of declarations pass one at a time, each
     /// reading the applied declarations and marks as they stand then.
     declarations_gate: tokio::sync::Mutex<()>,
+    /// Whether this boot warned that its options declare the applied
+    /// revision with other content.
+    options_conflict_warned: AtomicBool,
 }
 
 /// Keeps sources' runner schedules in line with their records: Meta's
@@ -602,6 +605,7 @@ impl AnnouncementService {
                 runners: std::sync::Mutex::new(None),
                 runners_gate: tokio::sync::Mutex::new(()),
                 declarations_gate: tokio::sync::Mutex::new(()),
+                options_conflict_warned: AtomicBool::new(false),
             }),
         })
     }
@@ -642,14 +646,27 @@ impl AnnouncementService {
     /// fails, or is still running after `bound`, is logged and the
     /// dispatcher starts anyway: a declaration fault never holds delivery.
     pub async fn start_after_reconcile(&self, bound: Duration) -> tokio::task::JoinHandle<()> {
-        let _ = bound;
         let reconciling = self.clone();
-        drop(tokio::spawn(async move {
-            if let Err(error) = reconciling.reconcile_declarations().await {
-                tracing::warn!(%error, "mob announcement declarations not reconciled at compose");
-            }
-        }));
-        self.start()
+        // Its own task: past the bound the reconcile goes on while the
+        // dispatcher starts.
+        let reconcile = tokio::spawn(async move { reconciling.reconcile_declarations().await });
+        match tokio::time::timeout(bound, reconcile).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => tracing::warn!(
+                kind = %super::rpc::refusal_kind(&error),
+                %error,
+                "mob announcement declarations not reconciled before the dispatcher started"
+            ),
+            Ok(Err(error)) => tracing::warn!(
+                %error,
+                "mob announcement declarations reconcile ended before the dispatcher started"
+            ),
+            Err(_) => tracing::warn!(
+                bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+                "mob announcement declarations still reconciling when the dispatcher started"
+            ),
+        }
+        self.supervise()
     }
 
     /// Hold the declarations gate a reconcile takes, so a test can keep one
@@ -2028,6 +2045,12 @@ impl AnnouncementService {
     /// doubles up to a minute.
     pub fn start(&self) -> tokio::task::JoinHandle<()> {
         self.inner.stopped.store(false, Ordering::SeqCst);
+        self.supervise()
+    }
+
+    /// The dispatcher under its supervisor, leaving a stop request as it
+    /// stands: a stop asked for before a delayed start holds.
+    fn supervise(&self) -> tokio::task::JoinHandle<()> {
         let first = self.spawn_dispatcher();
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(async move {

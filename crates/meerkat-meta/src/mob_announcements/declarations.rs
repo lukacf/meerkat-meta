@@ -451,14 +451,17 @@ pub fn role_child_id(template: &SubscriptionId, member: &Member) -> Result<Subsc
 /// declared subscription that names both or neither of `member` and
 /// `members`, one that starts anywhere but now, and the handling wait a
 /// later release adds to declared subscriptions; each declared source's
-/// own configuration as `sources/put` checks it; a triage member its
-/// source's audience can never cover; and declared subscriptions the
+/// own configuration as `sources/put` checks it; two declared sources on
+/// one principal's scope; a triage member its source's audience can never
+/// cover; and declared subscriptions the
 /// declared sources never admit (a conversation member subscribed to its
 /// own scope, a member reaching a source both directly and through its
 /// forward).
 pub fn validate(declarations: &Declarations, own: &MobId) -> Result<()> {
     let mut sources = BTreeSet::new();
     let mut owned: std::collections::BTreeMap<(MobId, Topic), SourceId> =
+        std::collections::BTreeMap::new();
+    let mut scopes: std::collections::BTreeMap<(MobId, String), SourceId> =
         std::collections::BTreeMap::new();
     for source in &declarations.sources {
         let mob_id = source.mob(own);
@@ -472,6 +475,16 @@ pub fn validate(declarations: &Declarations, own: &MobId) -> Result<()> {
         let config = source.config();
         config.validate()?;
         config.validate_for(&mob_id)?;
+        // One principal's scope is one source per mob: the source declared
+        // first holds it.
+        if let Some(holder) = scopes.insert(
+            (mob_id.clone(), config.identity.key()?),
+            source.source_id.clone(),
+        ) {
+            return Err(super::types::AnnouncementStoreError::SourceIdentityTaken {
+                source_id: holder,
+            });
+        }
         // A triage route's forward topics are the source's as much as its
         // own topics are.
         for (topic, _) in config.owned_topics() {
