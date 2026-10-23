@@ -1474,6 +1474,7 @@ class Supervisor:
             if cancelled or self.stop.is_set():
                 raise asyncio.CancelledError
             startup_timeout = START_TIMEOUT
+            pending_budget_attempted = False
             while True:
                 done, _ = await asyncio.wait({started, exited, stopped}, timeout=startup_timeout, return_when=asyncio.FIRST_COMPLETED)
                 if stopped in done:
@@ -1502,6 +1503,13 @@ class Supervisor:
                         admission_health={"attempt_id": attempt_id, **pending.admission},
                         console_url=None, runtime_pid=process.pid, process_live=True,
                         health="pending", health_checked_at=now())
+                    if self.service_owned and not pending_budget_attempted:
+                        # Admission may remain pending while the gateway owns
+                        # durable sessions. Size a Stop for the unreported
+                        # horizon now, still capped by the enforced unit if
+                        # widening fails. Heartbeats do not reload the unit.
+                        await self.widen_service_stop_budget(None)
+                        pending_budget_attempted = True
                     # Each actual child frame renews this bounded wait. A
                     # silent child must fail instead of holding startup open.
                     # This performs no admission or retry.

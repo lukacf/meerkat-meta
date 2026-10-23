@@ -176,7 +176,8 @@ async def test_pending_admission_waits_for_later_native_ready_before_console_pro
         assert receipt["status"] == "starting" and receipt["bootstrap"] == pending["bootstrap"]
         assert receipt["admission_health"] == {"attempt_id": receipt["startup_attempt_id"], **pending["admission"]}
         assert receipt["console_url"] is None and console.requests == [] and published == []
-        assert receipt["gateway_shutdown_horizon_ms"] is None and widened == []
+        assert receipt["gateway_shutdown_horizon_ms"] is None
+        assert widened == [(None, receipt["admission_health"])]
         # A known pending condition is not an absent startup handshake.
         await asyncio.sleep(.25)
         assert not task.done() and console.requests == []
@@ -186,7 +187,8 @@ async def test_pending_admission_waits_for_later_native_ready_before_console_pro
         assert published == [True] and receipt["health"] == "ready"
         assert receipt["admission_health"] is None and len(console.requests) == 1
         assert receipt["gateway_shutdown_horizon_ms"] == supervisor.gateway_shutdown_horizon_ms == reported
-        assert widened == [(reported, None)]
+        assert widened == [(None, {"attempt_id": receipt["startup_attempt_id"], **pending["admission"]}),
+                           (reported, None)]
     finally:
         supervisor.stop.set()
         await asyncio.gather(task, return_exceptions=True)
@@ -339,6 +341,71 @@ async def test_pending_admission_can_be_stopped_without_publishing_ready(fixture
             await asyncio.wait_for(task, 3)
         assert supervisor.child is None and console.requests == []
         assert read_receipt(supervisor.directory)["health"] == "pending"
+    finally:
+        supervisor.stop.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("widening", ["widened", "refused", "reload-failed", "unchanged"])
+async def test_pending_admission_stop_uses_the_first_frame_service_budget(fixture, monkeypatch, widening):
+    from test_admission_health import pending_payload
+    from launchkit import deployment_service, deployment_worker as worker
+    from launchkit.deployment_deadlines import shutdown_budget
+    supervisor, definition, console = await fixture([])
+    pending = pending_payload()
+    pending["console_url"] = f"http://127.0.0.1:{definition['port']}/console"
+    update_receipt(supervisor.directory, service={"manager": "systemd-user", "stop_timeout_seconds": 45})
+    supervisor.own_service()
+    (supervisor.destination / "app.py").write_text(
+        "import json,os,time\n"
+        f"payload={pending!r}\npayload['pid']=os.getpid()\n"
+        "fd=int(os.environ['MOBKIT_LAUNCH_READY_FD'])\n"
+        "while True:\n os.write(fd,(json.dumps(payload)+'\\n').encode())\n time.sleep(.02)\n")
+    attempts, windows = [], []
+    def widen(directory, horizon_ms):
+        assert directory == supervisor.directory
+        attempts.append(horizon_ms)
+        if widening == "refused":
+            raise deployment_service.DraftConflict("The owned unit changed.")
+        return None if widening == "unchanged" else ["/usr/bin/systemctl", "--user", "daemon-reload"]
+
+    class Manager:
+        async def command(self, arguments, **kwargs):
+            if widening == "reload-failed":
+                raise RuntimeError("The unit reload failed.")
+            return 0, ""
+
+    actual_wait = asyncio.wait_for
+    async def observe(awaitable, timeout):
+        if getattr(getattr(awaitable, "cr_code", None), "co_name", None) == "parent_exit":
+            windows.append(timeout)
+        return await actual_wait(awaitable, timeout)
+
+    monkeypatch.setattr(deployment_service, "widen_service_stop_budget", widen)
+    monkeypatch.setattr(deployment_service, "UserServiceManager", Manager)
+    monkeypatch.setattr(worker.asyncio, "wait_for", observe)
+    task = asyncio.create_task(supervisor.start(definition, on_ready=lambda: pytest.fail("Pending is not ready")))
+    try:
+        for _ in range(100):
+            if task.done():
+                await task
+            if read_receipt(supervisor.directory).get("health") == "pending":
+                break
+            await asyncio.sleep(.01)
+        else:
+            pytest.fail("The child never reported pending admission")
+        # Repeated pending frames must not repeatedly reload the service.
+        await asyncio.sleep(.1)
+        supervisor.stop.set()
+        with pytest.raises(asyncio.CancelledError):
+            await actual_wait(task, 3)
+        expected = shutdown_budget()["application"] if widening == "widened" else 15
+        assert windows and set(windows) == {expected}
+        assert attempts == [None]
+        assert supervisor.child is None and console.requests == []
+        receipt = read_receipt(supervisor.directory)
+        assert receipt["health"] == "pending" and receipt["console_url"] is None
+        assert receipt["gateway_shutdown_horizon_ms"] is None
     finally:
         supervisor.stop.set()
         await asyncio.gather(task, return_exceptions=True)
