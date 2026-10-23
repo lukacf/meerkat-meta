@@ -360,6 +360,19 @@ pub trait AnnouncementStore: Send + Sync {
         Ok(String::new())
     }
 
+    /// The answer an operator's redelivery of batch `id` recorded under
+    /// `operation`, if it was made: a retry answers it without reading
+    /// anything else. The same operation id with another request is
+    /// refused.
+    async fn redeliver_receipt(
+        &self,
+        operation: &OperationId,
+        id: &BatchId,
+    ) -> Result<Option<BatchHandling>> {
+        let _ = (operation, id);
+        Ok(None)
+    }
+
     /// An operator's redelivery of what batch `id` holds after its turn
     /// ended unhandled: each held item is checked afresh for coverage with
     /// the member's roster `facts`, and what passes is owed again for the

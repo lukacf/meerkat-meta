@@ -1433,12 +1433,16 @@ impl AnnouncementService {
     /// unhandled and whose items are held: each held item is checked afresh
     /// against its member's coverage, and what passes is owed again, under
     /// a notice, for the member's next batch. A roster that cannot be read
-    /// decides nothing: the remedy is refused, to be asked again.
+    /// decides nothing: the remedy is refused, to be asked again. A retry
+    /// answers what the first call recorded, whatever the roster says now.
     pub async fn redeliver_held(
         &self,
         operation: &OperationId,
         id: &BatchId,
     ) -> Result<BatchHandling, AnnouncementError> {
+        if let Some(recorded) = self.inner.store.redeliver_receipt(operation, id).await? {
+            return Ok(recorded);
+        }
         let batch = self
             .inner
             .store

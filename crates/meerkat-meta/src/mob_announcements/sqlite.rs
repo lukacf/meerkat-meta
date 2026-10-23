@@ -5286,6 +5286,22 @@ impl AnnouncementStore for SqliteAnnouncementStore {
             .await
     }
 
+    async fn redeliver_receipt(
+        &self,
+        operation: &OperationId,
+        id: &BatchId,
+    ) -> Result<Option<BatchHandling>> {
+        let (operation, id) = (operation.clone(), id.clone());
+        self.run(move |db| {
+            let fingerprint = request_fingerprint("redeliver_held", &id)?;
+            operation_result(db, &operation, &fingerprint)?
+                .as_deref()
+                .map(decode)
+                .transpose()
+        })
+        .await
+    }
+
     async fn redeliver_held(
         &self,
         operation: &OperationId,
