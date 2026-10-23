@@ -63,6 +63,7 @@ test_public_meta_shell.py
 test_remote_product_access.py
 test_remote_product_custom_ports_background.py
 test_repository_application_selection.py
+test_retained_ordinary_application.py
 test_runtime_history_v2.py
 test_selected_member_classes.py
 test_selected_startup_host.py

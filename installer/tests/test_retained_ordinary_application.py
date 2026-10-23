@@ -137,11 +137,11 @@ async def test_upgrade_cannot_recover_from_receipts_or_unrelated_launcher_choice
     assert not launched and not owner._builds and not owner._installations
 
 
-@pytest.mark.parametrize("fault", ["package-bytes", "source-pin", "runtime-proof"])
+@pytest.mark.parametrize("fault", ["package-bytes", "source-pin", "installed-source"])
 async def test_explicit_retention_does_not_bypass_original_installation_checks(
         ordinary_registry, newer_target, monkeypatch, fault):
     f = ordinary_registry
-    saved, result, directory, _, entry = await installed(f, monkeypatch)
+    saved, result, directory, destination, entry = await installed(f, monkeypatch)
     _, service, owner = upgraded_registry(f, newer_target, (entry,))
     if fault == "package-bytes":
         (directory / "package.zip").write_bytes(b"changed accepted package\n")
@@ -149,8 +149,9 @@ async def test_explicit_retention_does_not_bypass_original_installation_checks(
         source = f.implementation._directory(saved["id"], result["build_id"]) / "ordinary-application-source"
         (source / "application-runtime-selection.json").write_bytes(b"{}\n")
     else:
-        from launchkit.deployment_updates import update_receipt
-        update_receipt(directory, installed_candidate_runtime_proof=None)
+        # Ordinary physical-runtime verification belongs to the actual worker.
+        # This source-only admission control can prove installed byte refusal.
+        (destination / "config/mob.toml").write_bytes(b"changed installed definition\n")
     launched = []
     monkeypatch.setattr(service, "_launch", lambda *args, **kwargs: launched.append((args, kwargs)))
     with pytest.raises((CustodyError, DraftConflict)):
