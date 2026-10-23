@@ -15257,7 +15257,11 @@ pub enum GatewayHostCloseReason {
     CallerCancelled,
 }
 
+/// A native host composition's error. Each variant has a fixed text, which
+/// the gateway reports as the init failure. Later releases can add variants,
+/// so a match on it needs a wildcard arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GatewayHostError {
     Unavailable,
     Denied,
@@ -15274,10 +15278,12 @@ impl std::fmt::Display for GatewayHostError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Unavailable => "native host composition is unavailable",
-            Self::Denied | Self::AgentCustomizerRequired => {
-                "native host composition refused admission"
-            }
+            Self::Denied => "native host composition refused admission",
             Self::SettlementIncomplete => "native host settlement is incomplete",
+            Self::AgentCustomizerRequired => {
+                "the native host composition requires an agent customizer: configure the SDK \
+                 agent customizer (a pass-through is enough)"
+            }
         })
     }
 }
