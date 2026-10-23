@@ -685,6 +685,10 @@ fn build_persistent_session_service(
     let live_config = config.clone();
     let mut builder = FactoryAgentBuilder::new(factory, config);
     let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
+    // Prepare each member's construction only after its configured MCP
+    // servers have connected or failed, so the surface captured for it
+    // carries them.
+    builder.wait_for_mcp = true;
     builder.default_blob_store = Some(blob_store.clone());
     let jobs_path =
         meerkat_store::realm_paths_in(layout.state_dir(), meerkat_realm.as_str()).jobs_sqlite_path;
@@ -3048,6 +3052,8 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         let member_model_config = Arc::new(config.clone());
         let mut builder = FactoryAgentBuilder::new(factory, config);
         let host_default_decorator = Arc::clone(&builder.default_agent_llm_client_decorator);
+        // As in the persistent arm: members wait for their MCP servers.
+        builder.wait_for_mcp = true;
         builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
             session_store.clone(),
         )));
