@@ -76,17 +76,23 @@ class SseEventStream:
 async def parse_sse_stream(
     response_body: AsyncIterator[bytes],
 ) -> AsyncIterator[SseEvent]:
-    """Parse an SSE byte stream into SseEvent objects."""
-    buffer = ""
+    """Parse an SSE byte stream into SseEvent objects.
+
+    Lines are split on bytes and each complete line is decoded as strict
+    UTF-8, so a multi-byte character that a chunk boundary splits arrives
+    whole. A complete line that is not UTF-8 raises ``UnicodeDecodeError``
+    instead of being repaired with U+FFFD.
+    """
+    buffer = b""
     current_id: str | None = None
     current_event = "message"
     current_data: list[str] = []
 
     async for chunk in response_body:
-        buffer += chunk.decode("utf-8", errors="replace")
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            line = line.rstrip("\r")
+        buffer += chunk
+        while b"\n" in buffer:
+            raw_line, buffer = buffer.split(b"\n", 1)
+            line = raw_line.rstrip(b"\r").decode("utf-8")
 
             if not line:
                 if current_data:

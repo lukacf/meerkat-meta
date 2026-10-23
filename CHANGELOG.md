@@ -464,6 +464,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   horizon) ends its own process group with SIGKILL, after a SIGTERM while
   it can still absorb one. The next start confirms a deployment's cleanup
   from the record its worker wrote.
+- The Python SDK's SSE reader (`parse_sse_stream`, behind the agent and mob
+  event streams) decodes each complete line as UTF-8 instead of decoding each
+  network chunk with replacement: a multi-byte character that a chunk
+  boundary split arrived as U+FFFD. A complete line that is not UTF-8 now
+  raises `UnicodeDecodeError` instead of being repaired.
 
 ### Known limitations
 
