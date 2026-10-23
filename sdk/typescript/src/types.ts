@@ -3194,6 +3194,118 @@ export function sendResultToDict(result: SendResult): Record<string, unknown> {
   return out;
 }
 
+/**
+ * Where a keyed send's delivery stands, read for each answer. `state` is
+ * `pending` (committed, not admitted yet: replay the same key to read it
+ * again; a `pending` that survives a gateway restart is not proof of loss, so
+ * do not resend it under a new key), `admitted` (queued in the member's
+ * session: `sessionId` and `inputId` name the input, which `sendStatus`
+ * follows; not proof that a turn ran), `stranded` (final: never admitted,
+ * because the member incarnation it was bound to was replaced; resend under a
+ * new key) or `refused` (final, never admitted; `reason` says why). Tolerate
+ * other values: the vocabulary may grow.
+ */
+export interface ContinuationStatus {
+  readonly state: string;
+  readonly sessionId?: string;
+  readonly inputId?: string;
+  readonly reason?: string;
+}
+
+export function parseContinuationStatus(raw: unknown): ContinuationStatus {
+  const d = asRecord(raw);
+  const out: {
+    state: string;
+    sessionId?: string;
+    inputId?: string;
+    reason?: string;
+  } = { state: String(d.state ?? "") };
+  if (typeof d.session_id === "string") out.sessionId = d.session_id;
+  if (typeof d.input_id === "string") out.inputId = d.input_id;
+  if (typeof d.reason === "string") out.reason = d.reason;
+  return out;
+}
+
+export function continuationStatusToDict(
+  status: ContinuationStatus,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { state: status.state };
+  if (status.sessionId !== undefined) out.session_id = status.sessionId;
+  if (status.inputId !== undefined) out.input_id = status.inputId;
+  if (status.reason !== undefined) out.reason = status.reason;
+  return out;
+}
+
+/**
+ * Typed result of a keyed send (`send(identity, content, { idempotencyKey })`):
+ * the member continuation the content was committed as. A replay of the key
+ * answers the same `deliveryId` and `committedAtMs`; `status` is read for each
+ * answer and may advance.
+ */
+export interface KeyedSendResult {
+  readonly deliveryId: string;
+  readonly committedAtMs: number;
+  readonly status: ContinuationStatus;
+}
+
+export function parseKeyedSendResult(raw: unknown): KeyedSendResult {
+  const continuation = asRecord(asRecord(raw).continuation);
+  if (typeof continuation.delivery_id !== "string") {
+    throw new TypeError("a keyed meta/send result carries no continuation receipt");
+  }
+  return {
+    deliveryId: continuation.delivery_id,
+    committedAtMs: Number(continuation.committed_at_ms ?? 0),
+    status: parseContinuationStatus(continuation.status),
+  };
+}
+
+export function keyedSendResultToDict(result: KeyedSendResult): Record<string, unknown> {
+  return {
+    continuation: {
+      delivery_id: result.deliveryId,
+      committed_at_ms: result.committedAtMs,
+      status: continuationStatusToDict(result.status),
+    },
+  };
+}
+
+/**
+ * The runtime's state of one input, as meerkat's `session/input_status`
+ * reports it. `currentState` is `accepted`, `queued`, `staged`, `applied`,
+ * `applied_pending_consumption`, `consumed`, `superseded`, `coalesced` or
+ * `abandoned`; `terminalOutcome` is set once the input is terminal
+ * (`completed`, `abandoned`, `superseded`, `coalesced`, `cancelled`).
+ * Tolerate other values. `raw` is the whole wire object.
+ */
+export interface InputState {
+  readonly inputId: string;
+  readonly currentState: string;
+  readonly terminalOutcome: string | null;
+  readonly raw: Record<string, unknown>;
+}
+
+/** Typed result of `sendStatus`: `state` is `null` when the session holds no such input. */
+export interface SendStatusResult {
+  readonly state: InputState | null;
+}
+
+export function parseSendStatusResult(raw: unknown): SendStatusResult {
+  const state = asRecord(raw).state;
+  if (typeof state !== "object" || state === null) {
+    return { state: null };
+  }
+  const d = state as Record<string, unknown>;
+  return {
+    state: {
+      inputId: String(d.input_id ?? ""),
+      currentState: String(d.current_state ?? ""),
+      terminalOutcome: typeof d.terminal_outcome === "string" ? d.terminal_outcome : null,
+      raw: { ...d },
+    },
+  };
+}
+
 /** Typed result from identity-first `dispatch()`. */
 export interface DispatchResult {
   readonly fencingToken: number;

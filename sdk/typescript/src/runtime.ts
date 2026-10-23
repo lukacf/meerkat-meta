@@ -182,6 +182,8 @@ import {
   type IdentityBootstrapStatus,
   completionCursorToDict,
   parseSendResult,
+  parseKeyedSendResult,
+  parseSendStatusResult,
   parseDispatchResult,
   parseScopedDispatchResult,
   parseScopedRecovery,
@@ -276,6 +278,8 @@ import {
   type IdentityInspection,
   type AwaitedTurn,
   type SendResult,
+  type KeyedSendResult,
+  type SendStatusResult,
   type RegisteredSpec,
   type DispatchResult,
   type DeliveryScope,
@@ -1437,19 +1441,97 @@ export class MetaRuntime {
   async send(
     identity: string,
     content: string | DispatchContentBlock[],
-    options: { trackTurn?: boolean; expectedSpecDigest?: string } = {},
-  ): Promise<SendResult> {
+    options?: { trackTurn?: boolean; expectedSpecDigest?: string; idempotencyKey?: undefined },
+  ): Promise<SendResult>;
+  /**
+   * A keyed send: the gateway commits `content` as a member continuation
+   * under `idempotencyKey`, which belongs to the identity (not a session),
+   * and resolves the continuation's receipt with its current delivery
+   * status. A retry under the same key never sends twice: it resolves the
+   * first receipt, after a respawn, reset or gateway restart too, and other
+   * content under the key is refused (`data.kind`
+   * `input_idempotency_conflict`). Keys never expire. Follow an `admitted`
+   * status with {@link sendStatus}. A key does not combine with `trackTurn`
+   * or `expectedSpecDigest`. A gateway that does not advertise
+   * `meta/send_status` would ignore the key, so the key is refused with
+   * {@link CapabilityUnavailableError} before anything is sent.
+   */
+  async send(
+    identity: string,
+    content: string | DispatchContentBlock[],
+    options: { idempotencyKey: string; trackTurn?: false; expectedSpecDigest?: undefined },
+  ): Promise<KeyedSendResult>;
+  async send(
+    identity: string,
+    content: string | DispatchContentBlock[],
+    options: { trackTurn?: boolean; expectedSpecDigest?: string; idempotencyKey?: string } = {},
+  ): Promise<SendResult | KeyedSendResult> {
+    if (
+      options.idempotencyKey !== undefined &&
+      (options.trackTurn || options.expectedSpecDigest !== undefined)
+    ) {
+      const combined = options.trackTurn ? "trackTurn" : "expectedSpecDigest";
+      throw new TypeError(`idempotencyKey does not combine with ${combined}`);
+    }
     const params: Record<string, unknown> = { identity };
     if (typeof content === "string") {
       params.content = content;
     } else {
       params.content = content.map(contentBlockToDict);
     }
+    if (options.idempotencyKey !== undefined) {
+      await this.requireKeyedSend();
+      params.idempotency_key = options.idempotencyKey;
+      return parseKeyedSendResult(await this._rpc("meta/send", params));
+    }
     if (options.trackTurn) params.track_turn = true;
     if (options.expectedSpecDigest !== undefined) {
       params.expected_spec_digest = options.expectedSpecDigest;
     }
     return parseSendResult(await this._rpc("meta/send", params));
+  }
+
+  /**
+   * Refuse a keyed send, typed, on a gateway that does not serve it: such a
+   * gateway ignores `idempotency_key` and would send unkeyed. Keyed sends ship
+   * with `meta/send_status`, so its advertisement is the gate.
+   */
+  private async requireKeyedSend(): Promise<void> {
+    const raw = await this._rpc("meta/capabilities");
+    const methods =
+      typeof raw === "object" && raw !== null
+        ? (raw as Record<string, unknown>).methods
+        : undefined;
+    if (!Array.isArray(methods) || !methods.includes("meta/send_status")) {
+      throw new CapabilityUnavailableError(
+        "this gateway does not serve keyed sends: it would ignore idempotency_key and send unkeyed",
+        "",
+        "meta/send",
+        { requires: "meta/send_status" },
+      );
+    }
+  }
+
+  /**
+   * The state of an input in a session `identity` has had (`meta/send_status`),
+   * as meerkat's `session/input_status` reports it: follow a keyed send's
+   * `admitted` status (its `sessionId` and `inputId`) to its terminal state.
+   * Resolves `state: null` when the session holds no such input. A session
+   * that is neither the identity's current session nor one it held before is
+   * refused (`data.kind` `session_not_held_by_identity`).
+   */
+  async sendStatus(
+    identity: string,
+    sessionId: string,
+    inputId: string,
+  ): Promise<SendStatusResult> {
+    return parseSendStatusResult(
+      await this._rpc("meta/send_status", {
+        identity,
+        session_id: sessionId,
+        input_id: inputId,
+      }),
+    );
   }
 
   /**

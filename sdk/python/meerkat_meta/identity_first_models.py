@@ -1323,6 +1323,132 @@ class SendResult:
         )
 
 
+def _optional_text(data: dict[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    return value if isinstance(value, str) else None
+
+
+@dataclass(frozen=True)
+class ContinuationStatus:
+    """Where a keyed send's delivery stands, read for each answer.
+
+    ``state`` is one of:
+
+    - ``pending``: committed, not admitted yet. Replay the same key to read
+      it again. A ``pending`` that survives a gateway restart is not proof of
+      loss: do not resend it under a new key.
+    - ``admitted``: queued in the member's session; ``session_id`` and
+      ``input_id`` name the input, which :meth:`MetaRuntime.send_status`
+      follows. Not proof that a turn ran.
+    - ``stranded``: final. The content was never admitted: the member
+      incarnation it was bound to was replaced. Resend under a new key.
+    - ``refused``: final, never admitted; ``reason`` says why.
+
+    Tolerate other values: the vocabulary may grow.
+    """
+
+    state: str
+    session_id: str | None = None
+    input_id: str | None = None
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"state": self.state}
+        if self.session_id is not None:
+            result["session_id"] = self.session_id
+        if self.input_id is not None:
+            result["input_id"] = self.input_id
+        if self.reason is not None:
+            result["reason"] = self.reason
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ContinuationStatus:
+        return cls(
+            state=str(data.get("state", "")),
+            session_id=_optional_text(data, "session_id"),
+            input_id=_optional_text(data, "input_id"),
+            reason=_optional_text(data, "reason"),
+        )
+
+
+@dataclass(frozen=True)
+class KeyedSendResult:
+    """Typed result of a keyed send (``send(..., idempotency_key=...)``): the
+    member continuation the content was committed as.
+
+    A replay of the key answers the same ``delivery_id`` and
+    ``committed_at_ms``; ``status`` is read for each answer and may advance.
+    """
+
+    delivery_id: str
+    committed_at_ms: int
+    status: ContinuationStatus
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "continuation": {
+                "delivery_id": self.delivery_id,
+                "committed_at_ms": self.committed_at_ms,
+                "status": self.status.to_dict(),
+            }
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> KeyedSendResult:
+        continuation = data.get("continuation")
+        if not isinstance(continuation, dict) or not isinstance(
+            continuation.get("delivery_id"), str
+        ):
+            raise ValueError("a keyed meta/send result carries no continuation receipt")
+        status = continuation.get("status")
+        return cls(
+            delivery_id=continuation["delivery_id"],
+            committed_at_ms=int(continuation.get("committed_at_ms", 0)),
+            status=ContinuationStatus.from_dict(status if isinstance(status, dict) else {}),
+        )
+
+
+@dataclass(frozen=True)
+class InputState:
+    """The runtime's state of one input, as meerkat's ``session/input_status``
+    reports it.
+
+    ``current_state`` is ``accepted``, ``queued``, ``staged``, ``applied``,
+    ``applied_pending_consumption``, ``consumed``, ``superseded``,
+    ``coalesced`` or ``abandoned``; ``terminal_outcome`` is set once the input
+    is terminal (``completed``, ``abandoned``, ``superseded``, ``coalesced``,
+    ``cancelled``). Tolerate other values. ``raw`` is the whole wire object.
+    """
+
+    input_id: str
+    current_state: str
+    terminal_outcome: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> InputState:
+        return cls(
+            input_id=str(data.get("input_id", "")),
+            current_state=str(data.get("current_state", "")),
+            terminal_outcome=_optional_text(data, "terminal_outcome"),
+            raw=copy.deepcopy(data),
+        )
+
+
+@dataclass(frozen=True)
+class SendStatusResult:
+    """Typed result of :meth:`MetaRuntime.send_status`: ``state`` is ``None``
+    when the session holds no such input."""
+
+    state: InputState | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SendStatusResult:
+        state = data.get("state")
+        return cls(state=InputState.from_dict(state) if isinstance(state, dict) else None)
+
+
 @dataclass(frozen=True)
 class DispatchResult:
     """Typed result from identity-first dispatch()."""
