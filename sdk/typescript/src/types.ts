@@ -1367,6 +1367,13 @@ export interface MobRun {
   readonly schemaVersion: number;
   readonly rootStepOutputs: Readonly<Record<string, unknown>>;
   readonly loopIterationOutputs: Readonly<Record<string, unknown>>;
+  /**
+   * The members each role of a role-targeted run dispatches to, as the
+   * runtime recorded them; absent for a role-wide run, and for a run read
+   * from a gateway or runtime that predates role targets. A gate that needs
+   * a bound run must treat its absence as not bound.
+   */
+  readonly roleTargets?: Readonly<Record<string, readonly string[]>>;
 }
 
 function parseMobRunStatus(raw: unknown): MobRunStatus {
@@ -1443,7 +1450,25 @@ export function parseMobRun(raw: unknown): MobRun {
     schemaVersion: Number(d.schema_version ?? 0),
     rootStepOutputs: rootOutputs,
     loopIterationOutputs: iterOutputs,
+    ...roleTargetsField(d.role_targets),
   };
+}
+
+/**
+ * A run record's `role_targets` as an optional `roleTargets` field: present
+ * only for a role-targeted run.
+ */
+function roleTargetsField(
+  raw: unknown,
+): { roleTargets?: Readonly<Record<string, readonly string[]>> } {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
+  const roleTargets: Record<string, readonly string[]> = {};
+  for (const [role, members] of Object.entries(raw as Record<string, unknown>)) {
+    if (Array.isArray(members)) {
+      roleTargets[role] = members.map((member) => String(member));
+    }
+  }
+  return { roleTargets };
 }
 
 // -- Rich member / helper / catalog / cross-mob results --------------------
@@ -1650,6 +1675,11 @@ export interface MobRunSnapshot {
   readonly status: string;
   readonly stepLedger: readonly Record<string, unknown>[];
   readonly failureLedger: readonly Record<string, unknown>[];
+  /**
+   * The members each role of a role-targeted run dispatches to, as the
+   * runtime recorded them; absent for a role-wide run.
+   */
+  readonly roleTargets?: Readonly<Record<string, readonly string[]>>;
 }
 
 export function parseMobRunSnapshot(raw: unknown): MobRunSnapshot {
@@ -1661,6 +1691,7 @@ export function parseMobRunSnapshot(raw: unknown): MobRunSnapshot {
     status: String(d.status ?? "unknown"),
     stepLedger: asRecordArray(d.step_ledger),
     failureLedger: asRecordArray(d.failure_ledger),
+    ...roleTargetsField(d.role_targets),
   };
 }
 
@@ -5885,4 +5916,26 @@ export function supportsAnnouncementSources(
     ? (capabilities as readonly string[])
     : (capabilities as CapabilitiesResult).featureCapabilities;
   return features.includes(MOB_ANNOUNCEMENT_SOURCES_V1);
+}
+
+/**
+ * The `meta/capabilities` feature capability that says `meta/run_flow`
+ * accepts `role_targets`.
+ */
+export const FLOW_ROLE_TARGETS = "flow_role_targets" as const;
+
+/**
+ * Whether `meta/run_flow` accepts `role_targets` on this gateway: its
+ * `featureCapabilities` name `"flow_role_targets"`. Takes a
+ * {@link CapabilitiesResult} or its `featureCapabilities`. A gateway without
+ * it ignores the parameter and runs the flow role-wide, so a caller checks
+ * this before sending role targets (`MobHandle.runFlow` does).
+ */
+export function supportsFlowRoleTargets(
+  capabilities: CapabilitiesResult | readonly string[],
+): boolean {
+  const features = Array.isArray(capabilities)
+    ? (capabilities as readonly string[])
+    : (capabilities as CapabilitiesResult).featureCapabilities;
+  return features.includes(FLOW_ROLE_TARGETS);
 }

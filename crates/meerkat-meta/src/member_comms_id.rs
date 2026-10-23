@@ -456,6 +456,20 @@ pub(crate) fn validate_public_rpc_member_aliases(params: &serde_json::Value) -> 
             validate_public_member_alias(field, value)?;
         }
     }
+    // `meta/run_flow` names the members of each bound role.
+    if let Some(roles) = params
+        .get("role_targets")
+        .and_then(serde_json::Value::as_object)
+    {
+        for member in roles
+            .values()
+            .filter_map(serde_json::Value::as_array)
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+        {
+            validate_public_member_alias("role_targets", member)?;
+        }
+    }
     Ok(())
 }
 
@@ -1396,6 +1410,27 @@ mod tests {
             Ok(())
         );
         Ok(())
+    }
+
+    #[test]
+    fn public_rpc_ingress_rejects_encoded_roster_role_targets() {
+        let refused = validate_public_rpc_member_aliases(&serde_json::json!({
+            "flow_id": "review",
+            "role_targets": { "reviewer": ["rev-a1", "  mk--rt_csecret_c0  "] },
+        }));
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.contains("role_targets")),
+            "an encoded roster id in role_targets must be refused at ingress: {refused:?}"
+        );
+        assert_eq!(
+            validate_public_rpc_member_aliases(&serde_json::json!({
+                "flow_id": "review",
+                "role_targets": { "reviewer": ["rev-a1", "rt:rev-a2:0"] },
+            })),
+            Ok(())
+        );
     }
 
     #[test]

@@ -3195,11 +3195,43 @@ pub(super) async fn handle_run_flow(
     match flow_id_str {
         Some(fid) if !fid.is_empty() => {
             let flow_id = meerkat_mob::FlowId::from(fid);
-            match Box::pin(runtime.mob_handle().run_flow(flow_id, flow_params)).await {
+            // `role_targets` binds each role of the flow to existing members;
+            // meerkat's mob actor admits the binding and refuses it typed.
+            let role_targets = match crate::flow_role_targets::parse_role_targets(params) {
+                Ok(role_targets) => role_targets,
+                Err(message) => {
+                    return JsonRpcResponse {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: response_id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: format!("Invalid params: {message}"),
+                            data: None,
+                        }),
+                    };
+                }
+            };
+            let echo = role_targets
+                .as_ref()
+                .map(crate::flow_role_targets::role_targets_echo);
+            let started = match role_targets {
+                Some(role_targets) => {
+                    Box::pin(runtime.mob_handle().run_flow_with_role_targets(
+                        flow_id,
+                        flow_params,
+                        role_targets,
+                        None,
+                    ))
+                    .await
+                }
+                None => Box::pin(runtime.mob_handle().run_flow(flow_id, flow_params)).await,
+            };
+            match started {
                 Ok(run_id) => JsonRpcResponse {
                     jsonrpc: JSONRPC_VERSION.to_string(),
                     id: response_id,
-                    result: Some(serde_json::json!({ "run_id": run_id.to_string() })),
+                    result: Some(crate::flow_role_targets::run_flow_result(&run_id, echo)),
                     error: None,
                 },
                 Err(err) => JsonRpcResponse {
@@ -3209,7 +3241,7 @@ pub(super) async fn handle_run_flow(
                     error: Some(JsonRpcError {
                         code: -32602,
                         message: format!("run_flow failed: {err}"),
-                        data: None,
+                        data: crate::flow_role_targets::run_flow_error_data(&err),
                     }),
                 },
             }

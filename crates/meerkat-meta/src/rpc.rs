@@ -2412,6 +2412,19 @@ async fn handle_unified_rpc_json_inner(
                     }
                 }
             }
+            // `meta/run_flow` accepts `role_targets`. A client checks for this
+            // before sending them: a server without it ignores the binding
+            // and runs the flow role-wide.
+            match crate::live_contracts::FeatureCapability::new(
+                crate::flow_role_targets::FLOW_ROLE_TARGETS_FEATURE,
+            ) {
+                Ok(capability) => feature_capabilities.push(capability),
+                Err(error) => tracing::error!(
+                    error,
+                    name = crate::flow_role_targets::FLOW_ROLE_TARGETS_FEATURE,
+                    "flow role targets feature capability refused"
+                ),
+            }
             let announcement_capabilities = crate::mob_announcements::rpc::capabilities_projection(
                 runtime.mob_announcements().as_ref(),
             )
