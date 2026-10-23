@@ -1585,10 +1585,7 @@ async fn every_released_h_local_capture_reads_as_its_plan() {
                 .await
                 .expect("read the capture's member history");
         for (identity, facts) in manifest["identities"].as_object().expect("identities") {
-            if facts["sessions_seen"]
-                .as_array()
-                .is_none_or(|seen| seen.is_empty())
-            {
+            if facts["sessions_seen"].as_array().is_none_or(Vec::is_empty) {
                 continue;
             }
             let member = meerkat_meta::member_comms_id::roster_member_id_for_identity(identity);
