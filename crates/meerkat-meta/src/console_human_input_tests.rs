@@ -1466,7 +1466,24 @@ async fn console_send_selected_skills_reach_a_member_only_worker() {
     assert_eq!(
         h.reserved_inputs(&accepted.identity).await,
         frames_before_replay,
-        "the replay reserved and dispatched nothing new"
+        "the replay reserved nothing new"
+    );
+    // Nor did it dispatch anything: observing the turn again through its
+    // delivery identity resolves to the committed one, and the worker's
+    // history still holds exactly one SkillContext for the interaction.
+    h.finish_human_with_skills(&accepted, HUMAN, vec![key.clone()])
+        .await;
+    let messages = h
+        .unified
+        .mob_runtime()
+        .read_session_history(accepted.session_id.as_deref().unwrap(), 0, None)
+        .await
+        .unwrap()
+        .messages;
+    assert_eq!(
+        skill_context_rows(&messages, &accepted.interaction_id).len(),
+        1,
+        "the replay dispatched nothing new"
     );
     h.stop().await;
 }
