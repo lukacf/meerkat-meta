@@ -2055,7 +2055,11 @@ STAGE_CHANGED = "The installation changed while its update was being prepared. N
 
 
 def _stage_binding(receipt):
-    """The receipt facts a prepared Stage read; status observations stay out."""
+    """The receipt facts a prepared Stage relies on: source, owner, runtime state and the staged update.
+
+    Health, Console and log observations stay out, so a status read during the
+    preparation does not refuse it; a changed runtime state or owner does.
+    """
     return {**inspection_binding(receipt), **{key: receipt.get(key) for key in (*BOUND_KEYS, "target")},
         "update": receipt.get("update")}
 
