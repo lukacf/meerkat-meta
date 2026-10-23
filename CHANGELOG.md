@@ -468,7 +468,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   event streams) decodes each complete line as UTF-8 instead of decoding each
   network chunk with replacement: a multi-byte character that a chunk
   boundary split arrived as U+FFFD. A complete line that is not UTF-8 now
-  raises `UnicodeDecodeError` instead of being repaired.
+  raises `UnicodeDecodeError` instead of being repaired. The TypeScript SDK's
+  reader already reassembled split characters; it now throws the decoder's
+  `TypeError` for bytes that are not UTF-8 instead of replacing them.
 
 ### Known limitations
 

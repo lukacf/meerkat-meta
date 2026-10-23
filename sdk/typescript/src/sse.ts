@@ -39,11 +39,15 @@ export function encodeSseEvent(event: SseEvent): string {
  *
  * Handles `id:`, `event:`, `data:` fields and comment lines (`:` prefix).
  * Events are emitted on blank-line boundaries per the SSE spec.
+ *
+ * The stream is decoded as UTF-8 incrementally, so a character that a chunk
+ * boundary splits arrives whole. Bytes that are not UTF-8 throw the decoder's
+ * `TypeError` instead of being replaced with U+FFFD.
  */
 export async function* parseSseStream(
   body: AsyncIterable<Uint8Array>,
 ): AsyncGenerator<SseEvent, void, undefined> {
-  const decoder = new TextDecoder("utf-8");
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   let buffer = "";
   let currentId: string | null = null;
   let currentEvent = "message";
