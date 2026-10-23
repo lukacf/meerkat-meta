@@ -793,7 +793,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   child of a member behind them is told the visible tools of its source.
   Without the forward the trait default answered that the source was not
   live, and the child's fork notice never compared the tools.
-
 - In Meta Forge's guided setup, a guide reply that leaves a saved design with
   incoming-information routes unchanged, such as one that explains the current
   status or asks the next question, is checked against the saved team and
