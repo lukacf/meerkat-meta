@@ -124,7 +124,7 @@ def _assemble(plan):
     _text(owner["deployment"], "Deployment")
     _array(owner["components"], "Selected components")
     native = _closed(owner["native_host"], {"realm", "grant_administrator", "remote_operator",
-        "ingress_domain", "members", "routes"}, "PreparedNativeHost", {"service_parent_administration"})
+        "ingress_domain", "members", "routes"}, "PreparedNativeHost", {"service_parent_administration", "member_classes"})
     realm = _text(native["realm"], "Native realm")
     members = _array(native["members"], "Prepared native members")
     by_member = {}
@@ -169,6 +169,8 @@ def _assemble(plan):
     declarations = _array(application.get("member_classes", []), "Native member-class declarations")
     if any(not isinstance(item, dict) for item in declarations):
         raise CustodyError("Native member-class declarations must retain their selected objects.")
+    if not _same(native.get("member_classes", []), declarations):
+        raise CustodyError("Application and owner member-class selections differ.")
     if not members and (has_helper or not declarations):
         raise CustodyError("An empty initial inventory requires helperless native member classes.")
     if not _same(application["members"], members):

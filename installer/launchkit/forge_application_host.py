@@ -348,7 +348,13 @@ class ForgeApplicationHost:
         application["tool_policy"] = policy
         if "member_classes" in original:
             application["member_classes"] = deepcopy(original["member_classes"])
-        plan = {"schema": 1, "deployment_root": str(deployment_root), "owner": deepcopy(owner),
+        classes = original.get("member_classes", [])
+        if "member_classes" in native and not _same_json_value(native["member_classes"], classes):
+            raise CustodyError("The host owner changed the selected native member classes.")
+        selected_owner = deepcopy(owner)
+        if classes:
+            selected_owner["native_host"]["member_classes"] = deepcopy(classes)
+        plan = {"schema": 1, "deployment_root": str(deployment_root), "owner": selected_owner,
             "startup": deepcopy(startup), "authorities": deepcopy(authorities), "application": application}
         if has_helper:
             plan["acquisition"] = deepcopy(acquisition)

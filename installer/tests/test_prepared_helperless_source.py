@@ -38,7 +38,18 @@ def test_helperless_join_preserves_actual_inventory_and_classes_without_rewritin
 def test_fixed_helperless_inventory_does_not_require_a_class_declaration(tmp_path):
     plan, setup = completed_specimen(tmp_path)
     del plan["application"]["member_classes"]
+    del plan["owner"]["native_host"]["member_classes"]
+    del setup["native_owner"]["native_host"]["member_classes"]
     assert _prepared_plan_source(plan, setup) is plan["application"]
+
+
+@pytest.mark.parametrize("side", ["selected", "completed"])
+def test_helperless_join_refuses_classes_missing_from_either_native_owner(tmp_path, side):
+    plan, setup = completed_specimen(tmp_path)
+    owner = plan["owner"] if side == "selected" else setup["native_owner"]
+    del owner["native_host"]["member_classes"]
+    with pytest.raises(CustodyError, match="selected member classes"):
+        _prepared_plan_source(plan, setup)
 
 
 def test_helperless_original_controller_only_changes_its_selected_parent(tmp_path):
@@ -120,5 +131,5 @@ def test_empty_helperless_join_requires_classes_without_invented_initial_invento
         source["roster"] = [{"identity": "invented", "profile": "application__project"}]
     else:
         source["tool_policy"]["members"] = [{"member_identity": "invented", "grants": []}]
-    with pytest.raises(CustodyError, match="no invented initial inventory"):
+    with pytest.raises(CustodyError, match="no invented initial inventory|selected member classes"):
         _prepared_plan_source(plan, setup)

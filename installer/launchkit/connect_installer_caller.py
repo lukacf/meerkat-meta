@@ -750,7 +750,7 @@ def _prepared_plan_source(plan, setup):
     original, resolved = plan["owner"], setup.get("native_owner")
     owner_fields = {"deployment", "components", "channels", "native_host"}
     native_fields = {"realm", "grant_administrator", "remote_operator", "ingress_domain", "members", "routes"}
-    native_optional = {"service_parent_administration"}
+    native_optional = {"service_parent_administration", "member_classes"}
     if (not isinstance(original, dict) or set(original) != owner_fields
             or not isinstance(resolved, dict) or set(resolved) != owner_fields
             or not isinstance(original["native_host"], dict) or not native_fields <= original["native_host"].keys()
@@ -760,6 +760,11 @@ def _prepared_plan_source(plan, setup):
             or not _same_json_value(original["native_host"]["members"], source.get("members"))):
         raise CustodyError("The completed preparation requires its exact resolved native owner.")
     before, after = original["native_host"], resolved["native_host"]
+    classes = source.get("member_classes", [])
+    if (not isinstance(classes, list) or any(not isinstance(row, dict) for row in classes)
+            or not _same_json_value(before.get("member_classes", []), classes)
+            or not _same_json_value(after.get("member_classes", []), classes)):
+        raise CustodyError("The completed native owner changed its selected member classes.")
     administration = [_selected_service_parent_administration(value.get("service_parent_administration"),
         routes=value["routes"], remote_operator=value["remote_operator"]) for value in (before, after)]
     if not _same_json_value(*administration):
@@ -971,11 +976,11 @@ class CompletedApplicationSetupBundle:
     """
 
     directory: tuple
-    resources_directory: tuple
+    resources_directory: tuple | None
     manifest: ExactFile
     setup: ExactFile
     application_tool_policy: ExactFile
-    resource_handoff: ExactFile
+    resource_handoff: ExactFile | None
     setup_input: ExactFile | None
     member_surfaces: tuple[tuple[ExactFile, ExactFile], ...]
     source_files: tuple[ExactFile, ...]
@@ -983,13 +988,20 @@ class CompletedApplicationSetupBundle:
     preparation_plan: ExactFile | None = None
     _require_filesystem_current: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
+    @property
+    def artifact_directory(self):
+        """Actual native artifact root; helperless output has no resource copy."""
+        return self.resources_directory if self.resources_directory is not None else self.directory
+
     def pins(self):
         return {"directory": {"path": str(self.directory[0]),
                     "device": self.directory[1][0], "inode": self.directory[1][1]},
-                "resources_directory": {"path": str(self.resources_directory[0]),
-                    "device": self.resources_directory[1][0], "inode": self.resources_directory[1][1]},
+                **({"resources_directory": {"path": str(self.resources_directory[0]),
+                    "device": self.resources_directory[1][0], "inode": self.resources_directory[1][1]}}
+                   if self.resources_directory is not None else {}),
                 **{name: getattr(self, name).pin() for name in (
-                    "manifest", "setup", "application_tool_policy", "resource_handoff")},
+                    "manifest", "setup", "application_tool_policy", "resource_handoff")
+                    if getattr(self, name) is not None},
                 **({"preparation_plan": self.preparation_plan.pin()} if self.preparation_plan is not None
                    else {"setup_input": self.setup_input.pin()}),
                 "member_surfaces": [{"original": original.pin(), "output": output.pin()}
@@ -1010,7 +1022,7 @@ class CompletedApplicationSetupBundle:
 
         require_current()
         if (_private_directory(self.directory[0]) != self.directory
-                or _private_directory(self.resources_directory[0]) != self.resources_directory):
+                or _private_directory(self.artifact_directory[0]) != self.artifact_directory):
             raise CustodyError("The retained completed setup directories changed.")
         input_pin = self.preparation_plan if self.preparation_plan is not None else self.setup_input
         source_bytes = input_pin.read()
@@ -1038,29 +1050,41 @@ class CompletedApplicationSetupBundle:
                 or artifacts.get("application-tool-policy.json") != self.application_tool_policy
                 or not _same_json_value(setup.get("application_tool_policy"), {
                     "name": self.application_tool_policy.path.name,
-                    "sha256": self.application_tool_policy.sha256})
-                or not _same_json_value(setup.get("resources"), {
-                    "artifact_directory": str(self.resources_directory[0]),
-                    "handoff": self.resource_handoff.pin()})):
-            raise CustodyError("The completed setup changed its selected policy or resource references.")
+                    "sha256": self.application_tool_policy.sha256})):
+            raise CustodyError("The completed setup changed its selected policy references.")
+        has_helper = "helper" in source
+        if has_helper:
+            if (self.resources_directory is None or self.resource_handoff is None
+                    or "artifact_directory" in setup
+                    or not _same_json_value(setup.get("resources"), {
+                        "artifact_directory": str(self.resources_directory[0]),
+                        "handoff": self.resource_handoff.pin()})):
+                raise CustodyError("The completed setup changed its selected resource references.")
+        elif (self.preparation_plan is None or self.resources_directory is not None
+                or self.resource_handoff is not None
+                or set(setup) != {"schema", "native_owner", "input_sha256", "realm", "definition_source",
+                    "definition", "native_members", "artifact_directory", "application_tool_policy"}
+                or setup["artifact_directory"] != str(self.directory[0])):
+            raise CustodyError("Helperless completion requires its exact compiler-owned artifact directory.")
         source_helper, helper = source.get("helper"), setup.get("helper")
         selections, members = source.get("members"), setup.get("native_members")
-        if (not isinstance(source_helper, dict) or not isinstance(source_helper.get("member"), dict)
+        if (not isinstance(selections, list) or not isinstance(members, list) or len(members) != len(selections)):
+            raise CustodyError("The completed setup changed its selected member inventory.")
+        if has_helper and (not isinstance(source_helper, dict) or not isinstance(source_helper.get("member"), dict)
                 or not isinstance(helper, dict) or not isinstance(helper.get("member"), dict)
-                or not isinstance(selections, list) or not selections
-                or not isinstance(members, list) or len(members) != len(selections)
+                or not selections
                 or not _same_json_value(setup.get("source_helper_member"), source_helper["member"])
                 or not _same_json_value(
                     {key: value for key, value in source_helper["member"].items() if key != "role"},
                     {key: value for key, value in helper["member"].items() if key != "role"})):
             raise CustodyError("The completed setup changed its source and final helper associations.")
         helper_indices = [index for index, row in enumerate(selections)
-            if isinstance(row, dict) and _same_json_value(row.get("member"), source_helper["member"])]
-        if len(helper_indices) != 1:
+            if has_helper and isinstance(row, dict) and _same_json_value(row.get("member"), source_helper["member"])]
+        if has_helper and len(helper_indices) != 1:
             raise CustodyError("The retained schema4 input has an ambiguous source helper association.")
         references = []
         for index, (selected, member) in enumerate(zip(selections, members)):
-            expected_member = helper["member"] if index == helper_indices[0] else selected.get("member") if isinstance(selected, dict) else None
+            expected_member = helper["member"] if index in helper_indices else selected.get("member") if isinstance(selected, dict) else None
             reference = member.get("initial_surface") if isinstance(member, dict) else None
             if (not isinstance(selected, dict) or not isinstance(member, dict)
                     or not isinstance(selected.get("member"), dict) or not isinstance(member.get("member"), dict)
@@ -1074,7 +1098,7 @@ class CompletedApplicationSetupBundle:
                     or not re.fullmatch(r"member-surface-[0-9a-f]{64}\.json", reference["name"])
                     or not re.fullmatch(r"[0-9a-f]{64}", reference["sha256"])):
                 raise CustodyError("The completed setup changed its exact member reference inventory.")
-            references.append((ExactFile(self.resources_directory[0] / reference["name"], reference["sha256"]),
+            references.append((ExactFile(self.artifact_directory[0] / reference["name"], reference["sha256"]),
                                ExactFile(self.directory[0] / reference["name"], reference["sha256"])))
         if (len({output.path.name for _, output in references}) != len(references)
                 or tuple(references) != self.member_surfaces
@@ -1097,7 +1121,7 @@ class CompletedApplicationSetupBundle:
         # These literal identity/profile strings associate the retained row.
         # Native alone resolves roster member IDs and all other typed row values.
         roster, retained_row = source.get("roster"), setup.get("source_helper_roster")
-        if (not isinstance(roster, list) or not isinstance(retained_row, dict)
+        if has_helper and (not isinstance(roster, list) or not isinstance(retained_row, dict)
                 or not isinstance(retained_row.get("identity"), str)
                 or not _same_json_value(retained_row.get("profile"), source_helper["member"].get("role"))
                 or sum(isinstance(row, dict)
@@ -1105,7 +1129,8 @@ class CompletedApplicationSetupBundle:
                     and _same_json_value(row.get("profile"), retained_row.get("profile"))
                     for row in roster) != 1):
             raise CustodyError("The completed setup changed its retained source helper roster association.")
-        self.resource_handoff.read()
+        if self.resource_handoff is not None:
+            self.resource_handoff.read()
         for original, output in references:
             if _completed_surface(original) != _completed_surface(output):
                 raise CustodyError("The completed member surface differs from its original resource bytes.")
@@ -1113,7 +1138,8 @@ class CompletedApplicationSetupBundle:
         # Reauthenticate the entire supplied source closure and output pins after
         # observation. Currentness remains the existing application owner's duty.
         for pin in (input_pin, *self.source_files, self.manifest, self.setup,
-                    self.application_tool_policy, self.resource_handoff):
+                    self.application_tool_policy,
+                    *((self.resource_handoff,) if self.resource_handoff is not None else ())):
             pin.read()
         if self.preparation_plan is not None:
             _private_parent(_path(input_pin.path))
@@ -1121,7 +1147,7 @@ class CompletedApplicationSetupBundle:
             _completed_surface(original)
             _completed_surface(output)
         if (_private_directory(self.directory[0]) != self.directory
-                or _private_directory(self.resources_directory[0]) != self.resources_directory
+                or _private_directory(self.artifact_directory[0]) != self.artifact_directory
                 or {path.name for path in self.directory[0].iterdir()} != set(artifacts) | {"manifest.json"}):
             raise CustodyError("The completed setup closure changed during observation.")
         require_current()
@@ -1536,21 +1562,29 @@ class NativeInstallerCaller:
         directory = _private_directory(manifest.path.parent)
         setup = artifacts["application-setup.json"]
         value = _json(setup.read())
-        resources = value.get("resources") if isinstance(value, dict) else None
-        if (not isinstance(resources, dict) or not isinstance(resources.get("artifact_directory"), str)
-                or not isinstance(value.get("native_members"), list)):
-            raise CustodyError("The completed setup lacks its retained resource and member references.")
-        resource_directory = _private_directory(Path(resources["artifact_directory"]))
-        if (directory[0] == resource_directory[0] or directory[0] in resource_directory[0].parents
-                or resource_directory[0] in directory[0].parents):
-            raise CustodyError("The completed setup output overlaps its original resources.")
-        handoff = _artifact_pin(resources.get("handoff"))
-        if handoff.path != resource_directory[0] / "prepare.stdout":
-            raise CustodyError("The completed setup changed its original resource handoff path.")
+        if not isinstance(value, dict) or not isinstance(value.get("native_members"), list):
+            raise CustodyError("The completed setup lacks its retained member references.")
+        resource_directory, handoff = None, None
+        if "helper" in value:
+            resources = value.get("resources")
+            if ("artifact_directory" in value or not isinstance(resources, dict)
+                    or not isinstance(resources.get("artifact_directory"), str)):
+                raise CustodyError("The completed setup lacks its retained resource references.")
+            resource_directory = _private_directory(Path(resources["artifact_directory"]))
+            if (directory[0] == resource_directory[0] or directory[0] in resource_directory[0].parents
+                    or resource_directory[0] in directory[0].parents):
+                raise CustodyError("The completed setup output overlaps its original resources.")
+            handoff = _artifact_pin(resources.get("handoff"))
+            if handoff.path != resource_directory[0] / "prepare.stdout":
+                raise CustodyError("The completed setup changed its original resource handoff path.")
+        elif (preparation_plan is None or "resources" in value
+                or value.get("artifact_directory") != str(directory[0])):
+            raise CustodyError("Helperless completion requires its exact compiler-owned artifact directory.")
+        artifact_directory = resource_directory if resource_directory is not None else directory
         source_paths = [input_pin.path, *(pin.path for pin in source_files)]
         if len(set(source_paths)) != len(source_paths) or any(
                 path == owner or owner in path.parents
-                for path in source_paths for owner in (directory[0], resource_directory[0])):
+                for path in source_paths for owner in (directory[0], artifact_directory[0])):
             raise CustodyError("The completed setup must preserve separate original source custody.")
         surfaces = []
         for member in value["native_members"]:
@@ -1559,7 +1593,7 @@ class NativeInstallerCaller:
                     or not isinstance(reference["name"], str) or not isinstance(reference["sha256"], str)
                     or not re.fullmatch(r"member-surface-[0-9a-f]{64}\.json", reference["name"])):
                 raise CustodyError("The completed setup lacks flat native member surface references.")
-            surfaces.append((ExactFile(resource_directory[0] / reference["name"], reference["sha256"]),
+            surfaces.append((ExactFile(artifact_directory[0] / reference["name"], reference["sha256"]),
                              ExactFile(directory[0] / reference["name"], reference["sha256"])))
         bundle = CompletedApplicationSetupBundle(directory, resource_directory, manifest, setup,
             artifacts["application-tool-policy.json"], handoff, setup_input, tuple(surfaces),

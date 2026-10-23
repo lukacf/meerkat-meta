@@ -161,6 +161,7 @@ def test_host_passes_exact_selected_class_declarations_into_native_plan(selected
     source = json.loads(selected.inventory.read())
     assert chosen == original
     assert result["application"]["member_classes"] == source["member_classes"]
+    assert result["owner"]["native_host"]["member_classes"] == source["member_classes"]
     assert result["application"]["roster"] == source["roster"]
     assert all(row["identity"] != "project:main" for row in result["application"]["roster"])
     assert result["application"]["definition"]["text"] == selected.definition.read().decode()
@@ -170,6 +171,16 @@ def test_host_passes_exact_selected_class_declarations_into_native_plan(selected
         assert "acquisition" not in result and result["authorities"] == {}
         assert not {"helper", "helper_tools", "helper_profile"} & result["application"].keys()
         assert [row["identity"] for row in source["roster"]] == ["assistant:main"]
+
+
+@pytest.mark.parametrize("helperless", [False, True])
+def test_host_refuses_a_different_owner_class_selection(selected, monkeypatch, helperless):
+    selected = select_member_classes(selected, helperless=helperless)
+    retained, actual = observation(selected, monkeypatch)
+    chosen = declarations(selected, actual)
+    chosen["owner"]["native_host"]["member_classes"] = []
+    with pytest.raises(CustodyError, match="selected native member classes"):
+        selected.host.preparation_plan(retained, **chosen)
 
 
 @pytest.mark.parametrize("field", ["helper", "acquisition"])

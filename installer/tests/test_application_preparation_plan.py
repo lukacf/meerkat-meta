@@ -123,6 +123,7 @@ def helperless_fixture(root, *, empty=False):
         native["routes"] = []
     application["member_classes"] = [{"id": "project", "profile": "application__project",
         "factory": "application:project", "callbacks": [], "grants": []}]
+    native["member_classes"] = deepcopy(application["member_classes"])
     return f
 
 
@@ -208,6 +209,7 @@ def test_helperful_plan_also_preserves_selected_member_classes(tmp_path):
     f.plan["authorities"] = {}
     f.plan["application"]["member_classes"] = [{"id": "project", "profile": "application__project",
         "factory": "application:project", "callbacks": [], "grants": []}]
+    f.plan["owner"]["native_host"]["member_classes"] = deepcopy(f.plan["application"]["member_classes"])
     assert f.assemble() == f.plan
 
 
