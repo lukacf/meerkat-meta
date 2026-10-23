@@ -122,6 +122,32 @@ def test_the_public_runtime_takes_no_selected_product_or_candidate():
         compiler.package_availability(plan(), public_runtime=True, verified_artifacts=object())
 
 
+def test_agent_team_download_and_preview_are_the_meta_package():
+    # The download (POST /api/blueprint/package) and its preview (POST
+    # /api/blueprint/validate) give the package Install agent team installs.
+    import zipfile
+    spec = plan()
+    prefix = spec["project"]["slug"] + "/"
+    with zipfile.ZipFile(io.BytesIO(compiler.build_archive(spec))) as archive:
+        files = {name.removeprefix(prefix): archive.read(name) for name in archive.namelist()}
+    expected = public_files(spec)
+    assert json.loads(files["deployment.json"])["mobkitVersion"] == VERSION
+    assert b"meerkat-mobkit" not in files["requirements.txt"] and "requirements.sdk.txt" in files
+    digests = lambda values: {name: hashlib.sha256(value).hexdigest() for name, value in values.items()}
+    assert digests(files) == digests({name: item.as_bytes() for name, item in expected.items()})
+    preview = compiler.package_preview(spec)
+    assert preview["mobkit_version"] == VERSION
+    assert {item["path"] for item in preview["files"]} == set(expected)
+    unlisted = plan(provider="anthropic", model="claude-opus-4-6")
+    reason = public_meta_runtime.models_unlisted_reason([("anthropic", "claude-opus-4-6")])
+    held = compiler.package_preview(unlisted)
+    assert held["package_availability"]["reason"] == reason and held["files"] == []
+    assert held["checks"] == [{"label": "Model catalog", "status": "pending-configuration", "detail": reason}]
+    with pytest.raises(ValueError) as refused:
+        compiler.build_archive(unlisted)
+    assert str(refused.value) == reason
+
+
 def test_meta_release_assets_follow_the_recorded_manifest_tiers(tmp_path, monkeypatch):
     tiers = {name: [row[1].lstrip("*") for row in manifest_rows(name)]
         for name in ("checksums.sha256", "checksums-trailing.sha256")}
