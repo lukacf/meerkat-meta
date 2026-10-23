@@ -156,7 +156,7 @@ export interface MetaBuilderConfig {
    */
   initDeadlineMs: number | null;
   /** The `meta/init` parameter `shutdown_in_flight_drain_ms`; `null` sends nothing. */
-  shutdownInFlightDrainMs?: number | null;
+  shutdownInFlightDrainMs: number | null;
   modules: unknown[];
   persistentState: string | null;
   rosterProvider: RosterProvider | null;
@@ -200,6 +200,7 @@ function defaultConfig(): MetaBuilderConfig {
     gatewayTimeoutMs: null,
     gatewayBin: null,
     initDeadlineMs: null,
+    shutdownInFlightDrainMs: null,
     modules: [],
     persistentState: null,
     rosterProvider: null,

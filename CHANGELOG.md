@@ -254,13 +254,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   SDK shutdown handshake or SIGTERM, `rpc_gateway` stops taking new work,
   stops the mob with its members' current runs left running, and waits for
   those runs up to the window. The shutdown that follows cancels what is
-  still running, as before. SIGINT and a closed stdin shut down at once. The
-  advertised `stdio_shutdown_horizon_ms` grows by the window plus 10 seconds,
-  and the `meta/shutdown` answer reports the drain as `in_flight_drain`.
-  Without the parameter nothing changes. Embedded hosts call the same drain
-  as `UnifiedRuntime::drain_in_flight_turns`, and a host composition stops
-  its own admissions first in `GatewayHostComposition::stop_admitting` (a
-  default no-op).
+  still running, as before. Any other stop (SIGINT, a closed stdin or host, a
+  cancelled caller) shuts down at once. The advertised
+  `stdio_shutdown_horizon_ms` grows by the window plus 10 seconds, and the
+  `meta/shutdown` answer reports the drain as `in_flight_drain`. Without the
+  parameter nothing changes. Embedded hosts call the same drain as
+  `UnifiedRuntime::drain_in_flight_turns`, and a host composition stops its
+  own admissions first in `GatewayHostComposition::stop_admitting` (a default
+  no-op).
 
 ### Changed
 
