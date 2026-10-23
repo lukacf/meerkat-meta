@@ -1214,9 +1214,11 @@ async fn the_dispatcher_starts_once_the_declarations_are_reconciled() {
     let starting = tokio::spawn({
         let service = harness.service.clone();
         async move {
-            service
-                .start_after_reconcile(std::time::Duration::from_secs(30))
-                .await
+            drop(
+                service
+                    .start_after_reconcile(std::time::Duration::from_secs(30))
+                    .await,
+            );
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1225,7 +1227,7 @@ async fn the_dispatcher_starts_once_the_declarations_are_reconciled() {
         "the dispatcher waits for the reconcile"
     );
     drop(held);
-    drop(starting.await.unwrap());
+    starting.await.unwrap();
     assert_eq!(
         subscription_state(&harness.service, "declared-a")
             .await
@@ -1256,15 +1258,17 @@ async fn the_dispatcher_starts_once_the_declarations_are_reconciled() {
     let starting = tokio::spawn({
         let service = stopping.service.clone();
         async move {
-            service
-                .start_after_reconcile(std::time::Duration::from_secs(30))
-                .await
+            drop(
+                service
+                    .start_after_reconcile(std::time::Duration::from_secs(30))
+                    .await,
+            );
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     stopping.service.stop();
     drop(held);
-    drop(starting.await.unwrap());
+    starting.await.unwrap();
     assert!(
         stopping.service.is_stopped(),
         "a stop asked for before the dispatcher started holds"
