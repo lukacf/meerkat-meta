@@ -2044,9 +2044,24 @@ class DeploymentService:
         if deployment_id in self.tasks:
             raise DraftConflict("Wait for this deployment's active operation before updating its supervisor.")
 
+    async def _require_installed_service_readable(self, directory, deployment_id=None):
+        """Refuse a start or support refresh of an earlier launchd unit in a protected macOS folder.
+
+        It runs before any manager call. Stop is never refused.
+        """
+        from .deployment_service import installed_service_folder_refusal
+        receipt = read_receipt(directory)
+        if ((deployment_id is not None and receipt.get("deployment_id") != deployment_id)
+                or receipt.get("execution_mode") != "background" or not isinstance(receipt.get("service"), dict)):
+            return
+        refusal = await await_validation(installed_service_folder_refusal, receipt["service"], receipt)
+        if refusal is not None:
+            raise DraftConflict(refusal)
+
     async def _prepare_supervisor_refresh_locked(self, guide_id, deployment_id, *, expected_service_digest, revision=None):
         directory = self._directory(guide_id)
         self._support_current(guide_id, deployment_id, directory)
+        await self._require_installed_service_readable(directory, deployment_id)
         current = lambda: self._support_current(guide_id, deployment_id, directory)
         from .deployment_supervisor import prepare, require_selected_stopped
         selected = read_receipt(directory).get("supervisor_refresh")
@@ -2068,6 +2083,7 @@ class DeploymentService:
     async def _apply_supervisor_refresh_locked(self, guide_id, deployment_id, revision, *, expected_digest):
         directory = self._directory(guide_id)
         self._support_current(guide_id, deployment_id, directory)
+        await self._require_installed_service_readable(directory, deployment_id)
         from .deployment_supervisor import apply
         return await apply(directory, revision, self.service_manager, expected_digest=expected_digest,
             require_current=lambda: self._support_current(guide_id, deployment_id, directory))
@@ -3677,6 +3693,8 @@ class DeploymentService:
             self._destination_control_owner(destination_owner, guide_id, deployment_id)
             if action not in {"stop", "restart"} or update_id is not None or application_startup is not None:
                 raise DraftConflict("Destination lifecycle cannot select origin source updates or installation retry.")
+        if action in {"restart", "retry"}:
+            await self._require_installed_service_readable(directory, deployment_id)
         receipt = read_receipt(directory) if application_startup is not None else await self.status(guide_id,
             **({"destination_owner": destination_owner} if destination_owner is not None else {}))
         if receipt["deployment_id"] != deployment_id:

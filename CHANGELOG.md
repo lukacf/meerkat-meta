@@ -665,7 +665,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   message. The reason now says so and suggests a folder such as
   `~/MetaForge`, or **While Forge is open** (on the setup card, **Start
   installed application**). Forge does not look inside those folders to
-  decide this and changes no privacy setting.
+  decide this and changes no privacy setting. A background service installed
+  earlier with its files in such a folder is not moved: **Restart**, **Retry**
+  and **Installation support** refuse it with the same reason before any
+  service manager call, its status says why it is still starting, and
+  **Stop** still works.
 - A background service that ended before it started the application, such
   as one whose Python stalled while starting, now stops at once and no
   longer blocks a restart. Its Stop waited 60 seconds for a cleanup report

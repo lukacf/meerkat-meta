@@ -1204,9 +1204,10 @@ service when available. That service survives closing Forge and can be recovered
 stopped or restarted from its saved ownership receipt. On macOS it is unavailable
 while Forge's folder or the installation folder is in Desktop, Documents,
 Downloads, iCloud Drive, a cloud storage folder or another volume, because macOS
-does not let a background login item read them. The interactive mode stays
-supervised by Forge and stops with its host. Both preserve installed files and
-native history.
+does not let a background login item read them. A service installed there earlier
+is not moved: Forge refuses to restart it or refresh its support, says why it is
+still starting, and can still stop it. The interactive mode stays supervised by
+Forge and stops with its host. Both preserve installed files and native history.
 
 A stop waits for the application's native gateway shutdown. That is the horizon
 its runtime reports at readiness (this repository's gateway horizon when it reports

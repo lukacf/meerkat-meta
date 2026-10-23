@@ -238,6 +238,19 @@ def launchd_folder_refusal(paths, *, home=None, volumes=None, setup_card=False):
     return _PROTECTED_REASONS[kind] + " " + (_SETUP_CARD if setup_card else _NEW_INSTALLATION)
 
 
+def installed_service_folder_refusal(service, receipt):
+    """The typed refusal for an existing launchd unit whose own files are protected, or None.
+
+    No migration: the unit runs the interpreter its definition names, from the
+    deployment directory that holds service-host/launcher.py, for the
+    installation folder. Stop is never refused.
+    """
+    if not isinstance(service, dict) or service.get("manager") != "launchd":
+        return None
+    paths = [service.get("interpreter"), service.get("receipt_directory"), receipt.get("destination")]
+    return launchd_folder_refusal([path for path in paths if isinstance(path, str) and path])
+
+
 def service_plan(identity, directory, *, platform=None, home=None):
     if str(uuid.UUID(identity)) != identity:
         raise ValueError("Use the exact owned deployment identity.")
@@ -920,6 +933,13 @@ async def background_status(directory, manager):
             }
             if changes["status"] in details:
                 changes["detail"] = details[changes["status"]]
+        if changes.get("status", observed.get("status")) == "starting" and not matching:
+            # An earlier unit whose files are in a protected macOS folder waits
+            # in Python start-up and never registers. Say why, as a projection.
+            from .deployment import await_validation
+            reason = await await_validation(installed_service_folder_refusal, service, observed)
+            if reason is not None:
+                changes["detail"] = reason
         return {**observed, **changes}
     except (OSError, ValueError, DraftConflict, RuntimeError, TimeoutError) as error:
         observation = {"owned": False, "state": "unknown", "checked_at": now()}

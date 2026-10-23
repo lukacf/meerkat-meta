@@ -9,13 +9,17 @@ with no message. Options and submit say so before anything is installed.
 These rows use a fake home and a fake launchd manager. Nothing here reads a
 real protected folder or changes a privacy setting.
 """
+import asyncio
 import os
 from pathlib import Path
 import sys
+import uuid
 
 import pytest
 
 import launchkit.deployment_service as deployment_service
+from launchkit.deployment import DeploymentService, materialize, read_receipt, update_receipt
+from launchkit.projects import DraftConflict
 from test_deployment import Guide, Implementation, Service, submit
 
 # Third-party cloud folders (~/Library/CloudStorage) are refused too, failing closed.
@@ -198,3 +202,114 @@ async def test_background_follows_links_without_looking_inside_protected_folders
     assert home / "MetaForge" in lookups, "The check reads the link where it is."
     protected = home / "Documents"
     assert not [path for path in lookups if protected in path.parents], lookups
+
+
+@pytest.fixture(params=["darwin"])
+async def earlier_service(request, home, tmp_path, monkeypatch):
+    """A service installed before this preflight, with its Python in Documents.
+
+    No migration: the unit keeps the interpreter its definition names.
+    """
+    from test_deployment_service import Manager as ServiceManager
+    plan = deployment_service.service_plan
+    monkeypatch.setattr(deployment_service, "service_plan", lambda identity, root, **options:
+        plan(identity, root, **{**options, "platform": request.param, "home": Path.home()}))
+    guide = Guide()
+    manager = ServiceManager()
+    service = Service(tmp_path / "private", guide, Implementation(guide), service_manager=manager)
+    with monkeypatch.context() as earlier:
+        # No preflight existed when this service was installed.
+        earlier.setattr(DeploymentService, "_background_folder_refusal", lambda self, *args, **kwargs: None)
+        receipt = await submit(service, tmp_path / "application", execution_mode="background")
+        directory = service._directory(guide.identity)
+        materialize(directory)
+        service.tasks[receipt["deployment_id"]].cancel()
+        await asyncio.gather(*service.tasks.values(), return_exceptions=True)
+        service.tasks.clear()
+        earlier.setattr(sys, "executable", str(home / "Documents/MetaForge/.venv/bin/python"))
+        unit = deployment_service.prepare_service(directory, read_receipt(directory))
+    assert unit["interpreter"].startswith(str(home / "Documents"))
+    yield service, manager, directory
+    await service.shutdown()
+
+
+def waiting_in_start_up(directory, manager):
+    # The unit's Python is waiting on a protected folder and never registered.
+    update_receipt(directory, status="starting", phase="service", service_cleanup_confirmed=False)
+    manager.observation = {"loaded": True, "pid": 98110, "state": "running"}
+
+
+def no_manager_effect(manager):
+    return not [call for call in manager.calls if call[0] in {"observe", "start", "stop"}]
+
+
+@pytest.mark.parametrize("action", ["restart", "retry"])
+async def test_earlier_service_in_a_protected_folder_refuses_a_start_before_any_manager_call(
+        earlier_service, action):
+    service, manager, directory = earlier_service
+    waiting_in_start_up(directory, manager)
+    before = read_receipt(directory)
+    manager.calls.clear()
+    with pytest.raises(DraftConflict) as refused:
+        await service.action(service.guide.identity, directory.name, action)
+    assert str(refused.value) == FOLDER_REFUSAL
+    assert no_manager_effect(manager)
+    after = read_receipt(directory)
+    assert after["status"] == before["status"]
+    assert deployment_service.service_binding(after["service"]) == deployment_service.service_binding(before["service"])
+
+
+@pytest.mark.parametrize("action", ["prepare-support", "apply-support"])
+async def test_earlier_service_in_a_protected_folder_refuses_a_support_refresh_before_any_manager_call(
+        earlier_service, action):
+    service, manager, directory = earlier_service
+    update_receipt(directory, status="stopped", service_cleanup_confirmed=True)
+    manager.calls.clear()
+    support = ({"expected_service_digest": "a" * 64} if action == "prepare-support"
+               else {"revision": str(uuid.uuid4()), "descriptor_sha256": "b" * 64})
+    with pytest.raises(Exception) as refused:
+        await service.action(service.guide.identity, directory.name, action,
+                             action_request_id=str(uuid.uuid4()), **support)
+    assert (type(refused.value), str(refused.value)) == (DraftConflict, FOLDER_REFUSAL)
+    assert no_manager_effect(manager)
+    assert not (directory / "supervisor-refresh").exists()
+
+
+async def test_earlier_service_in_a_protected_folder_can_still_stop(earlier_service, monkeypatch):
+    from test_deployment_service import ended_pid
+    service, manager, directory = earlier_service
+    monkeypatch.setattr(deployment_service, "SERVICE_TIMEOUT", 2)
+    waiting_in_start_up(directory, manager)
+    manager.observation = {"loaded": True, "pid": ended_pid(), "state": "running"}
+    stopped = await service.action(service.guide.identity, directory.name, "stop")
+    assert stopped["status"] == "stopped"
+
+
+@pytest.mark.parametrize("earlier_service", ["linux"], indirect=True)
+async def test_a_linux_user_service_with_its_python_in_documents_still_restarts(earlier_service):
+    service, manager, directory = earlier_service
+    manager.cleanup = directory
+    update_receipt(directory, status="running", service_supervisor_pid=4567, service_instance_id="generation-one",
+                   service_cleanup_confirmed=False)
+    manager.observation = {"loaded": True, "pid": 4567, "state": "running"}
+    restarted = await service.action(service.guide.identity, directory.name, "restart")
+    assert restarted["status"] == "starting"
+    assert [call[0] for call in manager.calls if call[0] != "observe"] == ["stop", "start"]
+
+
+async def test_status_names_the_folder_an_earlier_service_waits_on(earlier_service):
+    _, manager, directory = earlier_service
+    waiting_in_start_up(directory, manager)
+    status = await deployment_service.background_status(directory, manager)
+    assert (status["status"], status["detail"]) == ("starting", FOLDER_REFUSAL)
+    assert read_receipt(directory)["detail"] != FOLDER_REFUSAL, "The reason is a status projection only."
+
+
+async def test_status_of_an_earlier_service_running_in_a_protected_folder_is_unchanged(earlier_service):
+    # A lifetime registered there, so this computer lets it read the folder.
+    _, manager, directory = earlier_service
+    update_receipt(directory, status="running", service_supervisor_pid=4567,
+                   service_instance_id=str(uuid.uuid4()), service_cleanup_confirmed=False)
+    manager.observation = {"loaded": True, "pid": 4567, "state": "running"}
+    status = await deployment_service.background_status(directory, manager)
+    assert status["detail"] != FOLDER_REFUSAL
