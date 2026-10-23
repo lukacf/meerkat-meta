@@ -42,9 +42,9 @@ A corrected response can then be submitted against that same version.
 A guide reply that leaves the design unchanged can use the saved team's
 recipients, whether it explains the current status or asks the next question.
 It does not need to compile or stage a replacement team. This also applies to
-direct routes for classes with zero initial members. The same reply still
-rejects missing recipients or non-user evidence; initial compiler scaffolding
-does not qualify as a saved team.
+direct routes for classes with zero initial members. Such a reply is still
+rejected when a route names a missing recipient or a source cites non-user
+evidence; initial compiler scaffolding does not qualify as a saved team.
 
 ## Implementation boundary
 
