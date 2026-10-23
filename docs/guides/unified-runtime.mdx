@@ -81,13 +81,15 @@ let runtime = persistent_builder
     .await?;
 ```
 
-Hosts with document MCP bindings wait for configured MCP connection attempts
-before native inherited tool visibility is resolved. This includes every MCP
-server configured for the agent, using each server's `connect_timeout_secs`;
-a failed connection completes the wait but does not make its tools available.
-The wait is enabled only for document-bound hosts and can increase startup
-latency. Hosts without document bindings retain the default asynchronous MCP
-startup behavior.
+Every member waits for its configured MCP connection attempts, document-bound
+or not, before its construction is prepared. A member's authoritative tool
+surface, and the native inherited tool visibility resolved against it, are
+captured after its configured MCP servers connect or fail: the first turn
+waits for each configured MCP server, profile-injected or document-bound, up
+to its connect timeout (`connect_timeout_secs`) plus at most 0.25 s (plus the
+TERM grace for a server that ignores SIGTERM). A failed connection completes
+the wait without making its tools available, and the member's session holds
+a typed setup-failure notice for it.
 
 The configured storage provider must support durable extension documents.
 The disk provider supplies this capability. No factory means no extension
