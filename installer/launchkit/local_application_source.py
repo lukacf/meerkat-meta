@@ -144,15 +144,16 @@ def _initial_policy(spec, inventory, guide_id):
     """
     bundled = {identity for item in spec.agent_classes
         if "meerkat_toolkit.setup" in item.tools.rust_bundles for identity in item.identities()}
+    helper_identity = inventory.get("helper_identity")
     members = []
     for row in inventory["roster"]:
         identity = row["identity"]
-        names = ("setup_report", "toolkit_request_public_service", "toolkit_request_service_account") if identity == inventory["helper_identity"] else (
+        names = ("setup_report", "toolkit_request_public_service", "toolkit_request_service_account") if identity == helper_identity else (
             ("find_and_install",) if identity in bundled else ())
-        if identity == inventory["helper_identity"] and not spec.acquisition.account_requests:
+        if identity == helper_identity and not spec.acquisition.account_requests:
             names = tuple(name for name in names if name != "toolkit_request_service_account")
         grants = [{"tool_name": name, "action": "invoke", "consequence": "r1"} for name in names]
-        if identity == inventory["helper_identity"]:
+        if identity == helper_identity:
             grants += [{"tool_name": name, "action": "invoke", "consequence": consequence}
                 for name, consequence in _CHECKED_SETUP_CONSEQUENCES.items()]
             if spec.acquisition.public_research:
