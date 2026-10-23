@@ -385,3 +385,49 @@ async def test_interruption_before_atomic_publish_leaves_no_final_input(registry
     assert host._accepted_inventory_pin is None
     bind_accepted_build_inventory(f.registry, host, saved["id"], result["build_id"], publish=True)
     assert host._inventory_pin.read() == content
+
+
+def test_documented_zero_callback_class_is_accepted_source_without_a_factory_registry():
+    from launchkit.application_inventory_contract import HELPERLESS_APPLICATION_CONTRACT
+    from launchkit.implementation import APPLICATION_CONTRACT
+    declaration = json.loads(HELPERLESS_APPLICATION_CONTRACT.split("```json\n", 1)[1].split("```", 1)[0])
+    raw = starter_blueprint().model_dump(mode="json")
+    raw["agent_classes"].append({**deepcopy(raw["agent_classes"][0]),
+        "id": "project", "instances": 0, "members": []})
+    spec = Blueprint.model_validate(raw)
+    assert declaration["profile"] == compiler.application_profiles(spec)["project"]
+    inventory = compiler.application_inventory_input(spec, member_classes=[declaration])
+    rows = json.loads(inventory)["roster"]
+    policy = json.dumps({"provider_id": "example", "policy_id": "seeds", "revision": 1,
+        "members": [{"member_identity": row["identity"], "grants": []} for row in rows]}).encode()
+    files = {"blueprint.json": json.dumps(spec.model_dump(mode="json")).encode(),
+        "deployment.json": json.dumps({INVENTORY_FIELD: INVENTORY_PATH}).encode(),
+        INVENTORY_PATH: inventory, POLICY_PATH: policy, "application/tool-policy.json": policy}
+    assert application_inventory_source(files) == inventory
+    assert not any(row["identity"].startswith("project:") for row in rows)
+    assert HELPERLESS_APPLICATION_CONTRACT in APPLICATION_CONTRACT
+    # No native process, factory discovery or application callback is executed.
+
+
+async def test_generated_helperless_example_declares_each_zero_class_in_native_order(registry):
+    from launchkit.application_inventory_contract import HELPERLESS_APPLICATION_CONTRACT
+    f = registry
+    saved = ordinary_guide(f)
+    raw = saved["proposal"]
+    for name in ("zeta", "alpha"):
+        raw["agent_classes"].append({**deepcopy(raw["agent_classes"][0]),
+            "id": name, "instances": 0, "members": []})
+    saved["proposal"] = Blueprint.model_validate(raw).model_dump(mode="json")
+    saved = f.store.save(saved, saved["version"])
+    result = await build(f, saved)
+    project = workspace(f.implementation, result)
+    inventory = json.loads(project.read_file("native-inventory.example.json"))
+    assert inventory["member_classes"] == [{"id": name,
+        "profile": compiler.application_profiles(project.blueprint)[name],
+        "factory": "application:" + name, "callbacks": [], "grants": []}
+        for name in ("alpha", "zeta")]
+    assert [row["identity"] for row in inventory["roster"]] == project.blueprint.identities()
+    assert HELPERLESS_APPLICATION_CONTRACT in project.read_file("README.md")
+    # Generated examples do not silently become accepted application source.
+    with pytest.raises((ValueError, KeyError, FileNotFoundError)):
+        project.read_file(INVENTORY_PATH)

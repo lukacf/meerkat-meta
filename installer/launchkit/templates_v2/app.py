@@ -429,13 +429,22 @@ class Application:
         self._tool_policy_source, self._tool_policy_selection = source, selection
         self._tool_policy_loaded, self._tool_policy_required = True, required
 
+    def _require_tool_policy_roster(self):
+        if self.dynamic and self._tool_policy_selection is not None:
+            from launchkit.connect_policy_input import (
+                APPLICATION_NATIVE_POLICY_PATH, application_tool_policy_path,
+            )
+            # The compiler-selected helperless input covers only existing seeds.
+            # Native class compilation and governed Add own later member grants.
+            if application_tool_policy_path(self.deployment) != APPLICATION_NATIVE_POLICY_PATH:
+                raise ValueError("Explicit application tool policy currently requires a fixed durable roster.")
+
     async def validate_tool_policy_catalog(self, callbacks_by_identity):
         """Report available callback matches and names awaiting native validation."""
         await self.load_tool_policy()
         if self._tool_policy_selection is None:
             return
-        if self.dynamic:
-            raise ValueError("Explicit application tool policy currently requires a fixed durable roster.")
+        self._require_tool_policy_roster()
         identities = {agent["identity"] for agent in self.deployment["agents"]}
         if set(callbacks_by_identity) != identities:
             raise ValueError("Application tool policy catalog needs every fixed identity once.")
@@ -536,8 +545,7 @@ class Application:
             if getattr(self.integration, "admission_roster", None) is not None and not self.dynamic:
                 raise ValueError("Application admission_roster requires desired_roster and desired_edges.")
             self._member_mcp_hooks()
-            if self.dynamic and self._tool_policy_selection is not None:
-                raise ValueError("Explicit application tool policy currently requires a fixed durable roster.")
+            self._require_tool_policy_roster()
             if self.dynamic:
                 await self._prepare_snapshot(initial=True)
             for original in self.deployment["agents"]:
