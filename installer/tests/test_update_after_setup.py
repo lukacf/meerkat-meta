@@ -542,6 +542,43 @@ async def test_pre_stage_bootstrap_admission_is_not_reused_after_stage(local_res
     assert after != before
 
 
+async def test_apply_with_an_action_request_on_a_host_without_a_replacement_owner(local_restore, monkeypatch):
+    """A selected host without a replacement supplier binds no replacement owner.
+
+    Apply with the browser's action request UUID then takes the same update
+    path as without one: the worker installs the set-up application's update.
+    """
+    f = local_restore
+    assert f.service.application_replacement_selection is None
+    await completed_setup(f, monkeypatch)
+    update, report = stage_candidate(f)
+    accept_candidate(f, monkeypatch, report)
+    f.service.launched.clear()
+    applied = await f.service.action(f.guide_id, f.directory.name, "apply-update", update["update_id"],
+        action_request_id=str(uuid4()))
+    assert applied["action_request"]["outcome"] == "returned", applied["action_request"]
+    directory, mode, options = f.service.launched[-1]
+    assert (directory, mode) == (f.directory, "update")
+    worker_type = await run_worker(f, monkeypatch, "update", options["update_selection"])
+    assert worker_type.starts == [] and worker_type.checks == [(report["build_id"], "--application-check")]
+    assert deployment.read_receipt(f.directory)["update"]["status"] == "completed"
+
+
+@pytest.mark.parametrize("with_request", [False, True], ids=["no-action-request", "action-request"])
+async def test_apply_in_a_forge_without_a_selected_host_takes_the_ordinary_update_path(tmp_path, with_request):
+    """A Forge started from source selects no application host and no replacement owner."""
+    service, directory, _, previous, _, identity = await staged(tmp_path)
+    assert service.application_replacement_selection is None
+    options = {"action_request_id": str(uuid4())} if with_request else {}
+    try:
+        await service.action(service.guide.identity, previous["deployment_id"], "apply-update",
+            update_id=identity, **options)
+        assert deployment.read_receipt(directory)["update_action"] == {"action": "apply-update", "update_id": identity}
+        assert directory.name in service.tasks
+    finally:
+        await service.shutdown()
+
+
 async def test_ordinary_update_keeps_its_doctor_check_and_worker_start(tmp_path):
     _, directory, _, previous, _, identity = await staged(tmp_path)
     calls = []

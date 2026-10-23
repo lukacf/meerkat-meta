@@ -30,8 +30,7 @@ from launchkit.templates import install_candidate as adapter
 from test_candidate_deployment_updates import packed
 from test_forge_application_host import encoded
 from test_local_application_prepared_recovery import unavailable_service_query
-from test_local_application_recovery import CALLBACKS
-from test_local_application_registry import (accept_source_fixture, build, install_fixture,
+from test_local_application_registry import (accept_source_fixture, bind_registry, build, install_fixture,
     new_guide, no_processes, no_product_execution, product, registry, workspace)
 from test_local_application_restore import finalize_original
 
@@ -43,6 +42,9 @@ INERT_WORKER_PID = 981237
 async def set_up(registry, monkeypatch):
     """Install, prepare, Fresh and a normal Stop through the real registry."""
     f = registry
+    # The launcher's callbacks, with no replacement supplier: the packaged entry.
+    assert f.registry.replacement_selection is None
+    assert f.service.application_replacement_selection == f.registry._selected_replacement
     monkeypatch.setattr(f.service.service_manager, "command", unavailable_service_query)
     saved = new_guide(f)
     installed = await build(f, saved)
@@ -135,8 +137,11 @@ async def run_worker(f, monkeypatch, mode, selection):
 
 
 async def apply(f, monkeypatch, update):
+    """Apply as the browser sends it: with its own action request UUID."""
     f.service.launched.clear()
-    await f.service.action(f.guide_id, f.directory.name, "apply-update", update["update_id"])
+    applied = await f.service.action(f.guide_id, f.directory.name, "apply-update", update["update_id"],
+        action_request_id=str(uuid4()))
+    assert applied["action_request"]["outcome"] == "returned", applied["action_request"]
     directory, mode, options = f.service.launched[-1]
     assert (directory, mode) == (f.directory, "update")
     return await run_worker(f, monkeypatch, "update", options["update_selection"])
@@ -278,8 +283,7 @@ def reloaded(f, monkeypatch):
     owner = LocalApplicationRegistry(guide_store=store, implementation=implementation,
         deployment=service, runtime_target=f.target)
     implementation.prepare_workspace = owner.prepare_workspace
-    for name, method in CALLBACKS:
-        setattr(service, name, getattr(owner, method))
+    bind_registry(service, owner)
     service.launched = []
     monkeypatch.setattr(service, "_launch",
         lambda directory, mode, **kwargs: service.launched.append((directory, mode, kwargs)))
@@ -364,3 +368,105 @@ async def test_after_a_forge_restart_stage_waits_for_the_reconnected_setup_owner
         assert staged["update"]["setup_restore_sha256"] == f.restore.sha256
     finally:
         await restarted.implementation.shutdown()
+
+
+async def test_apply_keeps_refusing_a_redirect_to_another_installation(set_up, monkeypatch):
+    f = set_up
+    second = await continuation(f)
+    update = await stage(f, second["build_id"])
+    key = (f.guide_id, f.directory.name)
+    host, binding = f.registry._installations[key]
+    # The retained owner anchors another installation folder than this receipt.
+    f.registry._installations[key] = (host, {**binding,
+        "destination": str(f.destination.parent / "another installation")})
+    f.service.launched.clear()
+    with pytest.raises(CustodyError, match="cannot be redirected to another build or source owner"):
+        await f.service.action(f.guide_id, f.directory.name, "apply-update", update["update_id"],
+            action_request_id=str(uuid4()))
+    assert not f.service.launched
+    receipt = deployment.read_receipt(f.directory)
+    assert receipt["build_id"] == f.installed["build_id"] and receipt["update"]["status"] == "staged"
+
+
+async def test_apply_before_the_first_setup_refuses_before_any_worker(registry, monkeypatch):
+    """A product application that has not finished its setup cannot take an update in place.
+
+    Its update worker could not start the application without the setup's
+    startup inputs, so Apply refuses with guidance before any worker is
+    queued. The installed source and the staged update stay as they were.
+    """
+    f = registry
+    saved = new_guide(f)
+    installed = await build(f, saved)
+    await accept_source_fixture(f, installed)
+    directory, destination = await install_fixture(f, saved, installed, monkeypatch)
+    f.saved, f.installed, f.guide_id, f.directory, f.destination = saved, installed, saved["id"], directory, destination
+    second = await continuation(f)
+    update = await stage(f, second["build_id"])
+    assert update["status"] == "staged" and "setup_restore_sha256" not in update
+    before = deployment.read_receipt(directory)
+    f.service.launched.clear()
+    with pytest.raises(CustodyError, match="has not finished its setup, so it cannot take a staged update in place yet"):
+        await f.service.action(f.guide_id, directory.name, "apply-update", update["update_id"],
+            action_request_id=str(uuid4()))
+    assert not f.service.launched
+    after = deployment.read_receipt(directory)
+    assert {key: after.get(key) for key in ("status", "build_id", "package_sha256", "update", "update_action")} == {
+        key: before.get(key) for key in ("status", "build_id", "package_sha256", "update", "update_action")}
+
+
+async def test_apply_without_an_action_request_refuses_before_selection(set_up, monkeypatch):
+    """The launcher's Apply needs the browser's action request UUID, as before."""
+    f = set_up
+    second = await continuation(f)
+    update = await stage(f, second["build_id"])
+
+    def no_selection(*args):
+        pytest.fail("Apply without its action request UUID cannot select an owner.")
+
+    monkeypatch.setattr(f.registry, "selected_host", no_selection)
+    f.service.launched.clear()
+    with pytest.raises(ValueError, match="requires its exact action request UUID"):
+        await f.service.action(f.guide_id, f.directory.name, "apply-update", update["update_id"])
+    assert not f.service.launched
+    assert deployment.read_receipt(f.directory)["update"]["status"] == "staged"
+
+
+async def test_apply_of_a_non_product_application_takes_the_ordinary_update_path(registry, monkeypatch):
+    """An installation without a selected product runtime has no setup owner.
+
+    On the launcher's callbacks, its Apply queues the ordinary update worker,
+    whose checks and start then complete the update.
+    """
+    f = registry
+    saved = new_guide(f, ordinary=True)
+    first = await build(f, saved, ordinary=True)
+    await accept_source_fixture(f, first)
+    directory, _ = await install_fixture(f, saved, first, monkeypatch, ordinary=True)
+    assert f.registry.selected_host(saved["id"], directory.name) is None
+    second = await build(f, saved, "Improve the requested local job.", ordinary=True, previous=first)
+    await accept_source_fixture(f, second)
+    staged = await f.service.stage_update(saved["id"], directory.name, saved["version"], second["build_id"])
+    update = staged["update"]
+    assert update["status"] == "staged" and update["blockers"] == []
+    f.service.launched.clear()
+    applied = await f.service.action(saved["id"], directory.name, "apply-update", update["update_id"],
+        action_request_id=str(uuid4()))
+    assert applied["action_request"]["outcome"] == "returned", applied["action_request"]
+    selected_directory, mode, options = f.service.launched[-1]
+    assert (selected_directory, mode) == (directory, "update")
+    assert "application_startup" not in updates.read_update_admission(directory, "update", options["update_selection"])
+    calls = []
+
+    class Ready(worker.Supervisor):
+        async def command(self, args, *other, **kwargs):
+            calls.append(args[-1])
+
+        async def start(self, definition, *, on_ready):
+            calls.append("start")
+            on_ready()
+
+    await worker.update_runtime(Ready(directory), "update", update_selection=options["update_selection"])
+    receipt = deployment.read_receipt(directory)
+    assert calls == ["--doctor", "--application-check", "start"]
+    assert receipt["update"]["status"] == "completed" and receipt["build_id"] == second["build_id"]

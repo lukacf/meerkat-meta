@@ -83,6 +83,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with that source, and "Restore previous application" returns to the
   previous source if that Start fails. The installation keeps its setup
   across later updates, Stops and Forge restarts.
+- In a Meta Forge started from a product package or a product launcher,
+  "Apply and verify update" refused every staged update with "The original
+  installation cannot be redirected to another build or source owner.": it
+  looked for a replacement owner that these launchers never select. It now
+  takes the ordinary update path. A set-up Meta Toolkit product application
+  updates as described above, and an application without a selected product
+  runtime updates and starts as it does in a Forge started from source. An
+  application that cannot take an update in place yet now gets a refusal
+  that says so before anything changes (see Known limitations).
 - Meta Forge keeps answering other requests while it prepares an
   application's installation options, or admits a Start or Retry of an
   installed application. Hashing, compressing and unpacking the package, and
@@ -101,6 +110,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Meta Toolkit Connect route, an update staged before the application's
   first setup can still make that setup refuse. After Forge restarts, use
   "Continue setup" once before you stage or apply an update.
+- In a Meta Forge started from a product package or a product launcher, an
+  application without a setup helper cannot take a staged update in place
+  yet, and neither can a Meta Toolkit product application that has not
+  finished its setup. "Apply and verify update" refuses such an update
+  before anything changes. Install the new build into a new empty folder;
+  for a Meta Toolkit product application, you can instead finish its setup
+  and then stage the accepted update again. A launcher that selects a Meta
+  Forge application host directly does not refuse that Apply for a Meta
+  Toolkit product application that has not finished its setup: the update
+  stops as "recovery needed", and its previous package and private data are
+  kept. Finish such an application's setup before you apply an update.
 
 ## [0.9.4] - 2026-10-22
 
