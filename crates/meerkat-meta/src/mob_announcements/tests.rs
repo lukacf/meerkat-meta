@@ -10064,10 +10064,11 @@ fn the_version_two_schema_is_pinned() {
              generation, member, action, reason"
                 .to_string(),
             "table announcement_holds: subscription_id TEXT notnull pk1, mob_id TEXT notnull \
-             pk2, sequence INTEGER notnull pk3, member TEXT notnull, held_at_ms INTEGER \
+             pk2, sequence INTEGER notnull pk3, member TEXT notnull, source_id TEXT notnull, \
+             generation INTEGER notnull, held_at_ms INTEGER notnull, checked_at_ms INTEGER \
              notnull, record TEXT notnull"
                 .to_string(),
-            "index announcement_holds_by_member on announcement_holds: member, held_at_ms"
+            "index announcement_holds_by_member on announcement_holds: member, checked_at_ms"
                 .to_string(),
             "table announcement_source_streams: mob_id TEXT notnull pk1, source_id TEXT \
              notnull pk2, stream TEXT notnull pk3, generation INTEGER notnull, phase TEXT \
