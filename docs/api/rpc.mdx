@@ -1045,14 +1045,23 @@ that are still active and still hold the role, never to another member of
 the role, so several runs can share one mob and one role. The binding must
 name every role the flow's steps use and no other, no quorum step may need
 more members than its role binds, and each member must be an active member
-of the mob holding that role. Member ids are public aliases: a generated
-runtime alias names its durable identity, and the encoded roster spelling is
-refused. The binding is fixed for the run: when a step's remaining bound
-members can no longer meet its collection policy, the run fails with
-`insufficient_targets` before that step dispatches anything, whatever the
-step's `failure_policy`; no other member is substituted and no member is
-provisioned. A malformed binding is refused as invalid params (`-32602`,
-no data). A binding the mob refuses is `-32602` with data
+of the mob holding that role. Member ids are public aliases, and the encoded
+roster spelling is refused. A durable identity or plain member name names
+its own member. A generated runtime alias (`rt:{identity}:{generation}`)
+names its durable identity when the identity runtime confirms it is the
+current incarnation; a stale one is refused with `-32000` and data kind
+`stale_identity_runtime_binding`, as every member action refuses it, and on
+a gateway without an identity runtime the alias keeps its exact spelling,
+which names no member (`not_a_member`). A role named twice in the JSON
+object keeps its last value, by JSON object rules. The binding is fixed for
+the run: when a step's remaining bound members can no longer meet its
+collection policy, the run fails with `insufficient_targets` before that
+step dispatches anything, whatever the step's `failure_policy`; no other
+member is substituted and no flow member is provisioned. An identity-first
+gateway still materializes its registered identities before admission, as
+for every run; that decides no membership. A malformed binding is refused
+as invalid params (`-32602`, no data). A binding the mob refuses is
+`-32602` with data
 `{"kind": "flow_role_targets_refused", "flow_id", "refusal": {"kind", ...}}`,
 where the refusal `kind` is one of `role_not_in_flow`, `role_unbound`,
 `quorum_exceeds_bound_set`, `not_a_member`, `role_mismatch` or
@@ -1061,11 +1070,17 @@ names; no run is recorded. On the console, a role-targeted run also needs
 `agent.send` on every bound member.
 
 The result echoes the admitted binding as `role_targets`, with members as
-public aliases, and the run record (`meta/flow_status`, `meta/list_runs`)
-carries it as the runtime recorded it: there a member id that does not start
-with a letter or `_`, or holds characters other than letters, digits, `-`
-and `_`, appears in its encoded roster spelling. A gateway that serves `role_targets` lists `flow_role_targets`
-in `meta/capabilities.feature_capabilities`. An older gateway ignores the
+public aliases. The run record (`meta/flow_status`, `meta/list_runs`)
+carries it as the runtime recorded it, in the mob roster spelling that
+every member id of the record uses, the `root_step_outputs` keys of a
+multi-member step included: a member id that does not start with a letter
+or `_`, or holds characters other than letters, digits, `-` and `_`,
+appears there in its encoded spelling. Since the encoded spelling never
+equals a public alias, a gate comparing aliases with the record can only
+withhold authorization; give members comms-safe ids (a letter or `_`
+first, then letters, digits, `-` and `_`) so a gate can compare them
+directly. A gateway that serves `role_targets` lists `flow_role_targets` in
+`meta/capabilities.feature_capabilities`. An older gateway ignores the
 parameter and runs the flow role-wide, so a raw RPC caller must check the
 capability before sending `role_targets`, and must treat a result without
 the echoed binding as a role-wide run (cancel it). The Python and
@@ -1073,7 +1088,7 @@ TypeScript SDKs do both: they refuse `role_targets` with
 `CapabilityUnavailableError` before calling, and cancel a run whose result
 does not echo the binding before raising `FlowRoleTargetsNotAppliedError`.
 A run record read through an older runtime has no `role_targets`; a check
-that requires a bound run must treat a missing binding as not bound.
+that requires a bound run must treat a missing binding as not authorized.
 
 ### `meta/reset_all`
 

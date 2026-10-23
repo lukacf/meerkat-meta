@@ -1371,7 +1371,7 @@ export interface MobRun {
    * The members each role of a role-targeted run dispatches to, as the
    * runtime recorded them; absent for a role-wide run, and for a run read
    * from a gateway or runtime that predates role targets. A gate that needs
-   * a bound run must treat its absence as not bound.
+   * a bound run must treat its absence as not authorized.
    */
   readonly roleTargets?: Readonly<Record<string, readonly string[]>>;
 }

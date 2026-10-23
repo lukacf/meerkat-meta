@@ -11860,11 +11860,23 @@ async fn handle_console_runtime_rpc_with_visibility(
             let flow_params = request.params.get("params").cloned().unwrap_or(Value::Null);
             // `role_targets` binds each role of the flow to existing members;
             // meerkat's mob actor admits the binding and refuses it typed.
-            let role_targets =
-                match crate::flow_role_targets::parse_role_targets(&request.params) {
-                    Ok(role_targets) => role_targets,
-                    Err(message) => return invalid_params(response_id, message),
-                };
+            // Each member id resolves by the member-id alias rule first, so a
+            // stale generated alias is refused here, typed, before anything
+            // is materialized.
+            let role_targets = match crate::flow_role_targets::resolve_role_targets(
+                &request.params,
+                identity_runtime.as_ref(),
+            )
+            .await
+            {
+                Ok(role_targets) => role_targets,
+                Err(crate::flow_role_targets::RoleTargetsRefusal::Invalid(message)) => {
+                    return invalid_params(response_id, message);
+                }
+                Err(crate::flow_role_targets::RoleTargetsRefusal::StaleAlias(error)) => {
+                    return response_value(response_id, None, Some(error));
+                }
+            };
             if let Some(identity_runtime) = &identity_runtime
                 && let Err(err) = identity_runtime.materialize_all_required_tracked().await
             {
@@ -16578,6 +16590,193 @@ comms = true
                 (ACTION_AGENT_SEND, Some("rev-a2".to_string())),
             ])
         );
+    }
+
+    /// `meta/run_flow` on the console, through its own arm: the
+    /// single-runtime console lists `flow_role_targets` beside
+    /// `meta/run_flow` and the aggregator-only console neither; a bound run
+    /// echoes its binding; a binding the mob refuses carries the typed
+    /// refusal; and under identity authority a stale generated alias is
+    /// refused with the typed stale-binding refusal before anything runs.
+    /// Neither refusal records a run.
+    #[tokio::test]
+    async fn console_run_flow_role_targets_capability_echo_and_refusals()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = tempfile::tempdir()?;
+        let session_path = temp_dir.path().join("sessions");
+        std::fs::create_dir_all(&session_path)?;
+        let factory = AgentFactory::new(&session_path).comms(true);
+        let session_service = Arc::new(build_ephemeral_service(factory, Config::default(), 16));
+        let definition = MobDefinition::from_toml(
+            r#"
+[mob]
+id = "console-run-flow-role-targets"
+
+[profiles.worker]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.worker.tools]
+comms = true
+
+[flows.review]
+description = "review one change"
+
+[flows.review.steps.review]
+role = "worker"
+message = "review"
+"#,
+        )?;
+        let runtime = MobRuntime::bootstrap(
+            MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
+                .with_options(MobBootstrapOptions {
+                    allow_ephemeral_sessions: true,
+                    notify_orchestrator_on_resume: true,
+                    default_llm_client: Some(Arc::new(TestClient::for_provider(
+                        meerkat::Provider::OpenAI,
+                    ))),
+                }),
+        )
+        .await?;
+        runtime
+            .handle()
+            .spawn_spec(SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                "rev-a1".to_string(),
+                None,
+                None,
+                None,
+            ))
+            .await?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "console-run-flow-role-targets".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        let call = |method: &str, params: Value, identity_runtime: Option<Arc<IdentityRuntime>>| {
+            Box::pin(handle_console_runtime_rpc(
+                &runtime,
+                None,
+                None,
+                None,
+                None,
+                None,
+                identity_runtime,
+                None,
+                None,
+                rpc_request_with_params(method, params),
+                true,
+            ))
+        };
+
+        let capabilities = call("meta/capabilities", json!({}), None).await;
+        assert!(
+            capabilities["result"]["methods"]
+                .as_array()
+                .ok_or("capabilities methods")?
+                .iter()
+                .any(|method| method == "meta/run_flow"),
+            "{capabilities:#?}"
+        );
+        assert!(
+            capabilities["result"]["feature_capabilities"]
+                .as_array()
+                .ok_or("capabilities feature_capabilities")?
+                .iter()
+                .any(|feature| feature == "flow_role_targets"),
+            "{capabilities:#?}"
+        );
+        let aggregator = handle_console_aggregator_rpc(
+            None,
+            rpc_request("meta/capabilities"),
+            true,
+            false,
+            None,
+            None,
+            &crate::console_aggregator::ConsoleSendScope::Anonymous,
+        )
+        .await;
+        assert_eq!(
+            aggregator["result"]["feature_capabilities"],
+            json!([]),
+            "the aggregator-only console serves no meta/run_flow: {aggregator:#?}"
+        );
+
+        let bound = call(
+            "meta/run_flow",
+            json!({
+                "flow_id": "review",
+                "params": {},
+                "role_targets": { "worker": ["rev-a1"] },
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(bound["error"], Value::Null, "{bound:#?}");
+        assert!(bound["result"]["run_id"].is_string(), "{bound:#?}");
+        assert_eq!(
+            bound["result"]["role_targets"],
+            json!({ "worker": ["rev-a1"] }),
+            "{bound:#?}"
+        );
+
+        let refused = call(
+            "meta/run_flow",
+            json!({
+                "flow_id": "review",
+                "params": {},
+                "role_targets": { "worker": ["ghost"] },
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(-32602), "{refused:#?}");
+        assert_eq!(
+            refused["error"]["data"],
+            json!({
+                "kind": "flow_role_targets_refused",
+                "flow_id": "review",
+                "refusal": { "kind": "not_a_member", "role": "worker", "member": "ghost" },
+            }),
+            "{refused:#?}"
+        );
+
+        let stale = call(
+            "meta/run_flow",
+            json!({
+                "flow_id": "review",
+                "params": {},
+                "role_targets": { "worker": ["rt:rev-a1:2"] },
+            }),
+            Some(identity_runtime.clone()),
+        )
+        .await;
+        assert_eq!(stale["error"]["code"], json!(-32000), "{stale:#?}");
+        assert_eq!(
+            stale["error"]["data"],
+            json!({
+                "kind": "stale_identity_runtime_binding",
+                "identity": "rev-a1",
+                "registered_runtime_member_id": null,
+                "live_runtime_member_id": "rt:rev-a1:2",
+                "registered_session_id": null,
+                "live_session_id": null,
+            }),
+            "{stale:#?}"
+        );
+
+        assert_eq!(
+            runtime.handle().list_runs(None).await?.len(),
+            1,
+            "only the admitted binding recorded a run"
+        );
+        let _ = runtime.handle().stop().await;
+        drop(temp_dir);
+        Ok(())
     }
 
     #[test]

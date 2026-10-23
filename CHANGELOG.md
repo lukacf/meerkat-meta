@@ -494,8 +494,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and one role while each dispatches only to its own members. Meerkat's mob
   actor admits the binding (each member active and holding its role, every
   flow role bound and no other); Meta only reads the member ids as public
-  aliases, refusing the encoded roster spelling at ingress. A refused binding
-  is `-32602` with data
+  aliases by the member-id alias rule, refusing the encoded roster spelling
+  at ingress. A generated runtime alias names its durable identity only when
+  the identity runtime confirms it is the current incarnation; a stale one
+  is refused with `-32000` and data kind `stale_identity_runtime_binding`,
+  and without an identity runtime it keeps its exact spelling, which names
+  no member. A refused binding is `-32602` with data
   `{"kind": "flow_role_targets_refused", "flow_id", "refusal": {"kind", ...}}`
   (`role_not_in_flow`, `role_unbound`, `quorum_exceeds_bound_set`,
   `not_a_member`, `role_mismatch`, `not_active`), its member a public alias,
@@ -513,7 +517,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `FlowRoleTargetsRefusedError` for a refused binding, and cancel a run whose
   result does not echo the binding before raising
   `FlowRoleTargetsNotAppliedError`. `MobRun` and `MobRunSnapshot` carry
-  `role_targets` (`roleTargets`), absent for a role-wide run.
+  `role_targets` (`roleTargets`), absent for a role-wide run. A run record
+  read through an older runtime has no `role_targets`, so a check that
+  requires a bound run must treat a missing binding as not authorized.
 
 ### Changed
 

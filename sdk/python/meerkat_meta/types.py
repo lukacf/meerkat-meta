@@ -714,7 +714,7 @@ def _role_targets_from(value: Any) -> dict[str, list[str]] | None:
 
     ``None`` for a role-wide run, and for a run read from a gateway or runtime
     that predates role targets. A gate that needs a bound run must treat
-    ``None`` as not bound.
+    ``None`` as not authorized.
     """
     if not isinstance(value, dict):
         return None

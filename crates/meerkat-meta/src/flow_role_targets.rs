@@ -2,14 +2,18 @@
 //!
 //! A run started with `role_targets` dispatches each role of its flow only to
 //! the members the caller bound to that role. Meerkat's mob actor admits the
-//! binding and refuses it typed; this module only reads the parameter, spells
-//! its member ids the way the mob roster does, and spells the echo and a
-//! refusal back in public aliases. Both `meta/run_flow` implementations (the
-//! stdio RPC server and the console) go through it, so they cannot disagree.
+//! binding and refuses it typed; this module reads the parameter, resolves
+//! each member id to its roster row by the member-id alias rule
+//! ([`crate::member_comms_id`]), and spells the echo and a refusal back in
+//! public aliases. Both `meta/run_flow` implementations (the stdio RPC server
+//! and the console) go through it, so they cannot disagree.
+
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
 use crate::member_comms_id::{
+    durable_identity_from_runtime_alias, mob_member_id, roster_member_id_for_identity,
     roster_member_id_for_supplied_id, runtime_alias_str, validate_public_member_alias,
 };
 
@@ -23,17 +27,63 @@ pub(crate) const FLOW_ROLE_TARGETS_FEATURE: &str = "flow_role_targets";
 /// binding.
 pub(crate) const ROLE_TARGETS_PARAM: &str = "role_targets";
 
-/// Read the optional `role_targets` parameter of `meta/run_flow`.
+/// The prefix of every `meta/run_flow` failure message.
+const RUN_FLOW_FAILED: &str = "run_flow failed: ";
+
+/// Why `meta/run_flow` refused its `role_targets` before asking the runtime.
+#[derive(Debug)]
+pub(crate) enum RoleTargetsRefusal {
+    /// The parameter is malformed: invalid params (`-32602`), without data.
+    Invalid(String),
+    /// A generated runtime alias that is not its identity's current
+    /// incarnation: the typed `stale_identity_runtime_binding` refusal every
+    /// other member action answers for it.
+    StaleAlias(crate::rpc::JsonRpcError),
+}
+
+/// Read the optional `role_targets` parameter of `meta/run_flow` and resolve
+/// it into the binding the mob actor admits.
 ///
 /// Absent or `null` is a role-wide run (`Ok(None)`). Otherwise it is an
-/// object mapping each role to a non-empty array of member ids, none listed
-/// twice for one role. Each id is a public alias: the encoded roster
-/// spelling is refused, and a generated runtime alias names its durable
-/// identity. Membership, role and lifecycle are not checked here; the mob
-/// actor admits the binding.
-pub(crate) fn parse_role_targets(
+/// object mapping each role to a non-empty array of member ids, none naming
+/// the same roster row twice for one role. Each id is a public alias, and
+/// resolves by the member-id alias rule: the encoded roster spelling is
+/// refused; a durable identity or plain member name names its own row; a
+/// generated runtime alias names its identity's durable row only when the
+/// identity runtime confirms it is the current incarnation, is refused typed
+/// when it is stale, and without an identity runtime keeps its exact
+/// spelling, which names no row (the mob actor then refuses it as
+/// `not_a_member`). Membership, role and lifecycle are not checked here; the
+/// mob actor admits the binding.
+pub(crate) async fn resolve_role_targets(
     params: &Value,
-) -> Result<Option<meerkat_mob::FlowRoleTargets>, String> {
+    identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+) -> Result<Option<meerkat_mob::FlowRoleTargets>, RoleTargetsRefusal> {
+    let Some(requested) = role_targets_request(params).map_err(RoleTargetsRefusal::Invalid)? else {
+        return Ok(None);
+    };
+    let mut bound = Vec::with_capacity(requested.len());
+    for (role, members) in requested {
+        let mut roster_ids = Vec::with_capacity(members.len());
+        for member in &members {
+            let roster_id = role_target_roster_id(identity_runtime, member).await?;
+            if roster_ids.contains(&roster_id) {
+                return Err(RoleTargetsRefusal::Invalid(format!(
+                    "role_targets.{role} names member '{member}' more than once"
+                )));
+            }
+            roster_ids.push(roster_id);
+        }
+        bound.push((meerkat_mob::ProfileName::from(role.as_str()), roster_ids));
+    }
+    meerkat_mob::FlowRoleTargets::new(bound)
+        .map(Some)
+        .map_err(|error| RoleTargetsRefusal::Invalid(error.to_string()))
+}
+
+/// The shape of the `role_targets` parameter: each role with its member ids,
+/// as sent. `Ok(None)` when it is absent or `null`.
+fn role_targets_request(params: &Value) -> Result<Option<Vec<(String, Vec<String>)>>, String> {
     let raw = match params.get(ROLE_TARGETS_PARAM) {
         None | Some(Value::Null) => return Ok(None),
         Some(raw) => raw,
@@ -44,14 +94,14 @@ pub(crate) fn parse_role_targets(
                 .to_string(),
         );
     };
-    let mut bound = Vec::with_capacity(roles.len());
+    let mut requested = Vec::with_capacity(roles.len());
     for (role, members) in roles {
         let Some(members) = members.as_array() else {
             return Err(format!(
                 "role_targets.{role} must be an array of member ids"
             ));
         };
-        let mut roster_ids = Vec::with_capacity(members.len());
+        let mut ids = Vec::with_capacity(members.len());
         for member in members {
             let Some(member) = member.as_str() else {
                 return Err(format!("role_targets.{role} must hold member id strings"));
@@ -60,19 +110,49 @@ pub(crate) fn parse_role_targets(
                 return Err(format!("role_targets.{role} holds an empty member id"));
             }
             validate_public_member_alias(ROLE_TARGETS_PARAM, member)?;
-            let roster_id = roster_member_id_for_supplied_id(member);
-            if roster_ids.contains(&roster_id) {
-                return Err(format!(
-                    "role_targets.{role} names member '{member}' more than once"
-                ));
-            }
-            roster_ids.push(roster_id);
+            ids.push(member.to_owned());
         }
-        bound.push((meerkat_mob::ProfileName::from(role.as_str()), roster_ids));
+        requested.push((role.clone(), ids));
     }
-    meerkat_mob::FlowRoleTargets::new(bound)
-        .map(Some)
-        .map_err(|error| error.to_string())
+    Ok(Some(requested))
+}
+
+/// The roster row one `role_targets` member id names, by the member-id alias
+/// rule.
+async fn role_target_roster_id(
+    identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+    supplied: &str,
+) -> Result<meerkat_mob::AgentIdentity, RoleTargetsRefusal> {
+    let alias = runtime_alias_str(supplied).into_owned();
+    // A durable identity or a plain member name names its own row.
+    let Some(durable) = durable_identity_from_runtime_alias(&alias) else {
+        return Ok(roster_member_id_for_supplied_id(&alias));
+    };
+    // A generated alias never collapses onto the current incarnation without
+    // the identity authority: it keeps its exact spelling.
+    let Some(identity_runtime) = identity_runtime else {
+        return Ok(mob_member_id(&alias));
+    };
+    let Ok(identity) = crate::identity_first::AgentIdentity::parse(&durable) else {
+        return Ok(mob_member_id(&alias));
+    };
+    let status = identity_runtime.status(&identity).await.ok();
+    let registered = status
+        .as_ref()
+        .and_then(|status| status.agent_runtime_id.as_ref())
+        .map(crate::identity_first::AgentRuntimeId::as_str);
+    if registered == Some(alias.as_str()) {
+        return Ok(roster_member_id_for_identity(&durable));
+    }
+    Err(RoleTargetsRefusal::StaleAlias(
+        crate::identity_control_target::stale_identity_runtime_binding_error(
+            RUN_FLOW_FAILED,
+            &identity,
+            status.as_ref(),
+            &alias,
+            None,
+        ),
+    ))
 }
 
 /// The binding as `meta/run_flow` echoes it: every bound role with its
@@ -136,7 +216,9 @@ pub(crate) fn run_flow_error_data(error: &meerkat_mob::MobError) -> Option<Value
 
 /// The bound members a `meta/run_flow` request names, as the public aliases
 /// the console scopes its `agent.send` check to. Malformed entries are
-/// skipped here; the handler refuses the request before anything runs.
+/// skipped here, and a generated alias is checked as its durable identity;
+/// the handler refuses a malformed binding and a stale alias before anything
+/// runs.
 pub(crate) fn role_target_members_for_access(params: &Value) -> Vec<String> {
     let Some(roles) = params.get(ROLE_TARGETS_PARAM).and_then(Value::as_object) else {
         return Vec::new();
@@ -156,28 +238,65 @@ pub(crate) fn role_target_members_for_access(params: &Value) -> Vec<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    fn parsed(params: &Value) -> meerkat_mob::FlowRoleTargets {
-        parse_role_targets(params)
-            .expect("well-formed role targets parse")
-            .expect("present role targets parse to a binding")
+    async fn resolved(
+        params: &Value,
+        identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+    ) -> Result<Option<meerkat_mob::FlowRoleTargets>, String> {
+        resolve_role_targets(params, identity_runtime)
+            .await
+            .map_err(|refusal| match refusal {
+                RoleTargetsRefusal::Invalid(message) => message,
+                RoleTargetsRefusal::StaleAlias(error) => {
+                    panic!("no identity runtime, no stale refusal: {error:?}")
+                }
+            })
     }
 
-    #[test]
-    fn absent_or_null_role_targets_is_a_role_wide_run() {
-        assert_eq!(parse_role_targets(&json!({"flow_id": "review"})), Ok(None));
+    async fn bound(params: &Value) -> meerkat_mob::FlowRoleTargets {
+        resolved(params, None)
+            .await
+            .expect("well-formed role targets resolve")
+            .expect("present role targets resolve to a binding")
+    }
+
+    /// An identity runtime that knows no identity: every generated alias is
+    /// stale to it.
+    fn empty_identity_runtime() -> Arc<crate::identity_first::IdentityRuntime> {
+        Arc::new(crate::identity_first::IdentityRuntime::new(
+            crate::identity_first::IdentityRuntimeConfig {
+                continuity_store: Arc::new(
+                    crate::identity_first::LocalContinuityStore::in_memory()
+                        .expect("in-memory continuity store"),
+                ),
+                lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
+                runtime_instance_id: "flow-role-targets-resolver-test".to_string(),
+                has_runtime_store: true,
+                durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                bridge: None,
+                default_timeout: None,
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn absent_or_null_role_targets_is_a_role_wide_run() {
         assert_eq!(
-            parse_role_targets(&json!({"flow_id": "review", "role_targets": null})),
+            resolved(&json!({"flow_id": "review"}), None).await,
+            Ok(None)
+        );
+        assert_eq!(
+            resolved(&json!({"flow_id": "review", "role_targets": null}), None).await,
             Ok(None)
         );
     }
 
-    #[test]
-    fn malformed_role_targets_are_refused_before_the_runtime_is_asked() {
+    #[tokio::test]
+    async fn malformed_role_targets_are_refused_before_the_runtime_is_asked() {
         for (role_targets, expected) in [
             (json!(["rev-a1"]), "must be an object"),
             (json!({"reviewer": "rev-a1"}), "must be an array"),
@@ -188,14 +307,11 @@ mod tests {
                 "reserved encoded roster-id",
             ),
             (json!({"reviewer": ["rev-a1", "rev-a1"]}), "more than once"),
-            (
-                json!({"reviewer": ["rev-a1", "rt:rev-a1:3"]}),
-                "more than once",
-            ),
             (json!({"reviewer": []}), "to no members"),
             (json!({}), "at least one role"),
         ] {
-            let error = parse_role_targets(&json!({ "role_targets": role_targets }))
+            let error = resolved(&json!({ "role_targets": role_targets }), None)
+                .await
                 .expect_err("malformed role targets are refused");
             assert!(
                 error.contains(expected),
@@ -204,20 +320,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn member_ids_take_the_roster_spelling_and_echo_as_public_aliases() {
+    /// Without identity authority a generated alias keeps its exact spelling:
+    /// it never collapses onto the current incarnation, so it names no row
+    /// and is no duplicate of its identity's own id.
+    #[tokio::test]
+    async fn member_ids_take_the_roster_spelling_and_echo_as_public_aliases() {
         let params = json!({
             "role_targets": {
-                "reviewer": ["rev-a2", "rt:rev-a1:3", "review:issue-7"],
+                "reviewer": ["rev-a2", "rev-a1", "rt:rev-a1:3", "review:issue-7"],
                 "coder": ["coder-a"],
             }
         });
-        let role_targets = parsed(&params);
+        let role_targets = bound(&params).await;
         let reviewers = role_targets
             .members(&meerkat_mob::ProfileName::from("reviewer"))
             .expect("the reviewer role is bound");
         assert!(reviewers.contains(&roster_member_id_for_supplied_id("rev-a1")));
         assert!(reviewers.contains(&roster_member_id_for_supplied_id("review:issue-7")));
+        assert!(
+            reviewers.contains(&mob_member_id("rt:rev-a1:3")),
+            "a generated alias keeps its exact spelling without identity authority"
+        );
 
         let echo = role_targets_echo(&role_targets);
         let mut echoed_reviewers = echo["reviewer"]
@@ -230,8 +353,8 @@ mod tests {
         echoed_reviewers.sort();
         assert_eq!(
             echoed_reviewers,
-            ["rev-a1", "rev-a2", "review:issue-7"],
-            "the echo names durable identities, never the encoded roster spelling"
+            ["rev-a1", "rev-a2", "review:issue-7", "rt:rev-a1:3"],
+            "the echo speaks public aliases, never the encoded roster spelling"
         );
         assert_eq!(echo["coder"], json!(["coder-a"]));
 
@@ -245,6 +368,54 @@ mod tests {
             json!({"run_id": run_id.to_string()}),
             "a role-wide run's result is unchanged"
         );
+    }
+
+    /// With identity authority a generated alias that is not its identity's
+    /// current incarnation is refused with the typed stale-binding refusal;
+    /// a durable identity or plain name needs no confirmation.
+    #[tokio::test]
+    async fn a_stale_generated_alias_is_refused_typed_under_identity_authority() {
+        let identity_runtime = empty_identity_runtime();
+
+        let refusal = resolve_role_targets(
+            &json!({ "role_targets": { "reviewer": ["rev-a2", "rt:rev-a1:2"] } }),
+            Some(&identity_runtime),
+        )
+        .await;
+        let error = match refusal {
+            Err(RoleTargetsRefusal::StaleAlias(error)) => error,
+            other => panic!("a stale generated alias is refused typed: {other:?}"),
+        };
+        assert_eq!(error.code, -32000);
+        assert!(
+            error.message.starts_with("run_flow failed: "),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            error.data,
+            Some(json!({
+                "kind": "stale_identity_runtime_binding",
+                "identity": "rev-a1",
+                "registered_runtime_member_id": null,
+                "live_runtime_member_id": "rt:rev-a1:2",
+                "registered_session_id": null,
+                "live_session_id": null,
+            }))
+        );
+
+        let plain = resolve_role_targets(
+            &json!({ "role_targets": { "reviewer": ["rev-a1", "review:issue-7"] } }),
+            Some(&identity_runtime),
+        )
+        .await
+        .expect("durable identities and plain names resolve")
+        .expect("a binding");
+        let reviewers = plain
+            .members(&meerkat_mob::ProfileName::from("reviewer"))
+            .expect("the reviewer role is bound");
+        assert!(reviewers.contains(&roster_member_id_for_supplied_id("rev-a1")));
+        assert!(reviewers.contains(&roster_member_id_for_supplied_id("review:issue-7")));
     }
 
     #[test]
