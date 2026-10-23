@@ -903,14 +903,17 @@ impl AnnouncementService {
                 collection: None,
                 delivery: None,
             };
+            // A template the reconciler made lists its children whatever its
+            // own status: they capture on their own.
+            if mark.template && mark.managed {
+                templates.insert(mark.id.clone());
+            }
             if mark.status == DeclarationStatus::Applied {
                 match mark.kind {
                     DeclarationRecordKind::Source => {
                         record.collection = self.declared_collection(mark).await?;
                     }
-                    DeclarationRecordKind::Subscription if mark.template => {
-                        templates.insert(mark.id.clone());
-                    }
+                    DeclarationRecordKind::Subscription if mark.template => {}
                     DeclarationRecordKind::Subscription => {
                         let id =
                             crate::mob_announcements::types::SubscriptionId::new(mark.id.clone())?;
