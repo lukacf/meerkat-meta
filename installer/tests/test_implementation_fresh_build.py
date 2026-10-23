@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from launchkit.connect_installer_caller import CustodyError
 from launchkit.implementation import update_receipt
 from launchkit.implementation_workspace import ImplementationWorkspace
 from launchkit.projects import DraftConflict, fingerprint
@@ -168,8 +169,16 @@ async def test_fresh_build_fences_changes_during_preparation(registry, newer_tar
                 old._save_state(stored)
             assert old.digest() == digest
         release.set()
-        with pytest.raises(DraftConflict, match='changed while preparing'):
-            await task
+        if change == 'guide':
+            # The original source owner refuses the changed exact guide
+            # before any new worker or receipt exists, ahead of the later
+            # fence.
+            with pytest.raises(CustodyError) as refused:
+                await task
+            assert str(refused.value) == "Initial Build requires this guide's exact current completed version."
+        else:
+            with pytest.raises(DraftConflict, match='changed while preparing'):
+                await task
         assert not implementation.tasks
         assert len(list(directory.parent.glob('*/receipt.json'))) == 1
     finally:
