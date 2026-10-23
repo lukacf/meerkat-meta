@@ -7,9 +7,8 @@
 //! - `meta/compact_member` — the routine verb. Arms a temporary
 //!   auto-compaction floor for the identity (bridge-applied via the typed
 //!   `override_profile.auto_compact_threshold` carrier), rebuilds the member
-//!   onto its SAME durable session (retire to roster absence, then
-//!   re-materialize — identity respawn only re-fences authority and never
-//!   rebuilds the agent) so a fresh build picks the floor up, drives one
+//!   onto its SAME durable session (a retire, then a fresh embodiment, under
+//!   one lifecycle lock) so a fresh build picks the floor up, drives one
 //!   queued maintenance turn so the forced compaction fires at that turn's
 //!   pre-LLM boundary, then disarms the floor and rebuilds again so the live
 //!   build returns to the original profile value. Leaving the floor armed
@@ -974,13 +973,14 @@ impl CompactOperation {
 /// Tear the identity's live member down and re-materialize it onto the SAME
 /// durable session, forcing a fresh agent build.
 ///
-/// This is the quiesce-and-rebuild cycle `compact_member` rides: identity
-/// respawn (`respawn_identity_in_place_tracked`) only re-fences authority and
-/// leaves the live agent's build untouched, so a build-time input like the
-/// armed compaction floor never reaches it. Retire tears the member down to
-/// roster absence with the durable session preserved; `restore_flow` then
-/// re-registers the identity from its current spec and resumes the SAME
-/// session through the bridge's spawn-spec build (where the floor applies).
+/// A test path for the quiesce-and-rebuild cycle: retire tears the member
+/// down to roster absence with the durable session preserved; `restore_flow`
+/// then re-registers the identity from its current spec and resumes the SAME
+/// session through the bridge's spawn-spec build, where a build-time input
+/// like the armed compaction floor applies. Identity respawn
+/// (`respawn_identity_in_place_tracked`) rebuilds too: it retires the
+/// identity's Core member and wakes it onto the same session at a new Core
+/// generation (see `IdentityRuntime::respawn_locked`).
 ///
 /// A Dormant/never-materialized identity skips the retire and goes straight
 /// to materialization. Deliberately NOT `restore_flow`: that is fleet-scoped

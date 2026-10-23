@@ -76,7 +76,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   outside it, such as a reset's fresh life. `Err` refuses init before the
   identity bootstrap, as does an answer that adds a customizer where the
   gateway composed none or drops the composed one. A gateway without an
-  identity roster never asks.
+  identity roster never asks. An application whose host gives members
+  build-time tools through the hook, such as one that declares member
+  classes, must configure the SDK's agent customizer (a pass-through is
+  enough): a host offered `None` can only start without a customizer or
+  refuse init, with `GatewayHostError::AgentCustomizerRequired` when it
+  needs one.
 - `GatewayHostComposition::identity_member_retired` (defaulted to doing
   nothing): a host-composed gateway tells its host once per retired incarnation
   of a durable identity's member, after Core's retire returned and with no Meta
