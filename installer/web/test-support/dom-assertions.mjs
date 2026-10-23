@@ -14,7 +14,7 @@ const COLLECTION_METHODS = new Set(["querySelectorAll", "getElementsByClassName"
   "getElementsByName"]);
 const NODE_PROPERTIES = new Set(["activeElement", "firstElementChild", "lastElementChild", "parentElement",
   "nextElementSibling", "previousElementSibling", "firstChild", "lastChild", "parentNode", "nextSibling",
-  "previousSibling", "offsetParent"]);
+  "previousSibling", "offsetParent", "ownerDocument", "contentDocument", "shadowRoot"]);
 const COLLECTION_PROPERTIES = new Set(["children", "childNodes"]);
 // A document's own nodes. Elsewhere, body is usually a request body.
 const DOCUMENT_NODES = new Set(["body", "head", "documentElement"]);

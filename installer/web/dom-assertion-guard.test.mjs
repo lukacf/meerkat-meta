@@ -87,3 +87,13 @@ test("the guard reads functions, a node's own values, request bodies and text ca
   ].join("\n");
   assert.deepEqual(domAssertions(source).map((finding) => finding.line), [9, 10]);
 });
+
+test("the guard reads a node's document and shadow root as nodes", () => {
+  const source = [
+    "assert.equal(input.ownerDocument, current);",
+    "assert.equal(frame.contentDocument, undefined);",
+    "assert.equal(host.shadowRoot, null);",
+    "assert.equal(host.shadowRoot === null, true);",
+  ].join("\n");
+  assert.deepEqual(domAssertions(source).map((finding) => finding.line), [1, 2, 3]);
+});
