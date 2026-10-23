@@ -494,3 +494,126 @@ fn the_options_take_declarations_inline_or_from_a_sidecar() {
         "a sidecar that cannot be read fails closed"
     );
 }
+
+/// The static checks refuse a whole declaration, whatever the runtime
+/// holds: a stream route selector, a triage member its source's audience
+/// leaves out, a topic two declared sources own (a forward topic too), a
+/// member whose declared subscriptions together reach a declared source
+/// both directly and through its forward, and a conversation member
+/// subscribed to its own scope.
+#[test]
+fn a_declaration_the_static_checks_refuse_is_refused_whole() {
+    let own = mob(OWN_MOB);
+    let check = |value: serde_json::Value| {
+        let declarations: super::super::declarations::Declarations =
+            serde_json::from_value(value).unwrap();
+        super::super::declarations::validate(&declarations, &own)
+    };
+    let streams = with(
+        declared_inbox(serde_json::json!([member_grant("agent:a")])),
+        "routes",
+        serde_json::json!([{ "kind": "direct", "streams": ["INBOX"] }]),
+    );
+    let triage_outside = with(
+        declared_inbox(serde_json::json!([member_grant("agent:a")])),
+        "routes",
+        serde_json::json!([
+            { "kind": "direct" },
+            triage_by("agent:t", serde_json::json!([member_grant("agent:a")])),
+        ]),
+    );
+    // "agent:t" triages "mail.received" and forwards on "mail.triaged".
+    let forwarding = with(
+        declared_inbox(serde_json::json!([
+            member_grant("agent:a"),
+            member_grant("agent:t")
+        ])),
+        "routes",
+        serde_json::json!([
+            { "kind": "direct" },
+            triage_by("agent:t", serde_json::json!([member_grant("agent:a")])),
+        ]),
+    );
+    let mut triaged = with(
+        source_params("unused", "triaged", "subject-2", &["mail.triaged"]),
+        "routes",
+        serde_json::json!([{ "kind": "direct" }]),
+    );
+    triaged.as_object_mut().unwrap().remove("operation_id");
+    let conversation = with(
+        declared_inbox(serde_json::json!([member_grant("agent:a")])),
+        "conversation_members",
+        serde_json::json!([{ "mob_id": OWN_MOB, "identity": "agent:a" }]),
+    );
+    let refusals = [
+        (
+            "a stream route selector",
+            matches!(
+                check(serde_json::json!({ "revision": 1, "sources": [streams] })),
+                Err(AnnouncementStoreError::RouteSelectorUnsupported { .. })
+            ),
+        ),
+        (
+            "a triage member outside its source's audience",
+            matches!(
+                check(serde_json::json!({ "revision": 1, "sources": [triage_outside] })),
+                Err(AnnouncementStoreError::AudienceNotCovered { .. })
+            ),
+        ),
+        (
+            "a forward topic another declared source owns",
+            matches!(
+                check(serde_json::json!({
+                    "revision": 1,
+                    "sources": [forwarding.clone(), triaged],
+                })),
+                Err(AnnouncementStoreError::TopicOwned { .. })
+            ),
+        ),
+        (
+            "a member reaching a declared source directly and through its forward",
+            matches!(
+                check(serde_json::json!({
+                    "revision": 1,
+                    "sources": [forwarding.clone()],
+                    "subscriptions": [
+                        declared_subscription("direct", "agent:a", &["mail.received"]),
+                        declared_subscription("forwarded", "agent:a", &["mail.triaged"]),
+                    ],
+                })),
+                Err(AnnouncementStoreError::RouteOverlap { .. })
+            ),
+        ),
+        (
+            "a conversation member subscribed to its own scope",
+            matches!(
+                check(serde_json::json!({
+                    "revision": 1,
+                    "sources": [conversation],
+                    "subscriptions": [
+                        declared_subscription("own-scope", "agent:a", &["mail.received"]),
+                    ],
+                })),
+                Err(AnnouncementStoreError::ConversationMember { .. })
+            ),
+        ),
+    ];
+    let missed: Vec<&str> = refusals
+        .iter()
+        .filter(|(_, refused)| !refused)
+        .map(|(what, _)| *what)
+        .collect();
+    assert!(missed.is_empty(), "the static checks admit: {missed:?}");
+    let admitted = check(serde_json::json!({
+        "revision": 1,
+        "sources": [forwarding],
+        "subscriptions": [
+            declared_subscription("forwarded", "agent:a", &["mail.triaged"]),
+            declared_subscription("triage", "agent:t", &["mail.received"]),
+        ],
+    }));
+    assert!(
+        admitted.is_ok(),
+        "a declaration the checks admit: {admitted:?}"
+    );
+}
