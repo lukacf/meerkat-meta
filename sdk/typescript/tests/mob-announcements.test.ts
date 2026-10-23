@@ -159,8 +159,8 @@ const RESPONSES: Record<string, unknown> = {
   "meta/mob_announcements/subscriptions/get": { subscription: SUBSCRIPTION, marker: null },
   "meta/mob_announcements/subscriptions/list": { subscriptions: [SUBSCRIPTION] },
   "meta/mob_announcements/deliveries/list": { deliveries: [BATCH] },
-  "meta/mob_announcements/deliveries/observe": { batch: BATCH, native: { kind: "settled" } },
-  "meta/mob_announcements/deliveries/reconcile": { batch: BATCH, native: { kind: "settled" } },
+  "meta/mob_announcements/deliveries/observe": { batch: BATCH, native: { status: "not_committed" } },
+  "meta/mob_announcements/deliveries/reconcile": { batch: BATCH, native: { status: "not_committed" } },
   "meta/mob_announcements/sources/put": { source: SOURCE },
   "meta/mob_announcements/sources/pause": { source: SOURCE },
   "meta/mob_announcements/sources/resume": { source: SOURCE },
@@ -381,7 +381,8 @@ describe("MobHandle mob announcement results", () => {
     const { handle } = mockHandle();
     const observation = await handle.announcementDeliveryObserve("batch-1");
     assert.equal(observation.batch.id, "batch-1");
-    assert.deepEqual(observation.native, { kind: "settled" });
+    assert.deepEqual(observation.native, { status: "not_committed" });
+    assert.equal(observation.nativeStatus, "not_committed");
     assert.equal(observation.marker, null);
   });
 
