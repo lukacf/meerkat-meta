@@ -457,6 +457,74 @@ async def test_package_cannot_borrow_fixed_cloud_plan_after_source_or_scope_chan
         assert cli.calls == [] and cloud.calls == []
 
 
+def replace_package_evidence(local, location, value):
+    name = "deployment.json" if location == "definition" else "implementation-report.json"
+    if location == "verification":
+        report = json.loads(local.files[name])
+        report["verification"] = value
+        value = report
+    local.files[name] = json.dumps(value).encode()
+    local.package_bytes = local.archive()
+
+
+@pytest.mark.parametrize("location", ["definition", "report", "verification"])
+@pytest.mark.parametrize("value", [None, [], "private-malformed-evidence", False, 7, 1.5])
+async def test_nonobject_package_evidence_refuses_before_probe_and_allows_repair(harness, location, value):
+    service, local, cli, cloud = harness
+    accepted_package = local.package_bytes
+    replace_package_evidence(local, location, value)
+    with pytest.raises(DraftConflict, match=r"^The accepted cloud package has invalid deployment evidence\.$"):
+        await checked(harness)
+    assert cli.calls == [] and cloud.calls == []
+    assert service._active is None
+
+    # Restore the same accepted bytes, then use the public operation again.
+    local.package_bytes = accepted_package
+    result = await checked(harness)
+    assert result["ready_for_plan"] is True and result["provisioning_verified"] is False
+    assert result["binding"]["package_sha256"] == hashlib.sha256(accepted_package).hexdigest()
+    assert service._active is None
+
+
+@pytest.mark.parametrize("location", ["definition", "report", "verification"])
+async def test_package_evidence_becoming_nonobject_during_probe_refuses_result(harness, location):
+    service, local, cli, cloud = harness
+    accepted_package = local.package_bytes
+    request = cloud.request
+    async def changing(method, url, body, token):
+        result = await request(method, url, body, token)
+        if urlsplit(url).path == "/v1/userinfo":
+            replace_package_evidence(local, location, None)
+        return result
+    cloud.request = changing
+    with pytest.raises(DraftConflict, match=r"^The accepted cloud package has invalid deployment evidence\.$"):
+        await checked(harness)
+    assert cli.calls and cloud.calls
+    assert service._active is None
+
+    cloud.request = request
+    local.package_bytes = accepted_package
+    result = await checked(harness)
+    assert result["ready_for_plan"] is True and result["provisioning_verified"] is False
+    assert result["binding"]["package_sha256"] == hashlib.sha256(accepted_package).hexdigest()
+    assert service._active is None
+
+
+@pytest.mark.parametrize("missing", [False, True])
+async def test_empty_or_missing_package_verification_keeps_existing_mismatch_refusal(harness, missing):
+    service, local, cli, cloud = harness
+    report = json.loads(local.files["implementation-report.json"])
+    if missing:
+        del report["verification"]
+    else:
+        report["verification"] = {}
+    replace_package_evidence(local, "report", report)
+    with pytest.raises(DraftConflict, match=r"^The accepted package differs from the current proposal or checked source\. Rebuild before cloud preparation\.$"):
+        await checked(harness)
+    assert cli.calls == [] and cloud.calls == []
+    assert service._active is None
+
+
 @pytest.mark.parametrize("location", ["report", "acceptance"])
 async def test_malformed_package_brief_binding_refuses_before_cloud_observation(harness, location):
     _, local, cli, cloud = harness
