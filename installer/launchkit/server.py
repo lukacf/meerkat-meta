@@ -941,9 +941,17 @@ class ImplementationRequest(BaseModel):
     previous_build_id: str | None = Field(default=None, min_length=1, max_length=64, strict=True)
     refresh_framework: bool = Field(default=False, strict=True)
     preserve_design: bool = Field(default=False, strict=True)
+    start_fresh: bool = Field(default=False, strict=True)
+    previous_source_digest: str | None = Field(default=None, pattern="^[a-f0-9]{64}$", strict=True)
 
     @model_validator(mode="after")
     def exact_runtime_refresh(self):
+        if self.start_fresh:
+            if (self.refresh_framework or self.preserve_design or self.request.strip()
+                    or self.previous_build_id is None or self.previous_source_digest is None):
+                raise ValueError("A fresh build needs its exact incomplete predecessor and no repair or refresh request.")
+        elif self.previous_source_digest is not None:
+            raise ValueError("A source digest is only selected for an explicit fresh build.")
         if self.preserve_design and (not self.refresh_framework or self.request.strip()
                 or self.previous_build_id is None):
             raise ValueError("Runtime refresh requires a selected accepted build, framework refresh, and no feedback.")
@@ -1624,6 +1632,8 @@ async def build_implementation(identity: str, value: ImplementationRequest):
                     raise DraftConflict("Runtime refresh must retain the accepted SDK family and deployment platform.")
                 target = current_target
             options = {"preserve_design": True, "runtime_target": target}
+        if value.start_fresh:
+            options.update(start_fresh=True, expected_fresh_source_digest=value.previous_source_digest)
         return await implementation.submit(identity, value.version, value.request,
             expected_selected_build_id=value.previous_build_id, refresh_framework=value.refresh_framework, **options)
     return await guide_result(submit_selected())

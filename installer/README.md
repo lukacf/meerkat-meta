@@ -1938,6 +1938,18 @@ The conversation layout and warm visual direction were informed by the supplied
 is included in `assets/meerkat-transparent.png`. Plan content, connection details,
 and package generation come from the actual installer services.
 
+## Starting again after an incomplete build
+
+For a stopped incomplete build on a host-selected Meta/Connect runtime,
+**Runtime and host updates > Start a fresh build** starts generation again from
+the current accepted setup using the host's current runtime. It requires the
+exact saved build, current source digest and confirmed worker cleanup. The prior
+source and history remain in their original build; authored code, repair notes,
+private configuration, checks and acceptance are not copied. The new build must
+pass its own checks and independent acceptance before installation. This action
+does not change a running or installed application. The accepted-design runtime
+refresh and ordinary repair actions keep their existing behavior.
+
 ## Retained 0.8 runtime refresh
 
 For the retained 0.8 generation, a runtime-only refresh preserves the accepted

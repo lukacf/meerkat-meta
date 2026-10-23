@@ -71,6 +71,7 @@ test_trusted_product_shipping.py
 test_update_after_setup.py
 test_update_after_setup_registry.py
 # Extras.
+test_implementation_fresh_build.py  # fresh admission shares the selected-runtime registry and retained-installation fixtures
 test_native_callback_member_contract.py  # the application's Meta callback dispatcher with selected member labels
 test_native_console_login.py  # templates_v2 native_console_login and console_auth, imported by the application at startup
 test_product_start_entry.py  # start.sh's product entry, which imports meerkat_meta from the selected product

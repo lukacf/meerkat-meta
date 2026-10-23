@@ -307,6 +307,8 @@ export function ImplementationPanel({ state, plan, designBusy, pendingManual, Ic
   const canRefreshFramework = current && ["completed", "failed", "interrupted"].includes(receipt?.status) &&
     typeof receipt?.build_id === "string" && !!receipt.build_id && receipt.worker_stop_confirmed === true &&
     receipt.cleanup_pending !== true && receipt.cleanup_in_progress !== true && receipt.cleanup_custody_lost !== true && !running;
+  const canStartFresh = canRefreshFramework && ["failed", "interrupted"].includes(receipt?.status) &&
+    receipt.source_verified === true && /^[a-f0-9]{64}$/.test(receipt.source_digest || "");
   const canShowSavedBuild = !statusUnconfirmed && canRefreshFramework && !!pendingSubmission &&
     buildAdmissionPending.current.get(state.id) === pendingSubmission &&
     pendingSubmission.guideId === state.id && pendingSubmission.version === state.version &&
@@ -329,20 +331,22 @@ export function ImplementationPanel({ state, plan, designBusy, pendingManual, Ic
     });
   }
 
-  async function build(refreshFramework = false) {
+  async function build(refreshFramework = false, startFresh = false) {
     const ownerCurrent = captureGuideSelection(selectionScope, state, selectionToken);
     if (!ownerCurrent || !canBuild || packagePreparationReason(latest.current) &&
-        (refreshFramework || !retainsCandidateFramework(latestReceipt.current, latest.current)) ||
+        (refreshFramework || startFresh || !retainsCandidateFramework(latestReceipt.current, latest.current)) ||
         (latest.current?.readiness?.decision_blockers?.length || 0) > 0 ||
         buildAdmissionPending.current.has(state.id) || refreshFramework && !canRefreshFramework ||
+        startFresh && !canStartFresh ||
         refreshFramework && retainsCandidateFramework(latestReceipt.current, latest.current) &&
           !candidateRuntimeRefreshReady(latestReceipt.current, latest.current) ||
-        !refreshFramework && needsFeedback && !text.trim()) return;
+        !refreshFramework && !startFresh && needsFeedback && !text.trim()) return;
     // A host-selected product moves to the host's current runtime only through
     // the host-owned refresh of its exact accepted build, which carries no
     // request: the unsent draft stays with the page.
     const candidateRefresh = refreshFramework && retainsCandidateFramework(latestReceipt.current, latest.current);
-    const submitted = { guideId: state.id, version: state.version, text: candidateRefresh ? "" : text,
+    const submitted = { guideId: state.id, version: state.version, text: candidateRefresh || startFresh ? "" : text,
+      previousSourceDigest: receipt?.source_digest,
       editRevision: feedbackEditRevision.current,
       previousBuildId: receipt?.build_id || null, navigationRevision: navigationLifetime.current.revision, selectionToken };
     const ownsAdmission = () => buildAdmissionPending.current.get(submitted.guideId) === submitted;
@@ -352,7 +356,10 @@ export function ImplementationPanel({ state, plan, designBusy, pendingManual, Ic
     setSubmissions(previous => ({ ...previous, [submitted.guideId]: submitted })); setError("");
     try {
       const body = { version: submitted.version, request: submitted.text.trim(), previous_build_id: submitted.previousBuildId };
-      if (candidateRefresh) {
+      if (startFresh) {
+        body.start_fresh = true;
+        body.previous_source_digest = submitted.previousSourceDigest;
+      } else if (candidateRefresh) {
         body.refresh_framework = true;
         body.preserve_design = true;
       } else if (refreshFramework) {
@@ -560,6 +567,10 @@ export function ImplementationPanel({ state, plan, designBusy, pendingManual, Ic
       <p className="implementation-detail">Rebuild with the runtime and generated application host available in this installer, keeping your application work. The new package will be tested and independently reviewed. Your installed application and any packages you have downloaded stay available. You can recover the installed version's source package from its Run area.</p>
       {candidateRefreshBlocked && <p className="implementation-detail">The runtime update starts from this application's independently accepted build.</p>}
       <button className="setup-action" onClick={() => build(true)} disabled={selectionBlocked || !canBuild || !!packageReason || candidateRefreshBlocked}>Rebuild with updated runtime</button>
+      {retainedContinuation && canStartFresh && <>
+        <p className="implementation-detail">You can build again from your accepted setup using the current runtime. The previous source and history stay saved; the new build starts without copying the unfinished application or its checks. Your unsent builder note stays here.</p>
+        <button className="setup-action" onClick={() => build(false, true)} disabled={selectionBlocked || !canBuild || !!packageReason}>Start a fresh build</button>
+      </>}
     </details>}
     {diagnostics.length > 0 && <details className="implementation-report">
       <summary>Build diagnostics - {diagnostics.length} {diagnostics.length === 1 ? "entry" : "entries"}</summary>
