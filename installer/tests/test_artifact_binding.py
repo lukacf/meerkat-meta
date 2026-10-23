@@ -89,7 +89,24 @@ def test_malformed_brief_binding_cannot_become_an_unbound_legacy_package(locatio
     assert (report, state) == before
 
 
-@pytest.mark.parametrize("kind", ["missing", "null", "nested_null", "report", "acceptance", "null_with_acceptance"])
+@pytest.mark.parametrize("invalid", ["not acceptance metadata", [], False, 7])
+@pytest.mark.parametrize("brief", ["missing", "null", "valid"])
+def test_malformed_acceptance_container_refuses_without_erasing_evidence(invalid, brief):
+    state = scope()
+    report = {"guide_version": state["version"], "blueprint_hash": inputs(state)["blueprint_hash"],
+              "acceptance": invalid, "build_id": "build", "verification": {"digest": "a" * 64}}
+    if brief != "missing":
+        report["brief_hash"] = inputs(state)["brief_hash"] if brief == "valid" else None
+    before = deepcopy((report, state))
+    assert report_brief_hash(report) == (inputs(state)["brief_hash"] if brief == "valid" else None)
+    assert not package_matches(report, state)
+    with pytest.raises(ValueError, match="^The application source report could not be verified\\.$"):
+        read_package_source({"implementation-report.json": (json.dumps(report).encode(), 0o644)})
+    assert (report, state) == before
+
+
+@pytest.mark.parametrize("kind", ["missing", "null", "nested_null", "report", "acceptance", "null_with_acceptance",
+                                  "acceptance_null", "acceptance_empty"])
 def test_valid_and_genuinely_absent_brief_bindings_keep_legacy_version_rules(kind):
     state = scope()
     report = {"guide_version": state["version"], "blueprint_hash": inputs(state)["blueprint_hash"],
@@ -98,6 +115,8 @@ def test_valid_and_genuinely_absent_brief_bindings_keep_legacy_version_rules(kin
         report["brief_hash"] = None
     if kind == "nested_null":
         report["acceptance"] = {"brief_digest": None}
+    if kind in {"acceptance_null", "acceptance_empty"}:
+        report["acceptance"] = None if kind == "acceptance_null" else {}
     if kind == "report":
         report["brief_hash"] = inputs(state)["brief_hash"]
     if kind in {"acceptance", "null_with_acceptance"}:

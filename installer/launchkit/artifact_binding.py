@@ -68,9 +68,11 @@ def current_version(receipt, state):
 
 def report_brief_hash(report, *, strict=False):
     """Read a digest; admission must distinguish malformed from absent legacy data."""
+    acceptance = report.get("acceptance")
+    if strict and acceptance is not None and not isinstance(acceptance, dict):
+        raise ValueError("The application brief binding is malformed.")
     value = report.get("brief_hash")
     if value is None:
-        acceptance = report.get("acceptance")
         value = acceptance.get("brief_digest") if isinstance(acceptance, dict) else None
     if value is None or isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value):
         return value
