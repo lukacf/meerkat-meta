@@ -280,6 +280,26 @@ history in Core, writes no first-boot row for it, and 0.9.4 leaves it to the
 host, as 0.9.3 did. Its session is usually held by `runtime.sqlite` alone,
 which is admitted too.
 
+A roster that declares such a member's name does not take the member over.
+While the member is live, the roster compile refuses with
+`IdentityNameHeldByRawMember` (`data.kind`
+`identity_name_held_by_raw_member`, naming the member and its session) and
+registers, wakes, respawns and retires nothing; before 0.9.5 the same compile
+failed with an untyped internal error. Once the member is retired, the
+identity's wake no longer resumes its session: 0.9.4 resumed Core's last
+binding under the identity's member id whoever made it, so the member's
+transcript became the identity's history. From 0.9.5 on, the wake resumes
+only a binding the identity runtime spawned (one whose spawn labels carry
+`agent_identity` naming the identity, 0.9.3's members included) and
+otherwise starts fresh. Two remedies:
+
+- keep the member's history as the identity's: respawn the member onto its
+  session with an `agent_identity` label naming the identity (through your
+  own mob calls), and compile again;
+- keep the identity separate: retire the member first (for example with
+  `meta/retire_member`). The identity then starts on a new session; the
+  retired member's transcript never becomes its history.
+
 ## Embedded builder apps
 
 An app built with the SDK builder and `persistent_state` keeps its sessions

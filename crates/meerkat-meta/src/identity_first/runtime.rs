@@ -1132,6 +1132,21 @@ pub enum IdentityRuntimeError {
     IdentityHostAdopted {
         identity: AgentIdentity,
     },
+    /// The identity's member id is held by a member the host made directly
+    /// on the mob: Core's live or retiring member under that id carries no
+    /// `agent_identity` label naming the identity, and this runtime did not
+    /// spawn it. Meta does not adopt such a member: a roster compile that
+    /// declares the identity, and the identity's wake, refuse before anything
+    /// is registered, woken, respawned or retired. The host labels the member
+    /// for the identity (respawns it onto its session with an
+    /// `agent_identity` label naming the identity) or retires it, then
+    /// compiles or wakes again. JSON-RPC internal-error code with `data.kind`
+    /// `identity_name_held_by_raw_member`.
+    IdentityNameHeldByRawMember {
+        identity: AgentIdentity,
+        member: String,
+        session_id: Option<SessionId>,
+    },
     /// The wake's resume was held: Core withheld the
     /// session's durable resume, or the roster profile moved off the role
     /// Core last ran the identity under without a declared migration. The
@@ -1443,6 +1458,20 @@ impl std::fmt::Display for IdentityRuntimeError {
                 f,
                 "identity {identity} is adopted by its host: Core holds its identity intent \
                  and drives it, so Meta's lifecycle verbs refuse it"
+            ),
+            Self::IdentityNameHeldByRawMember {
+                identity,
+                member,
+                session_id,
+            } => write!(
+                f,
+                "identity {identity} is declared under the member id of a member the host made \
+                 directly on the mob ({member}{}), which Meta does not adopt: label that member \
+                 for the identity (an agent_identity label naming {identity}) or retire it, then \
+                 try again",
+                session_id
+                    .as_ref()
+                    .map_or_else(String::new, |session| format!(" on session {session}"))
             ),
             Self::WakeHeld {
                 identity,
@@ -1879,6 +1908,19 @@ impl IdentityRuntimeError {
             })),
             Self::IdentityHostAdopted { identity } => Some(serde_json::json!({
                 "kind": "identity_host_adopted", "identity": identity, "retryable": false,
+            })),
+            // A member the host made under the identity's member id keeps the
+            // internal-error code; the kind names the collision, the member
+            // and its session, so the host can label or retire that member.
+            Self::IdentityNameHeldByRawMember {
+                identity,
+                member,
+                session_id,
+            } => Some(serde_json::json!({
+                "kind": "identity_name_held_by_raw_member", "identity": identity,
+                "member": member,
+                "session_id": session_id.as_ref().map(ToString::to_string),
+                "retryable": false,
             })),
             // An identity whose held member was not published keeps the
             // internal-error code; the kind tells its host that the identity
@@ -3851,6 +3893,21 @@ pub(crate) fn binding_carries_identity_marker(
             if continuity_key == identity.as_str()
                 || continuity_key == binding.identity().as_str()
     )
+}
+
+/// Whether an identity-first spawn made `binding`'s member for `identity`:
+/// it carries the identity's durable-identity marker, or its spawn labels
+/// carry the `agent_identity` label naming the identity, which every
+/// identity-first spawn writes (Meta 0.9.3's included) and the raw member
+/// creation surfaces refuse. A member the host made directly on the mob
+/// under the identity's member id has neither.
+pub(crate) fn binding_spawned_for_identity(
+    binding: &meerkat_mob::MemberBinding,
+    identity: &AgentIdentity,
+) -> bool {
+    binding_carries_identity_marker(binding, identity)
+        || crate::member_comms_id::durable_identity_label(binding.labels())
+            == Some(identity.as_str())
 }
 
 #[derive(Clone)]
@@ -6698,9 +6755,19 @@ impl IdentityRuntime {
                     ))
                 })?
         {
-            return Err(IdentityRuntimeError::Internal(format!(
-                "durable identity '{identity}' collides with an existing raw member alias"
-            )));
+            // The member's session, for the refusal: a read fault leaves it
+            // unnamed, and the refusal stands either way.
+            let session_id = self
+                .core_live_member(identity)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|live| live.session_id);
+            return Err(IdentityRuntimeError::IdentityNameHeldByRawMember {
+                identity: identity.clone(),
+                member: crate::member_comms_id::mob_member_id_str(identity.as_str()).into_owned(),
+                session_id,
+            });
         }
         Ok(())
     }
@@ -8899,12 +8966,19 @@ impl IdentityRuntime {
         let last = if first_boot_resume.is_some() || durable_spec_uses_external_binding(&spec) {
             None
         } else {
-            self.core_last_binding(identity).await?.and_then(|binding| {
-                binding
-                    .session_id()
-                    .cloned()
-                    .map(|session_id| (session_id, binding.role().clone()))
-            })
+            // A last binding no identity-first spawn made (a member the host
+            // made directly on the mob under the identity's member id, since
+            // retired) is not the identity's history: the wake starts fresh
+            // rather than hand that member's transcript to the identity.
+            self.core_last_binding(identity)
+                .await?
+                .filter(|binding| binding_spawned_for_identity(binding, identity))
+                .and_then(|binding| {
+                    binding
+                        .session_id()
+                        .cloned()
+                        .map(|session_id| (session_id, binding.role().clone()))
+                })
         };
         // Meta never infers a role migration. A resume
         // declares one only when the roster profile moved off the role Core
