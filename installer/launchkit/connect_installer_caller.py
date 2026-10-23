@@ -100,6 +100,22 @@ def _same_json_value(left, right):
     return left == right
 
 
+def _same_member_classes(left, right):
+    """Compare only the two defaults omitted by CompiledMemberClass's serde.
+
+    Ordinary purpose and an absent callback account serialize without a field.
+    DeclaredNone is a real account declaration and is never equivalent to null.
+    Preserve source bytes, declaration order and every other value exactly.
+    """
+    def canonical(value):
+        if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+            raise CustodyError("Native member classes require their selected declaration list.")
+        return [{key: item for key, item in row.items()
+            if not (key == "purpose" and item == "ordinary"
+                    or key == "callback_account" and item is None)} for row in value]
+    return _same_json_value(canonical(left), canonical(right))
+
+
 def _selected_service_parent_administration(value, *, routes, remote_operator):
     """Check the existing native selection shape, never administrative authority.
 
@@ -762,8 +778,8 @@ def _prepared_plan_source(plan, setup):
     before, after = original["native_host"], resolved["native_host"]
     classes = source.get("member_classes", [])
     if (not isinstance(classes, list) or any(not isinstance(row, dict) for row in classes)
-            or not _same_json_value(before.get("member_classes", []), classes)
-            or not _same_json_value(after.get("member_classes", []), classes)):
+            or not _same_member_classes(before.get("member_classes", []), classes)
+            or not _same_member_classes(after.get("member_classes", []), classes)):
         raise CustodyError("The completed native owner changed its selected member classes.")
     administration = [_selected_service_parent_administration(value.get("service_parent_administration"),
         routes=value["routes"], remote_operator=value["remote_operator"]) for value in (before, after)]

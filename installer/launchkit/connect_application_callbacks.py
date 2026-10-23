@@ -11,7 +11,7 @@ from copy import deepcopy
 import json
 import tomllib
 
-from .connect_installer_caller import CustodyError, ExactFile, _json
+from .connect_installer_caller import CustodyError, ExactFile, _json, _same_member_classes
 
 
 _SETUP_RESULTS_BUNDLE = "meerkat_toolkit.setup_results"
@@ -209,6 +209,25 @@ class SelectedApplicationCallbacks:
         """Selected native declaration data, never an admission or runtime fact."""
         self._current()
         return deepcopy(self._member_classes)
+
+    def require_completed_classes(self, setup_bytes):
+        """Bind selected callbacks to the retained native owner's class list.
+
+        Restore supplies its exact completed bytes before constructing a runtime.
+        Fresh completion uses the same comparison in the existing finalizer join.
+        """
+        self._current()
+        setup = _json(setup_bytes)
+        owner = setup.get("native_owner") if isinstance(setup, dict) else None
+        native = owner.get("native_host") if isinstance(owner, dict) else None
+        if native is None and not self._member_classes:
+            # Class-free legacy carriers have no callback class join. Native
+            # still validates their complete owner and installed policy.
+            return
+        if (not isinstance(native, dict)
+                or not _same_member_classes(list(self._member_classes.values()), native.get("member_classes", []))):
+            raise CustodyError("The completed native owner differs from the selected callback classes.")
+        self._current()
 
     def dynamic_catalog(self, deployment):
         """Bind compiled class callbacks without creating a template identity."""

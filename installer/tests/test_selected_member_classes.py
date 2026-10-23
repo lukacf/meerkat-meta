@@ -117,6 +117,17 @@ def startup_fixture(tmp_path, monkeypatch, mode, *, declarations=None, helperles
         del value["application"]["helper_profile"]
     f.plan = pin(f.plan.path, json.dumps(value).encode())
     if mode == "restored":
+        setup = json.loads(f.setup.read())
+        setup["native_owner"] = {"native_host": {
+            "member_classes": deepcopy(value["application"]["member_classes"])}}
+        f.setup = pin(f.setup.path, json.dumps(setup).encode())
+        manifest = json.loads(f.manifest.read())
+        for artifact in manifest["artifacts"]:
+            if artifact["path"] == f.setup.path.name:
+                artifact["sha256"] = f.setup.sha256
+        f.manifest = pin(f.manifest.path, json.dumps(manifest).encode())
+        f.selection["policy_manifest"] = f.manifest.pin()
+        f.selection_file = pin(f.selection_file.path, json.dumps(f.selection).encode())
         f.owner = f.make_owner()
     else:
         f.owner = FreshApplicationStartup(project_lease=f.lease, accepted_source=f.source,

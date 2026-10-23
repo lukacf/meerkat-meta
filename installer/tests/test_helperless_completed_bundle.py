@@ -12,8 +12,13 @@ from test_connect_completed_application_setup import encoded, write
 from test_prepared_helperless_source import completed_specimen
 
 
-def fixture(tmp_path, *, empty=False):
+def fixture(tmp_path, *, empty=False, class_defaults=None):
     plan, setup = completed_specimen(tmp_path, empty=empty)
+    if class_defaults is not None:
+        # The native typed serializer omits these defaults in the completed
+        # owner, while the original source pin must keep its selected bytes.
+        for classes in (plan["application"]["member_classes"], plan["owner"]["native_host"]["member_classes"]):
+            classes[0].update(class_defaults)
     f = SimpleNamespace(root=tmp_path.resolve(), plan_value=plan, setup_value=setup,
         calls=[], current=True)
     f.deployment = f.root / "installation"

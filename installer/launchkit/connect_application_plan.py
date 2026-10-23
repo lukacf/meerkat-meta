@@ -15,7 +15,7 @@ from pathlib import Path
 from .connect_installer_caller import (CustodyError, ExactFile, _preparation_setup_targets,
     _preparation_helper_catalog_request, _preparation_helper_catalog_capability,
     _preparation_helper_catalog_basis, _prepared_issuance_reference,
-    _selected_service_parent_administration, _selected_standing_policy)
+    _selected_service_parent_administration, _selected_standing_policy, _same_member_classes)
 
 
 MAX_PLAN_BYTES = 256 * 1024
@@ -169,7 +169,7 @@ def _assemble(plan):
     declarations = _array(application.get("member_classes", []), "Native member-class declarations")
     if any(not isinstance(item, dict) for item in declarations):
         raise CustodyError("Native member-class declarations must retain their selected objects.")
-    if not _same(native.get("member_classes", []), declarations):
+    if not _same_member_classes(native.get("member_classes", []), declarations):
         raise CustodyError("Application and owner member-class selections differ.")
     if not members and (has_helper or not declarations):
         raise CustodyError("An empty initial inventory requires helperless native member classes.")

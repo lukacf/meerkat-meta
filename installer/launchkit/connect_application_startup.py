@@ -810,7 +810,9 @@ class RestoredApplicationStartup:
         def read_inputs():
             from .connect_application_callbacks import SelectedApplicationCallbacks
             observed = self._read_inputs()
-            return observed, SelectedApplicationCallbacks(self.plan)
+            callbacks = SelectedApplicationCallbacks(self.plan)
+            callbacks.require_completed_classes(observed[3])
+            return observed, callbacks
 
         observed, callbacks = await _joined(read_inputs)
         self._require_current()

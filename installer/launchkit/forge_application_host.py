@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from .blueprint import Blueprint
 from .connect_application_callbacks import _source_definition
 from .connect_installer_caller import (CustodyError, ExactFile, NativeApplicationInventory, ProductGatewayFile,
-    _inventory_input, _json, _path, _private_parent, _same_json_value)
+    _inventory_input, _json, _path, _private_parent, _same_json_value, _same_member_classes)
 from .connect_policy_input import application_tool_policy_selection, _compiler_input
 from .projects import DraftConflict
 from .runtime_selection import MetaToolkitRuntimeTarget, parse_candidate_selection
@@ -349,7 +349,7 @@ class ForgeApplicationHost:
         if "member_classes" in original:
             application["member_classes"] = deepcopy(original["member_classes"])
         classes = original.get("member_classes", [])
-        if "member_classes" in native and not _same_json_value(native["member_classes"], classes):
+        if "member_classes" in native and not _same_member_classes(native["member_classes"], classes):
             raise CustodyError("The host owner changed the selected native member classes.")
         selected_owner = deepcopy(owner)
         if classes:
