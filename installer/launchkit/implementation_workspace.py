@@ -210,7 +210,10 @@ class ImplementationWorkspace:
             raise WorkspaceError("The workspace root cannot be a symlink.")
         candidate.mkdir(parents=True, mode=0o700, exist_ok=True)
         self.root = candidate.resolve()
-        os.chmod(self.root, 0o700)
+        # Opening a reader leaves a private root's metadata unchanged:
+        # recovery observes it, and a same-mode chmod still moves ctime.
+        if stat.S_IMODE(self.root.stat().st_mode) != 0o700:
+            os.chmod(self.root, 0o700)
         self.project = self.root / "project"
         self._state_path = self.root / "workspace-state.json"
         self._key_path = self.root / "verification-key"
