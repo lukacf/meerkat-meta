@@ -153,12 +153,13 @@ impl EscalationSubject {
     /// A short digest of the subject, for health announcement keys.
     #[must_use]
     pub fn digest(&self) -> String {
+        use std::fmt::Write as _;
         let digest = Sha256::digest(self.key().as_bytes());
-        digest
-            .iter()
-            .take(8)
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        let mut out = String::with_capacity(16);
+        for byte in digest.iter().take(8) {
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
     }
 }
 
