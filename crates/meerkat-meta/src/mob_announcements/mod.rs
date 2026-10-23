@@ -37,6 +37,7 @@
 
 pub mod availability;
 pub mod declarations;
+mod escalations_stub;
 mod faults;
 pub mod native;
 pub mod owner;
@@ -415,6 +416,15 @@ impl AnnouncementComposition {
         if !bound {
             return Err("the member tools are already bound".to_string());
         }
+        // The declarations are reconciled once the owner is composed (the
+        // options' ones first, when newer than the applied ones), as at
+        // every later trigger: a runtime refusal waits as pending.
+        let reconciling = service.clone();
+        drop(tokio::spawn(async move {
+            if let Err(error) = reconciling.reconcile_declarations().await {
+                tracing::warn!(%error, "mob announcement declarations not reconciled at compose");
+            }
+        }));
         drop(service.start());
         drop(service.watch_mobs());
         Ok(service)

@@ -390,6 +390,203 @@ async fn a_declaration_rollback_or_digest_conflict_is_refused() {
     assert_eq!(view["digest"], digest, "{view}");
 }
 
+/// An apply whose declarations the static checks refuse is refused whole:
+/// nothing it declares is made, nothing it drops is cancelled, and the
+/// applied revision stands.
+#[tokio::test]
+async fn an_apply_the_static_checks_refuse_changes_nothing() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    try_apply(
+        service,
+        1,
+        serde_json::json!([]),
+        serde_json::json!([declared_subscription("declared-a", "agent:a", &["ops.one"])]),
+    )
+    .await
+    .unwrap();
+    let before = declared(service).await;
+    // Revision 2 drops declared-a and names declared-b twice.
+    let refused = try_apply(
+        service,
+        2,
+        serde_json::json!([]),
+        serde_json::json!([
+            declared_subscription("declared-b", "agent:b", &["ops.two"]),
+            declared_subscription("declared-b", "agent:b", &["ops.three"]),
+        ]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, -32602, "{refused:?}");
+    assert_eq!(declared(service).await, before);
+    assert_eq!(
+        subscription_state(service, "declared-a").await.as_deref(),
+        Some("active")
+    );
+    assert_eq!(subscription_state(service, "declared-b").await, None);
+}
+
+/// A declared template whose replace is refused is pending with the
+/// refusal, and the children it made before are still listed: they still
+/// capture.
+#[tokio::test]
+async fn a_pending_template_replace_keeps_its_children_listed() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    harness.native.set_roster_facts("agent:b", "reviewer", &[]);
+    try_apply(
+        service,
+        1,
+        serde_json::json!([]),
+        serde_json::json!([declared_template("reviewers", "reviewer", &["deploy.done"])]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        role_children(&declared(service).await, "reviewers").len(),
+        1
+    );
+    // Revision 2 names a mob this gateway does not host: the replace is
+    // refused.
+    let moved = with(
+        declared_template("reviewers", "reviewer", &["deploy.done"]),
+        "mobs",
+        serde_json::json!(["mob-not-hosted"]),
+    );
+    try_apply(
+        service,
+        2,
+        serde_json::json!([]),
+        serde_json::json!([moved]),
+    )
+    .await
+    .unwrap();
+    let view = declared(service).await;
+    assert_eq!(
+        record(&view, "subscription", "reviewers").map(|record| &record["status"]),
+        Some(&serde_json::json!("pending")),
+        "{view}"
+    );
+    let children = role_children(&view, "reviewers");
+    assert_eq!(children.len(), 1, "{view}");
+    assert_eq!(children[0]["status"], "applied", "{view}");
+}
+
+/// Change the subscription `id` at its revision as an operator does:
+/// `verb` is "pause", "resume" or "cancel".
+async fn operator_changes(service: &AnnouncementService, verb: &str, id: &str) {
+    let found = try_host_call(
+        service,
+        SUBSCRIPTIONS_GET,
+        serde_json::json!({ "subscription_id": id }),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        &format!("meta/mob_announcements/subscriptions/{verb}"),
+        serde_json::json!({
+            "operation_id": format!("operator-{verb}-{id}"),
+            "subscription_id": id,
+            "expected_revision": found["subscription"]["revision"],
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+/// An operator's pause of a declared subscription holds. An operator's
+/// cancel of it, or end of a declared source, holds as suppressed while the
+/// declaration of that record is unchanged. A changed declaration starts
+/// the source's next generation; the cancelled subscription stays
+/// cancelled and its declaration waits as pending until retention removes
+/// the cancelled record.
+#[tokio::test]
+async fn an_operators_pause_and_cancel_of_a_declared_record_hold() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let first_inbox = declared_inbox(serde_json::json!([member_grant("agent:a")]));
+    let first = serde_json::json!([declared_subscription("declared-a", "agent:a", &["ops.one"])]);
+    try_apply(service, 1, serde_json::json!([first_inbox]), first.clone())
+        .await
+        .unwrap();
+
+    // A pause holds across the same declarations applied again and a
+    // reconcile.
+    operator_changes(service, "pause", "declared-a").await;
+    try_apply(service, 1, serde_json::json!([first_inbox]), first)
+        .await
+        .unwrap();
+    service.reconcile_mobs().await.unwrap();
+    assert_eq!(
+        subscription_state(service, "declared-a").await.as_deref(),
+        Some("paused")
+    );
+
+    // A cancel and an end hold as suppressed.
+    operator_changes(service, "cancel", "declared-a").await;
+    let revision = inbox(service).await["revision"].clone();
+    try_host_call(
+        service,
+        SOURCES_END,
+        serde_json::json!({
+            "operation_id": "operator-end-inbox",
+            "source_id": "inbox",
+            "expected_revision": revision,
+        }),
+    )
+    .await
+    .unwrap();
+    service.reconcile_mobs().await.unwrap();
+    let view = declared(service).await;
+    for (kind, id) in [("source", "inbox"), ("subscription", "declared-a")] {
+        assert_eq!(
+            record(&view, kind, id).map(|record| &record["status"]),
+            Some(&serde_json::json!("suppressed")),
+            "{view}"
+        );
+    }
+    assert_eq!(
+        subscription_state(service, "declared-a").await.as_deref(),
+        Some("cancelled")
+    );
+    assert_eq!(inbox(service).await["state"], "ended");
+
+    // Revision 2 changes both declarations.
+    try_apply(
+        service,
+        2,
+        serde_json::json!([declared_inbox(serde_json::json!([
+            member_grant("agent:a"),
+            member_grant("agent:b"),
+        ]))]),
+        serde_json::json!([declared_subscription("declared-a", "agent:a", &["ops.two"])]),
+    )
+    .await
+    .unwrap();
+    let view = declared(service).await;
+    assert_eq!(
+        record(&view, "source", "inbox").map(|record| &record["status"]),
+        Some(&serde_json::json!("applied")),
+        "{view}"
+    );
+    let source = inbox(service).await;
+    assert_eq!(source["generation"], 2, "{source}");
+    assert_eq!(source["state"], "active", "{source}");
+    let waiting = record(&view, "subscription", "declared-a")
+        .unwrap_or_else(|| panic!("the declared subscription is listed: {view}"));
+    assert_eq!(waiting["status"], "pending", "{view}");
+    assert_eq!(
+        waiting["refusal"]["kind"], "subscription_cancelled",
+        "{view}"
+    );
+    assert_eq!(
+        subscription_state(service, "declared-a").await.as_deref(),
+        Some("cancelled")
+    );
+}
+
 /// A managed subscription whose declaration changed is replaced in place
 /// at its revision: what it captured before stays owed, the new selector
 /// captures from now, and the old one captures no more.

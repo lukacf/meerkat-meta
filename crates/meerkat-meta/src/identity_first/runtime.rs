@@ -9804,6 +9804,18 @@ impl IdentityRuntime {
         Ok(RegisteredSpec { spec, spec_digest })
     }
 
+    /// The identities whose REGISTERED row names the profile `profile`, in
+    /// identity order.
+    pub async fn registered_with_profile(&self, profile: &str) -> Vec<AgentIdentity> {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .filter(|(_, entry)| entry.spec.profile.as_str() == profile)
+            .map(|(identity, _)| identity.clone())
+            .collect()
+    }
+
     /// Governed counterpart of [`Self::send_with_turn_ticket`]: deliver one
     /// trusted governed input to `identity`'s member under the same identity
     /// lease, lifecycle lock, delivery recording and [`TurnTicket`].

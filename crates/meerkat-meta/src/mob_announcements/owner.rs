@@ -40,6 +40,9 @@ use super::types::{
     SubscriptionState, SuccessorBatch, merge_gaps, render_item, successor_batch, wire_budget,
 };
 
+#[path = "owner_declarations.rs"]
+mod declarations_engine;
+
 /// The owner's error for a member a put cannot subscribe.
 fn member_problem(member: &Member, problem: MemberProblem) -> AnnouncementError {
     match problem {
@@ -166,13 +169,6 @@ impl Default for AnnouncementConfig {
             declarations: None,
         }
     }
-}
-
-/// What a declaration method answers until declarations are reconciled.
-fn declarations_unsupported() -> AnnouncementError {
-    AnnouncementError::Store(AnnouncementStoreError::Invalid(
-        "declarations are not supported by this gateway yet".to_string(),
-    ))
 }
 
 /// Announcement refusals and failures, as callers see them.
@@ -420,6 +416,9 @@ struct Inner {
     /// Runner reconciles pass one at a time, each reading the source's
     /// record as it stands then.
     runners_gate: tokio::sync::Mutex<()>,
+    /// Applies and reconciles of declarations pass one at a time, each
+    /// reading the applied declarations and marks as they stand then.
+    declarations_gate: tokio::sync::Mutex<()>,
 }
 
 /// Keeps sources' runner schedules in line with their records: Meta's
@@ -602,6 +601,7 @@ impl AnnouncementService {
                 stopped: AtomicBool::new(false),
                 runners: std::sync::Mutex::new(None),
                 runners_gate: tokio::sync::Mutex::new(()),
+                declarations_gate: tokio::sync::Mutex::new(()),
             }),
         })
     }
@@ -620,22 +620,21 @@ impl AnnouncementService {
         &self,
         declarations: Option<super::declarations::Declarations>,
     ) -> Result<super::declarations::DeclarationsView, AnnouncementError> {
-        let _ = declarations;
-        Err(declarations_unsupported())
+        self.apply_declared(declarations).await
     }
 
     /// What the declarations manage now (contract 4.6).
     pub async fn declarations(
         &self,
     ) -> Result<super::declarations::DeclarationsView, AnnouncementError> {
-        Err(declarations_unsupported())
+        self.declared_view().await
     }
 
     /// Reconcile the applied declarations again: at compose, before the
     /// dispatcher starts, and at each trigger that can admit a pending
     /// record (a mob set change, a health pass).
     pub async fn reconcile_declarations(&self) -> Result<(), AnnouncementError> {
-        Ok(())
+        self.reconcile_declared().await
     }
 
     /// Create a role template, or replace its selector at its revision
@@ -645,8 +644,12 @@ impl AnnouncementService {
         operation: &OperationId,
         request: super::declarations::PutRoleTemplate,
     ) -> Result<super::declarations::RoleTemplate, AnnouncementError> {
-        let _ = (operation, request);
-        Err(declarations_unsupported())
+        self.ensure_hosted(&request.mobs).await?;
+        Ok(self
+            .inner
+            .store
+            .put_role_template(operation, request, self.now())
+            .await?)
     }
 
     /// Why the member's deliveries wait now, if they do: the latest
@@ -757,16 +760,27 @@ impl AnnouncementService {
             .await?;
         // The roster facts of the members whose subscriptions take a topic a
         // source owns: the store captures only covered members there.
-        let subscribers = self
+        let mut subscribers = self
             .inner
             .store
             .owned_topic_subscribers(&request.mob_id, &request.topics)
             .await?;
+        // The role templates the announcement matches take the members with
+        // their role now: a member without a child is checked here, and the
+        // store makes its child in the capture.
+        let mut templates = self
+            .inner
+            .store
+            .role_templates(Some(&request.mob_id))
+            .await?;
+        templates.retain(|found| !found.template.topics.is_disjoint(&request.topics));
+        let (roles, admitted) = self.expand_roles(&templates).await;
+        subscribers.extend(admitted);
         let facts = self.roster_facts(subscribers).await;
         let outcome = self
             .inner
             .store
-            .announce_with_facts(request, &facts, self.now())
+            .announce_with_roles(request, &facts, &roles, self.now())
             .await?;
         if !outcome.captured_for.is_empty() {
             self.wake();
@@ -942,16 +956,23 @@ impl AnnouncementService {
     ) -> Result<SourceAdvance, AnnouncementError> {
         self.ensure_hosted(&BTreeSet::from([request.mob_id.clone()]))
             .await?;
-        let subscribers = self
+        let mut subscribers = self
             .inner
             .store
             .source_subscribers(&request.mob_id, &request.source_id)
             .await?;
+        let templates = self
+            .inner
+            .store
+            .role_templates(Some(&request.mob_id))
+            .await?;
+        let (roles, admitted) = self.expand_roles(&templates).await;
+        subscribers.extend(admitted);
         let facts = self.roster_facts(subscribers).await;
         let advance = self
             .inner
             .store
-            .advance_source_with_facts(operation, request, &facts, self.now())
+            .advance_source_with_roles(operation, request, &facts, &roles, self.now())
             .await?;
         super::faults::after_source_advance();
         if advance.captured {
@@ -1297,12 +1318,18 @@ impl AnnouncementService {
 
     /// Reconcile every mob the store knows against the mob owner's records:
     /// destroyed mobs leave the subscriptions that name them, and their logs
-    /// are marked ended for retention. Then reconcile the lineage records
-    /// ([`Self::reconcile_lineage`]).
+    /// are marked ended for retention. Then reconcile the declarations and
+    /// the children of role templates ([`Self::reconcile_declarations`]),
+    /// and the lineage records ([`Self::reconcile_lineage`]).
     pub async fn reconcile_mobs(&self) -> Result<Vec<SubscriptionId>, AnnouncementError> {
         let known = self.inner.store.known_mobs().await?;
         let changed = self.drop_ended(&known).await?;
         self.reconcile_child_members().await?;
+        // A mob set change can admit a pending declared record, and move
+        // members in and out of role templates' roles.
+        if let Err(error) = self.reconcile_declarations().await {
+            tracing::warn!(%error, "declarations not reconciled after a mob set change");
+        }
         self.reconcile_lineage().await?;
         Ok(changed)
     }

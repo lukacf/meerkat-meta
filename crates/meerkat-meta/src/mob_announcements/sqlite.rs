@@ -15,6 +15,11 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::declarations::{
+    DeclarationRecordKind, DeclarationRefusal, DeclarationStatus, PutRoleTemplate,
+    ROLE_TEMPLATE_LIMIT, RoleTemplate, role_child_id,
+};
+use super::owner::AnnouncementError;
 use super::sources::{
     AdvanceSource, AnnouncementSource, AuditAction, AuditQuery, AuditReason, AuditRow,
     CollectionPhase, Coverage, CoverageGap, DeletionCapability, ItemChange, ItemOutcome,
@@ -23,16 +28,20 @@ use super::sources::{
     SourceAdvance, SourceChange, SourceConfig, SourceConflictRecord, SourceFailureRecord,
     SourceQuery, SourceState, SourceStream, StreamPhase, TopicOwnership, covers,
 };
-use super::store::{AnnouncementStore, SubmissionCheck};
+use super::store::{
+    AnnouncementStore, AppliedDeclarations, DeclarationMark, RoleChild, RoleChildStatus,
+    RoleExpansion, RoleExpansions, RoleMember, SubmissionCheck, TemplateChildren,
+};
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Announcer, Batch,
     BatchEvent, BatchGap, BatchId, BatchItem, BatchPosition, BatchQuery, BatchState, BatchStateTag,
-    ExpiryReport, GapReason, LateOutcome, MAX_BACKFILL, MAX_ITEM_WIRE_BYTES, MAX_PAGE, Member,
-    MemberBacklog, MemberRoute, MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport,
-    PutSubscription, Result, SOURCE_KEY_PREFIX, SealingPolicy, Selector, SourceId, SourceKey,
-    StartFrontier, Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd,
-    SubscriptionId, SubscriptionState, Topic, content_digest, header_wire_bound, merge_gaps,
-    quoted, render_batch, render_gap, render_item, request_fingerprint, wire_budget, wire_len,
+    ChildMemberLimits, ExpiryReport, GapReason, LateOutcome, MAX_BACKFILL, MAX_ITEM_WIRE_BYTES,
+    MAX_PAGE, Member, MemberBacklog, MemberRoute, MemberRouteRecord, MobId, MobLineage,
+    OperationId, PruneReport, PutSubscription, Result, SOURCE_KEY_PREFIX, SealingPolicy, Selector,
+    SourceId, SourceKey, StartFrontier, Subscription, SubscriptionChange,
+    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, SubscriptionState, Topic,
+    content_digest, header_wire_bound, merge_gaps, quoted, render_batch, render_gap, render_item,
+    request_fingerprint, wire_budget, wire_len,
 };
 
 /// The mob announcement store's version 1 tables, frozen with the release
@@ -113,8 +122,10 @@ CREATE INDEX IF NOT EXISTS member_routes_by_route ON member_routes (route, membe
 /// sources own, the streams each generation onboarded, the counted audit
 /// of what sources' audiences and routes refused, withheld, held, released
 /// or let through, one entry per source, generation, member, action and
-/// reason, and the owed items held while their member does not pass. A
-/// provider applies this after [`SCHEMA`].
+/// reason, and the owed items held while their member does not pass; the
+/// declarations the reconciler follows (one row), a mark per declared
+/// record, the role templates, and the children each template made, one
+/// per member. A provider applies this after [`SCHEMA`].
 pub const SCHEMA_V2: &str = "
 CREATE TABLE IF NOT EXISTS announcement_sources (
  mob_id TEXT NOT NULL, source_id TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -151,7 +162,23 @@ CREATE TABLE IF NOT EXISTS announcement_holds (
 CREATE INDEX IF NOT EXISTS announcement_holds_by_member
  ON announcement_holds (member, checked_at_ms);
 CREATE INDEX IF NOT EXISTS announcement_holds_by_check
- ON announcement_holds (checked_at_ms);";
+ ON announcement_holds (checked_at_ms);
+CREATE TABLE IF NOT EXISTS announcement_declarations (
+ slot INTEGER PRIMARY KEY, revision INTEGER NOT NULL, digest TEXT NOT NULL,
+ applied_at_ms INTEGER NOT NULL, record TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS announcement_declaration_records (
+ kind TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL, digest TEXT NOT NULL,
+ status TEXT NOT NULL, since_ms INTEGER NOT NULL, record TEXT NOT NULL,
+ PRIMARY KEY (kind, id));
+CREATE TABLE IF NOT EXISTS announcement_role_templates (
+ id TEXT NOT NULL PRIMARY KEY, mob_id TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL,
+ updated_at_ms INTEGER NOT NULL, record TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS announcement_role_templates_by_mob
+ ON announcement_role_templates (mob_id, state);
+CREATE TABLE IF NOT EXISTS announcement_role_children (
+ template_id TEXT NOT NULL, member TEXT NOT NULL, subscription_id TEXT NOT NULL,
+ status TEXT NOT NULL, since_ms INTEGER NOT NULL, record TEXT NOT NULL,
+ PRIMARY KEY (template_id, member));";
 
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
@@ -763,6 +790,7 @@ fn announce_in(
     db: &Connection,
     request: &AnnounceRequest,
     facts: &RosterFacts,
+    roles: &RoleExpansions,
     now_ms: u64,
 ) -> Result<AnnounceOutcome> {
     request.validate()?;
@@ -786,6 +814,11 @@ fn announce_in(
     // only what would be announced now.
     request.ensure_key_open()?;
     ensure_topics_open(db, request)?;
+    // The role templates this announcement matches make their members'
+    // children first, from the head before it, so a member that took the
+    // role since the last capture captures it; a child whose member left
+    // the role captures nothing more.
+    let left_role = capture_role_children_in(db, request, facts, roles, now_ms)?;
     let head: Option<i64> = db
         .query_row(
             "SELECT head_sequence FROM announcement_logs WHERE mob_id = ?1",
@@ -855,9 +888,10 @@ fn announce_in(
     let owners = topic_sources(db, &announcement.mob_id, &announcement.topics)?;
     let mut captured = Vec::new();
     for subscription in subscriptions_for_topics(db, &announcement.topics)?.into_values() {
-        if !subscription
-            .selector
-            .matches(&announcement.mob_id, &announcement.topics)
+        if left_role.contains(&subscription.id)
+            || !subscription
+                .selector
+                .matches(&announcement.mob_id, &announcement.topics)
         {
             continue;
         }
@@ -2931,6 +2965,7 @@ fn announce_gap_notice(
     source: &AnnouncementSource,
     gap: &GapNotice<'_>,
     facts: &RosterFacts,
+    roles: &RoleExpansions,
     now_ms: u64,
 ) -> Result<bool> {
     let GapNotice {
@@ -2962,7 +2997,7 @@ fn announce_gap_notice(
         correlation_id: None,
         causes: Vec::new(),
     };
-    Ok(!announce_in(db, &notice, facts, now_ms)?
+    Ok(!announce_in(db, &notice, facts, roles, now_ms)?
         .captured_for
         .is_empty())
 }
@@ -2972,6 +3007,7 @@ fn advance_source_in(
     operation: &OperationId,
     request: &AdvanceSource,
     facts: &RosterFacts,
+    roles: &RoleExpansions,
     now_ms: u64,
 ) -> Result<SourceAdvance> {
     request.validate()?;
@@ -3148,7 +3184,7 @@ fn advance_source_in(
             existing_digest: None,
             offered_digest: None,
         };
-        match announce_in(db, &announcement, facts, now_ms) {
+        match announce_in(db, &announcement, facts, roles, now_ms) {
             Ok(committed) if committed.replayed => {
                 replayed += 1;
                 outcome.outcome = ItemOutcomeKind::Replayed;
@@ -3202,7 +3238,7 @@ fn advance_source_in(
             reason: &reason,
             until_ms,
         };
-        captured |= announce_gap_notice(db, &source, &notice, facts, now_ms)?;
+        captured |= announce_gap_notice(db, &source, &notice, facts, roles, now_ms)?;
         source.health.totals.gaps += 1;
     }
 
@@ -4043,8 +4079,19 @@ impl AnnouncementStore for SqliteAnnouncementStore {
         facts: &RosterFacts,
         now_ms: u64,
     ) -> Result<AnnounceOutcome> {
-        let facts = facts.clone();
-        self.run(move |db| announce_in(db, &request, &facts, now_ms))
+        self.announce_with_roles(request, facts, &RoleExpansions::default(), now_ms)
+            .await
+    }
+
+    async fn announce_with_roles(
+        &self,
+        request: AnnounceRequest,
+        facts: &RosterFacts,
+        roles: &RoleExpansions,
+        now_ms: u64,
+    ) -> Result<AnnounceOutcome> {
+        let (facts, roles) = (facts.clone(), roles.clone());
+        self.run(move |db| announce_in(db, &request, &facts, &roles, now_ms))
             .await
     }
 
@@ -4544,11 +4591,35 @@ impl AnnouncementStore for SqliteAnnouncementStore {
         facts: &RosterFacts,
         now_ms: u64,
     ) -> Result<SourceAdvance> {
+        self.advance_source_with_roles(
+            operation,
+            request,
+            facts,
+            &RoleExpansions::default(),
+            now_ms,
+        )
+        .await
+    }
+
+    async fn advance_source_with_roles(
+        &self,
+        operation: &OperationId,
+        request: AdvanceSource,
+        facts: &RosterFacts,
+        roles: &RoleExpansions,
+        now_ms: u64,
+    ) -> Result<SourceAdvance> {
         let request = Arc::new(request);
         let step = {
-            let (operation, request, facts) =
-                (operation.clone(), Arc::clone(&request), facts.clone());
-            move |db: &Connection| advance_source_in(db, &operation, &request, &facts, now_ms)
+            let (operation, request, facts, roles) = (
+                operation.clone(),
+                Arc::clone(&request),
+                facts.clone(),
+                roles.clone(),
+            );
+            move |db: &Connection| {
+                advance_source_in(db, &operation, &request, &facts, &roles, now_ms)
+            }
         };
         let result = self.run(step).await;
         // An onboarding refusal leaves the source unchanged, then counts
@@ -4632,4 +4703,919 @@ impl AnnouncementStore for SqliteAnnouncementStore {
         let query = query.clone();
         self.run(move |db| sources_in(db, &query)).await
     }
+
+    async fn role_templates(&self, mob_id: Option<&MobId>) -> Result<Vec<TemplateChildren>> {
+        let mob_id = mob_id.cloned();
+        self.run(move |db| role_templates_in(db, mob_id.as_ref()))
+            .await
+    }
+
+    async fn role_template(&self, id: &SubscriptionId) -> Result<Option<RoleTemplate>> {
+        let id = id.clone();
+        self.run(move |db| load_role_template(db, &id)).await
+    }
+
+    async fn put_role_template(
+        &self,
+        operation: &OperationId,
+        request: PutRoleTemplate,
+        now_ms: u64,
+    ) -> Result<RoleTemplate> {
+        let operation = operation.clone();
+        self.run(move |db| put_role_template_in(db, &operation, &request, now_ms))
+            .await
+    }
+
+    async fn cancel_role_template(
+        &self,
+        operation: &OperationId,
+        id: &SubscriptionId,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> Result<RoleTemplate> {
+        let (operation, id) = (operation.clone(), id.clone());
+        self.run(move |db| cancel_role_template_in(db, &operation, &id, expected_revision, now_ms))
+            .await
+    }
+
+    async fn reconcile_role_children(
+        &self,
+        roles: &RoleExpansions,
+        facts: &RosterFacts,
+        now_ms: u64,
+    ) -> Result<()> {
+        let (roles, facts) = (roles.clone(), facts.clone());
+        self.run(move |db| reconcile_role_children_in(db, &roles, &facts, now_ms))
+            .await
+    }
+
+    async fn role_children(&self) -> Result<Vec<RoleChild>> {
+        self.run(all_role_children).await
+    }
+
+    async fn applied_declarations(&self) -> Result<Option<AppliedDeclarations>> {
+        self.run(applied_declarations_in).await
+    }
+
+    async fn record_declarations(&self, applied: AppliedDeclarations) -> Result<()> {
+        self.run(move |db| record_declarations_in(db, &applied))
+            .await
+    }
+
+    async fn declaration_marks(&self) -> Result<Vec<DeclarationMark>> {
+        self.run(declaration_marks_in).await
+    }
+
+    async fn put_declaration_mark(&self, mark: DeclarationMark, now_ms: u64) -> Result<()> {
+        self.run(move |db| put_declaration_mark_in(db, &mark, now_ms))
+            .await
+    }
+
+    async fn remove_declaration_mark(
+        &self,
+        kind: DeclarationRecordKind,
+        id: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        let id = id.to_string();
+        self.run(move |db| remove_declaration_mark_in(db, kind, &id, now_ms))
+            .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Declarations and role templates
+// ---------------------------------------------------------------------------
+
+/// The one row of `announcement_declarations`: the declarations the
+/// reconciler follows.
+const DECLARATIONS_SLOT: i64 = 1;
+
+/// The typed refusal a declared record or a role child is pending with: the
+/// kind the same refusal carries on the wire, and its message.
+fn refusal_of(error: &AnnouncementStoreError) -> DeclarationRefusal {
+    DeclarationRefusal {
+        kind: super::rpc::refusal_kind(&AnnouncementError::Store(error.clone())),
+        message: error.to_string(),
+    }
+}
+
+/// An id a record made at runtime holds: the declaration or the template
+/// takes it once that record is gone.
+fn unmanaged_record(id: &SubscriptionId) -> DeclarationRefusal {
+    DeclarationRefusal {
+        kind: "unmanaged_record".to_string(),
+        message: format!(
+            "subscription {id} was made at runtime; it is never changed here, and the id is \
+             taken once that record is gone"
+        ),
+    }
+}
+
+/// An operation id derived from what it does, so a repeat of the same step
+/// meets its receipt and another step never does.
+fn derived_operation(step: &str, id: &SubscriptionId, revision: u64) -> Result<OperationId> {
+    let digest = super::types::sha256_hex(&[
+        step.as_bytes(),
+        id.as_str().as_bytes(),
+        &revision.to_be_bytes(),
+    ]);
+    let hex = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    OperationId::new(format!("{step}-{}", &hex[..32]))
+}
+
+/// Run `step` inside a savepoint: an error rolls back what `step` wrote and
+/// nothing before it.
+fn within_savepoint<T>(db: &Connection, step: impl FnOnce() -> Result<T>) -> Result<T> {
+    db.execute_batch("SAVEPOINT role_child").map_err(storage)?;
+    match step() {
+        Ok(value) => {
+            db.execute_batch("RELEASE role_child").map_err(storage)?;
+            Ok(value)
+        }
+        Err(error) => {
+            db.execute_batch("ROLLBACK TO role_child; RELEASE role_child")
+                .map_err(storage)?;
+            Err(error)
+        }
+    }
+}
+
+/// Raise the `declaration_pending` escalation of a record pending since
+/// `pending_since`, or resolve it.
+fn escalate_declaration(
+    db: &Connection,
+    kind: DeclarationRecordKind,
+    id: &str,
+    pending_since: Option<u64>,
+    now_ms: u64,
+) -> Result<()> {
+    use super::escalations_stub::{
+        DeclarationRecordKind as Record, EscalationCause, EscalationSubject, raise_escalation_in,
+        resolve_escalation_in,
+    };
+    let record_kind = match kind {
+        DeclarationRecordKind::Source => Record::Source,
+        DeclarationRecordKind::Subscription => Record::Subscription,
+        DeclarationRecordKind::RoleChild => Record::RoleChild,
+    };
+    let subject = EscalationSubject::Declaration {
+        record_kind,
+        id: id.to_string(),
+    };
+    match pending_since {
+        Some(since_ms) => raise_escalation_in(
+            db,
+            EscalationCause::DeclarationPending,
+            &subject,
+            since_ms,
+            now_ms,
+        ),
+        None => resolve_escalation_in(db, EscalationCause::DeclarationPending, &subject, now_ms),
+    }
+}
+
+fn applied_declarations_in(db: &Connection) -> Result<Option<AppliedDeclarations>> {
+    db.query_row(
+        "SELECT record FROM announcement_declarations WHERE slot = ?1",
+        params![DECLARATIONS_SLOT],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(storage)?
+    .map(|record| decode(&record))
+    .transpose()
+}
+
+/// Record `applied` as the declarations the reconciler follows: a lower
+/// revision than the recorded one is a rollback, the recorded revision with
+/// another digest a conflict, and with the same digest it changes nothing.
+fn record_declarations_in(db: &Connection, applied: &AppliedDeclarations) -> Result<()> {
+    if let Some(current) = applied_declarations_in(db)? {
+        if applied.revision < current.revision {
+            return Err(AnnouncementStoreError::DeclarationRollback {
+                applied: current.revision,
+            });
+        }
+        if applied.revision == current.revision {
+            if applied.digest != current.digest {
+                return Err(AnnouncementStoreError::DeclarationDigestConflict {
+                    revision: current.revision,
+                });
+            }
+            return Ok(());
+        }
+    }
+    db.execute(
+        "INSERT INTO announcement_declarations (slot, revision, digest, applied_at_ms, record)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(slot) DO UPDATE SET revision = excluded.revision,
+           digest = excluded.digest, applied_at_ms = excluded.applied_at_ms,
+           record = excluded.record",
+        params![
+            DECLARATIONS_SLOT,
+            int(applied.revision)?,
+            applied.digest,
+            int(applied.applied_at_ms)?,
+            encode(applied)?,
+        ],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+fn declaration_marks_in(db: &Connection) -> Result<Vec<DeclarationMark>> {
+    let mut statement = db
+        .prepare("SELECT record FROM announcement_declaration_records ORDER BY kind, id")
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(storage)?;
+    rows.map(|record| decode(&record.map_err(storage)?))
+        .collect()
+}
+
+/// Write a record's mark, raising its escalation while it is pending and
+/// resolving it otherwise, in the same transaction.
+fn put_declaration_mark_in(db: &Connection, mark: &DeclarationMark, now_ms: u64) -> Result<()> {
+    db.execute(
+        "INSERT INTO announcement_declaration_records
+         (kind, id, revision, digest, status, since_ms, record)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(kind, id) DO UPDATE SET revision = excluded.revision,
+           digest = excluded.digest, status = excluded.status,
+           since_ms = excluded.since_ms, record = excluded.record",
+        params![
+            mark.kind.as_str(),
+            mark.id,
+            int(mark.revision)?,
+            mark.digest,
+            mark.status.as_str(),
+            int(mark.since_ms)?,
+            encode(mark)?,
+        ],
+    )
+    .map_err(storage)?;
+    let pending = (mark.status == DeclarationStatus::Pending).then_some(mark.since_ms);
+    escalate_declaration(db, mark.kind, &mark.id, pending, now_ms)
+}
+
+fn remove_declaration_mark_in(
+    db: &Connection,
+    kind: DeclarationRecordKind,
+    id: &str,
+    now_ms: u64,
+) -> Result<()> {
+    db.execute(
+        "DELETE FROM announcement_declaration_records WHERE kind = ?1 AND id = ?2",
+        params![kind.as_str(), id],
+    )
+    .map_err(storage)?;
+    escalate_declaration(db, kind, id, None, now_ms)
+}
+
+/// The selector a role template's children capture with.
+fn template_selector(template: &RoleTemplate) -> Selector {
+    Selector {
+        topics: template.topics.clone(),
+        mobs: template.mobs.clone(),
+    }
+}
+
+fn load_role_template(db: &Connection, id: &SubscriptionId) -> Result<Option<RoleTemplate>> {
+    db.query_row(
+        "SELECT record FROM announcement_role_templates WHERE id = ?1",
+        params![id.as_str()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(storage)?
+    .map(|record| decode(&record))
+    .transpose()
+}
+
+fn write_role_template(db: &Connection, template: &RoleTemplate) -> Result<()> {
+    db.execute(
+        "INSERT INTO announcement_role_templates (id, mob_id, role, state, updated_at_ms, record)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET mob_id = excluded.mob_id, role = excluded.role,
+           state = excluded.state, updated_at_ms = excluded.updated_at_ms,
+           record = excluded.record",
+        params![
+            template.id.as_str(),
+            template.members.mob_id.as_str(),
+            template.members.role,
+            template.state.as_str(),
+            int(template.updated_at_ms)?,
+            encode(template)?,
+        ],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// A template's children, each with its subscription's state now (`None`:
+/// no subscription has its id).
+fn role_children_of(
+    db: &Connection,
+    template: &SubscriptionId,
+) -> Result<BTreeMap<Member, (RoleChild, Option<SubscriptionState>)>> {
+    let mut statement = db
+        .prepare_cached(
+            "SELECT c.record, s.record FROM announcement_role_children c
+             LEFT JOIN member_subscriptions s ON s.id = c.subscription_id
+             WHERE c.template_id = ?1",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![template.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(storage)?;
+    let mut children = BTreeMap::new();
+    for row in rows {
+        let (child, subscription) = row.map_err(storage)?;
+        let child: RoleChild = decode(&child)?;
+        let state = subscription
+            .map(|record| decode::<Subscription>(&record).map(|found| found.state))
+            .transpose()?;
+        children.insert(child.member.clone(), (child, state));
+    }
+    Ok(children)
+}
+
+fn all_role_children(db: &Connection) -> Result<Vec<RoleChild>> {
+    let mut statement = db
+        .prepare("SELECT record FROM announcement_role_children ORDER BY template_id, member")
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(storage)?;
+    rows.map(|record| decode(&record.map_err(storage)?))
+        .collect()
+}
+
+/// Write a child, raising its escalation while it is pending and resolving
+/// it otherwise, in the same transaction.
+fn write_role_child(db: &Connection, child: &RoleChild, now_ms: u64) -> Result<()> {
+    db.execute(
+        "INSERT INTO announcement_role_children
+         (template_id, member, subscription_id, status, since_ms, record)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(template_id, member) DO UPDATE SET
+           subscription_id = excluded.subscription_id, status = excluded.status,
+           since_ms = excluded.since_ms, record = excluded.record",
+        params![
+            child.template_id.as_str(),
+            child.member.key(),
+            child.subscription_id.as_str(),
+            child.status.as_str(),
+            int(child.since_ms)?,
+            encode(child)?,
+        ],
+    )
+    .map_err(storage)?;
+    let pending = (child.status == RoleChildStatus::Pending).then_some(child.since_ms);
+    escalate_declaration(
+        db,
+        DeclarationRecordKind::RoleChild,
+        child.subscription_id.as_str(),
+        pending,
+        now_ms,
+    )
+}
+
+fn delete_role_child(db: &Connection, child: &RoleChild, now_ms: u64) -> Result<()> {
+    db.execute(
+        "DELETE FROM announcement_role_children WHERE template_id = ?1 AND member = ?2",
+        params![child.template_id.as_str(), child.member.key()],
+    )
+    .map_err(storage)?;
+    escalate_declaration(
+        db,
+        DeclarationRecordKind::RoleChild,
+        child.subscription_id.as_str(),
+        None,
+        now_ms,
+    )
+}
+
+/// `child` at `status` with `refusal`, keeping when it took the status if
+/// it already had it.
+fn child_at(
+    child: &RoleChild,
+    status: RoleChildStatus,
+    refusal: Option<DeclarationRefusal>,
+    now_ms: u64,
+) -> RoleChild {
+    RoleChild {
+        status,
+        since_ms: if child.status == status {
+            child.since_ms
+        } else {
+            now_ms
+        },
+        refusal,
+        ..child.clone()
+    }
+}
+
+/// What making a role child came to: made, or the refusal it met and the
+/// audit entry that refusal counts under, if a source's audience or routes
+/// refused it.
+type Made = std::result::Result<(), (DeclarationRefusal, Option<AuditKey>)>;
+
+/// Make the child of `member` for `template` from the head of each mob its
+/// selector names, through the checks every subscription passes: a source's
+/// audience and routes, the member's kept route and the child member
+/// limits. A refusal leaves nothing written.
+#[allow(clippy::too_many_arguments)]
+fn make_role_child_in(
+    db: &Connection,
+    template: &RoleTemplate,
+    member: &Member,
+    route: &MemberRouteRecord,
+    member_mob_cursor: Option<u64>,
+    child_limits: ChildMemberLimits,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<Made> {
+    let id = role_child_id(&template.id, member)?;
+    if let Some(found) = load_subscription(db, &id)? {
+        // The id is held: by a record made at runtime, or by this child's
+        // own cancelled or ended record until retention removes it.
+        let refusal = match found.terminal_refusal() {
+            Some(terminal) => refusal_of(&terminal),
+            None => unmanaged_record(&id),
+        };
+        return Ok(Err((refusal, None)));
+    }
+    let request = PutSubscription {
+        id,
+        member: member.clone(),
+        selector: template_selector(template),
+        start: StartFrontier::Now,
+        expected_revision: None,
+        route: Some(route.clone()),
+        member_mob_cursor,
+        child_limits,
+    };
+    if let Some(refused) = ensure_subscription_admitted(db, &request, facts.get(member))? {
+        let audit = AuditKey {
+            mob_id: refused.mob_id,
+            source_id: refused.source_id,
+            generation: refused.generation,
+            member: member.clone(),
+            action: AuditAction::SubscriptionRefused,
+            reason: refused.reason,
+        };
+        return Ok(Err((refusal_of(&refused.error), Some(audit))));
+    }
+    let made = within_savepoint(db, || {
+        keep_member_route_in(db, member, route)?;
+        if route.route == MemberRoute::Child {
+            within_child_limits(db, &request)?;
+        }
+        create_subscription(db, &request, now_ms)
+    });
+    match made {
+        Ok(_) => Ok(Ok(())),
+        Err(error @ AnnouncementStoreError::Storage(_)) => Err(error),
+        Err(refused) => Ok(Err((refusal_of(&refused), None))),
+    }
+}
+
+/// Bring `template`'s children in line with the members `expansion` names
+/// (the members with its role now): a member without a child gets one, or
+/// is pending with the refusal it met, counted once in the audit; a left
+/// child of a member back in the role captures again; a child whose
+/// subscription an operator cancelled, or an end ended, is held. Returns
+/// the applied children of members `expansion` does not name: they left the
+/// role.
+fn expand_template_in(
+    db: &Connection,
+    template: &RoleTemplate,
+    expansion: &RoleExpansion,
+    child_limits: ChildMemberLimits,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<Vec<RoleChild>> {
+    let children = role_children_of(db, &template.id)?;
+    let mut live = u32::try_from(
+        children
+            .values()
+            .filter(|(child, state)| {
+                matches!(
+                    child.status,
+                    RoleChildStatus::Applied | RoleChildStatus::Left
+                ) && state.is_some_and(SubscriptionState::is_live)
+            })
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    for (member, found) in &expansion.members {
+        let existing = children.get(member);
+        if let Some((child, Some(state))) = existing
+            && child.status != RoleChildStatus::Pending
+        {
+            // A child already made: a live one captures (a left one again);
+            // a cancelled or ended one is held.
+            let status = if state.is_live() {
+                RoleChildStatus::Applied
+            } else {
+                RoleChildStatus::Suppressed
+            };
+            if child.status != status {
+                write_role_child(db, &child_at(child, status, None, now_ms), now_ms)?;
+            }
+            continue;
+        }
+        let made = match found {
+            RoleMember::Kept => continue,
+            RoleMember::Refused(refusal) => Err((refusal.clone(), None)),
+            RoleMember::Admitted { .. } if live >= ROLE_TEMPLATE_LIMIT => Err((
+                refusal_of(&AnnouncementStoreError::RoleTemplateLimit {
+                    limit: ROLE_TEMPLATE_LIMIT,
+                }),
+                None,
+            )),
+            RoleMember::Admitted {
+                route,
+                member_mob_cursor,
+            } => make_role_child_in(
+                db,
+                template,
+                member,
+                route,
+                *member_mob_cursor,
+                child_limits,
+                facts,
+                now_ms,
+            )?,
+        };
+        let child = match existing {
+            Some((child, _)) => child.clone(),
+            None => RoleChild {
+                template_id: template.id.clone(),
+                member: member.clone(),
+                subscription_id: role_child_id(&template.id, member)?,
+                status: RoleChildStatus::Pending,
+                since_ms: now_ms,
+                refusal: None,
+            },
+        };
+        match made {
+            Ok(()) => {
+                live = live.saturating_add(1);
+                write_role_child(
+                    db,
+                    &child_at(&child, RoleChildStatus::Applied, None, now_ms),
+                    now_ms,
+                )?;
+            }
+            Err((refusal, audit)) => {
+                // A refusal counts once, when the child first meets it.
+                let again = existing.is_some_and(|(child, _)| {
+                    child.status == RoleChildStatus::Pending
+                        && child
+                            .refusal
+                            .as_ref()
+                            .is_some_and(|before| before.kind == refusal.kind)
+                });
+                if let Some(audit) = audit
+                    && !again
+                {
+                    count_audit(db, &audit, now_ms)?;
+                }
+                write_role_child(
+                    db,
+                    &child_at(&child, RoleChildStatus::Pending, Some(refusal), now_ms),
+                    now_ms,
+                )?;
+            }
+        }
+    }
+    Ok(children
+        .into_values()
+        .filter(|(child, state)| {
+            child.status == RoleChildStatus::Applied
+                && state.is_some_and(SubscriptionState::is_live)
+                && !expansion.members.contains_key(&child.member)
+        })
+        .map(|(child, _)| child)
+        .collect())
+}
+
+/// At a capture: bring the children of each template in `roles` that this
+/// announcement matches in line with its members, then name the children
+/// that capture nothing: every child marked left, and each applied child
+/// whose member the owner did not find with the role now.
+fn capture_role_children_in(
+    db: &Connection,
+    request: &AnnounceRequest,
+    facts: &RosterFacts,
+    roles: &RoleExpansions,
+    now_ms: u64,
+) -> Result<BTreeSet<SubscriptionId>> {
+    let mut quiet = BTreeSet::new();
+    for (id, expansion) in &roles.templates {
+        let Some(template) = load_role_template(db, id)? else {
+            continue;
+        };
+        if template.state != SubscriptionState::Active
+            || template.revision != expansion.revision
+            || !template_selector(&template).matches(&request.mob_id, &request.topics)
+        {
+            continue;
+        }
+        let left = expand_template_in(db, &template, expansion, roles.child_limits, facts, now_ms)?;
+        quiet.extend(left.into_iter().map(|child| child.subscription_id));
+    }
+    let mut statement = db
+        .prepare_cached(
+            "SELECT subscription_id FROM announcement_role_children WHERE status = 'left'",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(storage)?;
+    for row in rows {
+        quiet.insert(SubscriptionId::new(row.map_err(storage)?)?);
+    }
+    Ok(quiet)
+}
+
+/// At a reconcile: bring each template's children in line with its members
+/// now, mark left the children of members that no longer have the role,
+/// drop the pending children of those members, and hold every child whose
+/// subscription an operator cancelled or an end ended.
+fn reconcile_role_children_in(
+    db: &Connection,
+    roles: &RoleExpansions,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<()> {
+    for (id, expansion) in &roles.templates {
+        let Some(template) = load_role_template(db, id)? else {
+            continue;
+        };
+        if template.state != SubscriptionState::Active || template.revision != expansion.revision {
+            continue;
+        }
+        let left = expand_template_in(db, &template, expansion, roles.child_limits, facts, now_ms)?;
+        for child in left {
+            write_role_child(
+                db,
+                &child_at(&child, RoleChildStatus::Left, None, now_ms),
+                now_ms,
+            )?;
+        }
+        for (child, _) in role_children_of(db, id)?.into_values() {
+            if child.status == RoleChildStatus::Pending
+                && !expansion.members.contains_key(&child.member)
+            {
+                delete_role_child(db, &child, now_ms)?;
+            }
+        }
+    }
+    for child in all_role_children(db)? {
+        if matches!(
+            child.status,
+            RoleChildStatus::Applied | RoleChildStatus::Left
+        ) && !load_subscription(db, &child.subscription_id)?
+            .is_some_and(|found| found.state.is_live())
+        {
+            write_role_child(
+                db,
+                &child_at(&child, RoleChildStatus::Suppressed, None, now_ms),
+                now_ms,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The live role templates, those whose selector names `mob_id` or every
+/// one, each with its children.
+fn role_templates_in(db: &Connection, mob_id: Option<&MobId>) -> Result<Vec<TemplateChildren>> {
+    let mut statement = db
+        .prepare(
+            "SELECT record FROM announcement_role_templates WHERE state = 'active' ORDER BY id",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(storage)?;
+    let mut templates = Vec::new();
+    for record in rows {
+        let template: RoleTemplate = decode(&record.map_err(storage)?)?;
+        if mob_id.is_some_and(|mob_id| !template.mobs.contains(mob_id)) {
+            continue;
+        }
+        templates.push(template);
+    }
+    drop(statement);
+    templates
+        .into_iter()
+        .map(|template| {
+            let children = role_children_of(db, &template.id)?.into_values().collect();
+            Ok(TemplateChildren { template, children })
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct TemplateCancel<'a> {
+    id: &'a SubscriptionId,
+    expected_revision: u64,
+}
+
+/// Create a role template (or start a cancelled one again), or replace its
+/// selector at its revision: its live children take the new selector in
+/// place from each mob's head, keeping what they owe, and a child an
+/// operator cancelled, or an end ended, is no longer held (it is made again
+/// once its old record is gone).
+fn put_role_template_in(
+    db: &Connection,
+    operation: &OperationId,
+    request: &PutRoleTemplate,
+    now_ms: u64,
+) -> Result<RoleTemplate> {
+    let fingerprint = request_fingerprint("put_role_template", request)?;
+    if let Some(result) = operation_result(db, operation, &fingerprint)? {
+        return decode(&result);
+    }
+    let selector = Selector {
+        topics: request.topics.clone(),
+        mobs: request.mobs.clone(),
+    };
+    selector.validate()?;
+    if request.members.role.is_empty() || request.members.role == "*" {
+        return Err(AnnouncementStoreError::Invalid(
+            "a role template names one role".to_string(),
+        ));
+    }
+    let template = match (
+        load_role_template(db, &request.id)?,
+        request.expected_revision,
+    ) {
+        (None, None) => {
+            if let Some(found) = load_subscription(db, &request.id)? {
+                return Err(AnnouncementStoreError::StaleRevision {
+                    current: found.revision,
+                });
+            }
+            RoleTemplate {
+                id: request.id.clone(),
+                members: request.members.clone(),
+                topics: request.topics.clone(),
+                mobs: request.mobs.clone(),
+                state: SubscriptionState::Active,
+                revision: 1,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            }
+        }
+        (None, Some(_)) => return Err(AnnouncementStoreError::UnknownSubscription),
+        // Declaring a cancelled template again starts it at its next
+        // revision; the children it made before stay cancelled.
+        (Some(existing), None) if existing.state != SubscriptionState::Active => RoleTemplate {
+            members: request.members.clone(),
+            topics: request.topics.clone(),
+            mobs: request.mobs.clone(),
+            state: SubscriptionState::Active,
+            revision: existing.revision + 1,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            ..existing
+        },
+        (Some(existing), None) => {
+            return Err(AnnouncementStoreError::StaleRevision {
+                current: existing.revision,
+            });
+        }
+        (Some(existing), Some(expected)) => {
+            if existing.state != SubscriptionState::Active {
+                return Err(AnnouncementStoreError::SubscriptionCancelled);
+            }
+            if existing.revision != expected {
+                return Err(AnnouncementStoreError::StaleRevision {
+                    current: existing.revision,
+                });
+            }
+            let template = RoleTemplate {
+                members: request.members.clone(),
+                topics: request.topics.clone(),
+                mobs: request.mobs.clone(),
+                revision: existing.revision + 1,
+                updated_at_ms: now_ms,
+                ..existing
+            };
+            repoint_role_children_in(db, &template, now_ms)?;
+            template
+        }
+    };
+    write_role_template(db, &template)?;
+    record_operation(db, operation, &fingerprint, now_ms, &encode(&template)?)?;
+    Ok(template)
+}
+
+/// Point `template`'s live children at its selector in place, from the head
+/// of each mob it names, keeping what they owe, and lift the hold on the
+/// ones an operator cancelled or an end ended.
+fn repoint_role_children_in(db: &Connection, template: &RoleTemplate, now_ms: u64) -> Result<()> {
+    let selector = template_selector(template);
+    let heads = log_heads(db)?;
+    for (child, _) in role_children_of(db, &template.id)?.into_values() {
+        match load_subscription(db, &child.subscription_id)? {
+            Some(mut found) if found.state.is_live() => {
+                if found.selector == selector {
+                    continue;
+                }
+                found.revision += 1;
+                found.selector_revision = found.revision;
+                found.frontier = selector
+                    .mobs
+                    .iter()
+                    .map(|mob_id| {
+                        let head = heads.get(mob_id).map_or(0, |(head, _)| *head);
+                        (mob_id.clone(), head)
+                    })
+                    .collect();
+                found.selector = selector.clone();
+                found.updated_at_ms = now_ms;
+                write_subscription(db, &found)?;
+                reopen_logs(db, &found.selector.mobs)?;
+            }
+            Some(found) if child.status == RoleChildStatus::Suppressed => {
+                let refusal = found
+                    .terminal_refusal()
+                    .map(|terminal| refusal_of(&terminal));
+                write_role_child(
+                    db,
+                    &child_at(&child, RoleChildStatus::Pending, refusal, now_ms),
+                    now_ms,
+                )?;
+            }
+            None if child.status == RoleChildStatus::Suppressed => {
+                delete_role_child(db, &child, now_ms)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Cancel a role template at its revision and every child it made: a
+/// dropped template's children stop capturing and settle what they owe as
+/// any cancelled subscription does.
+fn cancel_role_template_in(
+    db: &Connection,
+    operation: &OperationId,
+    id: &SubscriptionId,
+    expected_revision: u64,
+    now_ms: u64,
+) -> Result<RoleTemplate> {
+    let fingerprint = request_fingerprint(
+        "cancel_role_template",
+        &TemplateCancel {
+            id,
+            expected_revision,
+        },
+    )?;
+    if let Some(result) = operation_result(db, operation, &fingerprint)? {
+        return decode(&result);
+    }
+    let mut template =
+        load_role_template(db, id)?.ok_or(AnnouncementStoreError::UnknownSubscription)?;
+    if template.state != SubscriptionState::Active {
+        return Err(AnnouncementStoreError::SubscriptionCancelled);
+    }
+    if template.revision != expected_revision {
+        return Err(AnnouncementStoreError::StaleRevision {
+            current: template.revision,
+        });
+    }
+    template.state = SubscriptionState::Cancelled;
+    template.revision += 1;
+    template.updated_at_ms = now_ms;
+    write_role_template(db, &template)?;
+    for (child, _) in role_children_of(db, id)?.into_values() {
+        if let Some(found) = load_subscription(db, &child.subscription_id)?
+            && found.state.is_live()
+        {
+            let cancel = derived_operation("role-child-cancel", &found.id, found.revision)?;
+            change_subscription_in(
+                db,
+                &cancel,
+                &found.id,
+                found.revision,
+                SubscriptionChange::Cancel,
+                now_ms,
+            )?;
+        }
+        delete_role_child(db, &child, now_ms)?;
+    }
+    record_operation(db, operation, &fingerprint, now_ms, &encode(&template)?)?;
+    Ok(template)
 }

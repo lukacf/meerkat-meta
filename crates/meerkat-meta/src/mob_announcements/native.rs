@@ -1206,6 +1206,49 @@ impl MobNativeDelivery {
         }
     }
 
+    /// The members of this gateway's mob whose registered row names the
+    /// profile `role`, or of a mob hosted here a member created whose roster
+    /// entry has the role: the members a role template takes now. None for
+    /// a mob that is gone; unavailable while it is held.
+    pub async fn members_with_role(
+        &self,
+        mob_id: &MobId,
+        role: &str,
+    ) -> Result<Vec<Member>, NativeUnavailable> {
+        let identities: Vec<String> = if *mob_id == self.mob_id {
+            self.identities
+                .registered_with_profile(role)
+                .await
+                .into_iter()
+                .map(|identity| identity.as_str().to_string())
+                .collect()
+        } else {
+            let Some(handle) = self.running_child(mob_id).await? else {
+                return Ok(Vec::new());
+            };
+            handle
+                .list_members()
+                .await
+                .into_iter()
+                .filter(|entry| entry.role.as_str() == role)
+                .map(|entry| entry.agent_identity.as_str().to_string())
+                .collect()
+        };
+        Ok(identities
+            .into_iter()
+            .filter_map(|identity| match MemberIdentity::new(identity) {
+                Ok(identity) => Some(Member {
+                    mob_id: mob_id.clone(),
+                    identity,
+                }),
+                Err(error) => {
+                    tracing::warn!(mob = %mob_id, %error, "a roster member has no usable identity");
+                    None
+                }
+            })
+            .collect())
+    }
+
     /// The running handle of a mob hosted here other than this gateway's
     /// own; `None` when it is gone; unavailable while it is held.
     async fn running_child(
@@ -1604,6 +1647,14 @@ impl NativeDelivery for MobNativeDelivery {
         MobNativeDelivery::member_facts(self, member).await
     }
 
+    async fn members_with_role(
+        &self,
+        mob_id: &MobId,
+        role: &str,
+    ) -> Result<Vec<Member>, NativeUnavailable> {
+        MobNativeDelivery::members_with_role(self, mob_id, role).await
+    }
+
     async fn route_for(&self, member: &Member) -> Result<MemberRouteRecord, MemberProblem> {
         if member.mob_id == self.mob_id {
             return Ok(MemberRouteRecord {
@@ -1785,6 +1836,16 @@ impl NativeDelivery for AnnouncementNativeDelivery {
         member: &Member,
     ) -> Result<Option<MemberFacts>, NativeUnavailable> {
         self.local.member_facts(member).await
+    }
+
+    /// A mob on a peer gateway has no roster here: a template of its
+    /// members takes none.
+    async fn members_with_role(
+        &self,
+        mob_id: &MobId,
+        role: &str,
+    ) -> Result<Vec<Member>, NativeUnavailable> {
+        self.local.members_with_role(mob_id, role).await
     }
 
     /// A mob id hosted here as a mob a member created and also filed in the
