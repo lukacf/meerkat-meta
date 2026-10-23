@@ -50,6 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it, and the worker-plane `meta/ensure_member` answers Meerkat's own code
   (`CAPABILITY_UNAVAILABLE`, `-32020`) and data
   (`kind = "mob_non_durable_service"`) instead of `-32602`.
+- A mob runtime composed with a WorkGraph service answers Meerkat's resume
+  check for durable workers from that WorkGraph. Before Meerkat continues an
+  interrupted run of a durable worker, Meta checks that the worker still
+  holds its work. A run dispatched for an item is superseded when the item
+  ended or is gone, when another owner claimed it, when the worker's lease on
+  it lapsed, or when its attention binding stopped or now targets another
+  owner. A run that named no item is superseded when a claim the worker holds
+  lapsed. A lapsed lease is committed first, so the item can be claimed
+  again. A WorkGraph read fault answers unavailable, which Meerkat retries a
+  bounded number of times before it refuses the resume.
 - The stdio `meta/status` names why a mob's actor stopped: `mob_failure`,
   present only once the actor has stopped, beside `mob_state`, which stays
   the last phase the actor published. A fail-stopped actor keeps its last

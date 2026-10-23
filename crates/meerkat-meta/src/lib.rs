@@ -103,6 +103,7 @@ pub mod unobserved;
 pub mod workgraph_admission;
 pub mod workgraph_events;
 pub mod workgraph_realm;
+pub(crate) mod workgraph_resume_gate;
 pub mod workgraph_wiring;
 
 pub use access::{
