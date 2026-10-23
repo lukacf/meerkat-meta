@@ -295,6 +295,16 @@ waits for a held pass to publish it; it has not failed. Both SDKs surface the
 data on a plain `RpcError` (see
 [Adding one held member to a running roster](/guides/unified-runtime#adding-one-held-member-to-a-running-roster)).
 
+An identity whose member id is held by a member the host made directly on the
+mob (a live or retiring member whose spawn labels carry no `agent_identity`
+naming the identity) is not taken over. Its wake answers `-32603` with
+structured data
+`{kind: "identity_name_held_by_raw_member", identity, member, session_id}`,
+and a roster compile that declares it fails with the same error; nothing is
+registered, woken, respawned or retired. Label that member for the identity
+on its session, or retire it, then try again (see
+[Upgrading to 0.9.4](/guides/upgrading-to-0-9-4)).
+
 The `-32010` constant is exported from both SDKs as
 `MOB_EVENTS_STALE_CURSOR_CODE`. The Python and TypeScript SDKs auto-
 reify `-32010` errors into `MobEventsStaleError` (a typed subclass of
