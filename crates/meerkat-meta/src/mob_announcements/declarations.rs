@@ -347,7 +347,7 @@ impl DeclaredSource {
                 }]
             }),
             conversation_members: self.conversation_members.clone(),
-            start: self.start.clone().unwrap_or_default(),
+            start: self.start.unwrap_or_default(),
             delivery: self.delivery.unwrap_or_default(),
             health_policy: self.health_policy.unwrap_or_default(),
             runner: self.runner.clone(),
