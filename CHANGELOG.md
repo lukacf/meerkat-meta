@@ -656,11 +656,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a fixed roster unless its application host supports dynamic member classes.
 - On macOS, Meta Forge no longer offers **Run in the background** while its
   own Python or its saved deployments are in Desktop, Documents, Downloads,
-  iCloud Drive or another volume, and it refuses a background installation
-  into such a folder before anything is installed. macOS does not let a
-  background login item read those folders, so the service stalled while
-  Python started and the application never came up, with no message. The
-  reason now says so and suggests a folder such as `~/MetaForge`, or
+  iCloud Drive or another volume. It refuses a background installation, or
+  **Run in background** after a completed setup, when any of those or the
+  installation folder is there, before any service exists. macOS does not
+  let a background login item read those folders, so the service stalled
+  while Python started and the application never came up, with no message.
+  The reason now says so and suggests a folder such as `~/MetaForge`, or
   **While Forge is open**. Forge does not look inside those folders to decide
   this and changes no privacy setting.
 

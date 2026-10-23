@@ -3282,6 +3282,9 @@ class DeploymentService:
             await validate(current)
             if not isinstance(capability, dict) or capability.get("available") is not True:
                 return unavailable
+            refusal = await validate(self._background_folder_refusal, capability, destination)
+            if refusal is not None:
+                return {"available": False, "detail": refusal}
             result = {"available": True}
             persistence = capability.get("persistence")
             if isinstance(persistence, str) and persistence.strip() and len(persistence) <= 500:
@@ -3360,7 +3363,8 @@ class DeploymentService:
         if await await_validation(pending_custody, directory, deepcopy(receipt)):
             raise DraftConflict("Complete the original installation support custody before service startup.")
         current()
-        if not (await self.service_manager.capability())["available"]:
+        capability = await self.service_manager.capability()
+        if not capability["available"]:
             raise DraftConflict("The logged-in user's service manager is unavailable. No service was installed.")
         current()
         if destination_owner is None:
@@ -3369,6 +3373,10 @@ class DeploymentService:
         else:
             self._destination_control_owner(destination_owner, guide_id, deployment_id)
             destination = owned_destination(receipt["destination"])
+        current()
+        refusal = await await_validation(self._background_folder_refusal, capability, destination)
+        if refusal is not None:
+            raise DraftConflict(refusal)
         current()
         service = None
         service_identity = None

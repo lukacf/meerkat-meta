@@ -218,6 +218,29 @@ test("absent, malformed and unavailable background hints cannot unlock conversio
   }
 });
 
+// Compare strings and booleans only: a failed assertion on a DOM node prints it.
+const protectedFolderDetail = "macOS does not let a background login item read Desktop, Documents, Downloads or iCloud Drive. " +
+  "Move the Forge folder and the installation folder to a folder such as ~/MetaForge, or choose 'While Forge is open'.";
+
+test("an unavailable background hint shows its reason and keeps interactive Restore", async () => {
+  const receipt = receiptFor(), state = guide();
+  await mounted(async ({ document, actions, button, click }) => {
+    assert.equal(button("Run in background") === undefined, true);
+    assert.equal(document.body.textContent.includes(protectedFolderDetail), true);
+    await click("Start installed application");
+    assert.deepEqual(actions, ["finish-setup"]);
+  }, { responses: [readback(receipt, state, { kind: "restore",
+    background: { available: false, detail: protectedFolderDetail } })] });
+});
+
+test("an available background hint never shows an unavailable reason", async () => {
+  await mounted(async ({ document, button }) => {
+    assert.equal(button("Run in background") !== undefined, true);
+    assert.equal(document.body.textContent.includes(protectedFolderDetail), false);
+  }, { responses: [readback(receiptFor(), guide(), { kind: "restore",
+    background: { available: true, persistence: "Runs while this user is logged in.", detail: protectedFolderDetail } })] });
+});
+
 test("Fresh and preparation do not offer background startup even with a true hint", async () => {
   for (const patch of [{}, { action: "prepare-setup" }]) {
     await mounted(async ({ actions, button }) => {

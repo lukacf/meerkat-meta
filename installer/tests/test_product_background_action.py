@@ -7,6 +7,8 @@ import asyncio
 from copy import deepcopy
 import inspect
 import json
+from pathlib import Path
+import sys
 import threading
 import uuid
 
@@ -311,3 +313,52 @@ def test_actual_get_post_capability_drift_cannot_publish_background_or_stale_rea
     assert response.status_code == 200
     value = response.json()
     assert value["available"] is False and value["reason"] == "source_unavailable" and "background" not in value
+
+
+FOLDER_REFUSAL = ("macOS does not let a background login item read Desktop, Documents, Downloads or iCloud Drive. "
+    "Move the Forge folder and the installation folder to a folder such as ~/MetaForge, or choose 'While Forge is open'.")
+PROTECTED = ("Desktop", "Documents", "Downloads", "Library/Mobile Documents")
+PROTECTED_IDS = ("Desktop", "Documents", "Downloads", "iCloud-Drive")
+
+
+@pytest.mark.parametrize("folder", PROTECTED, ids=PROTECTED_IDS)
+async def test_restore_background_capability_names_protected_folders(selected_restore, monkeypatch, folder):
+    # The test manager is launchd; Forge's Python is in a protected folder of
+    # the fixture's home.
+    f = selected_restore
+    monkeypatch.setattr(sys, "executable", str(Path.home() / folder / "MetaForge/.venv/bin/python"))
+    before = (f.directory / "receipt.json").read_bytes()
+    result = await capability(f)
+    assert result == {"available": False, "detail": FOLDER_REFUSAL}
+    assert (f.directory / "receipt.json").read_bytes() == before
+    assert not (f.directory / "service-host").exists()
+    assert not any(row[0] in {"start", "stop"} for row in f.manager.calls)
+
+
+@pytest.mark.parametrize("folder", PROTECTED, ids=PROTECTED_IDS)
+async def test_restore_background_start_refuses_protected_folders_before_any_unit(selected_restore, monkeypatch, folder):
+    f = selected_restore
+    monkeypatch.setattr(sys, "executable", str(Path.home() / folder / "MetaForge/.venv/bin/python"))
+    request_id = str(uuid.uuid4())
+    with pytest.raises(DraftConflict) as refused:
+        await start(f, request_id)
+    assert str(refused.value) == FOLDER_REFUSAL
+    assert not (f.directory / "service-host").exists()
+    assert not any(row[0] in {"start", "stop"} for row in f.manager.calls)
+    assert deployment.read_receipt(f.directory).get("service") is None
+    repeated = await start(f, request_id)
+    assert repeated["action_request"]["outcome"] == "error"
+
+
+async def test_restore_background_checks_the_installation_folder(selected_restore, monkeypatch):
+    from launchkit import deployment_service as services
+    f = selected_restore
+    checked, original = [], getattr(services, "launchd_folder_refusal", None)
+
+    def record(paths, **options):
+        checked.append([Path(path) for path in paths])
+        return original(paths, **options)
+    monkeypatch.setattr(services, "launchd_folder_refusal", record, raising=False)
+    assert (await capability(f))["available"] is True
+    await start(f)
+    assert len(checked) == 2 and all(f.destination in paths for paths in checked)
