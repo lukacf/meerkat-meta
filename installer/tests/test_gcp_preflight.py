@@ -457,6 +457,22 @@ async def test_package_cannot_borrow_fixed_cloud_plan_after_source_or_scope_chan
         assert cli.calls == [] and cloud.calls == []
 
 
+@pytest.mark.parametrize("location", ["report", "acceptance"])
+async def test_malformed_package_brief_binding_refuses_before_cloud_observation(harness, location):
+    _, local, cli, cloud = harness
+    report = json.loads(local.files["implementation-report.json"])
+    if location == "report":
+        report["brief_hash"] = "malformed"
+    else:
+        del report["brief_hash"]
+        report["acceptance"] = {"brief_digest": "malformed"}
+    local.files["implementation-report.json"] = json.dumps(report).encode()
+    local.package_bytes = local.archive()
+    with pytest.raises(DraftConflict, match="^The accepted package differs from the current proposal or checked source\\."):
+        await checked(harness)
+    assert cli.calls == [] and cloud.calls == []
+
+
 @pytest.mark.parametrize("tampered", [False, True])
 async def test_package_accepted_by_forge_094_keeps_its_destination_helper(harness, tampered):
     # Forge 0.9.4 rendered this exact destination helper into the packages it

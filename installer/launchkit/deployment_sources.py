@@ -126,7 +126,7 @@ def read_package_source(files, receipt=None):
             report = json.loads(files["implementation-report.json"][0])
             source = {key: report.get(key) for key in ("guide_version", "blueprint_hash", "build_id")}
             source.update(source_kind="application", source_id=report.get("build_id"),
-                          source_digest=report.get("verification", {}).get("digest"), brief_hash=report_brief_hash(report))
+                          source_digest=report.get("verification", {}).get("digest"), brief_hash=report_brief_hash(report, strict=True))
         except (ValueError, KeyError, TypeError, AttributeError, UnicodeError):
             raise ValueError("The application source report could not be verified.") from None
     if receipt is not None:
