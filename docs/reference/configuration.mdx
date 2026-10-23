@@ -1190,20 +1190,11 @@ the SDK still reaps the bounded child process and then surfaces the failure.
 
 #### Letting in-flight turns finish on shutdown
 
-By default a graceful shutdown does not wait for the turns members are
-running. The mob's stop leaves each member's current run running, and the
-mob's terminal shutdown then settles it (meerkat 0.9.5):
-
-- A durable member, one whose session lives on a persistent session service
-  and so commits each round, keeps its run: the run is suspended, not
-  cancelled, and continues from its last committed round at the member's
-  next start. Its eligible queued prompts are kept for that start too, for up
-  to 15 minutes.
-- Any other member's run is cancelled, and its queued inputs end with it.
-
-An application that would rather let turns finish sets a drain window at
-init: the top-level `meta/init` parameter `shutdown_in_flight_drain_ms`
-(Python `MetaBuilder.shutdown_in_flight_drain_ms(ms)`, TypeScript
+By default a graceful shutdown cancels the turns members are running: the
+mob's stop interrupts each member's current run. An application that would
+rather let them finish sets a drain window at init: the top-level `meta/init`
+parameter `shutdown_in_flight_drain_ms` (Python
+`MetaBuilder.shutdown_in_flight_drain_ms(ms)`, TypeScript
 `MetaBuilder.shutdownInFlightDrainMs(ms)`). It is an integer of milliseconds.
 Absent or 0 drains nothing, and the most is 300000 (5 minutes); init refuses
 any other value.
@@ -1227,8 +1218,7 @@ before the rest of the shutdown, the gateway:
    until each of those runs ends or the window passes.
 
 The shutdown then continues as it does without a drain, and a run still going
-when the window ends is settled by it as above: kept for its next start on a
-durable member, cancelled on any other.
+when the window ends is cancelled by it.
 
 The advertised `stdio_shutdown_horizon_ms` grows by the window plus 10
 seconds for the drain's own stop: 432000 + 10000 + the window. The SDKs wait
@@ -1260,14 +1250,14 @@ What a drained turn can still do:
   should stop through the handshake.
 
 Durable child mobs are not drained: they are stood down later, as without a
-drain, and their in-flight turns are settled there the same way. A connected
-voice or live session does not lengthen the drain: its member is reported
+drain, and their in-flight turns are cancelled there. A connected voice or
+live session does not lengthen the drain: its member is reported
 `live_channel_open` and the shutdown handles it as before. An autonomous
 member whose current run is its long-lived kickoff loop holds the drain for
-the whole window, and the shutdown then settles it as above. A held member
-add or a roster pass still settling when the window ends cuts the drain
-before its stop (`identity_foreground_busy`), and the shutdown settles it
-inside its own budget.
+the whole window, and the shutdown then cancels it. A held member add or a
+roster pass still settling when the window ends cuts the drain before its
+stop (`identity_foreground_busy`), and the shutdown settles it inside its own
+budget.
 
 The `meta/shutdown` answer carries the drain's report as
 `result.in_flight_drain`, and the gateway also logs it at INFO

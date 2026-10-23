@@ -130,9 +130,7 @@ SIGTERM. The gateway reads it before it answers, refuses any other value with
 `-32602`, and advertises the longer horizon in `stdio_shutdown_horizon_ms`
 (in `accepted` and in the init result): 442000 plus the window. The
 `meta/shutdown` answer then carries the drain's report as
-`result.in_flight_drain`. Without a window the shutdown does not wait for
-running turns: it keeps a durable member's turn for the member's next start
-and cancels any other. See
+`result.in_flight_drain`. See
 [Letting in-flight turns finish on shutdown](/reference/configuration#letting-in-flight-turns-finish-on-shutdown).
 
 **Startup callbacks must not issue ordinary RPCs.** Ordinary request dispatch

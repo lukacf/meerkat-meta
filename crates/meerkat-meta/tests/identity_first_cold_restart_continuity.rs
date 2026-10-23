@@ -23,7 +23,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -161,47 +160,17 @@ impl AgentCustomizer for DriftingContextCustomizer {
 }
 
 /// Records the serialized LLM request each turn and answers "ok" so turns
-/// complete without a real provider. A [`CaptureClient::gated`] client holds
-/// every call until its gate opens.
+/// complete without a real provider.
 #[derive(Clone, Default)]
 struct CaptureClient {
     requests: Arc<std::sync::Mutex<Vec<String>>>,
-    gate: Option<tokio::sync::watch::Receiver<bool>>,
-    /// Calls holding at the gate right now.
-    held: Arc<AtomicUsize>,
-    /// Calls that answered.
-    answered: Arc<AtomicUsize>,
 }
 impl CaptureClient {
-    /// A client whose every call holds until `gate` reads true.
-    fn gated(gate: tokio::sync::watch::Receiver<bool>) -> Self {
-        Self {
-            gate: Some(gate),
-            ..Self::default()
-        }
-    }
     fn count(&self) -> usize {
         self.requests.lock().unwrap().len()
     }
     fn last(&self) -> Option<String> {
         self.requests.lock().unwrap().last().cloned()
-    }
-    fn requests(&self) -> Vec<String> {
-        self.requests.lock().unwrap().clone()
-    }
-    fn held(&self) -> usize {
-        self.held.load(Ordering::SeqCst)
-    }
-    fn answered(&self) -> usize {
-        self.answered.load(Ordering::SeqCst)
-    }
-}
-/// Takes a call out of [`CaptureClient::held`] when it leaves the gate,
-/// answered or dropped.
-struct HeldCall(Arc<AtomicUsize>);
-impl Drop for HeldCall {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 impl meerkat_client::LlmClient for CaptureClient {
@@ -223,17 +192,7 @@ impl meerkat_client::LlmClient for CaptureClient {
         // provider accounting, so the terminal `Done` never travels alone.
         let [usage, done] =
             llm_usage::usage_then_done(request, meerkat::Provider::OpenAI, StopReason::EndTurn);
-        let mut gate = self.gate.clone();
-        let held = Arc::clone(&self.held);
-        let answered = Arc::clone(&self.answered);
         Box::pin(async_stream::stream! {
-            if let Some(gate) = gate.as_mut() {
-                held.fetch_add(1, Ordering::SeqCst);
-                let holding = HeldCall(Arc::clone(&held));
-                let _ = gate.wait_for(|open| *open).await;
-                drop(holding);
-            }
-            answered.fetch_add(1, Ordering::SeqCst);
             yield Ok(LlmEvent::TextDelta { delta: "ok".to_string(), meta: None });
             yield Ok(usage);
             yield Ok(done);
@@ -1011,164 +970,4 @@ async fn identity_first_cold_restart_resumed_member_matches_fresh_materialisatio
         "resumed member diverged from fresh materialisation of the same definition:\n  {}",
         differences.join("\n  ")
     );
-}
-
-/// A graceful shutdown keeps a durable member's in-flight turn, and the
-/// input queued behind it, for the member's next start (meerkat 0.9.5): at
-/// the next boot the turn asks its model again without a new send, and the
-/// queued input runs after it. Every identity-first member here is durable:
-/// its session lives on the persistent session service, which commits each
-/// round. `drain` is the gateway's in-flight drain window; `None` is the
-/// default, no window. The turn is still held at the window's bound, so both
-/// paths leave it to the shutdown, whose own stop leaves it running for the
-/// terminal Shutdown to keep.
-///
-/// Waits on Meta's pin of a meerkat whose graceful Shutdown keeps durable
-/// runs, with the resumed-run machinery of the same release. On an older
-/// meerkat the Shutdown cancels the turn and stops the queued input, and the
-/// boot-2 half of this row fails.
-async fn a_graceful_shutdown_keeps_durable_work(drain: Option<Duration>) {
-    const KEPT: &str = "KEPT-TURN-KILO-7";
-    const QUEUED: &str = "QUEUED-INPUT-LIMA-3";
-    let temp = tempfile::TempDir::new().expect("temp dir");
-    let state_path = temp.path().join("state");
-    let mob_id = unique_cold_restart_mob_id();
-    let alice = id("personal:alice");
-    let roster = vec![spec(
-        "personal:alice",
-        AgentAddressability::Addressable,
-        "personal",
-    )];
-
-    // --- Boot 1: the turn holds at its model, a second input queues behind
-    // it, and the runtime shuts down gracefully ---
-    {
-        let (_open, gate) = tokio::sync::watch::channel(false);
-        let capture = CaptureClient::gated(gate);
-        let (unified, identity_rt) = boot(&state_path, &mob_id, capture.clone()).await;
-        let result = restore_flow(
-            &identity_rt,
-            &roster,
-            Some(&EmptyTopology as &dyn TopologyProvider),
-            Some(&NoopCustomizer as &dyn AgentCustomizer),
-        )
-        .await
-        .expect("restore_flow (boot 1)");
-        assert!(
-            matches!(
-                result.outcomes.get(&alice),
-                Some(RestoreOutcome::Created { .. })
-            ),
-            "{:?}",
-            result.outcomes
-        );
-
-        identity_rt
-            .send(
-                &alice,
-                &meerkat_core::ContentInput::Text(format!("Start the work: {KEPT}")),
-            )
-            .await
-            .expect("send the turn");
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while capture.held() < 1 {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for the turn to reach its model"
-            );
-            sleep(Duration::from_millis(50)).await;
-        }
-        identity_rt
-            .send(
-                &alice,
-                &meerkat_core::ContentInput::Text(format!("Then this: {QUEUED}")),
-            )
-            .await
-            .expect("queue the second input");
-
-        if let Some(window) = drain {
-            let report = unified.drain_in_flight_turns(Instant::now() + window).await;
-            assert!(
-                matches!(
-                    report.outcome,
-                    meerkat_meta::InFlightDrainOutcome::Drained(_)
-                ),
-                "the drain stopped the mob and waited: {report:?}"
-            );
-            assert_eq!(capture.held(), 1, "the turn is still held at the bound");
-        }
-        unified.shutdown().await;
-        assert_eq!(
-            (capture.held(), capture.answered(), capture.count()),
-            (0, 0, 1),
-            "boot 1 ended with the turn unanswered and the queued input not started"
-        );
-    }
-
-    // --- Boot 2: the same store, a model that answers, and nothing sent ---
-    {
-        let capture = CaptureClient::default();
-        let (unified, identity_rt) = boot(&state_path, &mob_id, capture.clone()).await;
-        let result = restore_flow(
-            &identity_rt,
-            &roster,
-            Some(&EmptyTopology as &dyn TopologyProvider),
-            Some(&NoopCustomizer as &dyn AgentCustomizer),
-        )
-        .await
-        .expect("restore_flow (boot 2)");
-        assert!(
-            matches!(
-                result.outcomes.get(&alice),
-                Some(RestoreOutcome::Resumed { .. })
-            ),
-            "{:?}",
-            result.outcomes
-        );
-
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !capture
-            .requests()
-            .iter()
-            .any(|request| request.contains(QUEUED))
-        {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for the kept turn and the queued input to run: {:?}",
-                capture.requests()
-            );
-            sleep(Duration::from_millis(100)).await;
-        }
-        let requests = capture.requests();
-        let kept = requests
-            .iter()
-            .position(|request| request.contains(KEPT) && !request.contains(QUEUED))
-            .expect("the kept turn asked its model again");
-        let queued = requests
-            .iter()
-            .position(|request| request.contains(QUEUED))
-            .expect("the queued input ran");
-        assert!(
-            kept < queued,
-            "the kept turn resumes before the queued input runs: {requests:?}"
-        );
-        sleep(Duration::from_millis(500)).await;
-        unified.shutdown().await;
-    }
-}
-
-/// [`a_graceful_shutdown_keeps_durable_work`] without a drain window: the
-/// shutdown's own stop is the first, on a running mob, and must leave the
-/// turn running for the terminal Shutdown. Waits on that meerkat pin.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_graceful_shutdown_keeps_a_durable_members_turn_and_queued_input() {
-    a_graceful_shutdown_keeps_durable_work(None).await;
-}
-
-/// [`a_graceful_shutdown_keeps_durable_work`] after a drain whose window ends
-/// with the turn still running: the drain's stop leaves it running and the
-/// terminal Shutdown keeps it. Waits on that meerkat pin.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_drained_graceful_shutdown_keeps_a_durable_members_turn_and_queued_input() {
-    a_graceful_shutdown_keeps_durable_work(Some(Duration::from_millis(500))).await;
 }

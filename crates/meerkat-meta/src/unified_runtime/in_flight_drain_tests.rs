@@ -2,10 +2,7 @@
 //! model holds mid-flight. A turn that ends inside the window is reported
 //! ended with its terminal. One still running at the bound is reported so
 //! and left running: the drain cancels nothing, and the shutdown that
-//! follows settles it as it does without a drain. This fixture's sessions
-//! are ephemeral, so the members are not durable and the shutdown cancels
-//! their turns; a durable member's turn is kept instead (the graceful
-//! shutdown rows in `tests/identity_first_cold_restart_continuity.rs`).
+//! follows cancels it as it does without a drain.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -238,31 +235,5 @@ async fn a_drain_at_its_bound_leaves_the_turn_to_the_shutdown() {
         ),
         (0, 0),
         "the shutdown cancelled the turn's model call"
-    );
-}
-
-/// Without a drain window the shutdown's own stop leaves the member's run
-/// running, as a zero-window drain would, and the terminal Shutdown settles
-/// it. This member's session is ephemeral, so it is not durable and its turn
-/// still ends at the shutdown: its model call is dropped unanswered. Runs on
-/// any meerkat: an earlier meerkat's Shutdown cancels every running turn.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_shutdown_without_a_drain_ends_a_non_durable_members_turn() {
-    let (_open, gate) = tokio::sync::watch::channel(false);
-    let calls = Arc::new(ModelCalls::default());
-    let runtime = gated_runtime("shutdown-no-drain", gate, Arc::clone(&calls)).await;
-    let handle = runtime.mob_handle();
-    seat_mid_turn(&handle, &calls, "worker-1").await;
-
-    tokio::time::timeout(WAIT, runtime.shutdown())
-        .await
-        .expect("the shutdown ends the turn and finishes");
-    assert_eq!(
-        (
-            calls.waiting.load(Ordering::SeqCst),
-            calls.answered.load(Ordering::SeqCst)
-        ),
-        (0, 0),
-        "the shutdown ended the turn's model call unanswered"
     );
 }
