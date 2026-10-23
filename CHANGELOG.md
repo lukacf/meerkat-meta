@@ -491,6 +491,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- A graceful shutdown no longer cancels members' running turns itself. Its
+  stop now leaves each member's current run running, as the in-flight drain's
+  stop already did, and the mob's terminal shutdown settles it: with meerkat
+  0.9.5 a durable member (one on a persistent session service) keeps its
+  in-flight run and eligible queued prompts for its next start, and any other
+  member's run is cancelled, as before. This applies with or without
+  `shutdown_in_flight_drain_ms`.
 - Docs: the configuration reference has a new "Fork instruction policy"
   section. It covers what a durable fork copies (activation rows only as
   history, the session configuration, no mob operator authority), what each

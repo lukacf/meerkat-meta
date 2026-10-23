@@ -502,11 +502,13 @@ export class MetaBuilder {
    * this SDK's shutdown handshake or a SIGTERM, the gateway stops the mob with
    * its members' current runs left running and waits for them, up to the
    * window, before it shuts down. A turn still running at the bound is
-   * cancelled by the shutdown, as without a drain. The gateway's advertised
-   * shutdown horizon grows by the window plus 10 seconds for the drain's own
-   * Stop, and this transport waits that much longer on close. 0 (the
-   * default) drains nothing; the most is 300000 (5 minutes). Mirrors the
-   * Python builder's `shutdown_in_flight_drain_ms`.
+   * settled by the shutdown, as without a drain: a durable member's turn and
+   * its eligible queued input are kept for the member's next start, and any
+   * other turn is cancelled. The gateway's advertised shutdown horizon grows
+   * by the window plus 10 seconds for the drain's own Stop, and this
+   * transport waits that much longer on close. 0 (the default) drains
+   * nothing; the most is 300000 (5 minutes). Mirrors the Python builder's
+   * `shutdown_in_flight_drain_ms`.
    */
   shutdownInFlightDrainMs(windowMs: number): this {
     if (!Number.isInteger(windowMs) || windowMs < 0 || windowMs > 300_000) {
