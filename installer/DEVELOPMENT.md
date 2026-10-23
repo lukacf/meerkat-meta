@@ -81,10 +81,11 @@ Allow substantial time for the full backend suite: in one process it took about
 two hours on a busy development host. The Forge workflow splits it into twelve
 shards balanced on the test time a hosted run recorded
 (`installer/tests/forge_shard_seconds.json`), each with a 120-minute limit and
-its own 20 slowest tests, and the `backend` job passes only once every shard
-has. Refresh the record from a complete run's junit files with
-`python installer/tests/forge_shards.py record forge-pytest.xml...`; a stale
-record only affects the balance, never which files run.
+its own 20 slowest tests. The `backend` job passes only once every shard
+has, and it checks that the shards together ran every test file once
+(`forge_shards.py verify`). Refresh the record from a complete run's junit
+files with `python installer/tests/forge_shards.py record forge-pytest.xml...`;
+a stale record only affects the balance, never which files run.
 No failure limit stops a run early, so every failure is reported. A run
 stopped by a job timeout is incomplete even when its earlier cases passed.
 Preserve the failure output and XML before making a correction. To run one
