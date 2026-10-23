@@ -1421,3 +1421,57 @@ fn two_declared_sources_on_one_identity_scope_are_refused_whole() {
         "{refused:?}"
     );
 }
+
+/// A declared record whose id a record of the other kind made at runtime
+/// holds is pending as unmanaged, as one of its own kind would be, and the
+/// runtime record is never touched.
+#[tokio::test]
+async fn a_declared_record_on_an_id_a_runtime_record_of_the_other_kind_holds_is_unmanaged() {
+    let harness = harness_with(native_serving(&[]));
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "template",
+            "subscription_id": "held-by-template",
+            "members": { "mob_id": OWN_MOB, "role": "reviewer" },
+            "topics": ["ops.one"],
+        }),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "held-by-subscription", "agent:a", &["ops.two"])
+        .await
+        .unwrap();
+    try_apply(
+        service,
+        1,
+        serde_json::json!([]),
+        serde_json::json!([
+            declared_subscription("held-by-template", "agent:a", &["ops.one"]),
+            declared_template("held-by-subscription", "reviewer", &["ops.two"]),
+        ]),
+    )
+    .await
+    .unwrap();
+    let view = declared(service).await;
+    for id in ["held-by-template", "held-by-subscription"] {
+        let held =
+            record(&view, "subscription", id).unwrap_or_else(|| panic!("{id} is listed: {view}"));
+        assert_eq!(held["status"], "pending", "{id}: {view}");
+        assert_eq!(held["refusal"]["kind"], "unmanaged_record", "{id}: {view}");
+    }
+    assert_eq!(
+        subscription_state(service, "held-by-template").await,
+        None,
+        "no subscription takes the template's id"
+    );
+    assert_eq!(
+        subscription_state(service, "held-by-subscription")
+            .await
+            .as_deref(),
+        Some("active"),
+        "the runtime subscription is never touched"
+    );
+}
