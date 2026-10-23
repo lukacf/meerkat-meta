@@ -158,6 +158,43 @@ async def test_shell_route_runs_a_meta_package_on_the_meta_sdk(shell, monkeypatc
     assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["definition_revision"] == 1
 
 
+async def test_meta_package_with_an_authenticated_console_requires_app_auth(shell, monkeypatch):
+    # A package that declares the local-password Console keeps app auth on the
+    # Meta route, with the front's own native auth configuration.
+    monkeypatch.setattr(asyncio.get_running_loop(), "add_signal_handler", lambda *args: None)
+    application = shell.root / "application"
+    application.mkdir(exist_ok=True)
+    (application / "__init__.py").write_text("class Integration:\n    pass\n\n\ndef build(context):\n    return Integration()\n")
+    (application / "console.json").write_text(json.dumps({"authentication": "local-password"}))
+    (application / "configuration.json").write_text(json.dumps({"fields": [
+        {"key": "CONSOLE_USER_ID", "label": "Console user", "secret": False, "required": True},
+        {"key": "CONSOLE_LOGIN_PASSWORD", "label": "Console password", "secret": True, "required": True,
+         "min_length": 12}]}))
+    monkeypatch.setenv("CONSOLE_USER_ID", "local-user")
+    monkeypatch.setenv("CONSOLE_LOGIN_PASSWORD", "local-password-123")
+    fronts = []
+
+    class Front:
+        def __init__(self, root, port, user, password, on_input, *, runtime_namespace):
+            self.native_auth = {"fixture": "front auth configuration", "namespace": runtime_namespace}
+            self.closed = False
+            fronts.append(self)
+
+        async def close(self):
+            self.closed = True
+
+        def __getattr__(self, name):
+            # The definition read never starts or serves the Console front.
+            raise AssertionError("The definition read must not use the Console front: " + name)
+
+    monkeypatch.setattr(shell.module, "ConsoleFront", Front)
+    await shell.module.run(shell.spec, arguments(definition_revision=True))
+    [front] = fronts
+    [config] = shell.configs
+    assert config["console_require_app_auth"] is True and config["auth_config"] is front.native_auth
+    assert front.native_auth["namespace"] == "meta" and front.closed
+
+
 async def test_meta_package_refuses_revision_activation_before_any_runtime(shell, monkeypatch):
     monkeypatch.setattr(asyncio.get_running_loop(), "add_signal_handler", lambda *args: None)
     with pytest.raises(ValueError, match="not available for this Meta package"):
