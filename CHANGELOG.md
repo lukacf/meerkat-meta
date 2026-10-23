@@ -121,6 +121,12 @@ gateway and Core 0.9.5.
   `ErrorEvent.context`) the key is new beside the old ones, and an event
   recorded without it reads as an empty list.
 
+### Security
+
+- tokio updated to 1.53.3 for RUSTSEC-2026-0386. Meta's crates still accept
+  any tokio 1.x release, so update tokio to >= 1.53.3 in your lockfile
+  (RUSTSEC-2026-0386).
+
 ### Upgrade
 
 - Upgrade Meta Forge together with the Meta gateway and Meerkat 0.9.5, and
