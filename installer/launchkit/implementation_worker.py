@@ -20,7 +20,7 @@ from .acceptance import SemanticAcceptance, POLICY_VERSION, REVIEWER_IDENTITY
 from .acceptance_reviewer import AcceptanceTools, ACCEPTANCE_PROMPT
 from .implementation import (APPLICATION_CONTRACT, IMPLEMENTATION_PROMPT, now,
                              progress, read_receipt, update_receipt, IMPLEMENTATION_SECONDS)
-from .owned_worker import begin_worker_cleanup, end_after_owner_loss, owned_job_deadline
+from .owned_worker import begin_worker_cleanup, end_after_owner_loss, owned_job_deadline, serve_as_owned_worker
 from .implementation_workspace import ImplementationWorkspace
 from .implementation_timing import ImplementationTiming, TimedDraft
 from .native_schedule_reference import meta_schedule_reference, selected_recurrence_guidance
@@ -1121,4 +1121,5 @@ if __name__ == "__main__":
     arguments = parser.parse_args()
     directory = arguments.directory.resolve()
     restore_worker_runtime(directory, arguments.agent_runtime_sha256)
+    serve_as_owned_worker()
     asyncio.run(run(directory, owned_stdin=arguments.owned_stdin))

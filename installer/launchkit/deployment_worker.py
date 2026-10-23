@@ -2367,17 +2367,19 @@ async def update_runtime(supervisor, mode, *, update_id=None, expected_binding=N
 async def owner_input(supervisor):
     reader = asyncio.StreamReader()
     await asyncio.get_running_loop().connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer)
+    stopped = False
     while True:
         line = await reader.readline()
         if not line:
             from .deployment import worker_stop_timeout
             end_after_owner_loss(worker_stop_timeout(supervisor.directory))
             supervisor.stop.set()
-            return "owner_lost"
+            return "stopped" if stopped else "owner_lost"
         try:
             if json.loads(line).get("action") == "stop":
+                # Keep reading: the owner can still be lost during this stop.
                 supervisor.stop.set()
-                return "stopped"
+                stopped = True
         except (ValueError, AttributeError):
             continue
 

@@ -2307,14 +2307,16 @@ class DeploymentService:
                 # of the application's startup/health result. No authored code
                 # can supply the worker's completion signal.
                 arguments = [sys.executable, "-c",
-                    "import asyncio,sys; from launchkit.deployment import interactive_worker; "
+                    "import asyncio,sys; from launchkit.owned_worker import serve_as_owned_worker; "
+                    "serve_as_owned_worker(); from launchkit.deployment import interactive_worker; "
                     "sys.exit(asyncio.run(interactive_worker(*sys.argv[1:])) or 0)",
                     str(directory), mode, receipt.get("interactive_lifecycle_id", "")]
             if bootstrap_selection is not None:
                 owner_argument = (", owner_source_sha256=" + repr(hashlib.sha256(bootstrap_owner_source).hexdigest())
                     if bootstrap_owner_source is not None else "")
                 arguments = [sys.executable, "-c",
-                    "import asyncio,sys; from launchkit.deployment import bootstrap_interactive_worker; "
+                    "import asyncio,sys; from launchkit.owned_worker import serve_as_owned_worker; "
+                    "serve_as_owned_worker(); from launchkit.deployment import bootstrap_interactive_worker; "
                     "sys.exit(asyncio.run(bootstrap_interactive_worker(*sys.argv[1:]" + owner_argument + ")) or 0)",
                     str(directory), receipt.get("interactive_lifecycle_id", ""),
                     bootstrap_selection["path"], bootstrap_selection["sha256"]]

@@ -17,25 +17,41 @@ from .deployment_deadlines import WORKER_STOP_TIMEOUT, PROCESS_FORCE_REAP_TIMEOU
 
 owned_job_deadline = ContextVar("owned_job_deadline", default=None)
 EXIT_OBSERVATION_TIMEOUT = 1
+_owned_worker_entry = False
 _owner_loss_bound = None
+
+
+def serve_as_owned_worker():
+    """Declare this process an owned worker. Only its entry point calls this.
+
+    In-process callers and tests never arm the owner-loss bound, even in a
+    process that leads its own session.
+    """
+    global _owned_worker_entry
+    _owned_worker_entry = True
 
 
 def end_after_owner_loss(budget=None):
     """Bound this worker's own stop once its owner is gone (stdin EOF).
 
-    No owner signals a worker it stopped waiting for: the worker stops itself
-    on owner loss. Only a worker leading its own session, as its owner spawns
-    it, arms this, once. If it still runs `budget` seconds later (by default
-    WORKER_STOP_TIMEOUT, the bound its live owner waits), it applies that
-    owner's escalation to its own group: SIGTERM, then SIGKILL.
+    Once its owner has stopped waiting, nothing signals the worker: it stops
+    itself on owner loss. Only a declared owned worker that leads its own
+    session, as its owner spawns it, arms this, once. If it still runs
+    `budget` seconds later (by default WORKER_STOP_TIMEOUT, the bound its live
+    owner waits), it ends its own group: SIGTERM first while its own handler
+    absorbs that, then SIGKILL always.
     """
     global _owner_loss_bound
-    if _owner_loss_bound is None and os.getsid(0) == os.getpid():
+    if _owner_loss_bound is None and _owned_worker_entry and os.getsid(0) == os.getpid():
         budget = WORKER_STOP_TIMEOUT if budget is None else budget
         def end():
             try:
-                os.killpg(os.getpid(), signal.SIGTERM)
-                time.sleep(.2)
+                # After the worker's event loop has closed, SIGTERM is back at
+                # its default and would end the worker before SIGKILL reached
+                # the rest of its group.
+                if signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, None):
+                    os.killpg(os.getpid(), signal.SIGTERM)
+                    time.sleep(.2)
                 os.killpg(os.getpid(), signal.SIGKILL)
             finally:
                 os._exit(1)

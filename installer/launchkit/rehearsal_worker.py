@@ -17,7 +17,7 @@ from .architect import _native_request, _schema
 from .blueprint import Blueprint
 from .compiler import _runtime, mob_toml
 from .implementation import now, update_receipt
-from .owned_worker import begin_worker_cleanup, end_after_owner_loss, owned_job_deadline
+from .owned_worker import begin_worker_cleanup, end_after_owner_loss, owned_job_deadline, serve_as_owned_worker
 from .guide_runtime import selected_runtime, configure_builder, build_with_cleanup
 from .rehearsal import (MAX_TRACE_BYTES, MAX_TRACE_FRAMES, REHEARSAL_SECONDS, REHEARSAL_IDLE_SECONDS,
     MAX_REHEARSAL_TURNS, MAX_COMMAND_BYTES, SCOPE, deadline_after, masked_capabilities, validate_trial)
@@ -669,4 +669,5 @@ if __name__ == "__main__":
     index = arguments.index("--agent-runtime-sha256")
     digest = arguments[index + 1] if index + 1 < len(arguments) else None
     restore_worker_runtime(directory, digest)
+    serve_as_owned_worker()
     asyncio.run(run(directory, owned_stdin="--owned-stdin" in arguments))
