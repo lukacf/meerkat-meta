@@ -822,9 +822,17 @@ def generate_package(value, *, runtime_target=None, verified_artifacts=None, pub
             f"printf '%s' {shlex.quote(plan)}\n"
             'if [[ "$#" == 1 && "$1" == --dry-run ]]; then exit 0; fi\n'
             'echo "Existing-host package: provisioning and remote lifecycle operations are unavailable here. Use the existing installation owner." >&2\nexit 1\n')
+    tunnel = f"#!/usr/bin/env bash\nset -euo pipefail\nexec gcloud compute ssh {shlex.quote(instance)} --project {shlex.quote(spec.gcp.project)} --zone {shlex.quote(spec.gcp.zone)} --tunnel-through-iap -- -N -L {spec.advanced.port}:127.0.0.1:{spec.advanced.port}\n"
+    if spec.target != "gcp":
+        # Local OS selection supplies no cloud destination or provisioning
+        # authority, even if unused cloud fields remain in the saved plan.
+        # Preserve filenames for old instructions without shipping a cloud path.
+        deploy = tunnel = ("#!/usr/bin/env bash\nset -euo pipefail\n"
+            'echo "This package targets a local operating system. Cloud deployment and tunneling require an explicitly selected GCP package. Use the existing installation owner for this host." >&2\n'
+            "exit 1\n")
     files += [PackageFile("deploy/deploy-gcp.sh", deploy, 0o755),
               PackageFile("deploy/install-service.sh", (TEMPLATES / "install-service.sh").read_text(), 0o755),
-              PackageFile("deploy/tunnel-gcp.sh", f"#!/usr/bin/env bash\nset -euo pipefail\nexec gcloud compute ssh {shlex.quote(instance)} --project {shlex.quote(spec.gcp.project)} --zone {shlex.quote(spec.gcp.zone)} --tunnel-through-iap -- -N -L {spec.advanced.port}:127.0.0.1:{spec.advanced.port}\n", 0o755)]
+              PackageFile("deploy/tunnel-gcp.sh", tunnel, 0o755)]
     hashes = "".join(f"{hashlib.sha256(item.as_bytes()).hexdigest()}  {item.path}\n" for item in sorted(files, key=lambda item: item.path))
     files.append(PackageFile("SHA256SUMS", hashes))
     return files
