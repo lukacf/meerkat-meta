@@ -309,12 +309,18 @@ customizer, and a gateway without a roster provider never asks.
 
 A wrapper delegates `after_create` as well as `customize_build`. The gateway
 calls `after_create` once after each build of a live member that ran
-`customize_build`, with the session the build created, best-effort: an error
-is logged and the build stands. `AgentCustomizer::after_create` has a no-op
-default, so a wrapper that overrides only `customize_build` silently drops the
-SDK's `after_create` callback. A member Core rebuilds on its own (its restore
-at a restart, a delivery-time repair) calls neither: the identity's customizer
-tools stay attached through its tool dispatcher.
+`customize_build`, with the session the build created or resumed,
+best-effort: an error is logged and the build stands. It calls it with no lock
+of the identity held, so an `after_create` can call back into the gateway for
+the same identity, and the call can come after the operation that built the
+member has answered. The context's `model` is the build's model, else the
+model of the profile when the mob definition declares it inline; it is empty
+for a realm-bound profile the build sets no model for.
+`AgentCustomizer::after_create` has a no-op default, so a wrapper that
+overrides only `customize_build` silently drops the SDK's `after_create`
+callback. A member Core rebuilds on its own (its restore at a restart, a
+delivery-time repair) calls neither: the identity's customizer tools stay
+attached through its tool dispatcher.
 
 The hook can wrap the composed customizer, but it cannot add one. Whether a
 customizer is composed is settled before the hook runs, because the registry

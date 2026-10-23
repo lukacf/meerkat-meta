@@ -3347,6 +3347,10 @@ pub struct IdentityRuntime {
     /// ledger only after it ran, so shutdown joins or reruns it.
     pending_reset_memory_captures: Arc<RwLock<BTreeMap<String, PendingResetMemoryCapture>>>,
     reset_memory_capture_tasks: Mutex<JoinSet<()>>,
+    /// The customizer `after_create` calls told outside any lifecycle lock
+    /// ([`Self::spawn_after_create`]). A graceful shutdown abandons and joins
+    /// them.
+    after_create_tasks: Mutex<JoinSet<()>>,
     /// Per-identity completed-turn counters ([`CompletionCursor`]).
     ///
     /// RETAINED for the process lifetime — never pruned on retire, reset, or
@@ -3667,6 +3671,18 @@ pub(crate) struct EmbodimentOutcome {
     /// The last session this wake replaced with a fresh one because Core
     /// holds no durable session for it.
     pub(crate) replaced_session: Option<SessionId>,
+    /// The `after_create` owed to the customizer the embodiment's caller
+    /// passed ([`EmbodimentOverrides::customizer`]), which
+    /// [`IdentityRuntime::embody_identity`] tells once it has released the
+    /// identity's lifecycle lock.
+    pub(crate) override_after_create: Option<AfterCreateNotice>,
+}
+
+/// An `after_create` a build owes its customizer: the session the build
+/// created or resumed, and what the build made of it.
+pub(crate) struct AfterCreateNotice {
+    session_id: SessionId,
+    context: crate::mob_handle_runtime::SessionCreatedContext,
 }
 
 /// Eager-only inputs to the shared embodiment transaction. Lazy foreground
@@ -4042,6 +4058,7 @@ impl IdentityRuntime {
             foreground_shutdown: AtomicBool::new(false),
             pending_reset_memory_captures: Arc::new(RwLock::new(BTreeMap::new())),
             reset_memory_capture_tasks: Mutex::new(JoinSet::new()),
+            after_create_tasks: Mutex::new(JoinSet::new()),
             completion_cursors: StdMutex::new(BTreeMap::new()),
             turn_outcomes: Arc::default(),
             turn_outcome_changes: Arc::new(watch::channel(()).0),
@@ -7663,17 +7680,28 @@ impl IdentityRuntime {
         bound_bootstrap_generation: &mut Option<u64>,
         overrides: EmbodimentOverrides<'_>,
     ) -> Result<EmbodimentOutcome, IdentityRuntimeError> {
-        let lifecycle_lock = self.lifecycle_lock_for(identity).await;
-        let _lifecycle_guard = lifecycle_lock.lock().await;
-        self.embody_identity_locked(
-            identity,
-            expected_alias,
-            cancellation,
-            expected_bootstrap_generation,
-            bound_bootstrap_generation,
-            overrides,
-        )
-        .await
+        let override_customizer = overrides.customizer;
+        let mut outcome = {
+            let lifecycle_lock = self.lifecycle_lock_for(identity).await;
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            self.embody_identity_locked(
+                identity,
+                expected_alias,
+                cancellation,
+                expected_bootstrap_generation,
+                bound_bootstrap_generation,
+                overrides,
+            )
+            .await?
+        };
+        // The caller's customizer is told with the lifecycle lock released,
+        // so its `after_create` may call back into this identity.
+        if let (Some(customizer), Some(notice)) =
+            (override_customizer, outcome.override_after_create.take())
+        {
+            Self::tell_after_create(customizer, identity, &notice).await;
+        }
+        Ok(outcome)
     }
 
     // -----------------------------------------------------------------------
@@ -8747,6 +8775,7 @@ impl IdentityRuntime {
                     )
                     .await?;
                     return Ok(EmbodimentOutcome {
+                        override_after_create: None,
                         already_active: true,
                         binding,
                         resumed: true,
@@ -8867,11 +8896,8 @@ impl IdentityRuntime {
         };
         let mut draft = Self::base_build_draft(&spec);
         let installed_customizer = self.customizer.read().await.clone();
-        // The customizer that runs this build, which is told of the session
-        // the build creates once Core has answered.
-        let build_customizer = overrides.customizer.or(installed_customizer.as_deref());
         let mut customized = false;
-        if let Some(customizer) = build_customizer {
+        if let Some(customizer) = overrides.customizer.or(installed_customizer.as_deref()) {
             let customize = customizer.customize_build(&build_context, &spec, &mut draft);
             tokio::pin!(customize);
             let customize_result = if let Some(cancellation) = cancellation.as_mut() {
@@ -9053,14 +9079,26 @@ impl IdentityRuntime {
         if first_boot_resume.is_some() {
             self.settle_first_boot_row(identity).await;
         }
-        if customized
-            && let (Some(customizer), Some(session_id)) =
-                (build_customizer, binding.session_id.as_ref())
-        {
-            self.customizer_after_create(customizer, identity, session_id, &spec, &draft)
-                .await;
+        // The customizer that ran the build is told of its session with the
+        // lifecycle lock released: the installed one in a runtime-owned
+        // task, the caller's own once the caller has released the lock.
+        let mut override_after_create = None;
+        if customized && let Some(session_id) = binding.session_id.as_ref() {
+            let notice = AfterCreateNotice {
+                session_id: session_id.clone(),
+                context: self.session_created_context(&spec, &draft),
+            };
+            match (overrides.customizer, installed_customizer) {
+                (Some(_), _) => override_after_create = Some(notice),
+                (None, Some(installed)) => {
+                    self.spawn_after_create(installed, identity.clone(), notice)
+                        .await;
+                }
+                (None, None) => {}
+            }
         }
         Ok(EmbodimentOutcome {
+            override_after_create,
             already_active: false,
             binding,
             resumed,
@@ -9084,32 +9122,81 @@ impl IdentityRuntime {
         }
     }
 
-    /// CONTRACT-04's `after_create`: the customizer that ran a build is told
-    /// of the session the build created. Best-effort: an error is logged at
-    /// WARN and never fails or rolls back the build.
-    async fn customizer_after_create(
+    /// What a build of `spec` with `draft` reports to `after_create`.
+    fn session_created_context(
         &self,
-        customizer: &dyn AgentCustomizer,
-        identity: &AgentIdentity,
-        session_id: &SessionId,
         spec: &DurableAgentSpec,
         draft: &AgentBuildDraft,
-    ) {
-        let context = crate::mob_handle_runtime::SessionCreatedContext {
+    ) -> crate::mob_handle_runtime::SessionCreatedContext {
+        crate::mob_handle_runtime::SessionCreatedContext {
             model: self.built_model(spec, draft),
             labels: draft.labels.clone(),
             system_prompt: draft.system_prompt.clone(),
-        };
+        }
+    }
+
+    /// CONTRACT-04's `after_create`: the customizer that ran a build is told
+    /// of the session the build created or resumed. Best-effort: an error is
+    /// logged at WARN and never fails or rolls back the build. Callers tell
+    /// it with no lifecycle lock held, so it may call back into the identity.
+    async fn tell_after_create(
+        customizer: &dyn AgentCustomizer,
+        identity: &AgentIdentity,
+        notice: &AfterCreateNotice,
+    ) {
         if let Err(error) = customizer
-            .after_create(identity, session_id, &context)
+            .after_create(identity, &notice.session_id, &notice.context)
             .await
         {
             tracing::warn!(
                 %identity,
-                %session_id,
+                session_id = %notice.session_id,
                 %error,
                 "the agent customizer's after_create failed; the build stands"
             );
+        }
+    }
+
+    /// Tell the installed `customizer` of a build's session in a
+    /// runtime-owned task, so no lifecycle lock is held while it answers. A
+    /// graceful shutdown abandons the call ([`Self::close_foreground_operations`])
+    /// and joins the task ([`Self::join_after_create_notices`]).
+    async fn spawn_after_create(
+        &self,
+        customizer: Arc<dyn AgentCustomizer>,
+        identity: AgentIdentity,
+        notice: AfterCreateNotice,
+    ) {
+        let mut shutdown = self.foreground_cancel.subscribe();
+        let mut tasks = self.after_create_tasks.lock().await;
+        while let Some(result) = tasks.try_join_next() {
+            if let Err(error) = result {
+                tracing::error!(%error, "an after_create task panicked");
+            }
+        }
+        tasks.spawn(async move {
+            tokio::select! {
+                () = Self::tell_after_create(customizer.as_ref(), &identity, &notice) => {}
+                _ = shutdown.wait_for(|shutting_down| *shutting_down) => {
+                    tracing::debug!(
+                        %identity,
+                        session_id = %notice.session_id,
+                        "the runtime shut down before the agent customizer's after_create \
+                         answered"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Join every `after_create` task once foreground lifecycle admission is
+    /// closed, which abandons the calls still waiting for their customizer.
+    pub(crate) async fn join_after_create_notices(&self) {
+        let mut tasks = self.after_create_tasks.lock().await;
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result {
+                tracing::error!(%error, "an after_create task panicked during shutdown");
+            }
         }
     }
 
@@ -13848,11 +13935,15 @@ impl IdentityRuntime {
                     ))
                 })?;
             // The customizer that built the successor is told of its session
-            // before the captured queue reaches it.
+            // with the lifecycle lock released, in a runtime-owned task.
             if let (Some(customizer), Some(session_id)) =
-                (customizer.as_deref(), successor.session_id.as_ref())
+                (customizer, successor.session_id.as_ref())
             {
-                self.customizer_after_create(customizer, identity, session_id, &spec, &draft)
+                let notice = AfterCreateNotice {
+                    session_id: session_id.clone(),
+                    context: self.session_created_context(&spec, &draft),
+                };
+                self.spawn_after_create(customizer, identity.clone(), notice)
                     .await;
             }
             // The captured queue goes to the fresh member before anything
