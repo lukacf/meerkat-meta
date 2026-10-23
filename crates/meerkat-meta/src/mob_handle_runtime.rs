@@ -5852,8 +5852,10 @@ pub struct MobBootstrapSpec {
     /// and to the agent mob-tool state for child mobs.
     pub(crate) member_runtime_registration_hook:
         Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
-    /// Restored members whose customizer tools could not be published before
-    /// the mob build (an early `customize_build` failure, #563). Forwarded to
+    /// Restored members whose customizer tools no publication before the mob
+    /// build covers: an early `customize_build` failure, every roster
+    /// identity of a composition that publishes none before its build, and
+    /// a member whose identity the roster no longer lists. Forwarded to
     /// `MobBuilder::hold_restored_member_run_starts` for
     /// `HostRunStartHoldReason::ToolsNotPublished`, so meerkat's restore
     /// starts no run for them (a queued input, a kickoff, a peer message)
@@ -6809,7 +6811,9 @@ impl MobBootstrapSpec {
     /// The definition this launch runs, judged before preparation: on a
     /// resume the one its event log holds, which preparation resumes whatever
     /// definition was supplied (the supplied one is only checked against it);
-    /// on a fresh boot the supplied one.
+    /// on a fresh boot the supplied one, in the form preparation creates the
+    /// mob with ([`auto_mark_declared_resume_overrides`]). Either way it is the
+    /// definition the running mob holds, which later roster reads are handed.
     ///
     /// A resume is judged here exactly as preparation would judge it
     /// ([`judge_resume`]): an undeclared storage, a diverged composition and
@@ -6829,7 +6833,9 @@ impl MobBootstrapSpec {
             .map_err(|err| MobRuntimeError::Mob(MobError::from(err)))?;
         if event_log_empty {
             self.launch_definition_read = Some(LaunchDefinitionRead::Fresh);
-            return Ok(self.definition.clone());
+            let mut definition = self.definition.clone();
+            auto_mark_declared_resume_overrides(&mut definition);
+            return Ok(definition);
         }
         // The form preparation judges in (`auto_mark_declared_resume_overrides`
         // runs there before the resume).
@@ -6846,11 +6852,37 @@ impl MobBootstrapSpec {
         )
         .await?;
         let definition = judged.snapshot.as_ref().map_or_else(
-            || self.definition.clone(),
+            || normalized.clone(),
             |snapshot| snapshot.definition().clone(),
         );
         self.launch_definition_read = Some(LaunchDefinitionRead::Resume(Box::new(judged)));
         Ok(definition)
+    }
+
+    /// The live members this spec's persistent mob store holds whose current
+    /// incarnation Meta spawned for a durable identity
+    /// ([`meerkat_mob::SpawnContinuityIntent::DurableIdentity`]), read from
+    /// the store's member binding history before the mob is built: the
+    /// identity members a resume of a log left Running revives. Empty for a
+    /// storage without a persistent path and for a store not created yet. A
+    /// history the store cannot give fails, so a caller that holds these
+    /// members fails closed.
+    pub(crate) async fn stored_durable_identity_members(
+        &self,
+    ) -> Result<Vec<meerkat_mob::AgentIdentity>, MobRuntimeError> {
+        let Some(path) = self.mob_storage_provenance.persistent_path() else {
+            return Ok(Vec::new());
+        };
+        match MobStorage::read_member_binding_history(path).await {
+            Ok(history) => Ok(history
+                .durable_identity_members()
+                .map(|binding| binding.identity().clone())
+                .collect()),
+            Err(meerkat_mob::MemberBindingHistoryReadError::StoreMissing { .. }) => Ok(Vec::new()),
+            Err(error) => Err(MobRuntimeError::Mob(MobError::Internal(format!(
+                "reading the mob store's member bindings before the mob build: {error}"
+            )))),
+        }
     }
 
     /// The host's fork instruction policy for member forks of this mob:

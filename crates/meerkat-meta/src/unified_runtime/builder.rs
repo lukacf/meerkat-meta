@@ -1891,7 +1891,7 @@ impl UnifiedRuntimeBuilder {
         // that was left Running revives every member inside meerkat's own
         // resume), before any identity activation step. Publish each roster
         // identity's customizer tools first, so those builds carry them (#563).
-        let early_customizer_tools_pending = match (
+        let mut early_customizer_tools_pending = match (
             customizer_tool_registry.as_ref(),
             identity_roster_specs.as_ref(),
             agent_customizer.as_ref(),
@@ -1908,6 +1908,28 @@ impl UnifiedRuntimeBuilder {
             }
             _ => BTreeMap::new(),
         };
+        // That resume revives a member whose identity this roster no longer
+        // lists as well, and no publication covers it: it is held until the
+        // roster pass retires it.
+        if let (Some(_), Some(roster), Some(_)) = (
+            customizer_tool_registry.as_ref(),
+            identity_roster_specs.as_ref(),
+            storage_layout.as_ref(),
+        ) {
+            let stored = mob_spec
+                .stored_durable_identity_members()
+                .await
+                .map_err(|error| {
+                    UnifiedRuntimeBuilderError::Bootstrap(UnifiedRuntimeBootstrapError::Mob(error))
+                })?;
+            early_customizer_tools_pending.extend(
+                crate::identity_first::customizer_tools::unpublished_before_mob_build(
+                    crate::identity_first::customizer_tools::unlisted_stored_identities(
+                        roster, &stored,
+                    ),
+                ),
+            );
+        }
         // A restored member without its tools must not start a run before its
         // materialization publishes them: meerkat holds its run starts from
         // registration until the identity runtime releases the hold.

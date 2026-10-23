@@ -306,14 +306,15 @@ fn refusal_after_storage_began_settles_failed_with_possible_durable_effects() {
         "has_roster_provider": true,
     }));
     assert_eq!(gateway.next("accepted")["result"]["init_state"], "accepted");
-    // The identity roster callback fails, after storage and prepare ran.
+    // The identity roster callback fails at prepare, before the mob is
+    // built and after storage ran.
     let seen = gateway.read_until("the failed settlement", |_| None, is_settled);
     let settled = &seen.last().unwrap()["params"];
     assert_eq!(settled["outcome"], "failed", "{settled}");
     assert_eq!(settled["durable_effects"], "possible");
     let phases = progress_phases(&seen);
     assert!(
-        phases.contains(&"storage".to_string()) && phases.contains(&"roster".to_string()),
+        phases.contains(&"storage".to_string()) && phases.contains(&"prepare".to_string()),
         "{phases:?}"
     );
     // A refused init is a failed gateway run: exit status 1.
@@ -466,10 +467,11 @@ fn shutdown_during_init_settles_failed_after_cleanup_then_is_answered() {
     }));
     assert_eq!(gateway.next("accepted")["result"]["init_state"], "accepted");
     // With persistent state the gateway runs two roster callbacks: owner
-    // publication (before prepare) and identity bootstrap (after it). Answer
-    // the first, hold the second, ask for shutdown, then answer it with an
-    // empty roster: init restores that roster and stops at the next gateway
-    // boundary, where a runtime exists to shut down.
+    // publication (before prepare) and the boot roster (at prepare, before
+    // the mob build; the identity bootstrap takes that roster). Answer the
+    // first, hold the second, ask for shutdown, then answer it with an empty
+    // roster: init builds the mob and stops at the next gateway boundary,
+    // where a runtime exists to shut down.
     let mut seen = Vec::new();
     let mut roster_calls = 0;
     let pending_roster = loop {
@@ -518,19 +520,19 @@ fn shutdown_during_init_settles_failed_after_cleanup_then_is_answered() {
     assert_eq!(settled["data"]["reason"], "shutdown_requested");
     assert_eq!(settled["durable_effects"], "possible");
     let phases = progress_phases(&seen);
-    // The empty roster was restored (a runtime-reported phase) before the
-    // next gateway boundary saw the shutdown and ran cleanup.
-    let restore = phases
+    // The mob was built before the next gateway boundary (the identity
+    // bootstrap's start) saw the shutdown and ran cleanup.
+    let roster = phases
         .iter()
-        .position(|p| p == "restore")
-        .expect("restore phase");
+        .position(|p| p == "roster")
+        .expect("roster phase");
     let cleanup = phases
         .iter()
         .position(|p| p == "cleanup")
         .expect("cleanup phase");
-    assert!(restore < cleanup, "{phases:?}");
-    // The runtime already restored; its durable child root is released with
-    // every other phase settled.
+    assert!(roster < cleanup, "{phases:?}");
+    // The runtime was built; its durable child root is released with every
+    // other phase settled.
     gateway_shutdown::assert_persistent_shutdown_completed(
         &seen[answered_at],
         "shutdown answered after init cleanup",
