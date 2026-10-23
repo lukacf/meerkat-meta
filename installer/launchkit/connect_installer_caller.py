@@ -44,6 +44,11 @@ CAPABILITY_COMMANDS = {
 CAPABILITY_PHASES = PHASES | {"native_parent_issuance"}
 
 
+HELPERLESS_UPDATE_UNAVAILABLE = (
+    "In-place updates are not yet supported for this Connect application without a setup helper. "
+    "Keep its installed build and use the original owner's Start to resume it.")
+
+
 class CustodyError(ValueError):
     """An exact owned file or attempt no longer matches the trusted caller."""
 

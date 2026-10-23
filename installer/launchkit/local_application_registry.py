@@ -779,6 +779,9 @@ class LocalApplicationRegistry:
         if self._reconnect_status(self.deployment, guide_id, deployment_id) is not None:
             raise CustodyError(OWNER_RECONNECT_UPDATE)
         host = self.selected_host(guide_id, deployment_id)
+        if type(host) is ForgeApplicationHost and "helper_identity" not in host._inventory:
+            from .connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+            raise CustodyError(HELPERLESS_UPDATE_UNAVAILABLE)
         directory = self.deployment._directory(guide_id, deployment_id)
         if type(host) is OrdinaryApplicationHost:
             _, root, update = inspect_transaction(directory, update_id)

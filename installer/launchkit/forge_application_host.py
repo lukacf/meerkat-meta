@@ -606,6 +606,11 @@ class ForgeApplicationHost:
         """
         if not self.applies(guide_id):
             return None
+        # Helperless Connect supports only Fresh and Restore here. A
+        # configured replacement supplier does not extend that contract.
+        if "helper_identity" not in self._inventory:
+            from .connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+            raise CustodyError(HELPERLESS_UPDATE_UNAVAILABLE)
         supplier = self._original_replacement_selection
         if self._replacement_selection is not supplier:
             raise CustodyError("The original installed replacement selection owner changed.")

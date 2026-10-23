@@ -167,6 +167,9 @@ class ReplacementApplicationStartup:
             raise CustodyError("Replacement callback plan must retain the original application storage roots.")
         if not _same_json_value(application, _json(contents[3])):
             raise CustodyError("The candidate callback plan differs from its exact selected compilation input.")
+        if "helper" not in application:
+            from .connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+            raise CustodyError(HELPERLESS_UPDATE_UNAVAILABLE)
         observed = (directories, tuple(files), current)
         if (any(_private_directory(path) != expected for path, expected in directories.items())
                 or any(_file_identity(pin.path) != identity for pin, identity in files)

@@ -298,6 +298,38 @@ def replacement_envelope(selected):
         "association_directory": str(selected.root / "associations"), "expected_revision": 7}
 
 
+@pytest.mark.parametrize("configured", [False, True])
+def test_helperless_replacement_refuses_before_reading_a_supplier(selected, configured):
+    from launchkit.connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+    selected = select_member_classes(selected, helperless=True)
+    before = selected.inventory.read()
+
+    def supplier(*args):
+        pytest.fail("Helperless replacement cannot enter the retained supplier.")
+
+    host = replacement_host(selected, supplier if configured else None)
+    assert host._selected_replacement("another-guide", "installation", "update") is None
+    with pytest.raises(CustodyError) as refused:
+        host._selected_replacement("original-guide", "installation", "update")
+    assert str(refused.value) == HELPERLESS_UPDATE_UNAVAILABLE
+    assert selected.inventory.read() == before
+
+
+def test_helperless_registry_update_refuses_before_opening_the_update_transaction(selected):
+    from launchkit.connect_installer_caller import HELPERLESS_UPDATE_UNAVAILABLE
+    from launchkit.local_application_registry import LocalApplicationRegistry
+    selected = select_member_classes(selected, helperless=True)
+
+    def forbidden(*args):
+        pytest.fail("Helperless Apply cannot open a transaction or launch an update worker.")
+
+    registry = SimpleNamespace(deployment=SimpleNamespace(_directory=forbidden),
+        _reconnect_status=lambda *args: None, selected_host=lambda *args: selected.host)
+    with pytest.raises(CustodyError) as refused:
+        LocalApplicationRegistry._no_replacement(registry, "original-guide", "installation", "update")
+    assert str(refused.value) == HELPERLESS_UPDATE_UNAVAILABLE
+
+
 async def async_replacement(*args):
     pytest.fail("An asynchronous supplier must never be invoked.")
 
