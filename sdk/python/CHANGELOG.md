@@ -4,6 +4,40 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+- Mob announcements on `MobHandle`: `announce`, `announcement_get`,
+  `announcement_subscription_{put,pause,resume,cancel,get,list}`,
+  `announcement_delivery_{list,observe,reconcile}`,
+  `announcement_source_{put,pause,resume,end,get,list,advance,record_failure}`
+  and `announcement_audit_list`, one per `meta/mob_announcements/*` method.
+  They return frozen result types (`AnnounceResult`, `Announcement`,
+  `AnnouncementSubscription`, `AnnouncementBatch`, `AnnouncementSource`,
+  `SourceAdvanceResult`, `AnnouncementAuditEntry`, ...) whose states, phases,
+  statuses, outcomes, actions and kinds stay plain strings, so a newer
+  gateway's value passes through; an announcer or route kind this SDK does
+  not know keeps its object as `raw`. `announcement_source_get` answers a
+  view whose `source` is `None` for an id the mob does not have. Optional
+  parameters are sent only when set.
+- `MetaBuilder.mob_announcements(config=True)` sets
+  `runtime_options.mob_announcements`: `{"enabled": true}` for `True`, a
+  mapping unchanged.
+- Typed refusals `MobAnnouncementsUnavailableError` (`-32044`),
+  `AnnouncementConflictError` (`-32045`), `AnnouncementFrontierError`
+  (`-32046`), `AnnouncementRefusedError` (`-32047`) and
+  `AnnouncementNotFoundError` (`-32048`), with their `*_CODE` constants and
+  the refusal's `kind`; a kind this SDK does not know keeps its code's class.
+  A source's `stale_revision` raises `SourceStaleRevisionError`
+  (`current_revision`, `current_version`, `generation`, `cursor`) and a moved
+  cursor `SourceVersionConflictError` (`current_version`, `cursor`, `state`,
+  `revision`), both `AnnouncementConflictError`s. A source method on a
+  gateway without sources raises `RpcError` `-32601` saying "Meta does not
+  support sources".
+- `CapabilitiesResult.mob_announcements` (`MobAnnouncementsCapability`:
+  `sources`, `local_delivery`, `local_delivery_kind`, `governed_admission`),
+  `None` when mob announcements are disabled or the gateway does not report
+  it, and `supports_announcement_sources(capabilities)`, true when
+  `feature_capabilities` lists `mob_announcements.sources.v1`
+  (`MOB_ANNOUNCEMENT_SOURCES_V1`).
+
 ## 0.9.4
 
 - `MemberReloadRequiredError` (an `RpcError`), with

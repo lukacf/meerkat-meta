@@ -278,6 +278,88 @@ export interface RosterContext {
 }
 ```
 
+## Mob announcements
+
+`Meta.builder().mobAnnouncements()` sends `runtime_options.mob_announcements`
+(`{enabled: true}`; pass an object for the batch, retention and limit
+options, sent unchanged; see
+[Configuration](/reference/configuration#mob-announcements)). On a
+persistent, identity-first launch, `MobHandle` then wraps every
+`meta/mob_announcements/*` method. Results are readonly camelCase types whose
+states, phases, statuses, outcomes, actions and kinds are open unions
+(`| (string & {})`), so a newer gateway's value passes through. Option
+objects are camelCase; the declarations you write (a source's identity,
+observation, audience, routes, ...) are wire objects, sent as given.
+Unset options are not sent.
+
+| Method | Wire method | Resolves |
+|--------|-------------|----------|
+| `announce(sourceKey, topics, body, { mobId?, correlationId?, causes? })` | `announce` | `AnnounceResult` |
+| `announcementGet(mobId, sourceKey)` | `get` | `Announcement \| null` |
+| `announcementSubscriptionPut(operationId, subscriptionId, member, topics, { mobs?, start?, expectedRevision? })` | `subscriptions/put` | `AnnouncementSubscription` |
+| `announcementSubscriptionPause` / `Resume` / `Cancel(operationId, subscriptionId, expectedRevision)` | `subscriptions/{pause,resume,cancel}` | `AnnouncementSubscriptionChange` |
+| `announcementSubscriptionGet(subscriptionId)` | `subscriptions/get` | `AnnouncementSubscriptionView` |
+| `announcementSubscriptionList({ member?, after?, limit? })` | `subscriptions/list` | `AnnouncementSubscription[]` |
+| `announcementDeliveryList({ member?, subscriptionId?, after?, limit? })` | `deliveries/list` | `AnnouncementBatch[]` |
+| `announcementDeliveryObserve(batchId)` / `announcementDeliveryReconcile(batchId)` | `deliveries/{observe,reconcile}` | `AnnouncementDeliveryObservation` |
+| `announcementSourcePut(operationId, sourceId, identity, observation, topics, audience, options?)` | `sources/put` | `AnnouncementSourcePutResult` |
+| `announcementSourcePause` / `Resume` / `End(operationId, sourceId, expectedRevision, { mobId? })` | `sources/{pause,resume,end}` | `AnnouncementSource` (`Resume` also takes `rebaseline`) |
+| `announcementSourceGet(sourceId, { mobId?, includeStreams? })` | `sources/get` | `AnnouncementSourceView` (`source` `null` when absent) |
+| `announcementSourceList({ mobId?, after?, state?, limit? })` | `sources/list` | `AnnouncementSource[]` |
+| `announcementSourceAdvance(operationId, sourceId, expectedRevision, expectedVersion, principal, nextCursor, options?)` | `sources/advance` | `SourceAdvanceResult` |
+| `announcementSourceRecordFailure(operationId, sourceId, expectedRevision, expectedVersion, principal, failure, { mobId? })` | `sources/record_failure` | `AnnouncementSource` |
+| `announcementAuditList({ mobId?, sourceId?, member?, action?, after?, limit? })` | `audit/list` | `AnnouncementAuditEntry[]` |
+
+A `member` is a parsed `AnnouncementMember` or the wire form
+`{ mob_id, identity }`. The [method reference](/api/rpc#mob-announcement-sources)
+describes every field. A collector step reads the source, then advances it
+from the position it read; a step that lost a race throws with the current
+position:
+
+```typescript
+import {
+  SourceStaleRevisionError,
+  SourceVersionConflictError,
+  supportsAnnouncementSources,
+} from "@rkat/meta-sdk";
+
+const handle = runtime.mobHandle();
+if (!supportsAnnouncementSources(await handle.capabilities())) {
+  throw new Error("this gateway does not serve announcement sources");
+}
+const { source } = await handle.announcementSourceGet("mail");
+if (source === null) throw new Error("declare the source first");
+const { items, nextCursor } = await readProvider(source.cursor.token); // your adapter
+try {
+  await handle.announcementSourceAdvance(
+    `${runId}:v${source.cursor.version}`,
+    "mail",
+    source.revision,
+    source.cursor.version,
+    principal,
+    nextCursor,
+    { items, observed: { kind: "delta" } },
+  );
+} catch (err) {
+  if (!(err instanceof SourceStaleRevisionError || err instanceof SourceVersionConflictError)) {
+    throw err;
+  }
+  // another step or a configuration change moved the source: read it again
+}
+```
+
+The refusals are typed: `MobAnnouncementsUnavailableError` (`-32044`),
+`AnnouncementConflictError` (`-32045`; `SourceStaleRevisionError` and
+`SourceVersionConflictError` carry the source's `currentVersion`, `cursor`
+and revision), `AnnouncementFrontierError` (`-32046`),
+`AnnouncementRefusedError` (`-32047`) and `AnnouncementNotFoundError`
+(`-32048`), each with the refusal's `kind` (a kind this SDK does not know
+keeps its code's class). `parseAnnouncementRpcError(code, message, ...)` is
+the reifier the runtime uses. A source method on a gateway without sources
+rejects with an `RpcError` `-32601` whose message says "Meta does not
+support sources". `CapabilitiesResult.mobAnnouncements` reads
+`meta/capabilities.mob_announcements`, `null` when they are disabled.
+
 ## Module support
 
 The SDK supports both ESM and CommonJS:

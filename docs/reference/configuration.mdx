@@ -921,6 +921,29 @@ plane is sealed. Each surface refuses what it cannot compose.
 child mob profile gets the member tools only by opting in itself, with
 `tools.bundles = ["mob_announcements"]`.
 
+An SDK host sets `runtime_options.mob_announcements` with the builder:
+`Meta.builder().mob_announcements({"enabled": True, ...})` in Python and
+`Meta.builder().mobAnnouncements({ enabled: true, ... })` in TypeScript send
+the object unchanged, and `mob_announcements()` or `mobAnnouncements()`
+alone sends `{"enabled": true}`.
+
+### Mob announcement source runners
+
+A [source](/api/rpc#mob-announcement-sources) may name the collector that
+advances it: `"runner": {"host_runnable": "<name>", "every_seconds": <n>}`.
+The host owns the runnable's code: it registers the name in
+`runtime_options.host_runnables` and handles each fire (`host_runnables`
+and `on_schedule_fire` in the Python SDK). Meta schedules the runnable for
+every live source that names it, through the gateway's schedule service,
+first at the declaration and then every `every_seconds` (60 to 2,592,000).
+A changed cadence restarts the interval at the change. Each schedule Meta
+makes for a runner is labelled `mob_announcements.source_runner`, and Meta
+never changes or ends a schedule without that label. `sources/put` refuses a
+runner that names a blank runnable or the memory steward's (`-32602`).
+A runner on a gateway that schedules none, such as the console gateway or
+one without a schedule service, never fires there: such a source collects
+only when the host advances it itself.
+
 A peer gateway refuses this gateway's keyed injects issued further from its
 clock than the window the owner assumes, which bounds when a batch for a
 member on that peer may expire. `rpc_gateway` takes it from
