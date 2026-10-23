@@ -1054,7 +1054,6 @@ class GuideService:
         state.pop("organization_update", None)
         if self.organization is not None and self.organization != state.get("organization"):
             from .organization import organization_snapshot
-            from .projects import fingerprint
             context = organization_snapshot(self.organization)
             state["organization_update"] = {"context": context, "fingerprint": fingerprint(context)}
         if not state.get("answers") and not state.get("proposal") and not state.get("blueprint") and not any(message["role"] == "user" for message in state["messages"]):
@@ -1086,7 +1085,6 @@ class GuideService:
             action = value.action
             if action == "organization":
                 from .organization import organization_snapshot
-                from .projects import fingerprint
                 selected = organization_snapshot(self.organization) if self.organization is not None else None
                 if selected is None or getattr(value, "organization_fingerprint", None) != fingerprint(selected):
                     raise DraftConflict("The workplace guidance changed. Reload and review the available document.")
