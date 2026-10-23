@@ -232,6 +232,65 @@ async def test_pending_admission_preserves_later_child_refusal(fixture, linger):
         await asyncio.gather(task, return_exceptions=True)
 
 
+async def test_exit_observed_before_refusal_pipe_delivery_preserves_the_refusal(fixture, monkeypatch):
+    from test_admission_health import pending_payload
+    supervisor, definition, console = await fixture([])
+    pending = pending_payload()
+    pending["console_url"] = f"http://127.0.0.1:{definition['port']}/console"
+    refusal = "The retained source changed before admission could finish."
+    refusal_line = (json.dumps({"refused": refusal}) + "\n").encode()
+    release = supervisor.destination / "release-exit-refusal"
+    (supervisor.destination / "app.py").write_text(
+        "import json,os,sys,time\n"
+        f"payload={pending!r}\npayload['pid']=os.getpid()\n"
+        "fd=int(os.environ['MOBKIT_LAUNCH_READY_FD'])\n"
+        "os.write(fd,(json.dumps(payload)+'\\n').encode())\n"
+        f"while not os.path.exists({str(release)!r}):\n time.sleep(.01)\n"
+        f"os.write(fd,{refusal_line!r})\nsys.exit(1)\n")
+    exit_observed = asyncio.Event()
+    delivered = []
+    original_exit = supervisor.parent_exit
+    original_readline = asyncio.StreamReader.readline
+
+    async def observe_exit(process):
+        result = await original_exit(process)
+        exit_observed.set()
+        return result
+
+    async def delayed_refusal(reader):
+        line = await original_readline(reader)
+        if line == refusal_line:
+            # Model the pipe reader lagging process-exit observation. The
+            # ordinary per-frame branch cannot consume this refusal first.
+            await exit_observed.wait()
+            await asyncio.sleep(.02)
+            delivered.append(True)
+        return line
+
+    monkeypatch.setattr(supervisor, "parent_exit", observe_exit)
+    monkeypatch.setattr(asyncio.StreamReader, "readline", delayed_refusal)
+    task = asyncio.create_task(supervisor.start(definition, on_ready=lambda: pytest.fail("Refusal is not ready")))
+    try:
+        for _ in range(100):
+            if task.done():
+                await task
+            if read_receipt(supervisor.directory).get("health") == "pending":
+                break
+            await asyncio.sleep(.01)
+        else:
+            pytest.fail("The child never reported pending admission")
+        release.touch()
+        with pytest.raises(RuntimeError) as raised:
+            await asyncio.wait_for(task, 3)
+        assert str(raised.value) == "The application refused to start: " + refusal
+        assert exit_observed.is_set() and delivered == [True]
+        assert supervisor.child is None and console.requests == []
+        assert read_receipt(supervisor.directory)["console_url"] is None
+    finally:
+        supervisor.stop.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_pending_child_must_keep_reporting_within_frame_deadline(fixture, monkeypatch):
     from test_admission_health import pending_payload
     import launchkit.deployment_worker as worker
