@@ -686,6 +686,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Stop only when the service manager reports the service gone, the service
   never registered, and no process the manager reported for it remains. A
   service that started still waits for its own cleanup report.
+- A persistent gateway holds the run starts of each member its bootstrap
+  restores until the identity bootstrap publishes the member's customizer
+  tools, as the library builder does. A gateway that stopped uncleanly left
+  its mob's log Running, so the restart's mob build revived the members before
+  any customizer tools were published, and a restored queued input, a kickoff
+  or a peer message could start a run without them. Each roster identity of a
+  persistent gateway reports `customizer_tools_pending` until its tools are
+  published.
 
 ### Known limitations
 

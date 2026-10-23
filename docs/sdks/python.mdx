@@ -961,11 +961,15 @@ adopted instead of respawned, a respawn, and delivery-time repair. On a
 restart Meta runs `customize_build` for each roster identity before the mob
 is restored, so every restored member starts with its tools. They are listed by
 `meta/identity/resolved_tools` before any turn, and a run that starts at
-activation (a queued input, a kickoff) sees them. The materialization that
-follows runs `customize_build` again and republishes. If that early call fails,
-the failure is logged for the identity and reported as
-`customizer_tools_pending` (with the reason) in its identity status. The member
-advertises no customizer tools until its materialization publishes them. A tool
+activation (a queued input, a kickoff) sees them. A gateway that stopped
+uncleanly left its mob running, so its restart restores the members while it
+builds the mob, before that call: each one starts no run until the call has
+published its tools. The materialization that follows runs `customize_build`
+again and republishes. On a persistent gateway each roster identity reports
+`customizer_tools_pending` (with the reason) in its identity status until its
+tools are published; if that early call fails, the failure is logged for the
+identity, and the member advertises no customizer tools until its
+materialization publishes them. A tool
 from an earlier build that the latest build no longer declares is refused,
 never routed to stale handlers.
 
