@@ -1711,6 +1711,17 @@ pub enum AuditAction {
     SubscriptionRefused,
     /// A capture was withheld from a subscription.
     CaptureWithheld,
+    /// Owed items were held: at a seal, or at the last check before a
+    /// submission, their member no longer passed the audience or routes.
+    ItemsHeld,
+    /// Held items passed a fresh check at a seal and were released.
+    ItemsReleased,
+    /// Held items outlived the retention window.
+    ExpiredWhileHeld,
+    /// A batch committed while its member passed was admitted after the
+    /// member stopped passing: nothing Meta controls stands between the two
+    /// on a gateway without a governed binder.
+    DeliveredAcrossRevocation,
 }
 
 impl AuditAction {
@@ -1718,6 +1729,10 @@ impl AuditAction {
         match self {
             Self::SubscriptionRefused => "subscription_refused",
             Self::CaptureWithheld => "capture_withheld",
+            Self::ItemsHeld => "items_held",
+            Self::ItemsReleased => "items_released",
+            Self::ExpiredWhileHeld => "expired_while_held",
+            Self::DeliveredAcrossRevocation => "delivered_across_revocation",
         }
     }
 }

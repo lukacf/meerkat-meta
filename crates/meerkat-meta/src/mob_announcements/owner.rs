@@ -1663,7 +1663,52 @@ impl AnnouncementService {
         if route == Some(MemberRoute::Child) {
             self.member_mob_ended(member, now).await?;
         }
-        Ok(self.inner.store.seal_batch(member, id, policy, now).await?)
+        // The store checks what it seals, and what it holds, against the
+        // member's coverage and routes as its roster says now.
+        let facts = self.member_facts(member).await;
+        Ok(self
+            .inner
+            .store
+            .seal_batch_with_facts(member, id, policy, facts, now)
+            .await?)
+    }
+
+    /// The last check before a native submission: every item of `batch`,
+    /// which nothing native holds, is checked again against its member's
+    /// coverage and routes. The cancelled batch comes back when an item
+    /// fails; its failing items are held and the rest reopen.
+    async fn last_check(
+        &self,
+        batch: &Batch,
+        now: u64,
+    ) -> Result<Option<Batch>, AnnouncementError> {
+        let facts = self.member_facts(&batch.member).await;
+        Ok(self
+            .inner
+            .store
+            .check_before_submission(&batch.id, batch.state.tag(), facts, now)
+            .await?)
+    }
+
+    /// Count what an admitted batch delivered past a revocation: on a
+    /// gateway without a governed binder nothing Meta controls stands
+    /// between a commit and its admission, so an item its member stopped
+    /// passing between them still reached it. A failure to count is
+    /// logged; the delivery stands.
+    async fn audit_delivered_across_revocation(&self, batch: &Batch, now: u64) {
+        let facts = self.member_facts(&batch.member).await;
+        if let Err(error) = self
+            .inner
+            .store
+            .audit_delivered_across_revocation(&batch.id, facts, now)
+            .await
+        {
+            tracing::warn!(
+                batch_id = %batch.id,
+                %error,
+                "a delivery across a revocation could not be audited"
+            );
+        }
     }
 
     /// Record when a batch the round just read is read again.
@@ -2146,11 +2191,16 @@ impl AnnouncementService {
         event: BatchEvent,
         now: u64,
     ) -> Result<Batch, AnnouncementError> {
-        Ok(self
+        let admitted = matches!(event, BatchEvent::NativeApplied { .. });
+        let next = self
             .inner
             .store
             .transition_batch(&batch.id, batch.state.tag(), event, now)
-            .await?)
+            .await?;
+        if admitted {
+            self.audit_delivered_across_revocation(&next, now).await;
+        }
+        Ok(next)
     }
 
     /// Advance one batch as far as native evidence allows now. Returns when
@@ -2217,6 +2267,12 @@ impl AnnouncementService {
                         }
                         Err(PrepareStep::Waits) => return Ok(owed_at),
                         Err(PrepareStep::NotYet) => return Ok(retry_at),
+                    }
+                    // The last point Meta controls: a member that stopped
+                    // passing since the seal gets nothing of it.
+                    if let Some(cancelled) = self.last_check(&batch, now).await? {
+                        batch = cancelled;
+                        continue;
                     }
                     // Stamped when the request is issued, not when the
                     // round began: a peer's window runs from the issue.
@@ -2299,6 +2355,11 @@ impl AnnouncementService {
                                 }
                                 Err(PrepareStep::Waits) => return Ok(owed_at),
                                 Err(PrepareStep::NotYet) => return Ok(retry_at),
+                            }
+                            // Every resubmission is checked again first.
+                            if let Some(cancelled) = self.last_check(&batch, now).await? {
+                                batch = cancelled;
+                                continue;
                             }
                             batch = self
                                 .apply(&batch, BatchEvent::RetryNotCommitted, self.now())

@@ -110,10 +110,11 @@ CREATE INDEX IF NOT EXISTS member_routes_by_route ON member_routes (route, membe
 
 /// The tables version 2 adds: announcement sources, one row per
 /// `(mob_id, source_id)` holding its current generation, the topics the
-/// sources own, the streams each generation onboarded, and the counted
-/// audit of refused subscriptions and withheld captures, one entry per
-/// source, generation, member, action and reason. A provider applies this
-/// after [`SCHEMA`].
+/// sources own, the streams each generation onboarded, the counted audit
+/// of what sources' audiences and routes refused, withheld, held, released
+/// or let through, one entry per source, generation, member, action and
+/// reason, and the owed items held while their member does not pass. A
+/// provider applies this after [`SCHEMA`].
 pub const SCHEMA_V2: &str = "
 CREATE TABLE IF NOT EXISTS announcement_sources (
  mob_id TEXT NOT NULL, source_id TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -141,7 +142,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS announcement_audit_counted
 CREATE INDEX IF NOT EXISTS announcement_audit_by_source
  ON announcement_audit (mob_id, source_id, id);
 CREATE INDEX IF NOT EXISTS announcement_audit_by_member
- ON announcement_audit (member, id);";
+ ON announcement_audit (member, id);
+CREATE TABLE IF NOT EXISTS announcement_holds (
+ subscription_id TEXT NOT NULL, mob_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+ member TEXT NOT NULL, held_at_ms INTEGER NOT NULL, record TEXT NOT NULL,
+ PRIMARY KEY (subscription_id, mob_id, sequence));
+CREATE INDEX IF NOT EXISTS announcement_holds_by_member
+ ON announcement_holds (member, held_at_ms);";
 
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
@@ -684,7 +691,10 @@ fn backlog_for(db: &Connection, member: &Member) -> Result<Option<MemberBacklog>
             "SELECT COUNT(*), COALESCE(SUM(o.rendered_bytes), 0), MIN(o.captured_at_ms)
              FROM owed_announcements o JOIN member_subscriptions s ON s.id = o.subscription_id
              WHERE o.member = ?1 AND o.settlement IS NULL AND o.batch_id IS NULL
-               AND s.state = 'active'",
+               AND s.state = 'active'
+               AND NOT EXISTS (
+                 SELECT 1 FROM announcement_holds h WHERE h.subscription_id = o.subscription_id
+                   AND h.mob_id = o.mob_id AND h.sequence = o.sequence)",
             params![member.key()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -1553,6 +1563,9 @@ fn backlogs_in(db: &Connection, limit: usize) -> Result<Vec<MemberBacklog>> {
                AND NOT EXISTS (
                  SELECT 1 FROM announcement_batches b WHERE b.member = o.member
                    AND b.state IN ('sealed', 'submitting', 'committed'))
+               AND NOT EXISTS (
+                 SELECT 1 FROM announcement_holds h WHERE h.subscription_id = o.subscription_id
+                   AND h.mob_id = o.mob_id AND h.sequence = o.sequence)
              GROUP BY o.member
              ORDER BY MIN(o.captured_at_ms), o.member
              LIMIT ?1",
@@ -1592,9 +1605,13 @@ fn seal_batch_in(
     member: &Member,
     batch_id: &BatchId,
     policy: &SealingPolicy,
+    facts: &RosterFacts,
     now_ms: u64,
 ) -> Result<Option<Batch>> {
     policy.validate()?;
+    // What the member holds is checked afresh first: what passes now is
+    // released and seals with the rest.
+    release_holds(db, member, policy.max_count, facts, now_ms)?;
     let Some(backlog) = backlog_for(db, member)? else {
         return Ok(None);
     };
@@ -1622,6 +1639,9 @@ fn seal_batch_in(
              FROM owed_announcements o JOIN member_subscriptions s ON s.id = o.subscription_id
              WHERE o.member = ?1 AND o.settlement IS NULL AND o.batch_id IS NULL
                AND s.state = 'active'
+               AND NOT EXISTS (
+                 SELECT 1 FROM announcement_holds h WHERE h.subscription_id = o.subscription_id
+                   AND h.mob_id = o.mob_id AND h.sequence = o.sequence)
              ORDER BY o.captured_at_ms, o.mob_id, o.sequence, o.subscription_id
              LIMIT ?2",
         )
@@ -1649,11 +1669,31 @@ fn seal_batch_in(
     // The encoded body is its header, its gap lines and each item's
     // encoding without the quotes: JSON escapes character by character.
     let mut wire = wire_budget.map_or(0, |_| header_wire_bound(batch_id));
+    let mut subscriptions: BTreeMap<SubscriptionId, Option<Subscription>> = BTreeMap::new();
     for (subscription, revision, mob_id, sequence, rendered) in candidates {
         let key = (MobId::new(mob_id)?, uint(sequence)?);
         let rendered = uint(rendered)?;
-        if !announcements.contains_key(&key) {
-            let announcement = announcement_at(db, &key.0, key.1)?;
+        let subscription_id = SubscriptionId::new(subscription)?;
+        // Each item is read once, by the first subscription that names it.
+        let fresh = if announcements.contains_key(&key) {
+            None
+        } else {
+            Some(announcement_at(db, &key.0, key.1)?)
+        };
+        // An item its member no longer passes is held, not sealed.
+        if !subscriptions.contains_key(&subscription_id) {
+            let loaded = load_subscription(db, &subscription_id)?;
+            subscriptions.insert(subscription_id.clone(), loaded);
+        }
+        let announcement = fresh.as_ref().or_else(|| announcements.get(&key));
+        if let (Some(Some(owner)), Some(announcement)) =
+            (subscriptions.get(&subscription_id), announcement)
+            && let Some(refusal) = owed_refusal(db, owner, announcement, facts)?
+        {
+            hold_owed(db, &subscription_id, &key, member, &refusal, now_ms)?;
+            continue;
+        }
+        if let Some(announcement) = fresh {
             let item = render_item(&announcement);
             let item_wire = wire_len(&item).saturating_sub(2);
             let over_bytes = bytes.saturating_add(rendered) > policy.max_bytes;
@@ -1667,7 +1707,7 @@ fn seal_batch_in(
             announcements.insert(key.clone(), announcement);
             items.push(item);
         }
-        owed.push((SubscriptionId::new(subscription)?, uint(revision)?, key));
+        owed.push((subscription_id, uint(revision)?, key));
     }
     if owed.is_empty() {
         return Ok(None);
@@ -1855,6 +1895,69 @@ fn expire_in(
     let quiet_cutoff = int(now_ms.saturating_sub(quiet_ms))?;
     let budget = u64::try_from(limit.max(1)).unwrap_or(u64::MAX);
     let mut report = ExpiryReport::default();
+
+    // Held items past the window expire with their own audit entry, and no
+    // gap line tells their member of them: it may not learn of what it may
+    // not receive.
+    let mut statement = db
+        .prepare(
+            "SELECT h.subscription_id, h.mob_id, h.sequence, h.member, h.record
+             FROM announcement_holds h JOIN owed_announcements o
+               ON o.subscription_id = h.subscription_id AND o.mob_id = h.mob_id
+              AND o.sequence = h.sequence
+             WHERE o.batch_id IS NULL AND o.settlement IS NULL AND o.captured_at_ms <= ?1
+             ORDER BY o.captured_at_ms, h.member, h.mob_id, h.sequence LIMIT ?2",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![cutoff, int(budget.saturating_add(1))?], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(storage)?;
+    let mut held = Vec::new();
+    for row in rows {
+        held.push(row.map_err(storage)?);
+    }
+    drop(statement);
+    if held.len() as u64 > budget {
+        held.truncate(usize::try_from(budget).unwrap_or(usize::MAX));
+        report.more = true;
+    }
+    for (subscription_id, mob_id, sequence, member, record) in held {
+        let refusal: OwedRefusal = decode(&record)?;
+        db.execute(
+            "UPDATE owed_announcements SET settlement = 'expired'
+             WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3
+               AND batch_id IS NULL AND settlement IS NULL",
+            params![subscription_id, mob_id, sequence],
+        )
+        .map_err(storage)?;
+        db.execute(
+            "DELETE FROM announcement_holds
+             WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3",
+            params![subscription_id, mob_id, sequence],
+        )
+        .map_err(storage)?;
+        count_audit(
+            db,
+            &AuditKey {
+                mob_id: MobId::new(mob_id)?,
+                source_id: refusal.source_id,
+                generation: refusal.generation,
+                member: Member::from_key(&member)?,
+                action: AuditAction::ExpiredWhileHeld,
+                reason: refusal.reason,
+            },
+            now_ms,
+        )?;
+        report.captures += 1;
+    }
 
     // Captures no batch holds, owed longer than the window: each
     // announcement once per member, oldest first.
@@ -2226,6 +2329,22 @@ fn prune_in(db: &Connection, now_ms: u64, retention_ms: u64, limit: usize) -> Re
         )
         .map_err(storage)? as u64;
     report.more |= audited >= budget;
+
+    // A hold whose item is no longer open (its subscription ended, or the
+    // item settled otherwise) holds nothing.
+    let orphans = db
+        .execute(
+            "DELETE FROM announcement_holds WHERE rowid IN (
+               SELECT h.rowid FROM announcement_holds h WHERE NOT EXISTS (
+                 SELECT 1 FROM owed_announcements o
+                 WHERE o.subscription_id = h.subscription_id AND o.mob_id = h.mob_id
+                   AND o.sequence = h.sequence AND o.settlement IS NULL
+                   AND o.batch_id IS NULL)
+               LIMIT ?1)",
+            params![int(budget)?],
+        )
+        .map_err(storage)? as u64;
+    report.more |= orphans >= budget;
     Ok(report)
 }
 
@@ -3380,6 +3499,250 @@ fn audit_in(db: &Connection, query: &AuditQuery) -> Result<Vec<AuditRow>> {
     .collect()
 }
 
+/// Why an owed item may not reach its member now: the reason, and the
+/// source and generation that refuse it.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct OwedRefusal {
+    reason: AuditReason,
+    source_id: SourceId,
+    generation: u64,
+}
+
+/// The check of capture, made again for an owed item: whether
+/// `subscription`'s member may still receive `announcement`, as the roster
+/// facts the owner read say. An item on no source's topic always may.
+fn owed_refusal(
+    db: &Connection,
+    subscription: &Subscription,
+    announcement: &Announcement,
+    facts: &RosterFacts,
+) -> Result<Option<OwedRefusal>> {
+    let owners = topic_sources(db, &announcement.mob_id, &announcement.topics)?;
+    Ok(
+        withholding(&owners, subscription, &announcement.topics, facts).map(|(reason, owned)| {
+            OwedRefusal {
+                reason,
+                source_id: owned.source_id.clone(),
+                generation: owned.generation,
+            }
+        }),
+    )
+}
+
+/// Hold an owed item: it stays owed, no batch takes it, and the hold is
+/// counted in the audit.
+fn hold_owed(
+    db: &Connection,
+    subscription_id: &SubscriptionId,
+    key: &(MobId, u64),
+    member: &Member,
+    refusal: &OwedRefusal,
+    now_ms: u64,
+) -> Result<()> {
+    db.execute(
+        "INSERT OR REPLACE INTO announcement_holds
+           (subscription_id, mob_id, sequence, member, held_at_ms, record)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            subscription_id.as_str(),
+            key.0.as_str(),
+            int(key.1)?,
+            member.key(),
+            int(now_ms)?,
+            encode(refusal)?,
+        ],
+    )
+    .map_err(storage)?;
+    count_audit(
+        db,
+        &AuditKey {
+            mob_id: key.0.clone(),
+            source_id: refusal.source_id.clone(),
+            generation: refusal.generation,
+            member: member.clone(),
+            action: AuditAction::ItemsHeld,
+            reason: refusal.reason,
+        },
+        now_ms,
+    )
+}
+
+/// Check the member's held items afresh, oldest first and at most `limit`:
+/// one that now passes, held by the source's current generation, is
+/// released and counted; one held by an earlier generation stays held
+/// until it expires, since a new generation inherits nothing held.
+fn release_holds(
+    db: &Connection,
+    member: &Member,
+    limit: u32,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<()> {
+    let mut statement = db
+        .prepare(
+            "SELECT h.subscription_id, h.mob_id, h.sequence, h.record
+             FROM announcement_holds h JOIN owed_announcements o
+               ON o.subscription_id = h.subscription_id AND o.mob_id = h.mob_id
+              AND o.sequence = h.sequence
+             WHERE h.member = ?1 AND o.settlement IS NULL AND o.batch_id IS NULL
+             ORDER BY h.held_at_ms, h.mob_id, h.sequence, h.subscription_id LIMIT ?2",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![member.key(), i64::from(limit)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(storage)?;
+    let mut held = Vec::new();
+    for row in rows {
+        held.push(row.map_err(storage)?);
+    }
+    drop(statement);
+    for (subscription_id, mob_id, sequence, record) in held {
+        let subscription_id = SubscriptionId::new(subscription_id)?;
+        let key = (MobId::new(mob_id)?, uint(sequence)?);
+        let refusal: OwedRefusal = decode(&record)?;
+        let Some(subscription) = load_subscription(db, &subscription_id)? else {
+            continue;
+        };
+        let current = load_source(db, &key.0, &refusal.source_id)?.map(|source| source.generation);
+        if current != Some(refusal.generation) {
+            continue;
+        }
+        let announcement = announcement_at(db, &key.0, key.1)?;
+        if owed_refusal(db, &subscription, &announcement, facts)?.is_some() {
+            continue;
+        }
+        db.execute(
+            "DELETE FROM announcement_holds
+             WHERE subscription_id = ?1 AND mob_id = ?2 AND sequence = ?3",
+            params![subscription_id.as_str(), key.0.as_str(), int(key.1)?],
+        )
+        .map_err(storage)?;
+        count_audit(
+            db,
+            &AuditKey {
+                mob_id: key.0,
+                source_id: refusal.source_id,
+                generation: refusal.generation,
+                member: member.clone(),
+                action: AuditAction::ItemsReleased,
+                reason: refusal.reason,
+            },
+            now_ms,
+        )?;
+    }
+    Ok(())
+}
+
+/// The last check before a submission of batch `id`, in state `expected`
+/// (sealed, or submitting after an answer that nothing was committed):
+/// every item is checked again. When one fails, the batch is cancelled
+/// while nothing native holds it, its failing items are held, the rest
+/// reopen for the member's next batch, and its gap lines go to that batch.
+fn check_before_submission_in(
+    db: &Connection,
+    id: &BatchId,
+    expected: BatchStateTag,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<Option<Batch>> {
+    let mut batch = load_batch(db, id)?.ok_or(AnnouncementStoreError::UnknownBatch)?;
+    let current = batch.state.tag();
+    if current != expected {
+        return Err(AnnouncementStoreError::BatchMoved { current });
+    }
+    let event = match expected {
+        BatchStateTag::Sealed => BatchEvent::Cancel,
+        BatchStateTag::Submitting => BatchEvent::CancelNotCommitted,
+        other => {
+            return Err(AnnouncementStoreError::Invalid(format!(
+                "a {} batch has no check before a submission",
+                other.as_str()
+            )));
+        }
+    };
+    let mut failing = Vec::new();
+    for item in &batch.items {
+        let Some(subscription) = load_subscription(db, &item.subscription_id)? else {
+            continue;
+        };
+        let announcement = announcement_at(db, &item.mob_id, item.sequence)?;
+        if let Some(refusal) = owed_refusal(db, &subscription, &announcement, facts)? {
+            failing.push((
+                item.subscription_id.clone(),
+                (item.mob_id.clone(), item.sequence),
+                refusal,
+            ));
+        }
+    }
+    if failing.is_empty() {
+        return Ok(None);
+    }
+    let next = batch.state.apply(&event)?;
+    // The batch reports nothing: its gap lines go to the member's next one.
+    add_gaps(db, &batch.member, &batch.gaps)?;
+    db.execute(
+        "UPDATE owed_announcements SET batch_id = NULL
+         WHERE batch_id = ?1 AND settlement IS NULL",
+        params![batch.id.as_str()],
+    )
+    .map_err(storage)?;
+    for (subscription_id, key, refusal) in &failing {
+        hold_owed(db, subscription_id, key, &batch.member, refusal, now_ms)?;
+    }
+    batch.state = next;
+    batch.updated_at_ms = now_ms;
+    update_batch(db, &batch)?;
+    Ok(Some(batch))
+}
+
+/// Count each item of the admitted batch `id` its member no longer passes:
+/// it reached the member across a revocation.
+fn audit_delivered_across_in(
+    db: &Connection,
+    id: &BatchId,
+    facts: &RosterFacts,
+    now_ms: u64,
+) -> Result<()> {
+    let batch = load_batch(db, id)?.ok_or(AnnouncementStoreError::UnknownBatch)?;
+    for item in &batch.items {
+        let Some(subscription) = load_subscription(db, &item.subscription_id)? else {
+            continue;
+        };
+        let announcement = announcement_at(db, &item.mob_id, item.sequence)?;
+        if let Some(refusal) = owed_refusal(db, &subscription, &announcement, facts)? {
+            count_audit(
+                db,
+                &AuditKey {
+                    mob_id: item.mob_id.clone(),
+                    source_id: refusal.source_id,
+                    generation: refusal.generation,
+                    member: batch.member.clone(),
+                    action: AuditAction::DeliveredAcrossRevocation,
+                    reason: refusal.reason,
+                },
+                now_ms,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The roster facts of one member, as a store check reads them.
+fn facts_of(member: &Member, facts: Option<MemberFacts>) -> RosterFacts {
+    let mut roster = RosterFacts::default();
+    if let Some(found) = facts {
+        roster.insert(member.clone(), found);
+    }
+    roster
+}
+
 /// A subscription a source's audience or routes refused: the refusal, and
 /// the source, generation and reason its audit entry counts under.
 struct SubscriptionRefusal {
@@ -3822,9 +4185,57 @@ impl AnnouncementStore for SqliteAnnouncementStore {
         policy: &SealingPolicy,
         now_ms: u64,
     ) -> Result<Option<Batch>> {
-        let (member, batch_id, policy) = (member.clone(), batch_id.clone(), *policy);
-        self.run(move |db| seal_batch_in(db, &member, &batch_id, &policy, now_ms))
+        self.seal_batch_with_facts(member, batch_id, policy, None, now_ms)
             .await
+    }
+
+    async fn seal_batch_with_facts(
+        &self,
+        member: &Member,
+        batch_id: &BatchId,
+        policy: &SealingPolicy,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<Option<Batch>> {
+        let (member, batch_id, policy) = (member.clone(), batch_id.clone(), *policy);
+        let facts = facts_of(&member, facts);
+        self.run(move |db| seal_batch_in(db, &member, &batch_id, &policy, &facts, now_ms))
+            .await
+    }
+
+    async fn check_before_submission(
+        &self,
+        id: &BatchId,
+        expected: BatchStateTag,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<Option<Batch>> {
+        let id = id.clone();
+        self.run(move |db| {
+            let member = load_batch(db, &id)?
+                .ok_or(AnnouncementStoreError::UnknownBatch)?
+                .member;
+            let facts = facts_of(&member, facts);
+            check_before_submission_in(db, &id, expected, &facts, now_ms)
+        })
+        .await
+    }
+
+    async fn audit_delivered_across_revocation(
+        &self,
+        id: &BatchId,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<()> {
+        let id = id.clone();
+        self.run(move |db| {
+            let member = load_batch(db, &id)?
+                .ok_or(AnnouncementStoreError::UnknownBatch)?
+                .member;
+            let facts = facts_of(&member, facts);
+            audit_delivered_across_in(db, &id, &facts, now_ms)
+        })
+        .await
     }
 
     async fn batch(&self, id: &BatchId) -> Result<Option<Batch>> {

@@ -178,6 +178,57 @@ pub trait AnnouncementStore: Send + Sync {
         now_ms: u64,
     ) -> Result<Option<Batch>>;
 
+    /// [`Self::seal_batch`] with the member's roster facts as the owner read
+    /// them. A store that keeps sources checks every item it would seal, and
+    /// every item it holds, against the member's coverage and routes first:
+    /// an item that fails is held, not sealed and not dropped, and a held
+    /// item that passes this fresh check is released and sealed. A store
+    /// without sources owns no topic and seals as before.
+    async fn seal_batch_with_facts(
+        &self,
+        member: &Member,
+        batch_id: &BatchId,
+        policy: &SealingPolicy,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<Option<Batch>> {
+        let _ = facts;
+        self.seal_batch(member, batch_id, policy, now_ms).await
+    }
+
+    /// The last check before a native submission of batch `id`, which is in
+    /// state `expected`: sealed, or submitting after an answer that nothing
+    /// was committed, so nothing native holds it. Every item is checked
+    /// again against its member's coverage and routes (`facts`). When all
+    /// pass, the batch is left as it is and `None` comes back. Otherwise the
+    /// batch is cancelled: its failing items are held, the rest reopen for
+    /// the member's next batch, its gap lines go to that batch, and the
+    /// cancelled batch comes back. A store without sources owns no topic and
+    /// passes every batch.
+    async fn check_before_submission(
+        &self,
+        id: &BatchId,
+        expected: BatchStateTag,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<Option<Batch>> {
+        let _ = (id, expected, facts, now_ms);
+        Ok(None)
+    }
+
+    /// Count, for batch `id` just admitted into its member's session, each
+    /// item its member's coverage or routes (`facts`) no longer allow: it was
+    /// committed while they did, and reached the member after they stopped.
+    async fn audit_delivered_across_revocation(
+        &self,
+        id: &BatchId,
+        facts: Option<MemberFacts>,
+        now_ms: u64,
+    ) -> Result<()> {
+        let _ = (id, facts, now_ms);
+        Ok(())
+    }
+
     async fn batch(&self, id: &BatchId) -> Result<Option<Batch>>;
 
     async fn batches(&self, query: &BatchQuery) -> Result<Vec<Batch>>;
