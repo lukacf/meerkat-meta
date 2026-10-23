@@ -140,8 +140,10 @@ jobs:
         run: python -m pytest -vv --tb=short --durations=20 --junitxml=forge-pytest.xml $(cat forge-shard-files.txt)
       # Application startup code runs against the selected product's Meta SDK,
       # not the Guide SDK installed above. Recheck this shard's share of
-      # installer/tests/checkout_sdk_startup_tests.txt with this checkout's SDK.
+      # installer/tests/checkout_sdk_startup_tests.txt with this checkout's SDK,
+      # also after a failure above, so that every failure is reported.
       - name: Application startup checks with this checkout's Meta SDK
+        if: ${{ !cancelled() }}
         env:
           PYTHONPATH: sdk/python:installer
         run: |
