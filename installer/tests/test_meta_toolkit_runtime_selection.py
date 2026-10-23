@@ -256,6 +256,19 @@ def test_pure_protected_parser_does_not_qualify_or_open_selected_artifacts(produ
     assert selection.parse_candidate_selection(rendered) == product.target
 
 
+@pytest.mark.parametrize("target", [[], {}])
+def test_protected_product_parser_refuses_container_target_without_artifact_reads(product, monkeypatch, target):
+    rendered = selection.candidate_selection(product.target)
+    rendered["target"] = target
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Malformed historical selection must not open artifact inputs.")
+
+    monkeypatch.setattr(selection, "read_meta_toolkit_artifacts", forbidden)
+    with pytest.raises(ValueError, match="selected native product target is invalid"):
+        selection.parse_candidate_selection(json.loads(json.dumps(rendered)))
+
+
 @pytest.fixture
 def portable_product(product, tmp_path):
     """Copy selected inert bytes; retain the producer's original record paths."""

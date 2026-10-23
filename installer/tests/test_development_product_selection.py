@@ -436,6 +436,8 @@ def test_malformed_product_container_refuses_before_payload_reads(
     ("paths", "artifact_root", None, "locator must stay inside its distribution"),
     ("paths", "artifact_root", [], "locator must stay inside its distribution"),
     ("paths", "artifact_root", 12, "locator must stay inside its distribution"),
+    ("selection", "target", [], "selected native product target is invalid"),
+    ("selection", "target", {}, "selected native product target is invalid"),
     ("selection", "assembly", None, "original selected Meta and Toolkit product"),
     ("selection", "meta_wheel", [], "original selected Meta and Toolkit product"),
     ("selection", "dependency_wheels", None, "packaged dependency inventory changed"),
