@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 
 use super::availability::SuspendMarker;
 use super::escalations::{
-    CONFLICT_WINDOW_MS, Escalation, EscalationCause, EscalationEvent, EscalationEventKind,
+    EVENT_WINDOW_MS, Escalation, EscalationCause, EscalationEvent, EscalationEventKind,
     EscalationNotice, EscalationPass, EscalationSubject, HEALTH_TOPIC, MemberBacklogRead,
     MemberRead, QuietEvidence, SUSPENDED_ESCALATION_MS, StatusCounts, health_body, health_key,
     health_topic,
@@ -171,7 +171,11 @@ CREATE TABLE IF NOT EXISTS announcement_escalation_events (
  cursor INTEGER PRIMARY KEY AUTOINCREMENT, escalation_id TEXT NOT NULL,
  at_ms INTEGER NOT NULL, record TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS announcement_member_markers (
- member TEXT NOT NULL PRIMARY KEY, written_at_ms INTEGER NOT NULL, record TEXT NOT NULL);";
+ member TEXT NOT NULL PRIMARY KEY, written_at_ms INTEGER NOT NULL, record TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS announcement_escalation_passes (
+ id INTEGER NOT NULL PRIMARY KEY, evaluated_at_ms INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS announcement_batches_reporting_gaps
+ ON announcement_batches (sealed_at_ms, member) WHERE json_array_length(record, '$.gaps') > 0;";
 
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
@@ -5151,8 +5155,12 @@ fn member_read_in(db: &Connection, member: &Member) -> Result<MemberRead> {
     let withheld_audience = count_in(
         db,
         "SELECT COALESCE(SUM(count), 0) FROM announcement_audit
-         WHERE member = ?1 AND action = 'capture_withheld' AND reason = 'audience_not_covered'",
-        &[&key],
+         WHERE member = ?1 AND action = ?2 AND reason = ?3",
+        &[
+            &key,
+            &AuditAction::CaptureWithheld.as_str(),
+            &AuditReason::AudienceNotCovered.as_str(),
+        ],
     )?;
     let last_sealed_at_ms: Option<i64> = db
         .query_row(
@@ -5316,10 +5324,83 @@ fn quiet_evidence(source: &AnnouncementSource) -> QuietEvidence {
     }
 }
 
+/// When the first of the source's gap notices announced since `from_ms` was
+/// announced: a rebaseline, or a final page that could not prove complete
+/// coverage, announces one.
+fn source_gap_since_in(
+    db: &Connection,
+    source: &AnnouncementSource,
+    from_ms: u64,
+) -> Result<Option<u64>> {
+    let prefix = format!("{SOURCE_KEY_PREFIX}{}:gap:", source.source_id);
+    let since: Option<i64> = db
+        .query_row(
+            "SELECT MIN(announced_at_ms) FROM announcements
+             WHERE mob_id = ?1 AND source_key > ?2 AND source_key < ?2 || '~'
+               AND announced_at_ms >= ?3",
+            params![source.mob_id.as_str(), prefix, int(from_ms)?,],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    since.map(uint).transpose()
+}
+
+/// The members with a batch sealed since `from_ms` that reported gaps, each
+/// with the first such batch's time.
+fn gap_batches_in(db: &Connection, from_ms: u64) -> Result<BTreeMap<Member, u64>> {
+    let mut statement = db
+        .prepare(
+            "SELECT member, MIN(sealed_at_ms) FROM announcement_batches
+             WHERE json_array_length(record, '$.gaps') > 0 AND sealed_at_ms >= ?1
+             GROUP BY member",
+        )
+        .map_err(storage)?;
+    let rows: Vec<(String, i64)> = statement
+        .query_map(params![int(from_ms)?], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(storage)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(storage)?;
+    rows.iter()
+        .map(|(member, since)| Ok((Member::from_key(member)?, uint(*since)?)))
+        .collect()
+}
+
+/// The members with a capture withheld since `from_ms` because a source's
+/// audience no longer covers them, each with the first time their counted
+/// entries name.
+fn withheld_for_coverage_in(db: &Connection, from_ms: u64) -> Result<BTreeMap<Member, u64>> {
+    let mut statement = db
+        .prepare(
+            "SELECT member, MIN(first_at_ms) FROM announcement_audit
+             WHERE action = ?1 AND reason = ?2 AND last_at_ms >= ?3
+             GROUP BY member",
+        )
+        .map_err(storage)?;
+    let rows: Vec<(String, i64)> = statement
+        .query_map(
+            params![
+                AuditAction::CaptureWithheld.as_str(),
+                AuditReason::AudienceNotCovered.as_str(),
+                int(from_ms)?,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(storage)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(storage)?;
+    rows.iter()
+        .map(|(member, since)| Ok((Member::from_key(member)?, uint(*since)?)))
+        .collect()
+}
+
 /// What the escalation pass raises or resolves for one source: each source
 /// cause with the time its condition began, or `None` when it does not hold.
+/// A conflict or gap counts from `from_ms` on; `gap_since` is when the first
+/// of its gaps since then was announced.
 fn source_conditions(
     source: &AnnouncementSource,
+    gap_since: Option<u64>,
+    from_ms: u64,
     now_ms: u64,
 ) -> Vec<(EscalationCause, Option<u64>, Option<QuietEvidence>)> {
     let active = source.state == SourceState::Active;
@@ -5349,9 +5430,8 @@ fn source_conditions(
         .last_conflict
         .as_ref()
         .map(|conflict| conflict.at_ms)
-        .filter(|at| active && elapsed(*at) < CONFLICT_WINDOW_MS);
-    let gap = (active && health.totals.gaps > 0 && source.collection != CollectionPhase::Live)
-        .then_some(now_ms);
+        .filter(|at| active && *at >= from_ms);
+    let gap = gap_since.filter(|_| active);
     vec![
         (
             EscalationCause::FailureStreak,
@@ -5432,6 +5512,41 @@ fn announce_health_unchecked_in(
     announce_in(db, request, facts, now_ms)
 }
 
+/// Where a pass at `now_ms` starts reading conditions that happen rather
+/// than hold: a day back, or the last pass when that is older, so what
+/// happened while no round ran is raised by the next one. The pass is
+/// recorded as the next one's start.
+fn escalation_window_in(db: &Connection, now_ms: u64) -> Result<u64> {
+    let last: Option<i64> = db
+        .query_row(
+            "SELECT evaluated_at_ms FROM announcement_escalation_passes WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    db.execute(
+        "INSERT INTO announcement_escalation_passes (id, evaluated_at_ms) VALUES (1, ?1)
+         ON CONFLICT(id) DO UPDATE SET evaluated_at_ms = excluded.evaluated_at_ms",
+        params![int(now_ms)?],
+    )
+    .map_err(storage)?;
+    // Less than a day old: a condition last seen a day ago is over.
+    let day = now_ms.saturating_add(1).saturating_sub(EVENT_WINDOW_MS);
+    Ok(match last.map(uint).transpose()? {
+        Some(last) => last.min(day),
+        None => day,
+    })
+}
+
+/// The earlier of two times, either of which may be missing.
+fn earliest(first: Option<u64>, second: Option<u64>) -> Option<u64> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (first, second) => first.or(second),
+    }
+}
+
 /// One escalation pass, in one transaction: every source cause raised or
 /// resolved from the source records as they stand, the member causes from
 /// the persisted markers, holds and gaps, open escalations notified again
@@ -5443,6 +5558,7 @@ fn escalation_pass_in(
     facts: &RosterFacts,
     now_ms: u64,
 ) -> Result<Vec<EscalationNotice>> {
+    let from_ms = escalation_window_in(db, now_ms)?;
     let mut notices = Vec::new();
     let mut audiences: BTreeMap<String, Vec<AudienceGrant>> = BTreeMap::new();
     for source in all_sources_in(db)? {
@@ -5451,14 +5567,19 @@ fn escalation_pass_in(
             source_id: source.source_id.clone(),
         };
         audiences.insert(subject.key(), source.audience.clone());
-        for (cause, since_ms, evidence) in source_conditions(&source, now_ms) {
+        let gap_since = source_gap_since_in(db, &source, from_ms)?;
+        for (cause, since_ms, evidence) in source_conditions(&source, gap_since, from_ms, now_ms) {
             notices.extend(settle_escalation_in(
                 db, cause, &subject, since_ms, evidence, now_ms,
             )?);
         }
     }
     let markers: BTreeMap<Member, SuspendMarker> = member_markers_in(db)?.into_iter().collect();
+    let gap_batches = gap_batches_in(db, from_ms)?;
+    let withheld = withheld_for_coverage_in(db, from_ms)?;
     let mut members: BTreeSet<Member> = markers.keys().cloned().collect();
+    members.extend(gap_batches.keys().cloned());
+    members.extend(withheld.keys().cloned());
     for escalation in open_escalations_in(db, None)? {
         if let EscalationSubject::Member { member } = escalation.subject {
             members.insert(member);
@@ -5494,18 +5615,25 @@ fn escalation_pass_in(
                 |row| row.get(0),
             )
             .map_err(storage)?;
-        let gaps = count_in(
+        let pending_gaps = count_in(
             db,
             "SELECT COUNT(*) FROM announcement_gaps WHERE member = ?1",
             &[&key],
         )?;
+        // Held items hold the escalation while they are held; a capture
+        // withheld for coverage, or a batch that reported gaps, for a day.
+        let audience_hold = earliest(
+            held_since.map(uint).transpose()?,
+            withheld.get(&member).copied(),
+        );
+        let member_gap = earliest(
+            gap_batches.get(&member).copied(),
+            (pending_gaps > 0).then_some(now_ms),
+        );
         let conditions = [
             (EscalationCause::Suspended, suspended),
-            (
-                EscalationCause::AudienceHold,
-                held_since.map(uint).transpose()?,
-            ),
-            (EscalationCause::MemberGap, (gaps > 0).then_some(now_ms)),
+            (EscalationCause::AudienceHold, audience_hold),
+            (EscalationCause::MemberGap, member_gap),
         ];
         for (cause, since_ms) in conditions {
             notices.extend(settle_escalation_in(

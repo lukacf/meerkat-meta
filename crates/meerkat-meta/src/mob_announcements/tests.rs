@@ -10073,8 +10073,14 @@ fn the_version_two_schema_is_pinned() {
             "index announcement_audit_counted on announcement_audit: mob_id, source_id, \
              generation, member, action, reason"
                 .to_string(),
+            "index announcement_batches_reporting_gaps on announcement_batches: sealed_at_ms, \
+             member"
+                .to_string(),
             "table announcement_escalation_events: cursor INTEGER pk1, escalation_id TEXT \
              notnull, at_ms INTEGER notnull, record TEXT notnull"
+                .to_string(),
+            "table announcement_escalation_passes: id INTEGER notnull pk1, evaluated_at_ms \
+             INTEGER notnull"
                 .to_string(),
             "table announcement_escalations: escalation_id TEXT notnull pk1, cause TEXT \
              notnull, subject TEXT notnull, mob_id TEXT, open INTEGER notnull, notified_at_ms \
@@ -10207,12 +10213,13 @@ async fn a_version_one_store_migrates_to_version_two_in_place() {
              AND name IN ('announcement_sources', 'announcement_source_topics',
                           'announcement_source_streams', 'announcement_audit',
                           'announcement_holds', 'announcement_escalations',
-                          'announcement_escalation_events', 'announcement_member_markers')",
+                          'announcement_escalation_events', 'announcement_member_markers',
+                          'announcement_escalation_passes')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 8);
+    assert_eq!(tables, 9);
 }
 
 // ---------------------------------------------------------------------------

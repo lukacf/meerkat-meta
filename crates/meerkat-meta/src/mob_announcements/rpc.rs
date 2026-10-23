@@ -1114,24 +1114,41 @@ pub async fn handle_announcement_method(
         "meta/mob_announcements/sources/list" => {
             let request: ListSourcesParams = params(raw)?;
             let mob_id = request.mob_id.unwrap_or_else(|| own_mob.clone());
-            let sources = service
-                .sources(&SourceQuery {
-                    after: request.after.map(|source_id| (mob_id.clone(), source_id)),
-                    mob_id: Some(mob_id),
-                    state: request.state,
-                    limit: request.limit.unwrap_or(DEFAULT_LIMIT),
-                })
-                .await
-                .map_err(rpc_error)?;
-            let mut listed = Vec::with_capacity(sources.len());
-            for source in &sources {
-                let value = with_health(service, source, listed_source(source)?).await?;
-                let escalated = value
-                    .pointer("/health/escalations")
-                    .and_then(Value::as_array)
-                    .is_some_and(|escalations| !escalations.is_empty());
-                if !request.escalated || escalated {
-                    listed.push(value);
+            let limit = request
+                .limit
+                .unwrap_or(DEFAULT_LIMIT)
+                .clamp(1, super::types::MAX_PAGE);
+            let mut after = request.after.map(|source_id| (mob_id.clone(), source_id));
+            let mut listed = Vec::new();
+            // Escalated sources are picked here, after the store's page: the
+            // read goes on until the page is full or the sources end, so an
+            // escalated source behind a page of others is still listed.
+            loop {
+                let sources = service
+                    .sources(&SourceQuery {
+                        after: after.clone(),
+                        mob_id: Some(mob_id.clone()),
+                        state: request.state,
+                        limit,
+                    })
+                    .await
+                    .map_err(rpc_error)?;
+                let ended = sources.len() < limit;
+                after = sources
+                    .last()
+                    .map(|source| (source.mob_id.clone(), source.source_id.clone()));
+                for source in &sources {
+                    let value = with_health(service, source, listed_source(source)?).await?;
+                    let escalated = value
+                        .pointer("/health/escalations")
+                        .and_then(Value::as_array)
+                        .is_some_and(|escalations| !escalations.is_empty());
+                    if (!request.escalated || escalated) && listed.len() < limit {
+                        listed.push(value);
+                    }
+                }
+                if ended || !request.escalated || listed.len() >= limit {
+                    break;
                 }
             }
             Ok(json!({ "sources": listed }))

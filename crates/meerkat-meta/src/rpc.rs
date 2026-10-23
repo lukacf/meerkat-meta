@@ -2389,13 +2389,18 @@ async fn handle_unified_rpc_json_inner(
                 .map(crate::live_wiring::LiveRpcHandler::feature_capabilities)
                 .unwrap_or_default();
             if runtime.mob_announcements().is_some() {
-                feature_capabilities.extend(
-                    crate::mob_announcements::rpc::announcement_feature_capabilities()
-                        .into_iter()
-                        .filter_map(|name| {
-                            crate::live_contracts::FeatureCapability::new(name).ok()
-                        }),
-                );
+                for name in crate::mob_announcements::rpc::announcement_feature_capabilities() {
+                    match crate::live_contracts::FeatureCapability::new(name) {
+                        Ok(capability) => feature_capabilities.push(capability),
+                        // The names are non-empty constants: a refusal is a
+                        // defect to see, not a capability to drop unseen.
+                        Err(error) => tracing::error!(
+                            error,
+                            name,
+                            "mob announcement feature capability refused"
+                        ),
+                    }
+                }
             }
             let announcement_capabilities = crate::mob_announcements::rpc::capabilities_projection(
                 runtime.mob_announcements().as_ref(),

@@ -151,7 +151,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   advance for a day), `quiet` and `empty_coverage` (opt-in), `conflicts`
   and `source_gap`; member causes: `suspended` (a delivery wait older than
   an hour), `member_gap` and `audience_hold`. The dispatcher evaluates them
-  every round.
+  every round. A condition that happens rather than holds (a conflict, a
+  source gap, a batch that reported gaps, a capture withheld because
+  coverage changed) keeps its escalation open for a day after it last
+  happened, and one that happened while no round ran is raised by the next
+  round.
   - Every event reaches the host as a `meta/on_error` notification,
     `mob_announcement_escalated` or `mob_announcement_escalation_resolved`,
     with the escalation id and the event cursor. After a reconnect,

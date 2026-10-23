@@ -331,5 +331,9 @@ pub struct StatusCounts {
 /// How long a member's deliveries wait before they escalate as suspended.
 pub(crate) const SUSPENDED_ESCALATION_MS: u64 = 60 * 60 * 1_000;
 
-/// How long a conflict keeps its source's conflicts escalation open.
-pub(crate) const CONFLICT_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
+/// How long the escalation of a condition that happens, rather than holds,
+/// stays open after it last happened: a source's conflict or gap, a batch
+/// that reported gaps, a capture withheld because coverage changed. A pass
+/// reads back further when the last pass before it is older: what happened
+/// while no round ran is raised by the next one.
+pub(crate) const EVENT_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;

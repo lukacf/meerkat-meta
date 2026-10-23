@@ -339,6 +339,14 @@ pub(crate) const ANNOUNCEMENT_SCHEMA_DOMAIN: meerkat_sqlite::SchemaDomain =
                 kind: meerkat_sqlite::SchemaObjectKind::Table,
                 name: "announcement_member_markers",
             },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "announcement_escalation_passes",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Index,
+                name: "announcement_batches_reporting_gaps",
+            },
         ],
         retired_objects: &[],
     };
