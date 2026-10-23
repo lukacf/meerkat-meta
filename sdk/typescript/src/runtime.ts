@@ -1236,6 +1236,9 @@ export class MetaRuntime {
     if (this._config.workgraphEnabled !== null) {
       runtimeOptions.workgraph = this._config.workgraphEnabled;
     }
+    if (this._config.mobAnnouncements != null) {
+      runtimeOptions.mob_announcements = { ...this._config.mobAnnouncements };
+    }
     if (this._config.forkInstructionPolicy !== null) {
       runtimeOptions.fork_instruction_policy = this._config.forkInstructionPolicy;
     }
@@ -4088,8 +4091,8 @@ export class MobHandle {
   }
 
   /**
-   * One source, with its cursor token and failure detail, and its streams
-   * when `includeStreams` is set.
+   * One source (`null` when the mob has none by that id), with its cursor
+   * token and failure detail, and its streams when `includeStreams` is set.
    */
   async announcementSourceGet(
     sourceId: string,
@@ -4128,7 +4131,9 @@ export class MobHandle {
   /**
    * One collector step: the items observed since the cursor, committed with
    * the next cursor at `expectedRevision` and `expectedVersion`, under
-   * `principal` (wire form). A step that lost a race throws
+   * `principal` (wire form). The final page of a baseline, a backfill or a
+   * stream onboarding says what it covered: `coverage: "complete"` or
+   * `{gap: {reason}}`. A step that lost a race throws
    * {@link SourceVersionConflictError} or {@link SourceStaleRevisionError}
    * with the source's current position.
    */
@@ -4142,7 +4147,7 @@ export class MobHandle {
     options: {
       readonly mobId?: string;
       readonly page?: AnnouncementWireObject;
-      readonly coverage?: AnnouncementWireObject;
+      readonly coverage?: "complete" | AnnouncementWireObject;
       readonly items?: readonly AnnouncementWireObject[];
       readonly streams?: readonly AnnouncementWireObject[];
       readonly rebaseline?: AnnouncementWireObject;

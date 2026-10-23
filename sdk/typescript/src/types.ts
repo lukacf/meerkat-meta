@@ -5107,16 +5107,20 @@ export interface AnnouncementSourceStream {
   readonly sinceMs: number | null;
 }
 
-/** `sources/get`: the source, and its streams when asked for them. */
+/**
+ * `sources/get`: the source (`null` when the mob has none by that id), and
+ * its streams when asked for them.
+ */
 export interface AnnouncementSourceView {
-  readonly source: AnnouncementSource;
+  readonly source: AnnouncementSource | null;
   readonly streams: readonly AnnouncementSourceStream[] | null;
 }
 
 export function parseAnnouncementSourceView(raw: unknown): AnnouncementSourceView {
   const d = asRecord(raw);
+  const source = wireRecordOrNull(d.source);
   return {
-    source: parseAnnouncementSource(d.source),
+    source: source === null ? null : parseAnnouncementSource(source),
     streams: Array.isArray(d.streams)
       ? asRecordArray(d.streams).map((stream) => ({
           stream: String(stream.stream ?? ""),

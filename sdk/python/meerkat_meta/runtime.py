@@ -964,6 +964,8 @@ class MetaRuntime:
             runtime_options["meerkat_config_path"] = self._config.meerkat_config_path
         if self._config.workgraph_enabled is not None:
             runtime_options["workgraph"] = self._config.workgraph_enabled
+        if self._config.mob_announcements is not None:
+            runtime_options["mob_announcements"] = dict(self._config.mob_announcements)
         if self._config.fork_instruction_policy is not None:
             runtime_options["fork_instruction_policy"] = self._config.fork_instruction_policy
         if self._config.routing_config_path:
@@ -4321,8 +4323,9 @@ class MobHandle:
     async def announcement_source_get(
         self, source_id: str, *, mob_id: str | None = None, include_streams: bool | None = None
     ) -> AnnouncementSourceView:
-        """One source, with its cursor token and failure detail, and its
-        streams when ``include_streams`` is set."""
+        """One source (``None`` when the mob has none by that id), with its
+        cursor token and failure detail, and its streams when
+        ``include_streams`` is set."""
         raw = await self._announcement_rpc(
             "sources/get", {"source_id": source_id}, {"mob_id": mob_id, "include_streams": include_streams}
         )
@@ -4355,7 +4358,7 @@ class MobHandle:
         *,
         mob_id: str | None = None,
         page: dict[str, Any] | None = None,
-        coverage: dict[str, Any] | None = None,
+        coverage: str | dict[str, Any] | None = None,
         items: list[dict[str, Any]] | None = None,
         streams: list[dict[str, Any]] | None = None,
         rebaseline: dict[str, Any] | None = None,
@@ -4366,7 +4369,9 @@ class MobHandle:
         with the next cursor at ``expected_revision`` and
         ``expected_version``, under ``principal``.
 
-        A step that lost a race raises :class:`SourceVersionConflictError` or
+        The final page of a baseline, a backfill or a stream onboarding says what
+        it covered: ``coverage="complete"`` or ``{"gap": {"reason": ...}}``. A
+        step that lost a race raises :class:`SourceVersionConflictError` or
         :class:`SourceStaleRevisionError` with the source's current position.
         """
         raw = await self._announcement_rpc(

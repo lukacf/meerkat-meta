@@ -3149,17 +3149,19 @@ class AnnouncementSourceStream:
 
 @dataclass(frozen=True)
 class AnnouncementSourceView:
-    """``sources/get``: the source, and its streams when asked for them."""
+    """``sources/get``: the source (``None`` when this mob has none by that
+    id), and its streams when asked for them."""
 
-    source: AnnouncementSource
+    source: AnnouncementSource | None
     streams: tuple[AnnouncementSourceStream, ...] | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> AnnouncementSourceView:
         d = _wire_dict(data)
+        source = d.get("source")
         streams = d.get("streams")
         return cls(
-            source=AnnouncementSource.from_dict(d.get("source")),
+            source=AnnouncementSource.from_dict(source) if isinstance(source, dict) else None,
             streams=tuple(AnnouncementSourceStream.from_dict(stream) for stream in streams)
             if isinstance(streams, list)
             else None,
