@@ -35,6 +35,7 @@ AUDIENCE = "persistent-gateway"
 HEALTH_AUDIENCE = "mobkit-launch-host-health"
 SESSION_SECONDS = 8 * 60 * 60
 HEALTH_PATHS = {"/console/experience", "/console/identities"}
+AVAILABILITY_PATH = "/host/availability"
 MAX_BODY = 101 * 1024 * 1024  # The pinned native multipart limit.
 # A 4096-character password can use four UTF-8 bytes per character, each
 # encoded as three form bytes. Leave bounded space for principal, nonce and keys.
@@ -731,6 +732,8 @@ class ConsoleFront:
     async def handle(self, request):
         from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
         path = request.url.path
+        availability = path == AVAILABILITY_PATH
+        availability_headers = _console_public_headers() if availability else None
         toolkit_callback_landing = path == "/host/toolkit/setup/callback" and request.method == "GET"
         # Internal health probes keep their existing loopback URL and separate
         # read-only bearer credential. A browser cookie never admits this alias.
@@ -738,9 +741,19 @@ class ConsoleFront:
                         and request.headers.get("host") == urlsplit(self.local_origin).netloc)
         if (request.headers.get("host") != self._browser_host and not local_health
                 or not toolkit_callback_landing and any(key == "auth_token" for key, _ in parse_qsl(request.url.query))):
-            return Response("Invalid Console address.", status_code=400)
+            return Response("Invalid Console address.", status_code=400, headers=availability_headers)
         if request.headers.get("origin") not in (None, self.origin) and not toolkit_callback_landing:
-            return Response("Cross-origin Console requests are refused.", status_code=403)
+            return Response("Cross-origin Console requests are refused.", status_code=403, headers=availability_headers)
+        if availability:
+            # Deployment relays may probe this front without allocating a login
+            # nonce, inspecting a session, driving retirement or calling native.
+            # Empty 204 means only that this listener accepts requests; native
+            # application readiness still requires authenticated HEALTH_PATHS.
+            if request.method not in ("GET", "HEAD"):
+                return Response(status_code=405, headers={**availability_headers, "Allow": "GET, HEAD"})
+            if request.scope["query_string"]:
+                return Response(status_code=400, headers=availability_headers)
+            return Response(status_code=503 if self._closing else 204, headers=availability_headers)
         if self._closing:
             if path == FRONTEND_DESCRIPTOR_PATH:
                 return _frontend_descriptor_error(503)
