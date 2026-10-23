@@ -607,7 +607,7 @@ fn a_declaration_the_static_checks_refuse_is_refused_whole() {
             matches!(
                 check(serde_json::json!({
                     "revision": 1,
-                    "sources": [forwarding.clone(), triaged],
+                    "sources": [forwarding, triaged],
                 })),
                 Err(AnnouncementStoreError::TopicOwned { .. })
             ),
@@ -617,7 +617,7 @@ fn a_declaration_the_static_checks_refuse_is_refused_whole() {
             matches!(
                 check(serde_json::json!({
                     "revision": 1,
-                    "sources": [forwarding.clone()],
+                    "sources": [forwarding],
                     "subscriptions": [
                         declared_subscription("direct", "agent:a", &["mail.received"]),
                         declared_subscription("forwarded", "agent:a", &["mail.triaged"]),
