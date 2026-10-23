@@ -71,9 +71,9 @@
   is `null` for a source without a runner, or from a gateway that does not
   report it.
 - `StatusResult.mobAnnouncements` (`MobAnnouncementsStatus`: `sources`,
-  `members`, `openEscalations`, `lastEventCursor`) is `null` in three cases:
-  mob announcements are disabled, their database could not be read, or the
-  gateway does not report it.
+  `members`, `openEscalations`, `lastEventCursor`) is absent when mob
+  announcements are disabled or the gateway does not report it, and `null`
+  when their database could not be read.
 - `ErrorCategory.MOB_ANNOUNCEMENT_ESCALATED` and
   `ErrorCategory.MOB_ANNOUNCEMENT_ESCALATION_RESOLVED`, with their messages.
   The resolution is in `RESOLUTION_ERROR_CATEGORIES`, so

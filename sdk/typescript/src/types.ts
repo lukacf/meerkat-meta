@@ -179,9 +179,9 @@ export interface StatusResult {
   readonly loadedModules: readonly string[];
   readonly storage?: StorageSummary;
   /**
-   * The gateway's mob announcement counts; `null` when mob announcements
-   * are disabled, their store could not be read, or the gateway predates the
-   * object.
+   * The gateway's mob announcement counts: absent when mob announcements are
+   * disabled or the gateway predates the object, and `null` when their store
+   * could not be read.
    */
   readonly mobAnnouncements?: MobAnnouncementsStatus | null;
 }
@@ -194,7 +194,9 @@ export function parseStatusResult(raw: unknown): StatusResult {
     running: Boolean(d.running),
     loadedModules: asStringArray(d.loaded_modules),
     ...(storage !== undefined ? { storage } : {}),
-    mobAnnouncements: parseOptionalMobAnnouncementsStatus(d.mob_announcements),
+    ...(d.mob_announcements !== undefined
+      ? { mobAnnouncements: parseOptionalMobAnnouncementsStatus(d.mob_announcements) }
+      : {}),
   };
 }
 

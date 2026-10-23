@@ -1131,7 +1131,7 @@ describe("MobHandle member, escalation and status reads", () => {
     assert.deepEqual([counts.openEscalations, counts.lastEventCursor], [3, 12]);
     assert.equal((api.parseStatusResult({ ...data, mob_announcements: null }) as any).mobAnnouncements, null);
     const { mob_announcements: _omitted, ...absent } = data;
-    assert.equal((api.parseStatusResult(absent) as any).mobAnnouncements, null);
+    assert.equal("mobAnnouncements" in api.parseStatusResult(absent), false);
   });
 });
 

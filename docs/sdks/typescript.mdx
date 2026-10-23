@@ -392,8 +392,9 @@ lastCursor = page.next;
 
 `StatusResult.mobAnnouncements` (`MobAnnouncementsStatus`: `sources`,
 `members`, `openEscalations`, `lastEventCursor`) reads
-`meta/status.mob_announcements`. It is `null` when mob announcements are
-disabled or their database could not be read. A source's `health` adds
+`meta/status.mob_announcements`. It is absent when mob announcements are
+disabled, and `null` when their database could not be read. A source's
+`health` adds
 `escalations`, `quietMonitoring`, `emptyCoverageMonitoring` and
 `runnerScheduledHere`. Each `AnnouncementEscalation` keeps its `cause` and
 its `subject` (a wire object, with its kind as `subjectKind`) as sent.
