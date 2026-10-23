@@ -184,6 +184,16 @@ def test_doctor_names_the_package_runtime(tmp_path, monkeypatch, capsys):
     assert "[needs setup] Storage maintenance tool" in lines
 
 
+def test_shell_runtime_follows_the_package_release_pin(tmp_path, monkeypatch):
+    module = load_host(monkeypatch, tmp_path)
+    assert [module.public_meta_package({"mobkitVersion": version}) for version in ("0.8.47", "0.9.4", "0.10.0")] \
+        == [False, True, True]
+    # Only a synthetic spec lacks the pin; it keeps the MobKit route it always had.
+    assert module.public_meta_package({}) is False
+    with pytest.raises(ValueError, match="invalid runtime version"):
+        module.public_meta_package({"mobkitVersion": "next"})
+
+
 async def test_meta_smoke_retries_a_saturated_lane_with_meta_errors(shell):
     replies = [RpcError("observation_lane_saturated"), "ready"]
 
