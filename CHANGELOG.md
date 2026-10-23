@@ -741,6 +741,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   trait default materialized the whole resume verdict instead, which a
   persistent service answers `Busy` for a session one of its live actors
   hosts.
+- A mob whose actor fail-stopped no longer reads as running. Its actor keeps
+  the live phase it last published, so the Console reported its runtime
+  running, a member of such a child mob could still be subscribed to
+  announcements, and the extension binding of its id refused the activation
+  that recovers the mob after a restart. These readers now use Meerkat's
+  mob lifecycle observation, which carries the stopped actor's failure.
 
 ### Known limitations
 
