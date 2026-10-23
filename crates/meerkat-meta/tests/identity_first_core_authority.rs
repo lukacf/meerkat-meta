@@ -2812,6 +2812,55 @@ async fn a_retired_raw_member_never_becomes_a_declared_identitys_history() {
     boot.stop().await;
 }
 
+/// Delete reads the identity's previous life as the wake does. After Meta
+/// retired alice, the host made and retired a raw member under her member
+/// id, so Core's last binding of the member id is that raw member's. The
+/// delete finds no life of alice's to end: it answers as for an identity
+/// Core never spawned and leaves Core's last binding as the raw member left
+/// it, rather than distilling that member's session and starting a fresh
+/// life over it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_never_takes_a_retired_raw_members_session_as_the_identitys_life() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state = temp.path().join("state");
+    let mob_id = unique_mob_id("raw-name-delete");
+    let alice = id("personal:alice");
+    let roster = vec![spec("personal:alice")];
+    const TOKEN: &str = "MARKER-RAW-DELETE-8-MIKE";
+
+    let boot = Boot::start(&state, &mob_id, &roster).await;
+    boot.compile(&roster).await;
+    let retired = boot.runtime().retire(&alice).await;
+    assert!(retired.is_ok(), "retire of a live identity: {retired:?}");
+    let raw_session = boot
+        .spawn_core_member(
+            &alice,
+            TOKEN,
+            BTreeMap::from([("team".to_string(), "direct".to_string())]),
+        )
+        .await;
+    boot.retire_core_member(&alice).await;
+    let before = boot.core_last_binding(&alice).await;
+    assert!(
+        !before.live && !before.marked && before.session.as_ref() == Some(&raw_session),
+        "Core's last binding of alice's member id is the retired raw member: {before:?}"
+    );
+
+    let deleted = boot.runtime().delete_identity(&alice).await;
+    assert!(
+        matches!(deleted, Ok(None)),
+        "a delete whose last binding is a raw member's acts as for an identity Core never \
+         spawned: {deleted:?}"
+    );
+    assert_eq!(
+        boot.core_last_binding(&alice).await,
+        before,
+        "the delete starts no fresh life over the raw member's binding"
+    );
+    boot.assert_continuity_and_leases_unread();
+    boot.stop().await;
+}
+
 /// A host-adopted identity is Core's to drive. The roster compile never
 /// respawns it, even when its member carries no durable-identity marker and
 /// the roster lists it: the compile reports the typed host-adopted conflict
