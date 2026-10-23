@@ -424,7 +424,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   stopped product owner." (or "Preparation cannot substitute a Supervisor
   from another installation."): the staged update counted as a change to the
   installed application, though it changes nothing until it is applied. The
-  update stays staged; to apply it after the setup, stage it again.
+  update stays staged; to apply it after the setup, stage it again. "Apply
+  and verify update" now says so for such an update, instead of asking you
+  to reconcile the Fresh bootstrap attempt of a setup that completed.
 - After Forge restarts, a retried Install of a Meta Toolkit product
   application no longer ends with "Trusted setup inputs were not retained".
   The application's setup owner lived only in the Forge process that built

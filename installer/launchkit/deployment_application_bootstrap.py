@@ -765,6 +765,8 @@ def require_bootstrap_history_settled(directory, bootstrap_selection=None):
 
 SETUP_RESTORE_CHANGED = ("The application's completed setup changed after this update was staged. Keep "
     "its files and update history, and stage the accepted update again.")
+UPDATE_STAGED_BEFORE_SETUP = ("This update was staged before the application's first setup. Its installed "
+    "application is unchanged. Stage the accepted update again, then apply it.")
 
 
 def require_update_bootstrap_history(directory, restore_selection, *, in_flight=None):

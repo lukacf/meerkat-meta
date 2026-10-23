@@ -643,6 +643,54 @@ async def test_update_staged_before_the_first_setup_keeps_that_setup_available(l
     assert (receipt["update"]["update_id"], receipt["update"]["status"]) == (update["update_id"], "staged")
 
 
+@pytest.mark.parametrize("with_request", [False, True], ids=["no-action-request", "action-request"])
+async def test_apply_after_the_first_setup_asks_to_stage_an_update_staged_before_it_again(local_restore,
+        monkeypatch, with_request):
+    """Stage before the first setup, then finish that setup and Stop normally.
+
+    Stage recorded no completed Restore, so Apply refuses with stage-again
+    guidance before anything changes, not with the Fresh refusal's reconcile
+    guidance. The next Stage records the owner's completed Restore.
+    """
+    f = local_restore
+    candidate, report = candidate_update(f)
+    update = updates.stage(f.directory, packed(candidate), report)["update"]
+    assert update["status"] == "staged" and "setup_restore_sha256" not in update
+    await completed_setup(f, monkeypatch)
+    accept_candidate(f, monkeypatch, report)
+    keys = ("status", "build_id", "package_sha256", "update", "update_action")
+    before = deployment.read_receipt(f.directory)
+    assert before["update"]["update_id"] == update["update_id"]
+    f.service.launched.clear()
+    options = {"action_request_id": str(uuid4())} if with_request else {}
+    with pytest.raises(DraftConflict) as refused:
+        await f.service.action(f.guide_id, f.directory.name, "apply-update", update["update_id"], **options)
+    assert str(refused.value) == bootstrap.UPDATE_STAGED_BEFORE_SETUP
+    assert not f.service.launched
+    after = deployment.read_receipt(f.directory)
+    assert {key: after.get(key) for key in keys} == {key: before.get(key) for key in keys}
+    restaged = updates.stage(f.directory, packed(candidate), report, restore_selection=owner_restore(f))["update"]
+    assert restaged["status"] == "staged" and restaged["setup_restore_sha256"] == f.owner._restore_pin.pin()["sha256"]
+
+
+async def test_apply_of_an_update_staged_before_an_unfinished_first_setup_keeps_the_fresh_refusal(local_restore,
+        monkeypatch):
+    """Fresh entered without a completed Restore: Apply keeps the Fresh refusal."""
+    f = local_restore
+    candidate, report = candidate_update(f)
+    update = updates.stage(f.directory, packed(candidate), report)["update"]
+    await finalize_original(f, monkeypatch)
+    assert f.service._setup_update_restore(f.guide_id, f.directory.name) is None
+    accept_candidate(f, monkeypatch, report)
+    f.service.launched.clear()
+    with pytest.raises(CustodyError) as refused:
+        await f.service.action(f.guide_id, f.directory.name, "apply-update", update["update_id"],
+            action_request_id=str(uuid4()))
+    assert str(refused.value) == bootstrap.FRESH_RETAINED
+    assert not f.service.launched
+    assert deployment.read_receipt(f.directory)["update"]["status"] == "staged"
+
+
 async def test_ordinary_update_keeps_its_doctor_check_and_worker_start(tmp_path):
     _, directory, _, previous, _, identity = await staged(tmp_path)
     calls = []
