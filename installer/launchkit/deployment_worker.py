@@ -39,6 +39,10 @@ STOP_TIMEOUT = APPLICATION_STOP_TIMEOUT
 MAX_LOG_BYTES = 64 * 1024
 MAX_READY_BYTES = 2 * 1024 * 1024
 MAX_PRIVATE_COMMAND_BYTES = 1024 * 1024
+# A sanity bound on an installed gateway before its receipt hash, which reads
+# the file in 1 MiB chunks. The installer already checked the release bytes
+# against their published checksum; Meta's rpc_gateway is 471 MiB at 0.9.4.
+MAX_NATIVE_BINARY_BYTES = 1024 * 1024 * 1024
 # Two bounded SDK source/cache files encoded as base64, plus their JSON/path
 # overhead. This stdin is never rendered or retained in the public log buffer.
 MAX_PRIVATE_COMMAND_INPUT_BYTES = 2 * ((32 * 1024 * 1024 + 2) // 3 * 4) + 64 * 1024
@@ -867,7 +871,7 @@ class Supervisor:
         override = read_settings(self.destination).get("MOBKIT_RPC_GATEWAY_BIN")
         if override and Path(override).resolve() != binary.resolve():
             raise RuntimeError("Native definition observation cannot use a gateway outside this installation's verified artifact receipt.")
-        for path, limit in ((binary, 512 * 1024 * 1024), (receipt, 1024 * 1024)):
+        for path, limit in ((binary, MAX_NATIVE_BINARY_BYTES), (receipt, 1024 * 1024)):
             info = path.lstat()
             if (path.is_symlink() or any(parent.is_symlink() for parent in path.parents)
                     or not path.is_file() or info.st_uid != os.getuid() or info.st_nlink != 1
