@@ -49,6 +49,8 @@ pub mod tools;
 pub mod types;
 
 #[cfg(test)]
+mod escalations_tests;
+#[cfg(test)]
 mod remote_tests;
 #[cfg(test)]
 mod tests;
@@ -351,6 +353,7 @@ impl AnnouncementComposition {
             .member_tools_in_child_mobs
             .then(|| Arc::clone(&local));
         let native = AnnouncementNativeDelivery::new(local, remote);
+        let member_limits = config.member_limits;
         let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config)
             .map_err(|error| error.to_string())?;
         if !runtime.attach_mob_announcements(service.clone()) {
@@ -367,7 +370,7 @@ impl AnnouncementComposition {
             .set(tools::ToolBackend {
                 service: service.clone(),
                 callers: Arc::new(callers),
-                limits: config.member_limits,
+                limits: member_limits,
             })
             .is_ok();
         if !bound {

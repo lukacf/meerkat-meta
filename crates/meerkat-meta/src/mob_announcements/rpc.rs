@@ -63,6 +63,24 @@ pub const ANNOUNCEMENT_METHODS: &[&str] = &[
     "meta/mob_announcements/audit/list",
 ];
 
+/// The feature capability a gateway with announcement sources advertises.
+pub const SOURCES_FEATURE_CAPABILITY: &str = "mob_announcements.sources.v1";
+
+/// The feature capabilities a gateway with mob announcements advertises.
+pub fn announcement_feature_capabilities() -> Vec<&'static str> {
+    Vec::new()
+}
+
+/// meta/status's `mob_announcements` object.
+pub async fn status_projection(_service: &AnnouncementService) -> Value {
+    Value::Null
+}
+
+/// meta/capabilities's `mob_announcements` object; null when disabled.
+pub async fn capabilities_projection(_service: Option<&AnnouncementService>) -> Value {
+    Value::Null
+}
+
 pub fn is_announcement_method(method: &str) -> bool {
     ANNOUNCEMENT_METHODS.contains(&method)
 }

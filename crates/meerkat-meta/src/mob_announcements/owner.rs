@@ -86,8 +86,12 @@ const RESTART_PAUSE_MAX: Duration = Duration::from_mins(1);
 /// batches and this many receipts; passes repeat while one stops at a limit.
 const PRUNE_LIMIT: usize = 1_000;
 
+/// Where escalation events reach the host: the gateway's `meta/on_error`
+/// hook.
+pub type ErrorSink = Arc<dyn Fn(crate::unified_runtime::ErrorEvent) + Send + Sync>;
+
 /// Configurable announcement policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnnouncementConfig {
     pub policy: SealingPolicy,
     pub retention_ms: u64,
@@ -117,6 +121,11 @@ pub struct AnnouncementConfig {
     /// that names it is refused, and a member a lowered ceiling no longer
     /// covers is built without it.
     pub member_tools_in_child_mobs: bool,
+    /// How long an open escalation waits before it is notified again.
+    pub renotify_after_ms: u64,
+    /// Who agents among a mob's members receive member escalations on the
+    /// health topic; empty, the default, leaves them to the host.
+    pub health_audience: Vec<super::sources::AudienceGrant>,
 }
 
 impl AnnouncementConfig {
@@ -159,6 +168,8 @@ impl Default for AnnouncementConfig {
             peer_request_window_ms: crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS,
             child_limits: ChildMemberLimits::default(),
             member_tools_in_child_mobs: false,
+            renotify_after_ms: 0,
+            health_audience: Vec::new(),
         }
     }
 }
@@ -597,6 +608,9 @@ impl AnnouncementService {
     pub fn config(&self) -> &AnnouncementConfig {
         &self.inner.config
     }
+
+    /// Send every escalation event to `sink` as it is written.
+    pub fn set_error_sink(&self, _sink: ErrorSink) {}
 
     /// Why the member's deliveries wait now, if they do: the latest
     /// classified outcome of an attempt for it.
@@ -1536,7 +1550,7 @@ impl AnnouncementService {
         let mut guard = self.inner.round.lock().await;
         let walk = &mut *guard;
         let now = self.now();
-        let config = self.inner.config;
+        let config = &self.inner.config;
         let mut report = RoundReport::default();
         // No next look is ever written further ahead than the slowest settle
         // pause, and no report is in the future; one that is predates a step

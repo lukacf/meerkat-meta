@@ -16506,6 +16506,7 @@ external_addressable = true
     // member's batch may expire.
     let announcements = gateway_options
         .mob_announcements
+        .clone()
         .map(|config| {
             crate::mob_announcements::AnnouncementComposition::new(config).map(|composition| {
                 composition.with_peer_request_window(gateway_options.control_request_window_ms)
