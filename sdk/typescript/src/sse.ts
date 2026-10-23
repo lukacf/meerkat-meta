@@ -101,14 +101,8 @@ export async function* parseSseStream(
   // line is still dropped.
   decodeUtf8(decoder);
 
-  // Flush any remaining event if the stream ended without a trailing blank line.
-  if (currentData.length > 0) {
-    yield {
-      id: currentId,
-      event: currentEvent,
-      data: currentData.join("\n"),
-    };
-  }
+  // The SSE spec discards pending data at the end of the stream: an event
+  // without its closing blank line is never dispatched.
 }
 
 /**

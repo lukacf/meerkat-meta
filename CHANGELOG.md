@@ -472,6 +472,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a stream that ends inside a character, now raise the SDK's
   `TransportError` (caused by the decode error) instead of being replaced
   with U+FFFD.
+- The TypeScript SDK's SSE reader (`parseSseStream`) no longer dispatches a
+  final event whose closing blank line never arrived before the stream
+  ended. The SSE specification discards that pending data, and the Python
+  reader already did.
 
 ### Known limitations
 
