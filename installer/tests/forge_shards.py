@@ -92,8 +92,10 @@ def record(junit_files, path=SECONDS):
     seconds = {}
     for junit in junit_files:
         for case in ElementTree.parse(junit).iter("testcase"):
-            name = case.get("classname", "").rpartition(".")[2] + ".py"
-            if name.startswith("test_"):
+            # tests.test_file, or tests.test_file.TestClass for a class's case.
+            module = next((part for part in case.get("classname", "").split(".") if part.startswith("test_")), None)
+            if module is not None:
+                name = module + ".py"
                 seconds[name] = seconds.get(name, 0.0) + float(case.get("time") or 0)
     path.write_text(json.dumps({name: round(value, 1) for name, value in sorted(seconds.items())}, indent=1) + "\n")
 

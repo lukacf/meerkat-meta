@@ -508,9 +508,10 @@ class WorkflowShapeTests(unittest.TestCase):
                          '<testcase classname="tests.test_a" name="one" time="1.25"/>'
                          '<testcase classname="tests.test_a" name="two" time="2"/>'
                          '<testcase classname="tests.test_b" name="one" time="0.5"/>'
+                         '<testcase classname="tests.test_b.ContractTests" name="two" time="1"/>'
                          '</testsuite></testsuites>')
         shards.record([junit], folder / "seconds.json")
-        self.assertEqual(json.loads((folder / "seconds.json").read_text()), {"test_a.py": 3.2, "test_b.py": 0.5})
+        self.assertEqual(json.loads((folder / "seconds.json").read_text()), {"test_a.py": 3.2, "test_b.py": 1.5})
         committed = shards.recorded_seconds()
         self.assertGreater(len(committed), 100)
         self.assertTrue(all(re.fullmatch(r"test_[A-Za-z0-9_]+\.py", name) for name in committed))
