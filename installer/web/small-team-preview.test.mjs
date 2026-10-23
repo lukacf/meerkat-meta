@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createSimulation} from './simulation-state.mjs';
-import {createSimulationScene,simulationViewport} from './simulation-scene.mjs';
+import {createSimulationScene,simulationViewport,smallTeamPreview,SMALL_TEAM_LIMIT} from './simulation-scene.mjs';
 import {composeTopology} from './topology-layout.mjs';
 import {applyVisualizationLayout} from './visualization-code.mjs';
 import {build} from 'esbuild';
@@ -95,5 +95,22 @@ test('the stage, layout, projection and renderer agree on which previews are a s
     }
   }finally{
     if(previous)Object.defineProperty(globalThis,'matchMedia',previous);else delete globalThis.matchMedia;
+  }
+});
+
+test('one small-team rule: one to eight agents outside a selected native flow',()=>{
+  assert.equal(SMALL_TEAM_LIMIT,8);
+  for(const [count,small] of [[0,false],[1,true],[8,true],[9,false],[-1,false],[2.5,false],[NaN,false],[undefined,false],['3',false]]){
+    assert.equal(smallTeamPreview(count,null),small,String(count));
+    assert.equal(smallTeamPreview(count,'review'),false,`${count} in a flow`);
+  }
+});
+
+test('the layout keeps its small-team rule inside its own source for the author sandbox',()=>{
+  // The sandbox runs composeTopology from its source text alone, so it cannot import the shared rule.
+  const isolated=new Function(`return ${composeTopology.toString()}`)();
+  for(const count of [0,1,8,9]){
+    const model=createSimulation(plan(count));
+    assert.deepEqual(isolated(model),composeTopology(model),String(count));
   }
 });

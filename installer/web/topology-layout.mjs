@@ -69,7 +69,9 @@ export function composeTopology(model, options = {}) {
 
   if (entry) put(entry, 520, large ? 165 : 142, "right");
 
-  const smallTeam = agents.length <= 8 && !model?.selectedFlowId;
+  // The rule of smallTeamPreview in simulation-scene.mjs, written out here because
+  // this function's source runs alone in the author's sandbox.
+  const smallTeam = agents.length > 0 && agents.length <= 8 && !model?.selectedFlowId;
   if (smallTeam) {
     // A handful of collaborators needs one coherent focal area, not empty lanes.
     const collaborators = agents.filter(node => node.id !== entry?.id);

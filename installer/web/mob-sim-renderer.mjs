@@ -1,6 +1,6 @@
 /* Adapt the detailed reference renderer to the proposal's semantic layers. */
 import { Net, COL, rgba, SANS } from './network-renderer.mjs';
-import { simulationViewport } from './simulation-scene.mjs';
+import { simulationViewport, smallTeamPreview } from './simulation-scene.mjs';
 import { createRelationshipProjection } from './mob-sim-relationships.mjs';
 
 export class MobSim extends Net {
@@ -14,7 +14,7 @@ export class MobSim extends Net {
     this.source = source;
     const relationships = createRelationshipProjection(source), simulation = this;
     super.setScene((width, height) => {
-      const smallTeam = source.population?.count <= 8 && !source.selectedFlowId;
+      const smallTeam = smallTeamPreview(source.population?.count, source.selectedFlowId);
       const {sc,sx,sy,ox,oy} = simulationViewport(source,width,height);
       this.transform = {sc,sx,sy,ox,oy};
       const point=p=>({x:p.x*sx+ox,y:p.y*sy+oy});
