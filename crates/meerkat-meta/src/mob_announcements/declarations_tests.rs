@@ -203,9 +203,9 @@ async fn a_role_template_captures_for_a_member_spawned_after_it() {
 }
 
 /// A member that loses the role stops capturing at once and keeps what it
-/// already owes: its child stays active while it owes, capturing nothing,
-/// and the first reconcile after what it owed is delivered cancels it. A
-/// member given the role again captures again, under the same child.
+/// already owes, which is delivered: its child stays active, capturing
+/// nothing, and leaving the role never cancels it. A member given the role
+/// again captures again, under the same child.
 #[tokio::test]
 async fn a_member_that_leaves_the_role_stops_capturing() {
     let harness = harness_with(native_serving(&["agent:b"]));
@@ -234,13 +234,8 @@ async fn a_member_that_leaves_the_role_stops_capturing() {
         "the second announcement is not captured; the first is still owed"
     );
     service.reconcile_mobs().await.unwrap();
-    assert_eq!(
-        subscription_state(service, &child).await.as_deref(),
-        Some("active"),
-        "a child that still owes is not cancelled"
-    );
     assert_eq!(owed(&harness).await.get("agent:b"), Some(&1));
-    // What it owes is delivered; the next reconcile cancels it.
+    // What it owes is delivered.
     harness.clock.store(10_000_000, Ordering::SeqCst);
     service.run_round().await.unwrap();
     let delivered = service
@@ -261,16 +256,26 @@ async fn a_member_that_leaves_the_role_stops_capturing() {
     service.reconcile_mobs().await.unwrap();
     assert_eq!(
         subscription_state(service, &child).await.as_deref(),
-        Some("cancelled")
+        Some("active"),
+        "leaving the role never cancels the child"
     );
-    assert!(role_children(&declared(service).await, "reviewers").is_empty());
+    let children = role_children(&declared(service).await, "reviewers");
+    assert_eq!(children.len(), 1, "{children:?}");
+    assert_eq!(children[0]["status"], "left", "{children:?}");
+    host_announces(service, "deploy-3", &["deploy.done"]).await;
+    assert_eq!(
+        owed(&harness).await.get("agent:b"),
+        None,
+        "a member without the role captures nothing"
+    );
     // The member is respawned with the role again.
     harness.native.set_roster_facts("agent:b", "reviewer", &[]);
-    host_announces(service, "deploy-3", &["deploy.done"]).await;
+    host_announces(service, "deploy-4", &["deploy.done"]).await;
     assert_eq!(owed(&harness).await.get("agent:b"), Some(&1));
     let children = role_children(&declared(service).await, "reviewers");
     assert_eq!(children.len(), 1, "{children:?}");
     assert_eq!(children[0]["id"], child.as_str());
+    assert_eq!(children[0]["status"], "applied", "{children:?}");
     assert_eq!(
         subscription_state(service, &child).await.as_deref(),
         Some("active")
