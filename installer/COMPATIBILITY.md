@@ -35,6 +35,19 @@ does not backfill the field or make them current for a different organization.
 Changing or removing the saved organization context makes a previously bound
 installation differ from the current guide; it does not alter that installation.
 
+Updates and source rollback copy the organization fingerprint from the selected
+package's report, or remove the receipt field when that report has none. Recovery
+to the accepted candidate uses the candidate's report; rollback uses the previous
+package's report. Native teams do not have an application update path.
+
+An older Forge does not maintain this field when updating an application.
+Downgrading Forge, updating an application to a different organization or to no
+organization, then upgrading Forge can therefore leave a stale fingerprint in
+the receipt. The newer reader refuses the mismatch. Reinstall the application
+after that downgrade-update-upgrade cycle; do not edit the receipt to bypass
+source verification. This rule does not backfill older receipts or automatically
+alter any retained installation.
+
 ## Inspected readers
 
 This is the source inventory inspected for the organization change on

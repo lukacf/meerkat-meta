@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   See [native package compatibility](installer/COMPATIBILITY.md) for the full
   inspected reader inventory and exact source identities; the Forge 0.2.0
   version string alone does not identify protocol support.
+  Refusing readers also include retained source `3f91e487`, release source
+  `9d61a72ff`, and both frozen `runtime_history_v1_candidate` and
+  `runtime_history_v2` source fixtures. After a downgrade-update-upgrade cycle,
+  an older Forge can leave a stale organization binding in an application
+  receipt. The newer reader refuses that receipt; reinstall the application.
 - `GatewayHostError` is `#[non_exhaustive]` and has a new unit variant,
   `AgentCustomizerRequired`. A host whose members need an agent customizer
   answers it when `GatewayHostComposition::compose_agent_customizer` is

@@ -2636,6 +2636,11 @@ def _publish_source_receipt(directory, files, update, *, project_lease=None, exp
             require_update_installation(receipt, expected_installation)
         receipt = _source_receipt_candidate(directory, receipt, files, update, project_lease=project_lease)
         receipt.update(changes, updated_at=now())
+        report = json.loads(files["implementation-report.json"][0])
+        if "organization_hash" in report:
+            receipt["organization_hash"] = report["organization_hash"]
+        else:
+            receipt.pop("organization_hash", None)
         project_lease.require_current()
         if require_owner_current is not None:
             require_owner_current()
