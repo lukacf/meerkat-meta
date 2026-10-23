@@ -52,6 +52,10 @@ VERSION = "0.2.0"
 TAG = "forge-v0.2.0"
 RUN, ATTEMPT, CI_RUN, FORGE_RUN = 501, 1, 77, 610
 JOBS = ("resolve", "build_package", "require_ci_green", "collect", "publish")
+# forge.yml's pull_request paths that a release does not bind: the repository's
+# root README and license files. No Forge test or package build reads them; the
+# installer ships and tests its own copies under installer/.
+FORGE_PATHS_NOT_BOUND = ("README.md", "LICENSE-MIT", "LICENSE-APACHE")
 
 
 def text(path=WORKFLOW):
@@ -441,6 +445,26 @@ class WorkflowShapeTests(unittest.TestCase):
             self.assertEqual(steps["Record the toolchain"]["run"],
                              "printf '{\"python\": \"%s\", \"node\": \"%s\"}\\n' \"$(python3 --version 2>&1)\" "
                              "\"$(node --version)\" > forge-toolchain.json\n")
+
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
+    def test_forge_pull_request_paths_and_the_release_binding_agree(self):
+        """A path forge.yml's filters select starts Forge's suite on a pull
+        request, and a release binds a run that tested the same inputs. Each
+        path is an evidence tree, an evidence file or a root file named as
+        unbound, and each evidence tree and file is a path the filters
+        select."""
+        import yaml
+
+        workflow = yaml.safe_load(text(FORGE_CI))
+        paths = workflow.get("on", workflow.get(True))["pull_request"]["paths"]
+        trees = {path[:-3] for path in paths if path.endswith("/**")}
+        unbound = [path for path in paths if not (path.endswith("/**") and path[:-3] in forge.EVIDENCE_TREES)
+                   and path not in forge.EVIDENCE_FILES and path not in FORGE_PATHS_NOT_BOUND]
+        self.assertEqual(unbound, [])
+        self.assertLessEqual(set(forge.EVIDENCE_TREES), trees)
+        unselected = [path for path in forge.EVIDENCE_FILES
+                      if path not in paths and not any(path.startswith(f"{tree}/") for tree in trees)]
+        self.assertEqual(unselected, [])
 
     def test_the_guide_says_a_partial_rerun_is_not_evidence(self):
         guide = (ROOT / "installer/RELEASING.md").read_text()
