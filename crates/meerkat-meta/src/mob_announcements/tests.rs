@@ -2338,6 +2338,8 @@ struct ScriptedNative {
     /// What each member's roster records: its role and its labels. A member
     /// missing here has no roster facts.
     roster_facts: Mutex<BTreeMap<String, RosterRow>>,
+    /// Members whose roster facts cannot be read now.
+    unreadable_facts: Mutex<BTreeSet<String>>,
 }
 
 /// A member's role and labels, as a scripted roster records them.
@@ -2367,6 +2369,7 @@ impl ScriptedNative {
             mob_events: Mutex::new(BTreeMap::new()),
             log_reads: Mutex::new(Vec::new()),
             roster_facts: Mutex::new(BTreeMap::new()),
+            unreadable_facts: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -2473,6 +2476,14 @@ impl NativeDelivery for ScriptedNative {
     ) -> std::result::Result<Option<super::sources::MemberFacts>, NativeUnavailable> {
         if member.mob_id != mob(OWN_MOB) {
             return Ok(None);
+        }
+        if self
+            .unreadable_facts
+            .lock()
+            .unwrap()
+            .contains(member.identity.as_str())
+        {
+            return Err(NativeUnavailable("the roster cannot be read now".into()));
         }
         Ok(self
             .roster_facts
@@ -14588,7 +14599,7 @@ async fn regained_coverage_releases_held_items_only_after_a_fresh_check() {
     service.run_round().await.unwrap();
     assert!(
         batches_of_b(service).await.is_empty(),
-        "a held item is no backlog of its own"
+        "not before its next check: no new item, and the recheck bound not reached"
     );
     assert!(
         entries_for(service, agent_b(), "items_released")
@@ -14863,4 +14874,368 @@ async fn a_batch_admitted_after_a_revocation_is_audited_as_delivered_across_it()
         serde_json::json!("audience_not_covered")
     );
     assert_eq!(across[0]["count"], serde_json::json!(1));
+}
+
+/// The bound on a held-only member's fresh check: a hold is checked again
+/// at least this often while its member has nothing else to seal.
+const HOLD_RECHECK_BOUND_MS: u64 = 300_000;
+
+/// A held item whose member passes again is released within the bound even
+/// when nothing new arrives for the member.
+#[tokio::test]
+async fn regained_coverage_without_new_traffic_releases_held_items_within_the_bound() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    b_owes_an_inbox_item(service).await;
+    inbox_audience(
+        service,
+        "narrow",
+        1,
+        serde_json::json!([member_grant("agent:a")]),
+    )
+    .await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert!(batches_of_b(service).await.is_empty(), "held at the seal");
+    inbox_audience(
+        service,
+        "widen",
+        2,
+        serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]),
+    )
+    .await;
+    harness
+        .clock
+        .store(100_000 + HOLD_RECHECK_BOUND_MS + 1, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let batches = batches_of_b(service).await;
+    assert_eq!(batches.len(), 1, "released and sealed: {batches:?}");
+    assert_eq!(batches[0].items.len(), 1);
+    let released = entries_for(service, agent_b(), "items_released").await;
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert_eq!(released[0]["count"], serde_json::json!(1));
+}
+
+/// A hold that passes again is released even behind more holds than one
+/// seal checks: an earlier generation's hold, which never releases, does
+/// not stand in front of it.
+#[tokio::test]
+async fn a_regained_hold_is_released_behind_more_holds_than_one_seal_checks() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    let both = serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]);
+    let only_a = serde_json::json!([member_grant("agent:a")]);
+    // m-1, held under generation 1.
+    b_owes_an_inbox_item(service).await;
+    inbox_audience(service, "narrow", 1, only_a.clone()).await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    // Generation 2 covers b again, and b captures m-2 there.
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        with(
+            with(
+                inbox_with(
+                    "renew",
+                    both.clone(),
+                    serde_json::json!([{ "kind": "direct" }]),
+                ),
+                "expected_revision",
+                serde_json::json!(2),
+            ),
+            "new_generation",
+            serde_json::json!(true),
+        ),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with(
+            advance_params("baseline-g2", 3, 0, "c1"),
+            "coverage",
+            serde_json::json!("complete"),
+        ),
+    )
+    .await
+    .unwrap();
+    let advanced = try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:g2:v1", 3, 1, "c2"),
+            &[upsert("m-2", "v1", "second")],
+        ),
+    )
+    .await
+    .unwrap();
+    let second = advanced["items"][0]["sequence"].as_u64().unwrap();
+    // m-2 is held under generation 2.
+    inbox_audience(service, "narrow-g2", 3, only_a).await;
+    harness.clock.store(200_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert!(batches_of_b(service).await.is_empty(), "both held");
+    // b passes again: a seal that checks one hold releases m-2.
+    inbox_audience(service, "widen-g2", 4, both).await;
+    let one = SealingPolicy {
+        max_count: 1,
+        max_bytes: 1_048_576,
+        max_delay_ms: 60_000,
+        min_wake_interval_ms: 60_000,
+    };
+    let sealed = harness
+        .store
+        .seal_batch(&member("agent:b"), &batch_id("b-one"), &one, 10_000_000)
+        .await
+        .unwrap()
+        .expect("m-2 is released and sealed");
+    assert_eq!(sealed.items.len(), 1);
+    assert_eq!(sealed.items[0].sequence, second);
+}
+
+/// Held items past retention beyond one expiry pass still get no gap line:
+/// they wait for the next pass, which counts them expired_while_held.
+#[tokio::test]
+async fn held_items_past_retention_beyond_one_expiry_pass_get_no_gap_line() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    b_owes_an_inbox_item(service).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v2", 1, 2, "c3"),
+            &[upsert("m-2", "v1", "second")],
+        ),
+    )
+    .await
+    .unwrap();
+    inbox_audience(
+        service,
+        "narrow",
+        1,
+        serde_json::json!([member_grant("agent:a")]),
+    )
+    .await;
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert_eq!(
+        entries_for(service, agent_b(), "items_held").await[0]["count"],
+        serde_json::json!(2),
+        "both held"
+    );
+    let (retention_ms, _) = retention_and_quiet();
+    let later = 1_000 + retention_ms + 1;
+    for _ in 0..2 {
+        harness
+            .store
+            .expire(later, retention_ms, 0, 1)
+            .await
+            .unwrap();
+    }
+    let expired = entries_for(service, agent_b(), "expired_while_held").await;
+    assert_eq!(expired.len(), 1, "{expired:?}");
+    assert_eq!(expired[0]["count"], serde_json::json!(2), "{expired:?}");
+    inbox_audience(
+        service,
+        "widen",
+        2,
+        serde_json::json!([member_grant("agent:a"), member_grant("agent:b")]),
+    )
+    .await;
+    harness.clock.store(later, Ordering::SeqCst);
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v3", 3, 3, "c4"),
+            &[upsert("m-3", "v1", "third")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(later + 100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let batches = batches_of_b(service).await;
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    assert_eq!(batches[0].items.len(), 1);
+    assert!(batches[0].gaps.is_empty(), "{:?}", batches[0].gaps);
+}
+
+/// On a peer route an earlier request may still commit until the quiet
+/// window after it: a batch that fails its last check inside that window is
+/// neither submitted again nor cancelled. Past the window its outcome is
+/// read first, so a late commit settles as delivered and is counted, and no
+/// second batch carries its item.
+#[tokio::test]
+async fn a_peer_batch_failing_its_last_check_inside_the_quiet_window_is_neither_resubmitted_nor_cancelled()
+ {
+    let native = ScriptedNative::new();
+    native.ledger.lock().unwrap().refuse =
+        Some((SuspendCause::MemberNotLive, EvidenceClass::Local));
+    let harness = harness_with(native);
+    let service = &harness.service;
+    let peer = peer_member("agent:p", "mob-b");
+    let peer_grant = serde_json::json!({
+        "kind": "member",
+        "member": { "mob_id": "mob-b", "identity": "agent:p" },
+    });
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            serde_json::json!([member_grant("agent:a"), peer_grant]),
+            serde_json::json!([{ "kind": "direct" }]),
+        ),
+    )
+    .await
+    .unwrap();
+    service
+        .put_subscription(
+            &op("p-direct"),
+            put_for("p-direct", peer.clone(), &["mail.received"]),
+        )
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let query = BatchQuery {
+        member: Some(peer.clone()),
+        limit: 10,
+        ..BatchQuery::default()
+    };
+    let batch = service.deliveries(&query).await.unwrap().remove(0);
+    assert_eq!(
+        batch.state.tag(),
+        BatchStateTag::Sealed,
+        "owed again: {batch:?}"
+    );
+    let submits = harness.native.submits();
+    assert!(submits >= 1);
+
+    // The peer stops passing while that request may still land.
+    inbox_audience(
+        service,
+        "narrow",
+        1,
+        serde_json::json!([member_grant("agent:a")]),
+    )
+    .await;
+    harness.native.ledger.lock().unwrap().refuse = None;
+    harness
+        .clock
+        .store(batch.updated_at_ms + 1_000, Ordering::SeqCst);
+    service.reconcile_delivery(&batch.id).await.unwrap();
+    let inside = service.deliveries(&query).await.unwrap().remove(0);
+    assert_eq!(
+        inside.state.tag(),
+        BatchStateTag::Sealed,
+        "not cancelled inside the window"
+    );
+    assert_eq!(harness.native.submits(), submits, "not submitted again");
+
+    // The earlier request did land, and was admitted.
+    let exact = serde_json::to_string(&continuation_for(&batch).unwrap()).unwrap();
+    let receipt = NativeReceipt {
+        delivery_id: format!("continuation:{}", batch.id),
+        address: "rt:member:test:agent:1".into(),
+        submission_digest: format!("digest:{}", batch.id),
+        committed_at_ms: batch.updated_at_ms,
+    };
+    harness
+        .native
+        .ledger
+        .lock()
+        .unwrap()
+        .bindings
+        .insert(batch.id.to_string(), (exact, receipt, true));
+    let (_, quiet) = retention_and_quiet();
+    harness
+        .clock
+        .store(batch.updated_at_ms + quiet + 1_000, Ordering::SeqCst);
+    service.reconcile_delivery(&batch.id).await.unwrap();
+    let after = service.deliveries(&query).await.unwrap();
+    assert_eq!(after.len(), 1, "no second batch: {after:?}");
+    assert_eq!(after[0].state.tag(), BatchStateTag::Delivered);
+    assert_eq!(harness.native.submits(), submits);
+    let p = serde_json::json!({ "mob_id": "mob-b", "identity": "agent:p" });
+    let across = entries_for(service, p, "delivered_across_revocation").await;
+    assert_eq!(across.len(), 1, "{across:?}");
+}
+
+/// A roster that cannot be read now defers the decision: the member's items
+/// are neither held nor sealed until a read answers, and then they go as
+/// their coverage says.
+#[tokio::test]
+async fn a_roster_read_error_defers_instead_of_holding() {
+    let native = native_serving(&["agent:b"]);
+    native.set_roster_facts("agent:b", "analyst", &[]);
+    let harness = harness_with(native);
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        inbox_with(
+            "put",
+            serde_json::json!([
+                member_grant("agent:a"),
+                { "kind": "role", "mob_id": OWN_MOB, "role": "analyst" }
+            ]),
+            serde_json::json!([{ "kind": "direct" }]),
+        ),
+    )
+    .await
+    .unwrap();
+    try_subscribe(service, "b-direct", "agent:b", &["mail.received"])
+        .await
+        .unwrap();
+    baseline_inbox(service, 1).await;
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("inbox:v1", 1, 1, "c2"),
+            &[upsert("m-1", "v1", "first")],
+        ),
+    )
+    .await
+    .unwrap();
+    harness
+        .native
+        .unreadable_facts
+        .lock()
+        .unwrap()
+        .insert("agent:b".to_string());
+    harness.clock.store(100_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert!(batches_of_b(service).await.is_empty(), "deferred");
+    assert!(
+        entries_for(service, agent_b(), "items_held")
+            .await
+            .is_empty(),
+        "nothing is held on an unreadable roster"
+    );
+    harness.native.unreadable_facts.lock().unwrap().clear();
+    harness.clock.store(200_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    let batches = batches_of_b(service).await;
+    assert_eq!(
+        batches.len(),
+        1,
+        "sealed once the roster reads: {batches:?}"
+    );
 }
