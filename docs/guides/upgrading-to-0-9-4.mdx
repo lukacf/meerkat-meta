@@ -308,10 +308,11 @@ remedies:
   identity through a roster compile that is not held.
 
 The `IdentityNameHeldByRawMember` check runs at the roster compile and at
-the wake. Retire, respawn, reset and delete of a registered identity act on
-Core's live member under its member id without it, so do not spawn a member of your own under a
-registered identity's member id: if the host does, after Meta retired the
-identity, those verbs act on the host's member as the identity's.
+the wake. Retire, respawn and reset of a registered identity act on Core's
+live member under its member id without that check, so do not spawn a member
+of your own under a registered identity's member id: if the host does, after
+Meta retired the identity, those verbs act on the host's member as the
+identity's.
 
 ## Embedded builder apps
 
