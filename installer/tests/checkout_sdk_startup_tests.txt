@@ -49,6 +49,7 @@ test_meta_toolkit_preserved_refresh.py
 test_meta_toolkit_product_startup.py
 test_meta_toolkit_worker_update.py
 test_ordinary_application_registry.py
+test_ordinary_application_update.py
 test_ordinary_meta_bootstrap.py
 test_product_background_action.py
 test_product_installed_bootstrap.py
