@@ -519,6 +519,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Call it only when the credential is gone, never when a login attempt, its
   callback or a transport is disposed of, and pass the realm-scoped identity
   the members' connections report (`mcp_target_in_service_realm`).
+- `meta/run_flow` takes `role_targets`, which binds every role the flow's
+  steps use to existing members of the mob, for example
+  `{"reviewer": ["rev-a1", "rev-a2"]}`, so several runs can share one mob
+  and one role while each dispatches only to its own members. Meerkat's mob
+  actor admits the binding (each member active and holding its role, every
+  flow role bound and no other); Meta only reads the member ids as public
+  aliases by the member-id alias rule, refusing the encoded roster spelling
+  at ingress. A generated runtime alias names its durable identity only when
+  the identity runtime confirms it is the current incarnation; a stale one
+  is refused with `-32000` and data kind `stale_identity_runtime_binding`,
+  and without an identity runtime it keeps its exact spelling, which names
+  no member. A refused binding is `-32602` with data
+  `{"kind": "flow_role_targets_refused", "flow_id", "refusal": {"kind", ...}}`
+  (`role_not_in_flow`, `role_unbound`, `quorum_exceeds_bound_set`,
+  `not_a_member`, `role_mismatch`, `not_active`), its member a public alias,
+  and records no run; a malformed one is `-32602` without data. The result
+  echoes the admitted binding as `role_targets`, and the run record that
+  `meta/flow_status` and `meta/list_runs` return carries it. Both the stdio
+  surface and the console serve it and list `flow_role_targets` in
+  `meta/capabilities.feature_capabilities`; an older gateway ignores the
+  parameter and runs the flow role-wide, so a raw RPC caller checks the
+  capability first. On the console a role-targeted run also needs
+  `agent.send` on every bound member. The Python and TypeScript SDKs add
+  `run_flow(..., role_targets=...)` and `runFlow(flowId, params,
+  { roleTargets })`: they refuse with `CapabilityUnavailableError` before
+  calling a gateway without the capability, raise the typed
+  `FlowRoleTargetsRefusedError` for a refused binding, and cancel a run whose
+  result does not echo the binding before raising
+  `FlowRoleTargetsNotAppliedError`. `MobRun` and `MobRunSnapshot` carry
+  `role_targets` (`roleTargets`), absent for a role-wide run. A run record
+  read through an older runtime has no `role_targets`, so a check that
+  requires a bound run must treat a missing binding as not authorized.
 
 ### Changed
 

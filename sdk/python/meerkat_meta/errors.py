@@ -42,6 +42,21 @@ COMPOSITION_PROVENANCE_CODE: int = -32019
 # and the repair, ``required_action = "reload_member_registration"``.
 MEMBER_RELOAD_REQUIRED_CODE: int = -32029
 MEMBER_RELOAD_REQUIRED_KIND: str = "mob_member_reload_required"
+# ``meta/run_flow`` refused its ``role_targets`` (JSON-RPC invalid params,
+# ``-32602``). The error data carries meerkat's typed refusal:
+# ``{"kind": FLOW_ROLE_TARGETS_REFUSED_KIND, "flow_id", "refusal": {"kind", ...}}``.
+FLOW_ROLE_TARGETS_REFUSED_KIND: str = "flow_role_targets_refused"
+# The refusal kinds, a closed vocabulary: a new kind is a breaking change.
+FLOW_ROLE_TARGET_REFUSAL_KINDS: frozenset[str] = frozenset(
+    {
+        "role_not_in_flow",
+        "role_unbound",
+        "quorum_exceeds_bound_set",
+        "not_a_member",
+        "role_mismatch",
+        "not_active",
+    }
+)
 # WorkGraph service not configured on the runtime.
 WORKGRAPH_UNAVAILABLE_CODE: int = -32041
 # WorkGraph CAS/revision conflict on a mutation (stale `expected_revision`).
@@ -576,6 +591,72 @@ class MemberReloadRequiredError(RpcError):
         self.required_action: str | None = (
             required_action if isinstance(required_action, str) else None
         )
+
+
+class FlowRoleTargetsRefusedError(RpcError):
+    """Raised when ``meta/run_flow`` refused its ``role_targets``; no run started.
+
+    The gateway answers invalid params (``-32602``) with data ``kind``
+    ``"flow_role_targets_refused"``; both must match, and any other
+    ``-32602`` answer stays a plain :class:`RpcError`. ``flow_id`` names the
+    flow, and ``refusal`` is meerkat's typed refusal: its ``kind`` is one of
+    :data:`FLOW_ROLE_TARGET_REFUSAL_KINDS` (``role_not_in_flow``,
+    ``role_unbound``, ``quorum_exceeds_bound_set``, ``not_a_member``,
+    ``role_mismatch``, ``not_active``) beside the role, member and other
+    fields that kind names. ``refusal_kind`` is that ``kind``, ``None`` when
+    the gateway sent none.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str = "",
+        method: str = "",
+        data: Any | None = None,
+    ):
+        super().__init__(
+            -32602,
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+        payload = data if isinstance(data, dict) else {}
+        flow_id = payload.get("flow_id")
+        self.flow_id: str | None = flow_id if isinstance(flow_id, str) else None
+        refusal = payload.get("refusal")
+        self.refusal: dict[str, Any] = dict(refusal) if isinstance(refusal, dict) else {}
+        kind = self.refusal.get("kind")
+        self.refusal_kind: str | None = kind if isinstance(kind, str) else None
+
+
+class FlowRoleTargetsNotAppliedError(MetaError):
+    """Raised when ``meta/run_flow`` started a run without echoing the
+    ``role_targets`` it was sent.
+
+    A gateway that does not echo the binding may have run the flow
+    role-wide, so the SDK asked it to cancel the run before raising.
+    ``run_id`` names the run, ``requested`` is the binding sent, ``echoed``
+    the response's ``role_targets`` (``None`` when absent), and
+    ``cancel_error`` the error the cancel raised, ``None`` when it was
+    accepted (when it is set, the run may still be running).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        run_id: str,
+        requested: dict[str, list[str]],
+        echoed: Any,
+        cancel_error: BaseException | None = None,
+    ):
+        super().__init__(message)
+        self.run_id = run_id
+        self.requested = requested
+        self.echoed = echoed
+        self.cancel_error = cancel_error
 
 
 class WorkGraphUnavailableError(RpcError):

@@ -2379,3 +2379,185 @@ async def test_schedule_tools_fails_closed_on_malformed_results(raw):
 
     with pytest.raises(ValueError, match="meta/schedule/tools"):
         await handle.schedule_tools()
+
+
+# ---------------------------------------------------------------------------
+# meta/run_flow role_targets
+# ---------------------------------------------------------------------------
+
+from meerkat_meta.errors import (  # noqa: E402
+    CapabilityUnavailableError,
+    FlowRoleTargetsNotAppliedError,
+    FlowRoleTargetsRefusedError,
+)
+
+_FLOW_ROLE_TARGETS_CAPABILITIES = {
+    "contract_version": "0.9.5",
+    "methods": ["meta/run_flow", "meta/cancel_flow"],
+    "loaded_modules": [],
+    "feature_capabilities": ["flow_role_targets"],
+}
+
+
+@pytest.mark.asyncio
+async def test_run_flow_with_role_targets_checks_the_capability_then_sends_the_binding():
+    handle, calls = make_mock_mob_handle({
+        "meta/capabilities": _FLOW_ROLE_TARGETS_CAPABILITIES,
+        "meta/run_flow": {
+            "run_id": "run-a",
+            "role_targets": {"reviewer": ["rev-a2", "rev-a1"]},
+        },
+    })
+
+    run_id = await handle.run_flow(
+        "review",
+        {"issue": 7},
+        role_targets={"reviewer": ["rev-a1", "rt:rev-a2:3"]},
+    )
+
+    assert run_id == "run-a"
+    assert [method for method, _ in calls] == ["meta/capabilities", "meta/run_flow"]
+    assert calls[1][1] == {
+        "flow_id": "review",
+        "params": {"issue": 7},
+        "role_targets": {"reviewer": ["rev-a1", "rt:rev-a2:3"]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_flow_refuses_role_targets_locally_without_the_capability():
+    handle, calls = make_mock_mob_handle({
+        "meta/capabilities": {**_FLOW_ROLE_TARGETS_CAPABILITIES, "feature_capabilities": []},
+    })
+
+    with pytest.raises(CapabilityUnavailableError) as raised:
+        await handle.run_flow("review", role_targets={"reviewer": ["rev-a1"]})
+
+    assert raised.value.method == "meta/run_flow"
+    assert raised.value.data == {"capability": "flow_role_targets"}
+    assert [method for method, _ in calls] == ["meta/capabilities"], (
+        "an older gateway would run the flow role-wide, so nothing is started"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "echoed",
+    [
+        None,
+        {"reviewer": ["rev-b1"]},
+        {"reviewer": ["rev-a1"], "coder": ["coder-a"]},
+        {"reviewer": "rev-a1"},
+        ["rev-a1"],
+    ],
+)
+async def test_run_flow_cancels_and_raises_when_the_binding_is_not_echoed(echoed):
+    response = {"run_id": "run-a"}
+    if echoed is not None:
+        response["role_targets"] = echoed
+    handle, calls = make_mock_mob_handle({
+        "meta/capabilities": _FLOW_ROLE_TARGETS_CAPABILITIES,
+        "meta/run_flow": response,
+        "meta/cancel_flow": {},
+    })
+
+    with pytest.raises(FlowRoleTargetsNotAppliedError) as raised:
+        await handle.run_flow("review", role_targets={"reviewer": ["rev-a1"]})
+
+    assert raised.value.run_id == "run-a"
+    assert raised.value.requested == {"reviewer": ["rev-a1"]}
+    assert raised.value.echoed == echoed
+    assert raised.value.cancel_error is None
+    assert calls[-1] == ("meta/cancel_flow", {"run_id": "run-a"})
+
+
+@pytest.mark.asyncio
+async def test_run_flow_reports_a_failed_cancel_of_an_unechoed_run():
+    handle, calls = make_mock_mob_handle({
+        "meta/capabilities": _FLOW_ROLE_TARGETS_CAPABILITIES,
+        "meta/run_flow": {"run_id": "run-a"},
+    })
+    inner_rpc = handle._runtime._rpc
+
+    async def rpc_with_failing_cancel(method, params=None, *, transport_timeout=None):
+        if method == "meta/cancel_flow":
+            calls.append((method, params))
+            raise RpcError(-32000, "cancel_flow failed", method=method)
+        return await inner_rpc(method, params, transport_timeout=transport_timeout)
+
+    handle._runtime._rpc = rpc_with_failing_cancel
+
+    with pytest.raises(FlowRoleTargetsNotAppliedError) as raised:
+        await handle.run_flow("review", role_targets={"reviewer": ["rev-a1"]})
+
+    assert isinstance(raised.value.cancel_error, RpcError)
+    assert "canceling it failed" in str(raised.value)
+    assert calls[-1] == ("meta/cancel_flow", {"run_id": "run-a"})
+
+
+@pytest.mark.asyncio
+async def test_run_flow_without_role_targets_reads_no_capabilities():
+    handle, calls = make_mock_mob_handle({"meta/run_flow": {"run_id": "run-a"}})
+
+    assert await handle.run_flow("review") == "run-a"
+
+    assert calls == [("meta/run_flow", {"flow_id": "review", "params": None})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "role_targets",
+    [{"reviewer": "rev-a1"}, {"reviewer": ["rev-a1", 7]}, {7: ["rev-a1"]}],
+)
+async def test_run_flow_refuses_role_targets_that_are_not_member_id_sequences(role_targets):
+    handle, calls = make_mock_mob_handle({
+        "meta/capabilities": _FLOW_ROLE_TARGETS_CAPABILITIES,
+    })
+
+    with pytest.raises(TypeError):
+        await handle.run_flow("review", role_targets=role_targets)
+
+    assert calls == []
+
+
+def test_a_refused_binding_is_a_typed_error():
+    from meerkat_meta.runtime import _rpc_error_from_payload
+
+    error = _rpc_error_from_payload(
+        {
+            "code": -32602,
+            "message": "run_flow failed: role targets refused",
+            "data": {
+                "kind": "flow_role_targets_refused",
+                "flow_id": "review",
+                "refusal": {"kind": "not_a_member", "role": "reviewer", "member": "ghost"},
+            },
+        },
+        request_id="r-1",
+        method="meta/run_flow",
+    )
+
+    assert isinstance(error, FlowRoleTargetsRefusedError)
+    assert error.code == -32602
+    assert error.flow_id == "review"
+    assert error.refusal_kind == "not_a_member"
+    assert error.refusal == {"kind": "not_a_member", "role": "reviewer", "member": "ghost"}
+
+    plain = _rpc_error_from_payload(
+        {"code": -32602, "message": "Invalid params: flow_id required"},
+        request_id="r-2",
+        method="meta/run_flow",
+    )
+    assert type(plain) is RpcError
+
+
+def test_run_records_carry_their_role_targets():
+    from meerkat_meta.types import MobRun, MobRunSnapshot
+
+    bound = {"run_id": "r-1", "status": "running", "role_targets": {"reviewer": ["rev-a1"]}}
+    assert MobRunSnapshot.from_dict(bound).role_targets == {"reviewer": ["rev-a1"]}
+    assert MobRun.from_dict(bound).role_targets == {"reviewer": ["rev-a1"]}
+
+    role_wide = {"run_id": "r-2", "status": "running"}
+    assert MobRunSnapshot.from_dict(role_wide).role_targets is None
+    assert MobRun.from_dict(role_wide).role_targets is None
