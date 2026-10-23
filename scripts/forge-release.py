@@ -24,7 +24,8 @@ forge.yml run (backend and frontend) that tested exactly the Forge inputs at
 its commit: the
 trees of installer, console, packages/console-core, packages/console-components
 and sdk/python, forge.yml itself, the lockfiles, installer requirements and
-vendored wheels, and a toolchain that fits forge.yml's declared versions. A
+vendored wheels, the gateway source whose shutdown horizon a Forge test pins,
+and a toolchain that fits forge.yml's declared versions. A
 pull request run never counts: it tests GitHub's merge of its head into the
 base (refs/pull/N/merge), not its head commit. If no dispatched run did, it
 refuses until forge.yml is dispatched for that commit.
@@ -110,7 +111,10 @@ DOWNLOAD_ATTEMPTS = 3
 # lockfiles and vendored wheels, and the toolchain forge.yml declares.
 FORGE_CI = ".github/workflows/forge.yml"
 EVIDENCE_TREES = ("console", "installer", "packages/console-components", "packages/console-core", "sdk/python")
-EVIDENCE_FILES = (FORGE_CI, "console/package-lock.json", "installer/web/package-lock.json")
+# installer/tests/test_gateway_shutdown_horizon.py reads the shutdown horizon
+# the gateway source advertises, so the bound run must have tested it too.
+EVIDENCE_FILES = (FORGE_CI, "console/package-lock.json", "installer/web/package-lock.json",
+                  "crates/meerkat-meta/src/rpc_gateway.rs")
 EVIDENCE_JOBS = ("backend", "frontend")
 TOOLCHAIN_FILE = "forge-toolchain.json"
 MAX_EVIDENCE_RUNS = 30

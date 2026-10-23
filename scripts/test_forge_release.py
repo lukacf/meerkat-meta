@@ -919,6 +919,7 @@ BASE_TREE = {
     "console/package-lock.json": "console lock",
     "console/src/app.ts": "console",
     "crates/meerkat-meta/src/lib.rs": "rust",
+    "crates/meerkat-meta/src/rpc_gateway.rs": "gateway",
     "installer/launchkit/server.py": "server",
     "installer/requirements-guide-sdk.txt": "guide requirements",
     "installer/requirements-standalone.txt": "standalone requirements",
@@ -1071,6 +1072,17 @@ class EvidenceTests(unittest.TestCase):
                     self.evidence(github)
                 self.assertIn(member, str(refusal.exception))
                 self.assertIn("Dispatch forge.yml", str(refusal.exception))
+
+    def test_a_run_that_tested_another_gateway_source_is_not_reused(self):
+        """installer/tests/test_gateway_shutdown_horizon.py pins the shutdown
+        horizon the gateway source advertises, so the bound run must have
+        tested the candidate's own copy of that source."""
+        path = "crates/meerkat-meta/src/rpc_gateway.rs"
+        github = self.github(run_files={**BASE_TREE, path: "another horizon"})
+        with self.assertRaises(forge.ProtocolError) as refusal:
+            self.evidence(github)
+        self.assertIn(f"files:{path}", str(refusal.exception))
+        self.assertIn("Dispatch forge.yml", str(refusal.exception))
 
     def test_a_new_requirements_file_or_wheel_refuses_reuse(self):
         for path in ("installer/requirements-extra.txt", "installer/vendor/guide/extra-1.0-py3-none-any.whl"):
