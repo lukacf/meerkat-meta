@@ -652,6 +652,225 @@ async fn a_template_replace_re_admits_its_children() {
     );
 }
 
+/// A declared source an operator ended, whose changed declaration's next
+/// generation is refused at runtime, stays pending at every trigger, and
+/// starts once the refusal is gone.
+#[tokio::test]
+async fn a_declared_source_whose_restart_is_refused_stays_pending_and_is_retried() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    try_apply(
+        service,
+        1,
+        serde_json::json!([declared_inbox(serde_json::json!([member_grant("agent:a")]))]),
+        serde_json::json!([]),
+    )
+    .await
+    .unwrap();
+    // An operator ends it, and a source made at runtime takes its identity.
+    let revision = inbox(service).await["revision"].clone();
+    try_host_call(
+        service,
+        SOURCES_END,
+        serde_json::json!({
+            "operation_id": "operator-end-inbox",
+            "source_id": "inbox",
+            "expected_revision": revision,
+        }),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SOURCES_PUT,
+        source_params("put-other", "other", "subject-1", &["mail.other"]),
+    )
+    .await
+    .unwrap();
+    // Revision 2 changes the declaration: its next generation is refused
+    // while the other source holds the identity.
+    try_apply(
+        service,
+        2,
+        serde_json::json!([declared_inbox(serde_json::json!([
+            member_grant("agent:a"),
+            member_grant("agent:b"),
+        ]))]),
+        serde_json::json!([]),
+    )
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        service.reconcile_mobs().await.unwrap();
+        let view = declared(service).await;
+        let waiting = record(&view, "source", "inbox")
+            .unwrap_or_else(|| panic!("the declared source is listed: {view}"));
+        assert_eq!(waiting["status"], "pending", "{view}");
+        assert_eq!(
+            waiting["refusal"]["kind"], "source_identity_taken",
+            "{view}"
+        );
+    }
+    // Once the other source ends, the next trigger starts the declared one.
+    let other = try_host_call(
+        service,
+        SOURCES_GET,
+        serde_json::json!({ "source_id": "other" }),
+    )
+    .await
+    .unwrap();
+    try_host_call(
+        service,
+        SOURCES_END,
+        serde_json::json!({
+            "operation_id": "operator-end-other",
+            "source_id": "other",
+            "expected_revision": other["source"]["revision"],
+        }),
+    )
+    .await
+    .unwrap();
+    service.reconcile_mobs().await.unwrap();
+    let view = declared(service).await;
+    assert_eq!(
+        record(&view, "source", "inbox").map(|record| &record["status"]),
+        Some(&serde_json::json!("applied")),
+        "{view}"
+    );
+    let source = inbox(service).await;
+    assert_eq!(source["generation"], 2, "{source}");
+    assert_eq!(source["state"], "active", "{source}");
+}
+
+/// A role template's id is at most 200 bytes whichever way it is put, so
+/// each child's id fits; a capture on its topics goes on.
+#[tokio::test]
+async fn a_role_template_id_over_the_bound_is_refused_and_captures_go_on() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    harness.native.set_roster_facts("agent:b", "reviewer", &[]);
+    let refused = try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "put-long-template",
+            "subscription_id": "t".repeat(250),
+            "members": { "mob_id": OWN_MOB, "role": "reviewer" },
+            "topics": ["deploy.done"],
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code, -32602, "{refused:?}");
+    host_announces(service, "deploy-1", &["deploy.done"]).await;
+}
+
+/// A source advance resolves only the role templates its items can reach:
+/// those on the source's own or forward topics.
+#[tokio::test]
+async fn a_source_advance_resolves_only_the_templates_its_topics_reach() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    harness.native.set_roster_facts("agent:b", "reviewer", &[]);
+    live_inbox(service).await;
+    try_apply(
+        service,
+        1,
+        serde_json::json!([]),
+        serde_json::json!([declared_template("reviewers", "reviewer", &["deploy.done"])]),
+    )
+    .await
+    .unwrap();
+    let before = harness.native.role_reads();
+    let revision = inbox(service).await["revision"].as_u64().unwrap();
+    try_host_call(
+        service,
+        SOURCES_ADVANCE,
+        with_items(
+            advance_params("advance-1", revision, 1, "c2"),
+            &[upsert("item-1", "v1", "a message")],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        harness.native.role_reads(),
+        before,
+        "no roster read for a template the advance cannot reach"
+    );
+}
+
+/// `subscriptions/get` reads a role template by its id: the template beside
+/// no subscription.
+#[tokio::test]
+async fn subscriptions_get_reads_a_role_template() {
+    let harness = harness_with(native_serving(&["agent:b"]));
+    let service = &harness.service;
+    try_host_call(
+        service,
+        SUBSCRIPTIONS_PUT,
+        serde_json::json!({
+            "operation_id": "put-reviewers",
+            "subscription_id": "reviewers",
+            "members": { "mob_id": OWN_MOB, "role": "reviewer" },
+            "topics": ["deploy.done"],
+        }),
+    )
+    .await
+    .unwrap();
+    let found = try_host_call(
+        service,
+        SUBSCRIPTIONS_GET,
+        serde_json::json!({ "subscription_id": "reviewers" }),
+    )
+    .await
+    .unwrap();
+    assert!(found["subscription"].is_null(), "{found}");
+    assert_eq!(found["template"]["id"], "reviewers", "{found}");
+    assert_eq!(found["template"]["state"], "active", "{found}");
+    assert_eq!(found["template"]["members"]["role"], "reviewer", "{found}");
+}
+
+/// A template's resume resumes only the children its own pause paused: a
+/// child an operator paused by itself stays paused.
+#[tokio::test]
+async fn a_template_resume_leaves_a_child_its_operator_paused() {
+    let harness = harness_with(native_serving(&["agent:b", "agent:c"]));
+    let service = &harness.service;
+    harness.native.set_roster_facts("agent:b", "reviewer", &[]);
+    harness.native.set_roster_facts("agent:c", "reviewer", &[]);
+    try_apply(
+        service,
+        1,
+        serde_json::json!([]),
+        serde_json::json!([declared_template("reviewers", "reviewer", &["deploy.done"])]),
+    )
+    .await
+    .unwrap();
+    host_announces(service, "deploy-1", &["deploy.done"]).await;
+    let child_of = |identity: &str| {
+        super::super::declarations::role_child_id(&sid("reviewers"), &member(identity))
+            .unwrap()
+            .to_string()
+    };
+    operator_changes(service, "pause", &child_of("agent:b")).await;
+    template_change(service, "pause", "reviewers", 1).await;
+    template_change(service, "resume", "reviewers", 2).await;
+    assert_eq!(
+        subscription_state(service, &child_of("agent:b"))
+            .await
+            .as_deref(),
+        Some("paused"),
+        "the operator's own pause holds"
+    );
+    assert_eq!(
+        subscription_state(service, &child_of("agent:c"))
+            .await
+            .as_deref(),
+        Some("active")
+    );
+}
+
 /// Change the subscription `id` at its revision as an operator does:
 /// `verb` is "pause", "resume" or "cancel".
 async fn operator_changes(service: &AnnouncementService, verb: &str, id: &str) {
@@ -763,6 +982,18 @@ async fn an_operators_pause_and_cancel_of_a_declared_record_hold() {
     assert_eq!(
         subscription_state(service, "declared-a").await.as_deref(),
         Some("cancelled")
+    );
+
+    // The next trigger retries the changed declaration: it is still pending,
+    // never held as suppressed.
+    service.reconcile_mobs().await.unwrap();
+    let view = declared(service).await;
+    let waiting = record(&view, "subscription", "declared-a")
+        .unwrap_or_else(|| panic!("the declared subscription is listed: {view}"));
+    assert_eq!(waiting["status"], "pending", "{view}");
+    assert_eq!(
+        waiting["refusal"]["kind"], "subscription_cancelled",
+        "{view}"
     );
 }
 

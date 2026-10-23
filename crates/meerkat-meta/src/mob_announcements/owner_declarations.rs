@@ -91,6 +91,20 @@ fn step_operation(
 /// The keys of a mark: its kind and id.
 type MarkKey = (DeclarationRecordKind, String);
 
+/// Whether the reconciler made the record of `before` and applied, or held,
+/// the declaration of `digest`: only then does an operator's cancel or end
+/// hold. A pending mark of the digest is a refused attempt, tried again.
+fn held_at(before: Option<&DeclarationMark>, digest: &str) -> bool {
+    before.is_some_and(|mark| {
+        mark.managed
+            && mark.digest == digest
+            && matches!(
+                mark.status,
+                DeclarationStatus::Applied | DeclarationStatus::Suppressed
+            )
+    })
+}
+
 impl AnnouncementService {
     /// This gateway's own mob: a declared record names it when it names no
     /// mob.
@@ -426,7 +440,7 @@ impl AnnouncementService {
         error: AnnouncementStoreError,
     ) -> Result<(), AnnouncementError> {
         let managed = before.is_some_and(|mark| mark.managed);
-        if managed && before.is_some_and(|mark| mark.digest == base.digest) {
+        if held_at(before, &base.digest) {
             return self
                 .mark_record(before, base, DeclarationStatus::Suppressed, None, true)
                 .await;
@@ -522,7 +536,7 @@ impl AnnouncementService {
             return self.mark_put(before, base, put, managed).await;
         }
         // Ended by an operator: held while its declaration is unchanged.
-        if managed && before.is_some_and(|mark| mark.digest == digest) {
+        if held_at(before, &digest) {
             return self
                 .mark_record(before, base, DeclarationStatus::Suppressed, None, true)
                 .await;
@@ -634,7 +648,7 @@ impl AnnouncementService {
         if template.state == SubscriptionState::Cancelled {
             // Cancelled: held while its declaration is unchanged; declared
             // anew or changed, it starts again at its next revision.
-            if managed && before.is_some_and(|mark| mark.digest == digest) {
+            if held_at(before, &digest) {
                 return self
                     .mark_record(before, base, DeclarationStatus::Suppressed, None, true)
                     .await;
@@ -927,6 +941,15 @@ impl AnnouncementService {
         }
         let facts = self.roster_facts(admitted).await;
         Ok((expansion, facts))
+    }
+
+    /// A role template by its id, whatever its state: `subscriptions/get`
+    /// answers a template's id with it.
+    pub async fn role_template(
+        &self,
+        id: &SubscriptionId,
+    ) -> Result<Option<RoleTemplate>, AnnouncementError> {
+        Ok(self.inner.store.role_template(id).await?)
     }
 
     /// `subscriptions/pause`, `resume` and `cancel`: of the subscription with

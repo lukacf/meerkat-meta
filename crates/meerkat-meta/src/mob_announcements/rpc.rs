@@ -874,10 +874,20 @@ pub async fn handle_announcement_method(
             let marker = subscription
                 .as_ref()
                 .and_then(|subscription| service.suspend_marker(&subscription.member));
-            Ok(json!({
-                "subscription": to_value(subscription)?,
+            let mut found = json!({
+                "subscription": to_value(&subscription)?,
                 "marker": to_value(marker)?,
-            }))
+            });
+            // A role template's id reads the template beside no subscription.
+            if subscription.is_none()
+                && let Some(template) = service
+                    .role_template(&request.subscription_id)
+                    .await
+                    .map_err(rpc_error)?
+            {
+                found["template"] = to_value(template)?;
+            }
+            Ok(found)
         }
         "meta/mob_announcements/subscriptions/list" => {
             let request: ListSubscriptionsParams = params(raw)?;

@@ -995,10 +995,11 @@ impl AnnouncementService {
             .store
             .source_subscribers(&request.mob_id, &request.source_id)
             .await?;
+        // Only the templates the source's own or forward topics reach.
         let templates = self
             .inner
             .store
-            .role_templates(Some(&request.mob_id))
+            .source_role_templates(&request.mob_id, &request.source_id)
             .await?;
         let (roles, admitted) = self.expand_roles(&templates).await;
         subscribers.extend(admitted);

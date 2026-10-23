@@ -2344,6 +2344,8 @@ struct ScriptedNative {
     roster_facts: Mutex<BTreeMap<String, RosterRow>>,
     /// Members whose roster facts cannot be read now.
     unreadable_facts: Mutex<BTreeSet<String>>,
+    /// How many times the members of a role were read.
+    role_reads: AtomicU64,
 }
 
 /// A member's role and labels, as a scripted roster records them.
@@ -2374,7 +2376,13 @@ impl ScriptedNative {
             log_reads: Mutex::new(Vec::new()),
             roster_facts: Mutex::new(BTreeMap::new()),
             unreadable_facts: Mutex::new(BTreeSet::new()),
+            role_reads: AtomicU64::new(0),
         }
+    }
+
+    /// How many times the members of a role were read.
+    fn role_reads(&self) -> u64 {
+        self.role_reads.load(Ordering::SeqCst)
     }
 
     /// Record `identity`'s role and labels on this mob's roster.
@@ -2502,6 +2510,7 @@ impl NativeDelivery for ScriptedNative {
         mob_id: &MobId,
         role: &str,
     ) -> std::result::Result<Vec<Member>, NativeUnavailable> {
+        self.role_reads.fetch_add(1, Ordering::SeqCst);
         if *mob_id != mob(OWN_MOB) {
             return Ok(Vec::new());
         }
