@@ -6,9 +6,10 @@ import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 
-// A product-launched Forge reports agent_team.available === false in its
-// capabilities: its applications run on Meta 0.9.4, and an agent team
-// package installs the MobKit 0.8 runtime. The UI then offers no agent team.
+// The generic agent team gate: when Forge's capabilities report
+// agent_team.available === false, for whatever reason they give, the UI offers
+// no agent team. No entry reports a refusal today; the gate stays so that the
+// UI keeps honouring one when it is reported.
 const web = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(join(web, "package.json"));
 const { build } = require("esbuild");
@@ -90,7 +91,7 @@ test("the source entry's deployment panel offers the agent team choice", async (
   });
 });
 
-test("a product-launched Forge's deployment panel hides the agent team and never reads its options", async () => {
+test("a reported agent team refusal hides the agent team choice and never reads its options", async () => {
   await mounted({ agentTeamAvailable: false }, async ({ document, calls }) => {
     assert.equal(agentTeamChoice(document) === null, true, "no agent team choice");
     assert.equal(document.querySelector("fieldset.deployment-run-mode") === null, true, "no source chooser");
@@ -99,7 +100,7 @@ test("a product-launched Forge's deployment panel hides the agent team and never
   });
 });
 
-test("a product-launched Forge's setup progress and status lead to the builder, not the agent team", () => {
+test("with an agent team refusal reported, setup progress and status lead to the builder, not the agent team", () => {
   const { state } = acceptedPlan();
   const offered = setupProgress(state, {}, {});
   assert.equal(offered.title, "Your agent team is ready to install");
