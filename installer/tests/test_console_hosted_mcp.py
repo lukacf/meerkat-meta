@@ -349,21 +349,34 @@ async def test_typed_start_error_does_not_prove_native_nonadmission(tmp_path, re
         async with boundary(tmp_path) as (front, client, peer, key, contexts):
             peer.start_case = reason
             response = await start(client, key)
-            assert response.status_code == 503 and "location" not in response.headers
-            assert (await client.post("/logout", headers={"Origin": ORIGIN})).status_code == 503
-            assert peer.actions() == ["enroll_console_login", "describe", "start"]
+            logout = await client.post("/logout", headers={"Origin": ORIGIN})
+            actions = peer.actions()
+    # Assert after the expected cleanup error so it cannot hide a body failure.
+    assert response.status_code == 503 and "location" not in response.headers
+    assert logout.status_code == 503
+    # Retirement is attempted as a backstop; its success is not established by
+    # the fixture. Its synthetic acknowledgment cannot make MCP cleanup clean.
+    assert actions == ["enroll_console_login", "describe", "start", "retire_console_login"]
+    assert peer.actions() == actions
 
 
 async def test_lost_native_start_reply_keeps_cleanup_unconfirmed(tmp_path):
     with pytest.raises(RuntimeError, match="Console access cleanup is unconfirmed"):
         async with boundary(tmp_path) as (front, client, peer, key, contexts):
-            assert (await client.get(HOSTED_MCP_PATH + "/" + key)).status_code == 200
+            listing = await client.get(HOSTED_MCP_PATH + "/" + key)
             attempt = next(iter(front._logins.values())).mcp_attempts[key]
             attempt.client._timeout = 0.1  # Bound this lost-reply fixture's actual SDK call.
             peer.start_case = "lost_reply"
-            assert (await start(client, key)).status_code == 503
-            assert (await client.post("/logout", headers={"Origin": ORIGIN})).status_code == 503
-            assert "cancel" not in peer.actions() and "release" not in peer.actions()
+            response = await start(client, key)
+            logout = await client.post("/logout", headers={"Origin": ORIGIN})
+            actions = peer.actions()
+    assert listing.status_code == 200
+    assert response.status_code == 503 and "location" not in response.headers
+    assert logout.status_code == 503
+    # The initial detail GET observes status before the lost start reply.
+    # Retirement is only a backstop attempt, not native success evidence.
+    assert actions == ["enroll_console_login", "describe", "status", "start", "retire_console_login"]
+    assert peer.actions() == actions
 
 
 async def test_cancelled_describe_waiter_keeps_same_live_attempt_for_next_request(tmp_path):
