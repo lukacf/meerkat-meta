@@ -1366,7 +1366,23 @@ async fn console_send_selected_skills_resolve_natively_and_replay_exactly() {
     );
     let calls_after_turn = requests.len();
 
+    // A history refresh projects the member's committed user messages (its
+    // spawn kickoff among them) as user_input frames of their own, which can
+    // land at any read. The replay is checked against the console's own
+    // reservation: the one input this row's send reserved.
+    h.aggregator.refresh_session_history().await.unwrap();
+    tokio::time::timeout(WAIT, h.aggregator.history_backfill_converged())
+        .await
+        .expect("the console's history backfills converge");
     let frames_before_replay = h.user_input_frames(&accepted.identity).await;
+    assert_eq!(
+        frames_before_replay,
+        vec![(
+            accepted.input_frame_id.clone(),
+            ConsoleFrameStatus::Delivered
+        )],
+        "the send reserved one console input"
+    );
 
     // The response is lost; the caller replays the same send.
     let replay = h.send(request.clone()).await.unwrap();
