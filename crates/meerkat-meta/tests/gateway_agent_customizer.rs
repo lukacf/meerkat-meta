@@ -6,9 +6,10 @@
 //! wrapper sees the dispatcher the SDK customizer's tools were built into. A
 //! host without the hook keeps the gateway's own composition. A refusal, or an
 //! answer that adds or drops a customizer, fails init before the identity
-//! bootstrap, and a gateway without an identity roster never asks. Each case is
-//! a separate gateway process over real stdio, answering the SDK callbacks
-//! itself.
+//! bootstrap, and a gateway without an identity roster never asks. A host that
+//! needs a customizer refuses `None` with `AgentCustomizerRequired`, whose text
+//! names what to configure. Each case is a separate gateway process over real
+//! stdio, answering the SDK callbacks itself.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -59,6 +60,7 @@ const WRAP_TEST: &str = "a_host_wrapper_is_the_one_customizer_on_both_build_path
 const DEFAULT_TEST: &str = "a_host_without_the_hook_keeps_the_composed_customizer";
 const REFUSE_TEST: &str = "a_refused_customizer_composition_fails_init_closed";
 const SHAPE_TEST: &str = "a_host_can_neither_add_nor_drop_the_agent_customizer";
+const REQUIRE_TEST: &str = "a_host_that_needs_a_customizer_names_what_to_configure";
 
 fn append(record: &Path, line: &str) {
     let mut file = std::fs::OpenOptions::new()
@@ -140,6 +142,8 @@ enum Answer {
     Refuse,
     Add,
     Drop,
+    /// Keep a composed customizer, and refuse `None` as needing one.
+    Require,
 }
 
 /// A host that answers the composition hook and records it, and what the
@@ -203,6 +207,14 @@ impl GatewayHostComposition for ComposingHost {
             (Answer::Drop, _) => {
                 append(&self.record, &format!("compose given={given}"));
                 Ok(None)
+            }
+            (Answer::Require, Some(composed)) => {
+                append(&self.record, &format!("compose given={given}"));
+                Ok(Some(composed))
+            }
+            (Answer::Require, None) => {
+                append(&self.record, &format!("compose given={given}"));
+                Err(GatewayHostError::AgentCustomizerRequired)
             }
         }
     }
@@ -308,6 +320,7 @@ fn serve_if_host_process() {
         "refuse" => composing(Answer::Refuse),
         "add" => composing(Answer::Add),
         "drop" => composing(Answer::Drop),
+        "require" => composing(Answer::Require),
         other => panic!("unknown host mode {other}"),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -680,4 +693,37 @@ fn a_host_can_neither_add_nor_drop_the_agent_customizer() {
         assert_eq!(run.lines, [given, "returned ok=false"], "{mode}");
         assert_eq!(run.bootstrap_builds, 0, "{mode}: no member build");
     }
+}
+
+/// A host whose members need a customizer refuses `None` with
+/// `AgentCustomizerRequired`: init fails closed with `-32603` before the
+/// identity bootstrap, and its message is the variant's text, which names the
+/// SDK agent customizer to configure and that a pass-through is enough. With
+/// the SDK's customizer configured, the same host starts.
+#[test]
+fn a_host_that_needs_a_customizer_names_what_to_configure() {
+    serve_if_host_process();
+    let required = GatewayHostError::AgentCustomizerRequired.to_string();
+    let run = drive(REQUIRE_TEST, "require", true, false);
+    assert_eq!(run.outcome(), "failed", "{:?}", run.seen);
+    assert_eq!(run.settled()["code"], -32603, "{}", run.settled());
+    assert_eq!(run.settled()["message"], required, "{}", run.settled());
+    for named in ["agent customizer", "pass-through"] {
+        assert!(
+            required.contains(named),
+            "the refusal names {named:?}: {required}"
+        );
+    }
+    assert_eq!(run.lines, ["compose given=none", "returned ok=false"]);
+    let reached: Vec<&str> = run
+        .phases()
+        .into_iter()
+        .filter(|phase| IDENTITY_PHASES.contains(phase))
+        .collect();
+    assert!(reached.is_empty(), "no identity phase: {reached:?}");
+    assert_eq!(run.bootstrap_builds, 0, "no member build");
+
+    let run = drive(REQUIRE_TEST, "require", true, true);
+    assert_eq!(run.outcome(), "ready", "{:?}", run.seen);
+    assert_eq!(run.starting("compose "), ["compose given=some"]);
 }
