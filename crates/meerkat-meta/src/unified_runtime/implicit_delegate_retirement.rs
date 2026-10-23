@@ -3080,11 +3080,12 @@ comms = true
     /// runtime store, and the opt-ins in `<root>/metadata.sqlite3`. A second
     /// boot over the same root restores the roster, the sessions and the
     /// opt-ins. No identity-first activation runs, so nothing revives a
-    /// restored member's session.
+    /// restored member's session. Members run on `client`.
     async fn boot_restartable_sweeping_runtime(
         mob_id: &str,
         root: &std::path::Path,
         sweep_interval_ms: u64,
+        client: Arc<dyn meerkat_client::LlmClient>,
     ) -> UnifiedRuntime {
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).expect("state root");
@@ -3103,7 +3104,10 @@ comms = true
         // Both boots run in one process: a durable child-mob default would
         // hold the state root's child mobs for the process lifetime.
         .with_child_mob_storage(crate::ChildMobStorage::ProcessBound)
-        .with_options(sweeping_options());
+        .with_options(crate::MobBootstrapOptions {
+            default_llm_client: Some(client),
+            ..sweeping_options()
+        });
         bootstrap_sweeping(
             spec,
             mob_id,
@@ -3116,18 +3120,52 @@ comms = true
     /// L11: a member a restart left without a live session, that owes no
     /// work, is retired after its window like any idle member. The first boot
     /// seats `worker` with an opt-in and `bystander` without one, and never
-    /// sweeps. The second boot over the same durable root restores both, and
-    /// nothing revives their sessions: the store holds the worker's session
-    /// and no live actor serves it, so its execution snapshot fails. The sweep
-    /// retires `worker` and clears its opt-in; `bystander` stays.
+    /// sweeps. While the worker's kickoff turn is held on the model, the
+    /// durable store read finds its open input under the worker's session;
+    /// once the turn ends it finds none. The second boot over the same
+    /// durable root restores both members, and nothing revives their
+    /// sessions: the store holds the worker's session and no live actor
+    /// serves it, so its execution snapshot fails. The sweep retires `worker`
+    /// and clears its opt-in; `bystander` stays.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_restart_retires_an_opted_in_worker_no_live_session_serves() {
         const MOB_ID: &str = "restart-not-live";
         let temp = tempfile::tempdir().expect("tempdir");
         let metadata_path = temp.path().join("metadata.sqlite3");
-        let first = boot_restartable_sweeping_runtime(MOB_ID, temp.path(), 3_600_000).await;
+        let (open_gate, gate) = tokio::sync::watch::channel(false);
+        let first = boot_restartable_sweeping_runtime(
+            MOB_ID,
+            temp.path(),
+            3_600_000,
+            Arc::new(GatedLlmClient { gate }),
+        )
+        .await;
         let handle = first.mob_handle();
+        // Autonomous: the worker's kickoff turn starts at once and holds on
+        // the gate.
         let worker_session = seat(&handle, "worker").await;
+        await_member_run_open(&handle, &AgentIdentity::from("worker")).await;
+        assert_eq!(
+            first
+                .mob_runtime
+                .session_owes_durable_input(&worker_session)
+                .await,
+            Some(true),
+            "the store read does not find the held kickoff turn's input under the worker's session"
+        );
+        open_gate.send(true).expect("open the gate");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while first
+                .mob_runtime
+                .session_owes_durable_input(&worker_session)
+                .await
+                != Some(false)
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the worker's input stayed open after its turn ended");
         seat(&handle, "bystander").await;
         first
             .mob_runtime
@@ -3140,7 +3178,13 @@ comms = true
         first.shutdown().await;
         drop(first);
 
-        let second = boot_restartable_sweeping_runtime(MOB_ID, temp.path(), 1_000).await;
+        let second = boot_restartable_sweeping_runtime(
+            MOB_ID,
+            temp.path(),
+            1_000,
+            Arc::new(meerkat_client::TestClient::default()),
+        )
+        .await;
         let handle = second.mob_handle();
         let service = second
             .mob_runtime
