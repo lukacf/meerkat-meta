@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import time
 
 import pytest
 
@@ -244,13 +245,22 @@ async def test_interruption_joins_original_child_before_staging_is_removed(super
     assert_reaped(files.children[0])
 
 
-@pytest.mark.parametrize("mode", ["timeout", "pip-failure"])
+@pytest.mark.parametrize("mode", ["timeout", "timeout-after-slow-staging", "pip-failure"])
 async def test_install_failure_joins_child_and_refuses_later_commands(supervised_files, mode):
     files = supervised_files
-    files.mode = mode
-    expected = TimeoutError if mode == "timeout" else installed.CandidateArtifactError
+    files.mode = "timeout" if mode.startswith("timeout") else mode
+    if mode == "timeout-after-slow-staging":
+        # A loaded host stages the wheels slowly before the first pip child.
+        fence, staged = files.require_current, []
+        def slow_fence():
+            if not staged:
+                staged.append(True)
+                time.sleep(0.2)
+            return fence()
+        files.require_current = slow_fence
+    expected = TimeoutError if mode.startswith("timeout") else installed.CandidateArtifactError
     with pytest.raises(expected):
-        await selected_install(files, timeout=0.15 if mode == "timeout" else 3)
+        await selected_install(files, timeout=0.15 if mode.startswith("timeout") else 3)
     assert len(files.children) == 1 and files.owner.child is None
     assert not list((files.root / ".venv").glob(".forge-selected-*"))
     assert_reaped(files.children[0])
